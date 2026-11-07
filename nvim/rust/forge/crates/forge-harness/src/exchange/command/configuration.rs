@@ -343,11 +343,19 @@ pub(crate) enum ConfigurationRejection {
     #[error("check definitions changed before preferences could apply")]
     CheckDefinitionsChanged,
     /// The provider positively rejected the change without altering its configuration.
-    #[error("configuration was rejected ({0:?}); existing settings remain active")]
+    #[error("{}", provider_rejection_text(*.0))]
     Provider(forge_provider_api::ProviderFailureKind),
     /// A prerequisite could not be read or validated before any execution effect.
     #[error("configuration prerequisites are unavailable; execution was not changed")]
     Unavailable,
+}
+
+/// Describe a provider rejection by the condition the user can act on.
+fn provider_rejection_text(kind: forge_provider_api::ProviderFailureKind) -> String {
+    match kind {
+        forge_provider_api::ProviderFailureKind::ResourceConflict => "configuration cannot change while provider work such as a background terminal is still running; stop it from the terminal list and retry. Existing settings remain active".into(),
+        kind => format!("configuration was rejected ({kind:?}); existing settings remain active"),
+    }
 }
 
 impl ConfigurationRejection {
@@ -383,10 +391,10 @@ pub(crate) enum TimeoutConfigurationError {
     Empty,
     /// Approval timing must fit the platform timer range.
     #[error("invalid approval timeout: {0}")]
-    Approval(#[source] forge_provider_api::deadline::InputTimeoutError),
+    Approval(#[source] crate::session::InputTimeoutError),
     /// Execution requires a nonzero timeout that fits the platform timer range.
     #[error("invalid tool timeout: {0}")]
-    Tool(#[source] forge_provider_api::deadline::InputTimeoutError),
+    Tool(#[source] crate::session::InputTimeoutError),
 }
 
 /// Decode the supported automatic-check policy fields at the transport/journal boundary.

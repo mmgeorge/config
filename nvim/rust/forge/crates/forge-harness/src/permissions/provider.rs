@@ -2,7 +2,7 @@ use super::matcher::PermissionRequest;
 use crate::provider::approval::{
     ApprovalAuthority, ApprovalResolution, PermissionCoordinator, protected_target,
 };
-use crate::provider::{ProviderError, ProviderEventSink};
+use crate::provider::{HarnessEventSink, ProviderError};
 use crate::session::ApprovalMode;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,13 +11,16 @@ use std::sync::{Arc, Mutex as StandardMutex};
 
 pub(crate) const REJECT_ALL_GUIDANCE: &str = "Tool approval is set to reject all, and no user is reviewing requests. Commands and tools that saved permission rules do not allow are rejected automatically. Continue with the allowed tools and commands. Do not wait for approval, retry rejected operations, or work around the restrictions.";
 
+#[derive(Clone)]
 struct PermissionState {
     task_authority: Option<crate::tools::TaskAuthority>,
     checkpoint: Option<crate::checkpoint::ToolGate>,
-    owner: Option<crate::provider::ExecutionOwner>,
+    owner: Option<crate::provider::ThreadOwner>,
     approval_mode: ApprovalMode,
+    execution_kind: crate::provider::ApprovalExecutionKind,
     lsp_mutations: bool,
-    event_sink: Option<ProviderEventSink>,
+    event_sink: Option<HarnessEventSink>,
+    inheritance: Option<crate::provider::approval::PermissionInheritance>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -26,18 +29,36 @@ enum PermissionOrigin {
     SessionStorage,
 }
 
+/// Resolve independently admitted native-child callbacks through the binding's trusted registry.
+#[async_trait]
+pub(crate) trait ObservedChildAuthority: Send + Sync {
+    /// Get the retained child context only after validating binding, parent relation, and original turn.
+    async fn context(
+        &self,
+        parent: &crate::provider::InvocationScope,
+        child: &crate::provider::TurnAddress,
+    ) -> std::result::Result<Arc<ProviderPermissionContext>, ProviderError>;
+}
+
 /// Own the authorization and checkpoint context used by native provider callbacks.
 pub(crate) struct ProviderPermissionContext {
     coordinator: Arc<PermissionCoordinator>,
     state: StandardMutex<PermissionState>,
+    provider_fence: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
     retired: tokio::sync::watch::Sender<bool>,
     approval_authority: Arc<ApprovalAuthority>,
+    observed_authority: StandardMutex<Option<Arc<dyn ObservedChildAuthority>>>,
+    inherited_lease: StandardMutex<Option<crate::provider::approval::InheritedPermissionLease>>,
 }
 
 impl ProviderPermissionContext {
     /// Check immutable invocation routing before or after an asynchronous permission decision.
     fn matches_scope(&self, scope: &forge_provider_api::InvocationScope) -> bool {
         !*self.retired.borrow()
+            && self
+                .provider_fence
+                .get()
+                .is_none_or(|fence| !fence.load(std::sync::atomic::Ordering::Acquire))
             && self.state.lock().is_ok_and(|state| {
                 state
                     .event_sink
@@ -51,26 +72,147 @@ impl ProviderPermissionContext {
     pub(crate) fn new(coordinator: Arc<PermissionCoordinator>) -> Self {
         Self {
             coordinator,
+            provider_fence: std::sync::OnceLock::new(),
             retired: tokio::sync::watch::channel(false).0,
             approval_authority: Arc::new(ApprovalAuthority::default()),
+            observed_authority: StandardMutex::new(None),
+            inherited_lease: StandardMutex::new(None),
             state: StandardMutex::new(PermissionState {
                 task_authority: None,
                 checkpoint: None,
                 owner: None,
                 approval_mode: ApprovalMode::Ask,
+                execution_kind: crate::provider::ApprovalExecutionKind::Managed,
                 lsp_mutations: false,
                 event_sink: None,
+                inheritance: None,
             }),
         }
+    }
+
+    /// Bind the exact provider quarantine latch before admitting native callbacks.
+    pub(crate) fn bind_provider_fence(
+        &self,
+        fence: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        self.provider_fence
+            .set(fence)
+            .map_err(|_| anyhow::anyhow!("provider permission fence already installed"))
+    }
+
+    /// Install the binding-owned native-child authority without replacing an existing owner.
+    pub(crate) fn bind_observed_authority(
+        &self,
+        authority: Arc<dyn ObservedChildAuthority>,
+    ) -> Result<()> {
+        let mut current = self
+            .observed_authority
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native child authority lock poisoned"))?;
+        anyhow::ensure!(
+            current.is_none(),
+            "native child authority already installed"
+        );
+        *current = Some(authority);
+        Ok(())
+    }
+
+    /// Create a distinct child policy context after the binding registry proves its original owner.
+    pub(crate) fn fork_observed(
+        &self,
+        association: &crate::provider::ObservedAgentAssociation,
+        sink: HarnessEventSink,
+    ) -> std::result::Result<Arc<Self>, ProviderError> {
+        let rejected = || {
+            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Authorization,
+            ))
+        };
+        let scope = association.turn().cloned().ok_or_else(rejected)?;
+        let address = crate::provider::TurnAddress {
+            thread_id: association.thread_id().cloned().ok_or_else(rejected)?,
+            turn_id: scope.turn_id().map_err(|_| rejected())?,
+            scope,
+        };
+        let mut state = self.state.lock().map_err(|_| rejected())?.clone();
+        let parent = state
+            .event_sink
+            .as_ref()
+            .and_then(|sink| sink.scope().invocation())
+            .ok_or_else(rejected)?;
+        if parent != association.parent()
+            || parent.owner == address.scope.owner
+            || parent.owner.session_id() != address.scope.owner.session_id()
+            || sink.scope().invocation() != Some(&address.scope)
+            || address.thread_id != address.scope.owner.thread_id()
+        {
+            return Err(rejected());
+        }
+        let captured = state.inheritance.as_ref().ok_or_else(rejected)?;
+        let inherited = self
+            .coordinator
+            .inherit(&address.scope, captured)
+            .map_err(|error| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    error,
+                )
+            })?;
+        state.owner = Some(address.scope.owner.clone());
+        state.execution_kind = crate::provider::ApprovalExecutionKind::NativeObserved;
+        state.event_sink = Some(sink);
+        Ok(Arc::new(Self {
+            coordinator: self.coordinator.clone(),
+            state: StandardMutex::new(state),
+            provider_fence: self.provider_fence.clone(),
+            retired: tokio::sync::watch::channel(false).0,
+            approval_authority: Arc::new(ApprovalAuthority::default()),
+            observed_authority: StandardMutex::new(
+                self.observed_authority
+                    .lock()
+                    .map_err(|_| rejected())?
+                    .clone(),
+            ),
+            inherited_lease: StandardMutex::new(Some(inherited)),
+        }))
+    }
+
+    /// Get the independently retained child's selected-skill attribution observer.
+    pub(crate) fn skill_observer(
+        &self,
+    ) -> std::result::Result<Option<Arc<dyn crate::provider::events::EventObserver>>, ProviderError>
+    {
+        Ok(self
+            .inherited_lease
+            .lock()
+            .map_err(|_| ProviderError::Cancelled)?
+            .as_ref()
+            .and_then(crate::provider::approval::InheritedPermissionLease::skill_observer))
+    }
+
+    /// Get the host-proven original child context while keeping root matching exact.
+    async fn observed_context(
+        &self,
+        parent: &crate::provider::InvocationScope,
+        child: &crate::provider::TurnAddress,
+    ) -> std::result::Result<Arc<Self>, ProviderError> {
+        let authority = self
+            .observed_authority
+            .lock()
+            .map_err(|_| ProviderError::Cancelled)?
+            .clone()
+            .ok_or(ProviderError::Cancelled)?;
+        authority.context(parent, child).await
     }
 
     /// Bind callbacks to the current invocation while retaining its native session directory.
     pub(crate) fn configure(
         &self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         approval_mode: ApprovalMode,
         _workspace: String,
-        event_sink: Option<ProviderEventSink>,
+        event_sink: Option<HarnessEventSink>,
     ) -> Result<()> {
         anyhow::ensure!(
             !*self.retired.borrow(),
@@ -80,13 +222,20 @@ impl ProviderPermissionContext {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?;
+        let inheritance = event_sink
+            .as_ref()
+            .and_then(|sink| sink.scope().invocation())
+            .map(|scope| self.coordinator.capture_inheritance(scope))
+            .transpose()?;
         *state = PermissionState {
             task_authority: None,
             checkpoint: None,
             owner: Some(owner),
             approval_mode,
+            execution_kind: crate::provider::ApprovalExecutionKind::Managed,
             lsp_mutations: false,
             event_sink,
+            inheritance,
         };
         Ok(())
     }
@@ -97,6 +246,10 @@ impl ProviderPermissionContext {
     pub(crate) fn retire(&self) -> Result<()> {
         self.retired.send_replace(true);
         self.approval_authority.retire()?;
+        self.inherited_lease
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native child permission lease lock poisoned"))?
+            .take();
         Ok(())
     }
 
@@ -122,6 +275,38 @@ impl ProviderPermissionContext {
 
 #[async_trait]
 impl ProviderPermissions for ProviderPermissionContext {
+    /// Resolve permission only through the binding-proven independent child context.
+    async fn authorize_observed_child(
+        &self,
+        parent: &crate::provider::InvocationScope,
+        child: &crate::provider::TurnAddress,
+        request: PermissionRequest,
+    ) -> PermissionResponse {
+        match self.observed_context(parent, child).await {
+            Ok(context) => {
+                context
+                    .authorize_request(&child.scope, request, PermissionOrigin::Ordinary)
+                    .await
+            }
+            Err(_) => denied(
+                "Native child permission ownership is unavailable or retired.",
+                None,
+            ),
+        }
+    }
+
+    /// Apply the captured execution barrier under the child's original authority.
+    async fn before_observed_child(
+        &self,
+        parent: &crate::provider::InvocationScope,
+        child: &crate::provider::TurnAddress,
+    ) -> std::result::Result<(), ProviderError> {
+        self.observed_context(parent, child)
+            .await?
+            .before_tool(&child.scope)
+            .await
+    }
+
     async fn before_tool(
         &self,
         scope: &forge_provider_api::InvocationScope,
@@ -135,7 +320,7 @@ impl ProviderPermissions for ProviderPermissionContext {
             .map(|state| state.checkpoint.clone())
             .map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
             })?;
@@ -148,7 +333,7 @@ impl ProviderPermissions for ProviderPermissionContext {
             };
             result.map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
             })?;
@@ -188,23 +373,25 @@ impl ProviderPermissionContext {
         if !self.matches_scope(scope) {
             return denied("Provider session observation was retired.", None);
         }
-        let (approval_mode, event_sink, _owner, task_authority) = match self.state.lock() {
-            Ok(state) => (
-                state.approval_mode,
-                state.event_sink.clone(),
-                state.owner.clone(),
-                state.task_authority.clone(),
-            ),
-            Err(_) => {
-                return denied(
-                    "Automatically rejected because Harness permission context is unavailable.",
-                    None,
-                );
-            }
-        };
+        let (approval_mode, execution_kind, event_sink, _owner, task_authority) =
+            match self.state.lock() {
+                Ok(state) => (
+                    state.approval_mode,
+                    state.execution_kind,
+                    state.event_sink.clone(),
+                    state.owner.clone(),
+                    state.task_authority.clone(),
+                ),
+                Err(_) => {
+                    return denied(
+                        "Automatically rejected because Harness permission context is unavailable.",
+                        None,
+                    );
+                }
+            };
         let deny = |reason: &str| denied(reason, Some(approval_mode));
         if let Some(authority) = &task_authority
-            && let Err(error) = authority.validate_scope()
+            && let Err(error) = authority.validate_task_for_new_request()
         {
             return deny(&format!(
                 "Task authority changed before permission approval: {error:#}"
@@ -311,17 +498,24 @@ impl ProviderPermissionContext {
                 )),
             };
         }
-        match self
-            .coordinator
-            .authorize_scoped(
-                approval_mode,
-                request,
-                None,
-                event_sink.as_ref(),
-                Some(self.approval_authority.clone()),
-            )
-            .await
-        {
+        let approval = self.coordinator.authorize_scoped(
+            approval_mode,
+            request,
+            None,
+            event_sink.as_ref(),
+            Some(self.approval_authority.clone()),
+            execution_kind,
+        );
+        tokio::pin!(approval);
+        let mut retired = self.retired.subscribe();
+        let resolution = tokio::select! {
+            resolution = &mut approval => resolution,
+            _ = async { let _ = retired.wait_for(|retired| *retired).await; } => {
+                let _ = self.coordinator.cancel_owner(&scope.owner, event_sink.as_ref()).await;
+                return deny("Provider session observation was retired while approval was pending.");
+            }
+        };
+        match resolution {
             Ok(
                 ApprovalResolution::AllowOnce
                 | ApprovalResolution::AllowExact
@@ -387,7 +581,7 @@ mod tests {
     async fn retirement_releases_a_callback_waiting_for_checkpoint() -> anyhow::Result<()> {
         let coordinator = PermissionCoordinator::transient(".")?;
         let context = ProviderPermissionContext::new(coordinator);
-        let owner = crate::provider::ExecutionOwner::root("checkpoint-cancel");
+        let owner = crate::provider::ThreadOwner::root("checkpoint-cancel");
         let scope = crate::provider::InvocationScope::new(owner.clone(), "exchange");
         let (sink, _events) = crate::provider::events::channel(scope.clone());
         context.configure(owner, ApprovalMode::Ask, ".".into(), Some(sink))?;
@@ -410,7 +604,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let coordinator = PermissionCoordinator::transient(root.path())?;
         let context = ProviderPermissionContext::new(coordinator.clone());
-        let owner = crate::provider::ExecutionOwner::root("storage-policy");
+        let owner = crate::provider::ThreadOwner::root("storage-policy");
         let scope = crate::provider::InvocationScope::new(owner.clone(), "exchange");
         let (sink, _events) = crate::provider::events::channel(scope.clone());
         context.configure(

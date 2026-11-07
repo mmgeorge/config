@@ -105,7 +105,7 @@ pub struct CompactionResult {
     /// Generated context summary, distinct from the complete retained model context.
     pub summary_content: Option<String>,
     /// Normalized failure information; native diagnostics remain inside the adapter.
-    pub diagnostic: Option<crate::ProviderDiagnostic>,
+    pub error: Option<crate::ProviderFailure>,
     /// Conversation tokens before context replacement.
     pub pre_compaction_tokens: Option<u64>,
     /// Conversation tokens after context replacement.
@@ -162,6 +162,9 @@ impl Compaction {
 
     /// Merge lifecycle replays without moving the row or reopening terminal history.
     pub fn observe(&mut self, mut update: Self, now_ms: i64) {
+        if self.id != update.id || self.thread_id != update.thread_id {
+            return;
+        }
         if !matches!(
             self.state,
             CompactionState::Running | CompactionState::Unconfirmed
@@ -169,8 +172,10 @@ impl Compaction {
             && update.state == CompactionState::Running)
         {
             if self.state == update.state || update.state == CompactionState::Running {
-                update.result.context_tokens_before = self.result.context_tokens_before;
-                update.result.context_tokens_after = self.result.context_tokens_after;
+                if update.state == CompactionState::Running {
+                    update.result.context_tokens_before = self.result.context_tokens_before;
+                    update.result.context_tokens_after = self.result.context_tokens_after;
+                }
                 self.result.retain_missing(update.result);
             }
             return;
@@ -242,17 +247,28 @@ impl CompactionResult {
 mod tests {
     use super::*;
 
-    /// Ignore obsolete native fields when loading history and never publish them again.
+    /// Require typed failures on reload while omitting obsolete native diagnostic metadata.
     #[test]
-    fn legacy_compaction_diagnostics_do_not_escape_on_reload() {
+    fn compaction_diagnostics_require_typed_failure_on_reload() {
+        assert!(
+            serde_json::from_value::<CompactionResult>(serde_json::json!({
+                "error":"private-native-error", "summary_content":"Useful summary"
+            }))
+            .is_err()
+        );
+        let failure = crate::ProviderFailure::new(
+            crate::ProviderOperation::ThreadCompact,
+            crate::ProviderFailureKind::Runtime,
+        );
         let result: CompactionResult = serde_json::from_value(serde_json::json!({
-            "error":"private-native-error", "request_id":"private-request",
+            "error":failure, "request_id":"private-request",
             "service_request_id":"private-service", "status_code":503,
             "checkpoint_path":"private-checkpoint", "checkpoint_number":42,
             "summary_content":"Useful summary"
         }))
         .unwrap();
         assert_eq!(result.summary_content.as_deref(), Some("Useful summary"));
+        assert_eq!(result.error, Some(failure));
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("private-"));
         assert!(!encoded.contains("status_code"));
@@ -318,5 +334,42 @@ mod tests {
         replay.result.context_tokens_before = Some(800);
         start.observe(replay, 700);
         assert_eq!(start.result.context_tokens_before, None);
+    }
+
+    #[test]
+    fn exact_terminal_metadata_refines_unknown_counts_without_retargeting_or_overwriting() {
+        let mut retained = Compaction {
+            id: "operation".into(),
+            thread_id: "original-thread".into(),
+            state: CompactionState::Completed,
+            manual: false,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            result: CompactionResult::default(),
+        };
+        let mut detail = retained.clone();
+        detail.result.context_tokens_before = Some(120_000);
+        detail.result.context_tokens_after = Some(32_000);
+        for (id, thread) in [
+            ("other-operation", "original-thread"),
+            ("operation", "other-thread"),
+        ] {
+            let mut foreign = detail.clone();
+            foreign.id = id.into();
+            foreign.thread_id = thread.into();
+            retained.observe(foreign, 3);
+            assert_eq!(retained.result.context_tokens_before, None);
+            assert_eq!(retained.result.context_tokens_after, None);
+        }
+        retained.observe(detail.clone(), 4);
+        retained.observe(detail.clone(), 5);
+        assert_eq!(retained.result.context_tokens_before, Some(120_000));
+        assert_eq!(retained.result.context_tokens_after, Some(32_000));
+        detail.result.context_tokens_before = Some(900_000);
+        detail.result.context_tokens_after = Some(64_000);
+        retained.observe(detail, 6);
+        assert_eq!(retained.result.context_tokens_before, Some(120_000));
+        assert_eq!(retained.result.context_tokens_after, Some(32_000));
+        assert_eq!(retained.completed_at_ms, Some(2));
     }
 }

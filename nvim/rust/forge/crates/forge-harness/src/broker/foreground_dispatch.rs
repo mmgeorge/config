@@ -40,7 +40,6 @@ pub(crate) struct ForegroundAdmission {
     task_compaction_failure: Option<anyhow::Error>,
     pub(crate) workspace_prepared: bool,
     pub(crate) automatic_check_owner: Option<String>,
-    pub(crate) idle_reopen: bool,
     pub(crate) prior_finalization: Option<prior_finalization::PriorFinalization>,
     prior_checked: bool,
     pub(crate) question_catalog: Option<Vec<crate::provider::ProviderModel>>,
@@ -106,7 +105,7 @@ impl ForegroundDispatch {
         {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::WrongInvocation,
                 ),
             ));
@@ -236,7 +235,6 @@ impl ForegroundDispatch {
                     Ok(ForegroundSignal::SessionObservationsReady)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
                         .finalization
@@ -246,7 +244,6 @@ impl ForegroundDispatch {
                     Ok(ForegroundSignal::FinalizeEffectsRequested)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
                         .finalization
@@ -256,7 +253,6 @@ impl ForegroundDispatch {
                     Ok(ForegroundSignal::FinalizeChecksRequested)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
                         .finalization
@@ -284,13 +280,12 @@ pub(crate) struct QuestionModelCatalogJob {
 pub(crate) struct ProviderPrepareJob {
     cancellation: Arc<TurnCancellationSignal>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
 }
 
-/// Retain the session model until question discussion has completed.
+/// Retain presentation context while a temporary question-model selection is active.
 pub(crate) struct QuestionDiscussion {
     pub(crate) visible_text: String,
-    previous_model: Option<String>,
     previous_usage: Option<crate::session::ContextUsage>,
 }
 
@@ -300,6 +295,8 @@ pub(crate) struct PlanningContext {
     pub(crate) permit: crate::task::TaskPermit,
     pub(crate) before_version: u64,
     pub(crate) discussion: bool,
+    /// True when the turn configures project checks before planning can start.
+    pub(crate) configures_checks: bool,
 }
 
 /// Retain the clarification owner for post-turn continuation.
@@ -499,6 +496,10 @@ impl HarnessBroker {
             method: "session.prompt.submit".into(),
             params: json!({"text":text}),
         };
+        let mut request = request;
+        if let Some((document, token)) = &self.prompt_admission {
+            request.params["_prompt_admission"] = json!({"document":document,"token":token});
+        }
         let mut dispatch = self.begin_foreground_dispatch(request, sink)?;
         let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
             unreachable!()
@@ -513,7 +514,7 @@ impl HarnessBroker {
                 .task_controller
                 .current()?
                 .context("planning requires an active task")?;
-            admission.planning = Some(self.capture_planning_context(&task)?);
+            admission.planning = self.planning_context(&task, mode)?;
         }
         admission.phase = AdmissionPhase::Prepared;
         Ok(dispatch)
@@ -575,7 +576,7 @@ impl HarnessBroker {
                     clarification,
                     planning,
                 } => {
-                    let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+                    let owner = crate::provider::ThreadOwner::root(&self.session.id);
                     let engine = self
                         .execution_registry()
                         .existing_owner(&owner)?
@@ -677,7 +678,7 @@ impl HarnessBroker {
         ProviderPrepareJob {
             cancellation: self.turn_cancellation.capture(),
             registry,
-            owner: crate::provider::ExecutionOwner::root(&self.session.id),
+            owner: crate::provider::ThreadOwner::root(&self.session.id),
         }
     }
 
@@ -776,7 +777,6 @@ impl HarnessBroker {
         };
         let discussion = QuestionDiscussion {
             visible_text,
-            previous_model: self.session.resolved_model.clone(),
             previous_usage: self.session.context_usage.clone(),
         };
         self.question_model = Some(selected);
@@ -784,14 +784,14 @@ impl HarnessBroker {
         Ok(Some(discussion))
     }
 
-    /// Restore session model state after the question interaction settles.
+    /// Restore requested-model inheritance while leaving actual execution model unconfirmed.
     pub(crate) fn finish_question_discussion(
         &mut self,
         discussion: QuestionDiscussion,
     ) -> Result<()> {
         self.question_discussion = false;
         self.question_model = None;
-        self.session.resolved_model = discussion.previous_model;
+        self.session.resolved_model = None;
         self.session.context_usage = discussion.previous_usage;
         self.save_session()
     }
@@ -1160,7 +1160,6 @@ impl HarnessBroker {
                 planning: None,
                 reset_check_setup: false,
                 automatic_check_owner: None,
-                idle_reopen: false,
                 events: Vec::new(),
                 staged_interaction: None,
                 local_interaction: None,
@@ -1272,7 +1271,7 @@ impl HarnessBroker {
             configuration.apply(&self.session, &mut request);
         }
         request.submission = Some(staged.submission.clone());
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+        let owner = crate::provider::ThreadOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
             match &mut request.input {
                 ProviderInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
@@ -1429,10 +1428,8 @@ impl HarnessBroker {
             Some(crate::task::WorkflowSnapshot::Goal { .. }) => PromptMode::GoalContinuation,
             None => PromptMode::Chat,
         };
-        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-            admission.planning = Some(self.capture_planning_context(
-                task.as_ref().context("question plan owner is missing")?,
-            )?);
+        if let Some(task) = task.as_ref() {
+            admission.planning = self.planning_context(task, mode)?;
         }
 
         // The explicit recorded answer authorizes continuation; a late native event does not.
@@ -1563,9 +1560,7 @@ impl HarnessBroker {
                 _ if task.kind() == crate::task::TaskKind::Execute => PromptMode::ExecutePlan,
                 _ => PromptMode::GoalContinuation,
             };
-            if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-                admission.planning = Some(self.capture_planning_context(&task)?);
-            }
+            admission.planning = self.planning_context(&task, mode)?;
             return self.stage_foreground_interaction(
                 &text,
                 mode,
@@ -1632,6 +1627,9 @@ impl HarnessBroker {
             self.check_setup = true;
             admission.reset_check_setup = true;
             let prompt = PlanPrompt::checks_setup(&plan.request);
+            if let Some(task) = self.task_controller.current()? {
+                admission.planning = self.planning_context(&task, PromptMode::Chat)?;
+            }
             return self.stage_foreground_interaction(
                 &prompt,
                 PromptMode::Chat,
@@ -1658,7 +1656,7 @@ impl HarnessBroker {
                 .task_controller
                 .current()?
                 .context("planning requires an active task")?;
-            admission.planning = Some(self.capture_planning_context(&task)?);
+            admission.planning = self.planning_context(&task, mode)?;
         }
         let prompt = match active_plan.as_ref() {
             Some(plan) if !plan.working_path.is_empty() => {
@@ -1937,7 +1935,7 @@ impl TaskCompactionJob {
     pub(crate) async fn run(
         self,
     ) -> Result<crate::provider::Compaction, crate::provider::ProviderError> {
-        self.provider.session_compact(self.request).await
+        self.provider.thread_compact(self.request).await
     }
 }
 
@@ -2012,11 +2010,10 @@ impl HarnessBroker {
             Ok(evidence) => evidence,
             Err(error) => {
                 state.compaction.state = crate::provider::CompactionState::Failed;
-                state.compaction.result.diagnostic =
-                    Some(crate::provider::lifecycle_error::diagnostic(
-                        forge_provider_api::ProviderOperation::SessionCompact,
-                        &error,
-                    ));
+                state.compaction.result.error = Some(crate::provider::lifecycle_error::diagnostic(
+                    forge_provider_api::ProviderOperation::ThreadCompact,
+                    &error,
+                ));
                 state.record.detail = SessionEventKind::Compaction {
                     compaction: state.compaction.into(),
                 };
@@ -2106,24 +2103,33 @@ impl HarnessBroker {
 }
 
 impl HarnessBroker {
-    pub(super) fn capture_planning_context(
+    /// Capture planning postprocessing evidence for a planning, plan-discussion, or check-setup
+    /// turn of a Plan task. Check setup runs in Chat mode, yet its completion must still advance
+    /// the retained plan, so setup turns carry their starting configuration digest.
+    pub(super) fn planning_context(
         &self,
         task: &crate::task::Task,
-    ) -> Result<PlanningContext> {
+        mode: PromptMode,
+    ) -> Result<Option<PlanningContext>> {
         let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else {
-            anyhow::bail!("planning requires a Plan task");
+            return Ok(None);
         };
+        let configures_checks = plan.artifact.state == PlanState::ConfiguringChecks;
+        if !configures_checks && !matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
+            return Ok(None);
+        }
         let plan_id = plan.artifact.id.clone();
         let before_version = self
             .plan_file
             .read_working_document(&self.session.id, &plan_id)?
             .version;
-        Ok(PlanningContext {
+        Ok(Some(PlanningContext {
             plan_id,
             permit: task.permit(),
             before_version,
             discussion: plan.artifact.state == PlanState::AwaitingReview,
-        })
+            configures_checks,
+        }))
     }
 }
 
@@ -2153,7 +2159,7 @@ impl HarnessBroker {
             &self.session.id,
             "lua.rpc.received",
             json!({
-                "id": request.id, "method": request.method, "params": request.params.clone(),
+                "request_id": request.id, "method": request.method, "params": request.params.clone(),
             }),
         );
         self.record_plan_trace(
@@ -2176,7 +2182,7 @@ impl HarnessBroker {
                 &self.session.id,
                 "lua.rpc.failed",
                 json!({
-                    "id": id, "code": failure.code, "error": failure.message, "event": result.event,
+                    "request_id": id, "code": failure.code, "error": failure.message, "event": result.event,
                 }),
             );
         } else {
@@ -2184,7 +2190,7 @@ impl HarnessBroker {
                 &self.session.id,
                 "lua.rpc.completed",
                 json!({
-                    "id": id, "response": result.response, "event": result.event,
+                    "request_id": id, "response": result.response, "event": result.event,
                 }),
             );
             self.record_plan_trace(
@@ -2198,21 +2204,13 @@ impl HarnessBroker {
         if error.is::<TurnRetracted>() {
             return;
         }
-        let code = if error.is::<RequestNotAdmitted>() {
-            "not_admitted"
-        } else if error.is::<TurnCancelled>() {
-            "turn_cancelled"
-        } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
-            "tool_timeout"
-        } else {
-            "request_failed"
-        };
+        let code = super::request_failure_code(error);
         self.record_plan_trace("request_failed", json!({ "request_id": id, "code": code }));
         self.trace.record(
             &self.session.id,
             "lua.rpc.failed",
             json!({
-                "id": id, "code": code, "error": format!("{error:#}"), "event": [],
+                "request_id": id, "code": code, "error": format!("{error:#}"), "event": [],
             }),
         );
     }
@@ -2224,7 +2222,7 @@ impl HarnessBroker {
         &mut self,
         sink: publication::SessionUpdateSink,
     ) -> Result<(Option<ForegroundDispatch>, PendingProviderDelivery)> {
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+        let owner = crate::provider::ThreadOwner::root(&self.session.id);
         let feedback = self.permission_coordinator.take_timeout_feedback(&owner)?;
         let mut dispatch = None;
         if let Some(feedback) = feedback {
@@ -2368,7 +2366,7 @@ mod tests {
         let data = tempfile::tempdir()?;
         let mut broker =
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+        let owner = crate::provider::ThreadOwner::root(&broker.session.id);
         let engine = broker.execution_registry().owner(owner.clone()).await?;
         let mut original = broker.stage_foreground_interaction(
             "Retain this exchange",
@@ -2419,6 +2417,35 @@ mod tests {
         }
         engine.close().await?;
         broker.provider.shutdown().await?;
+        Ok(())
+    }
+    /// Restoring configured model inheritance cannot assert a model from an earlier execution.
+    #[test]
+    fn finished_question_discussion_clears_actual_model_without_changing_requested_model()
+    -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let configured = broker.session.model.clone();
+        broker.session.resolved_model = Some("discussion-actual".into());
+        broker.question_discussion = true;
+        broker.finish_question_discussion(QuestionDiscussion {
+            visible_text: "Question discussion".into(),
+            previous_usage: None,
+        })?;
+        assert_eq!(broker.session.model, configured);
+        assert!(broker.session.resolved_model.is_none());
+        assert!(!broker.question_discussion);
+        assert!(broker.question_model.is_none());
+        assert!(
+            broker
+                .store
+                .load_session(&broker.session.id)?
+                .unwrap()
+                .resolved_model
+                .is_none()
+        );
         Ok(())
     }
 }

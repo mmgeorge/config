@@ -45,23 +45,29 @@ async fn timed_out_finish_keeps_worker_accounted_and_requests_cancellation() {
     let pool = BlockingReadPool::new(1).unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = mpsc::channel();
+    let (cancellation_sender, cancellation_receiver) = mpsc::channel();
     let task = pool
         .submit(4, move |cancellation| {
             started.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(cancellation.is_requested());
+            wait.recv().unwrap();
+            // Report to the test thread: a worker panic is invisible once its waiter drops.
+            cancellation_sender
+                .send(cancellation.is_requested())
+                .unwrap();
             Ok(())
         })
         .unwrap();
     ready.await.unwrap();
+    // An already-expired timeout polls `finish` once while the worker is blocked, then drops it.
     assert!(
-        tokio::time::timeout(Duration::from_millis(5), task.finish())
+        tokio::time::timeout(Duration::ZERO, task.finish())
             .await
             .is_err()
     );
     assert_eq!(pool.status().active_jobs, 1);
     assert_eq!(pool.status().reserved_input_bytes, 4);
     release.send(()).unwrap();
+    assert!(cancellation_receiver.recv().unwrap());
     assert!(
         pool.shutdown(Duration::from_secs(2))
             .await

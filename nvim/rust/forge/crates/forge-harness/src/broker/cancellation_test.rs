@@ -18,7 +18,7 @@ async fn cancellation_signal_remains_bound_to_its_invocation() {
     first.cancelled().await;
     second.cancelled().await;
 }
-use crate::provider::{ProviderCompletion, TurnUpdate};
+use crate::provider::{ProviderCompletion, TurnEvent};
 use crate::turn::{ToolState, TurnOutcome, TurnState};
 use futures_util::FutureExt;
 use std::sync::atomic::AtomicUsize;
@@ -54,7 +54,7 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
         broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
         let engine = broker
             .execution_registry()
-            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .owner(crate::provider::ThreadOwner::root(&broker.session.id))
             .await?;
         let mut transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
         // Replace the never-polled submission with accepted observation fixtures, retaining its real host owner.
@@ -76,13 +76,14 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
         transaction.execution_open = false;
         transaction.agent_revision.borrow_and_update();
         let turn = crate::provider::TurnAddress {
+            thread_id: (scope).owner.thread_id(),
+            turn_id: (scope).turn_id().unwrap(),
             scope,
-            thread_id: "prefix-thread".into(),
-            turn_id: "prefix-turn".into(),
         };
         let mut frames = vec![ProviderEvent::Turn {
-            address: turn.clone(),
-            update: TurnUpdate::Started { started_at_ms: 1 },
+            thread_id: (turn.clone()).thread_id.clone(),
+            turn_id: (turn.clone()).turn_id.clone(),
+            event: TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 1 }),
         }];
         let mut expected = String::new();
         // Keep the native-channel prefix non-coalescible so it fills the same staging budget.
@@ -92,49 +93,87 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
             frames.extend(crate::provider::test_support::message(
                 &turn,
                 format!("prefix-{index}"),
-                Some(crate::provider::MessageRole::Response),
+                Some(crate::provider::TestMessageContent::Response),
                 text,
             ));
         }
-        let message = crate::provider::MessageAddress {
-            turn: turn.clone(),
-            message_id: crate::provider::MessageId::Native("streamed-prefix".into()),
-        };
-        frames.push(ProviderEvent::Message {
-            address: message.clone(),
-            update: crate::provider::MessageUpdate::Started {
-                classification: forge_provider_api::message::MessageClassification::Known(
-                    crate::provider::MessageRole::Response,
+        let message = (
+            turn.clone(),
+            forge_provider_api::ItemId::new("streamed-prefix").unwrap(),
+        );
+        frames.push(ProviderEvent::Item {
+            thread_id: (message.clone()).0.thread_id.clone(),
+            turn_id: (message.clone()).0.turn_id.clone(),
+            item_id: (message.clone()).1.clone(),
+            event: forge_provider_api::ItemEvent::Started(
+                forge_provider_api::ItemStart::AgentMessage(
+                    forge_provider_api::AgentMessageStart {
+                        text: "stream:\n".into(),
+                        classification: forge_provider_api::message::MessageClassification::Known(
+                            forge_provider_api::AgentMessageRole::Response,
+                        ),
+                    },
                 ),
-                text: "stream:\n".into(),
-            },
+            ),
         });
         let mut streamed = String::from("stream:\n");
         for index in 0..(forge_protocol::MAX_PENDING_FRAMES - 64) {
             let text = format!("frame-{index:03}: α🦀\n");
             streamed.push_str(&text);
-            frames.push(ProviderEvent::Message {
-                address: message.clone(),
-                update: crate::provider::MessageUpdate::Delta { text },
+            frames.push(ProviderEvent::Item {
+                thread_id: (message.clone()).0.thread_id.clone(),
+                turn_id: (message.clone()).0.turn_id.clone(),
+                item_id: (message.clone()).1.clone(),
+                event: forge_provider_api::ItemEvent::Message {
+                    event: forge_provider_api::MessageItemEvent::Delta(text),
+                },
             });
         }
-        frames.push(ProviderEvent::Message {
-            address: message,
-            update: crate::provider::MessageUpdate::Completed {
-                text: streamed.clone(),
-            },
+        frames.push(ProviderEvent::Item {
+            thread_id: (message).0.thread_id.clone(),
+            turn_id: (message).0.turn_id.clone(),
+            item_id: (message).1.clone(),
+            event: forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::AgentMessage(
+                    forge_provider_api::MessageCompletion {
+                        text: streamed.clone(),
+                        outcome: forge_provider_api::MessageOutcome::Completed,
+                    },
+                ),
+            ),
         });
         frames.push(ProviderEvent::Turn {
-            address: turn.clone(),
-            update: TurnUpdate::Finished {
-                outcome: TurnOutcome::Completed,
-                completed_at_ms: 2,
-            },
+            thread_id: (turn.clone()).thread_id.clone(),
+            turn_id: (turn.clone()).turn_id.clone(),
+            event: forge_provider_api::TurnEvent::Completed(
+                crate::provider::test_support::completed_turn(
+                    (turn.clone()).scope.clone(),
+                    forge_provider_api::TurnResult::new(
+                        TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        2,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         });
         expected.push_str(&streamed);
-        transaction
-            .pending_session_observations
-            .extend(frames[..64].iter().cloned());
+        let frames: Vec<_> = frames
+            .into_iter()
+            .map(|event| crate::provider::test_support::native_event(turn.scope.clone(), event))
+            .collect();
+        transaction.pending_session_observations.extend(
+            frames[..64]
+                .iter()
+                .cloned()
+                .map(crate::provider::session_execution::OwnerObservation::Event),
+        );
         for event in &frames[64..160] {
             native.send(event.clone())?;
         }
@@ -198,7 +237,10 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
                                 .context("missing native turn")?
                                 .state(),
                             TurnState::Finished {
-                                outcome: TurnOutcome::Completed
+                                outcome: TurnOutcome::Completed {
+                                    stop_reason:
+                                        forge_provider_api::turn::TurnCompletionReason::Normal
+                                }
                             }
                         );
                         break;
@@ -260,196 +302,221 @@ fn cancellation_fixture(
     .expect("fixture provider is registered");
     crate::provider::test_support::EventFixtureProvider::new(
         descriptor,
-        move |request, sink, mut cancelled| {
+        move |request, sink, start, mut cancelled| {
             let stats = stats.clone();
             async move {
+                let native_outcome;
+                let native_completed_at_ms;
+                start.observed(0).await?;
+
                 // Match native adapters: await the host checkpoint before producing turn/tool work.
                 request.turn_control.before_send(&request.scope).await?;
                 let call = stats.calls.fetch_add(1, Ordering::SeqCst);
                 let turn = crate::provider::TurnAddress {
+                    thread_id: (request.scope.clone()).owner.thread_id(),
+                    turn_id: (request.scope.clone()).turn_id().unwrap(),
                     scope: request.scope.clone(),
-                    thread_id: "fixture-thread".into(),
-                    turn_id: format!("fixture-turn-{call}").into(),
                 };
-                let completion = forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some(
-                        "fixture-thread"
-                            .to_owned()
-                            .try_into()
-                            .expect("fixture ID is valid"),
-                    ),
-                    capability: crate::provider::test_support::fixture_capability(),
-                    ..Default::default()
-                };
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        request.scope.clone(),
-                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                            address: turn.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(ProviderEvent::Turn {
-                    address: turn.clone(),
-                    update: TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                if let Some(history) = Some(
+                    "fixture-thread"
+                        .to_owned()
+                        .try_into()
+                        .expect("fixture ID is valid"),
+                ) {
+                    sink.send_wait(forge_provider_api::AdapterActivity::Thread {
+                        thread_id: request.thread_id.clone(),
+                        event: forge_provider_api::ThreadEvent::IdentityResolved(history),
+                    })
+                    .await?;
+                }
+
                 if call > 0 {
                     for event in crate::provider::test_support::message(
                         &turn,
                         "recovered",
-                        Some(crate::provider::MessageRole::Response),
+                        Some(crate::provider::TestMessageContent::Response),
                         "AFTER-CANCEL-OK",
                     ) {
-                        sink.send_wait(event).await?;
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
                     }
-                    let result = forge_provider_api::lifecycle::ExecutionResult::Completed {
-                        completion: completion.clone().into(),
+
+                    native_outcome = TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     };
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: turn.clone(),
-                        update: TurnUpdate::Finished {
-                            outcome: TurnOutcome::Completed,
-                            completed_at_ms: 5,
-                        },
-                    })
-                    .await?;
+                    native_completed_at_ms = 5;
                     request
                         .host_effects
                         .settle_foreground(sink.binding_id(), &request.scope)
                         .await
                         .map_err(|_| {
                             ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 forge_provider_api::ProviderFailureKind::Runtime,
                             ))
                         })?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            request.scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                address: turn,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 5,
-                                result,
-                            },
-                        )?,
-                    })
-                    .await?;
-                    return Ok(());
+
+                    return Ok(forge_provider_api::TurnResult::new(
+                        native_outcome,
+                        native_completed_at_ms,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"));
                 }
-                let tool = crate::provider::ToolAddress {
-                    turn: turn.clone(),
-                    tool_id: "denied-native-command".into(),
-                };
+                let tool = (
+                    turn.clone(),
+                    forge_provider_api::ItemId::new("denied-native-command").unwrap(),
+                );
                 for update in [
-                    crate::provider::ToolUpdate::Requested {
-                        invocation: crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::ToolCall,
-                            name: "shell".into(),
-                            title: "Denied fixture command".into(),
-                            arguments: json!({"command":"write denied"}),
-                        },
+                    forge_provider_api::ItemEvent::Started(
+                        forge_provider_api::ItemStart::ToolCall(
+                            forge_provider_api::ToolDescriptor {
+                                semantics: Default::default(),
+                                name: "shell".into(),
+                                title: "Denied fixture command".into(),
+                                arguments: forge_provider_api::InspectableArguments::new(
+                                    json!({"command":"write denied"}),
+                                ),
+                            },
+                        ),
+                    ),
+                    forge_provider_api::ItemEvent::Tool {
+                        event: forge_provider_api::ToolItemEvent::ExecutionStarted,
                     },
-                    crate::provider::ToolUpdate::Started,
                 ] {
-                    sink.send_wait(ProviderEvent::Tool {
-                        address: tool.clone(),
-                        update,
+                    sink.send_wait(forge_provider_api::AdapterActivity::Item {
+                        thread_id: turn.thread_id.clone(),
+                        turn_id: turn.turn_id.clone(),
+                        item_id: tool.1.clone(),
+                        event: update,
                     })
                     .await?;
                 }
                 if matches!(failure, ProviderFailure::Stalled) {
+                    // Keep producing output so only the original deadline, not idleness, can stop it.
+                    let tool_event = |event| forge_provider_api::AdapterActivity::Item {
+                        thread_id: tool.0.thread_id.clone(),
+                        turn_id: tool.0.turn_id.clone(),
+                        item_id: tool.1.clone(),
+                        event,
+                    };
                     loop {
                         tokio::select! {
                             changed = cancelled.changed() => {
                                 if changed.is_ok() && *cancelled.borrow() {
                                     stats.cancellations.fetch_add(1, Ordering::SeqCst);
-                                    sink.send_wait(ProviderEvent::Tool { address: tool.clone(), update: crate::provider::ToolUpdate::Finished {
-                                        outcome: crate::provider::ToolOutcome::Failed { diagnostic: crate::provider::ToolDiagnostic {
-                                            kind: forge_provider_api::ProviderFailureKind::Timeout,
-                                            message: forge_provider_api::diagnostic::SanitizedMessage::new("fixture tool timed out").expect("static diagnostic is valid"),
-                                        } },
-                                    }}).await?;
+                                    let completion = forge_provider_api::ToolCompletion {
+                                        outcome: crate::provider::ToolOutcome::Failed {
+                                            diagnostic: forge_provider_api::ToolDiagnostic {
+                                                kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                                message: forge_provider_api::diagnostic::SanitizedMessage::new("fixture tool timed out").expect("static diagnostic is valid"),
+                                            },
+                                        },
+                                        descriptor: None,
+                                        output: None,
+                                        changes: Default::default(),
+                                    };
+                                    sink.send_wait(tool_event(forge_provider_api::ItemEvent::Completed(
+                                        forge_provider_api::ItemCompletion::ToolCall(completion),
+                                    ))).await?;
                                     break;
                                 }
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                                sink.send_wait(ProviderEvent::Tool { address: tool.clone(), update: crate::provider::ToolUpdate::Output {
-                                    update: crate::provider::TextUpdate::Append("still running\n".into()),
-                                }}).await?;
+                                sink.send_wait(tool_event(forge_provider_api::ItemEvent::Tool {
+                                    event: forge_provider_api::ToolItemEvent::Output(
+                                        crate::provider::TextUpdate::Append("still running\n".into()),
+                                    ),
+                                })).await?;
                             }
                         }
                     }
-                } else {
-                    sink.send_wait(ProviderEvent::Tool {
-                        address: tool,
-                        update: crate::provider::ToolUpdate::Finished {
-                            outcome: crate::provider::ToolOutcome::Denied {
-                                reason: forge_provider_api::diagnostic::SanitizedMessage::new(
-                                    "workspace policy",
-                                )
-                                .expect("static denial is nonempty"),
-                            },
-                        },
-                    })
-                    .await?;
+                    request
+                        .host_effects
+                        .settle_foreground(sink.binding_id(), &request.scope)
+                        .await
+                        .map_err(|_| {
+                            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::TurnStart,
+                                forge_provider_api::ProviderFailureKind::Runtime,
+                            ))
+                        })?;
+                    return Ok(forge_provider_api::TurnResult::new(
+                        TurnOutcome::Interrupted,
+                        4,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"));
                 }
-                let outcome = match failure {
-                    ProviderFailure::Cancelled => TurnOutcome::Cancelled,
-                    ProviderFailure::SimilarMessage | ProviderFailure::Stalled => {
-                        TurnOutcome::Failed
-                    }
-                };
-                sink.send_wait(ProviderEvent::Turn {
-                    address: turn.clone(),
-                    update: TurnUpdate::Finished {
-                        outcome,
-                        completed_at_ms: 4,
-                    },
-                })
-                .await?;
-                let result = if outcome == TurnOutcome::Cancelled {
-                    forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                        completion: completion.into(),
-                    }
-                } else {
-                    forge_provider_api::lifecycle::ExecutionResult::Failed {
-                        completion: completion.into(),
-                        failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
-                            kind: if matches!(failure, ProviderFailure::Stalled) {
-                                forge_provider_api::ProviderFailureKind::Timeout
-                            } else {
-                                forge_provider_api::ProviderFailureKind::Unknown
-                            },
+                sink.send_wait(crate::provider::test_support::activity(
+                    ProviderEvent::Item {
+                        thread_id: (tool).0.thread_id.clone(),
+                        turn_id: (tool).0.turn_id.clone(),
+                        item_id: (tool).1.clone(),
+                        event: {
+                            let completion = forge_provider_api::ToolCompletion {
+                                outcome: crate::provider::ToolOutcome::Denied {
+                                    reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                        "workspace policy",
+                                    )
+                                    .expect("static denial is nonempty"),
+                                },
+                                descriptor: None,
+                                output: None,
+                                changes: Default::default(),
+                            };
+                            forge_provider_api::ItemEvent::Completed(
+                                forge_provider_api::ItemCompletion::ToolCall(completion),
+                            )
                         },
+                    },
+                )?)
+                .await?;
+                let outcome = match failure {
+                    ProviderFailure::Cancelled | ProviderFailure::Stalled => {
+                        TurnOutcome::Interrupted
                     }
+                    ProviderFailure::SimilarMessage => TurnOutcome::Failed {
+                        error: forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Unknown,
+                        )
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Observation,
+                            forge_provider_api::FailureDisposition::Uncertain,
+                        ),
+                        retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+                    },
                 };
+                native_outcome = outcome;
+                native_completed_at_ms = 4;
+
                 request
                     .host_effects
                     .settle_foreground(sink.binding_id(), &request.scope)
                     .await
                     .map_err(|_| {
                         ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Runtime,
                         ))
                     })?;
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        request.scope.clone(),
-                        forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                            address: turn,
-                            covered_submissions: vec![request.submission_id],
-                            completed_at_ms: 4,
-                            result,
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+
+                Ok(forge_provider_api::TurnResult::new(
+                    native_outcome,
+                    native_completed_at_ms,
+                    None,
+                    request.input_coverage(),
+                    Vec::new(),
+                    None,
+                )
+                .expect("fixture native coverage is valid"))
             }
         },
     )
@@ -467,6 +534,10 @@ async fn provider_failure_named_cancelled_remains_failed() -> Result<()> {
 }
 
 /// Stop a noisy shell command at its deadline, persist failure, and keep the next prompt usable.
+///
+/// The hour-long deadline never elapses during the test. Once the watchdog arms it, the test
+/// forces the watchdog's expiry path, because broker dispatch depends on timers that stall
+/// under a paused clock.
 #[tokio::test]
 async fn shell_timeout_stops_execution_without_replaying_the_command() -> Result<()> {
     tokio::time::timeout(
@@ -484,8 +555,9 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     if matches!(failure, ProviderFailure::Stalled) {
         broker.session.tool_timeout = crate::session::InputTimeout {
             amount: 1,
-            unit: crate::session::TimeoutUnit::S,
+            unit: crate::session::TimeoutUnit::H,
         };
+        broker.trace.configure(true)?;
     }
     let stats = Arc::new(CancellationFixtureStats {
         calls: Arc::new(AtomicUsize::new(0)),
@@ -495,13 +567,27 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     broker.provider = fixture.provider_handle();
     broker.turn_cancellation.arm();
-    let result = broker
-        .dispatch(Request {
+    let session_events = broker.observer.session_events();
+    let expire_stalled_tool = async {
+        if !matches!(failure, ProviderFailure::Stalled) {
+            return Ok::<_, anyhow::Error>(());
+        }
+        // The deadline arms when the broker observes the started tool, not when the fixture
+        // sends it, so force expiry only after a watchdog holds the deadline.
+        while session_events.expire_running_tool_deadlines()? == 0 {
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    };
+    let (result, expired) = tokio::join!(
+        broker.dispatch(Request {
             id: 1,
             method: "session.prompt.submit".into(),
             params: json!({"text":"Attempt the native command"}),
-        })
-        .await;
+        }),
+        expire_stalled_tool,
+    );
+    expired?;
     let expected = match failure {
         ProviderFailure::Cancelled => ExchangeState::Cancelled,
         ProviderFailure::SimilarMessage | ProviderFailure::Stalled => ExchangeState::Failed,
@@ -535,8 +621,18 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         result.response.error()
     );
     let expected_turn = match failure {
-        ProviderFailure::Cancelled => TurnOutcome::Cancelled,
-        ProviderFailure::SimilarMessage | ProviderFailure::Stalled => TurnOutcome::Failed,
+        ProviderFailure::Cancelled | ProviderFailure::Stalled => TurnOutcome::Interrupted,
+        ProviderFailure::SimilarMessage => TurnOutcome::Failed {
+            error: forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Unknown,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+        },
     };
     assert_eq!(
         exchange.turn[0].state(),
@@ -552,7 +648,35 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     assert_eq!(tool.id, "denied-native-command");
     if matches!(failure, ProviderFailure::Stalled) {
         assert_eq!(tool.state(), ToolState::Failed);
-        assert!(stats.cancellations.load(Ordering::SeqCst) > 0);
+        assert_eq!(stats.cancellations.load(Ordering::SeqCst), 1);
+        // The foreground alone collects the timed-out turn: it classifies the failure, stops the
+        // exchange through its scope, and joins native work before settling the exchange as failed.
+        broker.trace.flush()?;
+        let trace = std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)?;
+        let collection: Vec<String> = trace
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| match record["event"].as_str()? {
+                "exchange.foreground.failure_classified" => Some(format!(
+                    "classified:{}",
+                    record["payload"]["error_code"].as_str()?
+                )),
+                "foreground.cleanup" => {
+                    Some(format!("cleanup:{}", record["payload"]["phase"].as_str()?))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            collection,
+            [
+                "classified:foreground_failure",
+                "cleanup:engine_close_started",
+                "cleanup:engine_closed",
+                "cleanup:native_joined",
+            ],
+            "timeout collection order: {collection:?}"
+        );
     } else {
         assert_eq!(tool.state(), ToolState::Denied);
     }
@@ -623,7 +747,7 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
     let engine = broker
         .execution_registry()
-        .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+        .owner(crate::provider::ThreadOwner::root(&broker.session.id))
         .await?;
     let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
     assert!(
@@ -659,7 +783,7 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
     for succeeds in [true, false] {
         let cancellation = Arc::new(TurnCancellation::new());
         let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("collected"),
+            crate::provider::ThreadOwner::root("collected"),
             "exchange",
         );
         let (_sink, events) = crate::provider::events::channel(scope);
@@ -680,7 +804,7 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
                 } else {
                     Err(crate::provider::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ),
                     ))
@@ -688,7 +812,7 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
             },
             cancellation.capture(),
             watchdog,
-        );
+        )?;
         native.authorize_submission();
         started.notified().await;
         cancellation.request();
@@ -715,7 +839,7 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
 async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream() -> Result<()> {
     let cancellation = TurnCancellation::new();
     let scope = crate::provider::InvocationScope::new(
-        crate::provider::ExecutionOwner::root("cancelled-refresh"),
+        crate::provider::ThreadOwner::root("cancelled-refresh"),
         "exchange",
     );
     let (sink, events) = crate::provider::events::channel(scope.clone());
@@ -727,7 +851,7 @@ async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream()
         async { Ok(17u32) },
         cancellation.capture(),
         watchdog,
-    );
+    )?;
     native.authorize_submission();
     assert!(matches!(
         native.next_collected().await?,
@@ -747,14 +871,14 @@ async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream()
         native.has_dispatched_task(),
         "cancellation discarded the retained readiness refresh"
     );
-    sink.send(ProviderEvent::Turn {
-        address: crate::provider::TurnAddress {
-            scope,
-            thread_id: "refresh-thread".into(),
-            turn_id: "refresh-turn".into(),
+    sink.send(crate::provider::test_support::native_event(
+        scope.clone(),
+        ProviderEvent::Turn {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            event: TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 1 }),
         },
-        update: TurnUpdate::Started { started_at_ms: 1 },
-    })?;
+    ))?;
     assert!(
         matches!(
             native.next_collected().await?,
@@ -791,7 +915,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
         let engine = broker
             .execution_registry()
-            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .owner(crate::provider::ThreadOwner::root(&broker.session.id))
             .await?;
         let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
         transaction.scan_enabled = false;
@@ -810,7 +934,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
             } else {
                 Err(ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Rejected,
                     ),
                 ))

@@ -1,13 +1,13 @@
 use super::*;
 use crate::provider::{HostEffectBatch, InvocationScope, LiveHostEffectSender, ProviderError};
-use forge_provider_api::{ExecutionOwner, control::ToolCallId};
+use forge_provider_api::{ThreadOwner, control::ToolCallId};
 
 /// Closing admission resolves queued callbacks without handing any mutation to the owner.
 #[tokio::test]
 async fn closed_admission_rejects_queued_callback_without_commit()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, mut requests) = LiveHostEffectSender::channel();
-    let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
+    let scope = InvocationScope::new(ThreadOwner::root("session"), "exchange");
     let callback = sender.commit(
         scope,
         ToolCallId::new("queued-call")?,
@@ -33,7 +33,7 @@ async fn closed_admission_rejects_queued_callback_without_commit()
 async fn closing_admission_preserves_started_callback_settlement()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, mut requests) = LiveHostEffectSender::channel();
-    let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
+    let scope = InvocationScope::new(ThreadOwner::root("session"), "exchange");
     let first_id = ToolCallId::new("started-call")?;
     let first = sender.commit(
         scope.clone(),

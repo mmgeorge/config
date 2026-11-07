@@ -9,7 +9,7 @@ input.attach(state, function() end)
 requests[1].callback({ revision = 0, suspended = false, messages = {} })
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 local context = { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
-for _, scenario in ipairs({ { newer = false }, { newer = true }, { newer = false, late = true }, { newer = true, late = true } }) do
+for _, scenario in ipairs({ { newer = false }, { newer = true }, { newer = false, late = true }, { newer = true, late = true }, { newer = false, claimed = true } }) do
   local newer_draft = scenario.newer
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Cancel this prompt" })
   submission.start(state, { context = context }, function() end)
@@ -20,9 +20,16 @@ for _, scenario in ipairs({ { newer = false }, { newer = true }, { newer = false
   request.callback({ operation_id = request.spec.params.id, revision = revision,
     suspended = false, upsert = { message }, removed = {} })
   if newer_draft then vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Newer unsent draft" }) end
+  if scenario.claimed then
+    -- The foreground claims and accepts the submission before the user cancels it.
+    local accepted = vim.tbl_extend("force", message, { delivery = "accepted" })
+    input.receive(state, { revision = revision + 1, suspended = false, upsert = { accepted }, removed = {} })
+    input.receive(state, { revision = revision + 2, suspended = false, upsert = {}, removed = { message.id } })
+    revision = revision + 2
+  end
   local count = #requests
   local cancellation = { revision = revision + 1, suspended = true,
-    upsert = {}, removed = { message.id }, retracted = message.id }
+    upsert = {}, removed = scenario.claimed and {} or { message.id }, retracted = message.id }
   if scenario.late then
     input.receive(state, { revision = revision + 2,
       snapshot = { revision = revision + 2, control_revision = 9, suspended = true, messages = {} } })

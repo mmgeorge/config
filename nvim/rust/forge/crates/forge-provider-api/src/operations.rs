@@ -1,8 +1,8 @@
 //! Scoped lifecycle and history-operation evidence shared by adapters and the host owner.
 
 use crate::{
-    BindingId, CheckpointId, ExecutionResult, InvocationScope, ProviderSessionId, RecoveryToken,
-    SessionBinding, SessionConfiguration, SubmissionId,
+    CheckpointId, InvocationScope, ProviderSessionId, RecoveryToken, SessionBinding,
+    SessionConfiguration, SubmissionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -106,18 +106,16 @@ pub struct CancelRequest {
     pub scope: InvocationScope,
 }
 
-/// Prove native foreground work and callbacks collected independently of terminal observation.
-/// Background terminals and host-owned jobs have separate lifetimes. Retain this same
-/// value for repeated cancellation; failed collection publishes a typed failure instead.
+/// Confirm interruption observed the original turn's collection and stream boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct InvocationSettlement {
-    /// Identify the live generation which owns the collected work.
-    pub binding_id: BindingId,
-    /// Identify the exact invocation whose resources were collected.
-    pub scope: InvocationScope,
-    /// Preserve the true native terminal outcome, including cancellation losing completion races.
-    pub result: ExecutionResult,
-    /// Consume through this boundary before host transitions depending on terminal observations.
+pub struct TurnInterruptResult {
+    /// Identify the retained interruption operation.
+    pub operation_id: OperationId,
+    /// Identify the original host conversation.
+    pub thread_id: crate::ThreadId,
+    /// Identify the original host response cycle.
+    pub turn_id: crate::TurnId,
+    /// Consume through this published boundary before dependent transitions.
     pub watermark: EventSequence,
 }
 

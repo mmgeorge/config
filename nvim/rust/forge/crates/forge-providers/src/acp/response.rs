@@ -4,9 +4,34 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptOutcome {
     /// The agent reported a non-cancelled terminal reason.
-    Completed,
+    Completed(forge_provider_api::turn::TurnCompletionReason),
     /// The agent acknowledged native cancellation.
     Cancelled,
+}
+
+/// Retain a parsed native terminal fact before host receipt persistence or collection waits.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativePromptEnd {
+    outcome: PromptOutcome,
+    completed_at_ms: i64,
+}
+
+impl NativePromptEnd {
+    /// Decode exactly one native stop reason at its response boundary.
+    pub(super) fn parse(value: &Value, completed_at_ms: i64) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            outcome: prompt_outcome(value)?,
+            completed_at_ms,
+        })
+    }
+    /// Get the once-parsed native terminal outcome.
+    pub(super) fn outcome(self) -> PromptOutcome {
+        self.outcome
+    }
+    /// Get native response time independently of later receipt persistence and collection.
+    pub(super) fn completed_at_ms(self) -> i64 {
+        self.completed_at_ms
+    }
 }
 
 /// Validate the native completed-turn response before acknowledging delivery.
@@ -23,10 +48,18 @@ pub(crate) fn prompt_outcome(value: &Value) -> Result<PromptOutcome, serde_json:
         serde_json::from_value::<agent_client_protocol::schema::v1::PromptResponse>(value.clone())?;
     match response.stop_reason {
         StopReason::Cancelled => Ok(PromptOutcome::Cancelled),
-        StopReason::EndTurn
-        | StopReason::MaxTokens
-        | StopReason::MaxTurnRequests
-        | StopReason::Refusal => Ok(PromptOutcome::Completed),
+        StopReason::EndTurn => Ok(PromptOutcome::Completed(
+            forge_provider_api::turn::TurnCompletionReason::Normal,
+        )),
+        StopReason::MaxTokens => Ok(PromptOutcome::Completed(
+            forge_provider_api::turn::TurnCompletionReason::TokenLimit,
+        )),
+        StopReason::MaxTurnRequests => Ok(PromptOutcome::Completed(
+            forge_provider_api::turn::TurnCompletionReason::RequestLimit,
+        )),
+        StopReason::Refusal => Ok(PromptOutcome::Completed(
+            forge_provider_api::turn::TurnCompletionReason::Refusal,
+        )),
         _ => Err(serde_json::Error::custom(
             "unsupported ACP prompt stop reason",
         )),
@@ -42,12 +75,33 @@ mod tests {
     fn prompt_terminal_requires_a_known_stop_reason() {
         assert!(matches!(
             prompt_outcome(&json!({"stopReason":"end_turn"})),
-            Ok(PromptOutcome::Completed)
+            Ok(PromptOutcome::Completed(
+                forge_provider_api::turn::TurnCompletionReason::Normal
+            ))
         ));
         assert!(matches!(
             prompt_outcome(&json!({"stopReason":"cancelled"})),
             Ok(PromptOutcome::Cancelled)
         ));
+        for (native, reason) in [
+            (
+                "max_tokens",
+                forge_provider_api::turn::TurnCompletionReason::TokenLimit,
+            ),
+            (
+                "max_turn_requests",
+                forge_provider_api::turn::TurnCompletionReason::RequestLimit,
+            ),
+            (
+                "refusal",
+                forge_provider_api::turn::TurnCompletionReason::Refusal,
+            ),
+        ] {
+            assert_eq!(
+                prompt_outcome(&json!({"stopReason":native})).unwrap(),
+                PromptOutcome::Completed(reason)
+            );
+        }
         assert!(prompt_outcome(&json!({})).is_err());
         assert!(prompt_outcome(&json!({"stopReason":"future_reason"})).is_err());
     }

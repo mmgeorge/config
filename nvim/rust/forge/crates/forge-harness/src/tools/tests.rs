@@ -421,11 +421,12 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
             .is_err()
         );
     }
-    let root = crate::provider::ExecutionOwner::root("session");
-    let child = crate::provider::ExecutionOwner {
-        session_id: "session".into(),
-        agent_id: "child".into(),
-    };
+    let root = crate::provider::ThreadOwner::root("session");
+    let child = crate::provider::ThreadOwner::new(
+        "session".into(),
+        forge_provider_api::AgentId::new("child").unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     assert_eq!(
         ControlToolRegistry
             .definition_list_for_owner(&root, false, false)

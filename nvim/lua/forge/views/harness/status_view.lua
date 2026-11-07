@@ -26,7 +26,7 @@ local position = require("forge.buffer_view")
 local spinner = require("forge.render.harness.timeline_status")
 local hint = require("forge.views.harness.status_hint")
 
----@param options {transcript: table, transcript_window: integer, composer_window?: integer, alive: fun(): boolean, notice: fun(message: string), recover: fun(document: table)}
+---@param options {transcript: table, transcript_window: integer, composer_window?: integer, alive: fun(): boolean, notice: fun(message: string), recover: fun(document: table), refresh?: fun()}
 ---@return HarnessStatusView
 function StatusView.new(options)
   local self = setmetatable({ options = options, context = {}, commands = { action_by_id = {}, order = {} },
@@ -139,14 +139,24 @@ function StatusView:update_animation()
   local content = self.content
   local visible = not self.suspended and self.window and vim.api.nvim_win_is_valid(self.window)
   if content and content.animated and visible then
+    local timer = vim.uv.new_timer()
+    local refreshed_at = vim.uv.now()
+    -- A tick scheduled before this timer stopped must not overwrite the next state's icon.
     local function draw()
-      if self.closed or self.suspended or not self.options.alive() then return end
+      if self.timer ~= timer or self.closed or self.suspended or not self.options.alive() then return end
       vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.animated, 0,
         { id = 1, virt_text = { { spinner.frame_at(vim.uv.now()), "ForgeTimelineStatusSpinner" } }, virt_text_win_col = 0 })
+      -- Rust renders elapsed labels and refreshes them only when a sync arrives. A silent
+      -- tool produces no host events, so request one sync per second while Rust reports
+      -- active work; Rust's own ticking gate decides whether any text changes.
+      if self.options.refresh and vim.uv.now() - refreshed_at >= 1000 then
+        refreshed_at = vim.uv.now()
+        self.options.refresh()
+      end
     end
-    self.timer = vim.uv.new_timer()
+    self.timer = timer
     draw()
-    self.timer:start(120, 120, vim.schedule_wrap(draw))
+    timer:start(120, 120, vim.schedule_wrap(draw))
   elseif content and content.waiting and visible then
     vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.waiting, 0,
       { id = 1, virt_text = { { "◷", "ForgeStatusHint" } }, virt_text_win_col = 0 })

@@ -21,10 +21,15 @@ pub(super) struct PreparationProbe {
 pub(super) fn completed_message(
     turn: &crate::provider::TurnAddress,
     id: impl Into<String>,
-    role: crate::provider::MessageRole,
+    role: crate::provider::TestMessageContent,
     text: impl Into<String>,
 ) -> Vec<ProviderEvent> {
-    crate::provider::test_support::message(turn, id, Some(role), text)
+    crate::provider::test_support::message(
+        turn,
+        format!("{}:{}", turn.turn_id.as_str(), id.into()),
+        Some(role),
+        text,
+    )
 }
 
 /// Create native input with independently controlled checkpoint, execution, and cleanup barriers.
@@ -53,67 +58,33 @@ pub(super) fn checkpoint_fixture(
         let started = started.clone();
         let tool_ran = tool_ran.clone();
         let active = active.clone();
-        move |request, sink, _cancelled| {
+        move |request, _writer, start, _cancelled| {
             let started = started.clone();
             let tool_ran = tool_ran.clone();
             let active = active.clone();
             let workspace = workspace.clone();
-            let descriptor = descriptor.clone();
             async move {
                 active.fetch_add(1, Ordering::SeqCst);
                 let _active = ActiveProbe(active);
-                let scope = request.scope.clone();
-                let address = crate::provider::TurnAddress {
-                    scope: scope.clone(),
-                    thread_id: "checkpoint-thread".into(),
-                    turn_id: "checkpoint-turn".into(),
-                };
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        scope.clone(),
-                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-                })
-                .await?;
+                start.observed(0).await?;
                 started.notify_one();
-                if let Err(error) = request.turn_control.before_send(&scope).await {
+                if let Err(error) = request.turn_control.before_send(&request.scope).await {
                     if matches!(error, crate::provider::ProviderError::Cancelled) {
-                        sink.send_wait(ProviderEvent::Turn {
-                            address: address.clone(),
-                            update: crate::provider::TurnUpdate::Finished {
-                                outcome: forge_provider_api::turn::TurnOutcome::Cancelled,
-                                completed_at_ms: 1,
-                            },
-                        })
-                        .await?;
-                        sink.send_wait(ProviderEvent::Execution {
-                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                                scope,
-                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                    address,
-                                    covered_submissions: vec![request.submission_id],
-                                    completed_at_ms: 1,
-                                    result:
-                                        forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                                            completion:
-                                                forge_provider_api::completion::ProviderCompletion {
-                                                    capability: descriptor.capability.clone(),
-                                                    ..Default::default()
-                                                }
-                                                .into(),
-                                        },
-                                },
-                            )?,
-                        })
-                        .await?;
-                        return Ok(());
+                        return Ok(forge_provider_api::TurnResult::new(
+                            forge_provider_api::turn::TurnOutcome::Interrupted,
+                            1,
+                            None,
+                            vec![forge_provider_api::CoveredInput::new(
+                                request.submission_id,
+                                request.attempt_id,
+                            )],
+                            Vec::new(),
+                            Some(
+                                forge_provider_api::CheckpointId::new("fixture-native-boundary")
+                                    .unwrap(),
+                            ),
+                        )
+                        .expect("fixture has one admitted input and no conflicting accounting"));
                     }
                     return Err(error);
                 }
@@ -122,39 +93,26 @@ pub(super) fn checkpoint_fixture(
                     |_| {
                         crate::provider::ProviderError::Failure(
                             forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 forge_provider_api::ProviderFailureKind::Unknown,
                             ),
                         )
                     },
                 )?;
-                sink.send_wait(ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: forge_provider_api::turn::TurnOutcome::Completed,
-                        completed_at_ms: 2,
+                Ok(forge_provider_api::TurnResult::new(
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     },
-                })
-                .await?;
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        scope,
-                        forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                            address,
-                            covered_submissions: vec![request.submission_id],
-                            completed_at_ms: 2,
-                            result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                completion: forge_provider_api::completion::ProviderCompletion {
-                                    capability: descriptor.capability.clone(),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                    2,
+                    None,
+                    vec![forge_provider_api::CoveredInput::new(
+                        request.submission_id,
+                        request.attempt_id,
+                    )],
+                    Vec::new(),
+                    None,
+                )
+                .expect("fixture has one admitted input and no conflicting accounting"))
             }
         }
     });
@@ -179,7 +137,7 @@ pub(super) fn checkpoint_fixture(
                 if probe.fail || kind == forge_provider_api::ProviderFailureKind::Rejected {
                     return Err(crate::provider::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             kind,
                         ),
                     ));
@@ -192,7 +150,7 @@ pub(super) fn checkpoint_fixture(
         fixture.with_cleanup(|_| async {
             Err(crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::Transport,
                 ),
             ))
@@ -429,9 +387,12 @@ pub(super) fn admit_child_fixture(
         .agent_coordinator
         .reserve_spawn(&request, &spawn, selection, &parent.id, 100)?;
     parent.append_agent_task(&admission.task)?;
-    broker
-        .store
-        .admit_agent_task(&admission.agent, &admission.task, &parent)?;
+    broker.store.admit_agent_task(
+        &admission.agent,
+        &admission.task,
+        &parent,
+        admission.continuation_authorization(),
+    )?;
     let admission = match admission.commit()? {
         crate::agent::AgentCommit::Admitted(work) => work,
         crate::agent::AgentCommit::Existing(_) => anyhow::bail!("fixture reused a child admission"),
@@ -440,39 +401,70 @@ pub(super) fn admit_child_fixture(
     Ok(admission)
 }
 
-/// Create a stable child turn address for normalized observation fixtures.
-pub(super) fn child_address() -> crate::provider::TurnAddress {
-    crate::provider::test_support::address(
-        &crate::provider::test_support::scope(),
-        "durable-child-conversation",
-        "child-turn",
-    )
+/// Admit one fixture's original child owner and invocation before producing native facts.
+pub(super) fn child_address(
+    owner: &crate::provider::ThreadOwner,
+    task_id: &str,
+) -> crate::provider::TurnAddress {
+    crate::provider::test_support::address(&crate::provider::InvocationScope {
+        owner: owner.clone(),
+        exchange_id: task_id.into(),
+        invocation_id: format!("fixture:{task_id}").into(),
+    })
 }
 
 /// Create a child turn observation for the shared fixture address.
-pub(super) fn child_event(update: crate::provider::TurnUpdate) -> ProviderEvent {
+pub(super) fn child_event(
+    address: &crate::provider::TurnAddress,
+    update: crate::provider::TurnEvent,
+) -> ProviderEvent {
     ProviderEvent::Turn {
-        address: child_address(),
-        update,
+        thread_id: address.thread_id.clone(),
+        turn_id: address.turn_id.clone(),
+        event: update,
     }
+}
+
+/// Collect a native child outcome through the shared runner for reducer fixtures.
+pub(super) fn child_completed(
+    address: &crate::provider::TurnAddress,
+    outcome: forge_provider_api::turn::TurnOutcome,
+    completed_at_ms: i64,
+) -> ProviderEvent {
+    let result = forge_provider_api::TurnResult::new(
+        outcome,
+        completed_at_ms,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .expect("fixture has no conflicting input or accounting records");
+    let completed = crate::provider::test_support::completed_turn(address.scope.clone(), result)
+        .expect("deterministic fixture native resources collect successfully");
+    child_event(address, crate::provider::TurnEvent::Completed(completed))
 }
 
 /// Create a child tool lifecycle sequence for the shared fixture address.
 pub(super) fn child_tool(
+    address: &crate::provider::TurnAddress,
     output: String,
     status: crate::provider::ToolStatus,
 ) -> Vec<ProviderEvent> {
-    crate::provider::test_support::tool(
-        &child_address(),
-        "same-provider-call".into(),
-        crate::provider::ToolInvocation {
+    let start =
+        forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
             semantics: Default::default(),
-            kind: crate::provider::ToolActivityKind::Command,
             name: "inspect".into(),
             title: "Inspect compilation diagnostics".into(),
-            arguments: Value::Null,
-        },
-        crate::turn::test_support::tool_updates(status, Some(output), Default::default()),
+            arguments: forge_provider_api::InspectableArguments::new(Value::Null),
+        });
+    let updates =
+        crate::turn::test_support::tool_updates(&start, status, Some(output), Default::default());
+    crate::provider::test_support::tool(
+        address,
+        format!("{}:same-provider-call", address.turn_id.as_str()),
+        start,
+        updates,
     )
 }
 
@@ -480,48 +472,35 @@ impl HarnessBroker {
     /// Bind normalized fixture content to the admitted child before applying its observations.
     pub(super) async fn observe_child_fixture(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: &str,
         batch: impl Into<crate::provider::test_support::FixtureBatch>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         use crate::provider::test_support::FixtureBatch;
-        let updates = match batch.into() {
-            FixtureBatch::Event(event) => vec![*event],
-            FixtureBatch::Sequence(event) => event,
-        };
         let scope = crate::provider::InvocationScope {
             owner: owner.clone(),
             exchange_id: task_id.into(),
             invocation_id: format!("fixture:{task_id}").into(),
         };
-        for mut update in updates {
-            match &mut update {
-                ProviderEvent::Execution { .. }
-                | ProviderEvent::Settled { .. }
-                | ProviderEvent::SettlementFailed { .. }
-                | ProviderEvent::CapabilitiesChanged { .. }
-                | ProviderEvent::SessionIdentity { .. } => {
-                    anyhow::bail!("lifecycle fixture requires its original validated scope")
-                }
-                ProviderEvent::Message { address, .. } => address.turn.scope = scope.clone(),
-                ProviderEvent::Tool { address, .. } => address.turn.scope = scope.clone(),
-                ProviderEvent::Turn { address, .. }
-                | ProviderEvent::Usage { address, .. }
-                | ProviderEvent::Checklist { address, .. } => address.scope = scope.clone(),
-                ProviderEvent::Runtime { scope: binding, .. }
-                | ProviderEvent::Agent { scope: binding, .. }
-                | ProviderEvent::Approval { scope: binding, .. }
-                | ProviderEvent::DirectoryAccess { scope: binding, .. }
-                | ProviderEvent::InputAccepted { scope: binding, .. }
-                | ProviderEvent::Retry { scope: binding, .. }
-                | ProviderEvent::ParentBoundary { scope: binding, .. } => *binding = scope.clone(),
-                ProviderEvent::Terminals { scope: binding, .. }
-                | ProviderEvent::Compaction { scope: binding, .. }
-                | ProviderEvent::Diagnostic { scope: binding, .. } => {
-                    *binding = scope.clone().into()
-                }
+        let updates = match batch.into() {
+            FixtureBatch::Event(event) => {
+                vec![crate::provider::session_execution::OwnerObservation::Event(
+                    crate::provider::test_support::native_event(scope.clone(), *event),
+                )]
             }
+            FixtureBatch::Sequence(events) => events
+                .into_iter()
+                .map(|event| {
+                    crate::provider::session_execution::OwnerObservation::Event(
+                        crate::provider::test_support::native_event(scope.clone(), event),
+                    )
+                })
+                .collect(),
+            FixtureBatch::Observation(event) => vec![*event],
+            FixtureBatch::Observations(events) => events,
+        };
+        for update in updates {
             self.observe_managed_agent(owner.clone(), task_id, update, event)
                 .await?;
         }

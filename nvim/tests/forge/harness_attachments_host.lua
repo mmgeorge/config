@@ -18,7 +18,8 @@ if not vim.g.forge_attachments_grid and not vim.g.forge_attachments_manual then
 end
 
 local root = vim.fn.getcwd()
-local temporary = vim.fs.joinpath(vim.fn.stdpath("cache"), "forge-attachment-tests", tostring(vim.uv.hrtime()))
+local fixture_evidence = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/evidence_directory.lua")("harness-attachments")
+local temporary = fixture_evidence.path
 local workspace, data = temporary .. "/workspace", temporary .. "/data"
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
@@ -31,7 +32,8 @@ assert(image_file:close())
 local document_path = workspace .. "/report.pdf"
 vim.fn.writefile({ "%PDF-1.7", "attachment fixture", "%%EOF" }, document_path)
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = binary }) return function() end end }
@@ -61,7 +63,7 @@ local success, failure = xpcall(function()
   local paste_ms = (vim.uv.hrtime() - started) / 1000000
   assert(attachment.pending(state.composer_buf), "file import did not run asynchronously")
   controller.submit()
-  assert(#warnings == 1 and not state.busy, "submission consumed an unfinished attachment")
+  assert(#warnings == 1 and not require("forge.views.harness.activity").busy(state), "submission consumed an unfinished attachment")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "Inspect " })
   await(function() return not attachment.pending(state.composer_buf) end, "image import did not finish")
   local image_prompt = composer()
@@ -100,9 +102,18 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "Edited: " })
   controller.submit()
   assert(state.queue[1].text == "Edited: " .. image_prompt and #state.queue[1].attachments == 1 and composer() == "Unsent draft", "queue edit lost its attachment or original draft")
-  await(function() return #state.input.pending == 0 end, "attachment edit was not acknowledged")
+  -- Editor drafts await host acknowledgement in `input.drafts`; the committed edit replaces the
+  -- confirmed host message that carries the attachment.
+  await(function()
+    for _, draft in ipairs(state.input.drafts) do
+      if draft.draft_state == "pending" then return false end
+    end
+    return not state.queue_edit and vim.iter(state.input.confirmed):any(function(message)
+      return message.text == "Edited: " .. image_prompt and #(message.attachments or {}) == 1
+    end)
+  end, "attachment edit was not acknowledged")
   held:release()
-  await(function() return not state.busy and #state.queue == 0 end, "queued attachment prompt did not settle")
+  await(function() return not require("forge.views.harness.activity").busy(state) and #state.queue == 0 end, "queued attachment prompt did not settle")
   assert(state.session.name == "Attachment editing fixture", "queued input replaced the conversation name")
   await(function()
     for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -116,7 +127,7 @@ local success, failure = xpcall(function()
   attachment.restore(state.composer_buf, {})
   assert(#attachment.capture(state.composer_buf).attachments == 0)
   controller.submit()
-  await(function() return not state.busy end, "literal source prompt did not settle")
+  await(function() return not require("forge.views.harness.activity").busy(state) end, "literal source prompt did not settle")
   await(function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n"):find("forge-attachment:broken", 1, true) ~= nil
   end, "literal attachment syntax disappeared from the transcript")
@@ -148,11 +159,11 @@ local function cleanup()
   vim.fn.stdpath = original_stdpath
   assert(not vim.uv.fs_stat(temporary) or vim.uv.fs_realpath(temporary) == owned_root, "attachment fixture cleanup escaped its temporary root")
   if success then
+    local release_failure
     assert(vim.wait(5000, function()
-      if not vim.uv.fs_stat(temporary) then return true end
-      assert(vim.uv.fs_realpath(temporary) == owned_root, "attachment fixture cleanup escaped its temporary root")
-      return vim.fn.delete(temporary, "rf") == 0
-    end, 20), "attachment fixture cleanup failed")
+      release_failure = fixture_evidence.release(true)
+      return release_failure == nil
+    end, 20), release_failure)
   else print("attachment failure artifacts: " .. temporary) end
   return collected
 end

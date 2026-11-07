@@ -1015,6 +1015,7 @@ dependencies = [
  "async-trait",
  "forge-protocol",
  "forge-shell",
+ "futures-util",
  "semver",
  "serde",
  "serde_json",

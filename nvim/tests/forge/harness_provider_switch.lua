@@ -19,15 +19,15 @@ client.session_initialize = function(callback, options)
   starts = starts + 1
   pending_start, initialize_options = callback, options
 end
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.session = { id = 'source', provider = 'fixture_alpha' }
 config.options.harness.provider = 'fixture_alpha'
 local harness = require('forge.views.harness')
 local destination = { kind = 'resume', session_id = 'fixture_beta-chosen' }
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 harness.switch_provider('fixture_beta', destination)
 assert(starts == 0 and pending_stop == nil)
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.queue = { { prompt = 'pending' } }
 harness.switch_provider('fixture_beta', destination)
 assert(#state.queue == 1 and pending_stop == nil)

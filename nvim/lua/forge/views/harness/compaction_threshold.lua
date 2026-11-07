@@ -10,25 +10,38 @@ function Threshold.label(value)
   return tostring(value)
 end
 
----@param value number
----@param direction integer
----@return number
-function Threshold.change(value, direction)
-  for index, candidate in ipairs(values) do
-    if candidate == value then return values[(index - 1 + direction) % #values + 1] end
-  end
-  if direction > 0 then
-    for _, candidate in ipairs(values) do if candidate > value then return candidate end end
-    return values[1]
-  end
-  for index = #values, 1, -1 do if values[index] < value then return values[index] end end
-  return values[#values]
+---List presets that Harness accepts for the reported context capacity.
+---Harness rejects a threshold at or above the model context window, so an unknown capacity
+---keeps every preset and a known one removes the presets it cannot accept.
+---@param capacity? number
+---@return number[]
+function Threshold.options(capacity)
+  if not capacity then return vim.deepcopy(values) end
+  return vim.tbl_filter(function(value) return value < capacity end, values)
 end
 
----@param options {host: table, value: number, on_select: fun(value: number), on_close: fun()}
+---@param value number
+---@param direction integer
+---@param capacity? number
+---@return number
+function Threshold.change(value, direction, capacity)
+  local option_list = Threshold.options(capacity)
+  if #option_list == 0 then return value end
+  for index, candidate in ipairs(option_list) do
+    if candidate == value then return option_list[(index - 1 + direction) % #option_list + 1] end
+  end
+  if direction > 0 then
+    for _, candidate in ipairs(option_list) do if candidate > value then return candidate end end
+    return option_list[1]
+  end
+  for index = #option_list, 1, -1 do if option_list[index] < value then return option_list[index] end end
+  return option_list[#option_list]
+end
+
+---@param options {host: table, value: number, capacity?: number, on_select: fun(value: number), on_close: fun()}
 function Threshold.open(options)
   local rows, selected = {}, 1
-  for index, value in ipairs(values) do
+  for index, value in ipairs(Threshold.options(options.capacity)) do
     rows[index] = { id = tostring(value), label = Threshold.label(value), value = value }
     if value == options.value then selected = index end
   end

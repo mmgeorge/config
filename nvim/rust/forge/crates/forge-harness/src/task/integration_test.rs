@@ -373,7 +373,12 @@ fn draft_prerequisites_continue_then_suspend_with_their_setup_position() -> Resu
         }))?;
         let address = crate::turn::test_support::address(&exchange, "response");
         let mut turn = crate::turn::Turn::new("response".into(), address, 1);
-        turn.finish(crate::turn::TurnOutcome::Completed, 2)?;
+        turn.finish(
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            2,
+        )?;
         exchange.turn.push(turn);
         let (_, continuing) = controller
             .observe_plan_response(&mut store, &task.permit(), &exchange, false, 2)?

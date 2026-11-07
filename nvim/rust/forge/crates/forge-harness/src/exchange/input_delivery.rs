@@ -58,9 +58,9 @@ pub(crate) struct SteeringDeliveryOffer {
 /// Capture a steering destination without selecting a newer invocation after asynchronous preparation.
 #[derive(Clone)]
 pub(super) struct SteeringDispatchTarget {
-    route: SteeringRoute,
+    parent: crate::provider::SteeringTarget,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     engine: Arc<tokio::sync::OnceCell<Arc<crate::provider::session_execution::SessionExecution>>>,
 }
 
@@ -69,25 +69,12 @@ impl SteeringDispatchTarget {
     pub(super) fn parent(
         target: crate::provider::SteeringTarget,
         registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
     ) -> Self {
         Self {
-            route: SteeringRoute::Parent(target),
+            parent: target,
             registry,
             owner,
-            engine: Default::default(),
-        }
-    }
-
-    /// Capture an explicitly observed invocation for native steering after foreground settlement.
-    pub(super) fn native(
-        scope: crate::provider::InvocationScope,
-        registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    ) -> Self {
-        Self {
-            owner: scope.owner.clone(),
-            route: SteeringRoute::Native(scope),
-            registry,
             engine: Default::default(),
         }
     }
@@ -98,11 +85,8 @@ impl SteeringDispatchTarget {
         generation: &ProviderGenerationPermit,
         input: crate::provider::SteeringInput,
     ) -> Result<(), crate::provider::ProviderError> {
-        let engine = self.execution(generation).await?;
-        match &self.route {
-            SteeringRoute::Parent(target) => target.steer(input).await,
-            SteeringRoute::Native(scope) => engine.steer(scope.clone(), input).await,
-        }
+        self.execution(generation).await?;
+        self.parent.steer(input).await
     }
 
     /// Fence the exact engine captured before dispatch, rather than looking up its replacement.
@@ -124,7 +108,7 @@ impl SteeringDispatchTarget {
         if !self.registry.matches(generation.provider()) {
             return Err(crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ),
             ));
@@ -133,12 +117,6 @@ impl SteeringDispatchTarget {
             .get_or_try_init(|| self.registry.owner(self.owner.clone()))
             .await
     }
-}
-
-#[derive(Clone)]
-enum SteeringRoute {
-    Parent(crate::provider::SteeringTarget),
-    Native(crate::provider::InvocationScope),
 }
 
 enum InputDestination {
@@ -160,23 +138,13 @@ impl InputDestination {
         }
         Ok(match self {
             Self::Foreground => InputDispatchActivity::Active,
-            Self::Steering { target, .. } => match &target.route {
-                SteeringRoute::Parent(parent) if parent.is_open() => InputDispatchActivity::Active,
-                SteeringRoute::Parent(_) => InputDispatchActivity::Idle,
-                SteeringRoute::Native(scope) => {
-                    let active = target
-                        .engine
-                        .get()
-                        .ok_or(OperationFailure::ExecutionUnavailable)?
-                        .invocation_active_snapshot(scope)
-                        .map_err(OperationFailure::InputReconciliation)?;
-                    if active {
-                        InputDispatchActivity::Active
-                    } else {
-                        InputDispatchActivity::Idle
-                    }
+            Self::Steering { target, .. } => {
+                if target.parent.is_open() {
+                    InputDispatchActivity::Active
+                } else {
+                    InputDispatchActivity::Idle
                 }
-            },
+            }
         })
     }
 }
@@ -449,7 +417,7 @@ impl InputDeliveryRun {
                     }
                     SettingsProgress::Committed { mut updates } => {
                         let configured = broker
-                            .owner_finish_configuration(None, None)
+                            .owner_finish_configuration(None, None, None)
                             .map_err(OperationFailure::Domain)?;
                         updates.extend(configured.delivery.into_updates());
                         self.work = PreparationWork::None;
@@ -478,7 +446,7 @@ impl InputDeliveryRun {
                     }),
                     CompactionProgress::Committed { mut updates } => {
                         let completed = broker
-                            .owner_finish_configuration(None, self.selected.as_ref())
+                            .owner_finish_configuration(None, self.selected.as_ref(), None)
                             .map_err(OperationFailure::Domain)?;
                         updates.extend(completed.delivery.into_updates());
                         if let Some(prompt) = completed.resume {
@@ -896,7 +864,7 @@ impl InputDeliveryRun {
                     .map_err(OperationFailure::Domain)?
                     .delivery
                     == SubmissionState::Prepared;
-                let retired_parent = matches!(&flight.target.route, SteeringRoute::Parent(target) if !target.is_open());
+                let retired_parent = !flight.target.parent.is_open();
                 if outcome.is_err()
                     && prepared
                     && (retired_parent || *services.cancellation.subscribe().borrow())
@@ -1613,9 +1581,9 @@ mod tests {
     use crate::provider::ProviderError;
     use futures_util::FutureExt;
 
-    /// Preserve receipt evidence after native owner retirement without authorizing prepared replay.
+    /// Preserve accepted receipt evidence while a retired parent rejects delayed steering.
     #[tokio::test]
-    async fn accepted_receipt_does_not_query_retired_native_target() -> anyhow::Result<()> {
+    async fn accepted_receipt_does_not_retarget_retired_parent() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut broker = HarnessBroker::initialize(serde_json::from_value(serde_json::json!({
             "workspace":root.path(), "data_root":root.path().join("data"), "client_id":"retired-receipt",
@@ -1631,11 +1599,26 @@ mod tests {
         )?;
         receipt.sending(None)?;
         receipt.accepted(None)?;
-        let owner = crate::provider::ExecutionOwner::root(broker.observer().session_id());
-        let scope = crate::provider::InvocationScope::new(owner.clone(), "original");
+        let owner = crate::provider::ThreadOwner::root(broker.observer().session_id());
+        let lane = crate::provider::SteeringLane::default();
+        let receiver = lane.activate(None)?;
+        let parent = lane
+            .capture()
+            .expect("activated fixture parent retains its steering receiver");
+        drop(receiver);
         let registry = broker.execution_registry();
         registry.close().await?;
-        let target = SteeringDispatchTarget::native(scope, registry.clone());
+        let target = SteeringDispatchTarget::parent(parent, registry.clone(), owner);
+        assert!(!target.parent.is_open());
+        assert!(
+            target
+                .parent
+                .steer(crate::provider::SteeringInput::AgentResult(
+                    "late input".into()
+                ))
+                .await
+                .is_err()
+        );
         assert!(target.engine.get().is_none());
         let destination = InputDestination::Steering {
             target,
@@ -1655,12 +1638,10 @@ mod tests {
                 InputDispatchActivity::Active
             ));
         }
-        assert!(
-            destination
-                .receipt_activity(&SubmissionState::Prepared)
-                .is_err(),
-            "retirement must not manufacture safe requeue authority"
-        );
+        assert!(matches!(
+            destination.receipt_activity(&SubmissionState::Prepared)?,
+            InputDispatchActivity::Idle
+        ));
         registry.close().await?;
         provider.shutdown().await?;
         Ok(())

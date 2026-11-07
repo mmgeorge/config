@@ -2062,6 +2062,10 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
 }
 
 /// Kill a timed-out shell and stop the remaining check commands with a retained error.
+///
+/// The configured hour-long deadline never elapses during the test. The supervisor's forced
+/// expiry fires the same deadline path while the shell sleeps, because Windows child pipes
+/// hold blocking reads that keep a paused clock from auto-advancing.
 #[tokio::test]
 async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()> {
     let workspace = tempfile::tempdir()?;
@@ -2087,7 +2091,7 @@ async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()>
         &crate::settings::PortableSettings {
             tool_timeout: Some(crate::session::InputTimeout {
                 amount: 1,
-                unit: crate::session::TimeoutUnit::S,
+                unit: crate::session::TimeoutUnit::H,
             }),
             ..Default::default()
         },
@@ -2099,6 +2103,7 @@ async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()>
         crate::session::CheckShell::Nushell,
         "Timeout regression".into(),
     )?;
+    runner.expire_command_deadline();
     let failure = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         runner.run(request, None, None),

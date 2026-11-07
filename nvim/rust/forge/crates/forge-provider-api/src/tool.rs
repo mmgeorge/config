@@ -1,53 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ToolInvocation {
-    /// Adapter-normalized operation metadata; raw arguments are inspection-only.
-    #[serde(default)]
-    pub semantics: ToolSemantics,
-    pub kind: ToolActivityKind,
-    pub name: String,
-    pub title: String,
-    pub arguments: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(from = "StoredToolDiagnostic")]
+#[serde(deny_unknown_fields)]
 pub struct ToolDiagnostic {
     /// Carry a normalized failure class, without native codes or verbatim messages.
     pub kind: crate::error::ProviderFailureKind,
     /// Preserve useful host or adapter text after native detail has been sanitized.
     pub message: crate::diagnostic::SanitizedMessage,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-enum StoredToolDiagnostic {
-    Current {
-        kind: crate::error::ProviderFailureKind,
-        message: crate::diagnostic::SanitizedMessage,
-    },
-    Legacy {
-        code: serde::de::IgnoredAny,
-        message: serde::de::IgnoredAny,
-    },
-}
-
-impl From<StoredToolDiagnostic> for ToolDiagnostic {
-    /// Normalize legacy diagnostics without restoring native codes or error text.
-    fn from(stored: StoredToolDiagnostic) -> Self {
-        match stored {
-            StoredToolDiagnostic::Current { kind, message } => Self { kind, message },
-            StoredToolDiagnostic::Legacy { code, message } => {
-                let _ = (code, message);
-                Self {
-                    kind: crate::error::ProviderFailureKind::Unknown,
-                    message: crate::diagnostic::SanitizedMessage::new("Tool execution failed")
-                        .expect("static diagnostic is nonempty"),
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,53 +28,6 @@ pub enum ToolOutcome {
     },
     Cancelled,
     Interrupted,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolUpdate {
-    Requested {
-        invocation: ToolInvocation,
-    },
-    /// Update display text without replacing the admitted tool invocation.
-    TitleChanged {
-        title: String,
-    },
-    Input {
-        update: TextUpdate,
-    },
-    Started,
-    /// Retain a proven running command after its foreground turn completes.
-    Backgrounded,
-    Output {
-        update: TextUpdate,
-    },
-    Changes {
-        changes: crate::change::ProviderChangeSet,
-    },
-    SkillRead {
-        read: Vec<crate::skill::SkillRead>,
-    },
-    Finished {
-        outcome: ToolOutcome,
-    },
-}
-
-impl ToolUpdate {
-    /// Permit late metadata and output without reopening an existing tool execution.
-    pub fn can_update_settled(&self) -> bool {
-        match self {
-            Self::TitleChanged { .. }
-            | Self::Output { .. }
-            | Self::Changes { .. }
-            | Self::SkillRead { .. } => true,
-            Self::Requested { .. }
-            | Self::Input { .. }
-            | Self::Started
-            | Self::Backgrounded
-            | Self::Finished { .. } => false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -175,14 +87,6 @@ impl std::fmt::Display for ToolStatus {
 }
 
 /// Defines the visible action verb for one normalized tool invocation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolActivityKind {
-    Command,
-    FileChange,
-    ToolCall,
-}
-
 /// Carries the operation meaning without requiring native tool-name or argument parsing.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -200,39 +104,115 @@ pub enum ToolSemantics {
     },
 }
 
+/// Retain native arguments for inspection without defining event lifecycle.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct InspectableArguments(serde_json::Value);
+
+impl InspectableArguments {
+    /// Create an inspection-only native argument snapshot.
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+    /// Get the native snapshot for inspection or rendering.
+    pub fn value(&self) -> &serde_json::Value {
+        &self.0
+    }
+    /// Consume the native snapshot at a transport boundary.
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+/// Describe a native operation independently of the immutable enclosing item type.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolDescriptor {
+    /// Preserve the native operation name for display.
+    pub name: String,
+    /// Preserve the current display title.
+    pub title: String,
+    /// Carry normalized operation meaning without parsing native arguments.
+    pub semantics: ToolSemantics,
+    /// Retain raw arguments exclusively for inspection.
+    pub arguments: InspectableArguments,
+}
+
+/// Preserve streamed arguments and structured native snapshots separately.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ToolInputUpdate {
+    /// Apply an ordered textual argument update.
+    Text(TextUpdate),
+    /// Replace the structured argument snapshot.
+    Arguments(InspectableArguments),
+}
+
+/// Preserve metadata, positive execution evidence, output, and native changes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ToolItemEvent {
+    /// Refine the descriptor without admitting another item.
+    DescriptorUpdated(ToolDescriptor),
+    /// Change the displayed title of the same operation.
+    TitleChanged(String),
+    /// Apply argument text or a structured snapshot.
+    Input(ToolInputUpdate),
+    /// Record positive evidence that execution began.
+    ExecutionStarted,
+    /// Record positive evidence that work survives foreground completion.
+    Backgrounded,
+    /// Append output or replace it with an authoritative snapshot.
+    Output(TextUpdate),
+    /// Preserve native file observations separately from host checkpoints.
+    Changes(crate::change::ProviderChangeSet),
+}
+
+/// Freeze the tool's outcome and independently available final snapshots.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ToolCompletion {
+    /// Preserve the actual native operation result.
+    pub outcome: ToolOutcome,
+    /// Replace the prior descriptor only when a final snapshot was reported.
+    pub descriptor: Option<ToolDescriptor>,
+    /// Replace accumulated output only when a final snapshot was reported.
+    pub output: Option<String>,
+    /// Preserve final native file observations.
+    pub changes: crate::change::ProviderChangeSet,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Load old failed tools while keeping their native diagnostic details private.
+    /// Reject obsolete raw diagnostics and round-trip only the canonical sanitized failure.
     #[test]
-    fn legacy_tool_diagnostics_are_normalized_on_load() {
+    fn tool_diagnostics_reject_legacy_fields_and_preserve_typed_sanitized_values() {
         for code in [serde_json::Value::Null, serde_json::json!("native-code")] {
-            let diagnostic: ToolDiagnostic = serde_json::from_value(serde_json::json!({
-                "code":code,"message":"private native error"
-            }))
-            .unwrap();
-            assert_eq!(diagnostic.kind, crate::error::ProviderFailureKind::Unknown);
-            let serialized = serde_json::to_string(&diagnostic).unwrap();
-            assert!(!serialized.contains("private native"));
-            assert!(!serialized.contains("native-code"));
-            assert_eq!(
-                serde_json::from_str::<ToolDiagnostic>(&serialized).unwrap(),
-                diagnostic
+            assert!(
+                serde_json::from_value::<ToolDiagnostic>(serde_json::json!({
+                    "code":code,"message":"private native error"
+                }))
+                .is_err()
             );
         }
-        assert!(
-            serde_json::from_value::<ToolDiagnostic>(
-                serde_json::json!({"message":"missing category"})
-            )
-            .is_err()
+        let diagnostic = ToolDiagnostic {
+            kind: crate::error::ProviderFailureKind::Runtime,
+            message: crate::diagnostic::SanitizedMessage::new("Tool execution failed").unwrap(),
+        };
+        let serialized = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ToolDiagnostic>(&serialized).unwrap(),
+            diagnostic
         );
-        assert!(
-            serde_json::from_value::<ToolDiagnostic>(serde_json::json!({
-                "kind":"invalid", "code":null, "message":"bad current category"
-            }))
-            .is_err()
-        );
+        assert!(!serialized.contains("private native"));
+        assert!(!serialized.contains("native-code"));
+        for invalid in [
+            serde_json::json!({"message":"missing category"}),
+            serde_json::json!({"kind":"invalid", "message":"bad current category"}),
+            serde_json::json!({"kind":"runtime", "code":"native-code", "message":"Tool execution failed"}),
+        ] {
+            assert!(serde_json::from_value::<ToolDiagnostic>(invalid).is_err());
+        }
     }
 
     /// Preserve the existing denial wire shape while validating its diagnostic text.

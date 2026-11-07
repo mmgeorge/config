@@ -9,6 +9,87 @@ use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
 };
 
+/// Retain exact request identity and generation for operation-scoped native warnings.
+#[derive(Default)]
+pub(crate) struct OperationRegistry {
+    records: std::sync::Mutex<std::collections::HashMap<OperationId, RegisteredOperation>>,
+}
+impl OperationRegistry {
+    /// Register the original request before native work is polled; reject identity reassignment.
+    pub(crate) fn register(
+        &self,
+        id: OperationId,
+        scope: forge_provider_api::EventScope,
+        binding: Option<forge_provider_api::BindingId>,
+    ) -> Result<(), ProviderError> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| operation_ownership_failure())?;
+        if let Some(original) = records.get(&id) {
+            if original.scope == scope && (original.binding == binding || binding.is_none()) {
+                return Ok(());
+            }
+            return Err(operation_ownership_failure());
+        }
+        records.insert(id, RegisteredOperation { scope, binding });
+        Ok(())
+    }
+    /// Attach the returned generation only to the exact request which opened it.
+    pub(crate) fn bind_open(
+        &self,
+        id: &OperationId,
+        binding: forge_provider_api::BindingId,
+    ) -> Result<(), ProviderError> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| operation_ownership_failure())?;
+        let original = records
+            .get_mut(id)
+            .ok_or_else(operation_ownership_failure)?;
+        if original
+            .binding
+            .as_ref()
+            .is_some_and(|original| original != &binding)
+        {
+            return Err(operation_ownership_failure());
+        }
+        original.binding = Some(binding);
+        Ok(())
+    }
+    /// Resolve only a registered operation under its original owner and binding generation.
+    pub(crate) fn resolve(
+        &self,
+        id: &OperationId,
+        binding: &forge_provider_api::BindingId,
+        owner: &forge_provider_api::ThreadOwner,
+    ) -> Result<forge_provider_api::EventScope, forge_provider_api::events::EventDeliveryError>
+    {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| operation_warning_conflict())?;
+        let original = records.get(id).ok_or_else(operation_warning_conflict)?;
+        if original.binding.as_ref() != Some(binding) || original.scope.owner() != owner {
+            return Err(operation_warning_conflict());
+        }
+        Ok(forge_provider_api::EventScope::SessionOperation {
+            owner: owner.clone(),
+            operation_id: id.clone(),
+        })
+    }
+}
+struct RegisteredOperation {
+    scope: forge_provider_api::EventScope,
+    binding: Option<forge_provider_api::BindingId>,
+}
+/// Preserve the original host scope and native generation of one operation request.
+pub(super) struct OperationTarget {
+    pub(super) scope: forge_provider_api::EventScope,
+    pub(super) binding: Option<forge_provider_api::BindingId>,
+}
+
 /// Preserve an owned successful result until its caller handles failed completion evidence.
 pub(super) struct ObservedResult<T> {
     pub(super) result: Result<T, ProviderError>,
@@ -27,13 +108,13 @@ pub(super) enum ObservationPurpose {
 pub(crate) fn operation_timeout(operation: ProviderOperation) -> Option<Duration> {
     match operation {
         // Some native protocols acknowledge acceptance only when generation ends.
-        ProviderOperation::InputSubmit | ProviderOperation::InputSteer => None,
-        ProviderOperation::Cancel => Some(Duration::from_secs(30)),
-        ProviderOperation::SessionClose | ProviderOperation::Shutdown => {
+        ProviderOperation::TurnStart | ProviderOperation::TurnSteer => None,
+        ProviderOperation::TurnInterrupt => Some(Duration::from_secs(30)),
+        ProviderOperation::ThreadClose | ProviderOperation::Shutdown => {
             Some(Duration::from_secs(120))
         }
-        ProviderOperation::SessionOpen
-        | ProviderOperation::SessionConfigure
+        ProviderOperation::ThreadOpen
+        | ProviderOperation::ThreadConfigure
         | ProviderOperation::Authenticate
         | ProviderOperation::Inspect
         | ProviderOperation::ModelList
@@ -42,8 +123,8 @@ pub(crate) fn operation_timeout(operation: ProviderOperation) -> Option<Duration
         | ProviderOperation::TerminalList => Some(Duration::from_secs(30)),
         // These existing limits still require a separate policy decision.
         // They are neither generation nor discovery/whole-binding cleanup operations.
-        ProviderOperation::SessionFork
-        | ProviderOperation::SessionCompact
+        ProviderOperation::ThreadFork
+        | ProviderOperation::ThreadCompact
         | ProviderOperation::InputReconcile
         | ProviderOperation::InputRetract
         | ProviderOperation::TerminalTerminate => Some(Duration::from_secs(120)),
@@ -72,7 +153,7 @@ impl OperationControl {
         let id = OperationId::new(uuid::Uuid::new_v4().to_string())?;
         let (cancellation, observer) = OperationCancellation::channel();
         Ok(Self {
-            operation: ProviderOperation::Cancel,
+            operation: ProviderOperation::TurnInterrupt,
             context: OperationContext::unbounded(id, observer),
             cancellation,
         })
@@ -132,7 +213,7 @@ impl Drop for OperationObservation {
     fn drop(&mut self) {
         if !self.responded {
             self.trace.record(
-                self.target.owner().session_id.as_str(),
+                self.target.owner().session_id().as_str(),
                 "provider.operation.observation_detached",
                 serde_json::json!({
                     "operation_id": self.id.as_str(), "operation": self.operation,
@@ -159,8 +240,10 @@ pub(crate) async fn observe<T>(
         core,
         operation,
         context,
-        target,
-        binding,
+        OperationTarget {
+            scope: target,
+            binding,
+        },
         ObservationPurpose::Admission,
         work,
     )
@@ -181,21 +264,33 @@ pub(super) async fn observe_owned<T>(
     core: &CoreEventLog,
     operation: ProviderOperation,
     context: &OperationContext,
-    target: forge_provider_api::EventScope,
-    binding: Option<forge_provider_api::BindingId>,
+    target: OperationTarget,
     purpose: ObservationPurpose,
     work: impl Future<Output = Result<T, ProviderError>>,
 ) -> ObservedResult<T> {
+    let OperationTarget {
+        scope: target,
+        binding,
+    } = target;
+    if let Err(error) =
+        core.operations()
+            .register(context.id().clone(), target.clone(), binding.clone())
+    {
+        return ObservedResult {
+            result: Err(error),
+            completion_failure: None,
+        };
+    }
     let identity = CoreOperation::Provider {
         id: context.id().clone(),
         kind: operation,
         binding: binding.clone(),
         scope: target.clone(),
-        invocation: target.invocation().cloned(),
+        invocation: target.invocation().cloned().map(Box::new),
     };
     let start_failure = core
         .append(
-            target.owner().session_id.as_str(),
+            target.owner().session_id().as_str(),
             &CoreRecord::OperationStarted {
                 operation: identity.clone(),
             },
@@ -205,8 +300,8 @@ pub(super) async fn observe_owned<T>(
         && matches!(purpose, ObservationPurpose::Admission)
         && !matches!(
             operation,
-            ProviderOperation::Cancel
-                | ProviderOperation::SessionClose
+            ProviderOperation::TurnInterrupt
+                | ProviderOperation::ThreadClose
                 | ProviderOperation::Shutdown
                 | ProviderOperation::TerminalTerminate
         )
@@ -220,7 +315,7 @@ pub(super) async fn observe_owned<T>(
         };
     }
     trace.record(
-        target.owner().session_id.as_str(),
+        target.owner().session_id().as_str(),
         "provider.operation.started",
         serde_json::json!({
             "operation_id": context.id().as_str(), "operation": operation,
@@ -242,13 +337,13 @@ pub(super) async fn observe_owned<T>(
         Err(error) => match primary_failure(error) {
             Some(failure) => CoreOutcome::ProviderFailed { failure },
             None => CoreOutcome::ProviderReason {
-                kind: super::lifecycle_error::diagnostic(operation, error).kind,
+                kind: super::lifecycle_error::diagnostic(operation, error).kind(),
             },
         },
     };
     let completion_log_failure = core
         .append(
-            observation.target.owner().session_id.as_str(),
+            observation.target.owner().session_id().as_str(),
             &CoreRecord::OperationCompleted {
                 operation: identity,
                 outcome,
@@ -259,20 +354,20 @@ pub(super) async fn observe_owned<T>(
         persistence_failure(
             operation,
             match operation {
-                ProviderOperation::InputSubmit
-                | ProviderOperation::InputSteer
+                ProviderOperation::TurnStart
+                | ProviderOperation::TurnSteer
                 | ProviderOperation::InputReconcile
                 | ProviderOperation::InputRetract
-                | ProviderOperation::SessionFork
-                | ProviderOperation::SessionCompact
-                | ProviderOperation::Cancel
+                | ProviderOperation::ThreadFork
+                | ProviderOperation::ThreadCompact
+                | ProviderOperation::TurnInterrupt
                 | ProviderOperation::TerminalTerminate
                 | ProviderOperation::Authenticate => {
                     forge_provider_api::FailureDisposition::Uncertain
                 }
-                ProviderOperation::SessionOpen
-                | ProviderOperation::SessionConfigure
-                | ProviderOperation::SessionClose
+                ProviderOperation::ThreadOpen
+                | ProviderOperation::ThreadConfigure
+                | ProviderOperation::ThreadClose
                 | ProviderOperation::Shutdown => {
                     forge_provider_api::FailureDisposition::Invalidated
                 }
@@ -286,11 +381,11 @@ pub(super) async fn observe_owned<T>(
             },
         )
     });
-    observation.trace.record(observation.target.owner().session_id.as_str(), "provider.operation.completed", serde_json::json!({
+    observation.trace.record(observation.target.owner().session_id().as_str(), "provider.operation.completed", serde_json::json!({
         "operation_id": observation.id.as_str(), "operation": operation,
         "scope": observation.target, "binding_id": observation.binding,
         "success": result.is_ok(),
-        "reason": result.as_ref().err().map(|error| super::lifecycle_error::diagnostic(operation, error).kind),
+        "reason": result.as_ref().err().map(|error| super::lifecycle_error::diagnostic(operation, error).kind()),
         "phase": failure.map(ProviderFailure::phase),
         "disposition": failure.map(ProviderFailure::disposition),
     }));
@@ -332,8 +427,101 @@ pub(super) fn primary_failure(error: &ProviderError) -> Option<ProviderFailure> 
     }
 }
 
+/// Reject operation identity reassignment before dispatch.
+fn operation_ownership_failure() -> ProviderError {
+    ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+}
+/// Reject an unregistered, foreign, or retired-generation operation warning.
+fn operation_warning_conflict() -> forge_provider_api::events::EventDeliveryError {
+    forge_provider_api::events::EventDeliveryError::Observation(
+        forge_provider_api::ObservationFailure::OwnershipConflict,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// Preserve exact operation attribution and reject foreign owners, IDs, and retired bindings.
+    #[test]
+    fn operation_warning_requires_original_request_and_binding() {
+        let registry = super::OperationRegistry::default();
+        let owner = forge_provider_api::ThreadOwner::root("owner");
+        let foreign = forge_provider_api::ThreadOwner::root("foreign");
+        let id = forge_provider_api::OperationId::new("configure").unwrap();
+        let binding = forge_provider_api::BindingId::new("binding").unwrap();
+        registry
+            .register(
+                id.clone(),
+                forge_provider_api::EventScope::Binding {
+                    owner: owner.clone(),
+                },
+                Some(binding.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.resolve(&id, &binding, &owner).unwrap(),
+            forge_provider_api::EventScope::SessionOperation {
+                owner: owner.clone(),
+                operation_id: id.clone()
+            }
+        );
+        assert!(registry.resolve(&id, &binding, &foreign).is_err());
+        assert!(
+            registry
+                .resolve(
+                    &id,
+                    &forge_provider_api::BindingId::new("retired").unwrap(),
+                    &owner
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .resolve(
+                    &forge_provider_api::OperationId::new("other").unwrap(),
+                    &binding,
+                    &owner
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .register(
+                    id,
+                    forge_provider_api::EventScope::Binding { owner: foreign },
+                    Some(binding)
+                )
+                .is_err()
+        );
+    }
+
+    /// Attach an opening request only to its exact returned binding generation.
+    #[test]
+    fn opening_operation_requires_exact_binding_result() {
+        let registry = super::OperationRegistry::default();
+        let owner = forge_provider_api::ThreadOwner::root("owner");
+        let id = forge_provider_api::OperationId::new("open").unwrap();
+        let binding = forge_provider_api::BindingId::new("binding").unwrap();
+        registry
+            .register(
+                id.clone(),
+                forge_provider_api::EventScope::Binding {
+                    owner: owner.clone(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(registry.resolve(&id, &binding, &owner).is_err());
+        registry.bind_open(&id, binding.clone()).unwrap();
+        assert!(registry.resolve(&id, &binding, &owner).is_ok());
+        assert!(
+            registry
+                .bind_open(
+                    &id,
+                    forge_provider_api::BindingId::new("different-generation").unwrap()
+                )
+                .is_err()
+        );
+    }
     use super::*;
 
     /// Preserve possible credential mutation when completion evidence cannot be committed.
@@ -342,13 +530,13 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         crate::exchange::core_log::persist_test_session(root.path(), "session")?;
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         database.execute_batch("CREATE TRIGGER reject_auth_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' BEGIN SELECT RAISE(ABORT,'fixture completion storage failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);
         let core = CoreEventLog::new(root.path().to_owned());
         let control = OperationControl::fresh(ProviderOperation::Authenticate)?;
         let scope = forge_provider_api::EventScope::SessionOperation {
-            owner: forge_provider_api::ExecutionOwner::root("session"),
+            owner: forge_provider_api::ThreadOwner::root("session"),
             operation_id: control.context().id().clone(),
         };
         let mut credentials_changed = false;
@@ -378,29 +566,27 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);
         trace.configure(false)?;
         let core = CoreEventLog::new(root.path().to_owned());
-        let control = OperationControl::fresh(ProviderOperation::InputSubmit)?;
+        let control = OperationControl::fresh(ProviderOperation::TurnStart)?;
         let context = control.context();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("session"),
+            forge_provider_api::ThreadOwner::root("session"),
             "exchange",
         );
-        let expected = ProviderFailure::new(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Transport,
-        )
-        .at_phase(
-            forge_provider_api::ProviderPhase::Observation,
-            forge_provider_api::FailureDisposition::Uncertain,
-        );
+        let expected =
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                );
         let error = observe(
             trace,
             &core,
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             &context,
             scope.clone().into(),
             Some(forge_provider_api::BindingId::new("binding")?),
@@ -412,9 +598,9 @@ mod tests {
         let encoded: String = database.query_row("SELECT record FROM owner_core_log WHERE json_extract(record,'$.record')='operation_completed'", [], |row| row.get(0))?;
         let record: CoreRecord = serde_json::from_str(&encoded)?;
         assert!(matches!(record, CoreRecord::OperationCompleted {
-            operation: CoreOperation::Provider { id, kind: ProviderOperation::InputSubmit, invocation: Some(invocation), .. },
+            operation: CoreOperation::Provider { id, kind: ProviderOperation::TurnStart, invocation: Some(invocation), .. },
             outcome: CoreOutcome::ProviderFailed { failure },
-        } if &id == context.id() && invocation == scope && failure == expected));
+        } if &id == context.id() && *invocation == scope && failure == expected));
         Ok(())
     }
 
@@ -424,28 +610,30 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         database.execute_batch("CREATE TRIGGER reject_operation_evidence BEFORE INSERT ON owner_core_log BEGIN SELECT RAISE(ABORT,'fixture core storage failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);
         trace.configure(false)?;
         let core = CoreEventLog::new(root.path().to_owned());
-        let context = OperationControl::fresh(ProviderOperation::Cancel)?.context();
+        let context = OperationControl::fresh(ProviderOperation::TurnInterrupt)?.context();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("session"),
+            forge_provider_api::ThreadOwner::root("session"),
             "exchange",
         );
         let called = std::sync::atomic::AtomicBool::new(false);
-        let expected =
-            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Transport)
-                .at_phase(
-                    forge_provider_api::ProviderPhase::Interruption,
-                    forge_provider_api::FailureDisposition::Uncertain,
-                );
+        let expected = ProviderFailure::new(
+            ProviderOperation::TurnInterrupt,
+            ProviderFailureKind::Transport,
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Interruption,
+            forge_provider_api::FailureDisposition::Uncertain,
+        );
         let error = observe(
             trace,
             &core,
-            ProviderOperation::Cancel,
+            ProviderOperation::TurnInterrupt,
             &context,
             scope.into(),
             None,

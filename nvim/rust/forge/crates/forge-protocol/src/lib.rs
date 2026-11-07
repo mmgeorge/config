@@ -13,7 +13,7 @@ pub mod outbound;
 pub mod snapshot;
 pub mod transfer;
 
-pub const WIRE_VERSION: u32 = 39;
+pub const WIRE_VERSION: u32 = 40;
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ACTIVE_REQUESTS: usize = 256;

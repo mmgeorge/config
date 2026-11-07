@@ -419,7 +419,7 @@ mod tests {
             .write_working_document("session", "plan", &document)
             .unwrap();
         std::fs::write(
-            crate::storage::state::directory(&temporary.path())
+            crate::storage::state::directory(temporary.path())
                 .join("plans/session/plan/revisions/submitted-0001.json"),
             serde_json::to_vec(&changed).unwrap(),
         )

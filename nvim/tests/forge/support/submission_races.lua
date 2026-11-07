@@ -8,15 +8,25 @@ return function(context)
       provider_errors[#provider_errors + 1] = payload.text
     end
   end)
+  local command = require("forge.command")
+  local original_dispatch = command.dispatch
+  -- Editor drafts the host has not yet acknowledged; acknowledged input lives in `confirmed`.
+  local function unacknowledged()
+    local count = 0
+    for _, draft in ipairs(state.input.drafts) do
+      if draft.draft_state == "pending" then count = count + 1 end
+    end
+    return count
+  end
   local function await(predicate, label)
     assert(vim.wait(10000, predicate, 10), label .. ": " .. vim.inspect({
-      pending = state.input.pending, confirmed = state.input.confirmed,
-      busy = state.busy, errors = context.errors,
+      drafts = state.input.drafts, confirmed = state.input.confirmed,
+      busy = require("forge.views.harness.activity").busy(state), errors = context.errors,
     }))
   end
   local function settled()
     await(function()
-      return not state.busy and not state.input.sending and #state.input.pending == 0
+      return not require("forge.views.harness.activity").busy(state) and unacknowledged() == 0
     end, "submission did not settle")
   end
   local function exchanges()
@@ -34,12 +44,15 @@ return function(context)
       if message.id == id then return message end
     end
   end
-  local function expect_attachment_failure(previous_errors)
-    await(function() return #provider_errors > 0 end, "missing attachment failure was not reported")
-    for _, diagnostic in ipairs(provider_errors) do
-      assert(diagnostic:find("attachment is unavailable", 1, true), diagnostic)
+  local function find_draft(id)
+    for _, draft in ipairs(state.input.drafts) do
+      if draft.id == id then return draft end
     end
-    provider_errors = {}
+  end
+  -- Admission rejection reaches the user through the Harness message notification, not a provider event.
+  local function expect_attachment_failure(previous_errors)
+    await(function() return #context.errors > previous_errors end, "missing attachment failure was not reported")
+    assert(#provider_errors == 0, "admission rejection was reported as a provider error")
     while #context.errors > previous_errors do
       local diagnostic = table.remove(context.errors)
       assert(diagnostic:find("attachment is unavailable", 1, true), diagnostic)
@@ -68,7 +81,10 @@ return function(context)
       assert(held:wait().prompt == prompt)
       await(function() return delayed ~= nil end, "admission acknowledgement did not arrive")
       local message_id = operation.action.message.id
-      await(function() return state.input.accepted[message_id] end, "provider acceptance was not projected")
+      await(function()
+        local message = find_message(message_id)
+        return message and message.delivery == "accepted"
+      end, "provider acceptance was not projected")
       vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Newer unsent draft " .. outcome })
       if outcome == "complete" then held:release() settled()
       elseif outcome == "cancel" then controller.cancel_turn() settled() end
@@ -84,6 +100,8 @@ return function(context)
       if outcome == "active" then held:release() settled() end
     end
 
+    -- Lose the host's submit response beneath the shared command reconciler, so recovery must read
+    -- the command journal instead of resending the mutation.
     local lost_hold = context.mock.hold(state.session.id, "chat")
     local lost_operation, submissions, lookups = nil, 0, 0
     local prior_errors = #context.errors
@@ -91,31 +109,29 @@ return function(context)
       if owner == state and update.operation_id == lost_operation and lookups == 0 then return end
       return original_receive(owner, update)
     end
-    client.request = function(request_specification, callback)
-  local session_id = request_specification.session_id
-  local method = request_specification.method
-  local parameters = request_specification.params or {}
-
-      if method == "session.input.apply" and parameters.action.kind == "submit" then
-        submissions = submissions + 1
-        lost_operation = parameters.id
-        return original_request(request_specification, function()
-          callback(nil, "Injected acknowledgement loss", { code = "outcome_unknown" })
-        end)
-      elseif method == "session.input.operation.get" then
-        lookups = lookups + 1
+    command.dispatch = function(transport, session_id, method, params, callback, owned_command)
+      local function lossy(target_session, target_method, request, receive, sending)
+        if target_method == "session.input.apply" and request.action.kind == "submit" then
+          submissions = submissions + 1
+          lost_operation = request.id
+          return transport(target_session, target_method, request, function()
+            receive(nil, "Injected acknowledgement loss", { code = "outcome_unknown" })
+          end, sending)
+        elseif target_method == "session.command.status.get" then
+          lookups = lookups + 1
+        end
+        return transport(target_session, target_method, request, receive, sending)
       end
-      return original_request(request_specification, callback)
+      return original_dispatch(lossy, session_id, method, params, callback, owned_command)
     end
     context.compose_and_press("Recover a lost admission acknowledgement", "<C-s>")
     lost_hold:wait()
-    await(function() return lookups == 1 and #state.input.pending == 0 end,
-      "missing acknowledgement was not reconciled through the operation journal")
-    client.request, input.receive = original_request, original_receive
+    await(function() return lookups >= 1 and unacknowledged() == 0 end,
+      "missing acknowledgement was not reconciled through the command journal")
+    command.dispatch, input.receive = original_dispatch, original_receive
     assert(submissions == 1, "unknown delivery was resubmitted instead of reconciled")
-    while #context.errors > prior_errors do
-      assert(table.remove(context.errors):find("Injected acknowledgement loss", 1, true))
-    end
+    assert(#context.errors == prior_errors, "a reconciled acknowledgement was reported as a failure: "
+      .. table.concat(context.errors, "\n"))
     lost_hold:release()
     settled()
     assert_once("Recover a lost admission acknowledgement")
@@ -123,7 +139,8 @@ return function(context)
     local held = context.mock.hold(state.session.id, "chat")
     local dropped, delayed_snapshot
     input.receive = function(owner, update)
-      if owner == state and not dropped and update.upsert[1] and update.upsert[1].delivery == "delivering" then
+      if owner == state and not dropped and update.upsert and update.upsert[1]
+        and update.upsert[1].delivery == "delivering" then
         dropped = vim.deepcopy(update)
         return
       end
@@ -145,12 +162,12 @@ return function(context)
     context.compose_and_press("Recover a missing input delta", "<C-s>")
     assert(held:wait().prompt == "Recover a missing input delta")
     await(function()
-      return dropped and #state.input.pending == 0 and #state.pending_submit == 0
+      return dropped and unacknowledged() == 0 and #state.pending_submit == 0
     end, "complete publication did not recover the missing input event")
     input.refresh(state)
     await(function() return delayed_snapshot ~= nil end, "explicit snapshot did not arrive")
     held:release()
-    await(function() return not state.busy end, "provider did not finish during snapshot recovery")
+    await(function() return not require("forge.views.harness.activity").busy(state) end, "provider did not finish during snapshot recovery")
     await(function() return #state.input.confirmed == 0 end, "completed input did not leave the queue")
     local completed_revision = state.input.revision
     client.request, input.receive = original_request, original_receive
@@ -163,44 +180,47 @@ return function(context)
       "reordered input delta revived a delivered prompt")
     assert_once("Recover a missing input delta")
 
+    -- The host validates retained attachments before admission, so an unavailable attachment never
+    -- enters the host queue. Its text stays recoverable as an editor-owned rejected draft, which is
+    -- never eligible for delivery and therefore cannot hold later input behind it.
     local previous_errors, before = #context.errors, #exchanges()
     local failed_id = input.submit(state, "Unavailable attachment [File #1]", {
       { id = string.rep("0", 64), name = "missing.txt", media_type = "text/plain",
         label = "[File #1]", start = 23, ["end"] = 32 },
     }, "auto")
-    await(function() local message = find_message(failed_id) return message and message.delivery == "failed" end,
-      "attachment failure did not remain recoverable")
+    await(function() local draft = find_draft(failed_id) return draft and draft.draft_state == "rejected" end,
+      "attachment rejection did not remain recoverable")
     expect_attachment_failure(previous_errors)
+    assert(not find_message(failed_id) and #exchanges() == before, "an unavailable attachment was admitted")
     local follower = context.mock.hold(state.session.id, "chat")
-    context.compose_and_press("Blocked behind failed attachment", "<C-q>")
-    await(function() return #state.input.pending == 0 and #state.queue == 2 end, "follower was not retained")
-    assert(#exchanges() == before, "follower bypassed unresolved failure")
-    local failed_revision = find_message(failed_id).revision
-    input.retry(state, find_message(failed_id))
-    await(function()
-      local message = find_message(failed_id)
-      return message and message.revision > failed_revision and message.delivery == "failed"
-    end, "retry did not settle on the same failed message")
-    expect_attachment_failure(previous_errors)
-    assert(#state.queue == 2 and #exchanges() == before, "failed retry duplicated or dispatched input")
-    input.perform(state, { kind = "remove", id = failed_id })
-    assert(follower:wait().prompt == "Blocked behind failed attachment")
+    context.compose_and_press("Proceeds past a rejected draft", "<C-s>")
+    assert(follower:wait().prompt == "Proceeds past a rejected draft")
     follower:release()
     settled()
-    assert_once("Blocked behind failed attachment")
+    assert_once("Proceeds past a rejected draft")
+    assert(find_draft(failed_id).draft_state == "rejected", "later input discarded the rejected draft")
+    input.retry(state, find_draft(failed_id))
+    await(function()
+      local draft = find_draft(failed_id)
+      return draft and draft.draft_state == "rejected" and unacknowledged() == 0
+    end, "retry did not settle on the same rejected draft")
+    expect_attachment_failure(previous_errors)
+    assert(#exchanges() == before + 1, "a rejected retry dispatched input")
+    input.discard_rejected(state, failed_id)
+    assert(not find_draft(failed_id) and #state.queue == 0, "discarding the rejected draft left it queued")
 
     local active = context.mock.hold(state.session.id, "chat")
     context.compose_and_press("Finish while the next prompt is reserved", "<C-s>")
     active:wait()
     context.compose_and_press("Reserved follow-up", "<C-q>")
-    await(function() return #state.input.pending == 0 and #state.queue == 1 end, "queued edit target missing")
+    await(function() return unacknowledged() == 0 and #state.queue == 1 end, "queued edit target missing")
     local reserved_id = state.queue[1].id
     controller.edit_queued(-1)
-    await(function() return #state.input.pending == 0 and find_message(reserved_id).reservation end,
+    await(function() return unacknowledged() == 0 and find_message(reserved_id).reservation end,
       "edit reservation was not acknowledged")
     local reserved = vim.deepcopy(find_message(reserved_id))
     active:release()
-    await(function() return not state.busy end, "active response did not finish")
+    await(function() return not require("forge.views.harness.activity").busy(state) end, "active response did not finish")
     assert(find_message(reserved_id).reservation == reserved.reservation,
       "turn completion consumed a reserved prompt")
     local edited = context.mock.hold(state.session.id, "chat")
@@ -220,7 +240,7 @@ return function(context)
     context.compose_and_press("Hold while submitting identical text twice", "<C-s>")
     repeated_active:wait()
     for _ = 1, 2 do context.compose_and_press("Intentionally repeated prompt", "<C-q>") end
-    await(function() return #state.input.pending == 0 and #state.queue == 2 end,
+    await(function() return unacknowledged() == 0 and #state.queue == 2 end,
       "identical text was deduplicated before delivery")
     local first_id, second_id = state.queue[1].id, state.queue[2].id
     assert(first_id ~= second_id, "separate submissions reused a message identity")
@@ -259,7 +279,9 @@ return function(context)
     secondary:release()
     await(function() return secondary_finished end, "another session waited for the primary response")
     assert(not secondary_error, secondary_error)
-    assert(state.busy and primary:wait().prompt == "Primary session remains active",
+    assert(require("forge.views.harness.activity").busy(state), "secondary completion cleared the primary session's activity: "
+      .. vim.inspect({ status = state.status, session = state.session and state.session.id }))
+    assert(primary:wait().prompt == "Primary session remains active",
       "secondary completion changed primary execution ownership")
     for _, exchange in ipairs(exchanges()) do
       assert(exchange.prompt ~= "Independent secondary request", "secondary transcript leaked into the primary session")
@@ -269,7 +291,7 @@ return function(context)
     assert(#context.errors == previous_errors, table.concat(context.errors, "\n"))
     print("submission_races: late/duplicate/lost acknowledgements, cancellation, missing events, stale snapshots, failed retries, blocking, reservations, independent sessions passed")
   end, debug.traceback)
-  client.request, input.receive = original_request, original_receive
+  client.request, input.receive, command.dispatch = original_request, original_receive, original_dispatch
   unsubscribe()
   assert(success, failure)
 end

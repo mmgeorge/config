@@ -42,7 +42,8 @@ for _, scenario in ipairs({
   { busy = true, task_operation = { action = "configure", state = "accepted" } },
   { busy = true, status = { kind = "waiting_for_agent", agent_count = 2 } },
 }) do
-  state.busy, state.configuring = scenario.busy, scenario.configuring
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, scenario.busy)
+  state.configuring = scenario.configuring
   state.task_operation, state.status = scenario.task_operation, scenario.status
   state.capability = { native_steer = scenario.native_steer }
   submitted("Follow up through server admission", "auto", controller.submit)
@@ -78,11 +79,19 @@ assert(cancellation.request.method == "session.turn.cancel"
   and cancellation.request.params.restore_prompt_if_no_output == true)
 assert(text() == "Keep my unsent draft" and #host.requests == before
   and vim.deep_equal(state.queue, retained))
+-- The session owner joins a cancellation issued during cleanup with the one already collecting,
+-- so Lua forwards it under its own identity instead of predicting host execution state.
 local control_count = #controls
 controller.cancel_turn()
-assert(#transitions == transition_count and #controls == control_count,
-  "duplicate cancellation was submitted during cleanup")
+local repeated = controls[#controls]
+assert(#transitions == transition_count and #controls == control_count + 1
+  and repeated.request.method == "session.turn.cancel",
+  "cancellation during cleanup was not forwarded to the session owner")
+assert(repeated.request.params.operation_id ~= cancellation.request.params.operation_id,
+  "repeated cancellation reused the first cancellation identity")
+assert(text() == "Keep my unsent draft" and #host.requests == before and vim.deep_equal(state.queue, retained))
 cancellation.callback({ cancel_requested = true })
+repeated.callback({ cancel_requested = true })
 assert(text() == "Keep my unsent draft" and vim.deep_equal(state.queue, retained))
 
 local child_action

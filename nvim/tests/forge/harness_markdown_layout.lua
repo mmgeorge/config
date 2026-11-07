@@ -9,7 +9,9 @@ if vim.g.forge_markdown_layout_child then
   vim.bo[owner.buffer].filetype = "ForgeHarness"
   vim.wo.number, vim.wo.relativenumber = false, false
   vim.wo.foldcolumn = "0"
-  vim.wo.signcolumn, vim.wo.statuscolumn, vim.wo.winbar = "yes:1", "%s", ""
+  vim.wo.signcolumn, vim.wo.winbar = "yes:1", ""
+  -- Harness timeline views draw fold and content markers through the shared node status column.
+  vim.wo.statuscolumn = "%{%v:lua.require'forge.nodes'.sign()%}"
   vim.wo.wrap, vim.wo.linebreak, vim.wo.breakindent = true, true, true
   vim.o.showtabline, vim.o.laststatus = 0, 0
   local lines = {
@@ -112,8 +114,9 @@ local function verify_layout(width)
   end, 20)
   local screen_lines = capture()
   local screen = table.concat(screen_lines, "\n")
-  assert(screen_lines[1]:find("▸ what day is it?", 1, true) == 1, "prompt marker is indented:\n" .. screen)
-  assert(screen_lines[2]:find("▸ Thought for 3s", 1, true) == 1, "summary marker is indented:\n" .. screen)
+  -- Fold markers reflect expansion state; these headings own no folded body, so they display expanded.
+  assert(screen_lines[1]:find("▾ what day is it?", 1, true) == 1, "prompt marker is indented:\n" .. screen)
+  assert(screen_lines[2]:find("▾ Thought for 3s", 1, true) == 1, "summary marker is indented:\n" .. screen)
   assert(screen_lines[3]:find("  It is Thursday.", 1, true) == 1, "response lost its blank gutter:\n" .. screen)
   local indent = vim.g.forge_markdown_layout_indent or 2
   assert(screen_lines[4]:find("○ Commentary", 1, true) == indent - 1, "commentary marker/content offset differs:\n" .. screen)
@@ -151,10 +154,20 @@ local passed, failure = pcall(function()
   local function expect_equation(row, source)
     vim.rpcrequest(job, "nvim_exec_lua", "vim.api.nvim_win_set_cursor(0, {..., 0})", { row })
     assert(vim.wait(3000, function()
-      local screen = table.concat(capture(), "\n")
-      local opening = screen:find("\\[", 1, true) ~= nil
+      local screen_lines = capture()
+      local screen = table.concat(screen_lines, "\n")
+      -- A delimiter row is revealed when it occupies its own screen row. Markdown treats `\[` as a
+      -- backslash escape, and nvim-treesitter's markdown_inline query conceals that backslash even
+      -- on the cursor row, so the row may display as `[` rather than `\[`.
+      local function delimiter_row(delimiter)
+        for _, line in ipairs(screen_lines) do
+          if line:match("^%s*\\?%" .. delimiter .. "%s*$") then return true end
+        end
+        return false
+      end
+      local opening = delimiter_row("[")
       local body = screen:find("\\int", 1, true) ~= nil
-      local closing = screen:find("\\]", 1, true) ~= nil
+      local closing = delimiter_row("]")
       local rendered = screen:find("⌠", 1, true) ~= nil
       return opening == source and body == source and closing == source and rendered ~= source
     end, 20), "equation reveal was partial at source row " .. row)

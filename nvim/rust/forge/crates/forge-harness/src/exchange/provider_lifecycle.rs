@@ -1,8 +1,12 @@
-//! Prepare native initialization through a weak service callback and commit it in the owner.
+//! Prepare provider observation through a weak service callback and commit it in the owner.
+//!
+//! Startup never allocates a native conversation. An interactive session attaches its
+//! observation listener and registers its root owner, then `ProviderBridge::turn_start` opens
+//! or resumes the native conversation under admission when the first input needs it.
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use crate::provider::{Provider, ProviderRequest};
+use crate::provider::Provider;
 
 /// Retain a provider initialization future in the exchange owner's active stage.
 pub(crate) type ProviderInitializationFuture =
@@ -30,46 +34,25 @@ impl ProviderLifecycle {
     }
 }
 
-/// Carry initialized native identity back to the owner for a guarded domain commit.
+/// Carry the prepared provider generation back to the owner for a guarded commit.
 pub(crate) enum ProviderInitialization {
-    /// This session purpose has no persistent interactive native initialization.
+    /// This session purpose has no persistent interactive native conversation.
     NotRequired { provider: Arc<Provider> },
-    /// Native initialization completed for the exact captured settings and provider.
-    Ready {
-        provider: Arc<Provider>,
-        request: Box<ProviderRequest>,
-        provider_session_id: Option<forge_provider_api::ProviderSessionId>,
-    },
+    /// Observation is attached; the native conversation opens on first provider work.
+    Deferred { provider: Arc<Provider> },
 }
 
 impl ProviderInitialization {
-    /// Commit initialized metadata only while the captured provider remains current.
+    /// Accept the prepared generation only while it remains the broker's current provider.
     pub(crate) fn commit(
         self,
-        broker: &mut crate::broker::HarnessBroker,
-    ) -> Result<Option<crate::broker::BrokerSnapshot>, ProviderLifecycleFailure> {
-        let provider = match &self {
-            Self::NotRequired { provider } | Self::Ready { provider, .. } => provider,
-        };
+        broker: &crate::broker::HarnessBroker,
+    ) -> Result<(), ProviderLifecycleFailure> {
+        let (Self::NotRequired { provider } | Self::Deferred { provider }) = &self;
         if !Arc::ptr_eq(provider, &broker.provider_handle()) {
             return Err(ProviderLifecycleFailure::GenerationChanged);
         }
-        match self {
-            Self::NotRequired { .. }
-            | Self::Ready {
-                provider_session_id: None,
-                ..
-            } => Ok(None),
-            Self::Ready {
-                request,
-                provider_session_id: Some(id),
-                ..
-            } => broker
-                .retain_initialized_session(&request, id.into())
-                .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?
-                .map(Some)
-                .ok_or(ProviderLifecycleFailure::GenerationChanged),
-        }
+        Ok(())
     }
 }
 

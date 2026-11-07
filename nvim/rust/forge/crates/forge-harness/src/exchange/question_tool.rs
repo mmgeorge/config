@@ -146,7 +146,7 @@ fn validate_live_source(
 ) -> Result<(), QuestionEventError> {
     // A fast callback can reach owner intake before its native TurnStarted observation.
     if live_scope != Some(scope)
-        || scope.owner.session_id.as_str() != session
+        || scope.owner.session_id().as_str() != session
         || source.session_id != session
     {
         return Err(QuestionEventError::ForeignScope);
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn question_admission_precedes_native_turn_observation() {
         let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("session"),
+            crate::provider::ThreadOwner::root("session"),
             "exchange",
         );
         let mut source = crate::exchange::Exchange {
@@ -204,7 +204,7 @@ mod tests {
             archived_output: Default::default(),
             input_message_id: None,
             provider_retry: None,
-            agent_id: scope.owner.agent_id.to_string(),
+            agent_id: scope.owner.agent_id().to_string(),
             id: "exchange".into(),
             session_id: "session".into(),
             ordinal: 1,
@@ -218,6 +218,7 @@ mod tests {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,

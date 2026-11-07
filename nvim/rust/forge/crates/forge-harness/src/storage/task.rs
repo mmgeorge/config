@@ -827,7 +827,7 @@ pub struct Owner;
         changed.version += 1;
         changed.overview = "The live worker has written this pending edit.".into();
         files.write_working_mutation_guarded(&prior, &original, &changed)?;
-        let journal = crate::storage::state::directory(&root.path())
+        let journal = crate::storage::state::directory(root.path())
             .join("plans/session")
             .join(&id)
             .join("artifact-recovery.json");
@@ -954,7 +954,7 @@ pub struct Owner;
                 target.document_version,
             )?;
             target.review_digest = Some(digest);
-            let journal = crate::storage::state::directory(&root.path())
+            let journal = crate::storage::state::directory(root.path())
                 .join("plans/session")
                 .join(&id)
                 .join("artifact-recovery.json");

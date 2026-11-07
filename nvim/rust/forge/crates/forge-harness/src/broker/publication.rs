@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::provider::{ApprovalUpdate, ProviderDiagnostic, ProviderEvent, RuntimeUpdate};
+use crate::provider::PermissionApprovalEvent;
+use crate::provider::{HarnessEvent, ProviderEvent};
 
 impl super::HarnessBroker {
     /// Consume the prompt token once and retain its ordered admission publication.
@@ -31,14 +32,48 @@ impl super::HarnessBroker {
     }
 }
 
+/// Classify a presentation diagnostic without granting lifecycle authority.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+/// Preserve typed failure category and its original operational and native owners.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiagnosticView {
+    pub kind: forge_provider_api::ProviderFailureKind,
+    pub message: forge_provider_api::SanitizedMessage,
+    pub severity: DiagnosticSeverity,
+    pub scope: crate::provider::EventScope,
+    pub native_scope: forge_provider_api::WarningScope,
+}
+impl DiagnosticView {
+    /// Present a typed failure at its original native address.
+    pub fn failure(
+        scope: crate::provider::EventScope,
+        native_scope: forge_provider_api::WarningScope,
+        failure: &forge_provider_api::ProviderFailure,
+    ) -> Self {
+        Self {
+            kind: failure.kind(),
+            message: forge_provider_api::SanitizedMessage::new(failure.to_string())
+                .expect("typed failure display is nonempty"),
+            severity: DiagnosticSeverity::Error,
+            scope,
+            native_scope,
+        }
+    }
+}
+
 pub enum LiveUpdate {
     StateChanged,
-    Observation(Box<ProviderEvent>),
+    Observation(Box<HarnessEvent>),
     Notification(Box<SessionUpdate>),
 }
 
-impl From<ProviderEvent> for LiveUpdate {
-    fn from(event: ProviderEvent) -> Self {
+impl From<HarnessEvent> for LiveUpdate {
+    fn from(event: HarnessEvent) -> Self {
         Self::Observation(Box::new(event))
     }
 }
@@ -64,7 +99,9 @@ pub enum SessionUpdate {
         transition: SubmissionUpdate,
     },
     Approval {
-        update: Box<ApprovalUpdate>,
+        execution_owner: crate::provider::ThreadOwner,
+        execution_kind: crate::provider::ApprovalExecutionKind,
+        update: Box<PermissionApprovalEvent>,
     },
     Agent {
         snapshot: super::AgentSnapshot,
@@ -108,7 +145,7 @@ pub enum SessionUpdate {
         progress: forge_provider_api::CleanupProgress,
     },
     Diagnostic {
-        diagnostic: ProviderDiagnostic,
+        diagnostic: DiagnosticView,
     },
     CheckFailure {
         run_id: String,
@@ -169,59 +206,133 @@ pub struct PlanProgressUpdate {
 }
 
 impl SessionUpdate {
-    pub fn from_observation(event: &ProviderEvent) -> Option<Self> {
-        match event {
-            ProviderEvent::Terminals { snapshot, .. } => Some(Self::Terminals {
-                snapshot: snapshot.clone(),
-            }),
-            ProviderEvent::Approval { update, .. } => Some(Self::Approval {
-                update: Box::new(update.clone()),
-            }),
-            ProviderEvent::Runtime {
-                scope,
-                update: RuntimeUpdate::Resolved { runtime },
-            } => Some(Self::Runtime {
-                session_id: scope.owner.session_id.to_string(),
-                runtime: runtime.clone(),
-            }),
-            ProviderEvent::Runtime {
-                update: RuntimeUpdate::ContextUsage { usage },
-                ..
-            } => Some(Self::ContextUsage {
-                usage: usage.clone(),
-            }),
-            ProviderEvent::Diagnostic { diagnostic, .. } => Some(Self::Diagnostic {
-                diagnostic: diagnostic.clone(),
-            }),
-            ProviderEvent::Turn {
-                address,
-                update: crate::provider::TurnUpdate::Started { .. },
-            } => Some(Self::TurnStarted {
-                address: address.clone(),
-            }),
-            ProviderEvent::Settled { .. }
-            | ProviderEvent::SettlementFailed { .. }
-            | ProviderEvent::CapabilitiesChanged { .. }
-            | ProviderEvent::SessionIdentity { .. }
-            | ProviderEvent::Execution { .. }
-            | ProviderEvent::Message { .. }
-            | ProviderEvent::Tool { .. }
-            | ProviderEvent::Turn { .. }
-            | ProviderEvent::Usage { .. }
-            | ProviderEvent::Runtime { .. }
-            | ProviderEvent::Compaction { .. }
-            | ProviderEvent::Agent { .. }
-            | ProviderEvent::Checklist { .. }
-            | ProviderEvent::DirectoryAccess { .. }
-            | ProviderEvent::InputAccepted { .. }
-            | ProviderEvent::Retry { .. }
-            | ProviderEvent::ParentBoundary { .. } => None,
+    /// Project already attributed native and host observations into editor notifications.
+    pub fn from_observation(observation: &HarnessEvent) -> Option<Self> {
+        use crate::provider::HostEvent;
+        use forge_provider_api::{ProviderConnectionEvent, ThreadEvent, TurnEvent};
+        match observation {
+            HarnessEvent::Native { scope, event, .. } => match event.as_ref() {
+                ProviderEvent::Provider { event } => match event {
+                    ProviderConnectionEvent::CapabilitiesChanged(_) => None,
+                    ProviderConnectionEvent::Warning(warning) => Some(Self::Diagnostic {
+                        diagnostic: DiagnosticView {
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: warning.message.clone(),
+                            severity: DiagnosticSeverity::Warning,
+                            scope: scope.clone(),
+                            native_scope: warning.scope.clone(),
+                        },
+                    }),
+                    ProviderConnectionEvent::Unavailable(unavailable) => Some(Self::Diagnostic {
+                        diagnostic: DiagnosticView {
+                            kind: unavailable.failure.kind(),
+                            message: unavailable.message.clone(),
+                            severity: DiagnosticSeverity::Error,
+                            scope: scope.clone(),
+                            native_scope: forge_provider_api::WarningScope::Provider,
+                        },
+                    }),
+                },
+                ProviderEvent::Thread { thread_id, event } => match event {
+                    ThreadEvent::Error { error } => Some(Self::Diagnostic {
+                        diagnostic: DiagnosticView::failure(
+                            scope.clone(),
+                            forge_provider_api::WarningScope::Thread {
+                                thread_id: thread_id.clone(),
+                            },
+                            error,
+                        ),
+                    }),
+                    ThreadEvent::TerminalsUpdated(Ok(snapshot)) => Some(Self::Terminals {
+                        snapshot: snapshot.clone(),
+                    }),
+                    ThreadEvent::TerminalsUpdated(Err(error)) => Some(Self::Diagnostic {
+                        diagnostic: DiagnosticView::failure(
+                            scope.clone(),
+                            forge_provider_api::WarningScope::Thread {
+                                thread_id: thread_id.clone(),
+                            },
+                            error,
+                        ),
+                    }),
+                    ThreadEvent::ContextUsage(usage) => Some(Self::ContextUsage {
+                        usage: usage.clone(),
+                    }),
+                    ThreadEvent::IdentityResolved(_) | ThreadEvent::CompactionUpdated(_) => None,
+                },
+                ProviderEvent::Turn {
+                    thread_id,
+                    turn_id,
+                    event,
+                } => match event {
+                    TurnEvent::Started(_) => {
+                        scope.invocation().map(|invocation| Self::TurnStarted {
+                            address: crate::provider::TurnAddress {
+                                scope: invocation.clone(),
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                            },
+                        })
+                    }
+                    TurnEvent::Error { error } => Some(Self::Diagnostic {
+                        diagnostic: DiagnosticView::failure(
+                            scope.clone(),
+                            forge_provider_api::WarningScope::Turn {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                            },
+                            error,
+                        ),
+                    }),
+                    TurnEvent::Completed(_)
+                    | TurnEvent::ModelResolved(_)
+                    | TurnEvent::Usage(_)
+                    | TurnEvent::ChecklistUpdated(_) => None,
+                },
+                ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => None,
+            },
+            HarnessEvent::Host { scope, event } => match event {
+                HostEvent::PermissionApproval {
+                    execution_kind,
+                    event,
+                } => Some(Self::Approval {
+                    execution_owner: scope.owner().clone(),
+                    execution_kind: *execution_kind,
+                    update: Box::new(event.clone()),
+                }),
+                HostEvent::Failure { failure, message } => Some(Self::Diagnostic {
+                    diagnostic: DiagnosticView {
+                        kind: failure.kind(),
+                        message: message.clone(),
+                        severity: DiagnosticSeverity::Error,
+                        scope: scope.clone(),
+                        native_scope: forge_provider_api::WarningScope::Provider,
+                    },
+                }),
+                HostEvent::DirectoryAccessGranted(_)
+                | HostEvent::CapabilitiesNegotiated { .. }
+                | HostEvent::RetryUpdated { .. }
+                | HostEvent::ChildWait { .. }
+                | HostEvent::SkillRead { .. } => None,
+            },
         }
     }
 
     pub fn wakes_input(&self) -> bool {
         matches!(self, Self::ExecutionState { .. } | Self::TurnStarted { .. })
     }
+}
+
+/// Add immutable host control ownership to the canonical permission payload.
+fn approval_payload(
+    owner: &crate::provider::ThreadOwner,
+    execution_kind: crate::provider::ApprovalExecutionKind,
+    request: &impl Serialize,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(request)?;
+    value["execution_owner"] = serde_json::to_value(owner)?;
+    value["execution_kind"] = serde_json::to_value(execution_kind)?;
+    Ok(value)
 }
 
 pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json::Error> {
@@ -236,16 +347,26 @@ pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json
         SessionUpdate::Submission { transition } => {
             ("prompt_submission", None, serde_json::to_value(transition)?)
         }
-        SessionUpdate::Approval { update } => match update.as_ref() {
-            ApprovalUpdate::Requested(request) => {
-                ("approval_requested", None, serde_json::to_value(request)?)
-            }
-            ApprovalUpdate::Resolved(request) => {
-                ("approval_resolved", None, serde_json::to_value(request)?)
-            }
-            ApprovalUpdate::Cancelled(request) => {
-                ("approval_cancelled", None, serde_json::to_value(request)?)
-            }
+        SessionUpdate::Approval {
+            execution_owner,
+            execution_kind,
+            update,
+        } => match update.as_ref() {
+            PermissionApprovalEvent::Requested(request) => (
+                "approval_requested",
+                None,
+                approval_payload(execution_owner, *execution_kind, request)?,
+            ),
+            PermissionApprovalEvent::Resolved(request) => (
+                "approval_resolved",
+                None,
+                approval_payload(execution_owner, *execution_kind, request)?,
+            ),
+            PermissionApprovalEvent::Cancelled(request) => (
+                "approval_cancelled",
+                None,
+                approval_payload(execution_owner, *execution_kind, request)?,
+            ),
         },
         SessionUpdate::Agent { snapshot } => {
             ("agent_updated", None, serde_json::to_value(snapshot)?)
@@ -325,7 +446,7 @@ pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json
         SessionUpdate::Diagnostic { diagnostic } => (
             "error",
             Some(diagnostic.message.to_string()),
-            json!({"kind":diagnostic.kind,"fatal":diagnostic.fatal}),
+            json!({"kind":diagnostic.kind,"severity":diagnostic.severity,"scope":diagnostic.scope,"native_scope":diagnostic.native_scope}),
         ),
         SessionUpdate::CheckFailure { run_id, error } => (
             "checks_configuration_error",
@@ -483,15 +604,43 @@ pub async fn failed(sink: Option<&SessionUpdateSink>) -> std::io::Error {
 mod tests {
     use super::*;
 
+    /// Thread error presentation does not claim turn failure or connection unavailability.
+    #[test]
+    fn thread_error_presentation_retains_nonterminal_category() {
+        let owner = forge_provider_api::ThreadOwner::root("thread-error");
+        let event = crate::provider::test_support::native_event(
+            crate::provider::EventScope::Binding {
+                owner: owner.clone(),
+            },
+            ProviderEvent::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::Error {
+                    error: forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnStart,
+                        forge_provider_api::ProviderFailureKind::RateLimited,
+                    ),
+                },
+            },
+        );
+        assert!(
+            matches!(SessionUpdate::from_observation(&event), Some(SessionUpdate::Diagnostic { diagnostic })
+            if diagnostic.kind == forge_provider_api::ProviderFailureKind::RateLimited && matches!(diagnostic.severity, DiagnosticSeverity::Error))
+        );
+    }
+
     #[tokio::test]
     async fn flush_waits_for_prior_delivery_and_fails_when_consumer_closes() {
         let (sink, mut stream) = channel();
         sink.send_wait(SessionUpdate::Diagnostic {
-            diagnostic: ProviderDiagnostic {
+            diagnostic: DiagnosticView {
                 kind: forge_provider_api::ProviderFailureKind::Unknown,
                 message: forge_provider_api::SanitizedMessage::new("first")
                     .expect("fixture diagnostic is nonempty"),
-                fatal: false,
+                severity: DiagnosticSeverity::Warning,
+                scope: crate::provider::EventScope::Binding {
+                    owner: crate::provider::ThreadOwner::root("publication-fixture"),
+                },
+                native_scope: forge_provider_api::WarningScope::Provider,
             },
         })
         .await

@@ -3,20 +3,10 @@
 use super::*;
 use crate::exchange::command::CancellationOutcome;
 
-/// Describe current native activity without inferring it from an execution permit or clock.
-pub(crate) enum ControlExecution {
-    /// No detached native execution is currently observed.
-    Local,
-    /// The original invocation owns live native work after foreground settlement.
-    Native,
-}
-
 /// Capture the root exchange selected when an owner control command begins.
 pub(crate) struct ExchangeControlView {
     /// Current nonterminal exchange, if one exists.
     pub(crate) selection: Option<ExchangeControlSelection>,
-    /// Native observation ownership independent of pending user decisions.
-    pub(crate) execution: ControlExecution,
     /// Latest normalized invocation selected from the same accepted observation prefix.
     pub(crate) steering_scope: Option<crate::provider::InvocationScope>,
     /// Committed observation updates awaiting outbound publication.
@@ -83,6 +73,7 @@ impl HarnessBroker {
                 .map(TryInto::try_into)
                 .transpose()?,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         })
@@ -106,6 +97,7 @@ impl HarnessBroker {
         &mut self,
         command: Option<&crate::exchange::command::CommandId>,
         target: Option<&crate::provider::ExchangeId>,
+        policy_baseline: Option<&super::configuration::PolicyBaseline>,
     ) -> Result<super::configuration::PermissionConfigurationResult> {
         let resume = match target {
             Some(target) if self.owner_resume_selected(target)? => {
@@ -113,9 +105,13 @@ impl HarnessBroker {
                     .store
                     .load_exchange(target.as_str())?
                     .context("selected configuration exchange disappeared")?;
-                let notice = "Continue the interrupted request using the committed session configuration and completed tool results. Do not repeat completed actions.";
+                // A permission change names the policy transition; other settings resume generically.
+                let notice = policy_baseline.map_or_else(
+                    || "Continue the interrupted request using the committed session configuration and completed tool results. Do not repeat completed actions.".to_owned(),
+                    |baseline| baseline.resume_notice(self.session.access.abbreviation(), self.session.approval_mode),
+                );
                 Some(if selected.elicitation().is_some() {
-                    notice.to_owned()
+                    notice
                 } else {
                     format!("{notice}\n\nOriginal request: {}", selected.prompt)
                 })
@@ -153,10 +149,6 @@ impl HarnessBroker {
     pub(crate) fn owner_control_view(&mut self) -> Result<ExchangeControlView> {
         let events = self.drain_session_events()?;
         let current = self.owner_current_exchange()?;
-        let native = current
-            .as_ref()
-            .and_then(|exchange| exchange.turn.last())
-            .is_some_and(|turn| self.reopened_execution.active(&turn.provider().scope));
         Ok(ExchangeControlView {
             steering_scope: current
                 .as_ref()
@@ -176,11 +168,6 @@ impl HarnessBroker {
                 },
                 id: exchange.id.into(),
             }),
-            execution: if native {
-                ControlExecution::Native
-            } else {
-                ControlExecution::Local
-            },
             events,
         })
     }
@@ -191,7 +178,9 @@ impl HarnessBroker {
         target: Option<&crate::provider::ExchangeId>,
     ) -> Result<Vec<SessionEvent>> {
         let events = self.drain_session_events()?;
-        if let Some(target) = target {
+        if let Some(target) = target
+            && !self.exchange_retracted(target)
+        {
             let selected = self
                 .store
                 .load_exchange(target.as_str())?
@@ -201,8 +190,6 @@ impl HarnessBroker {
                 "collection target belongs to another session"
             );
         }
-        self.reopened_execution
-            .finish_owner(&crate::provider::ExecutionOwner::root(&self.session.id));
         Ok(events)
     }
 
@@ -228,7 +215,11 @@ impl HarnessBroker {
             return Ok((None, events));
         };
         let Some(mut exchange) = self.store.load_exchange(target.as_str())? else {
-            anyhow::bail!("selected cancellation exchange disappeared");
+            anyhow::ensure!(
+                self.exchange_retracted(target),
+                "selected cancellation exchange disappeared"
+            );
+            return Ok((None, events));
         };
         if exchange.is_finished() {
             return Ok((None, events));
@@ -283,6 +274,11 @@ impl HarnessBroker {
         let Some(target) = target else {
             return Ok(CancellationOutcome::NoWork);
         };
+        if self.exchange_retracted(target) {
+            return Ok(CancellationOutcome::Retracted {
+                exchange: target.clone(),
+            });
+        }
         let exchange = self
             .store
             .load_exchange(target.as_str())?
@@ -297,6 +293,46 @@ impl HarnessBroker {
             "cancellation has not settled its selected exchange"
         );
         Ok(CancellationOutcome::NoWork)
+    }
+
+    /// Get whether confirmed output-free retraction, rather than lost history, removed the exchange.
+    fn exchange_retracted(&self, exchange: &crate::provider::ExchangeId) -> bool {
+        self.retracted_exchange_id.as_deref() == Some(exchange.as_str())
+    }
+
+    /// Close the exchange that task-control collection parked once no task remains to resume it.
+    ///
+    /// Task controls collect through reconfiguration, which parks the selected exchange and
+    /// relies on the next admission to close it. A committed control that leaves no current
+    /// task schedules no such admission, so the parked exchange would otherwise stay running.
+    pub(crate) fn owner_close_orphaned_parked_exchange(&mut self) -> Result<Vec<SessionEvent>> {
+        if self.task_controller.current()?.is_some() {
+            return Ok(Vec::new());
+        }
+        let Some(mut exchange) = self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
+            .filter(Exchange::is_parked)
+        else {
+            return Ok(Vec::new());
+        };
+        self.questions.cancel_chat(Some(&exchange.id))?;
+        exchange.set_awaiting_input(false);
+        self.close_superseded_exchange(&mut exchange, self.clock.now_ms())?;
+        self.save_session()?;
+        let mut events = vec![self.event(
+            if exchange.is_finished() {
+                "exchange_complete"
+            } else {
+                "exchange_updated"
+            },
+            json!({"id":exchange.id,"state":exchange.state()}),
+        )?];
+        let patch = self.reconcile_timeline()?;
+        if !patch.is_empty() {
+            events.push(self.event("document_changed", patch.notification())?);
+        }
+        Ok(events)
     }
 
     /// Revalidate a selected parked exchange without silently continuing a different request.

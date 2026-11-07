@@ -5,21 +5,21 @@ use crate::{events, retry};
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperation {
     /// Open a fresh live generation atomically with its event reader.
-    SessionOpen,
+    ThreadOpen,
     /// Apply complete settled session defaults.
-    SessionConfigure,
+    ThreadConfigure,
     /// Create separate history at a stable boundary.
-    SessionFork,
+    ThreadFork,
     /// Compact settled native history.
-    SessionCompact,
+    ThreadCompact,
     /// Revoke and collect an entire binding.
-    SessionClose,
+    ThreadClose,
     /// Interrupt and settle one exact invocation.
-    Cancel,
+    TurnInterrupt,
     /// Admit a journaled input into idle execution.
-    InputSubmit,
+    TurnStart,
     /// Deliver input into an exact active invocation.
-    InputSteer,
+    TurnSteer,
     /// Observe stored native delivery evidence.
     InputReconcile,
     /// Retract an explicitly authorized exact cancelled input.
@@ -525,8 +525,8 @@ impl From<crate::lifecycle::LifecycleError> for ProviderError {
     }
 }
 
-impl From<crate::execution::ExecutionOwnerError> for ProviderError {
-    fn from(_error: crate::execution::ExecutionOwnerError) -> Self {
+impl From<crate::execution::ThreadOwnerError> for ProviderError {
+    fn from(_error: crate::execution::ThreadOwnerError) -> Self {
         Self::Contract(crate::lifecycle::LifecycleError::OwnershipMismatch)
     }
 }
@@ -534,7 +534,7 @@ impl From<crate::execution::ExecutionOwnerError> for ProviderError {
 impl From<crate::session::RecoveryTokenError> for ProviderError {
     fn from(_error: crate::session::RecoveryTokenError) -> Self {
         Self::Failure(ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Rejected,
         ))
     }
@@ -559,18 +559,20 @@ mod cleanup_tests {
             ProviderPhase,
         };
         let primary = ProviderFailure::new(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Persistence,
         )
         .at_phase(ProviderPhase::Persistence, FailureDisposition::Uncertain);
         let nested_cleanup = ProviderFailure::new(
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             ProviderFailureKind::Transport,
         )
         .at_phase(ProviderPhase::Close, FailureDisposition::Invalidated);
-        let independent =
-            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Timeout)
-                .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated);
+        let independent = ProviderFailure::new(
+            ProviderOperation::TurnInterrupt,
+            ProviderFailureKind::Timeout,
+        )
+        .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated);
         let error = ProviderError::Combined {
             primary: Box::new(ProviderError::PreparationFailed(Box::new(
                 ProviderError::PreparationCleanup {
@@ -583,7 +585,7 @@ mod cleanup_tests {
                 ProviderError::DeliveryUncertain,
             ],
         }
-        .for_operation(ProviderOperation::InputSteer);
+        .for_operation(ProviderOperation::TurnSteer);
         let ProviderError::Combined {
             primary: attributed,
             secondary,
@@ -600,7 +602,7 @@ mod cleanup_tests {
         let ProviderError::Failure(attributed) = *cause else {
             panic!("normalized primary cause was lost");
         };
-        assert_eq!(attributed.operation(), ProviderOperation::InputSteer);
+        assert_eq!(attributed.operation(), ProviderOperation::TurnSteer);
         assert_eq!(attributed.kind(), primary.kind());
         assert_eq!(attributed.phase(), ProviderPhase::Persistence);
         assert_eq!(attributed.disposition(), FailureDisposition::Uncertain);
@@ -642,11 +644,11 @@ mod cleanup_tests {
                 ObservationFailure::Disconnected,
                 Some(CleanupFailure::TimedOut),
                 Some(failure(
-                    ProviderOperation::Cancel,
+                    ProviderOperation::TurnInterrupt,
                     ProviderFailureKind::Transport,
                 )),
                 Some(failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Runtime,
                 )),
             )
@@ -654,7 +656,7 @@ mod cleanup_tests {
         );
         let mut report = first.clone();
         std::sync::Arc::make_mut(&mut report).record_collection_failure(failure(
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             ProviderFailureKind::Protocol,
         ));
         let report = report

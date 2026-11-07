@@ -60,6 +60,36 @@ local function parser_region_list(range_list)
   return region_list
 end
 
+--- Anchors render-markdown replacement lines that would otherwise follow the final buffer line.
+--- render-markdown conceals each wrapped table row and attaches its replacement lines above the next
+--- visible row. When the concealed rows end the buffer, no such row exists: the anchor lands past the
+--- final line, where a window scrolled to the end cannot show it, so a response ending in a wrapped
+--- table loses its body rows and bottom border. Attach those lines below the last visible row instead.
+local function install_final_replacement_anchor()
+  local replacements = require("render-markdown.lib.replacements")
+  local resolve = replacements.resolve
+  replacements.resolve = function(visible, line_count)
+    local groups = resolve(visible, line_count)
+    local hidden = {}
+    for _, mark in ipairs(visible) do
+      if mark.opts.conceal_lines then
+        local end_row = mark.opts.end_row or mark.start_row
+        if end_row > mark.start_row and mark.opts.end_col == 0 then end_row = end_row - 1 end
+        for row = mark.start_row, end_row do hidden[row] = true end
+      end
+    end
+    for _, group in ipairs(groups) do
+      local anchor = group.start_row
+      if anchor >= line_count then
+        anchor = line_count - 1
+        while anchor >= 0 and hidden[anchor] do anchor = anchor - 1 end
+        if anchor >= 0 then group.start_row, group.opts.virt_lines_above = anchor, false end
+      end
+    end
+    return groups
+  end
+end
+
 --- Resolves visible Markdown owners without traversing folded or off-screen history.
 ---@param session table Native document replica with an indexed block sequence.
 ---@param window integer Transcript window.
@@ -206,6 +236,7 @@ function M.render(buf, win, range_list)
       })
     end
     if not layout_handlers then
+      install_final_replacement_anchor()
       local state = require("render-markdown.state")
       for _, language in ipairs({ "markdown", "latex" }) do
         state.custom_handlers[language] = handler(state.custom_handlers[language]

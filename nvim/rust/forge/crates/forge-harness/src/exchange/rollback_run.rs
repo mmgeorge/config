@@ -301,25 +301,15 @@ impl RollbackRun {
                 else {
                     unreachable!("initialization commit retains its exact native result")
                 };
-                let (outcome, mut events) = self
+                let (outcome, events) = self
                     .pending_finish
                     .take()
                     .expect("replacement initialization retains the committed rollback outcome");
                 match result.and_then(|initialized| initialized.commit(broker)) {
-                    Ok(snapshot) => {
-                        if let Some(snapshot) = snapshot {
-                            events.push(SessionEvent {
-                                session_id: services.observer.session_id().into(),
-                                event: "session_configured".into(),
-                                payload: serde_json::to_value(snapshot)
-                                    .map_err(|error| OperationFailure::Domain(error.into()))?,
-                            });
-                        }
-                        Ok(RollbackProgress::Finished {
-                            outcome: Ok(outcome),
-                            events,
-                        })
-                    }
+                    Ok(()) => Ok(RollbackProgress::Finished {
+                        outcome: Ok(outcome),
+                        events,
+                    }),
                     Err(error) => {
                         self.stage = RollbackStage::InitializationFailed(error);
                         self.pending_finish = Some((outcome, events.clone()));
@@ -414,24 +404,13 @@ impl RollbackRecovery {
                 Ok(RollbackRecoveryProgress::Finished(events))
             }
             RollbackStage::InitializationReady(result) => {
-                let mut events = self
+                let events = self
                     .pending_finish
                     .take()
                     .map_or_else(Vec::new, |(_, events)| events);
-                let snapshot = match result.and_then(|initialized| initialized.commit(broker)) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        self.stage = RollbackStage::InitializationFailed(error);
-                        return Err(RollbackFailure::RecoveryRequired);
-                    }
-                };
-                if let Some(snapshot) = snapshot {
-                    events.push(SessionEvent {
-                        session_id: snapshot.session.id.clone(),
-                        event: "session_configured".into(),
-                        payload: serde_json::to_value(snapshot)
-                            .map_err(|_| RollbackFailure::RecoveryRequired)?,
-                    });
+                if let Err(error) = result.and_then(|initialized| initialized.commit(broker)) {
+                    self.stage = RollbackStage::InitializationFailed(error);
+                    return Err(RollbackFailure::RecoveryRequired);
                 }
                 Ok(RollbackRecoveryProgress::Finished(events))
             }

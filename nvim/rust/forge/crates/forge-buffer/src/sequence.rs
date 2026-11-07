@@ -375,7 +375,7 @@ impl BlockSequence {
                     let parent = incoming_node
                         .get(parent_id)
                         .copied()
-                        .or_else(|| self.node_owner.get(parent_id).and_then(&resolve))
+                        .or_else(|| self.node_owner.get(parent_id).and_then(resolve))
                         .filter(|parent| {
                             parent
                                 .metadata

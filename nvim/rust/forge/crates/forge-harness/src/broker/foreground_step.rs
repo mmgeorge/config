@@ -80,6 +80,12 @@ impl HarnessBroker {
         if failure_waiting && matches!(&signal, ForegroundSignal::PublicationDrained) {
             return self.finish_foreground_failure(dispatch);
         }
+        let signal = match signal {
+            ForegroundSignal::SettlementCommitted(result) if failure_waiting => {
+                return self.complete_failure_settlement_commit(dispatch, result);
+            }
+            signal => signal,
+        };
         let failure_cleanup = match &*dispatch {
             ForegroundDispatch::Running { transaction, .. }
             | ForegroundDispatch::Finalizing { transaction, .. } => {
@@ -389,6 +395,11 @@ impl HarnessBroker {
                     transaction.pending_native_ready = Some(Err(ProviderError::Cancelled));
                 }
                 self.collect_foreground_observations(transaction)?;
+                // A collected cancellation may already be settling an output-free prompt,
+                // which waits for this positive collection before deleting its exchange.
+                if transaction.failure.is_some() {
+                    return self.advance_foreground_failure(dispatch);
+                }
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::SessionObservationsReady
@@ -588,16 +599,31 @@ impl HarnessBroker {
                 ));
             }
             let mut events = Vec::new();
-            let applied = if matches!(observation, ProviderEvent::Tool { .. }) {
-                anyhow::ensure!(
-                    observation.scope().owner()
-                        == &crate::provider::ExecutionOwner::root(&self.session.id),
-                    "session tool event crosses execution ownership"
-                );
-                self.apply_settled_parent_event(&transaction.state.interaction, &observation)?
-            } else {
-                events.extend(self.observe_session_event(observation)?);
-                None
+            let applied = match &observation {
+                crate::provider::session_execution::OwnerObservation::HostFileChange {
+                    binding_id,
+                    scope,
+                    change,
+                } => Some(self.apply_observed_file_change(binding_id, scope, change)?),
+                crate::provider::session_execution::OwnerObservation::Event(
+                    event @ crate::provider::HarnessEvent::Native {
+                        event: native_event,
+                        ..
+                    },
+                ) if matches!(
+                    native_event.as_ref(),
+                    forge_provider_api::ProviderEvent::Item { .. }
+                ) =>
+                {
+                    self.apply_settled_parent_event(&transaction.state.interaction, event)?
+                }
+                crate::provider::session_execution::OwnerObservation::Event(_)
+                | crate::provider::session_execution::OwnerObservation::InputAcceptance {
+                    ..
+                } => {
+                    events.extend(self.observe_session_event(observation)?);
+                    None
+                }
             };
             if applied.is_some() || !events.is_empty() {
                 let mut delivery = self.prepare_provider_delivery(

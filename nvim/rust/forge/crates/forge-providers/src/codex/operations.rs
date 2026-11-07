@@ -1,10 +1,10 @@
 use forge_provider_api::{
     AuthenticationMethodId, BindingId, CancelRequest, CompactionRequest, CompactionResult,
     ConfiguredSession, InputAcceptance, InputReconcileRequest, InputRetractOutcome,
-    InputRetractRequest, InvocationSettlement, OpenedSession, OperationContext, OperationId,
-    PromptRequestIdentity, ProviderError, ProviderForkResult, ProviderModel, ProviderOperation,
-    ProviderSetup, SessionConfiguration, SessionForkRequest, SessionRequestIdentity,
-    SteeringAcceptance, SteeringRequestIdentity, SubmissionEvidence,
+    InputRetractRequest, OpenedSession, OperationContext, OperationId, PromptRequestIdentity,
+    ProviderError, ProviderForkResult, ProviderModel, ProviderOperation, ProviderSetup,
+    SessionConfiguration, SessionForkRequest, SessionRequestIdentity, SteeringAcceptance,
+    SteeringRequestIdentity, SubmissionEvidence, TurnInterruptResult,
     catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition, WorkspaceContext},
     retained_operation::{IdentityRegistry, Store},
     terminal::{TerminalId, TerminalSnapshot},
@@ -32,7 +32,7 @@ pub(super) struct Records {
     /// Retain complete binding collection and cleanup retry outcomes.
     pub(super) close: Store<BindingId, ()>,
     /// Retain exact invocation interruption and settlement outcomes.
-    pub(super) cancel: Store<(BindingId, CancelRequest), InvocationSettlement>,
+    pub(super) cancel: Store<(BindingId, CancelRequest), TurnInterruptResult>,
     /// Retain input acceptance with weak callback and lease identity metadata.
     pub(super) submit: Store<(BindingId, PromptRequestIdentity), InputAcceptance>,
     /// Retain exact active-invocation delivery with weak authority identity.

@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 /// Distinguish rename admission, preparation, commit, and recovery failures.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum MutationError {
+pub(crate) enum MutationError {
+    #[error("{0}")]
+    Retained(#[source] std::sync::Arc<MutationError>),
     #[error("invalid_argument: {0}")]
     Argument(&'static str),
     #[error("access_denied: {0}")]

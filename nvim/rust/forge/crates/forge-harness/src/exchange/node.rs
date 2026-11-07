@@ -119,7 +119,7 @@ pub struct VerificationResult {
     #[serde(default)]
     pub declaration_changes: Vec<crate::plan::execution::DeclarationMismatch>,
     #[serde(default)]
-    pub verification_tools: std::collections::BTreeMap<String, String>,
+    pub verification_tools: std::collections::BTreeMap<String, crate::turn::ToolAddress>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -188,7 +188,7 @@ impl AcpConversation {
                         cause: Box::new(cause),
                         cleanup: Box::new(crate::error::acp(
                             cleanup,
-                            forge_provider_api::ProviderOperation::SessionOpen,
+                            forge_provider_api::ProviderOperation::ThreadOpen,
                         )),
                     }),
                 }
@@ -257,7 +257,7 @@ impl AcpConversation {
             .request(method, parameter)
             .await
             .map_err(|error| {
-                crate::error::acp(error, forge_provider_api::ProviderOperation::SessionCompact)
+                crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadCompact)
             })
     }
 
@@ -305,7 +305,7 @@ impl AcpConversation {
             .request("session/load", configuration.clone())
             .await
             .map_err(|error| {
-                crate::error::acp(error, forge_provider_api::ProviderOperation::InputSubmit)
+                crate::error::acp(error, forge_provider_api::ProviderOperation::TurnStart)
             })
             .and_then(|response| {
                 if response["sessionId"].as_str() == Some(self.id.as_str()) {
@@ -313,7 +313,7 @@ impl AcpConversation {
                 } else {
                     Err(ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Protocol,
                         ),
                     ))
@@ -329,7 +329,7 @@ impl AcpConversation {
                 // session/load may have installed this callback URL even when its response is lost or invalid.
                 let cause = ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         kind,
                     )
                     .at_phase(
@@ -386,7 +386,7 @@ impl AcpConversation {
             .map_err(|error| {
                 crate::error::acp(
                     error,
-                    forge_provider_api::ProviderOperation::SessionConfigure,
+                    forge_provider_api::ProviderOperation::ThreadConfigure,
                 )
             })?;
         if response["sessionId"].as_str() != Some(self.id.as_str()) {
@@ -419,6 +419,14 @@ impl AcpConversation {
             .await
     }
 
+    /// Get native response evidence retained independently of receipt persistence.
+    pub(super) fn prompt_end(
+        &self,
+        input: &forge_provider_api::CoveredInput,
+    ) -> Option<super::response::NativePromptEnd> {
+        self.transport.prompt_end(input)
+    }
+
     /// Submit steering and retain the adapter's typed lifecycle limitation.
     pub async fn steer(
         &self,
@@ -431,14 +439,14 @@ impl AcpConversation {
     /// Interrupt this conversation while retaining the outstanding prompt's terminal response.
     pub fn cancel(&self) -> Result<(), ProviderError> {
         self.transport.cancel(&self.id).map_err(|error| {
-            crate::error::acp(error, forge_provider_api::ProviderOperation::Cancel)
+            crate::error::acp(error, forge_provider_api::ProviderOperation::TurnInterrupt)
         })
     }
 
     /// Stop and collect the owned native process.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
         self.transport.shutdown().await.map_err(|error| {
-            crate::error::acp(error, forge_provider_api::ProviderOperation::SessionClose)
+            crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadClose)
         })
     }
 
@@ -490,7 +498,7 @@ impl AcpConversation {
                 .request("session/fork", configuration)
                 .await
                 .map_err(|error| {
-                    crate::error::acp(error, forge_provider_api::ProviderOperation::SessionFork)
+                    crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadFork)
                 })?;
             let id = response["sessionId"]
                 .as_str()
@@ -520,7 +528,7 @@ impl AcpConversation {
                         .map_err(|error| {
                             crate::error::acp(
                                 error,
-                                forge_provider_api::ProviderOperation::SessionFork,
+                                forge_provider_api::ProviderOperation::ThreadFork,
                             )
                         })?;
                 } else {
@@ -530,7 +538,7 @@ impl AcpConversation {
                         .map_err(|error| {
                             crate::error::acp(
                                 error,
-                                forge_provider_api::ProviderOperation::SessionFork,
+                                forge_provider_api::ProviderOperation::ThreadFork,
                             )
                         })?;
                 }
@@ -552,7 +560,7 @@ impl AcpConversation {
                     )
                     .await
                     .map_err(|error| {
-                        crate::error::acp(error, forge_provider_api::ProviderOperation::SessionFork)
+                        crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadFork)
                     })?;
             }
             Ok(id)
@@ -791,7 +799,7 @@ fn append_system_instructions(configuration: &mut Value, instructions: &str) {
 
 fn acp_failure(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::SessionOpen,
+        forge_provider_api::ProviderOperation::ThreadOpen,
         kind,
     ))
 }

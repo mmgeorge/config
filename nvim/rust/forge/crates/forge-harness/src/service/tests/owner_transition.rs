@@ -53,7 +53,6 @@ async fn owner_prepared_configuration_close_resumes_retained_unconsumed_input() 
 /// Exercise committed off/on selections across one exact native generation boundary.
 async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Result<()> {
     use crate::exchange::command::{CommandOutcome, ConfigurationOutcome};
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -72,10 +71,8 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
         let invoked = invoked.clone();
         let dispatched = dispatched.clone();
         let observations = observations.clone();
-        let identity_controller = identity_controller.clone();
-        move |request, sink, mut cancelled| {
+        move |request, sink, start, mut cancelled| {
             let invoked = invoked.clone();
-            let identity_controller = identity_controller.clone();
             let first = dispatched.fetch_add(1, Ordering::AcqRel) == 0;
             observations.lock().unwrap().push((
                 sink.binding_id().clone(),
@@ -87,36 +84,13 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                     .collect::<Vec<_>>(),
             ));
             async move {
-                let thread_id = identity_controller
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .expect("native execution retains its session owner")
-                    .observer
-                    .snapshot()
-                    .expect("fixture session snapshot remains readable")
-                    .session
-                    .provider_session_id
-                    .expect("opened fixture history is observed before input");
                 let address = crate::provider::TurnAddress {
                     scope: request.scope.clone(),
-                    thread_id,
-                    turn_id: request.scope.invocation_id.as_str().into(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
                 };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                start.observed(1).await?;
+
                 if first {
                     invoked.notify_one();
                     while !*cancelled.borrow_and_update() {
@@ -128,47 +102,25 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 } else {
                     for event in crate::provider::test_support::message(
                         &address,
-                        "tool-toggle-answer",
-                        Some(crate::provider::MessageRole::Response),
+                        format!("{}:tool-toggle-answer", request.turn_id.as_str()),
+                        Some(crate::provider::TestMessageContent::Response),
                         "Binding remains usable",
                     ) {
-                        sink.send_wait(event).await?;
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
                     }
                 }
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: if first {
-                            forge_provider_api::turn::TurnOutcome::Cancelled
-                        } else {
-                            forge_provider_api::turn::TurnOutcome::Completed
-                        },
-                        completed_at_ms: 2,
+
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    if first {
+                        forge_provider_api::turn::TurnOutcome::Interrupted
+                    } else {
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        }
                     },
-                })
-                .await?;
-                let completion = forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some(address.thread_id.clone().try_into().unwrap()),
-                    ..Default::default()
-                }
-                .into();
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope,
-                        ExecutionUpdate::Finished {
-                            address,
-                            covered_submissions: vec![request.submission_id],
-                            completed_at_ms: 2,
-                            result: if first {
-                                ExecutionResult::Cancelled { completion }
-                            } else {
-                                ExecutionResult::Completed { completion }
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                ))
             }
         }
     });
@@ -224,14 +176,16 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 );
                 async move {
                     let owner =
-                        crate::provider::ExecutionOwner::root(controller.observer.session_id());
+                        crate::provider::ThreadOwner::root(controller.observer.session_id());
                     let sink = native.event_sink(&owner).await?;
                     if sink.binding_id() != &binding {
                         return Err(crate::provider::ProviderError::DeliveryUncertain);
                     }
-                    sink.send_wait(crate::provider::ProviderEvent::SessionIdentity {
-                        scope: crate::provider::EventScope::Binding { owner },
-                        provider_session_id: history.clone().try_into().unwrap(),
+                    sink.send_wait(forge_provider_api::AdapterActivity::Thread {
+                        thread_id: owner.thread_id(),
+                        event: forge_provider_api::ThreadEvent::IdentityResolved(
+                            history.clone().try_into().unwrap(),
+                        ),
                     })
                     .await?;
                     tokio::time::timeout(Duration::from_secs(5), async {
@@ -296,7 +250,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
         } else {
             tokio::time::timeout(Duration::from_secs(5), invoked.notified()).await?;
         }
-        let owner = crate::provider::ExecutionOwner::root(controller.observer.session_id());
+        let owner = crate::provider::ThreadOwner::root(controller.observer.session_id());
         let original = native.event_sink(&owner).await?;
         let binding = original.binding_id().clone();
         let inbox = controller.observer.session_events();
@@ -321,7 +275,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 tokio::time::timeout(Duration::from_secs(5), preparation.recv()).await?
                     .context("configured unconsumed continuation did not reach preparation")?;
                 ensure!(dispatched.load(Ordering::Acquire) == 0, "virgin input crossed native handoff");
-                let retained = SqliteStore::read_only(&controller.data_root)?.list_exchange(owner.session_id.as_str())?;
+                let retained = SqliteStore::read_only(&controller.data_root)?.list_exchange(owner.session_id().as_str())?;
                 ensure!(!retained.is_empty() && retained.iter().all(|exchange| exchange.input_message_id.is_some() && exchange.turn.is_empty()), "retained input lost its journal linkage or acquired native history");
                 return Ok::<(), anyhow::Error>(());
             }
@@ -518,88 +472,39 @@ async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Re
     let (prepared, mut preparation) = tokio::sync::mpsc::unbounded_channel();
     let (dispatched, mut dispatches) = tokio::sync::mpsc::unbounded_channel();
     let owner: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> = Arc::default();
-    let observed_owner = owner.clone();
     let descriptor = forge_providers::registry::descriptor(
         &forge_providers::registry::nonselectable_id().unwrap(),
     )
     .unwrap();
     let native = crate::provider::test_support::EventFixtureProvider::new(
         descriptor,
-        move |request, sink, _cancelled| {
+        move |request, sink, start, _cancelled| {
             let dispatched = dispatched.clone();
-            let owner = observed_owner.clone();
             async move {
-                use forge_provider_api::lifecycle::{
-                    ExecutionObservation, ExecutionResult, ExecutionUpdate,
-                };
-                let thread_id = owner
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap()
-                    .observer
-                    .snapshot()
-                    .unwrap()
-                    .session
-                    .provider_session_id
-                    .unwrap();
                 let address = crate::provider::TurnAddress {
                     scope: request.scope.clone(),
-                    thread_id,
-                    turn_id: request.scope.invocation_id.as_str().into(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
                 };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
-                let _ = dispatched.send(request.input);
+                start.observed(1).await?;
+
+                let _ = dispatched.send(request.input.clone());
                 for event in crate::provider::test_support::message(
                     &address,
                     "reply",
-                    Some(crate::provider::MessageRole::Response),
+                    Some(crate::provider::TestMessageContent::Response),
                     "New input completed",
                 ) {
-                    sink.send_wait(event).await?;
+                    sink.send_wait(crate::provider::test_support::activity(event)?)
+                        .await?;
                 }
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: forge_provider_api::turn::TurnOutcome::Completed,
-                        completed_at_ms: 2,
+
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     },
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope,
-                        ExecutionUpdate::Finished {
-                            address: address.clone(),
-                            covered_submissions: vec![request.submission_id],
-                            completed_at_ms: 2,
-                            result: ExecutionResult::Completed {
-                                completion: forge_provider_api::completion::ProviderCompletion {
-                                    provider_session_id: Some(
-                                        address.thread_id.try_into().unwrap(),
-                                    ),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                ))
             }
         },
     );
@@ -759,7 +664,6 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
         CancelExchangeRequest, CancellationOutcome, Command, CommandId, CommandOutcome,
         CommandRequest, ConfigurationOutcome, InputControl, InvocationDisposition,
     };
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -773,30 +677,13 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
     let native = crate::provider::test_support::EventFixtureProvider::new(descriptor, {
         let invoked = invoked.clone();
         let dispatched = dispatched.clone();
-        move |request, sink, mut cancelled| {
+        move |request, _sink, start, mut cancelled| {
             let invoked = invoked.clone();
             let dispatched = dispatched.clone();
             async move {
                 dispatched.fetch_add(1, Ordering::AcqRel);
-                let address = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id: "retained-thread".into(),
-                    turn_id: "retained-turn".into(),
-                };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                start.observed(1).await?;
+
                 invoked.notify_one();
                 while !*cancelled.borrow_and_update() {
                     cancelled
@@ -804,31 +691,11 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
                         .await
                         .map_err(|_| crate::provider::ProviderError::Cancelled)?;
                 }
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: forge_provider_api::turn::TurnOutcome::Cancelled,
-                        completed_at_ms: 2,
-                    },
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Finished {
-                            address,
-                            covered_submissions: vec![request.submission_id.clone()],
-                            completed_at_ms: 2,
-                            result: ExecutionResult::Cancelled {
-                                completion:
-                                    forge_provider_api::completion::ProviderCompletion::default()
-                                        .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Interrupted,
+                ))
             }
         }
     });
@@ -925,7 +792,7 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
         ensure!(dispatched.load(Ordering::Acquire) == 1, "a held successor reached native handoff");
         ensure!(controller.observer.snapshot()?.session.model == "default", "cancel reverted model B");
         let engine = controller.broker.lock().await.execution_registry()
-            .existing_owner(&crate::provider::ExecutionOwner::root(session))?.context("execution owner missing")?;
+            .existing_owner(&crate::provider::ThreadOwner::root(session))?.context("execution owner missing")?;
         ensure!(engine.active_invocation_snapshot()?.is_none(), "cancel left pending native work");
         let exchange = SqliteStore::read_only(&controller.data_root)?.load_exchange(&original)?.unwrap();
         ensure!(exchange.state() == crate::exchange::ExchangeState::Cancelled
@@ -1017,7 +884,9 @@ async fn owner_invalid_model_rejects_before_collection_and_preserves_queue() -> 
         fixture.controller.observer.snapshot()?.session.model,
         "mock-model"
     );
-    fixture.service.shutdown(Duration::from_secs(5)).await?;
+    if let Err(error) = fixture.service.shutdown(Duration::from_secs(5)).await {
+        return Err(retain_owner_transition_failure(fixture, error));
+    }
     fixture.reader.abort();
     Ok(())
 }
@@ -1090,10 +959,11 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
     };
     assert_eq!(
         arrived["session_id"],
-        crate::provider::ExecutionOwner {
-            session_id: fixture.session.clone().into(),
-            agent_id: child.into()
-        }
+        crate::provider::ThreadOwner::new(
+            fixture.session.clone().into(),
+            forge_provider_api::AgentId::new(child).expect("registered child identity is nonempty")
+        )
+        .expect("fixture identities are nonempty")
         .runtime_key()
     );
     assert!(fixture.controller.agent_coordinator.active_count() > 0);
@@ -1142,7 +1012,6 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
 /// A timed-out cleanup keeps its actual worker and leaves the requested policy uncommitted.
 #[tokio::test]
 async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<()> {
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -1155,28 +1024,11 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
     .unwrap();
     let native = crate::provider::test_support::EventFixtureProvider::new(descriptor, {
         let invoked = invoked.clone();
-        move |request, sink, mut cancelled| {
+        move |request, _sink, start, mut cancelled| {
             let invoked = invoked.clone();
             async move {
-                let address = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id: "cleanup-thread".into(),
-                    turn_id: "cleanup-turn".into(),
-                };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                start.observed(1).await?;
+
                 invoked.notify_one();
                 while !*cancelled.borrow_and_update() {
                     cancelled
@@ -1184,31 +1036,11 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
                         .await
                         .map_err(|_| crate::provider::ProviderError::Cancelled)?;
                 }
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: forge_provider_api::turn::TurnOutcome::Cancelled,
-                        completed_at_ms: 2,
-                    },
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Finished {
-                            address,
-                            covered_submissions: vec![request.submission_id.clone()],
-                            completed_at_ms: 2,
-                            result: ExecutionResult::Cancelled {
-                                completion:
-                                    forge_provider_api::completion::ProviderCompletion::default()
-                                        .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Interrupted,
+                ))
             }
         }
     });
@@ -1416,7 +1248,7 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
     let sibling = registry.resolve(&sibling_record.id).await?;
     let sibling_registry = sibling.broker.lock().await.execution_registry();
     let sibling_engine = sibling_registry
-        .owner(crate::provider::ExecutionOwner::root(&sibling_record.id))
+        .owner(crate::provider::ThreadOwner::root(&sibling_record.id))
         .await?;
     assert!(Arc::ptr_eq(&fixture.provider, &sibling.provider_handle()));
     sibling.start_provider(&fixture.sink).await;
@@ -1656,6 +1488,108 @@ async fn owner_starts_one_fifo_command_per_update_after_committed_completion() -
     if let Err(error) = scenario {
         return Err(retain_owner_transition_failure(fixture, error));
     }
+    fixture.service.shutdown(Duration::from_secs(5)).await?;
+    fixture.reader.abort();
+    Ok(())
+}
+
+/// The idle agent drain leaves a model request to the active root turn that authenticated it.
+#[tokio::test]
+async fn idle_agent_drain_defers_model_requests_to_the_active_root_turn() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = owner_transition_fixture().await?;
+    let child_provider = crate::provider::test_support::build_mock(
+        fixture.controller.data_root.join("child-provider"),
+        fixture.controller.permission.clone(),
+        fixture.controller.trace.clone(),
+    )?;
+    fixture
+        .controller
+        .broker
+        .lock()
+        .await
+        .agent_provider_factory
+        .register(child_provider.clone());
+    let child_script = child_provider
+        .mock_response_control()
+        .context("child fixture controls missing")?;
+    let child_hold = child_script
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: true,
+            },
+        )
+        .await?;
+    fixture.controller.agent_coordinator.set_enabled(true);
+    let (_expire, expired) = tokio::sync::watch::channel(false);
+    let sender = fixture.controller.agent_coordinator.sender();
+    let session = fixture.session.clone();
+    let parent_exchange_id = fixture.original.clone();
+    let mut broker = fixture.controller.broker.lock().await;
+    let (response, admitted) = tokio::sync::oneshot::channel();
+    sender
+        .send(crate::agent::AgentCommand::Request {
+            request: Box::new(crate::agent::AgentRequest {
+                operation_id: "model-child-during-root".into(),
+                source: crate::agent::AgentSource::Model,
+                operation: crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+                    profile: Some("worker".into()),
+                    text: "Report the fixture state".into(),
+                }),
+            }),
+            authority: Some(crate::agent::AgentRequestAuthority {
+                owner: crate::provider::ThreadOwner::root(&session),
+                parent_exchange_id,
+                expired,
+                task: None,
+            }),
+            target: None,
+            response,
+            task_admission: None,
+        })
+        .await?;
+    broker.drain_agent_commands(None).await?;
+    drop(broker);
+    let admitted = tokio::time::timeout(Duration::from_secs(10), admitted)
+        .await
+        .context("active root turn did not admit the model request")??
+        .context("active root turn rejected the model request")?;
+    ensure!(
+        admitted["agent"]["id"].is_string(),
+        "model request was not admitted: {admitted}"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        child_script.dispatch(
+            &fixture.session,
+            MockResponseCommand::Wait {
+                id: child_hold["id"].as_str().unwrap().into(),
+            },
+        ),
+    )
+    .await
+    .context("admitted child did not reach its provider hold")??;
+    child_script
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Release {
+                id: child_hold["id"].as_str().unwrap().into(),
+            },
+        )
+        .await?;
+    fixture
+        .provider
+        .mock_response_control()
+        .context("root fixture controls missing")?
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Release {
+                id: fixture.root_hold_id.clone(),
+            },
+        )
+        .await?;
     fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())

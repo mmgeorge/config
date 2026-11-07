@@ -60,6 +60,16 @@ client.request = function(request_specification, callback)
   else error("unexpected profile request: " .. method) end
 end
 
+-- Inherited tuning follows configuration, even when the last actual native model differs.
+local inherited = require("forge.views.harness.subagent_selection").new(state)
+inherited.catalog[default_provider] = vim.deepcopy(catalog_by_provider[default_provider])
+state.session.resolved_model = "simple-model"
+local inherited_result
+inherited:cycle({ provider = "inherit", model = "inherit", reasoning_effort = "default", service_tier = "inherit" }, "reasoning_effort", 1,
+  function(value, failure) assert(not failure, failure) inherited_result = value end)
+assert(inherited_result and inherited_result.reasoning_effort == "low", "observed model changed inherited configuration capabilities")
+state.session.resolved_model = nil
+
 local function select(id)
   local instance = assert(picker._state_for_test())
   for _, option in ipairs(instance.spec.page_list[1].option_list) do

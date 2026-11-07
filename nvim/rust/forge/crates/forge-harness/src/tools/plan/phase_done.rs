@@ -38,7 +38,7 @@ pub(super) fn definition() -> ControlToolDefinition {
                             ),
                             (
                                 "checks",
-                                json!({"type":"array","description":"One result per accepted manual action, in plan order. Use the exact command or manual check label. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
+                                json!({"type":"array","description":"One result per accepted manual action, in plan order. Copy each label verbatim from the accepted verification action. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
                             ("category", json!({"type":"string","enum":["manual"]})),
                             ("label", string_schema()),
                             ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),

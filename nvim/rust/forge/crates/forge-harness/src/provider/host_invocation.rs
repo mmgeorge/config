@@ -22,6 +22,11 @@ pub(crate) struct HostInvocation {
     scope: InvocationScope,
     request: super::ProviderRequest,
     executor: ControlToolExecutor,
+    template: ControlTurnContext,
+    observed_authority: Arc<super::bridge::ObservedPermissionAuthority>,
+    observed_tools: tokio::sync::Mutex<
+        std::collections::HashMap<forge_provider_api::TurnId, Arc<ObservedTools>>,
+    >,
     authority: Option<crate::tools::TaskAuthority>,
     permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     directories: Mutex<Option<super::approval::DirectoryExecution>>,
@@ -34,12 +39,82 @@ pub(crate) struct HostInvocation {
     endpoint_closed: tokio::sync::OnceCell<()>,
     relay: tokio::sync::Mutex<HostEventRelay>,
     skills: Mutex<Option<crate::skill::SkillExecution>>,
-    skill_observer: Option<Arc<dyn forge_provider_api::events::EventObserver>>,
-    lsp: Option<Arc<crate::tools::lsp::LspScope>>,
+    skill_observer: Option<Arc<dyn super::events::EventObserver>>,
     state: Mutex<InvocationState>,
     changed: Notify,
     live_host_effects: Option<super::LiveHostEffectSender>,
     calls: Mutex<std::collections::HashMap<forge_provider_api::control::ToolCallId, Arc<HostCall>>>,
+}
+
+/// Retain a native child's executor and physical receipts independently from its parent's settlement.
+struct ObservedTools {
+    scope: InvocationScope,
+    template: ControlTurnContext,
+    executor: ControlToolExecutor,
+    completion: Arc<CompletionSlot>,
+    sink: super::HarnessEventSink,
+    calls: Mutex<std::collections::HashMap<forge_provider_api::control::ToolCallId, Arc<HostCall>>>,
+}
+impl ObservedTools {
+    /// Replay the original response and physical receipts without repeating committed file writes.
+    async fn call(&self, call: ToolCall) -> Result<String, ProviderError> {
+        let (record, fresh) = {
+            let mut calls = self.calls.lock().map_err(|_| rejected())?;
+            if let Some(record) = calls.get(&call.id) {
+                if record.name != call.name || record.arguments != call.arguments {
+                    return Err(rejected());
+                }
+                (record.clone(), false)
+            } else {
+                let record = Arc::new(HostCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    state: Mutex::new(HostCallState::Running),
+                    changed: Notify::new(),
+                });
+                calls.insert(call.id.clone(), record.clone());
+                (record, true)
+            }
+        };
+        if fresh {
+            let _running = RunningHostCall(record.clone());
+            let invocation = ControlToolInvocation {
+                call_id: Some(call.id),
+                task_permit: None,
+                name: call.name,
+                arguments: call.arguments,
+            };
+            let result = match self.executor.execute(invocation.clone()).await {
+                Ok(outcome) => match outcome.result {
+                    Ok(result) => Ok(result.message),
+                    Err(error) => Ok(crate::tools::control_tool_failure_json(
+                        &invocation,
+                        &error,
+                        outcome.plan_document.as_ref(),
+                    )),
+                },
+                Err(_) => Err(rejected()),
+            };
+            *record.state.lock().map_err(|_| rejected())? = HostCallState::Complete(result);
+            record.changed.notify_waiters();
+        }
+        loop {
+            let changed = record.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let state = record.state.lock().map_err(|_| rejected())?.clone();
+            match state {
+                HostCallState::Running => changed.await,
+                HostCallState::Complete(result) => {
+                    for change in self.completion.collected_file_changes() {
+                        self.sink.send_host_file_change(change)?;
+                    }
+                    return result;
+                }
+                HostCallState::Published(_) => return Err(rejected()),
+            }
+        }
+    }
 }
 
 struct HostCall {
@@ -82,6 +157,7 @@ impl Drop for RunningHostCall {
 
 /// Own the callback transports and policy leases retained by one invocation.
 pub(crate) struct HostInvocationResources {
+    pub(crate) observed_authority: Arc<super::bridge::ObservedPermissionAuthority>,
     pub(crate) provider_closed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     pub(crate) directories: Option<super::approval::DirectoryExecution>,
@@ -100,25 +176,23 @@ pub(crate) struct HostEventRelay {
 
 impl HostEventRelay {
     pub(crate) fn start(
-        binding: BindingId,
-        mut events: forge_provider_api::events::ProviderEventStream,
+        _binding: BindingId,
+        mut events: super::events::HarnessEventStream,
         sender: tokio::sync::mpsc::UnboundedSender<
-            Result<super::bridge::HostEvent, forge_provider_api::events::EventDeliveryError>,
+            Result<
+                super::bridge::ProviderObservation,
+                forge_provider_api::events::EventDeliveryError,
+            >,
         >,
     ) -> Self {
         let (stop, mut stopping) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
-            let forward = |event: forge_provider_api::BoundProviderEvent| {
-                if event.binding_id != binding {
-                    let _ = sender.send(Err(
-                        forge_provider_api::events::EventDeliveryError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-                        ),
-                    ));
-                    return Err(HostEffectFailure::Retired);
-                }
+            let forward = |event: super::session_execution::OwnerObservation| {
                 sender
-                    .send(Ok(super::bridge::HostEvent::host(event.event)))
+                    .send(Ok(super::bridge::ProviderObservation {
+                        event,
+                        native: None,
+                    }))
                     .map_err(|_| HostEffectFailure::Retired)
             };
             loop {
@@ -215,6 +289,7 @@ impl HostInvocation {
         resources: HostInvocationResources,
     ) -> Self {
         let HostInvocationResources {
+            observed_authority,
             provider_closed,
             permissions,
             directories,
@@ -229,13 +304,15 @@ impl HostInvocation {
             .as_ref()
             .map(crate::skill::SkillExecution::event_observer);
         let checkpoint = context.checkpoint.clone();
-        let lsp = context.lsp.clone();
         Self {
             provider_closed,
             binding,
             scope,
             request: request.invocation_snapshot(),
             authority: crate::tools::TaskAuthority::capture(&context),
+            template: context.clone(),
+            observed_authority,
+            observed_tools: Default::default(),
             executor: ControlToolExecutor::new(context),
             permissions,
             directories: Mutex::new(directories),
@@ -249,7 +326,6 @@ impl HostInvocation {
             relay: tokio::sync::Mutex::new(relay),
             skills: Mutex::new(skills),
             skill_observer,
-            lsp,
             state: Mutex::new(InvocationState::default()),
             changed: Notify::new(),
             live_host_effects,
@@ -257,6 +333,66 @@ impl HostInvocation {
         }
     }
 
+    /// Retain host replay risk for this original delegation subtree without absorbing child results.
+    pub(crate) fn mark_descendant_work(
+        &self,
+        parent: &InvocationScope,
+    ) -> Result<(), ProviderError> {
+        if self.observed_authority.owns_parent(parent) {
+            self.completion.record_descendant_work()?;
+        }
+        Ok(())
+    }
+    /// Retire only independently owned child executors at their actual native lifecycle boundary.
+    pub(crate) async fn retire_observed(
+        &self,
+        thread: Option<&forge_provider_api::ThreadId>,
+        turn: Option<&forge_provider_api::TurnId>,
+    ) -> Result<(), ProviderError> {
+        let children = self.observed_tools.lock().await;
+        for (id, child) in children.iter() {
+            if turn.is_some_and(|turn| turn != id)
+                || thread.is_some_and(|thread| thread != &child.scope.owner.thread_id())
+            {
+                continue;
+            }
+            child.executor.cancel();
+            for change in child.completion.collected_file_changes() {
+                child.sink.send_host_file_change(change)?;
+            }
+        }
+        Ok(())
+    }
+    /// Collect every independently retained child callback after binding fencing wakes pending proof admission.
+    pub(crate) async fn collect_observed(&self) -> Result<(), ProviderError> {
+        let children = self
+            .observed_tools
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut mutation_failed = false;
+        for child in children {
+            child.executor.close().await;
+            mutation_failed |= child.executor.mutation_failed();
+            for change in child.completion.collected_file_changes() {
+                child.sink.send_host_file_change(change)?;
+            }
+        }
+        if mutation_failed {
+            return Err(ProviderFailure::new(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Runtime,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Collection,
+                forge_provider_api::FailureDisposition::Uncertain,
+            )
+            .into());
+        }
+        Ok(())
+    }
     /// Get immutable invocation preferences only for the fully matching invocation scope.
     pub(crate) fn request_snapshot(
         &self,
@@ -320,21 +456,33 @@ impl HostInvocation {
         Ok(())
     }
 
+    /// Verify original invocation authority and get its immutable native generation.
+    pub(super) fn binding_for(&self, scope: &InvocationScope) -> Result<&BindingId, ProviderError> {
+        if &self.scope != scope {
+            return Err(rejected());
+        }
+        Ok(&self.binding)
+    }
+
     /// Append host-owned skill-read observations after their normalized source event.
     pub(crate) fn observe(
         &self,
         event: &forge_provider_api::ProviderEvent,
-    ) -> Result<
-        Vec<forge_provider_api::ProviderEvent>,
-        forge_provider_api::events::EventDeliveryError,
-    > {
-        let mut additional = self.skill_observer.as_ref().map_or_else(
-            || Ok(Vec::new()),
-            |observer| observer.additional_events(event),
-        )?;
-        if let Some(lsp) = &self.lsp {
-            additional.extend(lsp.observe_changes(event));
-        }
+    ) -> Result<Vec<super::events::HarnessEvent>, forge_provider_api::events::EventDeliveryError>
+    {
+        let additional = self
+            .skill_observer
+            .as_ref()
+            .map_or_else(
+                || Ok(Vec::new()),
+                |observer| observer.additional_events(&self.scope.clone().into(), event),
+            )?
+            .into_iter()
+            .map(|event| super::events::HarnessEvent::Host {
+                scope: self.scope.clone().into(),
+                event,
+            })
+            .collect::<Vec<_>>();
         Ok(additional)
     }
 
@@ -354,7 +502,7 @@ impl HostInvocation {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(ProviderFailure::new(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             )
             .at_phase(
@@ -430,6 +578,9 @@ impl HostInvocation {
         endpoint_result?;
         endpoint_close?;
         relay_result?;
+        if self.executor.mutation_failed() || self.endpoint.mutation_failed() {
+            return Err(HostEffectFailure::Uncertain);
+        }
         let mut state = self
             .state
             .lock()
@@ -481,7 +632,7 @@ impl HostInvocation {
             {
                 let owner = owner.ok_or_else(|| {
                     ProviderError::Failure(ProviderFailure::new(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::Rejected,
                     ))
                 })?;
@@ -515,27 +666,30 @@ impl HostInvocation {
             name: call.name,
             arguments: call.arguments,
         };
-        let outcome = self
-            .executor
-            .execute(invocation.clone())
-            .await
-            .map_err(|error| {
-                if error.is::<crate::broker::TurnCancelled>() {
-                    ProviderError::Cancelled
-                } else {
-                    ProviderError::Failure(ProviderFailure::new(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Unknown,
-                    ))
-                }
-            })?;
+        let outcome = self.executor.execute(invocation.clone()).await;
+        // A call that fails before producing its batch, such as a question wait retired by
+        // cancellation, publishes no host effect. Its absence is certain, so it must not leave
+        // the invocation's collection uncertain and fail the owner's observation.
+        if outcome.is_err() {
+            admitted.published = true;
+        }
+        let outcome = outcome.map_err(|error| {
+            if error.is::<crate::broker::TurnCancelled>() {
+                ProviderError::Cancelled
+            } else {
+                ProviderError::Failure(ProviderFailure::new(
+                    ProviderOperation::TurnStart,
+                    ProviderFailureKind::Unknown,
+                ))
+            }
+        })?;
         let mut completion = ProviderCompletion::default();
         let message = match &outcome.result {
             Ok(result) => {
                 if let Some(effect) = &result.invocation {
                     crate::tools::apply_invocation(effect, &mut completion).map_err(|_| {
                         ProviderError::Failure(ProviderFailure::new(
-                            ProviderOperation::InputSubmit,
+                            ProviderOperation::TurnStart,
                             ProviderFailureKind::Rejected,
                         ))
                     })?;
@@ -564,6 +718,64 @@ impl HostInvocation {
 
 #[async_trait]
 impl ProviderTools for HostInvocation {
+    /// Execute only a positively registered native child's independently forked host context.
+    async fn call_observed_child(
+        &self,
+        parent: &InvocationScope,
+        child: &forge_provider_api::TurnAddress,
+        call: ToolCall,
+    ) -> Result<String, ProviderError> {
+        if self
+            .provider_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        if !self.tools.contains(&call.name) {
+            return Err(rejected());
+        }
+        let (proof, sink) = self.observed_authority.resolve(parent, child).await?;
+        self.mark_descendant_work(parent)?;
+        let tools = {
+            let mut children = self.observed_tools.lock().await;
+            for ancestor in self.observed_authority.ancestry(&proof)? {
+                let scope = ancestor.turn().ok_or_else(rejected)?;
+                let id = scope.turn_id().map_err(|_| rejected())?;
+                if children.contains_key(&id) {
+                    continue;
+                }
+                let template = if ancestor.parent() == &self.scope {
+                    self.template.clone()
+                } else {
+                    children
+                        .values()
+                        .find(|tools| &tools.scope == ancestor.parent())
+                        .ok_or_else(rejected)?
+                        .template
+                        .clone()
+                };
+                let sink = if scope == &child.scope {
+                    sink.clone()
+                } else {
+                    self.observed_authority.tool_sink(&ancestor)?
+                };
+                let context = template.fork_observed(&ancestor, sink.clone())?;
+                children.insert(
+                    id,
+                    Arc::new(ObservedTools {
+                        scope: scope.clone(),
+                        completion: context.provider_completion.clone(),
+                        template: context.clone(),
+                        executor: ControlToolExecutor::new(context),
+                        sink,
+                        calls: Default::default(),
+                    }),
+                );
+            }
+            children.get(&child.turn_id).cloned().ok_or_else(rejected)?
+        };
+        tools.call(call).await
+    }
     async fn call(&self, scope: &InvocationScope, call: ToolCall) -> Result<String, ProviderError> {
         if scope != &self.scope || !self.tools.contains(&call.name) {
             return Err(rejected());
@@ -682,7 +894,7 @@ impl TurnControl for HostInvocation {
     async fn close(&self, scope: &InvocationScope) -> Result<(), ProviderError> {
         self.settle(scope).await.map_err(|_| {
             ProviderError::Failure(ProviderFailure::new(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Unknown,
             ))
         })
@@ -705,7 +917,7 @@ impl TurnControl for HostInvocation {
             cancelled: matches!(state.admission, Admission::Cancelled),
             error: completion.control_error.map(|_| {
                 ProviderError::Failure(ProviderFailure::new(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ))
             }),
@@ -724,7 +936,7 @@ impl TurnControl for HostInvocation {
 /// Reject callbacks without exposing host storage or provider implementation state.
 fn rejected() -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(
-        ProviderOperation::InputSubmit,
+        ProviderOperation::TurnStart,
         ProviderFailureKind::Rejected,
     ))
 }

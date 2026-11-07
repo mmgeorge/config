@@ -9,11 +9,28 @@ local controller = require("forge.views.harness.controller")
 local client = require("forge.client")
 local duration = require("forge.views.harness.duration")
 local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win(), closed = function() end }
+-- The picker measures elapsed countdown time with `vim.uv.hrtime` and redraws from a libuv
+-- timer. The fixture advances that clock by hand and captures the tick instead of waiting
+-- for a real second to pass.
+local original_hrtime, original_new_timer = vim.uv.hrtime, vim.uv.new_timer
+local elapsed_ns = 0
+local countdown_tick ---@type fun()?
+vim.uv.hrtime = function() return original_hrtime() + elapsed_ns end
+vim.uv.new_timer = function()
+  local timer = assert(original_new_timer())
+  return {
+    start = function(_, _, _, callback) countdown_tick = callback return 0 end,
+    stop = function() return timer:stop() end,
+    close = function() return timer:close() end,
+    is_closing = function() return timer:is_closing() end,
+  }
+end
 local seconds, microseconds = vim.uv.gettimeofday()
 local deadline = seconds * 1000 + microseconds / 1000 + 62000
-approval.open({ id = "timeout-request", deadline = { expires_at_ms = deadline }, item_list = {
-  { id = "item", title = "Read", detail = "Inspect source", choice_list = { { id = "deny_once", label = "Deny once" } } },
-} }, vim.tbl_extend("force", host, { resolve = function() error("UI must not resolve the deadline") end }))
+approval.open({ request_id = "timeout-request", execution_kind = "managed", deadline = { expires_at_ms = deadline }, targets = {
+  { target_id = "item", title = "Read", detail = "Inspect source", commands = {}, choices = { { choice_id = "deny_once", label = "Deny once" } } },
+} },vim.tbl_extend("force", host, { resolve = function() error("UI must not resolve the deadline") end }))
+vim.uv.new_timer = original_new_timer
 local instance = picker._state_for_test()
 local before = vim.api.nvim_buf_get_changedtick(instance.buf)
 local cursor = vim.api.nvim_win_get_cursor(instance.win)
@@ -24,7 +41,12 @@ local function title()
   return table.concat(text)
 end
 assert(title():find("01:02", 1, true), title())
-assert(vim.wait(1700, function() return title():find("01:01", 1, true) ~= nil end, 20), title())
+assert(countdown_tick, "picker did not start its countdown timer")
+elapsed_ns = 1000 * 1000000
+countdown_tick()
+-- The tick is schedule-wrapped, so the wait only drains the scheduled redraw.
+assert(vim.wait(1000, function() return title():find("01:01", 1, true) ~= nil end, 5), title())
+vim.uv.hrtime = original_hrtime
 assert(vim.api.nvim_buf_get_changedtick(instance.buf) == before, "countdown rewrote the body")
 assert(vim.deep_equal(vim.api.nvim_win_get_cursor(instance.win), cursor), "countdown moved cursor")
 local timer = instance.timer

@@ -343,8 +343,8 @@ impl IdentityRegistry {
         if !state.admitting
             && !matches!(
                 operation,
-                ProviderOperation::Cancel
-                    | ProviderOperation::SessionClose
+                ProviderOperation::TurnInterrupt
+                    | ProviderOperation::ThreadClose
                     | ProviderOperation::Shutdown
             )
         {
@@ -633,7 +633,7 @@ mod tests {
     ) -> Interruption<impl Future<Output = Result<(), ProviderError>> + Send> {
         Interruption::new(
             reason.failure(
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 ProviderPhase::Observation,
                 FailureDisposition::Uncertain,
             ),
@@ -658,7 +658,7 @@ mod tests {
             owner
                 .observe(
                     observed_context,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async move {
                         native_count.fetch_add(1, Ordering::AcqRel);
@@ -681,7 +681,7 @@ mod tests {
         let result = store
             .observe(
                 operation,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 1_u8,
                 async { panic!("exact replay dispatched twice") },
                 interrupted,
@@ -706,7 +706,7 @@ mod tests {
             owner
                 .observe(
                     observed_context,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async move {
                         let _ = entered.send(());
@@ -726,7 +726,7 @@ mod tests {
         let pending = store
             .observe(
                 operation.clone(),
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 1_u8,
                 async { panic!("pending replay dispatched twice") },
                 interrupted,
@@ -742,7 +742,7 @@ mod tests {
             store
                 .observe(
                     operation,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async { panic!("late replay dispatched twice") },
                     interrupted
@@ -768,7 +768,7 @@ mod tests {
             owner
                 .observe(
                     operation,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async move {
                         let _ = entered.send(());
@@ -779,7 +779,7 @@ mod tests {
                     move |reason| {
                         Interruption::new(
                             reason.failure(
-                                ProviderOperation::SessionFork,
+                                ProviderOperation::ThreadFork,
                                 ProviderPhase::Observation,
                                 FailureDisposition::Uncertain,
                             ),
@@ -812,7 +812,7 @@ mod tests {
             store
                 .take(
                     operation.clone(),
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     1_u8,
                     async { Ok(SoleResult(5)) },
                     interrupted
@@ -826,7 +826,7 @@ mod tests {
         let taken = store
             .take(
                 operation.clone(),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 1_u8,
                 async { panic!("owned replay opened twice") },
                 interrupted,
@@ -838,7 +838,7 @@ mod tests {
         let changed = store
             .take(
                 operation.clone(),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 2_u8,
                 async { panic!("changed payload dispatched") },
                 interrupted,
@@ -851,7 +851,7 @@ mod tests {
         let changed = store
             .take(
                 changed_context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 1_u8,
                 async { panic!("changed context dispatched") },
                 interrupted,
@@ -874,7 +874,7 @@ mod tests {
             forks
                 .observe(
                     operation.clone(),
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async { Ok(7_u8) },
                     interrupted
@@ -887,7 +887,7 @@ mod tests {
         let duplicate = compactions
             .observe(
                 operation,
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 1_u8,
                 async { Ok(String::from("unexpected mutation")) },
                 interrupted,
@@ -907,7 +907,7 @@ mod tests {
         let rejected = store
             .observe(
                 operation.clone(),
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 1,
                 async { panic!("cancelled admission dispatched") },
                 interrupted,
@@ -919,7 +919,7 @@ mod tests {
         let changed = store
             .observe(
                 operation,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 2,
                 async { panic!("changed rejected operation dispatched") },
                 interrupted,
@@ -945,7 +945,7 @@ mod tests {
             owner
                 .observe(
                     original,
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     1_u8,
                     async move {
                         let _ = entered.send(());
@@ -962,7 +962,7 @@ mod tests {
         let local = running
             .observe(
                 rejected,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 2_u8,
                 async { panic!("closed local admission dispatched work") },
                 interrupted,
@@ -978,7 +978,7 @@ mod tests {
         let shared = other_domain
             .observe(
                 rejected,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 1_u8,
                 async { panic!("closed provider admission dispatched work") },
                 interrupted,
@@ -1000,7 +1000,7 @@ mod tests {
             running
                 .observe(
                     operation,
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     1_u8,
                     async { panic!("closed admission repeated native work") },
                     interrupted
@@ -1030,7 +1030,7 @@ mod tests {
             owner
                 .observe(
                     observed_context,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async move {
                         let _ = entered.send(());
@@ -1052,7 +1052,7 @@ mod tests {
             store
                 .observe(
                     operation,
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     1_u8,
                     async { panic!("expired replay dispatched again") },
                     interrupted
@@ -1079,7 +1079,7 @@ mod tests {
             owner
                 .observe(
                     original,
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     1_u8,
                     async move {
                         let _ = entered.send(());
@@ -1089,13 +1089,13 @@ mod tests {
                     move |reason| {
                         Interruption::new(
                             reason.failure(
-                                ProviderOperation::SessionConfigure,
+                                ProviderOperation::ThreadConfigure,
                                 ProviderPhase::Observation,
                                 FailureDisposition::Uncertain,
                             ),
                             async {
                                 Err(failure(
-                                    ProviderOperation::SessionConfigure,
+                                    ProviderOperation::ThreadConfigure,
                                     ProviderFailureKind::Transport,
                                     ProviderPhase::Collection,
                                     FailureDisposition::Invalidated,
@@ -1121,7 +1121,7 @@ mod tests {
         cleanup
             .observe(
                 repair,
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 1_u8,
                 async move {
                     repaired_native.store(false, Ordering::Release);
@@ -1137,7 +1137,7 @@ mod tests {
         let original = mutation
             .observe(
                 operation,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 1_u8,
                 async { panic!("failed operation was re-executed after repair") },
                 interrupted,

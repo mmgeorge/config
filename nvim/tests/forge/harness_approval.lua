@@ -67,17 +67,16 @@ local function choose(choice_id)
 end
 
 ---@type ForgeApprovalRequest
-local request = { id = "approval", item_list = {} }
+local request = { request_id = "approval", execution_kind = "managed", targets = {} }
 local complete_command = "rustc --version; cargo --version; rustup show active-toolchain"
 for index, command in ipairs({ "rustc --version", "cargo --version", "rustup show active-toolchain" }) do
-  request.item_list[index] = {
-    id = tostring(index), title = "Run command", detail = command,
-    command_list = { context(complete_command, command) },
-    choice_list = {
-      { id = "allow_once", label = "Allow once" },
-      { id = "allow_exact", label = "Always allow exact: shell " .. command },
-      { id = "deny_once", label = "Deny once" },
-      { id = "cancel", label = "Reject all" },
+  request.targets[index] = {
+    target_id = tostring(index), title = "Run command", detail = command,
+    commands = { context(complete_command, command) },
+    choices = {
+      { choice_id = "allow_once", label = "Allow once" },
+      { choice_id = "allow_exact", label = "Always allow exact: shell " .. command },
+      { choice_id = "deny_once", label = "Deny once" },
     },
   }
 end
@@ -92,7 +91,7 @@ local ok, failure = pcall(function()
     closed = function() closed = closed + 1 end,
     resolve = function(id, answer_list, callback)
       submitted = submitted + 1
-      assert(id == request.id)
+      assert(id == request.request_id)
       assert(vim.deep_equal(answer_list, {
         { item_id = "1", choice_id = "allow_exact" },
         { item_id = "2", choice_id = "allow_once" },
@@ -137,12 +136,12 @@ local ok, failure = pcall(function()
   assert(submitted == 2 and not approval.is_open())
 
   local single_request = vim.deepcopy(request)
-  single_request.item_list = { single_request.item_list[1] }
+  single_request.targets = { single_request.targets[1] }
   for _, choice_id in ipairs({ "allow_once", "deny_once", "allow_exact" }) do
     local pending_callback
     host.resolve = function(id, answer_list, callback)
       submitted = submitted + 1
-      assert(id == single_request.id)
+      assert(id == single_request.request_id)
       assert(vim.deep_equal(answer_list, { { item_id = "1", choice_id = choice_id } }))
       pending_callback = callback
     end
@@ -165,7 +164,7 @@ local ok, failure = pcall(function()
   end
   approval.open(request, host)
   choose("allow_exact")
-  choose("cancel")
+  choose("")
   assert(not approval.is_open(), "cancel must close without saving staged choices")
 
   host.resolve = function() error("interrupt must not approve or reject the tool") end
@@ -173,18 +172,34 @@ local ok, failure = pcall(function()
   local previous_closed = closed
   invoke("<C-c>")
   assert(interrupted == 1 and closed == previous_closed + 1 and not approval.is_open())
+  local native_request = vim.deepcopy(request)
+  native_request.execution_kind = "native_observed"
+  local native_cancelled = false
+  ---@type ForgeApprovalHost
+  local native_host = {
+    transcript_win = host.transcript_win, closed = host.closed, interrupt = host.interrupt,
+    resolve = function(id, answers, callback)
+      assert(id == native_request.request_id)
+      for _, answer in ipairs(answers) do assert(answer.choice_id == "cancel") end
+      native_cancelled = true
+      callback(true)
+    end,
+  }
+  approval.open(native_request, native_host)
+  invoke("<C-c>")
+  assert(native_cancelled and interrupted == 1 and not approval.is_open(), "native child cancellation invoked a managed task control")
+
 
   for _, operation in ipairs({ "readable", "writable" }) do
-    local directory_request = { id = "directory-" .. operation, item_list = { {
-      id = "file", title = "File access", detail = "/external/project/file",
-      choice_list = {
-        { id = "allow_once", label = "Allow once" },
-        { id = "allow_global_directory", label = "Allow and add to global " .. operation .. " directories: /external/project" },
-        { id = "cancel", label = "Reject all" },
-      },
+    local directory_request = { request_id = "directory-" .. operation, execution_kind = "managed", targets = { {
+      target_id = "file", title = "File access", detail = "/external/project/file",
+      choices = {
+        { choice_id = "allow_once", label = "Allow once" },
+        { choice_id = "allow_global_directory", label = "Allow and add to global " .. operation .. " directories: /external/project" },
+        },
     } } }
     host.resolve = function(id, answers, callback)
-      assert(id == directory_request.id)
+      assert(id == directory_request.request_id)
       assert(#answers == 1 and answers[1].item_id == "file" and answers[1].choice_id == "allow_global_directory")
       callback(true)
     end
@@ -217,8 +232,8 @@ local ok, failure = pcall(function()
   for index = 1, 40 do long_command = long_command .. ("  Write-Output 'line %d';\n"):format(index) end
   long_command = long_command .. "}"
   local detail_request = vim.deepcopy(request)
-  detail_request.item_list[1].detail = long_command
-  detail_request.item_list[1].command_list = { context(long_command, "ForEach-Object") }
+  detail_request.targets[1].detail = long_command
+  detail_request.targets[1].commands = { context(long_command, "ForEach-Object") }
   approval.open(detail_request, host)
   instance = picker._state_for_test()
   assert(#instance.frame.lines <= vim.api.nvim_win_get_height(instance.win), "details must fit the popup")
@@ -251,7 +266,7 @@ local ok, failure = pcall(function()
     assert(table.concat(syntax) == active_fragment, "wrapping must preserve syntax offsets alongside the marker")
   end
 
-  detail_request.item_list[1].command_list = { context(long_command, "Write-Output 'line 40'") }
+  detail_request.targets[1].commands = { context(long_command, "Write-Output 'line 40'") }
   approval.open(detail_request, host)
   instance = picker._state_for_test()
   assert(instance.frame.content_offset > 0, "long context must initially reveal the command being reviewed")

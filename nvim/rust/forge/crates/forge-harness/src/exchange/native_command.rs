@@ -29,6 +29,8 @@ pub(super) struct NativeCommandRun {
     work: NativeWork,
     stage: NativeCommandStage,
     selected: Option<ExchangeId>,
+    /// Execution policy observed when a permission change resolved, before its commit.
+    policy_baseline: Option<crate::broker::PolicyBaseline>,
     execution: Option<ExecutionPermit>,
     generation: Option<ProviderGenerationPermit>,
     control: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -128,6 +130,7 @@ impl NativeCommandRun {
             work,
             stage,
             selected: None,
+            policy_baseline: None,
             execution: None,
             generation: None,
             control: None,
@@ -242,6 +245,7 @@ impl NativeCommandRun {
                     let patch = broker
                         .owner_permission_patch(*change)
                         .map_err(OperationFailure::Validation)?;
+                    self.policy_baseline = Some(broker.owner_policy_baseline());
                     self.work = NativeWork::Settings(Box::new(SettingsRun::new(
                         self.command.record.request.id.clone(),
                         patch,
@@ -502,6 +506,7 @@ impl NativeCommandRun {
             .owner_finish_configuration(
                 Some(&self.command.record.request.id),
                 self.selected.as_ref(),
+                self.policy_baseline.as_ref(),
             )
             .map_err(OperationFailure::Domain)?;
         updates.extend(completed.delivery.into_updates());

@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     exchange::{Exchange, ExchangeState},
-    provider::{ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolUpdate},
+    provider::{ProviderEvent, TextUpdate},
+};
+use forge_provider_api::{
+    InspectableArguments, ItemEvent, ItemStart, ToolDescriptor, ToolItemEvent,
 };
 
 fn output_exchange(text: &str) -> Result<(Exchange, ProviderEvent)> {
@@ -16,26 +19,30 @@ fn output_exchange(text: &str) -> Result<(Exchange, ProviderEvent)> {
         &mut exchange,
         &address,
         "call",
-        ToolInvocation {
+        ItemStart::CommandExecution(ToolDescriptor {
             semantics: Default::default(),
-            kind: ToolActivityKind::Command,
             name: "read".into(),
             title: "read".into(),
-            arguments: serde_json::json!({}),
-        },
-        [ToolUpdate::Started],
+            arguments: InspectableArguments::new(serde_json::json!({})),
+        }),
+        [ItemEvent::Tool {
+            event: ToolItemEvent::ExecutionStarted,
+        }],
         2,
     )?;
-    let event = ProviderEvent::Tool {
-        address: crate::provider::ToolAddress {
-            turn: address,
-            tool_id: "call".into(),
-        },
-        update: ToolUpdate::Output {
-            update: TextUpdate::Replace(text.into()),
+    let event = ProviderEvent::Item {
+        thread_id: address.thread_id.clone(),
+        turn_id: address.turn_id.clone(),
+        item_id: forge_provider_api::ItemId::new("call")?,
+        event: ItemEvent::Tool {
+            event: ToolItemEvent::Output(TextUpdate::Replace(text.into())),
         },
     };
-    exchange.observe_turn(&event, 2)?;
+    exchange.observe_provider_event(
+        &exchange.turn[0].provider().scope.clone().into(),
+        &event,
+        2,
+    )?;
     Ok((exchange, event))
 }
 
@@ -61,12 +68,16 @@ fn output_saves_and_pages_preserve_content_without_history_reads() -> Result<()>
     store
         .connection
         .execute_batch("DROP TRIGGER no_output_rewrite")?;
-    if let ProviderEvent::Tool { update, .. } = &mut event {
-        *update = ToolUpdate::Output {
-            update: TextUpdate::Append("追加🙂".into()),
+    if let ProviderEvent::Item { event: update, .. } = &mut event {
+        *update = ItemEvent::Tool {
+            event: ToolItemEvent::Output(TextUpdate::Append("追加🙂".into())),
         };
     }
-    exchange.observe_turn(&event, 3)?;
+    exchange.observe_provider_event(
+        &exchange.turn[0].provider().scope.clone().into(),
+        &event,
+        3,
+    )?;
     store.connection.execute_batch("CREATE TRIGGER reject_summary BEFORE UPDATE ON tool_output_summary BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
     assert!(store.save_tool_output_delta(&exchange, &event).is_err());
     assert_eq!(
@@ -320,18 +331,70 @@ fn empty_output_can_append_after_reopening() -> Result<()> {
     store.save_exchange(&exchange)?;
     drop(store);
     let mut store = SqliteStore::open(root.path())?;
-    if let ProviderEvent::Tool { update, .. } = &mut event {
-        *update = ToolUpdate::Output {
-            update: TextUpdate::Append("first λ".into()),
+    if let ProviderEvent::Item { event: update, .. } = &mut event {
+        *update = ItemEvent::Tool {
+            event: ToolItemEvent::Output(TextUpdate::Append("first λ".into())),
         };
     }
-    exchange.observe_turn(&event, 3)?;
+    exchange.observe_provider_event(
+        &exchange.turn[0].provider().scope.clone().into(),
+        &event,
+        3,
+    )?;
     store.save_tool_output_delta(&exchange, &event)?;
     assert_eq!(
         store
             .tool_output_page("output", exchange.turn[0].id(), "call", 0, 100)?
             .output,
         "first λ"
+    );
+    Ok(())
+}
+
+/// Native identity reuse cannot route late observations into another invocation or host session.
+#[test]
+fn provider_exchange_lookup_requires_the_complete_turn_owner() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut store = SqliteStore::open(root.path())?;
+    store.save_session(&test::session("session", "workspace"))?;
+    let (exchange, _) = output_exchange("retained")?;
+    let address = exchange.turn[0].provider().clone();
+    store.save_exchange(&exchange)?;
+    assert_eq!(
+        store
+            .load_provider_exchange("session", &address)?
+            .unwrap()
+            .id,
+        exchange.id
+    );
+    let mut unrelated = address.clone();
+    unrelated.scope.invocation_id = "successor-invocation".into();
+    assert!(
+        store
+            .load_provider_exchange("session", &unrelated)?
+            .is_none()
+    );
+    unrelated = address.clone();
+    unrelated.scope.owner = crate::provider::ThreadOwner::root("foreign-session");
+    assert!(
+        store
+            .load_provider_exchange("session", &unrelated)?
+            .is_none()
+    );
+    unrelated = address.clone();
+    unrelated.scope.owner = crate::provider::ThreadOwner::new(
+        "session".into(),
+        forge_provider_api::AgentId::new("child")?,
+    )?;
+    assert!(
+        store
+            .load_provider_exchange("session", &unrelated)?
+            .is_none()
+    );
+    assert!(
+        store
+            .load_provider_exchange("foreign-session", &address)?
+            .is_none()
     );
     Ok(())
 }

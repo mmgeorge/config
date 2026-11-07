@@ -41,6 +41,29 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_s
 
 Parameterized fixtures for languages and providers need the setup in [Verification by area](verification-by-area.md), and fail without it.
 
+## Launch the host executable
+
+A host fixture launches the built Forge executable through `nvim/tests/forge/support/host_executable.lua`. Do not copy the executable into the fixture directory. Windows scans every new image before its first launch, and a scan of the 182 MB development build routinely outlasts a fixture's startup deadline. The helper acquires a lease from the builder's content-addressed executable cache under `stdpath("cache")`. That cache keeps one pinned copy per build, so repeated runs of the same build launch an image Windows has already scanned:
+
+```lua
+local binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
+```
+
+The first fixture run after a rebuild still pays for one copy and scan of the new image.
+
+## Place fixture workspaces
+
+A fixture never creates its workspace, data directory, or retained evidence inside the checkout. Git reports a nested repository as a single untracked entry, so a fixture workspace left in the checkout shows up in every later status, checkpoint, and Harness session of that checkout. Use `vim.fn.tempname()` for state that may disappear with the Neovim process, which deletes that directory on exit.
+
+A fixture that keeps diagnostics after a failure takes its directory from `nvim/tests/forge/support/evidence_directory.lua`. The helper creates a unique directory under `vim.uv.os_tmpdir()`, inside its `forge` subdirectory: `%TEMP%\forge` on Windows and `$TMPDIR/forge` on macOS. Resolve the helper at file scope, before the fixture changes directory:
+
+```lua
+local fixture_evidence = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/evidence_directory.lua")("harness-admission")
+local workspace, data = fixture_evidence.path .. "/workspace", fixture_evidence.path .. "/data"
+```
+
+Call `fixture_evidence.release(passed)` only after the host process exits, because a running host holds files in the data directory open. A passing run removes the directory. A failing run keeps it, and the fixture reports its `failure.txt` path. A failure to remove the directory fails the fixture.
+
 ## Control provider timing
 
 An interaction test often has to act after the provider receives a prompt but before it responds. Elapsed-time sleeps make these tests flaky, so `nvim/tests/forge/support/mock_provider.lua` holds the real host's `MockProvider` through `session.provider.mock_response` instead. Create the hold before submitting, then wait for the prompt to arrive:
@@ -60,8 +83,35 @@ This fragment assumes an initialized mock session and the existing Harness `stat
 
 `wait()` returns the held request's ID, session, mode, and full prompt. `release()` resumes only that request and does not wait for rendering, so afterward wait for the specific buffer or state change under test. `cancel()` discards an unused hold, or fails a response waiting on it. Unknown IDs, early release, and IDs from another session fail explicitly. The helper's ten-second deadline detects a stuck test, and cancellation or provider shutdown clears holds.
 
+Approval timeouts follow the same rule. Configure an approval timeout long enough that the real clock never reaches it, wait for the approval to appear, then call `mock.expire_approval(session_id)`. The host resolves the pending approval through its deadline path, so the fixture observes the same `Timeout` resolution, rejection feedback, and continuation as an elapsed timer.
+
+## Unscripted mock turns
+
+A fixture that does not script `session.provider.mock_response` receives the mock provider's default turn. Planning fixtures depend on that default reaching a reviewable plan, so the mock acts as a minimal planner instead of only echoing its prompt. Scripted turns skip all of the behavior below.
+
+1. A Plan turn, or a Chat turn whose prompt names the `harness-checks` skill, first reads `check_definition_list`. When checks are unconfigured or invalid, the mock resubmits the listed definitions through `check_definition_edit`, so the edit follows the session's approval mode. Harness issues that Chat turn while a plan waits in `configuring_checks`, and starts the original planning request after the configuration is saved.
+2. A Plan turn whose instructions or prompt contain the declaration JSON then fills the plan overview, adds the `src/change.rs` declaration file, and calls `plan_submit`, leaving the plan in review. A revision carries the original design in its instructions and the current design in its input. The mock therefore revises the higher version, and it skips the file edit when that design already declares `src/change.rs`. The mock cannot read the workspace, so a fixture whose workspace already contains `src/change.rs` gets a rejected add and never reaches review.
+3. Every unscripted turn ends with a `Mock response:` echo of its prompt.
+
+Fixtures answer the resulting approvals and review questions through shared helpers rather than private copies of the request shapes. `support/approval.lua` answers each pending approval request once through `session.approval.resolve`, and accepts a callback that inspects each request before it is answered. A resolution failure arrives in an asynchronous callback, where raising it would only log the error, so the responder retains the first failure and raises it from the next `answer_pending` call inside the fixture's wait loop. `support/plan_acceptance.lua` answers the execution tool-approval question that `session.plan.accept` raises before execution starts.
+
+## Observe state and activity
+
+Read session state through `support/state.lua` in any fixture that opens the Harness view. `session.state.get` is the reconnect primitive, not a passive read. Its response carries a retained `owner_publication` page, and the host records that page as delivered once the response reaches output. A fixture that calls the method directly and discards the page consumes live events such as `activity_changed`, and the presentation then waits for an idle transition it will never receive. The helper calls `controller.synchronize_state`, which sends the client's publication cursor and replays the page through `snapshot.apply`:
+
+```lua
+local state_snapshot = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/state.lua")
+local snapshot = state_snapshot.get()
+```
+
+Resolve the helper path at file scope, before the fixture changes directory, because `debug.getinfo` reports the path as `nvim -l` received it. Fixtures that test the method's own wire behavior, such as `request_independence_host.lua`, still issue it directly.
+
+Observe execution through `require("forge.views.harness.activity").busy(state)`, which reads the host-published `state.activity` phase. `session.prompt.submit` responds when the host admits the input, not when the turn finishes, so await a turn through activity or the concrete plan, question, or transcript state it produces. Lua unit fixtures without a host set activity through `support/activity.lua`, whose `set_busy` advances the activity revision the way a host publication does.
+
 ## Submission races
 
 `harness_host.lua` runs `support/submission_races.lua` against the real Rust host, SQLite storage, Lua input reconciliation, and transcript presentation. Only the provider response and selected transport callbacks are controlled.
+
+The module asserts the split input model. Host-confirmed messages live in `state.input.confirmed` with a `delivery` state, while editor drafts that the host has not confirmed live in `state.input.drafts` with a `draft_state` of `pending`, `rejected`, or `unknown`. A lost submit acknowledgement is recovered through `session.command.status.get` inside `forge.command.dispatch`, never by resubmitting, so the lossy-transport case asserts exactly one submission. A rejected attachment draft stays recoverable without blocking later submissions, and `input_state.discard_rejected` removes it. A host replacement restores durably queued input as the same confirmed message and does not deliver it on startup.
 
 Add a race case to that module with an explicit provider or callback barrier, and assert durable exchange identity, queue contents, and preservation of newer composer text. Do not replace the Rust queue with a Lua mock, or depend on sleeps to order events. Every wait needs a diagnostic deadline, and teardown must restore intercepted callbacks and collect the isolated host when an assertion fails.

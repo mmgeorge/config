@@ -12,6 +12,7 @@ use super::operation::OperationControl;
 pub(super) struct SessionOpening {
     state: Mutex<OpenState>,
     failed_output: Mutex<Option<FailedOpen>>,
+    quarantined: Mutex<Option<OpenedSession>>,
 }
 
 /// Retain the sole returned stream until exact native cleanup succeeds after metadata failure.
@@ -35,21 +36,39 @@ struct PendingOpen {
 }
 
 impl SessionOpening {
+    /// Get the exact rejected receipt still owned before installation can proceed.
+    #[cfg(test)]
+    pub(super) fn quarantined_binding(&self) -> Option<forge_provider_api::BindingId> {
+        self.quarantined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|opened| opened.binding.id.clone())
+    }
     /// Resolve retained opening work before the owner can report its session collected.
     pub(super) async fn collect(
         &self,
         provider: &dyn forge_provider_api::provider::Provider,
         trace: Arc<crate::trace::TraceStore>,
         core: &crate::exchange::core_log::CoreEventLog,
+        collection: Arc<super::bridge::BindingCollection>,
     ) -> Result<Option<OpenedSession>, ProviderError> {
         self.cancel();
+        if let Some(opened) = self
+            .quarantined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Ok(Some(opened));
+        }
         if self
             .failed_output
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         {
-            self.collect_failed_output(provider).await?;
+            self.collect_failed_output(provider, &collection).await?;
             return Ok(None);
         }
         let pending = {
@@ -74,16 +93,20 @@ impl SessionOpening {
         let result = super::operation::observe_owned(
             trace,
             core,
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             &operation,
-            forge_provider_api::EventScope::Binding { owner },
-            None,
+            super::operation::OperationTarget {
+                scope: forge_provider_api::EventScope::Binding { owner },
+                binding: None,
+            },
             super::operation::ObservationPurpose::RetainedCleanup,
-            provider.session_open(operation.clone(), request),
+            provider.thread_open(operation.clone(), request),
         )
         .await;
         let settled = self.complete(&operation, result.result.as_ref().err());
-        let result = self.resolve_observation(provider, result).await;
+        let result = self
+            .resolve_observation(provider, core, &operation, result, &collection)
+            .await;
         match result {
             Ok(opened) => Ok(Some(opened)),
             Err(_)
@@ -107,21 +130,26 @@ impl SessionOpening {
         trace: Arc<crate::trace::TraceStore>,
         core: &crate::exchange::core_log::CoreEventLog,
         request: SessionRequest,
+        collection: Arc<super::bridge::BindingCollection>,
     ) -> Result<OpenedSession, ProviderError> {
         let (operation, request, purpose) = self.begin(request)?;
         let owner = request.owner.clone();
         let result = super::operation::observe_owned(
             trace,
             core,
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             &operation,
-            forge_provider_api::EventScope::Binding { owner },
-            None,
+            super::operation::OperationTarget {
+                scope: forge_provider_api::EventScope::Binding { owner },
+                binding: None,
+            },
             purpose,
-            provider.session_open(operation.clone(), request),
+            provider.thread_open(operation.clone(), request),
         )
         .await;
-        let result = self.resolve_observation(provider, result).await;
+        let result = self
+            .resolve_observation(provider, core, &operation, result, &collection)
+            .await;
         self.complete(&operation, result.as_ref().err());
         result
     }
@@ -130,8 +158,51 @@ impl SessionOpening {
     async fn resolve_observation(
         &self,
         provider: &dyn forge_provider_api::provider::Provider,
-        observed: super::operation::ObservedResult<OpenedSession>,
+        core: &crate::exchange::core_log::CoreEventLog,
+        operation: &OperationContext,
+        mut observed: super::operation::ObservedResult<OpenedSession>,
+        collection: &super::bridge::BindingCollection,
     ) -> Result<OpenedSession, ProviderError> {
+        if observed
+            .result
+            .as_ref()
+            .is_ok_and(|opened| !collection.observe_returned(&opened.binding.id))
+        {
+            let opened = observed
+                .result
+                .expect("successful native opening was checked");
+            *self
+                .quarantined
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opened);
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = OpenState::Closed(None);
+            let conflict = ProviderError::Observation(
+                forge_provider_api::ObservationFailure::OwnershipConflict,
+            );
+            return Err(match observed.completion_failure {
+                Some(primary) => ProviderError::Combined {
+                    primary: Box::new(primary),
+                    secondary: vec![conflict],
+                },
+                None => conflict,
+            });
+        }
+        if let Ok(opened) = &observed.result
+            && let Err(error) = core
+                .operations()
+                .bind_open(operation.id(), opened.binding.id.clone())
+        {
+            observed.completion_failure = Some(match observed.completion_failure.take() {
+                Some(primary) => ProviderError::Combined {
+                    primary: Box::new(primary),
+                    secondary: vec![error],
+                },
+                None => error,
+            });
+        }
         match (observed.result, observed.completion_failure) {
             (result, None) => result,
             (Err(primary), Some(secondary)) => Err(ProviderError::Combined {
@@ -156,7 +227,7 @@ impl SessionOpening {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = OpenState::Closed(None);
-                match self.collect_failed_output(provider).await {
+                match self.collect_failed_output(provider, collection).await {
                     Ok(()) => Err(primary),
                     Err(secondary) => Err(ProviderError::Combined {
                         primary: Box::new(primary),
@@ -171,6 +242,7 @@ impl SessionOpening {
     async fn collect_failed_output(
         &self,
         provider: &dyn forge_provider_api::provider::Provider,
+        collection: &super::bridge::BindingCollection,
     ) -> Result<(), ProviderError> {
         let target = {
             let mut failed = self
@@ -181,7 +253,7 @@ impl SessionOpening {
                 Some(failed) => {
                     if failed.close.is_none() {
                         failed.close =
-                            Some(OperationControl::fresh(ProviderOperation::SessionClose)?);
+                            Some(OperationControl::fresh(ProviderOperation::ThreadClose)?);
                     }
                     Some((
                         failed.binding.id.clone(),
@@ -197,7 +269,19 @@ impl SessionOpening {
             }
         };
         if let Some((binding, context, events)) = target {
-            let closing = provider.session_close(context.clone(), &binding);
+            if collection.ambiguous(&binding) {
+                if collection.collected() {
+                    self.failed_output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    return Ok(());
+                }
+                return Err(ProviderError::Observation(
+                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                ));
+            }
+            let closing = provider.thread_close(context.clone(), &binding);
             tokio::pin!(closing);
             let drain = async {
                 let mut events = events.lock().await;
@@ -251,7 +335,7 @@ impl SessionOpening {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let purpose = if matches!(*state, OpenState::Idle) {
             *state = OpenState::Pending(PendingOpen {
-                operation: OperationControl::fresh(ProviderOperation::SessionOpen)?,
+                operation: OperationControl::fresh(ProviderOperation::ThreadOpen)?,
                 request,
             });
             super::operation::ObservationPurpose::Admission
@@ -265,7 +349,7 @@ impl SessionOpening {
                 purpose,
             )),
             OpenState::Closed(_) => Err(ProviderFailure::new(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             )
             .at_phase(ProviderPhase::Admission, FailureDisposition::Invalidated)

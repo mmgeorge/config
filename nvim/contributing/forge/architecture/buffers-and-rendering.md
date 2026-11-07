@@ -109,6 +109,10 @@ Redraws preserve its buffer; replacing or closing the picker disposes of the edi
 Compaction thresholds instead use a shared choice picker with 64k, 128k, 256k, and
 512k presets, stored as 64,000, 128,000, 256,000, and 512,000 tokens respectively.
 Main and Background model sections each end with Compact and Threshold settings.
+Main and Ask choices use the configured session's catalog from
+`views/harness/provider_catalog.lua`. Background rows use the Background
+controller's settings and catalog. A Background settings failure, such as an
+unresolved generation provider, disables only the Background rows.
 Ask settings begin with an Override toggle. Turning it on copies the current main
 model and compatible tuning into the existing Ask override; turning it off clears
 that override. While off, Model, Thinking, and Speed display the inherited main

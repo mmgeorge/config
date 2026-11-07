@@ -243,6 +243,16 @@ enum OpenDatabaseError {
 }
 
 fn open_database_with_timeout(path: &Path, timeout: Duration) -> Result<Database> {
+    open_database_observing_lock_waits(path, timeout, || {})
+}
+
+/// Calls `on_lock_wait` before each contended retry, which lets tests release a held lock only
+/// after the opener has observed it.
+fn open_database_observing_lock_waits(
+    path: &Path,
+    timeout: Duration,
+    mut on_lock_wait: impl FnMut(),
+) -> Result<Database> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -254,6 +264,7 @@ fn open_database_with_timeout(path: &Path, timeout: Duration) -> Result<Database
                 if is_database_lock_error(&error)
                     && Instant::now().duration_since(started) < timeout =>
             {
+                on_lock_wait();
                 thread::sleep(
                     Duration::from_millis(DB_LOCK_RETRY_MS)
                         .min(timeout.saturating_sub(started.elapsed())),
@@ -914,17 +925,23 @@ mod tests {
         let db_path = temp_db("lock");
         let database = open_database(&db_path)?;
         let reopen_path = db_path.clone();
+        let (lock_wait_sender, lock_wait_receiver) = std::sync::mpsc::channel();
         let opener = thread::spawn(move || {
-            open_database_with_timeout(&reopen_path, Duration::from_secs(2)).map(|database| {
+            open_database_observing_lock_waits(&reopen_path, Duration::from_secs(30), || {
+                let _ = lock_wait_sender.send(());
+            })
+            .map(|database| {
                 drop(database);
             })
         });
 
-        thread::sleep(Duration::from_millis(250));
+        // Release the lock only after the opener has failed once and entered its retry wait.
+        let observed_wait = lock_wait_receiver.recv();
         drop(database);
         opener
             .join()
             .map_err(|_| anyhow!("database opener thread panicked"))??;
+        observed_wait.map_err(|_| anyhow!("opener returned without waiting for the lock"))?;
         let _ = fs::remove_file(db_path);
         Ok(())
     }

@@ -376,6 +376,10 @@ function M.open(state, host, resume_state)
     local build_spec
     local commit
     local current
+    --- Main and Ask model choices come from the configured session's provider catalog, never from
+    --- the Background controller, whose failures concern only the Background rows.
+    ---@type {model_list?: ForgeHarnessModel[], failure?: string}
+    local main_catalog = {}
     local return_state = resume_state
     --- Re-enter only after the owned child closes and the original session remains current.
     local function reopen()
@@ -403,7 +407,14 @@ function M.open(state, host, resume_state)
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
         active.automatic_checks = state.automatic_checks == true
-        if applied and params.session_tools ~= nil then active.session_tools = params.session_tools end
+        -- The response can precede the session publication, so state.session may still hold an
+        -- older value. An applied configuration committed exactly the requested fields; access
+        -- alone is resolved against provider capability and is shown as the saved preference.
+        if applied then
+          for key, value in pairs(params) do
+            if key ~= "access" then active[key] = vim.deepcopy(value) end
+          end
+        end
         if completed then completed(applied) end
         if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -449,7 +460,7 @@ function M.open(state, host, resume_state)
       local id = context.option.id
       if id == "ask-override" then
         if ask.model then configure_ask(vim.empty_dict()) return end
-        local models = commit and commit.model_list or {}
+        local models = main_catalog.model_list or {}
         local model = require("forge.views.harness.model_options").find(models, active.resolved_model or active.model)
         if not model then notifications.error("The main model is not available in the provider model list", "Ask model") return end
         local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
@@ -460,7 +471,7 @@ function M.open(state, host, resume_state)
       end
       if id == "ask-model" or id == "ask-thinking" or id == "ask-speed" then
         if not ask.model then return end
-        local models = commit and commit.model_list or {}
+        local models = main_catalog.model_list or {}
         local model_options = require("forge.views.harness.model_options")
         local model = model_options.find(models, ask.model)
         local selection = vim.deepcopy(ask)
@@ -569,11 +580,11 @@ function M.open(state, host, resume_state)
         and state.session ~= nil and state.session.id == session_id
     end
     local function model_descriptor()
-      return require("forge.views.harness.model_options").find(commit and commit.model_list, active.model)
+      return require("forge.views.harness.model_options").find(main_catalog.model_list, active.model)
     end
     local function change_main(id, direction)
       if id == "main-model" then
-        local models = commit and commit.model_list or {}
+        local models = main_catalog.model_list or {}
         local values = vim.tbl_map(function(model) return model.id end, models)
         local selected = cycle(values, active.model, direction)
         for _, model in ipairs(models) do
@@ -597,6 +608,7 @@ function M.open(state, host, resume_state)
       if id == "compact-threshold" then
         local policy = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
         threshold.open({ host = host, value = policy.threshold_tokens, on_close = reopen,
+          capacity = active.context_usage and active.context_usage.size,
           on_select = function(value)
             if not current() then return end
             local updated = vim.deepcopy(active.auto_compaction or policy)
@@ -607,7 +619,7 @@ function M.open(state, host, resume_state)
       end
       if commit and id:match("^background%-") and commit:open(id) then return end
       if id == "ask-model" then
-        local models = vim.deepcopy(commit and commit.model_list or {})
+        local models = vim.deepcopy(main_catalog.model_list or {})
         for _, model in ipairs(models) do
           if model.id == ask.model then model.selected_reasoning = ask.effort end
         end
@@ -623,7 +635,7 @@ function M.open(state, host, resume_state)
         return
       end
       if id == "main-model" then
-        local models = vim.deepcopy(commit and commit.model_list or {})
+        local models = vim.deepcopy(main_catalog.model_list or {})
         for _, model in ipairs(models) do
           if model.id == active.model then model.selected_reasoning = active.effort end
         end
@@ -668,7 +680,7 @@ function M.open(state, host, resume_state)
           disabled_reason = disabled, muted = muted,
           input = kind == "input" and { kind = "choice", values = duration.choices(), initial = duration.selection(active[id]) } or nil }
       end
-      local catalog_disabled = not (commit and commit.model_list) and (commit and commit.failure or "Loading models") or nil
+      local catalog_disabled = not main_catalog.model_list and (main_catalog.failure or "Loading models") or nil
       local ask_disabled = not ask.model and "Enable Override to change Ask settings." or catalog_disabled
       local main = {
         field("main-model", "choice", active.model or "Default", nil,
@@ -795,12 +807,25 @@ function M.open(state, host, resume_state)
           if action == "activate" then activate(id)
           elseif id == "compact-threshold" then
             local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
-            policy.threshold_tokens = threshold.change(policy.threshold_tokens, direction)
+            policy.threshold_tokens = threshold.change(policy.threshold_tokens, direction,
+              active.context_usage and active.context_usage.size)
             configure({ auto_compaction = policy })
           elseif id:match("^main%-") then change_main(id, direction)
           else toggle({ option = { id = id } }, direction) end
         end,
       }
+    end
+    do
+      local session = require("forge.session")
+      local previous = session.harness
+      session.activate_harness(state)
+      require("forge.views.harness.provider_catalog").models(false, function(model_list, failure)
+        if not current() then return end
+        main_catalog.model_list, main_catalog.failure = model_list, failure
+        if failure then notifications.error(failure, "Harness models") end
+        if picker.is_open("harness-config") then picker.update(build_spec()) end
+      end)
+      session.activate_harness(previous)
     end
     commit = require("forge.views.harness.background_configuration").new({
       provider = active.provider, session_id = session_id, host = host,

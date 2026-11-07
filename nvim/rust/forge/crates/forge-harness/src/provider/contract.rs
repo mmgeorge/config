@@ -15,7 +15,7 @@ pub struct ProviderRequest {
     pub dispatch: super::DispatchTracker,
     /// Separates the agent runtime from its visible root session and settings scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_owner: Option<ExecutionOwner>,
+    pub execution_owner: Option<ThreadOwner>,
     pub harness_session_id: String,
     pub workspace: String,
     pub input: ProviderInput,
@@ -35,6 +35,9 @@ pub struct ProviderRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Earlier definitely undelivered input, ordered before the current instruction.
     pub recovered_input: Vec<ProviderInput>,
+    /// Identify child reports actually carried by this original explicit user input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged_child_reports: Vec<ExchangeId>,
     #[serde(skip, default)]
     pub control_context: Option<crate::tools::ControlTurnContext>,
 }
@@ -58,6 +61,7 @@ impl ProviderRequest {
             provider_session_id,
             submission: _,
             recovered_input,
+            acknowledged_child_reports,
             control_context: _,
         } = self;
         Self {
@@ -76,6 +80,7 @@ impl ProviderRequest {
             provider_session_id: provider_session_id.clone(),
             submission: None,
             recovered_input: recovered_input.clone(),
+            acknowledged_child_reports: acknowledged_child_reports.clone(),
             control_context: None,
         }
     }
@@ -91,16 +96,12 @@ impl ProviderRequest {
     }
 
     /// Resolve the independent runtime without changing the visible settings scope.
-    pub fn runtime_key(
-        &self,
-    ) -> Result<String, forge_provider_api::execution::ExecutionOwnerError> {
+    pub fn runtime_key(&self) -> Result<String, forge_provider_api::execution::ThreadOwnerError> {
         Ok(self.owner()?.runtime_key())
     }
     /// Validate the provider runtime key before admission or cancellation routing.
-    pub fn owner(
-        &self,
-    ) -> Result<ExecutionOwner, forge_provider_api::execution::ExecutionOwnerError> {
-        ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
+    pub fn owner(&self) -> Result<ThreadOwner, forge_provider_api::execution::ThreadOwnerError> {
+        ThreadOwner::resolve(&self.execution_owner, &self.harness_session_id)
     }
 }
 
@@ -110,13 +111,10 @@ pub use forge_provider_api::checklist::{
 
 pub use forge_provider_api::change::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
 
-/// Routes normalized provider updates to the live interaction reducer.
-pub use events::ProviderEventSink;
-
 /// Collected provider events and their completion metadata for non-streaming callers.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProviderOutput {
-    pub event: Vec<ProviderEvent>,
+    pub event: Vec<HarnessEvent>,
     #[serde(flatten)]
     pub completion: ProviderCompletion,
 }
@@ -138,6 +136,12 @@ pub struct ProviderCompletion {
     pub question_answer: Option<PlanQuestionAnswer>,
     pub question_withdrawal: Option<PlanQuestionWithdrawal>,
     pub control_error: Option<String>,
+    /// Prevent replay after independently owned native descendant work was admitted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) descendant_work_admitted: bool,
+    /// Retain committed host file effects under their exact callback and invocation identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
     #[serde(skip)]
     pub(crate) goal_control: Option<crate::goal::GoalControl>,
     #[serde(skip)]
@@ -163,6 +167,8 @@ impl ProviderCompletion {
             question_answer,
             question_withdrawal,
             control_error,
+            mut host_file_changes,
+            descendant_work_admitted,
             goal_control,
             dispatched_task_permit,
             dispatched_execution_id,
@@ -178,6 +184,8 @@ impl ProviderCompletion {
         self.question_answer = question_answer.or(self.question_answer.take());
         self.question_withdrawal = question_withdrawal.or(self.question_withdrawal.take());
         self.control_error = control_error.or(self.control_error.take());
+        self.host_file_changes.append(&mut host_file_changes);
+        self.descendant_work_admitted |= descendant_work_admitted;
         self.goal_control = goal_control.or(self.goal_control.take());
         self.dispatched_task_permit = dispatched_task_permit.or(self.dispatched_task_permit.take());
         self.dispatched_execution_id =
@@ -399,6 +407,7 @@ mod test {
                     approval_mode: ApprovalMode::Ask,
                     provider_session_id: None,
                     submission: None,
+                    acknowledged_child_reports: Vec::new(),
                     recovered_input: Vec::new(),
                     control_context: None,
                 })
@@ -412,7 +421,7 @@ mod test {
                 },
             )
             .await?;
-        let owner = crate::provider::ExecutionOwner::root("harness-session");
+        let owner = crate::provider::ThreadOwner::root("harness-session");
         assert!(test_provider.active_invocation_scope(&owner)?.is_some());
         test_provider.steer_current(owner.clone(), steering).await?;
         assert!(
@@ -434,9 +443,33 @@ mod test {
         let response = output
             .event
             .iter()
-            .filter_map(|event| match event {
-                crate::provider::ProviderEvent::Message { update, .. } => update.text(),
-                _ => None,
+            .filter_map(|event| {
+                let crate::provider::HarnessEvent::Native { event, .. } = event else {
+                    return None;
+                };
+                let event = event.as_ref();
+                match event {
+                    crate::provider::ProviderEvent::Item {
+                        event: forge_provider_api::message::ItemEvent::Started(start),
+                        ..
+                    } => match start {
+                        forge_provider_api::message::ItemStart::AgentMessage(message) => {
+                            Some(message.text.as_str())
+                        }
+                        forge_provider_api::message::ItemStart::Reasoning(message) => {
+                            Some(message.text.as_str())
+                        }
+                        _ => None,
+                    },
+                    crate::provider::ProviderEvent::Item {
+                        event:
+                            forge_provider_api::message::ItemEvent::Message {
+                                event: forge_provider_api::message::MessageItemEvent::Delta(text),
+                            },
+                        ..
+                    } => Some(text.as_str()),
+                    _ => None,
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");

@@ -34,6 +34,7 @@ fn discard_rejected_host_effects(
     }
     let mut retained =
         crate::provider::HostEffectBatch::active_completion(batches).unwrap_or_default();
+    retained.descendant_work_admitted |= output.descendant_work_admitted;
     retained.native = std::mem::take(&mut output.native);
     retained.dispatched_task_permit = output.dispatched_task_permit.take();
     retained.dispatched_execution_id = output.dispatched_execution_id.take();
@@ -83,6 +84,8 @@ fn applicable_host_effects(
     use crate::provider::session_execution::{HostEffectId, HostEffectKind};
     let crate::provider::ProviderCompletion {
         native,
+        host_file_changes,
+        descendant_work_admitted,
         plan_edit,
         design_patch,
         plan_submit,
@@ -100,6 +103,7 @@ fn applicable_host_effects(
     // Native metadata and authorization fields are consumed by the existing idempotent state path.
     let _ = (
         native,
+        descendant_work_admitted,
         plan_read,
         control_error,
         dispatched_task_permit,
@@ -137,6 +141,23 @@ fn applicable_host_effects(
             }),
         );
     }
+    for batch in batches {
+        expected.extend(
+            (0..batch.completion.host_file_changes.len()).map(|ordinal| HostEffectId {
+                batch_revision: batch.revision,
+                kind: HostEffectKind::FileChange,
+                ordinal,
+            }),
+        );
+    }
+    anyhow::ensure!(
+        expected
+            .iter()
+            .filter(|id| id.kind == HostEffectKind::FileChange)
+            .count()
+            == host_file_changes.len(),
+        "host file effects do not match their retained batch provenance"
+    );
     anyhow::ensure!(
         expected
             .iter()
@@ -174,7 +195,8 @@ fn applicable_host_effects(
                 }
                 HostEffectKind::PlanEdit
                 | HostEffectKind::DesignPatch
-                | HostEffectKind::GoalEvidence => false,
+                | HostEffectKind::GoalEvidence
+                | HostEffectKind::FileChange => false,
             })
             .context("terminal host effect has no batch provenance")?;
         expected.push(HostEffectId {
@@ -213,7 +235,8 @@ fn discard_published_terminal_effects(
             HostEffectKind::QuestionWithdrawal => batch.completion.question_withdrawal.is_some(),
             HostEffectKind::PlanEdit
             | HostEffectKind::DesignPatch
-            | HostEffectKind::GoalEvidence => false,
+            | HostEffectKind::GoalEvidence
+            | HostEffectKind::FileChange => false,
         });
         match batch {
             Some(batch) => Ok(cell.effect_published(HostEffectId {
@@ -320,7 +343,8 @@ impl HarnessBroker {
                     HostEffectKind::PlanEdit
                     | HostEffectKind::DesignPatch
                     | HostEffectKind::PlanSubmit
-                    | HostEffectKind::GoalEvidence => false,
+                    | HostEffectKind::GoalEvidence
+                    | HostEffectKind::FileChange => false,
                 })
             })
             .context("question effect has no batch provenance")?;
@@ -439,9 +463,14 @@ impl HarnessBroker {
             previous.repair_checks(now_ms)?;
             self.store.save_exchange(&previous)?;
         }
+        let session_title = match admission.map(|value| &value.origin) {
+            Some(crate::exchange::ExchangeOrigin::TaskStarted { start }) => start.title.as_str(),
+            _ => admitted_prompt,
+        };
         let (mut interaction, new_interaction, events, mut effects) = self
             .stage_interaction_for_turn(
                 admitted_prompt,
+                session_title,
                 admission.is_some() && !automatic_repair,
                 now_ms,
                 selected,
@@ -548,6 +577,54 @@ impl HarnessBroker {
         Ok((value, result.event))
     }
 
+    /// Persist an authenticated host file effect without recreating native tool activity.
+    pub(super) fn commit_host_file_change(
+        &mut self,
+        interaction: &mut Exchange,
+        change: &crate::tools::lsp::HostFileChange,
+        id: crate::provider::session_execution::HostEffectId,
+        cell: Option<&Arc<crate::provider::session_execution::SettlementCell>>,
+    ) -> Result<()> {
+        use crate::provider::session_execution::{HostEffectOutput, ResultEffectAdmission};
+        let guard = match cell.map(|cell| cell.begin_result_effect(id)).transpose()? {
+            Some(ResultEffectAdmission::Apply(guard)) => Some(guard),
+            Some(ResultEffectAdmission::Applied(_)) => None,
+            None => None,
+        };
+        let mut guard = guard;
+        if change.scope.owner.agent_id().as_str() == interaction.agent_id
+            && change.scope.owner.session_id().as_str() == interaction.session_id
+        {
+            let mut candidate = interaction.clone();
+            let changed = candidate.record_host_file_change(change)?;
+            if changed {
+                if let Some(guard) = &mut guard {
+                    guard.begin_mutation();
+                }
+                self.store.save_exchange(&candidate)?;
+                *interaction = candidate;
+            }
+        } else {
+            if let Some(guard) = &mut guard {
+                guard.begin_mutation();
+            }
+            self.record_observed_host_file_change(None, change)?;
+        }
+        if let Some(guard) = guard {
+            guard.commit_output(HostEffectOutput {
+                nodes: Vec::new(),
+                events: Vec::new(),
+                elicitation: None,
+                awaiting_input: false,
+                publication_drained: true,
+                plan_document: None,
+                continuing: None,
+                plan_record: None,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Apply completion metadata and derive the exact host effect set under broker ownership.
     pub(crate) fn stage_host_completion(
         &mut self,
@@ -591,7 +668,7 @@ impl HarnessBroker {
         }
         if let Some(identity) = &output.provider_session_id {
             self.retain_session_identity(
-                &crate::provider::ExecutionOwner::root(&self.session.id),
+                &crate::provider::ThreadOwner::root(&self.session.id),
                 identity,
             )?;
         }
@@ -599,8 +676,28 @@ impl HarnessBroker {
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
         }
-        if output.runtime.model.is_some() {
-            self.session.resolved_model = output.runtime.model.clone();
+
+        if let Some(batches) = &batches {
+            for batch in batches {
+                for (ordinal, change) in batch.completion.host_file_changes.iter().enumerate() {
+                    self.commit_host_file_change(
+                        interaction,
+                        change,
+                        crate::provider::session_execution::HostEffectId {
+                            batch_revision: batch.revision,
+                            kind: crate::provider::session_execution::HostEffectKind::FileChange,
+                            ordinal,
+                        },
+                        settlement.as_ref(),
+                    )?;
+                }
+            }
+        } else {
+            for change in &output.host_file_changes {
+                if interaction.record_host_file_change(change)? {
+                    self.store.save_exchange(interaction)?;
+                }
+            }
         }
 
         if let Some(control_error) = output.control_error.take() {
@@ -726,30 +823,30 @@ mod receipt_tests {
         let (mut exchange, _, _) = broker
             .test_stage_interaction_for_turn("Retain native history", true, 100)
             .await?;
-        let address = crate::provider::TurnAddress {
-            scope: crate::provider::InvocationScope::new(
-                crate::provider::ExecutionOwner::root(&broker.session.id),
-                exchange.id.clone(),
-            ),
-            thread_id: "arbitrary-routing-thread".into(),
-            turn_id: "routing-turn".into(),
-        };
-        broker.apply_turn_observation(
-            &exchange,
-            &address,
-            &crate::provider::TurnUpdate::Started { started_at_ms: 100 },
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root(&broker.session.id),
+            exchange.id.clone(),
+        );
+        let address = crate::provider::test_support::address(&scope);
+        exchange.observe_provider_event(
+            &address.scope.clone().into(),
+            &crate::provider::ProviderEvent::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event: crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 100,
+                }),
+            },
+            100,
         )?;
+        broker.store.save_exchange(&exchange)?;
         assert!(
             broker.session.provider_session_id.is_none(),
             "turn routing created durable native history"
         );
         broker.session.provider_session_id = Some("known-native-history".into());
         broker.save_session()?;
-        broker.apply_turn_observation(
-            &exchange,
-            &address,
-            &crate::provider::TurnUpdate::Started { started_at_ms: 101 },
-        )?;
+        broker.store.save_exchange(&exchange)?;
         assert_eq!(
             broker.session.provider_session_id.as_deref(),
             Some("known-native-history")

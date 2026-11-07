@@ -43,7 +43,8 @@ pub(crate) enum InputAbandonment {
     Superseded,
     /// Explicit delivery control prevented dispatch.
     Paused,
-    /// Host admission retracted the input before native dispatch.
+    /// Host admission retracted the input before native dispatch, or the provider confirmed
+    /// retraction of its output-free native history.
     Retracted,
     /// Configuration collection stopped admission before native dispatch.
     Reconfigured,
@@ -434,10 +435,18 @@ impl InputReceipts {
                         }
                     },
                 };
-                let retracted = matches!(
-                    reason,
-                    InputAbandonment::Cancelled | InputAbandonment::Retracted
-                ) && retirement == SubmissionRetirement::Cancelled;
+                // Confirmed native history retraction removes an accepted prompt as completely as
+                // journal retirement removes an unsent one, so both restore the composer draft.
+                let retracted = match reason {
+                    InputAbandonment::Cancelled => retirement == SubmissionRetirement::Cancelled,
+                    InputAbandonment::Retracted => matches!(
+                        retirement,
+                        SubmissionRetirement::Cancelled | SubmissionRetirement::Accepted
+                    ),
+                    InputAbandonment::Paused
+                    | InputAbandonment::Reconfigured
+                    | InputAbandonment::Superseded => false,
+                };
                 let mut update = tracked.commit_delivery(
                     services,
                     delivery,

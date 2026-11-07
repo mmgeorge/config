@@ -8,11 +8,11 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{AgentCoordinator, AgentOperation, AgentRequest, AgentSource};
-use crate::provider::ExecutionOwner;
+use crate::provider::ThreadOwner;
 
 /// Binds model tool authority to one authenticated root turn and parent exchange.
 pub struct AgentToolScope {
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     parent_exchange_id: String,
     coordinator: Arc<AgentCoordinator>,
     expired: watch::Sender<bool>,
@@ -32,7 +32,7 @@ impl Drop for AgentToolLease {
 
 impl AgentToolScope {
     pub fn new(
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         parent_exchange_id: String,
         coordinator: Arc<AgentCoordinator>,
     ) -> Result<(Arc<Self>, AgentToolLease)> {
@@ -192,7 +192,7 @@ mod tests {
         let coordinator = AgentCoordinator::new("session".into());
         coordinator.set_enabled(true);
         let (scope, _lease) = AgentToolScope::new(
-            ExecutionOwner::root("session"),
+            ThreadOwner::root("session"),
             "parent".into(),
             coordinator.clone(),
         )?;
@@ -216,21 +216,22 @@ mod tests {
     #[tokio::test]
     async fn tool_authority_rejects_children_foreign_roots_disabled_and_expired_turns() {
         let coordinator = AgentCoordinator::new("session".into());
-        let child = ExecutionOwner {
-            session_id: "session".into(),
-            agent_id: "child".into(),
-        };
+        let child = ThreadOwner::new(
+            "session".into(),
+            forge_provider_api::AgentId::new("child").unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
         assert!(AgentToolScope::new(child, "parent".into(), coordinator.clone()).is_err());
         assert!(
             AgentToolScope::new(
-                ExecutionOwner::root("foreign"),
+                ThreadOwner::root("foreign"),
                 "parent".into(),
                 coordinator.clone()
             )
             .is_err()
         );
         let (scope, lease) = AgentToolScope::new(
-            ExecutionOwner::root("session"),
+            ThreadOwner::root("session"),
             "parent".into(),
             coordinator.clone(),
         )
@@ -306,7 +307,7 @@ mod tests {
         let coordinator = AgentCoordinator::new("session".into());
         coordinator.set_enabled(true);
         let (scope, lease) = AgentToolScope::new(
-            ExecutionOwner::root("session"),
+            ThreadOwner::root("session"),
             "parent".into(),
             coordinator.clone(),
         )
@@ -333,7 +334,7 @@ mod tests {
         else {
             panic!("missing authenticated queued invocation")
         };
-        assert_eq!(authority.owner, ExecutionOwner::root("session"));
+        assert_eq!(authority.owner, ThreadOwner::root("session"));
         assert_eq!(authority.parent_exchange_id, "parent");
         assert!(*authority.expired.borrow());
         assert!(response.is_closed());

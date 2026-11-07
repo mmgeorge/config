@@ -58,8 +58,10 @@ vim.fn.writefile({ "[package]", 'name = "call_navigation"', 'version = "0.1.0"',
 vim.fn.writefile({ "invalid Rust {" }, workspace .. "/unrelated.rs")
 local initialized = vim.system({ "git", "init", "--quiet", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
+local declaration_plan = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/declaration_plan.lua")
 local executable = data .. "/forge-test-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local behavior_generator = (vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows) and (vim.g.forge_test_fixture_generator
   or vim.fs.dirname(require("forge.builder").binary_path()) .. "/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
@@ -101,9 +103,23 @@ local success, failure = xpcall(function()
   require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
-  vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan change the dispatch interface" })
-  require("forge.views.harness.controller").submit()
-  await(function() return not state.busy and state.active_plan and state.active_plan.review_digest end, "submitted plan did not arrive")
+  -- The workspace already contains src/change.rs, so the plan revises its declarations through
+  -- scripted plan tools instead of the unscripted mock planner's Add File.
+  local manifest = table.concat(vim.fn.readfile(workspace .. "/Cargo.toml"), "\n") .. "\n"
+  declaration_plan.submit({
+    request = "change the dispatch interface",
+    overview = {
+      objective = "Change the dispatch interface.",
+      background = "The dispatch functions own the calls that reviewers navigate.",
+      requirements = { "Preserve the dispatch ownership boundary." },
+      design = "Change the dispatch interface while preserving its ownership boundary.",
+      verification = { "Confirm the requested interface behaves as designed." },
+    },
+    source = { { path = "src/change.rs", declaration = { "pub fn reviewed_change();", "Algorithm", "  return none" } } },
+    configuration = { { path = "Cargo.toml", baseline = manifest, proposed = (manifest:gsub('"0%.1%.0"', '"0.2.0"', 1)) } },
+  })
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.active_plan
+    and state.active_plan.state == "awaiting_review" and state.active_plan.review_digest end, "submitted plan did not arrive")
   if vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows then
     local seeded = vim.system({ behavior_generator, data .. "/forge/harness", workspace, state.session.id, state.active_plan.id, vim.g.forge_test_plan_tests and "tests" or vim.g.forge_test_plan_flows and "flows" or "behavior" }, { text = true }):wait(30000)
     assert(seeded.code == 0, (seeded.stderr or "") .. (seeded.stdout or ""))
@@ -963,7 +979,13 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(input, 0, -1, false, { "dispatch" })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = input })
   local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
-  assert(#vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, {}) > 0, "incremental rename did not preview")
+  local preview_marks = vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true })
+  assert(#preview_marks > 0, "incremental rename did not preview")
+  -- Declaration rows render with a display indent, so each mark must cover the old name at its rendered column.
+  for _, mark in ipairs(preview_marks) do
+    local covered = vim.api.nvim_buf_get_text(review.buf, mark[2], mark[3], mark[4].end_row or mark[2], mark[4].end_col, {})
+    assert(table.concat(covered, "\n") == "reviewed_change", "rename preview concealed the wrong text: " .. vim.inspect(covered))
+  end
   assert(vim.deep_equal(vim.fn.readfile(artifact, "b"), canonical), "rename preview modified the plan")
   local cancel = vim.api.nvim_buf_call(input, function() return vim.fn.maparg("<Esc>", "n", false, true) end)
   cancel.callback()
@@ -976,7 +998,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(input, 0, -1, false, { "dispatch" })
   local confirm = vim.api.nvim_buf_call(input, function() return vim.fn.maparg("<CR>", "n", false, true) end)
   confirm.callback()
-  await(function() return not state.busy and state.plan_review == review and review.owner.version == document.version + 1 end, "rename did not update the retained review")
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.plan_review == review and review.owner.version == document.version + 1 end, "rename did not update the retained review")
   local renamed = vim.json.decode(table.concat(vim.fn.readfile(artifact, "b"), "\n"))
   assert(renamed.version == document.version + 1, "rename did not advance the plan version")
   assert(renamed.design.proposed["src/change.rs"]:find("pub fn dispatch", 1, true), "rename did not persist the new declaration")

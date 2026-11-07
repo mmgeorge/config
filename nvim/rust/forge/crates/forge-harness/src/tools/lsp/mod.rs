@@ -16,8 +16,11 @@ mod service;
 mod status;
 mod symbols;
 mod transaction;
+mod work;
 
 pub(crate) use catalog::is_tool;
 pub(in crate::tools) use catalog::{definitions, execute, record};
+pub(crate) use changes::HostFileChange;
 pub(crate) use rename::{allowed_mode, is_mutation};
 pub(crate) use service::{LspLease, LspScope, LspService};
+pub(crate) use work::MutationWork;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use forge_provider_api::{
-    ExecutionOwner,
+    ThreadOwner,
     testing::{
         ProviderTestControl, TestControlCommand, TestControlResult, TestHoldId, TestPromptScript,
     },
@@ -32,6 +32,9 @@ pub(crate) enum MockResponseCommand {
     Cancel { id: String },
     /// Queue normalized prompt steps and terminal evidence for the next request.
     Script { script: TestPromptScript },
+    /// Fire the session's pending timed approvals through their deadline path immediately.
+    /// The session service owns the permission coordinator, so it handles this operation.
+    ExpireApproval,
 }
 
 /// Preserve the existing Harness RPC surface while routing holds through a normalized provider API.
@@ -51,7 +54,7 @@ impl MockResponseControl {
         session_id: &str,
         command: MockResponseCommand,
     ) -> Result<Value> {
-        let owner = ExecutionOwner::root(session_id);
+        let owner = ThreadOwner::root(session_id);
         let command = match command {
             MockResponseCommand::Hold { mode, any_session } => TestControlCommand::Hold {
                 mode,
@@ -67,6 +70,9 @@ impl MockResponseControl {
                 id: TestHoldId::new(id)?,
             },
             MockResponseCommand::Script { script } => TestControlCommand::Script { script },
+            MockResponseCommand::ExpireApproval => {
+                anyhow::bail!("expire_approval requires the session permission coordinator")
+            }
         };
         let result = self
             .control

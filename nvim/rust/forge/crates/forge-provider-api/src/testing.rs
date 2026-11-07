@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{ExecutionOwner, MessageRole, PromptMode, ProviderError, error::ProviderFailureKind};
+use crate::{PromptMode, ProviderError, ThreadOwner, error::ProviderFailureKind};
 
 /// Identify one response barrier without exposing the mock provider's queue state.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -72,17 +72,33 @@ pub enum TestControlCommand {
     Script { script: TestPromptScript },
 }
 
+/// Select native fixture content without treating reasoning as an assistant prose role.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestMessageContent {
+    /// Emit intermediate assistant progress prose.
+    Commentary,
+    /// Emit positively classified final-answer prose.
+    Response,
+    /// Emit a distinct native reasoning representation.
+    Reasoning(crate::ReasoningKind),
+}
+
 /// Describe one normalized message or host-tool interaction in a test response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TestPromptStep {
     Message {
-        role: MessageRole,
+        content: TestMessageContent,
         text: String,
     },
     ToolCall {
         name: String,
         arguments: serde_json::Value,
+    },
+    /// Publish one complete native checklist replacement for the scripted turn.
+    Checklist {
+        update: crate::ProviderChecklistUpdate,
     },
 }
 
@@ -126,7 +142,7 @@ pub struct PendingTestResponse {
     /// Identify the hold that owns this response.
     pub id: TestHoldId,
     /// Identify the normalized conversation that reached the barrier.
-    pub owner: ExecutionOwner,
+    pub owner: ThreadOwner,
     /// Preserve the prompt's normalized execution mode.
     pub mode: PromptMode,
     /// Preserve the normalized prompt text for test assertions.
@@ -150,21 +166,21 @@ pub trait ProviderTestControl: Send + Sync {
     /// Arm, observe, release, or cancel one barrier owned by the selected test session.
     async fn dispatch(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         command: TestControlCommand,
     ) -> Result<TestControlResult, ProviderError>;
 
     /// Hold this normalized prompt when a matching barrier is armed.
     async fn arrive(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         mode: PromptMode,
         prompt: String,
     ) -> Result<(), ProviderError>;
 
     /// Consume the next script queued for this owner, if any.
-    fn take_script(&self, owner: &ExecutionOwner) -> Option<TestPromptScript>;
+    fn take_script(&self, owner: &ThreadOwner) -> Option<TestPromptScript>;
 
     /// Cancel barriers for one owner, or all owners during provider shutdown.
-    fn cancel_owner(&self, owner: Option<&ExecutionOwner>);
+    fn cancel_owner(&self, owner: Option<&ThreadOwner>);
 }

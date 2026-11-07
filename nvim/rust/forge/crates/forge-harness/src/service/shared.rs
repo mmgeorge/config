@@ -566,10 +566,18 @@ mod tests {
             &forge_providers::registry::nonselectable_id().unwrap(),
         )
         .unwrap();
-        let native =
-            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-                Ok(())
-            });
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            |request, _, start, _| async move {
+                start.observed(1).await?;
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            },
+        );
         native.with_mcp_list({
             let observing = observing.clone();
             let release = release.clone();
@@ -592,7 +600,7 @@ mod tests {
             broker.execution_registry()
         };
         execution_registry
-            .owner(crate::provider::ExecutionOwner::root(&session))
+            .owner(crate::provider::ThreadOwner::root(&session))
             .await?;
         *controller.provider.write().unwrap() = provider.provider_handle();
         controller.trace.configure_default(true)?;

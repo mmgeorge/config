@@ -14,7 +14,7 @@ package.loaded.forge = {
   open_compact_preview = record("compact"),
 }
 package.loaded["forge.views.permissions"] = { open = record("permissions") }
-package.loaded["forge.client"] = { request = record("request") }
+package.loaded["forge.client"] = { request = record("request"), history_clear = record("history_clear") }
 package.loaded.lazy = { load = record("lazy_load") }
 package.loaded["forge.views.harness.settings"] = { log = record("log") }
 require("forge.session").harness.session = { id = "command-test" }
@@ -30,7 +30,7 @@ local ok, failure = xpcall(function()
   local commands = vim.api.nvim_get_commands({})
   local expected_commands = {
     "ForgeBranchDiff", "ForgeBranchDiffFile", "ForgeFileRevision", "ForgeDiffCompactPreview",
-    "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgePermissions", "ForgeStartupLog",
+    "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgeHistoryClear", "ForgePermissions", "ForgeStartupLog",
     "ForgeGitConfigCacheReset",
     "ForgeDebugCommitPromptPreview", "ForgeDebugBackgroundTimeline",
   }
@@ -49,6 +49,8 @@ local ok, failure = xpcall(function()
   assert(recorded[#recorded].name == "new_session")
   vim.cmd("ForgePermissions")
   assert(recorded[#recorded].name == "permissions")
+  vim.cmd("ForgeHistoryClear")
+  assert(recorded[#recorded].name == "history_clear")
   vim.cmd("ForgeBranchDiff HEAD~1")
   assert(recorded[#recorded].arguments[1] == "HEAD~1")
   vim.cmd("ForgeBranchDiffFile file.rs HEAD ignored")

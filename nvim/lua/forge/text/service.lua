@@ -23,7 +23,16 @@ local function initialize_profile(owner,config,allowed,callback)
   local started=vim.uv.hrtime()
   client.request({method="text.initialize",params={profile=key,terminology=prepared.terminology,assets=config.assets}},function(result,failure)
     if profiles[key]~=profile then return end
-    require("forge.infra.perf").event("diff","text.initialize",{elapsed_ms=(vim.uv.hrtime()-started)/1e6,status=failure and "failed" or "ready"})
+    -- A host stopped or replaced after this request closes its text service; that is a lifecycle
+    -- cancellation, so the next use initializes against the current host instead of reporting it.
+    local superseded=failure and (client.host_get_generation()~=generation or not client.host_is_accepting())
+    require("forge.infra.perf").event("diff","text.initialize",{elapsed_ms=(vim.uv.hrtime()-started)/1e6,
+      status=superseded and "superseded" or failure and "failed" or "ready"})
+    if superseded then
+      profiles[key]=nil
+      for _,complete in ipairs(profile.callbacks) do complete(nil,nil) end
+      return
+    end
     profile.pending=false
     profile.ready=not failure and result or nil
     profile.generation=client.host_get_generation()
@@ -34,7 +43,7 @@ local function initialize_profile(owner,config,allowed,callback)
 end
 
 ---@param owner table
----@param callback fun(profile?: table, failure?: string)
+---@param callback fun(profile?: table, failure?: string) Receives neither value when a host stop supersedes initialization.
 function M.initialize(owner,callback)
   local config = require("forge.infra.config").options.text_correction
   require("forge.text.wordlist").vocabulary(config.wordlist,function(terms,failure)
@@ -50,7 +59,8 @@ end
 function M.correct(owner,occurrence,current,callback)
   M.initialize(owner,function(profile,failure)
     if failure then callback(nil,failure) return end
-    if not current() then return end
+    -- A profile superseded by a host stop yields neither a profile nor a failure.
+    if not profile or not current() then return end
     occurrence.profile=profile
     client.request({method="text.correct",params={profile=profile.profile,profile_revision=profile.profile_revision,
       occurrence=occurrence.id,context=occurrence.context.text,target=occurrence.context.target,protected=occurrence.context.protected}},function(result,error)

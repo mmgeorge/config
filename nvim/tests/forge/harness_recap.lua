@@ -18,7 +18,7 @@ local state = { session = { id = "session", model = "default", resolved_model = 
 local function render() rendered = rendered + 1 end
 recap.request(state, render)
 recap.request(state, render)
-assert(#pending == 1 and state.recap.loading and not state.busy)
+assert(#pending == 1 and state.recap.loading and not require("forge.views.harness.activity").busy(state))
 pending[1]({ text = "We fixed status rendering." })
 assert(state.recap.text == "We fixed status rendering." and not state.recap.loading)
 state.queue[1] = "next prompt"

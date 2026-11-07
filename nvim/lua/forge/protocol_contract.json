@@ -1,5 +1,5 @@
 {
-  "version": 39,
+  "version": 40,
   "node": {
     "kind": [
       "exchange",
@@ -113,11 +113,15 @@
     },
     "session_fork_ready": {
       "route": "handle",
-      "required": { "snapshot": "object" }
+      "required": {
+        "snapshot": "object"
+      }
     },
     "session_fork_failed": {
       "route": "handle",
-      "required": { "snapshot": "object" }
+      "required": {
+        "snapshot": "object"
+      }
     },
     "session_changed": {
       "route": "handle",
@@ -296,19 +300,20 @@
     "approval_requested": {
       "route": "handle",
       "required": {
-        "data.id": "string"
+        "data.request_id": "string",
+        "data.execution_kind": "string"
       }
     },
     "approval_resolved": {
       "route": "handle",
       "required": {
-        "data.id": "string"
+        "data.request_id": "string"
       }
     },
     "approval_cancelled": {
       "route": "handle",
       "required": {
-        "data.id": "string"
+        "data.request_id": "string"
       }
     },
     "agent_updated": {

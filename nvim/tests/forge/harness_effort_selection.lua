@@ -63,7 +63,8 @@ for _, owner in ipairs({ "configuring_config", "task_config" }) do
     for _, busy in ipairs({ false, true }) do
       state.session.model, state.session.resolved_model = "test", "test"
       state.session.effort, state.session.service_tier = "medium", "default"
-      state[owner], state.busy = pending, busy
+      state[owner] = pending
+      dofile("nvim/tests/forge/support/activity.lua").set_busy(state, busy)
       state.configuration_completion = { deferred = busy }
       controller.refresh_winbar()
       local _, count = header:gsub("%*", "")
@@ -86,7 +87,7 @@ for _, owner in ipairs({ "configuring_config", "task_config" }) do
     end
   end
 end
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.session.model, state.session.resolved_model, state.session.effort = "test", "test", "medium"
 state.session.service_tier = nil
 state.model_provider, state.model_list = "fixture_alpha", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
@@ -99,7 +100,7 @@ local function acknowledge(index)
   state.session = vim.tbl_extend("force", state.session, request.params.config)
   request.callback({ state = "completed" })
 end
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 local composer = vim.api.nvim_create_buf(false, true)
 keymaps.setup_view_keymaps(composer, "harness", state.command_set)
 local function press_effort(command_id, mode)
@@ -144,7 +145,7 @@ transition[1].callback({ state = "completed" })
 assert(state.session.effort == "minimal", "late configuration response overwrote current selection")
 transition = {}
 
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 state.session.active_task = { revision = "goal", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } }
 
 controller.change_effort(1)
@@ -166,7 +167,7 @@ local latest = transition[#transition]
 assert(state.task_config.effort == "medium" and latest.params.config.service_tier == "default")
 assert(header:find("test medium*", 1, true) and not header:find("standard", 1, true), header)
 task.receive(state, { id = transition[1].params.operation_id, state = "superseded" })
-assert(state.task_config and state.busy, "old operation cleared the latest desired settings")
+assert(state.task_config and require("forge.views.harness.activity").busy(state), "old operation cleared the latest desired settings")
 latest.callback({ state = "accepted" })
 for index = 2, #transition - 1 do
   task.receive(state, { id = transition[index].params.operation_id, state = "completed" })
@@ -175,7 +176,7 @@ state.session.effort, state.session.service_tier = "medium", "default"
 state.session.active_task.goal.state = "paused"
 state.session.active_task.status = "paused"
 task.receive(state, { id = latest.params.operation_id, state = "completed" })
-assert(not state.task_config and not state.busy and state.session.effort == "medium")
+assert(not state.task_config and not require("forge.views.harness.activity").busy(state) and state.session.effort == "medium")
 assert(not header:find("fast", 1, true))
 assert(not header:find("*", 1, true), "applied model properties retained a pending marker")
 state.model_list[#state.model_list + 1] = { id = "other-model", service_tiers = { "fast", "ultrafast" } }
@@ -184,13 +185,14 @@ controller.refresh_winbar()
 assert(header:find("󱐌 other-model high", 1, true), header)
 local _, idle_markers = header:gsub("%*", "")
 assert(idle_markers == 0, "idle model changes flashed a pending marker: " .. header)
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 state.task_config.service_tier = "ultrafast"
 controller.refresh_winbar()
 assert(header:find("󱐋 other-model high", 1, true), header)
 local _, paused_markers = header:gsub("%*", "")
 assert(paused_markers == 0, "paused model changes flashed a pending marker: " .. header)
-state.busy, state.task_config = false, nil
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+state.task_config = nil
 local count = #transition
 state.capability.ultrafast_mode = false
 controller.toggle_service_tier("ultrafast")

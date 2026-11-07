@@ -178,16 +178,16 @@ impl ContextCompactionRun {
                             }
                             None => ContextCompactionFailure::Provider {
                                 kind: crate::provider::lifecycle_error::diagnostic(
-                                    forge_provider_api::ProviderOperation::SessionCompact,
+                                    forge_provider_api::ProviderOperation::ThreadCompact,
                                     error.as_ref(),
                                 )
-                                .kind,
+                                .kind(),
                             },
                         };
                         CompactionStage::Failed(Box::new(OperationFailure::Compaction {
                             failure,
                             cause: crate::provider::lifecycle_error::classify(
-                                forge_provider_api::ProviderOperation::SessionCompact,
+                                forge_provider_api::ProviderOperation::ThreadCompact,
                                 error,
                             ),
                         }))

@@ -284,5 +284,4 @@ impl OwnedTaskCheckRun {
             payload: json!({"snapshot":broker.snapshot()?}),
         })
     }
-
 }

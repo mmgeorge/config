@@ -37,12 +37,33 @@ local function compose(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
 end
 local function composer_text() return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n") end
+---@param text string
+---@return {id: string, text: string, delivery?: string}?
 local function retained_message(text)
   for _, messages in ipairs({ state.queue, state.pending_steer }) do
     for _, message in ipairs(messages or {}) do
-      if message.text == text then return message end
+      if type(message) == "table" then
+        ---@cast message {id: string, text: string, delivery?: string}
+        if message.text == text then
+          assert(type(message.id) == "string", "fixture host message requires its original input identity")
+          return message
+        end
+      end
     end
   end
+end
+local function route_message(id, delivery, route)
+  for _, message in ipairs(host.messages) do
+    if message.id == id then
+      message.revision = message.revision + 1
+      message.delivery, message.route = delivery, route
+      host.revision = host.revision + 1
+      input.receive(state, { revision = host.revision, suspended = false,
+        upsert = { vim.deepcopy(message) }, removed = {} })
+      return
+    end
+  end
+  error("host message is missing: " .. id)
 end
 local path_prompt = "/workspace/Screen shot.png\n[Image #1]\n\n"
 compose(path_prompt)
@@ -53,17 +74,20 @@ compose("first follow-up")
 controller.queue_submit()
 compose("second follow-up")
 controller.queue_submit()
-assert(#state.queue == 2 and #state.pending_submit == 1 and #host.requests == 1, "queued input waited for acknowledgement")
+assert(#state.queue == 2 and #state.pending_submit == 1 and #host.requests == 3,
+  "queued drafts must submit independent host commands before earlier acknowledgements")
 compose("newer draft")
 current = false
 host.flush()
 assert(composer_text() == "newer draft", "retired capture overwrote the replacement composer")
+assert(#state.queue == 3 and #state.pending_submit == 0, "host queued receipts must replace pending drafts")
 host.complete(first)
-assert(#state.queue == 2 and #state.pending_submit == 1, "duplicate receipt removed another message")
+assert(#state.queue == 3 and #state.pending_submit == 0 and #host.messages == 3,
+  "duplicate receipt removed another message or duplicated host input")
 current = true
 
 controller.cancel_turn()
-assert(#state.queue == 2, "requesting cancellation must preserve queued input")
+assert(#state.queue == 3, "requesting cancellation must preserve queued input")
 local cancellation = controls[#controls]
 assert(cancellation.method == "session.turn.cancel" and cancellation.parameters.restore_prompt_if_no_output)
 cancellation.callback({ cancel_requested = true })
@@ -76,12 +100,25 @@ assert(resume.parameters.action == "resume")
 resume.callback({ state = "completed" })
 
 compose("active-turn addition")
-state.busy, state.execution_busy = false, true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+state.execution_busy = true
 controller.submit()
-assert(state.pending_steer[#state.pending_steer].text == "active-turn addition")
+---@type { id: string, text: string, delivery?: string }
+local addition = assert(state.pending_submit[#state.pending_submit])
+assert(addition.text == "active-turn addition" and #state.pending_steer == 0,
+  "local busy state must not invent host steering admission")
 assert(host.requests[#host.requests].parameters.action.message.intent == "auto",
   "stale local busy state bypassed host routing")
 host.flush()
+assert(assert(retained_message("active-turn addition")).delivery == "queued" and #state.pending_steer == 0,
+  "a queued receipt must not imply native steering")
+route_message(addition.id, "delivering", "steering")
+assert(#state.pending_steer == 1 and state.pending_steer[1].id == addition.id and #state.pending_submit == 0,
+  "host routing must move the original message into pending steering")
+route_message(addition.id, "accepted", "steering")
+assert(not retained_message("active-turn addition") and #state.pending_steer == 0,
+  "host acceptance must remove only the accepted steering message")
+assert(#state.queue == 3 and composer_text() == "", "steering acceptance changed unrelated queued input")
 
 state.checks_running, state.active_check_run = true, "check"
 compose("replace check")
@@ -114,7 +151,7 @@ retracted = assert(retained_message("retract while typing"))
 compose("preserve this")
 host.revision = host.revision + 1
 input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
-assert(composer_text() == "preserve this" and retained_message("retract while typing").id == retracted.id)
+assert(composer_text() == "preserve this" and assert(retained_message("retract while typing")).id == retracted.id)
 assert(#errors == 0, table.concat(errors, "\n"))
 if state.working_timer then state.working_timer:stop() state.working_timer:close() end
 print("harness_prompt_lifecycle: passed")

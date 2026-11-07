@@ -74,6 +74,13 @@ local ok, failure = xpcall(function()
   assert(vim.tbl_contains(sources.get_trigger_characters("default"), "/"))
   item(complete(commands, "/"), "/model")
   item(complete(commands, "/b"), "/bg")
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "/mod" })
+  vim.api.nvim_win_set_cursor(0, { 1, 4 })
+  local command_result
+  commands:get_completions({}, function(value) command_result = value end)
+  assert(vim.wait(1000, function() return command_result ~= nil end), "command completion timed out")
+  assert(command_result.is_incomplete_forward,
+    "command completion must re-query as arguments are typed instead of filtering stale labels")
   item(complete(commands, "/rec"), "/recap")
   local check_edit = complete(commands, "/checks edit")
   assert(#check_edit == 2, "check edit must only offer permission toggles")

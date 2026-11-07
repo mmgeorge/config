@@ -67,11 +67,10 @@ impl DisplayRegistry {
     #[cfg(test)]
     pub(super) fn tool_occurrences<'registry>(
         &'registry self,
-        source: &'registry str,
+        source: &'registry ToolAddress,
     ) -> impl Iterator<Item = DisplayId> + 'registry {
         self.id.iter().filter_map(move |(key, id)| {
-            matches!(&key.source, DisplaySource::Tool(address) if address.legacy_key() == source)
-                .then_some(*id)
+            matches!(&key.source, DisplaySource::Tool(address) if address == source).then_some(*id)
         })
     }
 
@@ -106,11 +105,15 @@ impl DisplayRegistry {
             .copied()
     }
 
-    pub(super) fn legacy_tool(&self, identity: &str) -> Option<DisplayId> {
-        let mut found = self.id.iter().filter_map(|(key, id)| {
-            matches!(&key.source, DisplaySource::Tool(source) if source.legacy_key() == identity)
-                .then_some((key, *id))
-        }).filter(|(key, _)| key.scope.is_none() && key.occurrence == 0);
+    pub(super) fn source_tool(&self, identity: &ToolAddress) -> Option<DisplayId> {
+        let mut found = self
+            .id
+            .iter()
+            .filter_map(|(key, id)| {
+                matches!(&key.source, DisplaySource::Tool(source) if source == identity)
+                    .then_some((key, *id))
+            })
+            .filter(|(key, _)| key.scope.is_none() && key.occurrence == 0);
         let (_, id) = found.next()?;
         found.all(|(_, other)| other == id).then_some(id)
     }
@@ -153,8 +156,8 @@ impl DisplayProjection<'_> {
         *self.registry.id.entry(key).or_insert(next)
     }
 
-    pub(super) fn legacy_tool(&self, identity: &str) -> Option<DisplayId> {
-        self.registry.legacy_tool(identity)
+    pub(super) fn source_tool(&self, identity: &ToolAddress) -> Option<DisplayId> {
+        self.registry.source_tool(identity)
     }
 }
 
@@ -162,10 +165,25 @@ impl DisplayProjection<'_> {
 mod tests {
     use super::*;
 
+    /// Create checked source identities containing separators to exercise collision safety.
+    fn fixture_address(turn_id: &str, item_id: &str) -> ToolAddress {
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("display-fixture"),
+            "exchange",
+        );
+        ToolAddress {
+            turn: crate::provider::TurnAddress {
+                thread_id: scope.owner.thread_id(),
+                turn_id: forge_provider_api::TurnId::new(turn_id).unwrap(),
+                scope,
+            },
+            item_id: forge_provider_api::ItemId::new(item_id).unwrap(),
+        }
+    }
     #[test]
     fn identities_survive_reordering_and_distinguish_sources_scopes_and_occurrences() {
-        let first = ToolAddress::new("a:b", "c");
-        let second = ToolAddress::new("a", "b:c");
+        let first = fixture_address("a:b", "c");
+        let second = fixture_address("a", "b:c");
         let mut registry = DisplayRegistry::default();
         let mut projection = registry.project("entry".into());
         let root = projection.tool(first.clone(), None);

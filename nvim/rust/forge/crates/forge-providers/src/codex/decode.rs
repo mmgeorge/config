@@ -1,9 +1,10 @@
 use anyhow::Result;
-use forge_provider_api::agent::AgentExecutionState;
+use forge_provider_api::agent::{AgentActiveState, AgentOutcome};
 use forge_provider_api::context::ContextUsage;
 use forge_provider_api::{
-    ChecklistStatus, ProviderChangeKind, ProviderChangeSet, ProviderChecklistEntry,
-    ProviderChecklistUpdate, ProviderFileChange, ToolActivityKind,
+    ChecklistStatus, FailureDisposition, ProviderChangeKind, ProviderChangeSet,
+    ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFailure, ProviderFailureKind,
+    ProviderFileChange, ProviderOperation, ProviderPhase,
 };
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -37,9 +38,17 @@ pub(super) fn dynamic_tool_response(text: String, success: bool) -> Value {
 #[error("invalid Codex tool status")]
 struct InvalidCodexToolStatus;
 
-pub struct CodexToolSnapshot {
+/// Classify the native item representation before constructing the canonical typed start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeToolKind {
+    Command,
+    FileChange,
+    ToolCall,
+}
+
+pub(super) struct CodexToolSnapshot {
     pub id: String,
-    pub kind: ToolActivityKind,
+    pub kind: NativeToolKind,
     pub name: String,
     pub arguments: Value,
     pub title: String,
@@ -49,161 +58,260 @@ pub struct CodexToolSnapshot {
     pub output_delta: bool,
 }
 
+/// Name the collaboration tool recorded by Codex app-server `collabAgentToolCall` items.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CollabAgentTool {
+    /// Create a new child agent; its receiver thread is the spawned child.
+    SpawnAgent,
+    /// Send additional input to an existing child.
+    SendInput,
+    /// Resume a previously stopped child.
+    ResumeAgent,
+    /// Wait for child results without changing child ownership.
+    Wait,
+    /// Close a child conversation.
+    CloseAgent,
+    /// Send a message to an existing child.
+    SendMessage,
+    /// Assign a follow-up task to an existing child.
+    FollowupTask,
+    /// Interrupt an existing child.
+    InterruptAgent,
+    /// List known children without changing their state.
+    ListAgents,
+}
+
+impl CollabAgentTool {
+    /// Report whether the tool restarts work in an already-owned child.
+    pub fn resumes_child(self) -> bool {
+        matches!(self, Self::SendInput | Self::ResumeAgent | Self::Wait)
+    }
+}
+
+/// Preserve the pinned collaboration tool-call status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CollabAgentToolCallStatus {
+    /// The tool call has not finished.
+    InProgress,
+    /// The tool call finished.
+    Completed,
+    /// The tool call failed.
+    Failed,
+    /// The tool call was interrupted.
+    Interrupted,
+}
+
+/// Preserve the pinned last-known child status reported inside `agentsStates`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CollabAgentStatus {
+    /// The child is initializing.
+    PendingInit,
+    /// The child is running.
+    Running,
+    /// The child was interrupted.
+    Interrupted,
+    /// The child completed normally.
+    Completed,
+    /// The child ended with an error.
+    Errored,
+    /// The child was shut down.
+    Shutdown,
+    /// The child conversation no longer exists.
+    NotFound,
+}
+
+/// Preserve the pinned kind of a `subAgentActivity` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SubAgentActivityKind {
+    /// The child was created.
+    Started,
+    /// The parent interacted with an existing child without a reported state change.
+    Interacted,
+    /// The child was interrupted.
+    Interrupted,
+    /// The child completed.
+    Completed,
+}
+
+#[derive(serde::Deserialize)]
+struct CollabAgentState {
+    status: CollabAgentStatus,
+}
+
+/// Decode the two pinned Codex app-server 0.164 collaboration item variants.
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum CollaborationItem {
+    #[serde(rename_all = "camelCase")]
+    CollabAgentToolCall {
+        tool: CollabAgentTool,
+        status: CollabAgentToolCallStatus,
+        sender_thread_id: String,
+        receiver_thread_ids: Vec<String>,
+        prompt: Option<String>,
+        #[serde(default)]
+        agents_states: std::collections::HashMap<String, CollabAgentState>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SubAgentActivity {
+        kind: SubAgentActivityKind,
+        agent_thread_id: String,
+    },
+}
+
+/// Distinguish live child work from an observed child end without an impossible combination.
+#[derive(Clone, Debug)]
+pub enum NativeAgentStatus {
+    /// The child still has live work or a resumable wait.
+    Active(AgentActiveState),
+    /// The child reported a terminal outcome.
+    Finished(AgentOutcome),
+}
+
+impl NativeAgentStatus {
+    /// Report whether the child can still receive input or interruption.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+}
+
 /// Retain native ancestry evidence privately until the adapter normalizes it.
 #[derive(Clone, Debug)]
 pub struct NativeAgentLifecycle {
-    pub operation: String,
+    /// The collaboration tool, absent for `subAgentActivity` records.
+    pub tool: Option<CollabAgentTool>,
     pub starts_child: bool,
     pub parent_thread_id: Option<String>,
     pub provider_thread_id: Option<String>,
-    pub definition: Option<String>,
-    pub nickname: Option<String>,
     pub task: Option<String>,
-    pub status: AgentExecutionState,
+    pub status: NativeAgentStatus,
 }
 
-fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
-    match status.to_ascii_lowercase().as_str() {
-        "pendinginit" => Some(AgentExecutionState::Starting),
-        "running" => Some(AgentExecutionState::Running),
-        "interrupted" | "cancelled" | "canceled" => Some(AgentExecutionState::Interrupted),
-        "completed" | "complete" | "done" => Some(AgentExecutionState::Completed),
-        "errored" | "failed" | "error" => Some(AgentExecutionState::Failed),
-        "shutdown" | "closed" | "notfound" => Some(AgentExecutionState::Closed),
-        "waiting" | "idle" => Some(AgentExecutionState::Waiting),
-        _ => None,
+/// Translate the pinned last-known child status into the normalized lifecycle vocabulary.
+fn agent_status(status: CollabAgentStatus) -> NativeAgentStatus {
+    match status {
+        CollabAgentStatus::PendingInit => NativeAgentStatus::Active(AgentActiveState::Starting),
+        CollabAgentStatus::Running => NativeAgentStatus::Active(AgentActiveState::Running),
+        CollabAgentStatus::Interrupted => NativeAgentStatus::Finished(AgentOutcome::Interrupted),
+        CollabAgentStatus::Completed => NativeAgentStatus::Finished(AgentOutcome::Completed),
+        CollabAgentStatus::Errored => NativeAgentStatus::Finished(AgentOutcome::Failed(
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Unknown)
+                .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain),
+        )),
+        CollabAgentStatus::Shutdown | CollabAgentStatus::NotFound => {
+            NativeAgentStatus::Finished(AgentOutcome::Closed)
+        }
     }
 }
 
-pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<NativeAgentLifecycle> {
-    let encoded = params.to_string().to_ascii_lowercase();
-    let method_lower = method.to_ascii_lowercase();
-    if !method_lower.contains("subagent")
-        && !method_lower.contains("collabagent")
-        && !encoded.contains("collabagenttoolcall")
-        && !encoded.contains("subagentactivity")
-    {
-        return Vec::new();
+/// Decode child lifecycle evidence from one `item/started` or `item/completed` notification.
+///
+/// Only the exact `collabAgentToolCall` and `subAgentActivity` item shapes carry collaboration
+/// state. Other methods and item types return no lifecycle; a malformed collaboration item is a
+/// protocol failure rather than an ignored observation.
+pub fn normalize_agent_lifecycle(
+    method: &str,
+    params: &Value,
+) -> Result<Vec<NativeAgentLifecycle>> {
+    if !matches!(method, "item/started" | "item/completed") {
+        return Ok(Vec::new());
     }
-    let item = params.pointer("/item").unwrap_or(params);
-    let operation = first_string(item, &["tool", "operation", "action", "type"])
-        .unwrap_or_else(|| "agentActivity".into());
-    let parent_thread_id = pointer_string(
-        params,
-        &[
-            "/item/senderThreadId",
-            "/item/sender_thread_id",
-            "/threadId",
-            "/thread_id",
-            "/senderThreadId",
-            "/sender_thread_id",
-        ],
-    );
-    let definition = first_string(item, &["agentType", "agent_type", "role"]);
-    let nickname = first_string(item, &["agentNickname", "agent_nickname", "nickname"]);
-    let task = first_string(item, &["prompt", "task", "input"]);
-    if item
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("subAgentActivity"))
-    {
-        let kind = first_string(item, &["kind"]).unwrap_or_default();
-        let starts_child = kind.eq_ignore_ascii_case("started");
-        let status = if starts_child {
-            AgentExecutionState::Running
-        } else if let Some(status) = normalize_agent_status(&kind) {
-            status
-        } else {
-            return Vec::new();
-        };
-        let provider_thread_id = pointer_string(
-            params,
-            &[
-                "/item/agentThreadId",
-                "/item/agent_thread_id",
-                "/agentThreadId",
-            ],
-        );
-        return provider_thread_id
-            .map(|provider_thread_id| {
-                vec![NativeAgentLifecycle {
-                    operation,
-                    starts_child,
-                    parent_thread_id,
-                    provider_thread_id: Some(provider_thread_id),
-                    definition,
-                    nickname,
-                    task,
-                    status,
-                }]
-            })
-            .unwrap_or_default();
+    let Some(item) = params.get("item") else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("collabAgentToolCall" | "subAgentActivity")
+    ) {
+        return Ok(Vec::new());
     }
-
-    let receiver_thread_id_list = item
-        .get("receiverThreadIds")
-        .or_else(|| item.get("receiver_thread_ids"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let agent_state_map = item
-        .get("agentsStates")
-        .or_else(|| item.get("agents_states"))
-        .and_then(Value::as_object);
-    let mut lifecycle_list = Vec::new();
-    for receiver_thread_id in receiver_thread_id_list {
-        let status = agent_state_map
-            .and_then(|state_map| state_map.get(&receiver_thread_id))
-            .and_then(|state| first_string(state, &["status", "state"]))
-            .and_then(|status| normalize_agent_status(&status))
-            .or_else(|| {
-                if operation.eq_ignore_ascii_case("spawnAgent") {
-                    Some(AgentExecutionState::Running)
-                } else if operation.eq_ignore_ascii_case("closeAgent")
-                    && method_lower.ends_with("/completed")
-                {
-                    Some(AgentExecutionState::Closed)
-                } else {
-                    None
+    let item: CollaborationItem = serde_json::from_value(item.clone())
+        .map_err(|error| anyhow::anyhow!("invalid Codex collaboration item: {error}"))?;
+    match item {
+        CollaborationItem::SubAgentActivity {
+            kind,
+            agent_thread_id,
+        } => {
+            let status = match kind {
+                SubAgentActivityKind::Started => {
+                    NativeAgentStatus::Active(AgentActiveState::Running)
                 }
-            });
-        let Some(status) = status else { continue };
-        lifecycle_list.push(NativeAgentLifecycle {
-            operation: operation.clone(),
-            starts_child: operation.eq_ignore_ascii_case("spawnAgent"),
-            parent_thread_id: parent_thread_id.clone(),
-            provider_thread_id: Some(receiver_thread_id),
-            definition: definition.clone(),
-            nickname: nickname.clone(),
-            task: task.clone(),
+                // An interaction reports no child state, so it changes no lifecycle.
+                SubAgentActivityKind::Interacted => return Ok(Vec::new()),
+                SubAgentActivityKind::Interrupted => {
+                    NativeAgentStatus::Finished(AgentOutcome::Interrupted)
+                }
+                SubAgentActivityKind::Completed => {
+                    NativeAgentStatus::Finished(AgentOutcome::Completed)
+                }
+            };
+            Ok(vec![NativeAgentLifecycle {
+                tool: None,
+                starts_child: kind == SubAgentActivityKind::Started,
+                parent_thread_id: pointer_string(params, &["/threadId"]),
+                provider_thread_id: Some(agent_thread_id),
+                task: None,
+                status,
+            }])
+        }
+        CollaborationItem::CollabAgentToolCall {
+            tool,
             status,
-        });
+            sender_thread_id,
+            receiver_thread_ids,
+            prompt,
+            agents_states,
+        } => {
+            let spawn = tool == CollabAgentTool::SpawnAgent;
+            let mut lifecycle_list = Vec::new();
+            for receiver_thread_id in receiver_thread_ids {
+                let status = match agents_states.get(&receiver_thread_id) {
+                    Some(state) => agent_status(state.status),
+                    None if spawn => NativeAgentStatus::Active(AgentActiveState::Running),
+                    None if tool == CollabAgentTool::CloseAgent
+                        && method == "item/completed"
+                        && status == CollabAgentToolCallStatus::Completed =>
+                    {
+                        NativeAgentStatus::Finished(AgentOutcome::Closed)
+                    }
+                    None => continue,
+                };
+                lifecycle_list.push(NativeAgentLifecycle {
+                    tool: Some(tool),
+                    starts_child: spawn,
+                    parent_thread_id: Some(sender_thread_id.clone()),
+                    provider_thread_id: Some(receiver_thread_id),
+                    task: prompt.clone(),
+                    status,
+                });
+            }
+            if lifecycle_list.is_empty() && spawn {
+                lifecycle_list.push(NativeAgentLifecycle {
+                    tool: Some(tool),
+                    starts_child: true,
+                    parent_thread_id: Some(sender_thread_id),
+                    provider_thread_id: None,
+                    task: prompt,
+                    status: NativeAgentStatus::Active(
+                        if status == CollabAgentToolCallStatus::InProgress {
+                            AgentActiveState::Starting
+                        } else {
+                            AgentActiveState::Running
+                        },
+                    ),
+                });
+            }
+            Ok(lifecycle_list)
+        }
     }
-    if lifecycle_list.is_empty() && operation.eq_ignore_ascii_case("spawnAgent") {
-        let status_text = first_string(item, &["status", "state"]).unwrap_or_default();
-        lifecycle_list.push(NativeAgentLifecycle {
-            operation,
-            starts_child: true,
-            parent_thread_id,
-            provider_thread_id: None,
-            definition,
-            nickname,
-            task,
-            status: if status_text.eq_ignore_ascii_case("inProgress") {
-                AgentExecutionState::Starting
-            } else {
-                AgentExecutionState::Running
-            },
-        });
-    }
-    lifecycle_list
 }
 
 /// Resolve child-agent lifecycle state from one raw provider message.
-pub fn agent_lifecycle_list(message: &Value) -> Vec<NativeAgentLifecycle> {
+pub fn agent_lifecycle_list(message: &Value) -> Result<Vec<NativeAgentLifecycle>> {
     let method = message
         .get("method")
         .and_then(Value::as_str)
@@ -221,13 +329,6 @@ pub fn pointer_string(value: &Value, pointer_list: &[&str]) -> Option<String> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
         })
-        .map(str::to_owned)
-}
-
-fn first_string(value: &Value, field_list: &[&str]) -> Option<String> {
-    field_list
-        .iter()
-        .find_map(|field| value.get(field).and_then(Value::as_str))
         .map(str::to_owned)
 }
 
@@ -252,22 +353,20 @@ pub fn context_usage(params: &Value) -> Option<ContextUsage> {
     ContextUsage::reported(used, size)
 }
 
-pub fn available_compact_update(params: &Value) -> Option<bool> {
-    let update = params.get("update").unwrap_or(params);
-    let command_list = update
-        .get("availableCommands")
-        .or_else(|| update.get("available_commands"))?
-        .as_array()?;
-    Some(command_list.iter().any(|command| {
-        command
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.trim_start_matches('/').eq_ignore_ascii_case("compact"))
-    }))
+/// Represent a native expenditure observation separately from context correction.
+pub(super) enum NativeUsageObservation {
+    Expenditure {
+        report_key: String,
+        usage: forge_provider_api::usage::TokenUsage,
+        cumulative: forge_provider_api::usage::TokenUsage,
+        cumulative_total: Option<u64>,
+    },
+    ContextAdjustment,
 }
 
-pub fn usage_update(params: &Value) -> Option<forge_provider_api::usage::UsageUpdate> {
-    use forge_provider_api::usage::{TokenUsage, UsageUpdate};
+/// Parse native token counts without turning context corrections into expenditure.
+pub(super) fn usage_update(params: &Value) -> Option<NativeUsageObservation> {
+    use forge_provider_api::usage::TokenUsage;
     fn pointer_u64(value: &Value, paths: &[&str]) -> Option<u64> {
         paths
             .iter()
@@ -296,13 +395,16 @@ pub fn usage_update(params: &Value) -> Option<forge_provider_api::usage::UsageUp
     let cumulative = counts(total);
     let cumulative_total = pointer_u64(total, &["/totalTokens", "/total_tokens"]);
     let id = serde_json::to_string(&(cumulative_total, &cumulative)).ok()?;
-    Some(UsageUpdate {
-        context_adjustment: usage.input == Some(0)
-            && usage.output == Some(0)
-            && cumulative_total.is_some_and(|total| total > 0),
-        id,
+    if usage.input == Some(0)
+        && usage.output == Some(0)
+        && cumulative_total.is_some_and(|total| total > 0)
+    {
+        return Some(NativeUsageObservation::ContextAdjustment);
+    }
+    Some(NativeUsageObservation::Expenditure {
+        report_key: id,
         usage,
-        cumulative: Some(cumulative),
+        cumulative,
         cumulative_total,
     })
 }
@@ -424,7 +526,7 @@ pub fn normalize_checklist_update(method: &str, params: &Value) -> Option<Provid
     })
 }
 
-pub fn normalize_tool_activity(
+pub(super) fn normalize_tool_activity(
     method: &str,
     params: &Value,
     workspace: &str,
@@ -456,16 +558,16 @@ pub fn normalize_tool_activity(
         || item_type.contains("command_execution")
         || method_lower.contains("commandexecution")
     {
-        ToolActivityKind::Command
+        NativeToolKind::Command
     } else if item_type.contains("filechange")
         || item_type.contains("file_change")
         || method_lower.contains("filechange")
     {
-        ToolActivityKind::FileChange
+        NativeToolKind::FileChange
     } else {
-        ToolActivityKind::ToolCall
+        NativeToolKind::ToolCall
     };
-    let generic_item = kind == ToolActivityKind::ToolCall
+    let generic_item = kind == NativeToolKind::ToolCall
         && !item_type.is_empty()
         && !matches!(item_type.as_str(), "mcptoolcall" | "dynamictoolcall");
     let title = callable_tool_title(item)
@@ -487,13 +589,13 @@ pub fn normalize_tool_activity(
         })
         .or_else(|| generic_item.then(|| generic_tool_title(item)).flatten())
         .unwrap_or_else(|| match kind {
-            ToolActivityKind::Command => "command".into(),
-            ToolActivityKind::FileChange => "file changes".into(),
-            ToolActivityKind::ToolCall if generic_item => item
+            NativeToolKind::Command => "command".into(),
+            NativeToolKind::FileChange => "file changes".into(),
+            NativeToolKind::ToolCall if generic_item => item
                 .get("type")
                 .and_then(tool_title)
                 .unwrap_or_else(|| "tool".into()),
-            ToolActivityKind::ToolCall => "tool".into(),
+            NativeToolKind::ToolCall => "tool".into(),
         });
     let output = if generic_item {
         method_lower
@@ -571,7 +673,7 @@ pub fn normalize_tool_activity(
             .unwrap_or("tool")
             .into(),
         arguments: item.get("arguments").cloned().unwrap_or_else(|| {
-            if kind == ToolActivityKind::Command {
+            if kind == NativeToolKind::Command {
                 json!({
                     "command": item.get("command").or_else(|| envelope.get("command")),
                     "cwd": item.get("cwd").or_else(|| envelope.get("cwd")),
@@ -696,12 +798,6 @@ fn provider_change_path(path: &str, workspace: &str) -> String {
         .unwrap_or_else(|_| Path::new(&path))
         .to_string_lossy()
         .into_owned()
-}
-
-pub fn successful_file_change(activity: &CodexToolSnapshot) -> bool {
-    activity.kind == ToolActivityKind::FileChange
-        && !activity.change.is_empty()
-        && activity.status == Some(forge_provider_api::ToolStatus::Succeeded)
 }
 
 fn tool_title(value: &Value) -> Option<String> {
@@ -1084,6 +1180,78 @@ mod tests {
             ),
         ] {
             assert_eq!(builtin_tool_title(&item).as_deref(), expected, "{item}");
+        }
+    }
+
+    /// Collaboration state comes only from the pinned item shapes, never from payload substrings.
+    #[test]
+    fn collaboration_lifecycle_uses_exact_item_schemas() {
+        use super::{CollabAgentTool, NativeAgentStatus, normalize_agent_lifecycle};
+        use forge_provider_api::agent::{AgentActiveState, AgentOutcome};
+        use serde_json::json;
+        let wait = normalize_agent_lifecycle(
+            "item/completed",
+            &json!({"threadId":"parent","item":{
+                "type":"collabAgentToolCall","id":"wait","tool":"wait","status":"completed",
+                "senderThreadId":"parent","receiverThreadIds":["running","errored","gone"],
+                "prompt":null,"agentsStates":{
+                    "running":{"status":"running","message":null},
+                    "errored":{"status":"errored","message":"boom"},
+                    "gone":{"status":"notFound","message":null}
+                }
+            }}),
+        )
+        .unwrap();
+        assert_eq!(wait.len(), 3);
+        assert!(
+            wait.iter()
+                .all(|lifecycle| lifecycle.tool == Some(CollabAgentTool::Wait)
+                    && lifecycle.parent_thread_id.as_deref() == Some("parent")
+                    && !lifecycle.starts_child)
+        );
+        assert!(matches!(
+            wait[0].status,
+            NativeAgentStatus::Active(AgentActiveState::Running)
+        ));
+        assert!(matches!(
+            wait[1].status,
+            NativeAgentStatus::Finished(AgentOutcome::Failed(_))
+        ));
+        assert!(matches!(
+            wait[2].status,
+            NativeAgentStatus::Finished(AgentOutcome::Closed)
+        ));
+
+        let interacted = normalize_agent_lifecycle(
+            "item/completed",
+            &json!({"threadId":"parent","item":{
+                "type":"subAgentActivity","id":"activity","kind":"interacted",
+                "agentThreadId":"child","agentPath":"/root/child"
+            }}),
+        )
+        .unwrap();
+        assert!(interacted.is_empty());
+
+        let unrelated = normalize_agent_lifecycle(
+            "thread/subagentStatus",
+            &json!({"item":{"type":"collabAgentToolCall","tool":"spawnAgent"},
+                "note":"mentions subAgentActivity"}),
+        )
+        .unwrap();
+        assert!(unrelated.is_empty());
+
+        for item in [
+            json!({"type":"collabAgentToolCall","id":"x","tool":"futureTool","status":"completed",
+                "senderThreadId":"parent","receiverThreadIds":[]}),
+            json!({"type":"collabAgentToolCall","id":"x","tool":"wait","status":"completed",
+                "senderThreadId":"parent","receiverThreadIds":["child"],
+                "agentsStates":{"child":{"status":"futureStatus"}}}),
+            json!({"type":"subAgentActivity","id":"x","kind":"started"}),
+        ] {
+            assert!(
+                normalize_agent_lifecycle("item/started", &json!({"item":item})).is_err(),
+                "{item}"
+            );
         }
     }
 }

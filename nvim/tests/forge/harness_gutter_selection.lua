@@ -36,6 +36,8 @@ local success, failure = xpcall(function()
       elseif method == "session.document" and params.operation == "background_terminals" then
         callback({ supported = false })
       elseif method == "session.health.get" then callback({ responsive = true })
+      elseif method == "session.input.get" then
+        callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
       else callback({ patch = {} }) end
     end
     _G.state = require("forge.session").harness

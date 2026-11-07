@@ -45,8 +45,8 @@ controller.render = function()
   }).kind == "Applied")
   status_view:render({}, state.command_set)
   status_view:apply({ document = transcript.document .. ":status", revision = revision, block = {
-    { id = "status", text = { state.busy and "Working · 1s" or "Waiting for your answer" }, metadata = {
-      status = { row = 0, animated = state.busy == true, hint = state.busy and "working" or "question" },
+    { id = "status", text = { require("forge.views.harness.activity").busy(state) and "Working · 1s" or "Waiting for your answer" }, metadata = {
+      status = { row = 0, animated = require("forge.views.harness.activity").busy(state) == true, hint = require("forge.views.harness.activity").busy(state) and "working" or "question" },
       target = {}, decoration = {}, editable_region = {},
     } },
   } }, function(ok) assert(ok) end)

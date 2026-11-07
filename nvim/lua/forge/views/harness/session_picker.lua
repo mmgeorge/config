@@ -97,11 +97,13 @@ local function delete_session(instance, entry)
     return
   end
   client.request({ session_id = instance.owner_session_id, method = "session.delete", params = { session_id = entry.id } }, function(_, request_error)
-    if active ~= instance then return end
     if request_error then
-      notifications.error(request_error, "ForgeSessions")
+      if active == instance then notifications.error(request_error, "ForgeSessions") end
       return
     end
+    -- Views of the deleted session close even when the picker closed before the host replied.
+    session_navigation.session_deleted(entry.id)
+    if active ~= instance then return end
     load_session_list(instance)
   end)
 end

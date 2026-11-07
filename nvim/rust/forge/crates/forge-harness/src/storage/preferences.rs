@@ -78,6 +78,12 @@ pub(super) fn apply_configuration(
 }
 
 /// Copy compatible settings once without accessing session tables or modifying the source.
+///
+/// A record whose payload no longer decodes into the current preference schema, or whose
+/// format version is outside the supported range, stays behind in the read-only source.
+/// Obsolete private formats are hidden rather than upgraded, so one stale record must not
+/// prevent the remaining compatible settings from importing or the store from opening.
+/// SQLite failures still abort the import, leaving the destination schema unversioned.
 fn import(destination: &Connection, path: &Path) -> Result<()> {
     let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -89,14 +95,15 @@ fn import(destination: &Connection, path: &Path) -> Result<()> {
         while let Some(row) = rows.next()? {
             let workspace: String = row.get(0)?;
             let provider: String = row.get(1)?;
-            let previous: PreferenceImport = serde_json::from_str(&row.get::<_, String>(2)?)
-                .with_context(|| format!("decode {provider} preferences for {workspace}"))?;
-            ensure!(
-                previous.format_version > 0
-                    && previous.format_version <= super::PREFERENCE_FORMAT_VERSION,
-                "unsupported imported preference format {}",
-                previous.format_version
-            );
+            let Ok(previous) = serde_json::from_str::<PreferenceImport>(&row.get::<_, String>(2)?)
+            else {
+                continue;
+            };
+            if previous.format_version == 0
+                || previous.format_version > super::PREFERENCE_FORMAT_VERSION
+            {
+                continue;
+            }
             let payload = serde_json::to_string(&serde_json::json!({
                 "format_version": super::PREFERENCE_FORMAT_VERSION,
                 "preference": previous.preference,
@@ -171,20 +178,42 @@ mod tests {
         Ok(())
     }
 
-    /// Roll back failed imports without marking unsupported settings as migrated.
+    /// Leave obsolete records behind while importing every compatible sibling.
     #[test]
-    fn preferences_failed_import_remains_retryable() -> Result<()> {
+    fn preferences_import_skips_records_outside_the_current_schema() -> Result<()> {
         let root = tempfile::tempdir()?;
         let old = Connection::open(root.path().join("harness.sqlite3"))?;
         old.execute_batch(
             "CREATE TABLE preference_record(workspace TEXT,backend TEXT,payload TEXT);
-            INSERT INTO preference_record VALUES('workspace','mock','{}');",
+            INSERT INTO preference_record VALUES('empty','mock','{}');",
         )?;
-        assert!(open(root.path()).is_err());
-        old.execute("UPDATE preference_record SET payload=?1", [
-            serde_json::json!({"format_version":44,"preference":{"model":"repaired","effort":"low"}}).to_string()
-        ])?;
-        assert!(open(root.path()).is_ok());
+        let obsolete_access = serde_json::json!({"format_version":44,"preference":{"model":"stale","effort":"low",
+            "access":{"sandbox":true,"write_access":"workspace","writable_directory":[],"windows_sandbox":true}}});
+        let future = serde_json::json!({"format_version":super::super::PREFERENCE_FORMAT_VERSION + 1,
+            "preference":{"model":"future","effort":"low"}});
+        let current =
+            serde_json::json!({"format_version":44,"preference":{"model":"kept","effort":"low"}});
+        for (workspace, payload) in [
+            ("obsolete", obsolete_access),
+            ("future", future),
+            ("current", current),
+        ] {
+            old.execute(
+                "INSERT INTO preference_record VALUES(?1,'mock',?2)",
+                [workspace, &payload.to_string()],
+            )?;
+        }
+        let store = crate::storage::SqliteStore::open(root.path())?;
+        for workspace in ["empty", "obsolete", "future"] {
+            assert!(
+                store.load_preference(workspace, "mock")?.is_none(),
+                "{workspace} was imported"
+            );
+        }
+        assert_eq!(
+            store.load_preference("current", "mock")?.unwrap().model,
+            "kept"
+        );
         Ok(())
     }
 }

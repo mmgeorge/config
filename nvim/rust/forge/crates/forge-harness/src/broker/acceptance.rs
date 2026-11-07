@@ -41,9 +41,12 @@ struct ExecutionCapture {
 
 impl BrokerObserver {
     /// Apply one captured plan-document edit and return guarded finite domain effects.
+    ///
+    /// `operation_id` correlates the edit's trace stages with the caller's request.
     pub(crate) async fn prepare_owner_plan_edit(
         &self,
         edit: &crate::exchange::command::PlanEdit,
+        operation_id: &str,
         current: Option<&crate::task::Task>,
         now_ms: i64,
     ) -> std::result::Result<
@@ -82,13 +85,20 @@ impl BrokerObserver {
                     target: PlanEntitySelection::Symbol(symbol),
                     name,
                 } => {
+                    let trace = crate::plan::edit_trace::PlanEditTrace::new(
+                        Arc::clone(&self.trace),
+                        &self.session_id,
+                        "session.plan.entity.rename",
+                        &json!({"operation_id": operation_id, "plan_id": plan.id,
+                            "expected_version": document.version}),
+                    );
                     let (previous, document, _, checksum) =
                         self.plan_file.rename_symbol_from_document(
                             &self.session_id,
                             &document,
                             symbol,
                             name,
-                            None,
+                            Some(&trace),
                         )?;
                     Ok((document, checksum, format!("Renamed {previous} to {name}")))
                 }

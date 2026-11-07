@@ -15,6 +15,18 @@ local composer_mode_group = vim.api.nvim_create_augroup("ForgeHarnessComposerMod
 local config = require("forge.infra.config")
 local input_gutter = require("forge.shared.input_gutter")
 
+-- Transcript windows soft-wrap raw Markdown, so `list:-1` hangs a wrapped list item under its text
+-- by indenting continuations to the width of the `formatlistpat` match on the item's first row.
+M.transcript_wrapping = { indent = true, options = "shift:0,list:-1" }
+-- The match spans leading indentation, the bullet or number, and the spaces before the item text.
+M.list_item_pattern = [[^\s*\%([-*+]\|\d\+[.)]\)\s\+]]
+
+---Recognize Markdown list items as hanging-indent headers in a transcript buffer.
+---@param buf integer
+function M.configure_transcript_buffer(buf)
+  vim.bo[buf].formatlistpat = M.list_item_pattern
+end
+
 ---@param win integer
 function M.configure_gutterless_window(win)
   vim.wo[win].number = false
@@ -61,6 +73,7 @@ function M.create_transcript_buffer(session_id)
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "ForgeHarness"
   vim.bo[buf].modifiable = false
+  M.configure_transcript_buffer(buf)
   return buf
 end
 
@@ -78,8 +91,8 @@ function M.configure_transcript_window(win)
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
   vim.wo[win].showbreak = ""
-  vim.wo[win].breakindent = true
-  vim.wo[win].breakindentopt = "shift:0"
+  vim.wo[win].breakindent = M.transcript_wrapping.indent
+  vim.wo[win].breakindentopt = M.transcript_wrapping.options
   vim.wo[win].foldmethod = "manual"
   vim.wo[win].foldenable = false
   M.configure_gutterless_window(win)

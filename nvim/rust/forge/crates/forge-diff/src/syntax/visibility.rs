@@ -220,9 +220,7 @@ impl Visibility<'_> {
             let opening = body.start_position().row;
             let closing = body.end_position().row;
             if opening < closing && self.rows[opening] {
-                for row in opening + 1..closing {
-                    self.rows[row] = false;
-                }
+                self.rows[opening + 1..closing].fill(false);
                 self.replacement.insert(
                     opening,
                     format!(

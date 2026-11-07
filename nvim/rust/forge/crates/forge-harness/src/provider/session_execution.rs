@@ -1,12 +1,11 @@
-//! Reduce delivery and native execution independently under one explicit owner.
-
+//! Reduce admitted input attempts and the sole native turn completion.
 mod cleanup;
 mod inbox;
+mod runtime;
 pub(crate) use cleanup::{
     CleanupError, CleanupJoinFailure, CleanupWorkFailure, CleanupWorkKind, RetainedCleanupFailure,
 };
-mod runtime;
-pub(crate) use inbox::{ObservationEnd, SessionObservationInbox};
+pub(crate) use inbox::{NativeAvailabilityReceipt, ObservationEnd, SessionObservationInbox};
 pub(crate) use runtime::{
     ContinuationAttempt, ExchangeCollection, HostEffectAdmission, HostEffectGuard, HostEffectId,
     HostEffectKind, HostEffectOutput, NativeReady, OwnerCloseReason, RegistryError,
@@ -14,16 +13,72 @@ pub(crate) use runtime::{
     SettlementCheckout, SettlementError,
 };
 
+use super::{InvocationId, InvocationScope, ThreadOwner};
+use forge_provider_api::{
+    CompletedTurn, DeliveryAttemptId, ThreadId, TurnId,
+    lifecycle::{LifecycleError, ObservationFailure, SubmissionId},
+};
 use std::collections::{HashMap, HashSet};
 
-use forge_provider_api::lifecycle::{
-    ExecutionObservation, ExecutionResult, ExecutionUpdate, LifecycleError, ObservationFailure,
-    SubmissionId,
-};
+/// Deliver original-owner activity or an actually committed input receipt to the session owner.
+#[derive(Clone, Debug)]
+pub enum OwnerObservation {
+    /// Apply native or host activity through its canonical reducer.
+    Event(super::HarnessEvent),
+    /// Persist a committed physical child effect independently of native or foreground lifetimes.
+    HostFileChange {
+        binding_id: forge_provider_api::BindingId,
+        scope: InvocationScope,
+        change: crate::tools::lsp::HostFileChange,
+    },
+    /// Apply input presentation only after the original provider acceptance succeeded.
+    InputAcceptance {
+        scope: InvocationScope,
+        receipt: std::sync::Arc<super::submission::Submission>,
+        presentation: InputPresentation,
+    },
+}
+impl OwnerObservation {
+    /// Get the immutable owner captured before input dispatch or event publication.
+    pub fn scope(&self) -> super::EventScope {
+        match self {
+            Self::Event(event) => event.scope().clone(),
+            Self::InputAcceptance { scope, .. } | Self::HostFileChange { scope, .. } => {
+                scope.clone().into()
+            }
+        }
+    }
+    /// Measure only serializable observations without exposing receipt capabilities to diagnostics.
+    pub(crate) fn encoded_event_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Event(event) => serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
+            Self::HostFileChange { change, .. } => {
+                serde_json::to_vec(change).ok().map(|encoded| encoded.len())
+            }
+            Self::InputAcceptance { .. } => None,
+        }
+    }
+    /// Get the native timestamp without assigning lifecycle meaning to host receipts.
+    pub fn observed_at_ms(&self, fallback: i64) -> i64 {
+        match self {
+            Self::Event(event) => event.observed_at_ms(fallback),
+            Self::InputAcceptance { .. } | Self::HostFileChange { .. } => fallback,
+        }
+    }
+}
+/// Preserve the user-visible role of an accepted input independently of provider notifications.
+#[derive(Clone, Debug)]
+pub enum InputPresentation {
+    /// Append an explicit user addition to its original exchange.
+    Steering { text: String },
+    /// Append the accepted workflow entry and its original instruction.
+    TaskStarted {
+        start: forge_provider_api::input::TaskStart,
+        prompt: String,
+    },
+}
 
-use super::{ExecutionOwner, InvocationId, InvocationScope, ProviderTurnId, TurnAddress};
-
-/// Preserve the native delivery evidence without interpreting execution as acknowledgment.
+/// Preserve delivery independently of native completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeliveryState {
     Pending,
@@ -31,8 +86,7 @@ pub(crate) enum DeliveryState {
     NotConsumed,
     Uncertain,
 }
-
-/// Identify why an invocation is not ready for host settlement.
+/// Identify the outstanding settlement barrier.
 #[derive(Clone, Debug)]
 pub(crate) enum ExecutionReadiness {
     Waiting,
@@ -40,114 +94,154 @@ pub(crate) enum ExecutionReadiness {
     ObservationLost(ObservationFailure),
     DeliveryUncertain,
 }
-
-/// Own delivery and lifecycle state for all retained invocations of one runtime.
+/// Retain original ownership and exact attempted-input coverage.
 pub(crate) struct ExecutionState {
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     latest: Option<InvocationId>,
     invocations: HashMap<InvocationId, InvocationState>,
 }
-
 struct InvocationState {
     scope: InvocationScope,
-    submissions: HashMap<SubmissionId, DeliveryState>,
-    executions: HashMap<(String, ProviderTurnId), NativeExecution>,
-    without_execution: Vec<NativeResolution>,
+    submissions: HashMap<SubmissionId, InputState>,
+    turn: NativeTurnState,
     covered: HashSet<SubmissionId>,
     observation_failure: Option<ObservationFailure>,
 }
-
-enum NativeExecution {
+/// Preserve the distinction between native lifecycle and an operation collected before native start.
+enum NativeTurnState {
+    /// Retain admission while no positive native work has been observed.
+    Preparing,
+    /// Retain positively observed native work until its sole completed result.
     Running,
-    Finished {
-        result: Box<ExecutionResult>,
-        covered: HashSet<SubmissionId>,
-        publication_failure: Option<forge_provider_api::HostEffectFailure>,
-    },
+    /// Preserve the authoritative collected native outcome.
+    Completed(CompletedTurn),
+    /// Preserve confirmed operation cancellation without inventing a native turn.
+    NotStarted,
 }
 
-struct NativeResolution {
-    result: ExecutionResult,
-    covered: HashSet<SubmissionId>,
-    publication_failure: Option<forge_provider_api::HostEffectFailure>,
+struct InputState {
+    group_id: SubmissionId,
+    attempt_id: DeliveryAttemptId,
+    delivery: DeliveryState,
 }
-
 impl ExecutionState {
-    /// Create the sole reducer for one independently controlled provider owner.
-    pub(crate) fn new(owner: ExecutionOwner) -> Self {
+    /// Create one reducer for an independently controlled owner.
+    pub(crate) fn new(owner: ThreadOwner) -> Self {
         Self {
             owner,
             latest: None,
             invocations: HashMap::new(),
         }
     }
-
-    /// Register ownership and a pending input before any write can emit native events.
+    /// Register an independently delivered journal input before native dispatch.
     pub(crate) fn admit(
         &mut self,
         scope: InvocationScope,
         submission: SubmissionId,
+        attempt_id: DeliveryAttemptId,
     ) -> Result<(), LifecycleError> {
+        self.admit_group(scope, submission, attempt_id, &[])
+    }
+    /// Register recovered logical inputs under their original attempts and one atomic receipt group.
+    pub(crate) fn admit_group(
+        &mut self,
+        scope: InvocationScope,
+        submission: SubmissionId,
+        attempt_id: DeliveryAttemptId,
+        included: &[forge_provider_api::CoveredInput],
+    ) -> Result<(), LifecycleError> {
+        // Validate the complete receipt group before publishing any admission.
         if scope.owner != self.owner {
             return Err(LifecycleError::OwnershipMismatch);
         }
-        if let Some(state) = self.invocations.get(&scope.invocation_id) {
-            if state.scope != scope {
-                return Err(LifecycleError::OwnershipMismatch);
-            }
-            if state.submissions.contains_key(&submission) {
-                return Err(LifecycleError::DuplicateSubmission(submission));
+        let mut inputs = vec![forge_provider_api::CoveredInput::new(
+            submission.clone(),
+            attempt_id,
+        )];
+        inputs.extend_from_slice(included);
+        let mut identities = HashSet::new();
+        for input in &inputs {
+            if !identities.insert(input.submission_id()) {
+                return Err(LifecycleError::DuplicateSubmission(
+                    input.submission_id().clone(),
+                ));
             }
         }
+        if let Some(state) = self.invocations.get(&scope.invocation_id) {
+            if state.scope != scope
+                || matches!(
+                    state.turn,
+                    NativeTurnState::Completed(_) | NativeTurnState::NotStarted
+                )
+            {
+                return Err(LifecycleError::OwnershipMismatch);
+            }
+            for input in &inputs {
+                if state.submissions.contains_key(input.submission_id()) {
+                    return Err(LifecycleError::DuplicateSubmission(
+                        input.submission_id().clone(),
+                    ));
+                }
+            }
+        }
+        // Commit all original identities together under the retained invocation.
         self.latest = Some(scope.invocation_id.clone());
-        self.invocations
+        let state = self
+            .invocations
             .entry(scope.invocation_id.clone())
             .or_insert_with(|| InvocationState {
                 scope,
                 submissions: HashMap::new(),
-                executions: HashMap::new(),
-                without_execution: Vec::new(),
+                turn: NativeTurnState::Preparing,
                 covered: HashSet::new(),
                 observation_failure: None,
-            })
-            .submissions
-            .insert(submission, DeliveryState::Pending);
+            });
+        for input in inputs {
+            state.submissions.insert(
+                input.submission_id().clone(),
+                InputState {
+                    group_id: submission.clone(),
+                    attempt_id: input.attempt_id().clone(),
+                    delivery: DeliveryState::Pending,
+                },
+            );
+        }
         Ok(())
     }
-
-    /// Get the most recently admitted invocation when its owner receives an unscoped control.
+    /// Get the most recently admitted scope for owner-scoped controls.
     pub(crate) fn latest_scope(&self) -> Option<&InvocationScope> {
         self.latest
             .as_ref()
             .and_then(|id| self.invocations.get(id))
             .map(|state| &state.scope)
     }
-
-    /// Get the retained scope whose native work still occupies this owner.
+    /// Get the original scope while native work or input remains unresolved.
     pub(crate) fn active_scope(&self) -> Option<&InvocationScope> {
         self.invocations
             .values()
             .find(|state| {
-                state
-                    .executions
-                    .values()
-                    .any(|execution| matches!(execution, NativeExecution::Running))
-                    || state.submissions.iter().any(|(id, delivery)| {
-                        matches!(delivery, DeliveryState::Pending | DeliveryState::Uncertain)
-                            || *delivery == DeliveryState::Accepted && !state.covered.contains(id)
-                    })
+                matches!(state.turn, NativeTurnState::Running)
+                    || state
+                        .submissions
+                        .iter()
+                        .any(|(id, input)| match input.delivery {
+                            DeliveryState::Pending | DeliveryState::Uncertain => true,
+                            DeliveryState::Accepted => {
+                                !matches!(state.turn, NativeTurnState::NotStarted)
+                                    && !state.covered.contains(id)
+                            }
+                            DeliveryState::NotConsumed => false,
+                        })
             })
             .map(|state| &state.scope)
     }
-
-    /// Recognize retained original ownership after its foreground waiter has completed.
+    /// Recognize retained original ownership after foreground completion.
     pub(crate) fn contains(&self, scope: &InvocationScope) -> bool {
         self.invocations
             .get(&scope.invocation_id)
             .is_some_and(|state| &state.scope == scope)
     }
-
-    /// Commit an input's evidence without allowing terminal execution to imply acceptance.
+    /// Commit grouped acceptance while preserving each original input's native coverage requirement.
     pub(crate) fn delivery(
         &mut self,
         scope: &InvocationScope,
@@ -155,134 +249,191 @@ impl ExecutionState {
         delivery: DeliveryState,
     ) -> Result<(), LifecycleError> {
         let state = self.invocation_mut(scope)?;
-        let previous = state
+        let group_id = state
+            .submissions
+            .get(submission)
+            .ok_or_else(|| LifecycleError::UnknownSubmission(submission.clone()))?
+            .group_id
+            .clone();
+        for (id, input) in state
+            .submissions
+            .iter()
+            .filter(|(_, input)| input.group_id == group_id)
+        {
+            if input.delivery != DeliveryState::Pending
+                && input.delivery != delivery
+                && !(input.delivery == DeliveryState::Uncertain
+                    && delivery == DeliveryState::Accepted)
+            {
+                return Err(LifecycleError::DeliveryConflict(id.clone()));
+            }
+            if delivery == DeliveryState::Accepted
+                && matches!(state.turn, NativeTurnState::Completed(_))
+                && !state.covered.contains(id)
+            {
+                return Err(LifecycleError::TerminalConflict);
+            }
+        }
+        for input in state
+            .submissions
+            .values_mut()
+            .filter(|input| input.group_id == group_id)
+        {
+            input.delivery = delivery;
+        }
+        Ok(())
+    }
+    /// Validate a presentation receipt against the exact attempt already accepted by this owner.
+    pub(crate) fn validate_acceptance(
+        &self,
+        scope: &InvocationScope,
+        submission: &SubmissionId,
+        attempt_id: &DeliveryAttemptId,
+    ) -> Result<(), LifecycleError> {
+        let state = self
+            .invocations
+            .get(&scope.invocation_id)
+            .filter(|state| &state.scope == scope)
+            .ok_or(LifecycleError::OwnershipMismatch)?;
+        let input = state
             .submissions
             .get(submission)
             .ok_or_else(|| LifecycleError::UnknownSubmission(submission.clone()))?;
-        if *previous != DeliveryState::Pending
-            && *previous != delivery
-            && !(*previous == DeliveryState::Uncertain && delivery == DeliveryState::Accepted)
-        {
+        if &input.attempt_id != attempt_id || input.delivery != DeliveryState::Accepted {
             return Err(LifecycleError::DeliveryConflict(submission.clone()));
         }
-        state.submissions.insert(submission.clone(), delivery);
         Ok(())
     }
 
-    /// Reduce a validated live event while preserving its original invocation.
-    pub(crate) fn observe(
-        &mut self,
-        observation: ExecutionObservation,
+    /// Validate identity and immutable completion before consumption or mutation.
+    pub(crate) fn validate_turn(
+        &self,
+        scope: &InvocationScope,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        completed: Option<&CompletedTurn>,
     ) -> Result<(), LifecycleError> {
-        let (scope, update) = observation.into_parts();
-        let state = self.invocation_mut(&scope)?;
-        let publication_failure = match &update {
-            ExecutionUpdate::PublicationFailed { failure, .. }
-            | ExecutionUpdate::ResolutionPublicationFailed { failure, .. } => Some(*failure),
-            ExecutionUpdate::Started { .. }
-            | ExecutionUpdate::Finished { .. }
-            | ExecutionUpdate::ResolvedWithoutExecution { .. }
-            | ExecutionUpdate::ObservationLost { .. } => None,
-        };
-        match update {
-            ExecutionUpdate::Started { address } => {
-                state
-                    .executions
-                    .entry(Self::key(address))
-                    .or_insert(NativeExecution::Running);
-            }
-            ExecutionUpdate::Finished {
-                address,
-                covered_submissions,
-                result,
-                ..
-            }
-            | ExecutionUpdate::PublicationFailed {
-                address,
-                covered_submissions,
-                result,
-                ..
-            } => {
-                let key = Self::key(address);
-                let execution = state
-                    .executions
-                    .get(&key)
-                    .ok_or(LifecycleError::UnknownExecution)?;
-                for id in &covered_submissions {
-                    if !state.submissions.contains_key(id) {
-                        return Err(LifecycleError::UnknownSubmission(id.clone()));
-                    }
+        let state = self
+            .invocations
+            .get(&scope.invocation_id)
+            .filter(|state| &state.scope == scope)
+            .ok_or(LifecycleError::OwnershipMismatch)?;
+        if &scope.owner.thread_id() != thread_id
+            || scope
+                .turn_id()
+                .map_err(|_| LifecycleError::OwnershipMismatch)?
+                != *turn_id
+        {
+            return Err(LifecycleError::OwnershipMismatch);
+        }
+        if let Some(completed) = completed {
+            match &state.turn {
+                NativeTurnState::Preparing | NativeTurnState::NotStarted => {
+                    return Err(LifecycleError::UnknownExecution);
                 }
-                let covered: HashSet<_> = covered_submissions.iter().cloned().collect();
-                if let NativeExecution::Finished {
-                    result: previous,
-                    covered: previous_covered,
-                    publication_failure: previous_publication_failure,
-                } = execution
+                NativeTurnState::Completed(previous) if previous != completed => {
+                    return Err(LifecycleError::TerminalConflict);
+                }
+                NativeTurnState::Running | NativeTurnState::Completed(_) => {}
+            }
+            if state.submissions.iter().any(|(id, input)| {
+                input.delivery == DeliveryState::Accepted
+                    && !completed
+                        .result()
+                        .covered_inputs()
+                        .iter()
+                        .any(|covered| covered.submission_id() == id)
+            }) {
+                return Err(LifecycleError::TerminalConflict);
+            }
+            for covered in completed.result().covered_inputs() {
+                let input = state
+                    .submissions
+                    .get(covered.submission_id())
+                    .ok_or_else(|| {
+                        LifecycleError::UnknownSubmission(covered.submission_id().clone())
+                    })?;
+                if &input.attempt_id != covered.attempt_id()
+                    || input.delivery == DeliveryState::NotConsumed
                 {
-                    if previous.as_ref() != &result
-                        || previous_covered != &covered
-                        || previous_publication_failure != &publication_failure
-                    {
-                        return Err(LifecycleError::TerminalConflict);
-                    }
-                    return Ok(());
+                    return Err(LifecycleError::DeliveryConflict(
+                        covered.submission_id().clone(),
+                    ));
                 }
-                state.executions.insert(
-                    key,
-                    NativeExecution::Finished {
-                        result: Box::new(result),
-                        covered,
-                        publication_failure,
-                    },
-                );
-                state.covered.extend(covered_submissions);
             }
-            ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions,
-                result,
-                ..
-            }
-            | ExecutionUpdate::ResolutionPublicationFailed {
-                covered_submissions,
-                result,
-                ..
-            } => {
-                for id in &covered_submissions {
-                    if !state.submissions.contains_key(id) {
-                        return Err(LifecycleError::UnknownSubmission(id.clone()));
-                    }
-                }
-                let covered: HashSet<_> = covered_submissions.iter().cloned().collect();
-                for previous in &state.without_execution {
-                    if previous.covered == covered {
-                        return if previous.result == result
-                            && previous.publication_failure == publication_failure
-                        {
-                            Ok(())
-                        } else {
-                            Err(LifecycleError::TerminalConflict)
-                        };
-                    }
-                    if !previous.covered.is_disjoint(&covered) {
-                        return Err(LifecycleError::TerminalConflict);
-                    }
-                }
-                state.without_execution.push(NativeResolution {
-                    result,
-                    covered,
-                    publication_failure,
-                });
-                state.covered.extend(covered_submissions);
-            }
-            ExecutionUpdate::ObservationLost { failure, .. } => {
-                state.observation_failure.get_or_insert(failure);
-            }
+        } else if matches!(
+            state.turn,
+            NativeTurnState::Completed(_) | NativeTurnState::NotStarted
+        ) {
+            return Err(LifecycleError::TerminalConflict);
         }
         Ok(())
     }
+    /// Record positively observed native work independently of acceptance.
+    pub(crate) fn started(
+        &mut self,
+        scope: &InvocationScope,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) -> Result<(), LifecycleError> {
+        self.validate_turn(scope, thread_id, turn_id, None)?;
+        self.invocation_mut(scope)?.turn = NativeTurnState::Running;
+        Ok(())
+    }
+    /// Retain the authoritative completion after exact attempt validation.
+    pub(crate) fn completed(
+        &mut self,
+        scope: &InvocationScope,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        completed: CompletedTurn,
+    ) -> Result<(), LifecycleError> {
+        self.validate_turn(scope, thread_id, turn_id, Some(&completed))?;
+        let state = self.invocation_mut(scope)?;
+        state.covered.extend(
+            completed
+                .result()
+                .covered_inputs()
+                .iter()
+                .map(|input| input.submission_id().clone()),
+        );
+        state.turn = NativeTurnState::Completed(completed);
+        Ok(())
+    }
+    /// Resolve only an exact collected operation whose watermark contained no positive native start.
+    pub(crate) fn cancel_unstarted(
+        &mut self,
+        scope: &InvocationScope,
+    ) -> Result<bool, LifecycleError> {
+        let state = self.invocation_mut(scope)?;
+        match state.turn {
+            NativeTurnState::Preparing => {
+                state.turn = NativeTurnState::NotStarted;
+                Ok(true)
+            }
+            NativeTurnState::NotStarted => Ok(true),
+            NativeTurnState::Running | NativeTurnState::Completed(_) => Ok(false),
+        }
+    }
 
-    /// Report settlement eligibility only after delivery and matching terminal coverage settle.
+    /// Identify collected no-start operations without assigning them a native outcome.
+    pub(crate) fn not_started(&self, scope: &InvocationScope) -> bool {
+        self.invocations
+            .get(&scope.invocation_id)
+            .is_some_and(|state| {
+                &state.scope == scope && matches!(state.turn, NativeTurnState::NotStarted)
+            })
+    }
+
+    /// Fence affected waits without inventing a native result.
+    pub(crate) fn unavailable(&mut self, failure: ObservationFailure) {
+        for state in self.invocations.values_mut() {
+            state
+                .observation_failure
+                .get_or_insert_with(|| failure.clone());
+        }
+    }
+    /// Require acceptance and exact terminal coverage before host settlement.
     pub(crate) fn readiness(
         &self,
         scope: &InvocationScope,
@@ -298,30 +449,28 @@ impl ExecutionState {
         if state
             .submissions
             .values()
-            .any(|delivery| *delivery == DeliveryState::Uncertain)
+            .any(|input| input.delivery == DeliveryState::Uncertain)
         {
             return Ok(ExecutionReadiness::DeliveryUncertain);
         }
-        if state
-            .submissions
-            .iter()
-            .any(|(id, delivery)| match delivery {
-                DeliveryState::Pending => true,
-                DeliveryState::Accepted => !state.covered.contains(id),
-                DeliveryState::NotConsumed => false,
-                DeliveryState::Uncertain => true,
-            })
+        if matches!(state.turn, NativeTurnState::Running)
             || state
-                .executions
-                .values()
-                .any(|execution| matches!(execution, NativeExecution::Running))
+                .submissions
+                .iter()
+                .any(|(id, input)| match input.delivery {
+                    DeliveryState::Pending | DeliveryState::Uncertain => true,
+                    DeliveryState::Accepted => {
+                        !matches!(state.turn, NativeTurnState::NotStarted)
+                            && !state.covered.contains(id)
+                    }
+                    DeliveryState::NotConsumed => false,
+                })
         {
             return Ok(ExecutionReadiness::Waiting);
         }
         Ok(ExecutionReadiness::Complete)
     }
-
-    /// Resolve one invocation without permitting aliases across owners or exchanges.
+    /// Resolve a retained invocation without accepting owner aliases.
     fn invocation_mut(
         &mut self,
         scope: &InvocationScope,
@@ -331,386 +480,197 @@ impl ExecutionState {
             .filter(|state| &state.scope == scope)
             .ok_or(LifecycleError::OwnershipMismatch)
     }
-
-    /// Retain the native thread and turn together because turn IDs are not globally unique.
-    fn key(address: TurnAddress) -> (String, ProviderTurnId) {
-        (address.thread_id, address.turn_id)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::completion::ProviderCompletion;
-
-    fn input(value: &str) -> SubmissionId {
-        SubmissionId::try_from(value.to_owned()).unwrap()
-    }
-
-    fn address(scope: &InvocationScope) -> TurnAddress {
-        TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-        }
-    }
-
-    fn finish(scope: &InvocationScope, covered: Vec<SubmissionId>) -> ExecutionObservation {
-        ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Finished {
-                address: address(scope),
-                covered_submissions: covered,
-                completed_at_ms: 1,
-                result: ExecutionResult::Completed {
-                    completion: ProviderCompletion::default().into(),
-                },
-            },
+    use forge_provider_api::{CoveredInput, TurnResult, turn::TurnOutcome};
+    /// Create exact terminal coverage for a retained attempt.
+    fn completion(attempt: &str) -> CompletedTurn {
+        crate::provider::test_support::completed_turn(
+            InvocationScope::new(ThreadOwner::root("fixture"), "exchange"),
+            TurnResult::new(
+                TurnOutcome::Interrupted,
+                10,
+                None,
+                vec![CoveredInput::new(
+                    "input".try_into().unwrap(),
+                    DeliveryAttemptId::new(attempt).unwrap(),
+                )],
+                vec![],
+                None,
+            )
+            .unwrap(),
         )
         .unwrap()
     }
-
-    /// A certified goal-only result still waits for delivery and rejects conflicting replay.
+    /// Completion cannot manufacture acceptance or cover a different delivery attempt.
     #[test]
-    fn no_execution_completion_requires_acknowledgment_and_rejects_conflicts() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "goal");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("goal")).unwrap();
-        let result = ExecutionResult::Completed {
-            completion: ProviderCompletion::default().into(),
-        };
-        let observation = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions: vec![input("goal")],
-                completed_at_ms: 1,
-                result: result.clone(),
-            },
-        )
-        .unwrap();
-        engine.observe(observation.clone()).unwrap();
-        engine.observe(observation).unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-        engine
-            .delivery(&scope, &input("goal"), DeliveryState::Accepted)
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Complete
-        ));
-        let conflict = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions: vec![input("goal")],
-                completed_at_ms: 2,
-                result: ExecutionResult::Cancelled {
-                    completion: ProviderCompletion::default().into(),
-                },
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            engine.observe(conflict),
-            Err(LifecycleError::TerminalConflict)
-        ));
-    }
-
-    /// Host publication failure cannot overwrite a known native no-turn result or skip receipt acceptance.
-    #[test]
-    fn no_execution_publication_failure_retains_result_and_requires_acceptance() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "goal");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("goal")).unwrap();
-        let result = ExecutionResult::Completed {
-            completion: ProviderCompletion::default().into(),
-        };
-        let observation = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::ResolutionPublicationFailed {
-                covered_submissions: vec![input("goal")],
-                completed_at_ms: 1,
-                result: result.clone(),
-                failure: forge_provider_api::HostEffectFailure::Uncertain,
-            },
-        )
-        .unwrap();
-        engine.observe(observation.clone()).unwrap();
-        engine.observe(observation).unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-        engine
-            .delivery(&scope, &input("goal"), DeliveryState::Accepted)
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Complete
-        ));
-        let retained = &engine.invocations[&scope.invocation_id].without_execution[0];
-        assert_eq!(retained.result, result);
-        assert_eq!(
-            retained.publication_failure,
-            Some(forge_provider_api::HostEffectFailure::Uncertain)
-        );
-        let contradictory = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions: vec![input("goal")],
-                completed_at_ms: 2,
-                result,
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            engine.observe(contradictory),
-            Err(LifecycleError::TerminalConflict)
-        ));
-    }
-
-    /// Distinct native turns cannot settle another steer before its own terminal and acknowledgment.
-    #[test]
-    fn separate_steers_require_each_native_turn_and_acknowledgment() {
-        let owner = ExecutionOwner::root("session");
+    fn completion_waits_for_exact_input_acceptance() {
+        let owner = ThreadOwner::root("session");
         let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        for id in ["prompt", "first-steer", "second-steer"] {
-            engine.admit(scope.clone(), input(id)).unwrap();
-        }
-        engine
-            .delivery(&scope, &input("prompt"), DeliveryState::Accepted)
-            .unwrap();
-        let first = address(&scope);
-        let mut second = first.clone();
-        second.turn_id = "second".into();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: first.clone(),
-                    },
-                )
-                .unwrap(),
+        let turn = scope.turn_id().unwrap();
+        let thread = owner.thread_id();
+        let mut state = ExecutionState::new(owner);
+        state
+            .admit(
+                scope.clone(),
+                "input".try_into().unwrap(),
+                DeliveryAttemptId::new("attempt").unwrap(),
             )
             .unwrap();
-        let terminal = |address, covered_submissions| {
-            ExecutionObservation::new(
+        state.started(&scope, &thread, &turn).unwrap();
+        assert!(
+            state
+                .completed(&scope, &thread, &turn, completion("other"))
+                .is_err()
+        );
+        let completed = completion("attempt");
+        state
+            .completed(&scope, &thread, &turn, completed.clone())
+            .unwrap();
+        assert!(matches!(
+            state.readiness(&scope).unwrap(),
+            ExecutionReadiness::Waiting
+        ));
+        state
+            .delivery(
+                &scope,
+                &"input".try_into().unwrap(),
+                DeliveryState::Accepted,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.readiness(&scope).unwrap(),
+            ExecutionReadiness::Complete
+        ));
+        state.completed(&scope, &thread, &turn, completed).unwrap();
+        assert!(state.started(&scope, &thread, &turn).is_err());
+    }
+    /// Grouped receipt acceptance still requires completion coverage for every recovered original attempt.
+    #[test]
+    fn recovered_inputs_keep_original_attempt_coverage() {
+        let owner = ThreadOwner::root("recovered");
+        let scope = InvocationScope::new(owner.clone(), "exchange");
+        let main = CoveredInput::new(
+            "current".try_into().unwrap(),
+            DeliveryAttemptId::new("current-attempt").unwrap(),
+        );
+        let old = CoveredInput::new(
+            "earlier".try_into().unwrap(),
+            DeliveryAttemptId::new("earlier-attempt").unwrap(),
+        );
+        let mut state = ExecutionState::new(owner.clone());
+        state
+            .admit_group(
                 scope.clone(),
-                ExecutionUpdate::Finished {
-                    address,
-                    covered_submissions,
-                    completed_at_ms: 1,
-                    result: ExecutionResult::Completed {
-                        completion: ProviderCompletion::default().into(),
-                    },
-                },
+                main.submission_id().clone(),
+                main.attempt_id().clone(),
+                std::slice::from_ref(&old),
+            )
+            .unwrap();
+        state
+            .delivery(&scope, main.submission_id(), DeliveryState::Accepted)
+            .unwrap();
+        state
+            .started(&scope, &owner.thread_id(), &scope.turn_id().unwrap())
+            .unwrap();
+        let result = |inputs| {
+            crate::provider::test_support::completed_turn(
+                scope.clone(),
+                TurnResult::new(TurnOutcome::Interrupted, 10, None, inputs, vec![], None).unwrap(),
             )
             .unwrap()
         };
-        engine
-            .observe(terminal(first, vec![input("prompt"), input("first-steer")]))
-            .unwrap();
-        engine
-            .delivery(&scope, &input("first-steer"), DeliveryState::Accepted)
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: second.clone(),
-                    },
+        assert!(
+            state
+                .completed(
+                    &scope,
+                    &owner.thread_id(),
+                    &scope.turn_id().unwrap(),
+                    result(vec![main.clone()])
                 )
-                .unwrap(),
+                .is_err()
+        );
+        state
+            .completed(
+                &scope,
+                &owner.thread_id(),
+                &scope.turn_id().unwrap(),
+                result(vec![old, main]),
             )
             .unwrap();
-        engine
-            .observe(terminal(second, vec![input("second-steer")]))
-            .unwrap();
         assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-        engine
-            .delivery(&scope, &input("second-steer"), DeliveryState::Accepted)
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
+            state.readiness(&scope).unwrap(),
             ExecutionReadiness::Complete
         ));
     }
 
-    /// A late acknowledgment cannot cause older terminal evidence to cover newer input.
+    /// Confirmed collection before native start resolves the host operation without changing acceptance.
     #[test]
-    fn terminal_before_ack_keeps_uncovered_steering_pending() {
-        let owner = ExecutionOwner::root("session");
+    fn collected_unstarted_operation_preserves_accepted_delivery() {
+        let owner = ThreadOwner::root("not-started");
         let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("prompt")).unwrap();
-        engine
-            .delivery(&scope, &input("prompt"), DeliveryState::Accepted)
+        let input: SubmissionId = "accepted".try_into().unwrap();
+        let attempt = DeliveryAttemptId::new("attempt").unwrap();
+        let mut state = ExecutionState::new(owner.clone());
+        state
+            .admit(scope.clone(), input.clone(), attempt.clone())
             .unwrap();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: address(&scope),
-                    },
-                )
-                .unwrap(),
-            )
+        state
+            .delivery(&scope, &input, DeliveryState::Accepted)
             .unwrap();
-        engine.admit(scope.clone(), input("steer")).unwrap();
-        engine
-            .observe(finish(&scope, vec![input("prompt")]))
-            .unwrap();
-        engine
-            .delivery(&scope, &input("steer"), DeliveryState::Accepted)
-            .unwrap();
+        assert!(state.cancel_unstarted(&scope).unwrap());
         assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-    }
-
-    /// Terminal coverage can precede acknowledgment without losing either piece of evidence.
-    #[test]
-    fn terminal_before_ack_settles_only_after_matching_acceptance() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("prompt")).unwrap();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: address(&scope),
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        engine
-            .observe(finish(&scope, vec![input("prompt")]))
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
-            ExecutionReadiness::Waiting
-        ));
-        engine
-            .delivery(&scope, &input("prompt"), DeliveryState::Accepted)
-            .unwrap();
-        assert!(matches!(
-            engine.readiness(&scope).unwrap(),
+            state.readiness(&scope).unwrap(),
             ExecutionReadiness::Complete
         ));
-    }
-
-    /// Loss before turn startup is terminal for local waiters without proving native completion.
-    #[test]
-    fn loss_resolves_waiter_before_native_start() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("prompt")).unwrap();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::ObservationLost {
-                        failure: ObservationFailure::Disconnected,
-                        completion: None,
-                    },
-                )
-                .unwrap(),
+        state.validate_acceptance(&scope, &input, &attempt).unwrap();
+        assert!(
+            state
+                .started(&scope, &owner.thread_id(), &scope.turn_id().unwrap())
+                .is_err()
+        );
+        let running_scope = InvocationScope::new(owner.clone(), "running");
+        state
+            .admit(
+                running_scope.clone(),
+                "running-input".try_into().unwrap(),
+                DeliveryAttemptId::new("running-attempt").unwrap(),
             )
             .unwrap();
+        state
+            .started(
+                &running_scope,
+                &owner.thread_id(),
+                &running_scope.turn_id().unwrap(),
+            )
+            .unwrap();
+        assert!(!state.cancel_unstarted(&running_scope).unwrap());
         assert!(matches!(
-            engine.readiness(&scope).unwrap(),
+            state.readiness(&running_scope).unwrap(),
+            ExecutionReadiness::Waiting
+        ));
+    }
+
+    /// Lost observation fences accepted input without certifying native completion.
+    #[test]
+    fn unavailable_does_not_certify_completion() {
+        let owner = ThreadOwner::root("session");
+        let scope = InvocationScope::new(owner.clone(), "exchange");
+        let mut state = ExecutionState::new(owner);
+        state
+            .admit(
+                scope.clone(),
+                "input".try_into().unwrap(),
+                DeliveryAttemptId::new("attempt").unwrap(),
+            )
+            .unwrap();
+        state.unavailable(ObservationFailure::Disconnected);
+        assert!(matches!(
+            state.readiness(&scope).unwrap(),
             ExecutionReadiness::ObservationLost(ObservationFailure::Disconnected)
         ));
-    }
-    /// Duplicate native terminal delivery must repeat the exact per-execution coverage set.
-    #[test]
-    fn terminal_duplicate_rejects_changed_coverage() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("prompt")).unwrap();
-        engine.admit(scope.clone(), input("steer")).unwrap();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: address(&scope),
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        engine
-            .observe(finish(&scope, vec![input("prompt"), input("steer")]))
-            .unwrap();
-        engine
-            .observe(finish(&scope, vec![input("steer"), input("prompt")]))
-            .unwrap();
-        assert_eq!(
-            engine.observe(finish(&scope, vec![input("prompt")])),
-            Err(LifecycleError::TerminalConflict)
-        );
-    }
-
-    /// Completion metrics are part of duplicate evidence even though persistence omits them.
-    #[test]
-    fn terminal_duplicate_rejects_changed_transient_metrics() {
-        let owner = ExecutionOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut engine = ExecutionState::new(owner);
-        engine.admit(scope.clone(), input("prompt")).unwrap();
-        engine
-            .observe(
-                ExecutionObservation::new(
-                    scope.clone(),
-                    ExecutionUpdate::Started {
-                        address: address(&scope),
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        engine
-            .observe(finish(&scope, vec![input("prompt")]))
-            .unwrap();
-        let mut completion = ProviderCompletion::default();
-        completion.metrics.native_compact_update = Some(true);
-        let changed = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Finished {
-                address: address(&scope),
-                covered_submissions: vec![input("prompt")],
-                completed_at_ms: 1,
-                result: ExecutionResult::Completed {
-                    completion: completion.into(),
-                },
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            engine.observe(changed),
-            Err(LifecycleError::TerminalConflict)
-        );
     }
 }

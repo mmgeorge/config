@@ -129,7 +129,7 @@ questions.open(state, host)
 assert(not picker.is_open("questions"), "reopening completed answers created an empty picker")
 
 -- Cancelling work leaves retained optional questions answerable while idle.
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.status = { kind = "idle" }
 state.questions = { revision = 7, questions = { question("cancelled-work", "optional") } }
 questions.open(state, host)

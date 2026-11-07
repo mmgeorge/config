@@ -254,6 +254,69 @@ local ok, failure = xpcall(function()
   transcript = vim.api.nvim_create_buf(false, true)
   composer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(window, transcript)
+
+  -- A deleted session is terminal: the retry loop must stop instead of polling every second.
+  local deferred = {}
+  vim.defer_fn = function(callback, delay)
+    local timer = { callback = callback, delay = delay }
+    function timer:stop() self.stopped = true end
+    function timer:close() self.closed = true end
+    deferred[#deferred + 1] = timer
+    return timer
+  end
+  local function pending_deferred(matches)
+    local pending = {}
+    for _, timer in ipairs(deferred) do
+      if matches(timer.delay) and not timer.stopped and not timer.closed then pending[#pending + 1] = timer end
+    end
+    return pending
+  end
+  local function fire_deferred(matches)
+    local pending = pending_deferred(matches)
+    for _, timer in ipairs(pending) do
+      timer.closed = true
+      timer.callback()
+    end
+    return #pending
+  end
+  local function is_retry(delay) return delay == 1000 end
+  local function is_publication(delay) return delay ~= 1000 and delay ~= 30000 end
+  local deleted_notices = {}
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end,
+    notice = function(message) deleted_notices[#deleted_notices + 1] = message end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  requests[#requests].callback({ transcript = snapshot(requests[#requests].params.document, "deleted history") })
+  assert(owner.ready, "deleted-session fixture did not open")
+  local before_sync = #requests
+  owner.sync()
+  while #requests == before_sync and fire_deferred(is_publication) > 0 do end
+  assert(#requests == before_sync + 1 and requests[#requests].params.operation == "sync",
+    "sync was not dispatched")
+  requests[#requests].callback(nil, "temporary admission contention", { code = "not_admitted" })
+  assert(owner.sync_failure and #pending_deferred(is_retry) == 1, "transient failure did not schedule a retry")
+  local before_retry = #requests
+  assert(fire_deferred(is_retry) == 1)
+  assert(#requests == before_retry + 1 and requests[#requests].params.operation == "sync",
+    "retry did not reissue the transcript read")
+  requests[#requests].callback(nil, "session not found", { code = "session_not_found" })
+  assert(#pending_deferred(is_retry) == 0, "deleted session scheduled another transcript retry")
+  assert(not owner.sync_failure, "deleted session retained the retry footer")
+  assert(owner.failure and owner.failure:find("no longer exists", 1, true)
+    and not owner.failure:find("Reopen", 1, true),
+    "deleted session was not marked terminal: " .. tostring(owner.failure))
+  local terminal_count = #requests
+  for _ = 1, 3 do owner.sync() end
+  fire_deferred(is_publication)
+  fire_deferred(is_retry)
+  assert(#requests == terminal_count, "deleted session dispatched further transcript reads")
+  assert(#deleted_notices == 1, "deleted session flooded notifications: " .. vim.inspect(deleted_notices))
+  assert(owner.close())
+  vim.defer_fn = original_defer
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(window, transcript)
   owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
     transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
     is_alive = function() return true end, notice = function(message) error(message) end,

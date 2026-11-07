@@ -7,15 +7,15 @@ local perf = require("forge.infra.perf")
 local command_detail = require("forge.views.harness.command_detail")
 
 ---@class ForgeApprovalChoice
----@field id string
+---@field choice_id string
 ---@field label string
 
 ---@class ForgeApprovalItem
----@field id string
+---@field target_id string
 ---@field title string
 ---@field detail string
----@field command_list ForgeApprovalCommand[]
----@field choice_list ForgeApprovalChoice[]
+---@field commands ForgeApprovalCommand[]
+---@field choices ForgeApprovalChoice[]
 
 ---@class ForgeApprovalSourceRange
 ---@field start integer Zero-based source byte offset.
@@ -28,11 +28,11 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field highlight_list {range: ForgeApprovalSourceRange, group: string, priority: integer}[]
 
 ---@class ForgeApprovalRequest
----@field id string
+---@field request_id string
+---@field execution_kind "managed"|"native_observed"
 ---@field reason? string
 ---@field deadline? {expires_at_ms: number}
----@field resolution_source? 'user'|'timeout'
----@field item_list ForgeApprovalItem[]
+---@field targets ForgeApprovalItem[]
 
 ---@class ForgeApprovalAnswer
 ---@field item_id string
@@ -58,11 +58,12 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field key? string
 ---@field value string
 ---@field label string
+---@field cancel_request? boolean
 ---@field confirm_on_key? boolean
 ---@field wrap_label? boolean
 
 ---@class ForgeApprovalPickerPage: ForgePickerPage
----@field id string
+---@field target_id string
 ---@field title string
 ---@field subtitle? string
 ---@field content_list ForgePickerContent[]
@@ -89,7 +90,7 @@ local active = nil
 local function detail_content(item)
   if item.title == "Run command" then
     local content_list = {}
-    for _, command in ipairs(item.command_list) do content_list[#content_list + 1] = command_detail.format(command) end
+    for _, command in ipairs(item.commands) do content_list[#content_list + 1] = command_detail.format(command) end
     return content_list
   end
   return { { text = item.detail, group = "ForgePickerText", preformatted = true } }
@@ -100,8 +101,8 @@ end
 ---@return string
 local function choice_label(item, choice)
   if item.title == "Run command" then
-    if choice.id == "allow_exact" then return "Always allow highlighted command" end
-    if choice.id == "deny_exact" then return "Always deny highlighted command" end
+    if choice.choice_id == "allow_exact" then return "Always allow highlighted command" end
+    if choice.choice_id == "deny_exact" then return "Always deny highlighted command" end
   end
   return choice.label
 end
@@ -111,14 +112,14 @@ end
 local function submit(instance, cancel)
   if instance.submitting then return end
   local answer_list = {}
-  for _, item in ipairs(instance.request.item_list) do
+  for _, item in ipairs(instance.request.targets) do
     answer_list[#answer_list + 1] = {
-      item_id = item.id,
-      choice_id = cancel and "cancel" or instance.selection[item.id].id,
+      item_id = item.target_id,
+      choice_id = cancel and "cancel" or instance.selection[item.target_id].choice_id,
     }
   end
   instance.submitting = true
-  instance.host.resolve(instance.request.id, answer_list, function(resolved)
+  instance.host.resolve(instance.request.request_id, answer_list, function(resolved)
     instance.submitting = false
     if active == instance and resolved then
       active = nil
@@ -141,33 +142,37 @@ local function build_spec(instance)
   end
   for _, key in ipairs(interrupt_keys) do
     actions[#actions + 1] = {
-      key = key, modes = { "n", "i" }, desc = "Interrupt Harness task",
+      key = key, modes = { "n", "i" }, desc = request.execution_kind == "native_observed" and "Cancel permission request" or "Interrupt Harness task",
       callback = function()
-        picker.close(true)
-        host.interrupt()
+        if request.execution_kind == "native_observed" then submit(instance, true)
+        else picker.close(true) host.interrupt() end
       end,
     }
   end
   local page_list = {}
-  for _, item in ipairs(request.item_list) do
+  for _, item in ipairs(request.targets) do
       local option_list, selected_index = {}, 1
-      for index, choice in ipairs(item.choice_list) do
+      for index, choice in ipairs(item.choices) do
         option_list[#option_list + 1] = {
-          key = config.options.picker.choice_keys[index], value = choice.id,
+          key = config.options.picker.choice_keys[index], value = choice.choice_id,
           label = choice_label(item, choice), wrap_label = true,
         }
-        if instance.selection[item.id] == choice then selected_index = index end
+        if instance.selection[item.target_id] == choice then selected_index = index end
       end
+      option_list[#option_list + 1] = {
+        key = config.options.picker.choice_keys[#item.choices + 1], value = "", cancel_request = true,
+        label = "Cancel permission request", wrap_label = true,
+      }
       local content_list = detail_content(item)
       if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
       if request.reason then content_list[#content_list + 1] = { text = "Reason: " .. request.reason, group = "ForgePickerText" } end
       page_list[#page_list + 1] = {
-        id = item.id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,
+        id = item.target_id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,
         content_list = content_list,
         scroll_content = true,
         column_headers = { "Decision" }, option_list = option_list, selected_index = selected_index,
         footer = "←→ page  ↑↓ select  Enter confirm  PgUp/PgDn details  q close"
-          .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
+          .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. (request.execution_kind == "native_observed" and " cancel request" or " interrupt")) or ""),
       }
     end
   return {
@@ -180,19 +185,19 @@ local function build_spec(instance)
     page_list = page_list, initial_page = instance.page_index,
     on_confirm = function(result)
       if active ~= instance or instance.submitting then return false end
-      if result.option.value == "cancel" then
+      if result.option.cancel_request then
         submit(instance, true)
         return false
       end
-      for _, item in ipairs(request.item_list) do
-        if item.id == result.page.id then
-          for _, choice in ipairs(item.choice_list) do
-            if choice.id == result.option.value then instance.selection[item.id] = choice end
+      for _, item in ipairs(request.targets) do
+        if item.target_id == result.page.id then
+          for _, choice in ipairs(item.choices) do
+            if choice.choice_id == result.option.value then instance.selection[item.target_id] = choice end
           end
         end
       end
-      for index, item in ipairs(request.item_list) do
-        if not instance.selection[item.id] then
+      for index, item in ipairs(request.targets) do
+        if not instance.selection[item.target_id] then
           instance.page_index = index
           picker.update(build_spec(instance))
           return false
@@ -216,7 +221,7 @@ function Approval.open(request, host)
     request = request, host = host, selection = {}, page_index = 1, submitting = false,
   }
   active = instance
-  perf.trace("harness", "ui.approval.open", { request_id = request.id, count = #request.item_list }, function()
+  perf.trace("harness", "ui.approval.open", { request_id = request.request_id, count = #request.targets }, function()
     picker.open(build_spec(instance))
   end)
 end

@@ -17,6 +17,7 @@ client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local task = require("forge.views.harness.task")
+local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
 local errors, starts = {}, 0
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 client.session_events_subscribe(function(event, payload)
@@ -25,7 +26,7 @@ end)
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10),
     message .. ": " .. vim.inspect({ starts = starts, mode = state.session and state.session.approval_mode,
-      task = task.current(state), operation = state.task_operation, error = state.configuration_error }))
+      task = task.current(state), error = state.configuration_error }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
 local success, failure = xpcall(function()
@@ -36,31 +37,48 @@ local success, failure = xpcall(function()
 
   local idle_applied
   controller.configure({ effort = "low" }, function(applied) idle_applied = applied end)
-  await(function() return idle_applied ~= nil end, "idle configuration did not settle")
+  -- The configure response reports admission; the confirmed settings arrive in a later publication.
+  await(function() return idle_applied ~= nil and (not idle_applied or state.session.effort == "low") end,
+    "idle configuration did not settle")
   assert(idle_applied and state.session.effort == "low" and starts == 0)
 
+  -- An unheld mock turn completes immediately, so every expected goal turn holds its response
+  -- to keep the work active until configuration interrupts it.
+  local session_id = state.session.id
+  local held = mock.hold(session_id)
   controller.task_transition({ action = "goal", text = "Wait for configuration changes" })
+  held:wait()
   await(function() return starts == 1 and task.current(state) end, "goal did not start")
   local task_id = task.current(state).id
-  require("forge.views.harness.activity").busy(state), state.task_operation = false, nil
+  state.activity = vim.tbl_extend("force", state.activity or {}, { phase = "idle" })
   local applied
+  held = mock.hold(session_id)
   controller.configure({ effort = "high" }, function(value) applied = value end)
-  await(function() return applied ~= nil and starts == 2 end, "configuration did not resume active work")
+  await(function() return applied ~= nil and starts == 2 and (not applied or state.session.effort == "high") end,
+    "configuration did not resume active work")
+  held:wait()
   assert(applied and state.session.effort == "high", "stale idle state rejected thinking selection")
   assert(task.current(state).id == task_id, "configuration replaced the running task")
   assert(not state.configuration_error, state.configuration_error)
 
+  held = mock.hold(session_id)
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "deny" } })
   await(function() return starts == 3 and state.session.approval_mode == "deny" end,
     "Deny did not resume active work")
+  held:wait()
+  held = mock.hold(session_id)
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "allow" } })
   await(function() return starts == 4 and state.session.approval_mode == "allow" end,
     "Allow did not resume active work")
+  local resumed = held:wait()
   assert(task.current(state).id == task_id, "permission change replaced the running task")
-  await(function()
-    local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    return transcript:find("Permission changed to allow", 1, true) ~= nil
-  end, "permission notice replaced the task lifecycle heading")
+  -- A permission restart keeps the original exchange, so the transcript retains the goal's
+  -- lifecycle heading, and the resumed provider prompt carries the policy change instead.
+  local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  assert(transcript:find("Goal started: Wait for configuration changes", 1, true),
+    "permission notice replaced the task lifecycle heading: " .. transcript)
+  assert(resumed.prompt:find("approval mode from deny to allow", 1, true),
+    "permission resume did not tell the model about the policy change: " .. resumed.prompt)
 
   controller.task_transition({ action = "pause" })
   await(function() return not require("forge.views.harness.activity").busy(state) and not state.state_sync_pending end,

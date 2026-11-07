@@ -89,6 +89,8 @@ local function refresh_winbar(review)
   local plan = review.plan
   local detail = plan.historical_revision and ("Revision " .. plan.historical_revision .. " • historical • read-only")
     or plan.state == "accepted" and "Accepted plan • read-only projection"
+    or plan.state ~= "awaiting_review" and ("Revision " .. tostring(plan.model_revision or "?") .. " • "
+      .. tostring(plan.state or "unavailable"):gsub("_", " ") .. " • decisions unavailable")
     or "Awaiting review"
   detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
@@ -217,7 +219,29 @@ local function submit(review, method, params)
       and current.plan.review_digest == review.plan.review_digest
       and current.plan.historical_revision == review.plan.historical_revision and current or review
     if not completed.owner.closed then close_review(completed) end
-    controller.synchronize_state()
+    if method == "session.plan.accept" or method == "session.plan.changes.request" then
+      -- A decision starts a new exchange like a composer submission does, so it resumes
+      -- following the transcript tail. Live follow is gated on composer focus, which
+      -- closing the review would otherwise leave on the transcript window.
+      local harness = session.harness
+      if harness.composer_win and vim.api.nvim_win_is_valid(harness.composer_win)
+        and vim.api.nvim_win_get_tabpage(harness.composer_win) == vim.api.nvim_get_current_tabpage() then
+        vim.api.nvim_set_current_win(harness.composer_win)
+      end
+      if harness.presentation and harness.presentation.follow_tail then harness.presentation.follow_tail() end
+    end
+    controller.synchronize_state(method == "session.plan.accept" and function(_, sync_failure)
+      if sync_failure or session.harness ~= submitted_state then return end
+      -- Acceptance respects a pause, so questions it commits stay hidden until the task resumes.
+      local task = require("forge.views.harness.task")
+      local current = task.current(submitted_state)
+      local review_state = current and current.plan and current.plan.artifact and current.plan.artifact.review
+      local questions = review_state and review_state.elicitation and review_state.elicitation.question_set.questions
+      if current and task.status(current) == "paused" and questions and #questions > 0 then
+        notifications.warn("Plan acceptance needs answers. The task is paused; run /task resume to answer them.",
+          "ForgePlanReview")
+      end
+    end or nil)
     controller.render()
   end)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
@@ -266,6 +290,12 @@ end
 
 local function prompt_decision(review, method, title)
   if review.plan.historical_revision or review.owner.closed then return end
+  if review.plan.state ~= "awaiting_review" then
+    -- A revision in progress replaces this document, so a decision here would
+    -- address a plan the reviewer has not seen.
+    notice("This plan revision is not awaiting review. Reopen the plan once the new revision is ready.")
+    return
+  end
   if review.decision_window and vim.api.nvim_win_is_valid(review.decision_window) then
     vim.api.nvim_set_current_win(review.decision_window)
     return

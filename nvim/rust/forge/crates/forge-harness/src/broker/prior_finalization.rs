@@ -72,12 +72,11 @@ impl HarnessBroker {
             .turn
             .last()
             .map(|turn| turn.provider().scope.clone());
-        let owns_settlement = scope.as_ref().is_none_or(|scope| {
-            self.reopened_execution.revision(scope) == 0
-                && !self.reopened_execution.is_settling(scope)
-        });
+        let owns_settlement = scope
+            .as_ref()
+            .is_none_or(|scope| !self.host_settlement.is_settling(scope));
         if owns_settlement && let Some(scope) = &scope {
-            self.reopened_execution.begin_settlement(scope);
+            self.host_settlement.begin_settlement(scope);
         }
         Ok(Some(PriorFinalization {
             exchange,
@@ -103,39 +102,23 @@ impl HarnessBroker {
             .store
             .load_exchange(&state.exchange.id)?
             .context("prior exchange disappeared")?;
-        if state.owns_settlement
-            && let Some(scope) = &state.scope
-            && self.reopened_execution.revision(scope) != 0
-        {
-            self.reopened_execution.end_settlement(scope);
-            state.owns_settlement = false;
-        }
         if state.exchange.is_finished() {
             if !state.owns_settlement {
                 return Ok(PriorFinalizationAction::Ready);
             }
             return self.finish_prior_finalization(state, events);
         }
-        if let Some(scope) = &state.scope {
-            if !state.owns_settlement {
-                if !self.reopened_execution.is_settling(scope) {
-                    self.observer.session_events().request_idle_settlement();
-                }
+        if let Some(scope) = &state.scope
+            && !state.owns_settlement
+        {
+            if !self.host_settlement.is_settling(scope) {
+                self.host_settlement.begin_settlement(scope);
+                state.owns_settlement = true;
+            } else {
                 return Ok(PriorFinalizationAction::Wait(PriorObservationJob {
                     inbox: self.observer.session_events(),
                     cancellation: self.turn_cancellation.capture(),
-                    settlement: self.reopened_execution.settlement_notification(),
-                }));
-            }
-            if self.reopened_execution.active(scope) {
-                anyhow::ensure!(
-                    !self.observer.session_events().is_closed(),
-                    "prior observation owner closed before terminal evidence"
-                );
-                return Ok(PriorFinalizationAction::Wait(PriorObservationJob {
-                    inbox: self.observer.session_events(),
-                    cancellation: self.turn_cancellation.capture(),
-                    settlement: self.reopened_execution.settlement_notification(),
+                    settlement: self.host_settlement.settlement_notification(),
                 }));
             }
         }
@@ -243,7 +226,7 @@ impl HarnessBroker {
         if state.owns_settlement
             && let Some(scope) = &state.scope
         {
-            self.reopened_execution.end_settlement(scope);
+            self.host_settlement.end_settlement(scope);
         }
         self.save_session()?;
         events.push(self.event(
@@ -264,7 +247,7 @@ impl HarnessBroker {
         if state.owns_settlement
             && let Some(scope) = &state.scope
         {
-            self.reopened_execution.end_settlement(scope);
+            self.host_settlement.end_settlement(scope);
         }
         Ok(())
     }

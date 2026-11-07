@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 /// Disposable-state contract shared by databases, journals, plans, and captured files.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// Pin one executable's state version until its final storage user releases it.
 #[derive(Clone)]
@@ -168,11 +168,94 @@ mod tests {
         store.save_session(&crate::storage::test::session("session", "workspace"))?;
         let mut pins = crate::storage::model_pin::ModelPinStore::open(root.path())?;
         pins.set("mock", "chosen-model", true)?;
-        fs::write(root.path().join("permissions.json"), "{}")?;
+        let preference = crate::session::HarnessPreference {
+            access: Default::default(),
+            shell: Default::default(),
+            model: "chosen-model".into(),
+            effort: "high".into(),
+            model_setting: Default::default(),
+            service_tier: crate::provider::ServiceTier::Fast,
+            plan_executor: Default::default(),
+            plan_compact: true,
+            approval_timeout: Default::default(),
+            tool_timeout: Default::default(),
+        };
+        store.save_preference("workspace", "mock", &preference)?;
+        let mut settings = crate::settings::SettingsStore::open(root.path())?;
+        settings.save_provider(
+            0,
+            "mock",
+            &serde_json::json!({"model":"provider-default","effort":"medium"}),
+        )?;
+        let readable = root.path().join("readable");
+        let writable = root.path().join("writable");
+        fs::create_dir_all(&readable)?;
+        fs::create_dir_all(&writable)?;
+        settings.grant_directories(&[
+            crate::permissions::directory::DirectoryGrant {
+                operation: crate::permissions::directory::DirectoryOperation::Read,
+                path: readable.to_string_lossy().into_owned(),
+            },
+            crate::permissions::directory::DirectoryGrant {
+                operation: crate::permissions::directory::DirectoryOperation::Write,
+                path: writable.to_string_lossy().into_owned(),
+            },
+        ])?;
+        let revision = settings.get("workspace", "session", "mock")?.revision;
+        settings.update(
+            revision,
+            crate::settings::SettingScope::Workspace,
+            "workspace",
+            "session",
+            &crate::settings::PortableSettings {
+                status_thoughts: Some(true),
+                ..Default::default()
+            },
+        )?;
+        let captured = settings.get("workspace", "session", "mock")?;
+        let captured_settings =
+            serde_json::to_value((&captured.desired, &captured.provider, captured.revision))?;
+        use crate::permissions::document::{
+            PermissionDecision, default_permission_document, parse_permission_document,
+            serialize_permission_document, set_permission_rule,
+        };
+        let mut permissions = default_permission_document();
+        set_permission_rule(
+            &mut permissions,
+            "read",
+            "retained/**",
+            PermissionDecision::Allow,
+        )?;
+        set_permission_rule(
+            &mut permissions,
+            "edit",
+            "protected/**",
+            PermissionDecision::Deny,
+        )?;
+        fs::write(
+            root.path().join("permissions.json"),
+            serialize_permission_document(&permissions)?,
+        )?;
+        let assert_persistent_settings = || -> Result<()> {
+            let reopened = crate::settings::SettingsStore::open(root.path())?;
+            let after = reopened.get("workspace", "session", "mock")?;
+            assert_eq!(
+                serde_json::to_value((&after.desired, &after.provider, after.revision))?,
+                captured_settings
+            );
+            assert_eq!(
+                parse_permission_document(&fs::read_to_string(
+                    root.path().join("permissions.json")
+                )?)?,
+                permissions
+            );
+            Ok(())
+        };
         let locked = clear(root.path())?;
         assert!(!locked.current_cleared);
         assert_eq!(locked.retained.len(), 2);
         assert!(old.join("objects/retained").is_file());
+        assert_persistent_settings()?;
         drop(store);
 
         let partial = clear(root.path())?;
@@ -181,17 +264,19 @@ mod tests {
         assert_eq!(partial.retained.len(), 1);
         assert!(old.join("objects/retained").is_file());
         assert_eq!(pins.load("mock")?, vec!["chosen-model"]);
+        assert_persistent_settings()?;
         drop(old_owner);
         let complete = clear(root.path())?;
         assert!(complete.retained.is_empty());
         assert!(!root.path().join("state").exists());
-        assert_eq!(
-            fs::read_to_string(root.path().join("permissions.json"))?,
-            "{}"
-        );
+        assert_persistent_settings()?;
         let fresh = SqliteStore::open(root.path())?;
         assert!(fresh.load_session("session")?.is_none());
         assert_eq!(pins.load("mock")?, vec!["chosen-model"]);
+        assert_eq!(
+            serde_json::to_value(fresh.load_preference("workspace", "mock")?.unwrap())?,
+            serde_json::to_value(preference)?
+        );
         Ok(())
     }
 

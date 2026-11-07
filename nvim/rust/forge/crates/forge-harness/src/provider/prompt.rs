@@ -72,16 +72,6 @@ impl ProviderRequest {
             crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
             crate::session::CheckShell::System => "the system login shell",
         };
-        let check_editing = if self
-            .control_context
-            .as_ref()
-            .and_then(|context| context.checks.as_ref())
-            .is_some_and(|scope| scope.editing_enabled())
-        {
-            "enabled. Use the harness-checks skill to configure checks, and submit changes with check_definition_edit, which follows the selected tool approval mode."
-        } else {
-            "disabled. The user can enable it with /checks edit on. The harness-checks skill describes check configuration."
-        };
         let harness = if self
             .control_context
             .as_ref()
@@ -97,7 +87,7 @@ impl ProviderRequest {
             String::new()
         };
         format!(
-            "{}Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{harness}",
+            "{}Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live check_editing, automatic_checks, and check_timing settings, because the user can change them during the conversation. When check_editing is true, use the harness-checks skill to configure checks and submit changes with check_definition_edit, which follows the selected tool approval mode. When it is false, only the user can enable it with /checks edit on. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{harness}",
             self.lsp_guidance(),
             self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
@@ -150,6 +140,7 @@ mod test {
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: Some(context),
         };
@@ -194,6 +185,7 @@ mod test {
             approval_mode: ApprovalMode::Ask,
             provider_session_id: Some("existing".to_owned().try_into().unwrap()),
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: Some(ControlTurnContext::inactive(PromptMode::Chat)),
         };
@@ -207,6 +199,10 @@ mod test {
             );
             assert!(!contract.contains("question_ask"));
             assert!(!contract.contains("already recorded"));
+            // Codex retains thread-start developer instructions, so a mutable check-editing value
+            // here goes stale; the contract defers to the live check_definition_list field.
+            assert!(contract.contains("live check_editing"));
+            assert!(!contract.contains("Check editing permission:"));
         }
         request.mode = PromptMode::Plan;
         request.control_context.as_mut().unwrap().planning_feedback = true;

@@ -118,7 +118,13 @@ vim.api.nvim_set_decoration_provider(namespace, {
       local text = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
       local available = vim.api.nvim_win_get_width(window) - vim.fn.getwininfo(window)[1].textoff
       local minimum = tonumber(vim.wo[window].breakindentopt:match("min:(%d+)")) or 20
-      indent = math.min(vim.fn.strdisplaywidth(text:match("^%s*") or ""), math.max(0, available - minimum))
+      local leading = text:match("^%s*") or ""
+      -- Mirror Neovim's `list:-1`, which indents continuations by the whole list-header match.
+      if vim.wo[window].breakindentopt:find("list:-1", 1, true) then
+        local header_end = vim.fn.matchend(text, vim.bo[buffer].formatlistpat)
+        if header_end > 0 then leading = text:sub(1, header_end) end
+      end
+      indent = math.min(vim.fn.strdisplaywidth(leading), math.max(0, available - minimum))
     end
     if relative == 0 then
       require("forge.content_layout").draw_fold(window, buffer, namespace, row,

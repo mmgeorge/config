@@ -278,11 +278,8 @@ fn snapshot_publication_preserves_previous_output_when_database_decode_fails() -
 fn lock_timeout_retains_database_without_archiving_it() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let database_path = directory.path().join("issues.redb");
-    let store = IssueStore::new(
-        database_path.clone(),
-        "owner/repo",
-        Duration::from_millis(15),
-    )?;
+    // A zero lock timeout expires on the first contended open attempt.
+    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
     store.read_state()?;
     let database = Database::create(&database_path)?;
     let started = Instant::now();

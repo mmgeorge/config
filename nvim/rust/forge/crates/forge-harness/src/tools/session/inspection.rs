@@ -320,7 +320,7 @@ impl HarnessInspectionScope {
                         }
                     }
                     for decision in &exchange.approval_resolution {
-                        page.push(json!({"kind":"approval","id":decision.id,"resolution_source":decision.resolution_source}))?;
+                        page.push(json!({"kind":"approval","event":decision}))?;
                     }
                     for run in exchange.checks() {
                         page.push(json!({"kind":"check","run_id":run.id,"state":run.state}))?;

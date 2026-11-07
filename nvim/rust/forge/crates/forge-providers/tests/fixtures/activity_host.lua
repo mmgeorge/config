@@ -85,7 +85,7 @@ local succeeded, failure = xpcall(function()
     .. "and finish with CODEX_ACTIVITY_VERIFIED." })
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.wait(90000, function()
-    return not state.busy and transcript():find("Thought", 1, true)
+    return not require("forge.views.harness.activity").busy(state) and transcript():find("Thought", 1, true)
       and transcript():find("CODEX_ACTIVITY_VERIFIED", 1, true)
   end, 10), "completed turn did not publish its settled transcript\n" .. transcript())
   local trace_path = request("host.trace.status").path

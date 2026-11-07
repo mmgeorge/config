@@ -88,14 +88,14 @@ impl CopilotRuntime {
         let mut client = self.client.lock().await;
         if self.closed.load(Ordering::Acquire) || client.is_some() {
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::SessionOpen,
+                forge_provider_api::error::ProviderOperation::ThreadOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
         *client = Some(RuntimeClient::Unvalidated(CopilotClient::new(
             Client::from_streams(reader, writer, workspace).map_err(|_| {
                 provider_failure(
-                    forge_provider_api::error::ProviderOperation::InputSubmit,
+                    forge_provider_api::error::ProviderOperation::TurnStart,
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 )
             })?,
@@ -111,7 +111,7 @@ impl CopilotRuntime {
         let _initializing = self.initializing.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::SessionOpen,
+                forge_provider_api::error::ProviderOperation::ThreadOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -141,7 +141,7 @@ impl CopilotRuntime {
                             forge_provider_api::error::ProviderFailureKind::Transport
                         };
                         provider_failure(
-                            forge_provider_api::error::ProviderOperation::SessionOpen,
+                            forge_provider_api::error::ProviderOperation::ThreadOpen,
                             kind,
                         )
                     })?);
@@ -149,7 +149,7 @@ impl CopilotRuntime {
                 if self.closed.load(Ordering::Acquire) {
                     started.force_stop();
                     return Err(provider_failure(
-                        forge_provider_api::error::ProviderOperation::SessionOpen,
+                        forge_provider_api::error::ProviderOperation::ThreadOpen,
                         forge_provider_api::error::ProviderFailureKind::Rejected,
                     ));
                 }
@@ -170,7 +170,7 @@ impl CopilotRuntime {
             transport.force_stop();
             state.take();
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::SessionOpen,
+                forge_provider_api::error::ProviderOperation::ThreadOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -304,7 +304,7 @@ pub(crate) async fn validate_version(
     let requirement = forge_provider_api::version::RuntimeRequirement::new(
         crate::registry::select("copilot").map_err(|_| {
             ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
-                forge_provider_api::error::ProviderOperation::SessionOpen,
+                forge_provider_api::error::ProviderOperation::ThreadOpen,
                 forge_provider_api::error::ProviderFailureKind::Unknown,
             ))
         })?,

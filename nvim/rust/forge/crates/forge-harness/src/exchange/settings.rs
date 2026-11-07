@@ -314,7 +314,7 @@ impl SettingsRun {
                         job.run().await.map_err(|error| {
                             OperationFailure::Reconciliation(
                                 crate::provider::lifecycle_error::classify(
-                                    forge_provider_api::ProviderOperation::SessionConfigure,
+                                    forge_provider_api::ProviderOperation::ThreadConfigure,
                                     error,
                                 ),
                             )

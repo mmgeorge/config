@@ -186,10 +186,11 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
             system_tokens,
             tool_definitions_tokens,
         } = native;
-        let diagnostic =
-            (error.is_some() || status_code.is_some_and(|status| status >= 400)).then(|| {
-                forge_provider_api::ProviderDiagnostic {
-                    kind: match status_code {
+        let normalized_error = (error.is_some() || status_code.is_some_and(|status| status >= 400))
+            .then(|| {
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::ThreadCompact,
+                    match status_code {
                         Some(401) => forge_provider_api::ProviderFailureKind::Authentication,
                         Some(403) => forge_provider_api::ProviderFailureKind::Authorization,
                         Some(408 | 504) => forge_provider_api::ProviderFailureKind::Timeout,
@@ -198,12 +199,11 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
                         Some(500 | 502 | 503) => forge_provider_api::ProviderFailureKind::Transport,
                         _ => forge_provider_api::ProviderFailureKind::Unknown,
                     },
-                    message: forge_provider_api::SanitizedMessage::new(
-                        "Provider compaction failed",
-                    )
-                    .expect("static diagnostic is nonempty"),
-                    fatal: false,
-                }
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                )
             });
         Self {
             context_tokens_before,
@@ -212,7 +212,7 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
             before_context: before_context.map(Into::into),
             custom_instructions,
             summary_content,
-            diagnostic,
+            error: normalized_error,
             pre_compaction_tokens,
             post_compaction_tokens,
             tokens_removed,
@@ -290,7 +290,7 @@ mod tests {
         .unwrap();
         let result: forge_provider_api::compaction::CompactionResult = native.into();
         assert_eq!(
-            result.diagnostic.as_ref().unwrap().kind,
+            result.error.as_ref().unwrap().kind(),
             forge_provider_api::ProviderFailureKind::Authentication
         );
         assert_eq!(

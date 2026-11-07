@@ -58,6 +58,16 @@ fn rename_affects_origin_but_copy_does_not() {
 }
 
 #[test]
+fn names_directory_entries_without_their_trailing_slash() {
+    let record = parse(b"? nested/workspace/\0! build/\0").unwrap();
+    assert_eq!(record[0].path.raw(), b"nested/workspace");
+    assert!(matches!(record[0].state, PathState::Untracked));
+    assert_eq!(record[1].path.raw(), b"build");
+    assert!(matches!(record[1].state, PathState::Ignored));
+    assert!(parse(b"? nested//\0").is_err());
+}
+
+#[test]
 fn preserves_conflict_stages_and_submodule_flags() {
     let input = format!(
         "u UU SCMU 100644 100755 120000 160000 {} {} {} conflict\0",

@@ -22,7 +22,6 @@ enum CaptureOwner {
     BeforeSubmission,
     Invocation {
         scope: crate::provider::InvocationScope,
-        revision: u64,
     },
 }
 
@@ -142,20 +141,20 @@ impl HarnessBroker {
         {
             Some(scope) => {
                 anyhow::ensure!(
-                    scope.owner.session_id.as_str() == self.session.id
-                        && scope.owner.agent_id.as_str() == interaction.agent_id
+                    scope.owner.session_id().as_str() == self.session.id
+                        && scope.owner.agent_id().as_str() == interaction.agent_id
                         && scope.exchange_id
                             == forge_provider_api::ExchangeId::from(interaction.id.as_str()),
                     "checkpoint capture crosses invocation ownership"
                 );
                 anyhow::ensure!(
-                    !self.reopened_execution.active(&scope),
+                    interaction.turn.last().is_some_and(|turn| matches!(
+                        turn.state(),
+                        crate::turn::TurnState::Finished { .. }
+                    )),
                     "checkpoint capture requires terminal native work"
                 );
-                CaptureOwner::Invocation {
-                    revision: self.reopened_execution.revision(&scope),
-                    scope,
-                }
+                CaptureOwner::Invocation { scope }
             }
             None => CaptureOwner::BeforeSubmission,
         };
@@ -206,10 +205,11 @@ impl HarnessBroker {
         let current_scope = interaction.turn.last().map(|turn| &turn.provider().scope);
         let owner_current = match &captured.owner {
             CaptureOwner::BeforeSubmission => current_scope.is_none(),
-            CaptureOwner::Invocation { scope, revision } => {
+            CaptureOwner::Invocation { scope } => {
                 current_scope == Some(scope)
-                    && !self.reopened_execution.active(scope)
-                    && self.reopened_execution.revision(scope) == *revision
+                    && interaction.turn.last().is_some_and(|turn| {
+                        matches!(turn.state(), crate::turn::TurnState::Finished { .. })
+                    })
             }
         };
         if !owner_current
@@ -251,12 +251,9 @@ mod tests {
     use super::*;
     use crate::broker::test::{planning_question_broker, repository};
 
-    /// A reopened execution's workspace capture does not hold the broker mutex.
+    /// An original completed invocation's workspace capture does not hold the broker mutex.
     #[tokio::test]
     async fn idle_checkpoint_capture_keeps_broker_available() -> Result<()> {
-        use forge_provider_api::lifecycle::{
-            ExecutionObservation, ExecutionResult, ExecutionUpdate,
-        };
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -267,55 +264,29 @@ mod tests {
         );
         exchange.phase = crate::exchange::ExchangePhase::Running;
         let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root(&broker.session.id),
+            crate::provider::ThreadOwner::root(&broker.session.id),
             exchange.id.clone(),
         );
-        let first = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "first".into(),
-        };
+        let first = crate::provider::test_support::address(&scope);
         exchange.start_turn(first.clone(), 10)?;
         exchange
             .turn_mut(&first)
             .context("first turn missing")?
-            .finish(crate::turn::TurnOutcome::Completed, 11)?;
-        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 12)?;
-        broker.store.save_exchange(&exchange)?;
-        let later = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "later".into(),
-        };
-        broker.observe_execution_lifecycle(ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Started {
-                address: later.clone(),
-            },
-        )?)?;
-        broker.observe_execution_lifecycle(ExecutionObservation::new(
-            scope,
-            ExecutionUpdate::Finished {
-                address: later,
-                covered_submissions: Vec::new(),
-                completed_at_ms: 14,
-                result: ExecutionResult::Cancelled {
-                    completion: forge_provider_api::completion::ProviderCompletion::default()
-                        .into(),
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            },
-        )?)?;
-        let exchange = broker
-            .store
-            .load_exchange(&exchange.id)?
-            .context("reopened exchange missing")?;
+                11,
+            )?;
+        exchange.begin_finalization(crate::exchange::ExchangeOutcome::Failed, 12)?;
+        broker.store.save_exchange(&exchange)?;
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let shared = Arc::new(tokio::sync::Mutex::new(broker));
         let mut capture = shared
             .lock()
             .await
-            .prepare_final_checkpoint(&exchange, crate::exchange::ExchangeOutcome::Cancelled)?;
+            .prepare_final_checkpoint(&exchange, crate::exchange::ExchangeOutcome::Failed)?;
         capture.barrier = Some((started.clone(), release.clone()));
         let job = tokio::spawn(capture.run());
         started.notified().await;

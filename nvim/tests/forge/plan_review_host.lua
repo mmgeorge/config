@@ -6,7 +6,10 @@ vim.fn.writefile({vim.json.encode({checks=vim.empty_dict()})},workspace .. "/.fo
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(30000)
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Resolve support paths before the fixture changes into its workspace.
+local fixture_directory = vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(fixture_directory .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors = {}
@@ -34,7 +37,7 @@ local success, failure = xpcall(function()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })
   controller.submit()
-  await(function() return not state.busy and state.active_plan
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.active_plan
     and state.active_plan.state == "awaiting_review" and state.active_plan.model_revision > 0 end,
     "mock plan did not reach review")
   local plan = state.active_plan
@@ -112,11 +115,15 @@ local success, failure = xpcall(function()
       end
     end
   end
-  for _, phase in ipairs({ "service.total", "service.broker_lock_wait", "rename.reference_index",
-    "rename.semantic_edit", "persist.working_json", "broker.timeline_reconcile",
-    "service.recapture_review", "service.syntax", "review.project", "service.send_response" }) do
-    assert(phases[phase], "missing plan edit phase: " .. phase)
+  -- Session owners serialize plan edits, so no broker lock wait precedes the rename stages, and a
+  -- persisted plan commits the renamed draft through its revision journal.
+  local missing = {}
+  for _, phase in ipairs({ "service.total", "service.capture_submission", "rename.reference_index",
+    "rename.semantic_edit", "rename.render_changed_plan", "persist.journal_revision" }) do
+    if not phases[phase] then missing[#missing + 1] = phase end
   end
+  assert(#missing == 0, "missing plan edit phases: " .. table.concat(missing, ", ")
+    .. "; recorded: " .. table.concat(vim.tbl_keys(phases), ", "))
   for _, phase in ipairs({ "persist.submitted_json", "persist.submitted_markdown", "persist.submitted_navigation" }) do
     assert(not phases[phase], "draft rename performed a submitted snapshot write: " .. phase)
   end
@@ -172,6 +179,8 @@ local success, failure = xpcall(function()
     if method == "session.plan.accept" then submitted_capture = vim.deepcopy(params) end
     return original_request(request_specification, callback)
   end
+  -- A decision is an explicit submission, so it must resume following the transcript tail.
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
   review.owner.annotation_saving, review.owner.saving = true, true
   review.command_set.action_by_id.accept.run({})
   local decision_buf = vim.api.nvim_get_current_buf()
@@ -203,8 +212,16 @@ local success, failure = xpcall(function()
     retained_comment = retained_comment or annotation.source.body == literal .. "\nsecond line\n"
   end
   assert(retained_comment, "acceptance lost the saved comment")
-  await(function() return not state.plan_review and not state.busy end, "plan acceptance did not settle")
-  await(function() return state.active_plan and state.active_plan.model_revision == submitted_revision + 1 and not state.busy end,
+  await(function() return not state.plan_review and not require("forge.views.harness.activity").busy(state) end, "plan acceptance did not settle")
+  assert(vim.api.nvim_get_current_win() == state.composer_win, "plan acceptance did not return focus to the composer")
+  assert(vim.api.nvim_win_get_cursor(state.transcript_win)[1] > 1, "plan acceptance did not follow the transcript tail")
+  -- The replacement host restores the task paused, so its review questions appear after an explicit resume.
+  local resumed
+  controller.task_transition({ action = "resume" }, nil, function(ok) resumed = ok end)
+  await(function() return resumed ~= nil and not require("forge.views.harness.activity").busy(state) end, "restored plan task did not resume")
+  assert(resumed, "restored plan task failed to resume")
+  dofile(fixture_directory .. "/support/plan_acceptance.lua").answer_execution_approval(state.session.id, "ask")
+  await(function() return state.active_plan and state.active_plan.model_revision == submitted_revision + 1 and not require("forge.views.harness.activity").busy(state) end,
     "final acceptance did not publish the reviewed draft")
   assert(vim.fn.filereadable(revision_directory .. ("/submitted-%04d.json"):format(submitted_revision + 1)) == 1,
     "final acceptance did not freeze the edited draft")

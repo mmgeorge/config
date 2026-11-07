@@ -5,7 +5,8 @@ assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
 vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 local errors = {}
@@ -23,7 +24,7 @@ local controller = require("forge.views.harness.controller")
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10), message .. " " .. vim.inspect({
     approval_mode = state.session and state.session.approval_mode, task_operation = state.task_operation,
-    configuring = state.configuring, task_config = state.task_config,
+    approval_timeout = state.session and state.session.approval_timeout,
   }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
@@ -89,17 +90,19 @@ local success, failure = xpcall(function()
   await(function() return picker.is_open("harness-config") end, "directory editor did not return to configuration")
   for _, mode in ipairs({ "deny", "allow", "ask" }) do
     change("approval-mode", "<Right>")
-    await(function() return state.session.approval_mode == mode and not state.busy end,
+    await(function() return state.session.approval_mode == mode and not require("forge.views.harness.activity").busy(state) end,
       "tool approval mode did not apply: " .. mode)
     assert(state.access_preference.sandbox and not state.session.access.sandbox,
       "approval mode overwrote saved sandbox preference or effective access")
   end
   for _ = 1, 3 do change("approval_timeout", "<Right>") end
-  await(function()
-    return not state.input_timeout_configuration.in_flight
-      and state.session.approval_timeout.amount == 13
-  end, "rapid timeout edits did not retain both final values")
-  assert(field("approval_timeout").value.value == "13m")
+  -- Timeout edits are ordinary session configuration now; the confirmed session value is the
+  -- settled state, and the picker must show the same final selection.
+  await(function() return state.session.approval_timeout.amount == 13 end,
+    "rapid timeout edits did not retain both final values")
+  local shown = vim.wait(5000, function() return field("approval_timeout").value.value == "13m" end, 10)
+  assert(shown, "configuration picker shows " .. tostring(field("approval_timeout").value.value)
+    .. " after the host confirmed 13m")
   local selected = request("settings.get", {})
   assert(selected.desired.approval_timeout.amount == 13)
   assert(selected.desired.access.sandbox and not state.session.access.sandbox)

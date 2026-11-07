@@ -113,7 +113,7 @@ mod tests {
             .instrument("session", "disabled", "admission", async { Ok(()) })
             .await?;
         assert!(
-            !crate::storage::state::directory(&root.path())
+            !crate::storage::state::directory(root.path())
                 .join("logs/session.jsonl")
                 .exists()
         );
@@ -144,7 +144,7 @@ mod tests {
         }
         trace.flush()?;
         let text = std::fs::read_to_string(
-            crate::storage::state::directory(&root.path()).join("logs/session.jsonl"),
+            crate::storage::state::directory(root.path()).join("logs/session.jsonl"),
         )?;
         let records: Vec<serde_json::Value> = text
             .lines()

@@ -34,6 +34,14 @@ function M.hold(session_id, mode, any_session)
   return setmetatable({ id = result.id, session_id = session_id }, Hold)
 end
 
+---Expire the session's pending timed approvals through the host's deadline path immediately.
+---Fails when no approval with a deadline is pending for the session's root owner.
+---@param session_id string
+---@return integer expired_count
+function M.expire_approval(session_id)
+  return request(session_id, { operation = "expire_approval" }).expired
+end
+
 ---Wait until the provider holds the matching request without releasing its response.
 ---@return ForgeMockPendingResponse
 function Hold:wait()

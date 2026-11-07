@@ -27,7 +27,7 @@ impl UndoTeardown {
         // The registry can serve other sessions; rollback retires only its captured binding.
         self.registry
             .retire(
-                &crate::provider::ExecutionOwner::root(&self.session_id),
+                &crate::provider::ThreadOwner::root(&self.session_id),
                 crate::provider::session_execution::OwnerCloseReason::Cancelled,
             )
             .await?;
@@ -154,14 +154,6 @@ impl HarnessBroker {
         self.context_usage_fresh = false;
         self.observer
             .replace_session_events(Arc::new(Default::default()));
-        let exchange = self
-            .store
-            .load_exchange(&teardown.exchanges[0])?
-            .filter(|exchange| exchange.session_id == self.session.id)
-            .context("rolled-back interaction disappeared")?;
-        Ok(vec![self.event(
-            "interaction_rolled_back",
-            serde_json::to_value(exchange)?,
-        )?])
+        self.rolled_back_events(&teardown.exchanges[0])
     }
 }

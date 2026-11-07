@@ -9,6 +9,7 @@ license.workspace = true
 async-trait = { workspace = true }
 forge-protocol = { workspace = true }
 forge-shell = { workspace = true }
+futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true, features = ["derive"] }

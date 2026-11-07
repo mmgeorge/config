@@ -156,7 +156,7 @@ mod tests {
             cancellation,
         )
         .unwrap();
-        Admission::new(context, ProviderOperation::SessionConfigure)
+        Admission::new(context, ProviderOperation::ThreadConfigure)
             .scope(async {
                 wait(tokio::time::sleep(Duration::from_secs(20)))
                     .await
@@ -175,7 +175,7 @@ mod tests {
     async fn unbounded_input_wait_survives_previous_acceptance_limit() {
         let (_source, cancellation) = forge_provider_api::OperationCancellation::channel();
         let context = OperationContext::unbounded(OperationId::new("input").unwrap(), cancellation);
-        Admission::new(context, ProviderOperation::InputSubmit)
+        Admission::new(context, ProviderOperation::TurnStart)
             .scope(async {
                 let (send, receive) = tokio::sync::oneshot::channel();
                 let waiting = wait(receive);

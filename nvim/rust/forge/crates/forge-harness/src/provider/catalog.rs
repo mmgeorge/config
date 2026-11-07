@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderCatalogRequest {
     /// Identify the independent agent owner while preserving the visible settings scope.
-    pub execution_owner: Option<super::ExecutionOwner>,
+    pub execution_owner: Option<super::ThreadOwner>,
     /// Identify the host session whose owner publishes these defaults.
     pub harness_session_id: String,
     /// Select the settings and resource workspace.
@@ -20,13 +20,13 @@ pub struct ProviderCatalogRequest {
 
 impl ProviderCatalogRequest {
     /// Get the runtime key owned by the published session snapshot.
-    pub fn runtime_key(&self) -> Result<String, forge_provider_api::ExecutionOwnerError> {
+    pub fn runtime_key(&self) -> Result<String, forge_provider_api::ThreadOwnerError> {
         Ok(self.owner()?.runtime_key())
     }
 
     /// Resolve the exact host owner without changing the visible preference scope.
-    pub fn owner(&self) -> Result<super::ExecutionOwner, forge_provider_api::ExecutionOwnerError> {
-        super::ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
+    pub fn owner(&self) -> Result<super::ThreadOwner, forge_provider_api::ThreadOwnerError> {
+        super::ThreadOwner::resolve(&self.execution_owner, &self.harness_session_id)
     }
 }
 

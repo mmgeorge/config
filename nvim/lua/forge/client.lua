@@ -50,8 +50,14 @@ local max_active_requests, reserved_control_requests = 256, 4
 ---@field admitted? boolean
 ---@field start? fun()
 
+---@class ForgeProviderRegistryAdoption
+---@field generation integer Host generation whose `provider.registry.list` reply produced the registry.
+---@field registry ForgeHarnessProviderRegistry Descriptors exactly as the host returned them.
+---@field provider_map table<string, ForgeHarnessProviderConfig> Map last written to `config.options`; another table there means `config.setup` replaced the options.
+
 ---@class ForgeClient
 ---@field process table?
+---@field provider_registry? ForgeProviderRegistryAdoption Host registry retained for the client's lifetime.
 ---@field generation integer
 ---@field launch_token integer
 ---@field next_id integer
@@ -238,7 +244,7 @@ end
 local function session_provider_descriptor()
   local harness_config = config.options.harness
   local provider = harness_config.provider
-  local configured = harness_config.providers[provider]
+  local configured = M.provider_map()[provider]
   assert(configured, "Unknown Harness provider: " .. tostring(provider))
   return {
     kind = provider,
@@ -247,7 +253,9 @@ local function session_provider_descriptor()
   }
 end
 
+--- Merge host descriptors with user provider configuration into `config.options`.
 ---@param registry ForgeHarnessProviderRegistry
+---@return table<string, ForgeHarnessProviderConfig> provider_map The map now held by `config.options`.
 local function adopt_provider_registry(registry)
   if type(registry) ~= "table" or type(registry.providers) ~= "table"
     or type(registry.default_provider) ~= "string" then
@@ -288,17 +296,48 @@ local function adopt_provider_registry(registry)
   if not config.harness_provider_explicit and not session.harness.session then
     config.options.harness.provider = provider_preference.load(providers, registry.default_provider)
   end
+  return providers
+end
+
+--- Re-derive the provider map from the retained registry when `config.setup` replaced the
+--- options that held the adopted map; user configuration may have changed, the host has not.
+---@param adoption ForgeProviderRegistryAdoption
+---@return string? failure
+local function synchronize_provider_registry(adoption)
+  if config.options.harness.providers == adoption.provider_map then return nil end
+  local ok, provider_map = pcall(adopt_provider_registry, adoption.registry)
+  if not ok then return tostring(provider_map) end
+  adoption.provider_map = provider_map
+  return nil
+end
+
+---@param client ForgeClient
+---@return ForgeProviderRegistryAdoption?
+local function current_provider_registry(client)
+  local adoption = client.provider_registry
+  if adoption and adoption.generation == client.generation then return adoption end
+  return nil
+end
+
+--- Resolve the effective provider map: host registry descriptors merged with user configuration.
+--- Readers use this instead of `config.options.harness.providers`, which `config.setup` resets.
+---@return table<string, ForgeHarnessProviderConfig>
+function M.provider_map()
+  local adoption = M._client and current_provider_registry(M._client)
+  if adoption then synchronize_provider_registry(adoption) end
+  return config.options.harness.providers or {}
 end
 
 ---@param callback fun(failure?: string)
 local function ensure_provider_registry(callback)
   local client = host_state()
-  if client.provider_registry_generation == client.generation then callback(nil) return end
+  local adoption = current_provider_registry(client)
+  if adoption then callback(synchronize_provider_registry(adoption)) return end
   send_request(nil, "provider.registry.list", {}, function(registry, failure)
     if failure then callback(failure) return end
-    local ok, apply_error = pcall(adopt_provider_registry, registry)
-    if not ok then callback(tostring(apply_error)) return end
-    client.provider_registry_generation = client.generation
+    local ok, provider_map = pcall(adopt_provider_registry, registry)
+    if not ok then callback(tostring(provider_map)) return end
+    client.provider_registry = { generation = client.generation, registry = registry, provider_map = provider_map }
     callback(nil)
   end)
 end
@@ -1001,7 +1040,8 @@ function M.session_initialize(callback, initialize_options, startup)
   local client = host_state()
   local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
   if client[mode .. "_ready"] and client.process then
-    if client.provider_registry_generation ~= client.generation then
+    local adoption = current_provider_registry(client)
+    if not adoption or adoption.provider_map ~= config.options.harness.providers then
       ensure_provider_registry(function(failure)
         if failure then callback(nil, failure) else M.session_initialize(callback, initialize_options, startup) end
       end)
@@ -1058,7 +1098,7 @@ function M.generation_get_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
   local provider = selected and selected.provider or harness_config.provider
-  local configured = harness_config.providers[provider]
+  local configured = M.provider_map()[provider]
   if not configured then return nil, "Unknown Harness provider: " .. tostring(provider) end
   selection = selection or (config.options.background_generation or {})[provider]
   if selection and (type(selection) ~= "table" or type(selection.model) ~= "string" or vim.trim(selection.model) == "") then
@@ -1099,11 +1139,9 @@ function M.generation_request(params, callback, on_model, selection)
   M.generation_config(function(generation, failure)
     if finished then return end
     if not generation then finished = true callback(nil, failure) return end
-    if on_model then
-      local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
-      on_model(generation.model .. effort .. " (" .. generation.provider.kind .. ")")
-    end
-    local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+    local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
+    local label = generation.model .. effort .. " (unconfirmed)"
+    if on_model then on_model(label .. " (" .. generation.provider.kind .. ")") end
     request_id = M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, function(...)
       finished = true
       callback(...)
@@ -1111,8 +1149,9 @@ function M.generation_request(params, callback, on_model, selection)
       if finished then return end
       local event = progress.event
       if not on_model or type(event) ~= "table" then return end
-      if event.kind == "runtime_resolved" and event.data and event.data.model then
-        label = event.data.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+      if event.kind == "runtime_resolved" and event.data then
+        label = type(event.data.model) == "string" and (event.data.model .. effort)
+          or (generation.model .. effort .. " (unconfirmed)")
         on_model(label)
       elseif event.kind == "reasoning_summary" and type(event.text) == "string" then
         on_model(label .. "\n" .. event.text)
@@ -1486,6 +1525,18 @@ function M.host_is_accepting()
 end
 
 function M._host_set_launcher_for_test(launcher) launcher_for_test = launcher end
+--- Treat the configured provider map as the current host generation's adopted registry, or
+--- forget the adoption so the next request fetches `provider.registry.list`.
+---@param adopted boolean
+function M._provider_registry_adopt_for_test(adopted)
+  local client = host_state()
+  client.provider_registry = adopted and {
+    generation = client.generation,
+    registry = { default_provider = config.options.harness.provider or "", providers = {} },
+    provider_map = config.options.harness.providers,
+  } or nil
+end
+
 function M._host_reset_for_test()
   local client = M._client
   M.host_stop()

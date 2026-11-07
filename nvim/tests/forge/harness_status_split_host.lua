@@ -17,7 +17,8 @@ local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local executable = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback) vim.schedule(function() callback({ ok = true, path = executable }) end) end }

@@ -1,14 +1,19 @@
-use forge_provider_api::tool::{ToolActivityKind, ToolInvocation, ToolSemantics};
+use super::decode::NativeToolKind;
+use forge_provider_api::tool::{InspectableArguments, ToolDescriptor, ToolSemantics};
 use serde_json::Value;
 
 /// Decode this integration's argument encodings before publishing operation semantics.
-pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
-    if let Some(encoded) = invocation.arguments.as_str()
+pub(super) fn normalize_descriptor(
+    mut invocation: ToolDescriptor,
+    kind: NativeToolKind,
+) -> ToolDescriptor {
+    let mut arguments = invocation.arguments.into_value();
+    if let Some(encoded) = arguments.as_str()
         && let Ok(decoded) = serde_json::from_str(encoded)
     {
-        invocation.arguments = decoded;
+        arguments = decoded;
     }
-    let arguments = &invocation.arguments;
+    let arguments = &arguments;
     let string = |keys: &[&str]| {
         keys.iter()
             .find_map(|key| arguments.get(*key).and_then(Value::as_str))
@@ -25,11 +30,10 @@ pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
         .next()
         .unwrap_or(&invocation.name)
         .to_ascii_lowercase();
-    let command = string(&["command", "cmd", "commandLine", "CommandLine"]).or_else(|| {
-        (invocation.kind == ToolActivityKind::Command).then(|| invocation.title.clone())
-    });
+    let command = string(&["command", "cmd", "commandLine", "CommandLine"])
+        .or_else(|| (kind == NativeToolKind::Command).then(|| invocation.title.clone()));
     if let Some(text) = command.filter(|_| {
-        invocation.kind == ToolActivityKind::Command
+        kind == NativeToolKind::Command
             || matches!(
                 name.as_str(),
                 "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command"
@@ -39,7 +43,6 @@ pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
             "bash" | "powershell" => Some(name.clone()),
             _ => None,
         });
-        invocation.kind = ToolActivityKind::Command;
         invocation.title = text.clone();
         invocation.semantics = ToolSemantics::Command {
             text,
@@ -70,5 +73,6 @@ pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
         }
         invocation.semantics = ToolSemantics::Read { paths, directory };
     }
+    invocation.arguments = InspectableArguments::new(arguments.clone());
     invocation
 }

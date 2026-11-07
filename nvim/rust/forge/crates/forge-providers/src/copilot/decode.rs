@@ -1,6 +1,3 @@
-use forge_provider_api::agent::{
-    AgentExecutionState, AgentId, AgentLifecycleEvent, AgentLifecycleKind,
-};
 use forge_provider_api::change::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
 use forge_provider_api::checklist::{
     ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate,
@@ -24,7 +21,7 @@ pub fn decode_compaction(
             .and_then(Value::as_bool)
             .ok_or_else(|| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?
@@ -37,23 +34,27 @@ pub fn decode_compaction(
     .map(Into::into)
     .map_err(|_error| {
         super::error::native_failure(
-            forge_provider_api::ProviderOperation::InputSubmit,
+            forge_provider_api::ProviderOperation::TurnStart,
             forge_provider_api::ProviderFailureKind::Protocol,
         )
     })?;
-    if succeeded && result.diagnostic.is_some() {
+    if succeeded && result.error.is_some() {
         return Err(super::error::native_failure(
-            forge_provider_api::ProviderOperation::InputSubmit,
+            forge_provider_api::ProviderOperation::TurnStart,
             forge_provider_api::ProviderFailureKind::Protocol,
         ));
     }
-    if complete && !succeeded && result.diagnostic.is_none() {
-        result.diagnostic = Some(forge_provider_api::ProviderDiagnostic {
-            kind: forge_provider_api::ProviderFailureKind::Unknown,
-            message: forge_provider_api::SanitizedMessage::new("Provider compaction failed")
-                .expect("static diagnostic is nonempty"),
-            fatal: false,
-        });
+    if complete && !succeeded && result.error.is_none() {
+        result.error = Some(
+            forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::ThreadCompact,
+                forge_provider_api::ProviderFailureKind::Unknown,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+        );
     }
     if !complete {
         let mut context = CompactionContext {
@@ -175,32 +176,6 @@ pub fn checklist_update(data: &Value, scope_id: String) -> Option<ProviderCheckl
                 .all(|entry| entry.status == ChecklistStatus::Completed),
         replace_entries: true,
         entry_list,
-    })
-}
-
-pub fn agent_lifecycle(event: &SessionEvent) -> Option<AgentLifecycleEvent> {
-    let agent_id = event
-        .agent_id
-        .clone()
-        .or_else(|| string_field(&event.data, &["agentId", "toolCallId"]))
-        .and_then(|id| AgentId::new(id).ok())?;
-    let (kind, state) = match event.event_type.as_str() {
-        "subagent.started" => (AgentLifecycleKind::Started, AgentExecutionState::Starting),
-        "subagent.completed" => (AgentLifecycleKind::Finished, AgentExecutionState::Completed),
-        "subagent.failed" => (AgentLifecycleKind::Finished, AgentExecutionState::Failed),
-        _ => return None,
-    };
-    Some(AgentLifecycleEvent {
-        agent_id,
-        parent_agent_id: string_field(&event.data, &["parentAgentId"])
-            .and_then(|id| AgentId::new(id).ok()),
-        conversation_id: string_field(&event.data, &["sessionId", "conversationId"])
-            .and_then(|id| forge_provider_api::ProviderSessionId::try_from(id).ok()),
-        kind,
-        definition: string_field(&event.data, &["agentName"]),
-        nickname: string_field(&event.data, &["agentDisplayName", "displayName"]),
-        task: string_field(&event.data, &["task", "prompt", "agentDescription"]),
-        state,
     })
 }
 

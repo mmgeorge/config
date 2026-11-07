@@ -10,7 +10,7 @@ pub(super) fn definition() -> ControlToolDefinition {
         name: NAME,
         description: "Discover saved check definitions before choosing or editing a check. Call with no arguments. Get \
                 check_id, label, category, enablement, automatic selection, declared inputs with descriptions, \
-                configuration revision, and live automatic-check policy, without history, logs, or previews. Use \
+                configuration revision, live automatic-check policy, and whether check editing is currently enabled, without history, logs, or previews. Use \
                 check_definition_details with a listed check_id for the full definition, check_run to execute it, \
                 or check_definition_edit to publish changes. Use check_list instead to find running jobs.",
         input_schema: strict_object_input_schema(vec![], &[]),

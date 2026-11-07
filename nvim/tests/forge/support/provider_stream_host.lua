@@ -54,6 +54,26 @@ end
 local controller = require("forge.views.harness.controller")
 local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
 
+-- Queue one provider stream whose final assistant prose is commentary. Reasoning and commentary
+-- interleave with host tool calls, then the stream publishes the synthetic response that an
+-- adapter such as Copilot derives from that final commentary. The adapter's fallback has its own
+-- Rust coverage; this host checks that Harness retains both texts through rendering and reopen.
+local function script_stream()
+  local completed, failure
+  client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = {
+    operation = "script", script = { terminal = "completed", steps = {
+      { kind = "message", content = { reasoning = "summary" }, text = "Checking caller relationships" },
+      { kind = "message", content = "commentary", text = "Inspecting callers" },
+      { kind = "tool_call", name = "check_definition_list", arguments = vim.empty_dict() },
+      { kind = "tool_call", name = "check_definition_list", arguments = vim.empty_dict() },
+      { kind = "message", content = "commentary", text = "Checked all callers" },
+      { kind = "message", content = "response", text = "Checked all callers" },
+    } },
+  } }, function(_, request_failure) completed, failure = true, request_failure end)
+  assert(vim.wait(10000, function() return completed end, 10), "provider stream script was not queued")
+  assert(not failure, failure)
+end
+
 ---@param predicate fun(): boolean
 ---@param reason string
 local function await(predicate, reason)
@@ -156,16 +176,12 @@ end
 
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({
-    harness = {
-      provider = "mock",
-      providers = { mock = { command = { "provider-stream" }, selectable = true } },
-    },
-  })
+  require("forge").setup({ harness = { provider = "mock" } })
   require("forge").open_harness()
   await(function()
     return state.ready and state.session and state.presentation and state.presentation.ready
   end, "provider-stream Harness did not open")
+  script_stream()
   local hold = mock.hold(state.session.id, "chat")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Inspect callers" })
   controller.submit()
@@ -176,7 +192,7 @@ local success, failure = xpcall(function()
   local viewport = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
   hold:release()
   await(function()
-    return not state.busy and response_count() == 1 and settled_activity_count() == 1
+    return not require("forge.views.harness.activity").busy(state) and response_count() == 1 and settled_activity_count() == 1
       and not state.presentation.applying and state.status and state.status.kind == "idle"
   end, "provider stream did not settle")
   vim.cmd("redraw!")
@@ -185,10 +201,11 @@ local success, failure = xpcall(function()
   assert(refreshed.topline == viewport.topline, "status refresh moved the viewport")
   expand_activity()
   assert_content(1)
+  script_stream()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Inspect another invocation" })
   controller.submit()
   await(function()
-    return not state.busy and response_count() == 2 and settled_activity_count() == 2
+    return not require("forge.views.harness.activity").busy(state) and response_count() == 2 and settled_activity_count() == 2
       and not state.presentation.applying and state.status and state.status.kind == "idle"
   end, "following provider invocation did not settle")
   expand_activity()

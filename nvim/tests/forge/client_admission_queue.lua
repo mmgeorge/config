@@ -35,7 +35,7 @@ local function start()
   client.host_start(function(_, failure) assert(not failure) ready = true end)
   await(function() return ready end)
   client._client.runtime_ready = true
-  client._client.provider_registry_generation = client.host_get_generation()
+  client._provider_registry_adopt_for_test(true)
 end
 local function ordinary(label, params)
   return client.request({ method = "repository.status.document", params = params or { label = label } }, record(label))
@@ -102,7 +102,7 @@ local succeeded, failure = xpcall(function()
   for index = 1, 252 do ordinary("reentrant-ordinary-" .. index) end
   for index = 1, 4 do control("reentrant-active-" .. index) end
   await(function() return #writes == offset + 256 end)
-  client._client.provider_registry_generation = nil
+  client._provider_registry_adopt_for_test(false)
   for index = 1, 5 do control("reentrant-queued-" .. index) end
   respond(writes[offset + 1])
   respond(writes[offset + 2])
@@ -131,7 +131,8 @@ local succeeded, failure = xpcall(function()
   for index = 1, 252 do ordinary("startup-ordinary-" .. index) end
   for index = 1, 4 do control("startup-active-" .. index) end
   await(function() return #writes == offset + 256 end)
-  client._client.runtime_ready, client._client.provider_registry_generation = false, nil
+  client._client.runtime_ready = false
+  client._provider_registry_adopt_for_test(false)
   control("startup-waiting")
   respond(writes[offset + 1])
   await(function() return #writes == offset + 257 end)

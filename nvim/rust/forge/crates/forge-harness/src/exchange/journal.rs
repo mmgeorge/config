@@ -812,20 +812,32 @@ mod tests {
             let event = forge_provider_api::BoundProviderEvent {
                 binding_id: forge_provider_api::BindingId::new("binding")?,
                 sequence: forge_provider_api::EventSequence::new(41),
-                event: forge_provider_api::ProviderEvent::Diagnostic {
-                    scope: forge_provider_api::EventScope::Binding {
-                        owner: forge_provider_api::ExecutionOwner::root("owner"),
-                    },
-                    diagnostic: forge_provider_api::ProviderDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Transport,
-                        message: forge_provider_api::diagnostic::SanitizedMessage::new(
-                            "private diagnostic content",
-                        )?,
-                        fatal: false,
-                    },
+                event: forge_provider_api::ProviderEvent::Provider {
+                    event: forge_provider_api::ProviderConnectionEvent::Warning(
+                        forge_provider_api::ProviderWarning {
+                            scope: forge_provider_api::WarningScope::Thread {
+                                thread_id: forge_provider_api::ThreadOwner::root("owner")
+                                    .thread_id(),
+                            },
+                            kind: forge_provider_api::ProviderWarningKind::NativeNotice {
+                                category: forge_provider_api::ProviderFailureKind::Transport,
+                            },
+                            message: forge_provider_api::SanitizedMessage::new(
+                                "private diagnostic content",
+                            )?,
+                        },
+                    ),
                 },
             };
-            assert_eq!(journal.append_core(&CoreRecord::provider_event(&event))?, 5);
+            assert_eq!(
+                journal.append_core(&CoreRecord::provider_event(
+                    forge_provider_api::EventScope::Binding {
+                        owner: forge_provider_api::ThreadOwner::root("owner")
+                    },
+                    &event
+                ))?,
+                5
+            );
             assert_eq!(
                 journal.append_core(&CoreRecord::CommandResponded {
                     command: request.id.clone(),
@@ -850,7 +862,7 @@ mod tests {
             assert!(!encoded.contains("private diagnostic content"));
         }
         assert!(matches!(serde_json::from_str::<CoreRecord>(&records[4].1)?,
-            CoreRecord::ProviderEventConsumed { sequence, kind: super::super::core_log::CoreProviderEventKind::Diagnostic, .. }
+            CoreRecord::ProviderEventConsumed { sequence, kind: super::super::core_log::CoreProviderEventKind::Provider, .. }
                 if sequence.get() == 41));
         Ok(())
     }

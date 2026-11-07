@@ -97,7 +97,7 @@ pub fn create(
     let id = &launch.kind;
     resolve(id).map_err(|_| {
         forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::SessionOpen,
+            forge_provider_api::ProviderOperation::ThreadOpen,
             forge_provider_api::ProviderFailureKind::Initialization,
         ))
     })?;

@@ -73,7 +73,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
     let engine = broker
         .execution_registry()
-        .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+        .owner(crate::provider::ThreadOwner::root(&broker.session.id))
         .await?;
     let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
     transaction.scan_enabled = false;
@@ -187,120 +187,80 @@ struct BoundarySteeringProvider {
     continuation_accept: Arc<tokio::sync::Semaphore>,
     continuation_release: Arc<tokio::sync::Semaphore>,
     input: Arc<std::sync::Mutex<Vec<String>>>,
+    steered: Arc<std::sync::Mutex<Vec<forge_provider_api::CoveredInput>>>,
     fail_response: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn task_start_fixture(
-    conflicting_replay: bool,
-) -> Arc<crate::provider::test_support::EventFixtureProvider> {
-    let descriptor = crate::provider::ProviderDescriptor {
-        kind: crate::provider::ProviderId::new("test-task-start").expect("fixture ID is valid"),
-        label: "Normalized task-start fixture".into(),
-        capability: crate::provider::test_support::fixture_capability(),
-    };
-    crate::provider::test_support::EventFixtureProvider::new(
-        descriptor,
-        move |request, sink, _cancelled| async move {
-            let scope = request.scope.clone();
-            let address = crate::provider::TurnAddress {
-                scope: scope.clone(),
-                thread_id: "task-start-thread".into(),
-                turn_id: "task-start-turn".into(),
-            };
-            let completion = forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some(
-                    "task-start-thread"
-                        .to_owned()
-                        .try_into()
-                        .expect("fixture ID is valid"),
-                ),
-                capability: crate::provider::test_support::fixture_capability(),
-                ..Default::default()
-            };
-            sink.send_wait(ProviderEvent::Execution {
-                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                    scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                        address: address.clone(),
-                    },
-                )?,
-            })
-            .await?;
-            sink.send_wait(ProviderEvent::Turn {
-                address: address.clone(),
-                update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-            })
-            .await?;
-            let start = forge_provider_api::input::TaskStart {
-                kind: forge_provider_api::input::TaskKind::Goal,
-                title: "Reduce startup time".into(),
-            };
-            let mut acknowledgement = forge_provider_api::InputAcknowledgement::TaskStarted {
-                input_id: Some("task-entry".into()),
-                start,
-                prompt: "Complete startup work.\nVerify the result.".into(),
-            };
-            sink.send_wait(ProviderEvent::InputAccepted {
-                scope: scope.clone(),
-                acknowledgement: acknowledgement.clone(),
-            })
-            .await?;
-            if conflicting_replay {
-                if let forge_provider_api::InputAcknowledgement::TaskStarted { prompt, .. } =
-                    &mut acknowledgement
-                {
-                    *prompt = "Conflicting instruction".into();
-                }
-                sink.send_wait(ProviderEvent::InputAccepted {
-                    scope: scope.clone(),
-                    acknowledgement,
-                })
-                .await?;
-            }
-            sink.send_wait(ProviderEvent::Turn {
-                address: address.clone(),
-                update: crate::provider::TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 1,
-                },
-            })
-            .await?;
-            sink.send_wait(ProviderEvent::Execution {
-                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                    scope,
-                    forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                        address,
-                        covered_submissions: vec![request.submission_id],
-                        completed_at_ms: 1,
-                        result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                            completion: completion.into(),
-                        },
-                    },
-                )?,
-            })
-            .await?;
-            Ok(())
-        },
-    )
+/// Commit a real accepted journal receipt without routing host acceptance through native events.
+fn accepted_input_receipt(
+    broker: &HarnessBroker,
+    id: &str,
+    text: &str,
+) -> Result<Arc<crate::provider::submission::Submission>> {
+    let catalog = broker.provider_catalog_request()?;
+    let receipt = broker.submission_store.prepare_input(
+        &catalog,
+        ProviderInput::from_text(text),
+        broker.provider.descriptor().kind,
+        Some(id.into()),
+    )?;
+    receipt.sending(None)?;
+    receipt.accepted(None)?;
+    Ok(receipt)
 }
+
+/// Apply task presentation through its host input owner and independently durable receipt.
+async fn apply_task_start_fixture(
+    broker: &mut HarnessBroker,
+    conflicting_replay: bool,
+) -> Result<()> {
+    let (mut exchange, _, _) = broker
+        .test_stage_interaction_for_turn("Inspect startup", true, 1)
+        .await?;
+    broker.store.save_exchange(&exchange)?;
+    let mut runtime = ExchangeRuntime {
+        task_permit: None,
+        checkpoint: None,
+        tool_gate: None,
+        exchange_id: exchange.id.clone(),
+        checklist: ChecklistTracker::default(),
+        retraction_eligibility: super::super::RetractionEligibility::output_free(),
+        active_wait: None,
+    };
+    let receipt = accepted_input_receipt(
+        broker,
+        "task-entry",
+        "Complete startup work.\nVerify the result.",
+    )?;
+    let presentation = crate::provider::session_execution::InputPresentation::TaskStarted {
+        start: forge_provider_api::input::TaskStart {
+            kind: forge_provider_api::input::TaskKind::Goal,
+            title: "Reduce startup time".into(),
+        },
+        prompt: "Complete startup work.\nVerify the result.".into(),
+    };
+    let effect =
+        broker.apply_input_acceptance(&mut runtime, &mut exchange, &receipt, &presentation)?;
+    broker.prepare_provider_delivery(effect)?.deliver().await?;
+    let mut replay = presentation.clone();
+    if conflicting_replay
+        && let crate::provider::session_execution::InputPresentation::TaskStarted { prompt, .. } =
+            &mut replay
+    {
+        *prompt = "Conflicting instruction".into();
+    }
+    let effect = broker.apply_input_acceptance(&mut runtime, &mut exchange, &receipt, &replay)?;
+    broker.prepare_provider_delivery(effect)?.deliver().await?;
+    broker.reconcile_live_interaction(Some(&exchange), None)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn acknowledged_task_start_is_retained_once_inside_its_exchange() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let native = task_start_fixture(false);
-    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-    broker.provider = fixture.provider_handle();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        broker.run_interaction(
-            "Inspect startup".into(),
-            PromptMode::Chat,
-            Some(ExchangeAdmission::chat("Inspect startup".into())),
-        ),
-    )
-    .await
-    .context("task-start fixture did not settle")??;
+    apply_task_start_fixture(&mut broker, false).await?;
     let snapshot = broker.snapshot()?;
     assert_eq!(snapshot.exchange.len(), 1);
     assert_eq!(
@@ -351,12 +311,12 @@ async fn owned_foreground_applies_events_and_rejects_foreign_scope() -> Result<(
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let (exchange, _, _) = broker
+    let (mut exchange, _, _) = broker
         .test_stage_interaction_for_turn("Inspect", true, 1)
         .await?;
     broker.store.save_exchange(&exchange)?;
     let scope = crate::provider::InvocationScope::new(
-        crate::provider::ExecutionOwner::root(&broker.session.id),
+        crate::provider::ThreadOwner::root(&broker.session.id),
         exchange.id.clone(),
     );
     broker.exchange_runtime = Some(ExchangeRuntime {
@@ -365,17 +325,31 @@ async fn owned_foreground_applies_events_and_rejects_foreign_scope() -> Result<(
         tool_gate: None,
         exchange_id: exchange.id.clone(),
         checklist: ChecklistTracker::default(),
-        retraction_eligible: true,
+        retraction_eligibility: super::super::RetractionEligibility::output_free(),
         active_wait: None,
     });
+    exchange.start_turn(crate::provider::test_support::address(&scope), 1)?;
     let mut transaction = broker.begin_owned_foreground(exchange, scope.clone())?;
     assert!(broker.exchange_runtime.is_none());
-    let event = |scope| ProviderEvent::InputAccepted {
-        scope,
-        acknowledgement: crate::provider::InputAcknowledgement::Steering {
-            input_id: Some("input".into()),
-            text: "continue".into(),
-        },
+    let event = |scope: crate::provider::InvocationScope| {
+        crate::provider::test_support::native_event(
+            scope.clone(),
+            ProviderEvent::Item {
+                thread_id: scope.owner.thread_id(),
+                turn_id: scope.turn_id().unwrap(),
+                item_id: forge_provider_api::ItemId::new("foreground-message").unwrap(),
+                event: forge_provider_api::ItemEvent::Started(
+                    forge_provider_api::ItemStart::AgentMessage(
+                        forge_provider_api::AgentMessageStart {
+                            text: "continue".into(),
+                            classification: forge_provider_api::MessageClassification::Known(
+                                forge_provider_api::AgentMessageRole::Response,
+                            ),
+                        },
+                    ),
+                ),
+            },
+        )
     };
     let foreign = crate::provider::InvocationScope::new(scope.owner.clone(), "another-exchange");
     assert!(
@@ -387,9 +361,13 @@ async fn owned_foreground_applies_events_and_rejects_foreign_scope() -> Result<(
     assert!(events.is_empty());
     broker.prepare_provider_delivery(effects)?.deliver().await?;
     let exchange = broker.finish_owned_foreground(&mut transaction)?;
-    assert!(exchange.node_list.iter().any(
-        |node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == "input")
-    ));
+    assert!(
+        exchange
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .any(|message| message.text() == "continue")
+    );
     assert!(broker.exchange_runtime.is_some());
     assert!(broker.finish_owned_foreground(&mut transaction).is_err());
     Ok(())
@@ -418,31 +396,24 @@ async fn task_start_updates_live_presentation_before_the_turn_finishes() -> Resu
         exchange_id: exchange.id.clone(),
 
         checklist: ChecklistTracker::default(),
-        retraction_eligible: true,
+        retraction_eligibility: super::super::RetractionEligibility::output_free(),
         active_wait: None,
     };
-    let task_event = ProviderEvent::InputAccepted {
-        scope: crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root(&broker.session.id),
-            exchange.id.clone(),
-        ),
-        acknowledgement: crate::provider::InputAcknowledgement::TaskStarted {
-            input_id: Some("live-input".into()),
-            start: crate::exchange::TaskStart {
-                kind: crate::task::TaskKind::Goal,
-                title: "Reduce startup time".into(),
-            },
-            prompt: "Complete startup work.\nVerify the result.".into(),
+    let receipt = accepted_input_receipt(
+        &broker,
+        "live-input",
+        "Complete startup work.\nVerify the result.",
+    )?;
+    let presentation = crate::provider::session_execution::InputPresentation::TaskStarted {
+        start: forge_provider_api::input::TaskStart {
+            kind: forge_provider_api::input::TaskKind::Goal,
+            title: "Reduce startup time".into(),
         },
+        prompt: "Complete startup work.\nVerify the result.".into(),
     };
-    broker
-        .test_apply_provider_event(
-            &mut runtime,
-            &mut exchange,
-            task_event.clone(),
-            &mut notifications,
-        )
-        .await?;
+    let effect =
+        broker.apply_input_acceptance(&mut runtime, &mut exchange, &receipt, &presentation)?;
+    notifications.extend(broker.prepare_provider_delivery(effect)?.deliver().await?);
     let assert_visible = |broker: &HarnessBroker| -> Result<()> {
         let snapshot = broker.presentation.lock().unwrap().snapshot(&document)?;
         let text = snapshot
@@ -460,9 +431,9 @@ async fn task_start_updates_live_presentation_before_the_turn_finishes() -> Resu
         Ok(())
     };
     assert_visible(&broker)?;
-    broker
-        .test_apply_provider_event(&mut runtime, &mut exchange, task_event, &mut notifications)
-        .await?;
+    let effect =
+        broker.apply_input_acceptance(&mut runtime, &mut exchange, &receipt, &presentation)?;
+    notifications.extend(broker.prepare_provider_delivery(effect)?.deliver().await?);
     broker.reconcile_live_interaction(Some(&exchange), None)?;
     assert_visible(&broker)?;
     assert_eq!(exchange.state(), ExchangeState::Running);
@@ -483,19 +454,7 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let native = task_start_fixture(true);
-    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-    broker.provider = fixture.provider_handle();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        broker.run_interaction(
-            "Inspect startup".into(),
-            PromptMode::Chat,
-            Some(ExchangeAdmission::chat("Inspect startup".into())),
-        ),
-    )
-    .await
-    .context("conflicting task-start fixture did not settle")?;
+    let result = apply_task_start_fixture(&mut broker, true).await;
     assert!(
         format!("{:#}", result.unwrap_err())
             .contains("task entry identity was reused for different content")
@@ -524,6 +483,7 @@ impl BoundarySteeringProvider {
             continuation_accept: Arc::new(tokio::sync::Semaphore::new(0)),
             continuation_release: Arc::new(tokio::sync::Semaphore::new(0)),
             input: Default::default(),
+            steered: Default::default(),
             fail_response: Default::default(),
         }
     }
@@ -552,18 +512,22 @@ impl BoundarySteeringProvider {
         let initial_release = self.initial_release.clone();
         let continuation_release = self.continuation_release.clone();
         let input = self.input.clone();
+        let steered = self.steered.clone();
         let fail_response = self.fail_response.clone();
         let native_steer = capability.native_steer;
         let provider = crate::provider::test_support::EventFixtureProvider::new(
             descriptor,
-            move |request, sink, _cancelled| {
+            move |request, sink, start, mut cancellation| {
                 let initial_started = initial_started.clone();
                 let initial_release = initial_release.clone();
                 let continuation_release = continuation_release.clone();
                 let input = input.clone();
+                let steered = steered.clone();
                 let fail_response = fail_response.clone();
-                let capability = capability.clone();
+
                 async move {
+                    start.observed(0).await?;
+
                     let text = match &request.input {
                         forge_provider_api::PromptInput::Text(text) => text.clone(),
                         forge_provider_api::PromptInput::Skill { name, arguments } => {
@@ -576,109 +540,73 @@ impl BoundarySteeringProvider {
                     input.lock().unwrap().push(text.clone());
                     let continuation = text == "boundary correction";
                     let address = crate::provider::TurnAddress {
+                        thread_id: (request.scope.clone()).owner.thread_id(),
+                        turn_id: (request.scope.clone()).turn_id().unwrap(),
                         scope: request.scope.clone(),
-                        thread_id: "boundary-thread".into(),
-                        turn_id: if continuation {
-                            "continuation-turn"
-                        } else {
-                            "initial-turn"
-                        }
-                        .into(),
                     };
-                    sink.send_wait(ProviderEvent::SessionIdentity {
-                        scope: request.scope.clone().into(),
-                        provider_session_id: "boundary-history"
-                            .to_owned()
-                            .try_into()
-                            .expect("fixture history is nonempty"),
-                    })
+                    sink.send_wait(crate::provider::test_support::activity(
+                        ProviderEvent::Thread {
+                            thread_id: (request.scope.clone()).owner.thread_id(),
+                            event: forge_provider_api::ThreadEvent::IdentityResolved(
+                                "boundary-history"
+                                    .to_owned()
+                                    .try_into()
+                                    .expect("fixture history is nonempty"),
+                            ),
+                        },
+                    )?)
                     .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            request.scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-                    })
-                    .await?;
-                    if continuation {
-                        crate::provider::test_support::wait_gate(&continuation_release).await?;
+
+                    let release = if continuation {
+                        &continuation_release
                     } else {
                         initial_started.add_permits(1);
-                        crate::provider::test_support::wait_gate(&initial_release).await?;
-                    }
-                    let cancelled =
-                        fail_response.load(Ordering::Acquire) && (continuation || !native_steer);
-                    let (outcome, result) = if cancelled {
-                        (
-                            crate::turn::TurnOutcome::Cancelled,
-                            forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                                completion: forge_provider_api::completion::ProviderCompletion {
-                                    provider_session_id: Some(
-                                        "boundary-history"
-                                            .to_owned()
-                                            .try_into()
-                                            .expect("fixture ID is valid"),
-                                    ),
-                                    capability: capability.clone(),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            },
-                        )
+                        &initial_release
+                    };
+                    let interrupted = if *cancellation.borrow() {
+                        true
+                    } else {
+                        tokio::select! {
+                            released = crate::provider::test_support::wait_gate(release) => {
+                                released?;
+                                false
+                            }
+                            _ = cancellation.changed() => true,
+                        }
+                    };
+                    let cancelled = interrupted
+                        || (fail_response.load(Ordering::Acquire)
+                            && (continuation || !native_steer));
+                    let outcome = if cancelled {
+                        crate::turn::TurnOutcome::Interrupted
                     } else {
                         for event in completed_message(
                             &address,
                             "handled-response",
-                            crate::provider::MessageRole::Response,
+                            crate::provider::TestMessageContent::Response,
                             format!("handled {text}"),
                         ) {
-                            sink.send_wait(event).await?;
+                            sink.send_wait(crate::provider::test_support::activity(event)?)
+                                .await?;
                         }
-                        (
-                            crate::turn::TurnOutcome::Completed,
-                            forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                completion: forge_provider_api::completion::ProviderCompletion {
-                                    provider_session_id: Some(
-                                        "boundary-history"
-                                            .to_owned()
-                                            .try_into()
-                                            .expect("fixture ID is valid"),
-                                    ),
-                                    capability: capability.clone(),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            },
-                        )
+                        crate::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        }
                     };
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome,
-                            completed_at_ms: 1,
-                        },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            request.scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 1,
-                                result,
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                    let native_outcome = outcome;
+                    let native_completed_at_ms = 1;
+
+                    let mut coverage = request.input_coverage();
+                    coverage.extend(steered.lock().unwrap().iter().cloned());
+                    Ok(forge_provider_api::TurnResult::new(
+                        native_outcome,
+                        native_completed_at_ms,
+                        None,
+                        coverage,
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"))
                 }
             },
         );
@@ -751,13 +679,9 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     tokio::pin!(pending);
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
     provider.initial_release.add_permits(1);
-    let (broker, result) =
+    let (_broker, result) =
         tokio::time::timeout(std::time::Duration::from_secs(5), running).await??;
     assert!(result.is_err());
-    assert!(
-        !broker.retained_foregrounds.is_empty(),
-        "the regression requires retained foreground ownership"
-    );
     let rejected = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
         .await?
         .unwrap_err();
@@ -908,7 +832,13 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         assert!(futures_util::poll!(steering.as_mut()).is_pending());
         await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
         provider.initial_release.add_permits(1);
-        await_boundary_barrier(&provider.continuation_started, "continuation preparation").await?;
+        tokio::select! {
+            prepared = await_boundary_barrier(&provider.continuation_started, "continuation preparation") => prepared?,
+            finished = &mut running => {
+                let (_, result) = finished?;
+                anyhow::bail!("foreground ended before continuation preparation: {result:?}");
+            }
+        }
         assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Prepared));
         assert!(futures_util::poll!(steering.as_mut()).is_pending(),
             "a continuation was acknowledged while its journal still allowed requeueing");
@@ -946,12 +876,23 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     });
     let started = provider.steering_started.clone();
     let release = provider.steering_release.clone();
-    let native = provider.inner.fixture().with_steering(move |_request| {
+    let steered = provider.inner.steered.clone();
+    let native = provider.inner.fixture().with_steering(move |request| {
         let started = started.clone();
         let release = release.clone();
+        let steered = steered.clone();
         async move {
             started.add_permits(1);
             crate::provider::test_support::wait_gate(&release).await?;
+            if let Some(receipt) = request.delivery.receipt() {
+                steered
+                    .lock()
+                    .unwrap()
+                    .push(forge_provider_api::CoveredInput::new(
+                        receipt.id().clone(),
+                        receipt.attempt_id()?,
+                    ));
+            }
             Ok(())
         }
     });

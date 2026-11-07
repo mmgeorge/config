@@ -18,11 +18,12 @@ function SessionPreview.open(transcript_win, status_view)
   vim.bo[preview_buf].swapfile = false
   vim.bo[preview_buf].filetype = "ForgeHarness"
   vim.bo[preview_buf].modifiable = false
+  layout.configure_transcript_buffer(preview_buf)
   require("forge.views.harness.workspace").set_buffer(transcript_win, preview_buf)
   vim.wo[transcript_win].wrap = true
   vim.wo[transcript_win].linebreak = true
-  vim.wo[transcript_win].breakindent = true
-  vim.wo[transcript_win].breakindentopt = "shift:0"
+  vim.wo[transcript_win].breakindent = layout.transcript_wrapping.indent
+  vim.wo[transcript_win].breakindentopt = layout.transcript_wrapping.options
   vim.wo[transcript_win].foldmethod = "manual"
   vim.wo[transcript_win].foldenable = false
   layout.configure_gutterless_window(transcript_win)

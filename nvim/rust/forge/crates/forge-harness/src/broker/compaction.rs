@@ -11,6 +11,7 @@ pub(crate) enum CompactionProvenance {
 #[derive(Clone)]
 pub(crate) struct OwnedCompaction {
     provenance: CompactionProvenance,
+    provider_session_id: forge_provider_api::ProviderSessionId,
     task: Option<crate::task::TaskPermit>,
     observer: Arc<crate::provider::session_execution::SessionObservationInbox>,
     compaction: crate::provider::Compaction,
@@ -37,13 +38,13 @@ impl CompactionJob {
 
     pub(crate) async fn run(self) -> CompactionResult {
         use futures_util::FutureExt;
-        let output = std::panic::AssertUnwindSafe(self.provider.session_compact(self.request))
+        let output = std::panic::AssertUnwindSafe(self.provider.thread_compact(self.request))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| {
                 Err(crate::provider::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::SessionCompact,
+                        forge_provider_api::ProviderOperation::ThreadCompact,
                         forge_provider_api::ProviderFailureKind::Runtime,
                     )
                     .at_phase(
@@ -65,27 +66,63 @@ impl HarnessBroker {
         &mut self,
         id: &crate::exchange::command::ContextCompactionId,
     ) -> Result<PendingProviderDelivery> {
-        let mut record = self.store.list_session_event(&self.session.id)?.into_iter().find(|record| {
-            matches!(&record.detail, SessionEventKind::Compaction { compaction } if compaction.id == id.as_str())
-        }).context("retained compaction attempt is missing")?;
-        let SessionEventKind::Compaction { compaction } = &mut record.detail else {
-            unreachable!()
-        };
-        if compaction.state == crate::provider::CompactionState::Running {
+        self.compaction_observation_lost(id.as_str())
+    }
+
+    /// Persist observation loss for the original automatic native compaction identity.
+    pub(crate) fn observed_compaction_observation_lost(
+        &mut self,
+        id: &str,
+    ) -> Result<PendingProviderDelivery> {
+        self.compaction_observation_lost(id)
+    }
+
+    /// Retain uncertain host observation without fabricating a native compaction update.
+    fn compaction_observation_lost(&mut self, id: &str) -> Result<PendingProviderDelivery> {
+        anyhow::ensure!(
+            self.store.list_session_event(&self.session.id)?.iter().any(|record| {
+                matches!(&record.detail, SessionEventKind::Compaction { compaction } if compaction.id == id)
+            }),
+            "retained compaction attempt is missing"
+        );
+        self.settle_running_root_compactions()?;
+        let patch = self.reconcile_timeline()?;
+        self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))
+    }
+
+    /// Mark every root-thread compaction still Running as Unconfirmed once an attempt ends
+    /// without completion evidence.
+    ///
+    /// Native progress can reach the timeline under an identity other than the host attempt,
+    /// and `SessionPhase::Compacting` follows any Running record, so settling only the host
+    /// attempt would leave the status counting indefinitely.
+    fn settle_running_root_compactions(&mut self) -> Result<()> {
+        let root_thread = crate::provider::ThreadOwner::root(&self.session.id).thread_id();
+        let now_ms = self.clock.now_ms();
+        for mut record in self.store.list_session_event(&self.session.id)? {
+            let SessionEventKind::Compaction { compaction } = &mut record.detail else {
+                continue;
+            };
+            if compaction.state != crate::provider::CompactionState::Running
+                || compaction.thread_id != root_thread.as_str()
+            {
+                continue;
+            }
             compaction.state = crate::provider::CompactionState::Unconfirmed;
-            compaction.completed_at_ms = Some(self.clock.now_ms());
-            compaction.result.diagnostic = Some(crate::provider::ProviderDiagnostic {
-                kind: forge_provider_api::ProviderFailureKind::Transport,
-                message: forge_provider_api::SanitizedMessage::new(
-                    "compaction worker observation was lost".to_owned(),
+            compaction.completed_at_ms = Some(now_ms);
+            compaction.result.error.get_or_insert_with(|| {
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::ThreadCompact,
+                    forge_provider_api::ProviderFailureKind::Transport,
                 )
-                .expect("host diagnostic is nonempty"),
-                fatal: false,
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                )
             });
             self.store.save_session_event(&record)?;
         }
-        let patch = self.reconcile_timeline()?;
-        self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))
+        Ok(())
     }
 
     /// Validate native compaction prerequisites before interrupting current exchange work.
@@ -116,7 +153,7 @@ impl HarnessBroker {
         policy.validate(self.session.context_usage.as_ref())?;
         if self.store.list_session_event(&self.session.id)?.iter().any(|event| matches!(&event.detail,
             SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Running
-                && Some(&compaction.thread_id) == self.session.provider_session_id.as_ref())) { return Ok(None); }
+                && compaction.thread_id == crate::provider::ThreadOwner::root(&self.session.id).thread_id().as_str())) { return Ok(None); }
         if !policy.due(
             self.session.context_usage.as_ref(),
             self.capability.native_compact,
@@ -155,11 +192,15 @@ impl HarnessBroker {
             self.capability.native_compact,
             "current provider does not support context compaction"
         );
-        let thread_id = self
+        let provider_session_id: forge_provider_api::ProviderSessionId = self
             .session
             .provider_session_id
             .clone()
-            .context("current session has no provider conversation to compact")?;
+            .context("current session has no provider conversation to compact")?
+            .try_into()?;
+        let thread_id = crate::provider::ThreadOwner::root(&self.session.id)
+            .thread_id()
+            .to_string();
         let now = self.clock.now_ms();
         let compaction = crate::provider::Compaction {
             id: Uuid::new_v4().to_string(),
@@ -202,6 +243,7 @@ impl HarnessBroker {
         let task = self.task_controller.current()?.map(|task| task.permit());
         let mut state = OwnedCompaction {
             provenance,
+            provider_session_id,
             task,
             observer: self.observer.session_events(),
             compaction,
@@ -211,27 +253,27 @@ impl HarnessBroker {
             let patch = self.reconcile_timeline()?;
             self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))
         })();
-        let delivery =
-            match delivery {
-                Ok(delivery) => delivery,
-                Err(error) => {
-                    state.compaction.state = crate::provider::CompactionState::Failed;
-                    state.compaction.completed_at_ms = Some(self.clock.now_ms());
-                    state.compaction.result.diagnostic =
-                        Some(crate::provider::lifecycle_error::diagnostic(
-                            forge_provider_api::ProviderOperation::InputSubmit,
-                            error.as_ref(),
-                        ));
-                    state.record.detail = SessionEventKind::Compaction {
-                        compaction: state.compaction.into(),
-                    };
-                    return match self.store.save_session_event(&state.record) {
-                        Ok(()) => Err(error),
-                        Err(persistence) => Err(error
-                            .context(format!("record failed compaction start: {persistence:#}"))),
-                    };
-                }
-            };
+        let delivery = match delivery {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                state.compaction.state = crate::provider::CompactionState::Failed;
+                state.compaction.completed_at_ms = Some(self.clock.now_ms());
+                state.compaction.result.error = Some(crate::provider::lifecycle_error::diagnostic(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    error.as_ref(),
+                ));
+                state.record.detail = SessionEventKind::Compaction {
+                    compaction: state.compaction.into(),
+                };
+                return match self.store.save_session_event(&state.record) {
+                    Ok(()) => Err(error),
+                    Err(persistence) => {
+                        Err(error
+                            .context(format!("record failed compaction start: {persistence:#}")))
+                    }
+                };
+            }
+        };
         Ok((
             CompactionJob {
                 provider: self.provider.clone(),
@@ -257,15 +299,15 @@ impl HarnessBroker {
             Ok(evidence) => evidence,
             Err(error) => {
                 state.compaction.state = crate::provider::CompactionState::Failed;
-                state.compaction.result.diagnostic =
-                    Some(crate::provider::lifecycle_error::diagnostic(
-                        forge_provider_api::ProviderOperation::SessionCompact,
-                        &error,
-                    ));
+                state.compaction.result.error = Some(crate::provider::lifecycle_error::diagnostic(
+                    forge_provider_api::ProviderOperation::ThreadCompact,
+                    &error,
+                ));
                 state.record.detail = SessionEventKind::Compaction {
                     compaction: state.compaction.into(),
                 };
                 self.store.save_session_event(&state.record)?;
+                self.settle_running_root_compactions()?;
                 let patch = self.reconcile_timeline()?;
                 return Ok((
                     self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
@@ -284,7 +326,7 @@ impl HarnessBroker {
             anyhow::ensure!(
                 Arc::ptr_eq(&state.observer, &self.observer.session_events())
                     && self.session.provider_session_id.as_deref()
-                        == Some(state.compaction.thread_id.as_str()),
+                        == Some(state.provider_session_id.as_str()),
                 "provider generation changed during compaction"
             );
             if let CompactionProvenance::Automatic { turn_id } = &state.provenance {
@@ -305,6 +347,7 @@ impl HarnessBroker {
             .map(|error| error.context(CompactionEvidenceError::AuthorityChanged))
             .or_else(|| settlement.err().map(anyhow::Error::from));
         if let Some(error) = failure {
+            self.settle_running_root_compactions()?;
             let patch = self.reconcile_timeline()?;
             return Ok((
                 self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
@@ -365,10 +408,13 @@ pub(super) fn apply_compaction_evidence(
                 Some(CompactionEvidenceError::Unconfirmed)
             }
             crate::provider::CompactionState::Failed => Some(CompactionEvidenceError::Failed {
-                kind: target.result.diagnostic.as_ref().map_or(
-                    forge_provider_api::ProviderFailureKind::Unknown,
-                    |diagnostic| diagnostic.kind,
-                ),
+                kind: target
+                    .result
+                    .error
+                    .as_ref()
+                    .map_or(forge_provider_api::ProviderFailureKind::Unknown, |error| {
+                        error.kind()
+                    }),
             }),
         }
     };
@@ -393,13 +439,11 @@ pub(super) fn apply_compaction_evidence(
             }
             CompactionEvidenceError::Failed { kind } => kind,
         };
-        if target.result.diagnostic.is_none() {
-            target.result.diagnostic = Some(crate::provider::ProviderDiagnostic {
+        if target.result.error.is_none() {
+            target.result.error = Some(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::ThreadCompact,
                 kind,
-                message: forge_provider_api::SanitizedMessage::new(error.to_string())
-                    .expect("host compaction diagnostics are nonempty"),
-                fatal: false,
-            });
+            ));
         }
         return Err(error);
     }
@@ -486,6 +530,54 @@ mod tests {
         );
         assert_eq!(broker.session.context_usage.as_ref().unwrap().used, 100);
         assert_eq!(serde_json::to_value(&broker.capability)?, capability);
+        Ok(())
+    }
+
+    /// A failed attempt settles every running root-thread record, including native progress
+    /// recorded under another identity, so the Compacting status cannot outlive the attempt.
+    #[tokio::test]
+    async fn failed_compaction_settles_every_running_root_record() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.capability.native_compact = true;
+        broker.session.native_compact = true;
+        broker.session.provider_session_id = Some("context-conversation".into());
+        let running_root_count = |broker: &HarnessBroker| -> Result<usize> {
+            Ok(broker
+                .store
+                .list_session_event(&broker.session.id)?
+                .iter()
+                .filter(|record| {
+                    matches!(&record.detail, SessionEventKind::Compaction { compaction }
+                    if compaction.state == crate::provider::CompactionState::Running)
+                })
+                .count())
+        };
+        for lost in [false, true] {
+            let (job, _started) = broker.prepare_owned_compaction(CompactionProvenance::Manual)?;
+            let mut native = job.state.compaction.clone();
+            native.id = format!("native-item-{lost}");
+            broker.retain_external_compaction(native, 1)?;
+            assert_eq!(running_root_count(&broker)?, 2);
+            if lost {
+                let id = job.id().to_owned();
+                broker.observed_compaction_observation_lost(&id)?;
+            } else {
+                let (_terminal, failure, _) = broker.commit_owned_compaction(CompactionResult {
+                    state: job.state,
+                    output: Err(crate::provider::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::ThreadCompact,
+                            forge_provider_api::ProviderFailureKind::Transport,
+                        ),
+                    )),
+                })?;
+                assert!(failure.is_some());
+            }
+            assert_eq!(running_root_count(&broker)?, 0, "lost observation: {lost}");
+        }
         Ok(())
     }
 }

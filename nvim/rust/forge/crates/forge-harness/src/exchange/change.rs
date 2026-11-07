@@ -11,6 +11,14 @@ pub struct ProviderChangeIndex {
 impl ProviderChangeIndex {
     /// Merge successful provider file changes from one interaction timeline.
     pub fn record(&mut self, interaction: &Exchange) {
+        for effect in &interaction.host_file_changes {
+            for change in &effect.changes.file {
+                self.path_set.insert(normalize_path(&change.path));
+                if let Some(path) = &change.move_path {
+                    self.path_set.insert(normalize_path(path));
+                }
+            }
+        }
         for turn in &interaction.turn {
             for tool in interaction.tools_for_turn(turn.id()) {
                 self.record_tool_list(std::slice::from_ref(tool));
@@ -64,9 +72,23 @@ impl ProviderDiffBuilder {
         builder.finish()
     }
 
+    /// Render actual committed host operations separately from native tool snapshots.
+    pub(crate) fn build_changes(changes: &crate::provider::ProviderChangeSet) -> Option<String> {
+        let mut builder = Self::default();
+        for change in &changes.file {
+            merge_change(&mut builder.projection, change);
+        }
+        builder.finish()
+    }
+
     /// Include successful edits from each provider turn in an exchange.
     pub fn record(&mut self, exchange: &Exchange) {
         self.record_tools(exchange.tools().map(|(_, tool)| tool));
+        for effect in &exchange.host_file_changes {
+            for change in &effect.changes.file {
+                merge_change(&mut self.projection, change);
+            }
+        }
     }
 
     fn record_tools<'tool>(&mut self, tool_list: impl Iterator<Item = &'tool ToolCall>) {
@@ -228,21 +250,20 @@ mod test {
     use super::{ProviderChangeIndex, ProviderDiffBuilder};
     use crate::exchange::ToolCall;
     use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
+    use crate::turn::ToolState;
 
-    fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> ToolCall {
-        ToolCall {
-            command_shell: None,
-            started_at_ms: None,
-            completed_at_ms: None,
-            checklist_item_id: None,
-            id: id.into(),
-            kind: "file_change".into(),
-            title: "file changes".into(),
-            output: Default::default(),
-            status: status.into(),
-            failed: status != "completed",
-            change: ProviderChangeSet { file },
-        }
+    /// Build file-change evidence under an explicit typed terminal state.
+    fn file_tool(id: &str, state: ToolState, file: Vec<ProviderFileChange>) -> ToolCall {
+        let mut tool = ToolCall::projection(
+            id.into(),
+            "file_change".into(),
+            "file changes".into(),
+            state,
+            None,
+            None,
+        );
+        tool.change = ProviderChangeSet { file };
+        tool
     }
 
     #[test]
@@ -250,7 +271,7 @@ mod test {
         let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
         let tool = file_tool(
             "move",
-            "completed",
+            ToolState::Completed,
             vec![ProviderFileChange {
                 path: "src/original.rs".into(),
                 move_path: Some("src/moved.rs".into()),
@@ -269,7 +290,7 @@ mod test {
         let tool_list = vec![
             file_tool(
                 "one",
-                "completed",
+                ToolState::Completed,
                 vec![ProviderFileChange {
                     path: "src/main.rs".into(),
                     move_path: None,
@@ -279,7 +300,7 @@ mod test {
             ),
             file_tool(
                 "two",
-                "completed",
+                ToolState::Completed,
                 vec![ProviderFileChange {
                     path: "src/main.rs".into(),
                     move_path: None,
@@ -300,7 +321,7 @@ mod test {
     fn excludes_failed_and_non_file_tools() {
         let failed = file_tool(
             "failed",
-            "failed",
+            ToolState::Failed,
             vec![ProviderFileChange {
                 path: "failed.rs".into(),
                 move_path: None,
@@ -308,19 +329,14 @@ mod test {
                 diff: "@@ -0,0 +1 @@\n+failed".into(),
             }],
         );
-        let command = ToolCall {
-            command_shell: None,
-            started_at_ms: None,
-            completed_at_ms: None,
-            checklist_item_id: None,
-            id: "command".into(),
-            kind: "command".into(),
-            title: "cargo fmt".into(),
-            output: Default::default(),
-            status: "completed".into(),
-            failed: false,
-            change: ProviderChangeSet::default(),
-        };
+        let command = ToolCall::projection(
+            "command".into(),
+            "command".into(),
+            "cargo fmt".into(),
+            ToolState::Completed,
+            None,
+            None,
+        );
 
         assert!(ProviderDiffBuilder::build(&[failed, command]).is_none());
     }
@@ -329,7 +345,7 @@ mod test {
     fn indexes_successful_provider_paths_and_move_destinations() {
         let completed = file_tool(
             "completed",
-            "completed",
+            ToolState::Completed,
             vec![
                 ProviderFileChange {
                     path: "a/src\\main.rs".into(),
@@ -347,7 +363,7 @@ mod test {
         );
         let failed = file_tool(
             "failed",
-            "failed",
+            ToolState::Failed,
             vec![ProviderFileChange {
                 path: "failed.rs".into(),
                 move_path: None,
@@ -400,7 +416,7 @@ mod test {
         ] {
             tools.push(file_tool(
                 id,
-                "completed",
+                ToolState::Completed,
                 vec![ProviderFileChange {
                     path: path.into(),
                     move_path: move_path.map(str::to_owned),
@@ -413,7 +429,7 @@ mod test {
 
         tools.push(file_tool(
             "persist",
-            "completed",
+            ToolState::Completed,
             vec![ProviderFileChange {
                 path: "existing.lua".into(),
                 move_path: None,
@@ -429,7 +445,7 @@ mod test {
 
         tools.push(file_tool(
             "recreate",
-            "completed",
+            ToolState::Completed,
             vec![ProviderFileChange {
                 path: "temporary.lua".into(),
                 move_path: None,
@@ -449,7 +465,7 @@ mod test {
     fn preserves_file_order_and_operation_headers() {
         let tool = file_tool(
             "changes",
-            "completed",
+            ToolState::Completed,
             vec![
                 ProviderFileChange {
                     path: "src/new.rs".into(),
@@ -481,5 +497,66 @@ mod test {
         assert!(diff.contains("--- /dev/null\n+++ b/src/new.rs"));
         assert!(diff.contains("@@ -0,0 +1,1 @@\n+new"));
         assert!(diff.contains("--- a/src/old.rs\n+++ /dev/null"));
+    }
+}
+
+#[cfg(test)]
+mod host_effect_tests {
+    use super::*;
+    use crate::provider::{InvocationScope, ThreadOwner};
+    use crate::tools::lsp::HostFileChange;
+    use forge_provider_api::control::ToolCallId;
+    use serde_json::json;
+
+    #[test]
+    fn committed_host_changes_keep_original_identity_and_survive_reload_without_native_items()
+    -> anyhow::Result<()> {
+        let scope = InvocationScope {
+            owner: ThreadOwner::root("session"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        };
+        let mut exchange: Exchange = serde_json::from_value(
+            json!({"id":"exchange","session_id":"session","agent_id":scope.owner.agent_id(),"ordinal":1,"prompt":"Rename","state":"running","created_at_ms":0,"attributed_matches_checkpoint":false,"node_list":[]}),
+        )?;
+        let effect = HostFileChange {
+            scope: scope.clone(),
+            call_id: ToolCallId::new("rename-call")?,
+            native_item_id: None,
+            changes: crate::provider::ProviderChangeSet {
+                file: vec![ProviderFileChange {
+                    path: "renamed.rs".into(),
+                    move_path: None,
+                    kind: ProviderChangeKind::Update,
+                    diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                }],
+            },
+        };
+        assert!(exchange.record_host_file_change(&effect)?);
+        assert!(!exchange.record_host_file_change(&effect)?);
+        assert!(exchange.turn.is_empty());
+        assert_eq!(exchange.tools().count(), 0);
+        let before = serde_json::to_value(&exchange)?;
+        let mut conflict = effect.clone();
+        conflict.changes.file[0].diff.push_str("different");
+        assert!(exchange.record_host_file_change(&conflict).is_err());
+        let mut foreign = effect.clone();
+        foreign.scope.invocation_id = "other".into();
+        foreign.scope.exchange_id = "other-exchange".into();
+        assert!(exchange.record_host_file_change(&foreign).is_err());
+        let mut fabricated = effect.clone();
+        fabricated.native_item_id = Some(forge_provider_api::ItemId::new("unobserved")?);
+        assert!(exchange.record_host_file_change(&fabricated).is_err());
+        assert_eq!(serde_json::to_value(&exchange)?, before);
+        let restored: Exchange = serde_json::from_value(before)?;
+        assert_eq!(restored.host_file_changes, vec![effect]);
+        let mut index = ProviderChangeIndex::default();
+        index.record(&restored);
+        assert!(index.paths().contains("renamed.rs"));
+        let mut diff = ProviderDiffBuilder::default();
+        diff.record(&restored);
+        assert!(diff.finish().unwrap().contains("+new"));
+        assert!(restored.turn.is_empty());
+        Ok(())
     }
 }

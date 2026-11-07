@@ -52,7 +52,11 @@ impl SessionController {
         })
     }
 
-    /// Initialize one exact published generation without committing its native identity.
+    /// Prepare one exact published generation without allocating a native conversation.
+    ///
+    /// An interactive session needs its observation listener and root owner before the first
+    /// lazy open publishes into them. The native conversation itself opens or resumes inside
+    /// `ProviderBridge::turn_start`, so settings changes before the first input stay local.
     async fn prepare_provider_initialization(
         self: &Arc<Self>,
         provider: Arc<crate::provider::Provider>,
@@ -62,30 +66,21 @@ impl SessionController {
             return Err(ProviderLifecycleFailure::ControllerClosed);
         }
         let revision = self.mcp_revision.load(Ordering::Acquire);
-        let (request, registry) = {
+        let (owner, registry) = {
             let mut broker = self.broker.lock().await;
             if !Arc::ptr_eq(&provider, &broker.provider_handle()) {
                 return Err(ProviderLifecycleFailure::GenerationChanged);
             }
-            (
-                broker
-                    .initialization_request()
-                    .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?,
-                broker.execution_registry(),
-            )
+            (broker.interactive_owner(), broker.execution_registry())
         };
-        let Some(request) = request else {
+        let Some(owner) = owner else {
             return Ok(ProviderInitialization::NotRequired { provider });
         };
         self.attach_provider_events(&provider, sink).await?;
-        let owner = request
-            .owner()
-            .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?;
         registry
             .owner(owner)
             .await
             .map_err(ProviderLifecycleFailure::Provider)?;
-        let provider_session_id = provider.session_open(request.clone()).await?;
         if self.input_stopping.load(Ordering::Acquire) {
             return Err(ProviderLifecycleFailure::ControllerClosed);
         }
@@ -94,11 +89,7 @@ impl SessionController {
         {
             return Err(ProviderLifecycleFailure::GenerationChanged);
         }
-        Ok(ProviderInitialization::Ready {
-            provider,
-            request: Box::new(request),
-            provider_session_id,
-        })
+        Ok(ProviderInitialization::Deferred { provider })
     }
 
     /// Retain startup work while the owner alone commits its initialized native identity.
@@ -142,15 +133,9 @@ impl SessionController {
                 ) {
                     return;
                 }
-                let message = if matches!(&error, ProviderLifecycleFailure::Provider(crate::provider::ProviderError::Failure(failure))
-                    if failure.kind() == forge_provider_api::ProviderFailureKind::SessionMissing)
-                {
-                    format!(
-                        "Provider initialization failed: {error}. Saved provider history is unavailable; retained conversation was preserved"
-                    )
-                } else {
-                    format!("Provider initialization failed: {error}")
-                };
+                // Startup never resumes native history, so a missing saved conversation surfaces
+                // as the first input's turn failure rather than here.
+                let message = format!("Provider initialization failed: {error}");
                 *controller
                     .provider_startup_error
                     .lock()
@@ -181,6 +166,8 @@ impl SessionController {
     }
 
     /// Attach one listener to the current inbox, collecting the previous listener first.
+    ///
+    /// The caller never waits on the broker; the listener installs the generation's root intake.
     async fn attach_provider_events(
         self: &Arc<Self>,
         provider: &Arc<crate::provider::Provider>,
@@ -209,24 +196,32 @@ impl SessionController {
             }
         }
         let session_id = self.observer.session_id().to_owned();
-        let registry = {
-            let mut broker = self.broker.lock().await;
-            if !Arc::ptr_eq(provider, &broker.provider_handle()) {
-                return Err(ProviderLifecycleFailure::GenerationChanged);
-            }
-            broker.execution_registry()
-        };
-        registry
-            .owner(crate::provider::ExecutionOwner::root(&session_id))
-            .await
-            .map_err(|_| ProviderLifecycleFailure::ObservationUnavailable)?;
         let controller = Arc::downgrade(self);
+        let broker = Arc::clone(&self.broker);
+        let provider = Arc::clone(provider);
         let events = inbox.clone();
         let task = tokio::spawn(async move {
             let result: Result<()> = async {
+                // Routing attaches this listener before every session request, including local
+                // policy commands that must not wait on a busy session's broker. The listener
+                // therefore installs root intake itself; the inbox buffers events meanwhile.
+                let registry = {
+                    let mut broker = broker.lock().await;
+                    // A replaced generation installs its own intake through provider
+                    // initialization, so a stale caller snapshot installs nothing.
+                    Arc::ptr_eq(&provider, &broker.provider_handle())
+                        .then(|| broker.execution_registry())
+                };
+                drop(broker);
+                drop(provider);
+                if let Some(registry) = registry {
+                    registry
+                        .owner(crate::provider::ThreadOwner::root(&session_id))
+                        .await
+                        .context("install root provider intake")?;
+                }
                 loop {
                     if events.has_pending()? {
-                        events.take_idle_settlement_request();
                         let Some(controller) = controller.upgrade() else {
                             return Ok(());
                         };
@@ -249,6 +244,19 @@ impl SessionController {
                         continue;
                     }
                     if events.is_closed() {
+                        if let Some(controller) = controller.upgrade() {
+                            match controller
+                                .exchange_owner
+                                .observe_provider_retained(messages.clone())
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(error)
+                                    if error.owner_closed()
+                                        && controller.input_stopping.load(Ordering::Acquire) => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
                         return Ok(());
                     }
                     events.notified().await?;
@@ -261,7 +269,7 @@ impl SessionController {
                 controller.trace.record(
                     &session_id,
                     "provider.observation_failed",
-                    json!({"reason":format!("{error:#}")}),
+                    observation_failure_trace(error),
                 );
                 // Retain the diagnostic before a nonblocking offer; observer collection never waits on stale UI capacity.
                 controller.publications.publish(SessionEvent { session_id, event: "provider_event".into(),
@@ -295,5 +303,41 @@ impl SessionController {
             result.context("session observation task failed during shutdown")??;
         }
         Ok(())
+    }
+}
+
+/// Describe a provider observation failure through the trace policy's typed fields.
+///
+/// The trace keeps only allowlisted metadata, so free-form error text never reaches it;
+/// the stage code and normalized observation kind identify the cause instead.
+fn observation_failure_trace(error: &anyhow::Error) -> serde_json::Value {
+    let error_code = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::exchange::ProviderObservationError>())
+        .map_or(
+            "observation_intake_failed",
+            crate::exchange::ProviderObservationError::code,
+        );
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<forge_provider_api::lifecycle::ObservationFailure>())
+        .and_then(|failure| serde_json::to_value(failure).ok())
+        .and_then(|failure| failure.get("kind").cloned());
+    json!({"error_code":error_code, "kind":kind, "reason":format!("{error:#}")})
+}
+
+#[cfg(test)]
+mod tests {
+    /// The observation failure trace names its stage and normalized cause without native text.
+    #[test]
+    fn observation_failure_trace_records_typed_cause() {
+        let error = anyhow::Error::from(crate::exchange::ProviderObservationError::Commit(
+            anyhow::Error::from(crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            )),
+        ));
+        let payload = super::observation_failure_trace(&error);
+        assert_eq!(payload["error_code"], "observation_commit_failed");
+        assert_eq!(payload["kind"], "ownership_conflict");
     }
 }

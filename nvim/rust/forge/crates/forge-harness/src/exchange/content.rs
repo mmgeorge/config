@@ -1,5 +1,4 @@
 use super::{Exchange, ExchangeNode, InputIntent};
-use crate::provider::MessageRole;
 use crate::turn::{ToolCall, ToolStore, TurnItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -85,7 +84,7 @@ impl Exchange {
                         .find(|message| message.id() == message_id)
                 })
                 .is_some_and(|message| {
-                    message.role() == Some(MessageRole::Commentary)
+                    message.role() == Some(forge_provider_api::AgentMessageRole::Commentary)
                         && !message.text().trim().is_empty()
                 }),
         }
@@ -122,6 +121,7 @@ impl Exchange {
 
     /// Recover orphaned background tools without changing settled foreground execution.
     pub(crate) fn interrupt_detached_background_tools(&mut self, observed_at: i64) -> Result<bool> {
+        let observed_at = self.tool_instant(observed_at);
         let mut changed = false;
         for entry in &mut self.entry {
             if let ExchangeEntry::Commentary { commentary } = entry {
@@ -188,7 +188,7 @@ impl Exchange {
                 return false;
             }
             match role {
-                Some(MessageRole::Commentary) => {
+                Some(forge_provider_api::AgentMessageRole::Commentary) => {
                     if !matches!(entry, ExchangeEntry::Commentary { .. }) {
                         *entry = ExchangeEntry::Commentary {
                             commentary: Commentary {
@@ -204,7 +204,7 @@ impl Exchange {
                     }
                     true
                 }
-                Some(MessageRole::Response) => {
+                Some(forge_provider_api::AgentMessageRole::Response) => {
                     *entry = ExchangeEntry::Response {
                         id: entry.id().to_owned(),
                     };
@@ -244,9 +244,11 @@ impl Exchange {
                     if message.text().trim().is_empty() {
                         continue;
                     }
-                    if message.role() == Some(MessageRole::Response) {
+                    if message.role() == Some(forge_provider_api::AgentMessageRole::Response) {
                         ExchangeEntry::Response { id: id.clone() }
-                    } else if message.role() == Some(MessageRole::Commentary) {
+                    } else if message.role()
+                        == Some(forge_provider_api::AgentMessageRole::Commentary)
+                    {
                         ExchangeEntry::Commentary {
                             commentary: Commentary {
                                 id: id.clone(),
@@ -464,7 +466,7 @@ impl Exchange {
                             || matches!(&commentary.source, CommentarySource::Provider { turn_id, message_id }
                                 if self.turn.iter().find(|turn| turn.id() == turn_id)
                                     .and_then(|turn| turn.messages().iter().find(|message| message.id() == message_id))
-                                    .is_some_and(|message| message.role() == Some(MessageRole::Response))),
+                                    .is_some_and(|message| message.role() == Some(forge_provider_api::AgentMessageRole::Response))),
                         ExchangeEntry::Response { .. } => true,
                     }
             });
@@ -504,77 +506,51 @@ impl Exchange {
         Ok(&mut commentary.tool[index].store)
     }
 
-    /// Check late updates against the exact persisted tool owner without reopening execution.
+    /// Admit late completion only for a positively certified background command.
     pub(crate) fn accepts_settled_tool_update(
         &self,
-        address: &crate::provider::ToolAddress,
-        update: &crate::provider::ToolUpdate,
+        address: &crate::provider::TurnAddress,
+        item_id: &forge_provider_api::ItemId,
+        event: &forge_provider_api::ItemEvent,
     ) -> bool {
-        self.entry.iter().any(|entry| {
+        matches!(
+            event,
+            forge_provider_api::ItemEvent::Tool { .. }
+                | forge_provider_api::ItemEvent::Completed(_)
+        ) && self.entry.iter().any(|entry| {
             let ExchangeEntry::Commentary { commentary } = entry else {
                 return false;
             };
-            commentary.tool.iter().any(|tools| {
-                tools
-                    .store
-                    .execution(address.tool_id.as_str())
-                    .is_some_and(|execution| {
-                        execution.address == *address
-                            && (update.can_update_settled()
-                                || matches!(update, crate::provider::ToolUpdate::Finished { .. })
-                                    && tools.store.accepts_background_completion(address))
-                    })
-            })
+            commentary
+                .tool
+                .iter()
+                .any(|tools| tools.store.accepts_background_completion(address, item_id))
         })
     }
 
     pub(crate) fn record_tool_event(
         &mut self,
         turn_id: &str,
-        address: &crate::provider::ToolAddress,
-        update: &crate::provider::ToolUpdate,
+        address: &crate::provider::TurnAddress,
+        item_id: &forge_provider_api::ItemId,
+        event: &forge_provider_api::ItemEvent,
         now_ms: i64,
     ) -> Result<()> {
-        let existing = self
-            .tools_for_turn(turn_id)
-            .any(|tool| tool.id == address.tool_id.as_str());
-        let late = self.accepts_settled_tool_update(address, update);
+        let late = self.accepts_settled_tool_update(address, item_id, event);
         ensure!(
             self.turn.iter().any(|turn| turn.id() == turn_id
-                && turn.provider() == &address.turn
-                && (turn.state() == crate::turn::TurnState::Running || late))
-                && !address.tool_id.as_str().is_empty(),
+                && turn.provider() == address
+                && (turn.state() == crate::turn::TurnState::Running || late)),
             "completed turn rejects tool events"
         );
-        if !existing && !matches!(update, crate::provider::ToolUpdate::Requested { .. }) {
-            return Err(crate::provider::ProviderError::Failure(
-                forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::SessionClose,
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                ),
-            )
-            .into());
-        }
-        let tool_id = address.tool_id.as_str();
-        let store = self.tool_store_mut(turn_id, tool_id)?;
-        let previous = store.get(tool_id).map(|tool| (tool.state(), tool.failed));
-        store.merge(address, update, now_ms)?;
-        let current = store
-            .get(tool_id)
-            .map(|tool| (tool.state(), tool.failed))
-            .unwrap();
-        if let Some((state, failed)) = previous {
-            self.tool_counter.failed -= usize::from(failed);
-            self.tool_counter.completed -=
-                usize::from(state == crate::turn::ToolState::Completed && !failed);
-            self.tool_counter.running -= usize::from(state == crate::turn::ToolState::Running);
-        } else {
-            self.tool_counter.total += 1;
-        }
-        self.tool_counter.failed += usize::from(current.1);
-        self.tool_counter.completed +=
-            usize::from(current.0 == crate::turn::ToolState::Completed && !current.1);
-        self.tool_counter.running += usize::from(current.0 == crate::turn::ToolState::Running);
+        let tool_id = item_id.as_str();
+        let now = self.tool_instant(now_ms);
+        // Validate the candidate before changing timeline ownership or counters.
+        let mut candidate = self.clone();
+        let store = candidate.tool_store_mut(turn_id, tool_id)?;
+        store.record_item(address, item_id, event, now)?;
+        candidate.rebuild_tool_counter();
+        *self = candidate;
         Ok(())
     }
 
@@ -584,11 +560,12 @@ impl Exchange {
         outcome: crate::turn::TurnOutcome,
         now_ms: i64,
     ) {
+        let now = self.tool_instant(now_ms);
         for entry in &mut self.entry {
             if let ExchangeEntry::Commentary { commentary } = entry {
                 for tools in &mut commentary.tool {
                     if tools.turn_id == turn_id {
-                        tools.store.finish(outcome, now_ms);
+                        tools.store.finish(outcome, now);
                     }
                 }
             }
@@ -599,53 +576,121 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
-        ProviderEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
+    use crate::provider::{EventScope, HarnessEvent, ProviderEvent, TurnAddress};
+    use forge_provider_api::{
+        AgentMessageRole, ItemCompletion, ItemEvent, ItemId, ItemStart, MessageClassification,
+        MessageCompletion, MessageItemEvent, MessageOutcome, ToolCompletion, ToolDescriptor,
+        ToolItemEvent, ToolOutcome,
     };
     use serde_json::json;
 
+    fn exchange(id: &str) -> Exchange {
+        serde_json::from_value(json!({"id":id,"session_id":"session","agent_id":"primary","ordinal":1,
+            "prompt":"Work","state":"running","created_at_ms":0,"attributed_matches_checkpoint":false,"node_list":[]})).unwrap()
+    }
+    fn item(address: &TurnAddress, id: &str, event: ItemEvent) -> HarnessEvent {
+        HarnessEvent::Native {
+            source: crate::provider::events::NativeEventSource {
+                binding_id: forge_provider_api::BindingId::new("content-reducer-fixture").unwrap(),
+                sequence: forge_provider_api::EventSequence::new(1),
+            },
+            scope: EventScope::Invocation {
+                invocation: address.scope.clone(),
+            },
+            event: Box::new(ProviderEvent::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: ItemId::new(id).unwrap(),
+                event,
+            }),
+        }
+    }
+    fn command(title: &str) -> ItemEvent {
+        ItemEvent::Started(ItemStart::CommandExecution(ToolDescriptor {
+            semantics: Default::default(),
+            name: title.into(),
+            title: title.into(),
+            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+        }))
+    }
+    fn complete(outcome: ToolOutcome, output: Option<&str>) -> ItemEvent {
+        ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
+            outcome,
+            descriptor: None,
+            output: output.map(str::to_owned),
+            changes: Default::default(),
+        }))
+    }
+    fn message_complete(text: &str) -> ItemEvent {
+        ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
+            text: text.into(),
+            outcome: MessageOutcome::Completed,
+        }))
+    }
+    fn classified(role: AgentMessageRole) -> ItemEvent {
+        ItemEvent::Message {
+            event: MessageItemEvent::Classified(MessageClassification::Known(role)),
+        }
+    }
+
+    /// Codex starts a command before asking approval; the wait pauses the Working clock,
+    /// so the tool's timer must exclude it too, both while running and once settled.
     #[test]
-    fn empty_snapshots_remove_text_without_admitting_empty_commentary() -> Result<()> {
-        let mut exchange: Exchange = serde_json::from_value(json!({
-            "id":"empty", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"Work", "state":"running", "created_at_ms":0,
-            "attributed_matches_checkpoint":false, "node_list":[]
-        }))?;
+    fn tool_timer_pauses_with_the_exchange_clock_during_approval() -> Result<()> {
+        let mut exchange = exchange("approval-timer");
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut message = crate::turn::test_support::message(
+        exchange.clock.resume(0);
+        exchange.observe_event(&item(&address, "call", command("write")), 1_000)?;
+        exchange.observe_event(
+            &item(
+                &address,
+                "call",
+                ItemEvent::Tool {
+                    event: ToolItemEvent::ExecutionStarted,
+                },
+            ),
+            1_000,
+        )?;
+        exchange.observe_blocker("approval:call".into(), true, 2_000);
+        exchange.observe_blocker("approval:call".into(), false, 12_000);
+        let running = exchange.tools().next().unwrap().1.clone();
+        assert_eq!(
+            running.elapsed_ms(exchange.tool_instant(12_500)),
+            Some(1_500),
+            "the running tool timer counted the approval wait"
+        );
+        exchange.observe_event(
+            &item(&address, "call", complete(ToolOutcome::Succeeded, None)),
+            13_000,
+        )?;
+        let (_, settled) = exchange.tools().next().unwrap();
+        assert_eq!(
+            settled.elapsed_ms(exchange.tool_instant(90_000)),
+            Some(2_000)
+        );
+        assert_eq!(exchange.elapsed(13_000), 3_000);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_snapshots_remove_text_without_admitting_empty_commentary() -> Result<()> {
+        let mut exchange = exchange("empty");
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let message = crate::turn::test_support::message(
             &address,
             "commentary",
-            Some(MessageRole::Commentary),
+            Some(AgentMessageRole::Commentary),
             "Visible",
         );
         assert!(exchange.entry.is_empty());
         assert!(exchange.turn[0].messages().is_empty());
-        let tool = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "call".into(),
-            },
-            update: ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "inspect".into(),
-                    title: "inspect".into(),
-                    arguments: json!({}),
-                },
-            },
-        };
-        exchange.observe_turn(&tool, 2)?;
+        exchange.observe_event(&item(&address, "call", command("inspect")), 2)?;
         let owner = exchange.entry[0].id().to_owned();
-        exchange.observe_turn(&message, 3)?;
+        exchange.observe_event(&message, 3)?;
         assert_eq!(exchange.entry.len(), 2);
-        if let ProviderEvent::Message { update, .. } = &mut message {
-            *update = crate::provider::MessageUpdate::Completed {
-                text: String::new(),
-            };
-        }
-        exchange.observe_turn(&message, 4)?;
+        exchange.observe_event(&item(&address, "commentary", message_complete("")), 4)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
         assert_eq!(restored.entry.len(), 1);
         assert_eq!(restored.entry[0].id(), owner);
@@ -656,91 +701,67 @@ mod tests {
 
     #[test]
     fn typed_classification_preserves_activity_without_duplicate_message_blocks() -> Result<()> {
-        use crate::provider::MessageUpdate;
-        let mut exchange: Exchange = serde_json::from_value(json!({
-            "id":"classification", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"Work", "state":"running", "created_at_ms":0,
-            "attributed_matches_checkpoint":false, "node_list":[]
-        }))?;
+        let mut exchange = exchange("classification");
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event =
-            crate::turn::test_support::message(&address, "answer", None, "Canonical answer");
-        exchange.observe_turn(&event, 1)?;
+        exchange.observe_event(
+            &crate::turn::test_support::message(&address, "answer", None, "Canonical answer"),
+            1,
+        )?;
         assert!(exchange.entry.is_empty());
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Classified {
-                role: MessageRole::Commentary,
-            };
-        }
-        exchange.observe_turn(&event, 2)?;
-        let mut tool = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "original".into(),
-            },
-            update: ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    title: "inspect".into(),
-                    name: "inspect".into(),
-                    kind: ToolActivityKind::Command,
-                    arguments: json!({}),
-                },
-            },
-        };
-        exchange.observe_turn(&tool, 3)?;
+        exchange.observe_event(
+            &item(&address, "answer", classified(AgentMessageRole::Commentary)),
+            2,
+        )?;
+        exchange.observe_event(&item(&address, "original", command("inspect")), 3)?;
         let provider_owner = exchange.entry[0].id().to_owned();
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Classified {
-                role: MessageRole::Response,
-            };
-        }
         let before_conflict = serde_json::to_value(&exchange)?;
-        let error = exchange.observe_turn(&event, 4).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
-        ));
+        let error = exchange
+            .observe_event(
+                &item(&address, "answer", classified(AgentMessageRole::Response)),
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol)
+        );
         assert_eq!(serde_json::to_value(&exchange)?, before_conflict);
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Completed {
-                text: "Canonical final answer".into(),
-            };
-        }
-        exchange.observe_turn(&event, 4)?;
-        exchange.observe_turn(&event, 5)?;
+        let completed = item(
+            &address,
+            "answer",
+            message_complete("Canonical final answer"),
+        );
+        exchange.observe_event(&completed, 4)?;
+        exchange.observe_event(&completed, 5)?;
         let mut restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
         assert_eq!(restored.turn[0].messages().len(), 1);
         assert_eq!(
             restored.turn[0].messages()[0].role(),
-            Some(MessageRole::Commentary)
+            Some(AgentMessageRole::Commentary)
         );
-        restored.observe_turn(
+        restored.observe_event(
             &crate::turn::test_support::message(
                 &address,
                 "next-inspection",
-                Some(MessageRole::Commentary),
+                Some(AgentMessageRole::Commentary),
                 "Next inspection",
             ),
             6,
         )?;
-        if let ProviderEvent::Tool { address, .. } = &mut tool {
-            address.tool_id = "later".into();
-        }
-        restored.observe_turn(&tool, 6)?;
+        restored.observe_event(&item(&address, "later", command("inspect")), 6)?;
         let original = restored
             .entry
             .iter()
             .find(|entry| entry.id() == provider_owner)
             .unwrap();
-        assert!(matches!(original, ExchangeEntry::Commentary { commentary }
-            if commentary.tool[0].store.get("original").is_some()
-            && commentary.tool[0].store.get("later").is_none()));
+        assert!(
+            matches!(original, ExchangeEntry::Commentary { commentary } if commentary.tool[0].store.get("original").is_some() && commentary.tool[0].store.get("later").is_none())
+        );
         assert_eq!(restored.tool_counter.total, 2);
         let rendered = crate::buffer::projection::project(
             crate::buffer::projection::ProjectionSource::Exchange(&restored),
             &Default::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             false,
             &Default::default(),
             &Default::default(),
@@ -766,122 +787,133 @@ mod tests {
                 .join("")
                 .contains("Noncanonical mirror")
         }));
-        let mut block_id = std::collections::HashSet::new();
+        let mut block_ids = std::collections::HashSet::new();
         assert!(
             rendered
                 .entry
                 .block
                 .iter()
-                .all(|block| block_id.insert(&block.id))
+                .all(|block| block_ids.insert(&block.id))
         );
         Ok(())
     }
 
     #[test]
     fn initial_commentary_owns_tools_once_across_steering_reload_and_late_updates() -> Result<()> {
-        let mut exchange: Exchange = serde_json::from_value(json!({
-            "id":"ownership", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"Work", "state":"running", "created_at_ms":0,
-            "attributed_matches_checkpoint":false, "node_list":[]
-        }))?;
+        let mut exchange = exchange("ownership");
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
-        let mut event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "first".into(),
-            },
-            update: ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    title: "inspect".into(),
-                    name: "inspect".into(),
-                    kind: ToolActivityKind::Command,
-                    arguments: json!({}),
-                },
-            },
-        };
-        exchange.observe_turn(&event, 1)?;
+        exchange.observe_event(&item(&address, "first", command("inspect")), 1)?;
         exchange.append_input(InputIntent::Steering, "more".into(), 2)?;
-        if let ProviderEvent::Tool { address, .. } = &mut event {
-            address.tool_id = "second".into();
-        }
-        exchange.observe_turn(&event, 3)?;
+        exchange.observe_event(&item(&address, "second", command("inspect")), 3)?;
         assert_eq!(exchange.tool_counter.total, 2);
         assert_eq!(exchange.tool_counter.running, 2);
         let initial_id = exchange.entry[0].id().to_owned();
         assert!(
-            matches!(&exchange.entry[0], ExchangeEntry::Commentary { commentary }
-            if matches!(commentary.source, CommentarySource::Initial { .. }))
+            matches!(&exchange.entry[0], ExchangeEntry::Commentary { commentary } if matches!(commentary.source, CommentarySource::Initial { .. }))
         );
-        exchange.observe_turn(
+        exchange.observe_event(
             &crate::turn::test_support::message(
                 &address,
                 "commentary",
-                Some(MessageRole::Commentary),
+                Some(AgentMessageRole::Commentary),
                 "Now check results",
             ),
             4,
         )?;
-        if let ProviderEvent::Tool { address, update } = &mut event {
-            address.tool_id = "first".into();
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            };
+        for id in ["first", "second"] {
+            exchange.observe_event(
+                &item(
+                    &address,
+                    id,
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                ),
+                4,
+            )?;
         }
-        exchange.observe_turn(&event, 5)?;
-        exchange.observe_turn(&event, 6)?;
-        assert_eq!(exchange.tool_counter.total, 2);
+        let finished = item(&address, "first", complete(ToolOutcome::Succeeded, None));
+        exchange.observe_event(&finished, 5)?;
+        exchange.observe_event(&finished, 6)?;
+        exchange.observe_event(
+            &item(
+                &address,
+                "second",
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Backgrounded,
+                },
+            ),
+            6,
+        )?;
         assert_eq!(exchange.tool_counter.completed, 1);
         assert_eq!(exchange.tool_counter.running, 1);
         let serialized = serde_json::to_value(&exchange)?;
         assert!(serialized["turn"][0].get("tool").is_none());
         assert!(serialized.get("tool_counter").is_none());
         let mut restored: Exchange = serde_json::from_value(serialized)?;
-        assert_eq!(restored.tool_counter.total, 2);
-        assert_eq!(restored.tool_counter.completed, 1);
-        restored.observe_turn(
-            &ProviderEvent::Turn {
-                address: address.clone(),
-                update: crate::provider::TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 6,
-                },
+        restored.turn[0].finish(
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
             6,
         )?;
-        restored.observe_turn(
-            &ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: address.clone(),
-                    tool_id: "first".into(),
-                },
-                update: ToolUpdate::Output {
-                    update: crate::provider::TextUpdate::Append("late output".into()),
-                },
-            },
-            6,
-        )?;
+        restored.settle_tools(6);
+        // A completed foreground item cannot acquire new output; a certified background command retains its original owner.
+        let before = serde_json::to_value(&restored)?;
+        assert!(
+            restored
+                .observe_event(
+                    &item(
+                        &address,
+                        "first",
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Output(crate::provider::TextUpdate::Append(
+                                "foreign late output".into()
+                            ))
+                        }
+                    ),
+                    7
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&restored)?, before);
         let node_count = restored.node_list.len();
-        assert!(restored.observe_turn(
-            &ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: address.clone(),
-                    tool_id: "first".into(),
+        restored.observe_event(
+            &item(
+                &address,
+                "second",
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Output(crate::provider::TextUpdate::Append(
+                        "late output".into(),
+                    )),
                 },
-                update: ToolUpdate::TitleChanged {
-                    title: "Inspect completed results".into(),
-                },
-            },
+            ),
             7,
-        )?);
+        )?;
+        restored.observe_event(
+            &item(
+                &address,
+                "second",
+                ItemEvent::Tool {
+                    event: ToolItemEvent::TitleChanged("Inspect completed results".into()),
+                },
+            ),
+            7,
+        )?;
+        let terminal = item(
+            &address,
+            "second",
+            complete(ToolOutcome::Succeeded, Some("late output")),
+        );
+        restored.observe_event(&terminal, 8)?;
         assert_eq!(restored.node_list.len(), node_count);
-        let owner = restored
+        let ExchangeEntry::Commentary { commentary } = restored
             .entry
             .iter()
             .find(|entry| entry.id() == initial_id)
-            .unwrap();
-        let ExchangeEntry::Commentary { commentary } = owner else {
+            .unwrap()
+        else {
             panic!("initial commentary missing")
         };
         assert_eq!(
@@ -892,15 +924,12 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            commentary.tool[0].store.get("first").unwrap().output,
-            "late output"
-        );
-        let updated = commentary.tool[0].store.get("first").unwrap();
+        let updated = commentary.tool[0].store.get("second").unwrap();
+        assert_eq!(updated.output, "late output");
         assert_eq!(updated.title, "Inspect completed results");
         assert_eq!(updated.state(), crate::turn::ToolState::Completed);
-        assert_eq!(updated.completed_at_ms, Some(5));
-        assert_eq!(restored.tool_counter.completed, 1);
+        assert_eq!(updated.completed_at_ms, Some(8));
+        assert_eq!(restored.tool_counter.completed, 2);
         let view = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(view.commentary[0].tools.call.len(), 2);
         assert!(matches!(
@@ -910,13 +939,15 @@ mod tests {
         let rendered = crate::buffer::projection::project(
             crate::buffer::projection::ProjectionSource::Exchange(&restored),
             &Default::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             false,
             &Default::default(),
             &Default::default(),
             &mut Default::default(),
         )?;
-        let blocks = &rendered.entry.block;
-        let heading = blocks
+        let heading = rendered
+            .entry
+            .block
             .iter()
             .find(|block| {
                 block
@@ -926,7 +957,9 @@ mod tests {
                     .contains("Considering initial steps")
             })
             .unwrap();
-        let steering = blocks
+        let steering = rendered
+            .entry
+            .block
             .iter()
             .find(|block| block.text.wire_rows().join("").contains("Steering: more"))
             .unwrap();
@@ -937,32 +970,22 @@ mod tests {
                 .iter()
                 .all(|fold| fold.end.block != steering.id)
         );
-        if let ProviderEvent::Tool { address, update } = &mut event {
-            address.tool_id = "failed-call".into();
-            *update = ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "check".into(),
-                    title: "check".into(),
-                    arguments: json!({}),
-                },
-            };
-        }
-        exchange.observe_turn(&event, 7)?;
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Failed {
+        exchange.observe_event(&item(&address, "failed-call", command("check")), 7)?;
+        let failed = item(
+            &address,
+            "failed-call",
+            complete(
+                ToolOutcome::Failed {
                     diagnostic: crate::provider::ToolDiagnostic {
                         kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new("failed")
-                            .expect("fixture diagnostic is nonempty"),
+                        message: forge_provider_api::SanitizedMessage::new("failed").unwrap(),
                     },
                 },
-            };
-        }
-        exchange.observe_turn(&event, 7)?;
-        exchange.observe_turn(&event, 8)?;
+                None,
+            ),
+        );
+        exchange.observe_event(&failed, 7)?;
+        exchange.observe_event(&failed, 8)?;
         assert_eq!(exchange.tool_counter.total, 3);
         assert_eq!(exchange.tool_counter.failed, 1);
         exchange.node_list.clear();

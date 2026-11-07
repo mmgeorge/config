@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use forge_provider_api::agent::AgentExecutionState;
-
 /// Defines the lifecycle of a persistent provider-backed agent identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +16,17 @@ impl AgentState {
     pub fn is_open(self) -> bool {
         matches!(self, Self::Starting | Self::Ready)
     }
+}
+
+/// Retain explicit authorization after a collected child stops with unfinished work.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentContinuationPolicy {
+    #[default]
+    Ready,
+    RequiresAuthorization {
+        task_id: forge_provider_api::ExchangeId,
+    },
 }
 
 /// Stores one reusable provider-backed agent identity and lifecycle.
@@ -39,11 +48,32 @@ pub struct Agent {
     /// Preserves informational messages across interruption and process restart.
     pub inbox: Vec<super::AgentMessage>,
     pub state: AgentState,
+    /// Point to the stopped original task without duplicating its native outcome.
+    #[serde(default)]
+    pub continuation: AgentContinuationPolicy,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
 
 impl Agent {
+    /// Acknowledge only the exact stopped task after an explicit user action.
+    pub fn authorize_continuation(
+        &mut self,
+        task_id: &forge_provider_api::ExchangeId,
+    ) -> anyhow::Result<bool> {
+        match &self.continuation {
+            AgentContinuationPolicy::Ready => Ok(false),
+            AgentContinuationPolicy::RequiresAuthorization { task_id: stopped } => {
+                anyhow::ensure!(
+                    stopped == task_id,
+                    "child authorization belongs to another stopped task"
+                );
+                self.continuation = AgentContinuationPolicy::Ready;
+                Ok(true)
+            }
+        }
+    }
+
     /// Create the persistent primary identity that owns a session timeline.
     pub fn primary(session_id: &str, now_ms: i64) -> Self {
         Self {
@@ -58,6 +88,7 @@ impl Agent {
             selection: None,
             inbox: Vec::new(),
             state: AgentState::Ready,
+            continuation: AgentContinuationPolicy::Ready,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }
@@ -77,6 +108,7 @@ impl Agent {
             selection: None,
             inbox: Vec::new(),
             state: AgentState::Starting,
+            continuation: AgentContinuationPolicy::Ready,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }

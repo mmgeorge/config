@@ -47,6 +47,30 @@ pub struct CheckSupervisor {
     owner: OnceLock<super::owner::CheckOwnerSender>,
     trace: Arc<crate::trace::TraceStore>,
     changed: tokio::sync::Notify,
+    command_expiry: CommandExpiry,
+}
+
+/// Ends a running check command at its captured execution deadline.
+///
+/// Tests force expiry through this owner because a paused Tokio clock cannot auto-advance
+/// while Windows child pipes hold blocking reads, and real deadlines must not elapse in tests.
+#[derive(Default)]
+struct CommandExpiry {
+    #[cfg(test)]
+    forced: tokio::sync::Notify,
+}
+
+impl CommandExpiry {
+    /// Resolves when the deadline passes, or when a test has forced the next command to expire.
+    async fn wait(&self, deadline: tokio::time::Instant) {
+        #[cfg(test)]
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {},
+            () = self.forced.notified() => {},
+        }
+        #[cfg(not(test))]
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 /// Check state and its matching presentation revision captured under one lock.
@@ -270,7 +294,14 @@ impl CheckSupervisor {
             owner: OnceLock::new(),
             trace,
             changed: Default::default(),
+            command_expiry: CommandExpiry::default(),
         }))
+    }
+
+    /// Expires the current or next check command as if its execution deadline had passed.
+    #[cfg(test)]
+    pub(crate) fn expire_command_deadline(&self) {
+        self.command_expiry.forced.notify_one();
     }
 
     /// Captures the source boundary before provider edits can affect check applicability.
@@ -1487,9 +1518,11 @@ impl CheckSupervisor {
             }
             Ok(())
         };
-        let result = tokio::time::timeout_at(deadline, result)
-            .await
-            .unwrap_or_else(|_| Err(CommandTimeout(timeout).into()));
+        let result = tokio::select! {
+            biased;
+            result = result => result,
+            () = self.command_expiry.wait(deadline) => Err(CommandTimeout(timeout).into()),
+        };
         if result.is_err() {
             process.stop().await?;
         }

@@ -77,7 +77,7 @@ local function snapshot(entry)
 end
 
 local ok, failure = pcall(function()
-  forge.setup({ walkthrough_inventory = "sem", harness = { provider = "mock" } })
+  forge.setup({ walkthrough_inventory = "sem", text_correction = { enabled = false }, harness = { provider = "mock" } })
   local state = session.harness
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win = layout.open()
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
@@ -137,6 +137,10 @@ local ok, failure = pcall(function()
       callback({ deleted = params.session_id })
     elseif method == "session.resume" then
       local entry = vim.iter(entry_list):find(function(candidate) return candidate.id == params.session_id end)
+      callback(snapshot(vim.deepcopy(entry)))
+    elseif method == "session.state.get" then
+      -- Activation reconciles through the reconnect primitive after applying the resume snapshot.
+      local entry = vim.iter(entry_list):find(function(candidate) return candidate.id == request_specification.session_id end)
       callback(snapshot(vim.deepcopy(entry)))
     elseif method == "session.provider.model.list" then
       callback({})

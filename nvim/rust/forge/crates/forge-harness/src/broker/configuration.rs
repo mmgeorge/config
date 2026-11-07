@@ -19,6 +19,16 @@ pub(crate) enum ConfigurationEffect {
     ReplaceTree,
 }
 
+/// Resolve a retained configuration intent without launching work or replacing a live child.
+pub(crate) enum PendingConfigurationRetry {
+    /// Preserve the latest intent until independently observed native work is collected.
+    Blocked,
+    /// Discard an intent whose newest desired revision is already confirmed applied.
+    Obsolete,
+    /// Rebuild a fresh owned command from the exact raw patch or newest desired revision.
+    Ready(Box<crate::exchange::command::SessionConfigurationPatch>),
+}
+
 /// Retain the exact permission authority selected before a short host commit.
 pub(crate) struct PermissionConfiguration {
     session_id: String,
@@ -31,6 +41,33 @@ pub(crate) struct PermissionConfiguration {
     selected_approval: crate::session::ApprovalMode,
     resume: bool,
     operation_id: Option<String>,
+}
+
+/// Execution policy committed before a permission change, kept to describe that change on resume.
+#[derive(Clone, Debug)]
+pub(crate) struct PolicyBaseline {
+    access: String,
+    approval: crate::session::ApprovalMode,
+}
+
+impl PolicyBaseline {
+    /// Tell the resumed model exactly which policy changed so it re-plans interrupted operations.
+    pub(crate) fn resume_notice(
+        &self,
+        current_access: &str,
+        current_approval: crate::session::ApprovalMode,
+    ) -> String {
+        format!(
+            "The user changed filesystem access from {} to {} and approval mode from {} to {}. \
+             Continue the interrupted work under the updated policy. Saved approval rules still apply. \
+             Preserve completed work. Before retrying an interrupted operation, inspect its recorded \
+             outcome and any affected files.",
+            self.access,
+            current_access,
+            self.approval.label(),
+            current_approval.label()
+        )
+    }
 }
 
 /// Return owned presentation and any continuation prompt to the service driver.
@@ -62,7 +99,7 @@ pub(crate) struct ConfigurationReconcileJob {
     authority: Box<ConfigurationAuthority>,
     completed: Option<Arc<std::sync::atomic::AtomicBool>>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     controller: Arc<crate::task::SessionTaskController>,
 }
 
@@ -76,7 +113,7 @@ pub(crate) struct ConfigurationReconcileResult {
 /// Fence an owner if an in-flight provider settings write loses its completion.
 struct ConfigurationWriteGuard {
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     controller: Arc<crate::task::SessionTaskController>,
     armed: bool,
 }
@@ -236,7 +273,7 @@ impl ConfigurationReconcileJob {
         use crate::provider::ProviderError;
         match error {
             ProviderError::Failure(failure) => {
-                failure.operation() == forge_provider_api::ProviderOperation::SessionConfigure
+                failure.operation() == forge_provider_api::ProviderOperation::ThreadConfigure
                     && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
             }
             ProviderError::Combined { primary, secondary } => {
@@ -284,7 +321,7 @@ impl ConfigurationReconcileJob {
                 let _lane = lane;
                 let configured = self
                     .provider
-                    .session_configure(self.request, &self.selection, self.deadline)
+                    .thread_configure(self.request, &self.selection, self.deadline)
                     .await;
                 // A completed native rejection is a result, not failed task collection.
                 // Keep it outside the cleanup ledger so it cannot poison later commands.
@@ -399,7 +436,14 @@ impl HarnessBroker {
             .provider
             .query_context(&self.provider_catalog_request()?)
             .await?;
-        let models = self.provider.model_list(context).await?;
+        // ACP agents negotiate their model catalog per binding, so workspace discovery before
+        // the first binding is unsupported. The binding validates the inherited settings when
+        // it opens, so an unsupported workspace catalog leaves them unchanged.
+        let models = match self.provider.model_list(context).await {
+            Ok(models) => models,
+            Err(crate::provider::ProviderError::Unsupported(_)) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
         let model = models
             .iter()
             .find(|model| {
@@ -499,6 +543,48 @@ impl HarnessBroker {
             Ok(true)
         })
     }
+    /// Revalidate a pending native configuration after consuming the original child-terminal prefix.
+    pub(crate) fn pending_configuration_retry(
+        &self,
+        captured: &crate::exchange::command::SessionConfigurationPatch,
+    ) -> Result<PendingConfigurationRetry> {
+        let observed = self.store.list_observed_agents(&self.session.id)?;
+        let root_bindings: std::collections::HashSet<_> = observed
+            .iter()
+            .filter(|agent| agent.parent_scope().owner.is_root())
+            .map(|agent| agent.key().binding_id().clone())
+            .collect();
+        let blocked = observed.iter().any(|agent| {
+            root_bindings.contains(agent.key().binding_id())
+                && agent.availability() == crate::agent::ObservedAgentAvailability::Available
+                && (matches!(agent.state(), crate::agent::ObservedAgentState::Active(_))
+                    || agent.exchanges().iter().any(|exchange| {
+                        exchange
+                            .turn
+                            .iter()
+                            .any(|turn| matches!(turn.state(), crate::turn::TurnState::Running))
+                    }))
+        });
+        if blocked {
+            return Ok(PendingConfigurationRetry::Blocked);
+        }
+        if captured.application_revision().is_none() {
+            return Ok(PendingConfigurationRetry::Ready(Box::new(captured.clone())));
+        }
+        let store = crate::settings::SettingsStore::read_only(&self.data_root)?;
+        let snapshot = store.get(
+            &self.session.workspace,
+            &self.session.id,
+            &self.session.provider,
+        )?;
+        if store.application(&self.session.id)?.applied_revision == Some(snapshot.revision) {
+            return Ok(PendingConfigurationRetry::Obsolete);
+        }
+        Ok(PendingConfigurationRetry::Ready(serde_json::from_value(
+            json!({"settings_revision":snapshot.revision}),
+        )?))
+    }
+
     /// Confirm only the settings revision that this operation actually applied.
     pub(crate) fn confirm_configuration_application(&mut self, action: &Value) -> Result<()> {
         let Some(revision) = action
@@ -589,11 +675,15 @@ impl HarnessBroker {
             deliveries.push(
                 self.prepare_provider_delivery(AppliedProviderEvent::Update(
                     SessionUpdate::Diagnostic {
-                        diagnostic: crate::provider::ProviderDiagnostic {
+                        diagnostic: super::publication::DiagnosticView {
                             kind: forge_provider_api::ProviderFailureKind::Unknown,
                             message: forge_provider_api::SanitizedMessage::new(message.clone())
                                 .expect("host diagnostic is nonempty"),
-                            fatal: false,
+                            severity: super::publication::DiagnosticSeverity::Warning,
+                            scope: crate::provider::EventScope::Binding {
+                                owner: crate::provider::ThreadOwner::root(&self.session.id),
+                            },
+                            native_scope: forge_provider_api::WarningScope::Provider,
                         },
                     },
                 ))?,
@@ -881,7 +971,7 @@ impl HarnessBroker {
             anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
             if model != configured.model {
                 configured.model = model.to_owned();
-                configured.resolved_model = (model != "default").then(|| model.to_owned());
+                configured.resolved_model = None;
             }
         }
         if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -944,11 +1034,18 @@ impl HarnessBroker {
             .is_some_and(|enabled| enabled != self.agent_coordinator.enabled())
             || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id))
             || session_tools.is_some();
+        // The candidate persists the requested policy as the saved preference, while the session
+        // runs with the subset this provider can enforce, so an unsupported sandbox stays selected.
+        // Isolation modes come only from the provider's advertised list, so an unknown mode is a
+        // malformed request rather than a preference and still rejects before commit.
         if let Some(access) = &access {
             self.capability
-                .validate_access(access)
+                .validate_access(&crate::session::AccessPolicy {
+                    sandbox: false,
+                    ..access.clone()
+                })
                 .context(ConfigurationRejection::AccessPolicyInvalid)?;
-            configured.access = access.clone();
+            configured.access = self.capability.resolve_access(access.clone());
         }
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
@@ -1018,6 +1115,7 @@ impl HarnessBroker {
                 .map(TryInto::try_into)
                 .transpose()?,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -1232,7 +1330,7 @@ impl HarnessBroker {
                 {
                     self.task_controller.mark_configuration_uncertain();
                     let registry = self.execution_registry.clone();
-                    let owner = crate::provider::ExecutionOwner::root(&session_id);
+                    let owner = crate::provider::ThreadOwner::root(&session_id);
                     if let Err(cleanup) = self.execution_registry.retain_cleanup(
                         crate::provider::session_execution::CleanupWorkKind::OwnerFence,
                         async move {
@@ -1251,7 +1349,7 @@ impl HarnessBroker {
         if let Err(error) = self.store.clear_configuration_intent(&intent) {
             self.task_controller.mark_configuration_uncertain();
             let registry = self.execution_registry.clone();
-            let owner = crate::provider::ExecutionOwner::root(&session_id);
+            let owner = crate::provider::ThreadOwner::root(&session_id);
             if let Err(cleanup) = self.execution_registry.retain_cleanup(
                 crate::provider::session_execution::CleanupWorkKind::OwnerFence,
                 async move {
@@ -1349,7 +1447,7 @@ impl HarnessBroker {
             authority: self.capture_configuration_authority()?,
             completed: None,
             registry: Arc::clone(&self.execution_registry),
-            owner: crate::provider::ExecutionOwner::root(&self.session.id),
+            owner: crate::provider::ThreadOwner::root(&self.session.id),
             controller: Arc::clone(&self.task_controller),
         })
     }
@@ -1460,7 +1558,7 @@ impl HarnessBroker {
         let crate::provider::ConfigureReceipt::Applied(receipt) = receipt else {
             return self.validate_native_configuration_authority(authority);
         };
-        receipt.validate(&crate::provider::ExecutionOwner::root(&self.session.id))?;
+        receipt.validate(&crate::provider::ThreadOwner::root(&self.session.id))?;
         let before = receipt.before_history().map(|id| id.as_str());
         let after = receipt.after_history().map(|id| id.as_str());
         let captured = authority.session.provider_session_id.as_deref();
@@ -1479,11 +1577,11 @@ impl HarnessBroker {
     /// Persist only the latest consumed identity while a configured binding's weak proof remains live.
     pub(super) fn retain_session_identity(
         &mut self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
         identity: &forge_provider_api::ProviderSessionId,
     ) -> Result<()> {
         anyhow::ensure!(
-            owner == &crate::provider::ExecutionOwner::root(&self.session.id),
+            owner == &crate::provider::ThreadOwner::root(&self.session.id),
             "session identity crosses root ownership"
         );
         if let Some(receipt) = &self.configuration_identity {
@@ -1586,6 +1684,14 @@ impl HarnessBroker {
         })
     }
 
+    /// Capture the committed execution policy before a permission change replaces it.
+    pub(crate) fn owner_policy_baseline(&self) -> PolicyBaseline {
+        PolicyBaseline {
+            access: self.session.access.abbreviation().to_owned(),
+            approval: self.session.approval_mode,
+        }
+    }
+
     /// Resolve caller policy intent inside the owner before choosing affected execution.
     pub(crate) fn owner_permission_patch(
         &self,
@@ -1607,48 +1713,85 @@ impl HarnessBroker {
     ) -> Result<PermissionConfigurationResult> {
         let controller = self.task_controller.clone();
         controller.with_task_snapshot(|current| {
-            anyhow::ensure!(foreground_failure::same_retraction_task(current.as_ref(), captured.expected_task.as_ref())
-                && self.session.id == captured.session_id && self.session.provider == captured.provider
-                && self.session.provider_session_id == captured.provider_session_id
-                && self.session.access == captured.expected_access && self.session.approval_mode == captured.expected_approval,
-                "permission authority changed before configuration commit");
+            anyhow::ensure!(
+                foreground_failure::same_retraction_task(
+                    current.as_ref(),
+                    captured.expected_task.as_ref()
+                ) && self.session.id == captured.session_id
+                    && self.session.provider == captured.provider
+                    && self.session.provider_session_id == captured.provider_session_id
+                    && self.session.access == captured.expected_access
+                    && self.session.approval_mode == captured.expected_approval,
+                "permission authority changed before configuration commit"
+            );
             let previous = self.session.clone();
-            let previous_access = previous.access.abbreviation().to_owned();
-            let previous_approval = previous.approval_mode;
+            let baseline = self.owner_policy_baseline();
             let mut configured = previous.clone();
             configured.approval_mode = captured.selected_approval;
-            configured.approval_timeout = self.permission_coordinator.approval_timeout(&configured.id)?;
-            if let Some(access) = &captured.selected_access { configured.access = access.clone(); }
+            configured.approval_timeout = self
+                .permission_coordinator
+                .approval_timeout(&configured.id)?;
+            if let Some(access) = &captured.selected_access {
+                configured.access = access.clone();
+            }
             self.session = configured;
-            self.permission_coordinator.configure_timeout(&self.session.id, self.session.approval_timeout)?;
+            self.permission_coordinator
+                .configure_timeout(&self.session.id, self.session.approval_timeout)?;
             if let Err(error) = self.save_session() {
-                self.permission_coordinator.configure_timeout(&previous.id, previous.approval_timeout)?;
+                self.permission_coordinator
+                    .configure_timeout(&previous.id, previous.approval_timeout)?;
                 self.session = previous;
                 return Err(error);
             }
             self.save_preference(false)?;
             if let Some(access) = captured.selected_access {
                 let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
-                let portable = crate::settings::PortableSettings { access: Some(access), ..Default::default() };
-                settings.patch(crate::settings::SettingTarget { scope: crate::settings::SettingScope::Session,
-                    workspace: &self.session.workspace, session: &self.session.id }, &portable)?;
+                let portable = crate::settings::PortableSettings {
+                    access: Some(access),
+                    ..Default::default()
+                };
+                settings.patch(
+                    crate::settings::SettingTarget {
+                        scope: crate::settings::SettingScope::Session,
+                        workspace: &self.session.workspace,
+                        session: &self.session.id,
+                    },
+                    &portable,
+                )?;
             }
-            let update = SessionUpdate::Configuration { snapshot: Box::new(self.snapshot()?),
+            let update = SessionUpdate::Configuration {
+                snapshot: Box::new(self.snapshot()?),
                 operation_id: captured.operation_id,
-                catalog: Box::new(self.provider_catalog_request()?) };
+                catalog: Box::new(self.provider_catalog_request()?),
+            };
             let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Update(update))?;
             let resume = if captured.resume {
-                let previous = self.store.latest_exchange(&self.session.id)?.context("interrupted exchange is missing")?;
+                let previous = self
+                    .store
+                    .latest_exchange(&self.session.id)?
+                    .context("interrupted exchange is missing")?;
                 if previous.is_finished() {
                     None
                 } else {
-                    let notice = format!("The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. Saved approval rules still apply. Preserve completed work. Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
-                        previous_access, self.session.access.abbreviation(), previous_approval.label(), captured.selected_approval.label());
-                    Some(if previous.elicitation().is_some() { notice } else { format!("{notice}\n\nOriginal request: {}", previous.prompt) })
+                    let notice = baseline.resume_notice(
+                        self.session.access.abbreviation(),
+                        captured.selected_approval,
+                    );
+                    Some(if previous.elicitation().is_some() {
+                        notice
+                    } else {
+                        format!("{notice}\n\nOriginal request: {}", previous.prompt)
+                    })
                 }
-            } else { None };
+            } else {
+                None
+            };
             let value = serde_json::to_value(self.snapshot()?)?;
-            Ok(PermissionConfigurationResult { delivery, resume, value })
+            Ok(PermissionConfigurationResult {
+                delivery,
+                resume,
+                value,
+            })
         })
     }
 
@@ -1667,12 +1810,7 @@ impl HarnessBroker {
             .load_exchange(selected.as_str())?
             .context("no Harness interaction is available to resume")?;
         anyhow::ensure!(
-            interaction.state() == ExchangeState::Running
-                && interaction.execution_started_at_ms().is_none()
-                && interaction
-                    .turn
-                    .iter()
-                    .all(|turn| turn.state() != crate::turn::TurnState::Running),
+            interaction.is_parked(),
             "the selected Harness exchange is not paused for resumption"
         );
         let pending_plan = if self.active_plan_awaits_input()? {
@@ -1734,14 +1872,12 @@ impl HarnessBroker {
             "the selected Harness exchange is awaiting a user decision"
         );
         let mode = self.task_prompt_mode()?;
-        let planning = if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-            let task = self
-                .task_controller
-                .current()?
-                .context("planning requires an active task")?;
-            Some(self.capture_planning_context(&task)?)
-        } else {
-            None
+        let planning = match self.task_controller.current()? {
+            Some(task) => self.planning_context(&task, mode)?,
+            None if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) => {
+                anyhow::bail!("planning requires an active task")
+            }
+            None => None,
         };
         let staged = self.stage_selected_foreground_interaction(
             &text,
@@ -1762,8 +1898,7 @@ impl HarnessBroker {
         action: Value,
         command: ConfigurationCommand,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let previous_permission = self.session.approval_mode;
-        let previous_access = self.session.access.abbreviation();
+        let baseline = self.owner_policy_baseline();
         let mut access = self.session.access.clone();
         let mut permission_access = None;
         let mut permission = self.session.approval_mode;
@@ -1888,12 +2023,8 @@ impl HarnessBroker {
             &mut Vec::new(),
         )
         .await?;
-        let permission_notice = (command == ConfigurationCommand::Permission).then(|| format!(
-            "The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. \
-             Saved approval rules still apply. Preserve completed work. \
-             Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
-            previous_access, self.session.access.abbreviation(), previous_permission.label(), permission.label()
-        ));
+        let permission_notice = (command == ConfigurationCommand::Permission)
+            .then(|| baseline.resume_notice(self.session.access.abbreviation(), permission));
         if resume {
             self.configuration_progress(ConfigurationProgressState::Resuming)
                 .await?;
@@ -1929,31 +2060,26 @@ mod owned_tests {
             let data = tempfile::tempdir()?;
             let mut broker =
                 super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-            let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+            let owner = crate::provider::ThreadOwner::root(&broker.session.id);
             let descriptor = forge_providers::registry::descriptor(
                 &forge_providers::registry::nonselectable_id().unwrap(),
             )
             .unwrap();
             let native = crate::provider::test_support::EventFixtureProvider::new(
                 descriptor,
-                |request, sink, _| async move {
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::ExecutionObservation::new(
-                            request.scope,
-                            forge_provider_api::ExecutionUpdate::ResolvedWithoutExecution {
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 1,
-                                result: forge_provider_api::ExecutionResult::Completed {
-                                    completion:
-                                        forge_provider_api::completion::ProviderCompletion::default(
-                                        )
-                                        .into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                |request, _writer, start, _| async move {
+                    start.observed(0).await?;
+                    Ok(forge_provider_api::TurnResult::new(
+                        crate::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        1,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture accepted input coverage has no conflicts"))
                 },
             );
             let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1968,7 +2094,7 @@ mod owned_tests {
                         if reject {
                             return Err(ProviderError::Failure(
                                 ProviderFailure::new(
-                                    ProviderOperation::SessionConfigure,
+                                    ProviderOperation::ThreadConfigure,
                                     ProviderFailureKind::ResourceConflict,
                                 )
                                 .at_phase(
@@ -1987,7 +2113,7 @@ mod owned_tests {
             let engine = registry.owner(owner.clone()).await?;
             broker
                 .provider
-                .session_open(
+                .thread_open(
                     broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
                 )
                 .await?;
@@ -2026,12 +2152,13 @@ mod owned_tests {
                     .await?;
                 broker.certify_candidate_reconcile(&mut candidate, result)?;
                 broker.commit_configuration_candidate(candidate)?;
-                let bindings = bindings.lock().unwrap();
-                assert!(
-                    bindings.windows(2).all(|pair| pair[0] == pair[1]),
-                    "unchanged rejection replaced its binding"
-                );
-                drop(bindings);
+                {
+                    let bindings = bindings.lock().unwrap();
+                    assert!(
+                        bindings.windows(2).all(|pair| pair[0] == pair[1]),
+                        "unchanged rejection replaced its binding"
+                    );
+                }
                 let scope =
                     crate::provider::InvocationScope::new(owner, "after-rejected-configuration");
                 let (sink, _events) = crate::provider::events::channel(scope);
@@ -2160,14 +2287,16 @@ mod owned_tests {
             let data = tempfile::tempdir()?;
             let mut broker =
                 super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-            let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+            let owner = crate::provider::ThreadOwner::root(&broker.session.id);
             let descriptor = forge_providers::registry::descriptor(
                 &forge_providers::registry::nonselectable_id().unwrap(),
             )
             .unwrap();
             let native = crate::provider::test_support::EventFixtureProvider::new(
                 descriptor,
-                |_, _, _| async { Ok(()) },
+                |_, _, _, _| async {
+                    panic!("configuration-only fixture must not dispatch a native prompt")
+                },
             );
             native.with_session_configure({
                 let native = Arc::downgrade(&native);
@@ -2186,9 +2315,11 @@ mod owned_tests {
                         native
                             .event_sink(&owner)
                             .await?
-                            .send_wait(ProviderEvent::SessionIdentity {
-                                scope: crate::provider::EventScope::Binding { owner },
-                                provider_session_id: history.try_into().unwrap(),
+                            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                                thread_id: owner.thread_id(),
+                                event: forge_provider_api::ThreadEvent::IdentityResolved(
+                                    history.try_into().unwrap(),
+                                ),
                             })
                             .await?;
                         Ok(())
@@ -2201,7 +2332,7 @@ mod owned_tests {
             let engine = registry.owner(owner.clone()).await?;
             broker
                 .provider
-                .session_open(
+                .thread_open(
                     broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
                 )
                 .await?;
@@ -2238,12 +2369,48 @@ mod owned_tests {
                         broker.session.provider_session_id.as_deref(),
                         Some("configured-history-1")
                     );
-                    broker.observe_session_event(ProviderEvent::SessionIdentity {
-                        scope: crate::provider::EventScope::Binding {
-                            owner: owner.clone(),
-                        },
-                        provider_session_id: "configured-history-0".to_owned().try_into().unwrap(),
-                    })?;
+                    let first_identity: forge_provider_api::ProviderSessionId =
+                        "configured-history-0".to_owned().try_into()?;
+                    let second_identity: forge_provider_api::ProviderSessionId =
+                        "configured-history-1".to_owned().try_into()?;
+                    let is_identity =
+                        |observation: &crate::provider::session_execution::OwnerObservation,
+                         expected: &forge_provider_api::ProviderSessionId| {
+                            if let crate::provider::session_execution::OwnerObservation::Event(
+                                HarnessEvent::Native { event, .. },
+                            ) = observation
+                            {
+                                matches!(event.as_ref(), ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::IdentityResolved(id), .. } if id == expected)
+                            } else {
+                                false
+                            }
+                        };
+                    let mut retained = Vec::new();
+                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        loop {
+                            retained.extend(broker.observer.session_events().drain()?);
+                            if [&first_identity, &second_identity].iter().all(|expected| {
+                                retained.iter().any(|event| is_identity(event, expected))
+                            }) {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    .context("configured identity prefix was not retained")??;
+                    let prior_identity = retained
+                        .iter()
+                        .find(|event| is_identity(event, &first_identity))
+                        .context("original identity frame missing")?
+                        .clone();
+                    let current_identity = retained
+                        .iter()
+                        .find(|event| is_identity(event, &second_identity))
+                        .context("current identity frame missing")?
+                        .clone();
+                    broker.observe_session_event(prior_identity)?;
                     assert_eq!(
                         broker.session.provider_session_id.as_deref(),
                         Some("configured-history-1")
@@ -2262,12 +2429,7 @@ mod owned_tests {
                         broker.session.provider_session_id.as_deref(),
                         Some("configured-history-1")
                     );
-                    broker.observe_session_event(ProviderEvent::SessionIdentity {
-                        scope: crate::provider::EventScope::Binding {
-                            owner: owner.clone(),
-                        },
-                        provider_session_id: "configured-history-1".to_owned().try_into().unwrap(),
-                    })?;
+                    broker.observe_session_event(current_identity)?;
                     let (mut exchange, _, _) = broker
                         .test_stage_interaction_for_turn("Preserve configured identity", true, 100)
                         .await?;
@@ -2550,14 +2712,13 @@ mod owned_tests {
             .expect("unadvertised isolation was accepted");
         assert!(error.is::<forge_provider_api::model::AccessCapabilityError>());
         assert_eq!(broker.session.access, original);
+        // An unsupported sandbox is a saved preference: the candidate accepts it and resolves the
+        // runtime policy to what the provider enforces.
         let mut unavailable_sandbox = original.clone();
         unavailable_sandbox.sandbox = true;
         let preparation = broker.prepare_configuration(json!({"access":unavailable_sandbox}))?;
-        assert!(
-            broker
-                .build_configuration_candidate(preparation, &[])
-                .is_err()
-        );
+        let candidate = broker.build_configuration_candidate(preparation, &[])?;
+        assert!(!candidate.configured.access.sandbox);
         assert_eq!(broker.session.access, original);
         Ok(())
     }
@@ -2592,7 +2753,7 @@ mod owned_tests {
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
         let guard = ConfigurationWriteGuard {
             registry: Arc::clone(&broker.execution_registry),
-            owner: crate::provider::ExecutionOwner::root(&broker.session.id),
+            owner: crate::provider::ThreadOwner::root(&broker.session.id),
             controller: Arc::clone(&broker.task_controller),
             armed: true,
         };
@@ -2669,6 +2830,139 @@ mod owned_tests {
         let after = broker.store.latest_exchange(&broker.session.id)?.unwrap();
         assert_eq!(after.id, exchange.id);
         assert!(after.is_finished());
+        Ok(())
+    }
+    /// Queued metadata retains its old connection identity across replacement of the native binding.
+    #[tokio::test]
+    async fn retired_binding_metadata_cannot_replace_current_capabilities_or_context() -> Result<()>
+    {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let owner = crate::provider::ThreadOwner::root(&broker.session.id);
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().unwrap(),
+        )
+        .unwrap();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            |_, _, _, _| async { panic!("metadata fixture never dispatches a prompt") },
+        );
+        let fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(native.clone())?;
+        broker.set_provider_for_test(fixture.provider_handle());
+        let mut old_stream = broker.provider.session_events(owner.clone()).await?;
+        let request = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
+        let old_history = broker
+            .provider
+            .thread_open(request.clone())
+            .await?
+            .context("old native history missing")?;
+        let old_writer = native.event_sink(&owner).await?;
+        old_writer
+            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::IdentityResolved(old_history),
+            })
+            .await?;
+        let mut old_capabilities =
+            forge_provider_api::CapabilityManifest::from_descriptor(broker.provider.descriptor());
+        old_capabilities.effective_revision = 500;
+        native
+            .publish_capabilities(&owner, old_capabilities)
+            .await?;
+        old_writer
+            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::ContextUsage(
+                    crate::session::ContextUsage::reported(900, 1000).unwrap(),
+                ),
+            })
+            .await?;
+        // The open's host manifest precedes three native metadata events on the old stream.
+        let mut queued = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while queued.len() < 4 {
+                let observation = old_stream
+                    .recv()
+                    .await?
+                    .context("old binding stream ended before metadata")?;
+                if let Some((binding, sequence)) = &observation.native {
+                    broker.provider.event_consumed(binding, *sequence).await?;
+                }
+                queued.push(observation.event);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("fixture metadata did not reach its original host stream")??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            broker.provider.session_close_owner(&owner),
+        )
+        .await
+        .context("old binding collection did not settle its consumed prefix")??;
+        let mut current_stream = broker.provider.session_events(owner.clone()).await?;
+        let current_history = broker
+            .provider
+            .thread_open(request)
+            .await?
+            .context("replacement native history missing")?;
+        let current_writer = native.event_sink(&owner).await?;
+        current_writer
+            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::IdentityResolved(current_history.clone()),
+            })
+            .await?;
+        anyhow::ensure!(
+            old_writer.binding_id() != current_writer.binding_id(),
+            "fixture reused a retired binding identity"
+        );
+        current_writer
+            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::ContextUsage(
+                    crate::session::ContextUsage::reported(10, 2000).unwrap(),
+                ),
+            })
+            .await?;
+        for _ in 0..3 {
+            let current =
+                tokio::time::timeout(std::time::Duration::from_secs(3), current_stream.recv())
+                    .await??
+                    .context("replacement stream ended")?;
+            if let Some((binding, sequence)) = &current.native {
+                broker.provider.event_consumed(binding, *sequence).await?;
+            }
+            broker.observe_session_event(current.event)?;
+        }
+        assert_eq!(
+            broker.session.provider_session_id.as_deref(),
+            Some(current_history.as_str())
+        );
+        assert_eq!(
+            broker.session.context_usage,
+            crate::session::ContextUsage::reported(10, 2000)
+        );
+        let capabilities = serde_json::to_value(&broker.capability)?;
+        let context = broker.session.context_usage.clone();
+        let manifest = serde_json::to_value(&broker.latest_manifest)?;
+        let history = broker.session.provider_session_id.clone();
+        for observation in queued {
+            broker.observe_session_event(observation)?;
+        }
+        assert_eq!(serde_json::to_value(&broker.capability)?, capabilities);
+        assert_eq!(broker.session.context_usage, context);
+        assert_eq!(broker.session.provider_session_id, history);
+        assert_eq!(serde_json::to_value(&broker.latest_manifest)?, manifest);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            broker.provider.shutdown(),
+        )
+        .await
+        .context("replacement binding collection did not settle its consumed prefix")??;
         Ok(())
     }
 }

@@ -18,7 +18,8 @@ local compact = table.concat({ "pub struct Registry { pub first: u64, pub second
   "pub fn engine_handle(value: engine::Engine);", "fn hidden_helper();" }, "\n")
 compact = "/// Registry keeps the published handles and exposes the shared declarations used by callers throughout the application.\n" .. compact
 if bevy_navigation then compact = "use bevy::prelude::*;\n" .. compact end
-vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
+-- Saved checks keep planning out of the check-configuration turn.
+vim.fn.writefile({ '{"declaration_line_width":60,"checks":{}}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
 vim.fn.writefile({ "/// Exposes movement declarations.", "pub mod change;", "/// Consumes movement declarations.", "mod input_consumer;" }, workspace .. "/src/lib.rs")
 vim.fn.writefile({ "use engine::*;", "use crate::change::MovementInput;", "/// Uses sampled movement intent.",
@@ -42,8 +43,10 @@ for path, contents in pairs(configuration) do
 end
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
+local declaration_plan = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/declaration_plan.lua")
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors, validation_notifications = {}, {}
@@ -60,6 +63,41 @@ end }
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
+-- Declaration targets whose captured source is unchanged resolve through the language server
+-- first. Without the Bevy variant's real rust-analyzer, resolve the identifier at the queried
+-- source position to its declaration in the fixture workspace, as the server would.
+if not bevy_navigation then
+  require("forge.views.plan_review.workspace_definition").request = function(query, current, receive)
+    local line = vim.fn.readfile(query.path)[query.line] or ""
+    local before, after = line:sub(1, query.column):match("[%w_]*$"), line:sub(query.column + 1):match("^[%w_]*")
+    local name = before .. after
+    local cancelled = false
+    vim.schedule(function()
+      if cancelled or not current() then return end
+      -- The workspace crate and its path dependency hold every fixture declaration.
+      local paths = vim.fn.globpath(workspace .. "/src," .. engine .. "/src", "*.rs", false, true)
+      -- A `use path::Original as Alias;` import resolves the alias to its original declaration.
+      for _, path in ipairs(paths) do
+        for _, candidate in ipairs(vim.fn.readfile(path)) do
+          name = candidate:match("([%w_]+) as " .. vim.pesc(name) .. ";") or name
+        end
+      end
+      for _, path in ipairs(paths) do
+        for index, candidate in ipairs(vim.fn.readfile(path)) do
+          for _, keyword in ipairs({ "struct ", "enum ", "fn " }) do
+            local start = candidate:find("%f[%w_]" .. keyword .. vim.pesc(name) .. "%f[^%w_]")
+            if start then
+              receive({ path = path, line = index, column = start - 1 + #keyword })
+              return
+            end
+          end
+        end
+      end
+      receive(nil, nil, "no fixture definition for " .. name)
+    end)
+    return function() cancelled = true end
+  end
+end
 package.loaded["forge.views.plan_review"] = require("forge.views.plan_review.native_controller")
 local function await(predicate, message)
   local completed = vim.wait(30000, function() return #errors > 0 or predicate() end, 10)
@@ -76,14 +114,49 @@ local success, failure = xpcall(function()
   require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
-  vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan revise the registry interface" })
-  require("forge.views.harness.controller").submit()
-  await(function() return not state.busy and state.active_plan end, "mock design did not arrive")
+  local configuration_revision = {}
+  for _, path in ipairs({ "Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj", ".gitignore" }) do
+    local contents = path == "Cargo.toml" and manifest or configuration[path]
+    configuration_revision[#configuration_revision + 1] = { path = path, baseline = contents,
+      proposed = (contents:gsub('"0%.1%.0"', '"0.2.0"', 1)) }
+  end
+  declaration_plan.submit({
+    request = "revise the registry interface",
+    overview = {
+      objective = "Revise the registry interface.",
+      background = "The registry owns published handles used by its callers.",
+      requirements = { "Preserve the registry ownership boundary." },
+      design = "Revise the registry interface while preserving its ownership boundary.",
+      verification = { "Confirm the requested interface behaves as designed." },
+    },
+    source = { { path = "src/change.rs", declaration = { "pub fn reviewed_change();", "Algorithm", "  return none" } } },
+    configuration = configuration_revision,
+  })
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.active_plan
+    and state.active_plan.state == "awaiting_review" end, "mock design did not arrive")
   local plan = state.active_plan
+  -- Completed exchanges keep their change summaries collapsed until the user opens them.
+  local function expand_transcript(heading, child)
+    local controller = require("forge.views.harness.controller")
+    for index, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+      if line:find(heading, 1, true) then
+        vim.api.nvim_set_current_win(state.transcript_win)
+        vim.api.nvim_win_set_cursor(state.transcript_win, { index, 0 })
+        controller.toggle_activity()
+        await(function() return text(state.transcript_buf):find(child, 1, true) ~= nil end, heading .. " did not expand")
+        return
+      end
+    end
+    error("transcript has no " .. heading .. " summary:\n" .. text(state.transcript_buf))
+  end
+  expand_transcript("Proposed changes", "Modified src/change.rs")
+  expand_transcript("Plan overview", "Objective")
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(transcript:find("Proposed changes", 1, true) and transcript:find("Modified src/change.rs", 1, true),
     "submitted declaration plan did not expose individual file changes")
-  assert(transcript:find("Plan overview 5 sections", 1, true) and not transcript:find("Artifact:", 1, true),
+  -- A first submission diffs against an empty overview, so the Tests inventory's "None planned"
+  -- text counts as a new section beside the five scripted fields.
+  assert(transcript:find("Plan overview 6 sections", 1, true) and not transcript:find("Artifact:", 1, true),
     "declaration submission still displays the rendered artifact diff")
   for _, baseline in ipairs({ false, true }) do
     local declaration, declaration_failure
@@ -93,7 +166,8 @@ local success, failure = xpcall(function()
     end)
     await(function() return declaration or declaration_failure end, "saved declaration read did not finish")
     assert(not declaration_failure, declaration_failure)
-    assert(declaration.text:find(baseline and "pub struct Registry" or "pub fn reviewed_change();", 1, true),
+    -- The proposed side presents the Algorithm as the callable body, so match the signature prefix.
+    assert(declaration.text:find(baseline and "pub struct Registry" or "pub fn reviewed_change(", 1, true),
       "declaration navigation read the wrong submitted side")
   end
   plan.validation_warning = { { path = "lib.rs", message = "review validation warning fixture" } }
@@ -176,8 +250,10 @@ local success, failure = xpcall(function()
   assert(review.public_only == true and review.owner.public_only == true, "review did not default to Public")
   visibility_label(true)
   assert(not text(review.buf):find("secret:", 1, true), "default Public view exposed private fields")
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
-  await(function() return review.public_only == false end, "first Shift+Tab did not show All")
+  -- The shared diff visibility toggle (keymaps.diff.toggle_visibility) replaced Shift+Tab.
+  local visibility_key = require("forge.infra.config").options.keymaps.diff.toggle_visibility
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(visibility_key, true, false, true), "xt", false)
+  await(function() return review.public_only == false end, "first visibility toggle did not show All")
   visibility_label(false)
   local selection_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -202,7 +278,8 @@ local success, failure = xpcall(function()
   assert(review.owner.replica.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n", "plan copy retained gutter selection")
   vim.g.clipboard = previous_clipboard
   assert(text(review.buf):find(document.design.document.design, 1, true), "change description is missing")
-  assert(text(review.buf):find(" Objective \n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
+  -- Section headings are separated from their body by a blank row.
+  assert(text(review.buf):find(" Objective \n\n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
   local last_section = 0
   for _, heading in ipairs({ " Objective ", " Requirements ", " Background ", " Design ", " Changes ", "Tests · None planned", " Verification " }) do
     local position = assert(text(review.buf):find(heading, 1, true), "missing plan section: " .. heading)
@@ -243,33 +320,52 @@ local success, failure = xpcall(function()
     review.command_set.action_by_id.toggle.run({})
     if projected then await(function() return replica.revision > revision end, "container toggle did not settle") end
   end
+  -- Overview sections collapse by projection: their body rows leave the buffer instead of
+  -- entering a native fold. A label is visible when a buffer row holds it outside closed folds.
+  local function visible(label)
+    for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if line:find(label, 1, true) then return closed(row) == -1 end
+    end
+    return false
+  end
+  local objective_text, design_text = document.design.document.objective, document.design.document.design
+  local layout = vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)
   assert(closed(description_row) == -1 and closed(changes_row) == -1, "plan sections did not start expanded")
   toggle(task_row)
-  assert(closed(task_row + 1) == task_row and closed(description_row) == -1, "task fold hid the description")
+  assert(not visible(objective_text) and visible(" Design ") and visible(design_text), "task fold hid the description")
   toggle(task_row)
+  assert(visible(objective_text), "task fold did not reopen")
   toggle(description_row)
-  assert(closed(description_row + 1) == description_row and closed(file_row) == -1,
+  assert(not visible(design_text) and visible("Modified src/change.rs"),
     "description fold hid changes or left its body visible")
   toggle(description_row)
   toggle(changes_row)
-  assert(closed(file_row) == changes_row and closed(hunk_row) == changes_row and closed(description_row) == -1,
+  assert(not visible("Modified src/change.rs") and visible(" Changes ") and visible(design_text),
     "changes fold left descendants visible or hid the description")
   toggle(changes_row)
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), layout),
+    "section reopening changed the review layout")
   assert(closed(file_row) == -1 and closed(hunk_row) == -1, "section reopening changed child folds")
+  -- Files and hunks also collapse by projection, so compare their rows with the expanded layout.
+  local function row_text(row) return vim.api.nvim_buf_get_lines(review.buf, row - 1, row, false)[1] end
+  local file_heading, hunk_heading, hunk_body = layout[file_row], layout[hunk_row], layout[hunk_row + 1]
+  local function shows(row, expected) return row_text(row) == expected and closed(row) == -1 end
   toggle(file_row)
-  assert(closed(file_row) == file_row and closed(hunk_row) == file_row,
+  assert(shows(file_row, file_heading) and row_text(hunk_row) ~= hunk_heading,
     "closing a file left its first hunk visible")
   toggle(file_row)
-  assert(closed(file_row) == -1 and closed(hunk_row) == -1, "file did not reopen")
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), layout), "file did not reopen")
   toggle(hunk_row)
-  assert(closed(file_row) == -1 and closed(hunk_row) == hunk_row, "hunk did not close independently")
+  assert(shows(file_row, file_heading) and shows(hunk_row, hunk_heading) and row_text(hunk_row + 1) ~= hunk_body,
+    "hunk did not close independently")
   toggle(hunk_row)
-  vim.api.nvim_win_set_cursor(review.win, { file_row, 0 })
-  vim.api.nvim_win_call(review.win, function() vim.cmd("normal! zc") end)
-  assert(closed(hunk_row) == file_row, "native file folding left its first hunk visible")
-  vim.api.nvim_win_call(review.win, function() vim.cmd("normal! zo") end)
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), layout), "hunk did not reopen")
+  -- Forge keeps collapsed descendants out of the buffer instead of using native folds
+  -- (contributing/forge/architecture/buffers-and-rendering.md), so the file has no native fold.
+  assert(vim.api.nvim_win_call(review.win, function() return vim.fn.foldlevel(file_row) end) == 0,
+    "PlanReview file headings retained a native fold")
   local function public_key()
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(visibility_key, true, false, true), "xt", false)
   end
   local function declaration_row(label)
     for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -611,7 +707,7 @@ local success, failure = xpcall(function()
   await(function() return not vim.bo[review.buf].modified end, "private comment did not save")
   local comments = bytes(annotation_path)
   public_key()
-  await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
+  await(function() return review.public_only == true end, "visibility toggle did not enable public visibility")
   assert(text(review.buf):find("Modified Cargo.toml", 1, true), "public filter hid manifest changes")
   assert(text(review.buf):find("Modified .gitignore", 1, true) < text(review.buf):find("Modified Cargo.toml", 1, true),
     "root ignore configuration must precede package files")
@@ -667,7 +763,7 @@ local success, failure = xpcall(function()
 
   toggle(file_row)
   public_key()
-  await(function() return review.public_only == false end, "Shift+Tab did not restore complete visibility")
+  await(function() return review.public_only == false end, "visibility toggle did not restore complete visibility")
   assert(text(review.buf):find("secret:", 1, true) and text(review.buf):find("Review the private field", 1, true),
     "public filtering discarded private declarations or comments")
   assert(bytes(annotation_path) == comments and bytes(artifact_path) == artifact
@@ -777,7 +873,7 @@ local success, failure = xpcall(function()
     "approval allowed editing or premature document closure")
   client.request = original_request
   original_request(unpack(pending_approval))
-  await(function() return state.plan_review == nil and not state.busy end, "approval did not settle")
+  await(function() return state.plan_review == nil and not require("forge.views.harness.activity").busy(state) end, "approval did not settle")
   assert(bytes(workspace .. "/src/change.rs") == compact .. "\n", "design approval changed project source")
   assert(bytes(artifact_path) == artifact, "approval reformatted the saved design")
   require("forge.views.harness.controller").command_set().action_by_id.close.run({})

@@ -105,7 +105,10 @@ pub struct Exchange {
     pub attributed_matches_checkpoint: bool,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
-    pub approval_resolution: Vec<crate::provider::approval::ApprovalRequestView>,
+    pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
+    /// Committed host file operations retain their own callback identity.
+    #[serde(default)]
+    pub(crate) host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
     /// Owns the setup question boundary independently of the active plan.
     pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
@@ -170,7 +173,10 @@ struct ExchangeRecord {
     pub attributed_matches_checkpoint: bool,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
-    pub approval_resolution: Vec<crate::provider::approval::ApprovalRequestView>,
+    pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
+    /// Committed host file operations retain their own callback identity.
+    #[serde(default)]
+    pub(crate) host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
     /// Owns the setup question boundary independently of the active plan.
     pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
@@ -200,6 +206,52 @@ impl<'de> Deserialize<'de> for Exchange {
         deserializer: Deserializer,
     ) -> Result<Self, Deserializer::Error> {
         let mut exchange = ExchangeRecord::deserialize(deserializer)?;
+        let mut retained_tools = std::collections::HashSet::new();
+        for entry in &exchange.entry {
+            if let super::ExchangeEntry::Commentary { commentary } = entry {
+                for tools in &commentary.tool {
+                    let turn = exchange
+                        .turn
+                        .iter()
+                        .find(|turn| turn.id() == tools.turn_id)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("tool store has no original turn")
+                        })?;
+                    if !tools.store.belongs_to(turn.provider()) {
+                        return Err(serde::de::Error::custom(
+                            "tool store disagrees with its original turn",
+                        ));
+                    }
+                    for tool in tools.store.iter() {
+                        if !retained_tools.insert((turn.id().to_owned(), tool.id.clone())) || !turn.items().iter().any(|item| matches!(item, crate::turn::TurnItem::Tool { id } if id == &tool.id)) {
+                            return Err(serde::de::Error::custom("tool has duplicate or unadmitted transcript ownership"));
+                        }
+                    }
+                }
+            }
+        }
+        for turn in &exchange.turn {
+            for item in turn.items() {
+                if let crate::turn::TurnItem::Tool { id } = item
+                    && !retained_tools.contains(&(turn.id().to_owned(), id.clone()))
+                {
+                    return Err(serde::de::Error::custom(
+                        "admitted tool has no retained original store",
+                    ));
+                }
+            }
+        }
+        let changes = std::mem::take(&mut exchange.host_file_changes);
+        for change in changes {
+            if !exchange
+                .record_host_file_change(&change)
+                .map_err(serde::de::Error::custom)?
+            {
+                return Err(serde::de::Error::custom(
+                    "duplicate committed host file operation",
+                ));
+            }
+        }
         exchange
             .reconcile_entries()
             .map_err(serde::de::Error::custom)?;
@@ -322,6 +374,7 @@ impl Exchange {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             created_at_ms: delegation.created_at_ms,
             tool_counter: Default::default(),
@@ -335,6 +388,65 @@ impl Exchange {
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
         }
+    }
+
+    /// Admit a registry-proven native child without manufacturing a submitted host input.
+    pub(crate) fn observed(
+        id: String,
+        ordinal: u64,
+        address: crate::provider::TurnAddress,
+        started_at_ms: i64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !id.trim().is_empty() && ordinal > 0,
+            "observed exchange identity is incomplete"
+        );
+        anyhow::ensure!(
+            address.thread_id == address.scope.owner.thread_id()
+                && address.turn_id == address.scope.turn_id()?,
+            "observed turn identity disagrees with original owner"
+        );
+        let mut exchange = Self {
+            id: id.clone(),
+            session_id: address.scope.owner.session_id().as_str().to_owned(),
+            agent_id: address.scope.owner.agent_id().as_str().to_owned(),
+            ordinal,
+            prompt: String::new(),
+            origin: crate::exchange::ExchangeOrigin::NativeAgent,
+            approval_mode: None,
+            phase: crate::exchange::ExchangePhase::Running,
+            finalization_error: None,
+            check_owner: None,
+            output_store: None,
+            archived_output: Default::default(),
+            input_message_id: None,
+            provider_retry: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
+            check_setup: None,
+            created_at_ms: started_at_ms,
+            tool_counter: Default::default(),
+            entry: Vec::new(),
+            node_list: Vec::new(),
+            turn: vec![crate::turn::Turn::new(
+                format!("{}:turn:1", id),
+                address,
+                started_at_ms,
+            )],
+            metrics: ExchangeMetrics::default(),
+            comment: Vec::new(),
+            checklist: None,
+
+            question: crate::exchange::ExchangeQuestion::None,
+            clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
+        };
+        exchange.clock.resume(started_at_ms);
+        Ok(exchange)
     }
 
     /// Freeze execution for persistence, allowing later cleanup or capture failure to downgrade the outcome.
@@ -392,19 +504,6 @@ impl Exchange {
         }
     }
 
-    /// Retain fresh usage on the latest compaction without changing settled history.
-    pub(crate) fn observe_compaction_usage(&mut self, thread_id: &str, used: u64) -> bool {
-        let Some(compaction) = self.node_list.iter_mut().rev().find_map(|node| match node {
-            ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id => {
-                Some(compaction)
-            }
-            _ => None,
-        }) else {
-            return false;
-        };
-        compaction.observe_context_usage(used)
-    }
-
     /// Stop active compaction presentation when its provider execution ends without confirmation.
     pub(crate) fn unconfirm_compaction(&mut self, thread_id: &str, now_ms: i64) {
         for node in &mut self.node_list {
@@ -418,198 +517,395 @@ impl Exchange {
         }
     }
 
-    /// Route provider lifecycle and tool provenance before accepting presentation content.
-    pub(crate) fn observe_turn(
+    /// Retain a committed host effect without rewriting native item snapshots.
+    pub(crate) fn record_host_file_change(
         &mut self,
-        event: &crate::provider::ProviderEvent,
+        change: &crate::tools::lsp::HostFileChange,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.owns_scope(&crate::provider::EventScope::Invocation {
+                invocation: change.scope.clone()
+            }),
+            "host file operation crosses invocation ownership"
+        );
+        if let Some(item_id) = &change.native_item_id {
+            anyhow::ensure!(
+                self.turn
+                    .iter()
+                    .any(|turn| turn.provider().scope == change.scope
+                        && self
+                            .tools_for_turn(turn.id())
+                            .any(|tool| tool.id == item_id.as_str())),
+                "host file operation has no positively correlated native item"
+            );
+        }
+        if let Some(previous) = self
+            .host_file_changes
+            .iter_mut()
+            .find(|previous| previous.scope == change.scope && previous.call_id == change.call_id)
+        {
+            anyhow::ensure!(
+                previous.changes == change.changes,
+                "committed host file operation cannot change"
+            );
+            match (&previous.native_item_id, &change.native_item_id) {
+                (Some(before), Some(after)) => anyhow::ensure!(
+                    before == after,
+                    "host callback cannot move to another native item"
+                ),
+                (None, Some(item)) => {
+                    previous.native_item_id = Some(item.clone());
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        self.host_file_changes.push(change.clone());
+        Ok(true)
+    }
+
+    /// Apply fixture observations through the same original-owner reducers.
+    #[cfg(test)]
+    pub(crate) fn observe_event(
+        &mut self,
+        event: &crate::provider::HarnessEvent,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        use crate::provider::{ProviderEvent, TurnUpdate};
-        use crate::turn::TurnState;
-        let event_scope = event.scope();
-        let Some(scope) = event_scope.invocation() else {
+        match event {
+            crate::provider::HarnessEvent::Native { scope, event, .. } => {
+                let event = event.as_ref();
+                self.observe_provider_event(scope, event, now_ms)
+            }
+            crate::provider::HarnessEvent::Host { scope, event } => {
+                self.observe_host_event(scope, event, now_ms)
+            }
+        }
+    }
+
+    fn owns_scope(&self, scope: &crate::provider::EventScope) -> bool {
+        scope.invocation().is_some_and(|scope| {
+            (scope.exchange_id.as_str() == self.id
+                || self.turn.iter().any(|turn| &turn.provider().scope == scope))
+                && scope.owner.session_id().as_str() == self.session_id
+                && scope.owner.agent_id().as_str() == self.agent_id
+        })
+    }
+
+    /// Reduce native evidence without deriving ownership from the currently visible turn.
+    pub(crate) fn observe_provider_event(
+        &mut self,
+        scope: &crate::provider::EventScope,
+        event: &forge_provider_api::ProviderEvent,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let mut candidate = self.clone();
+        let changed = candidate.reduce_provider_event(scope, event, now_ms)?;
+        if changed {
+            *self = candidate;
+        }
+        Ok(changed)
+    }
+
+    fn reduce_provider_event(
+        &mut self,
+        scope: &crate::provider::EventScope,
+        event: &forge_provider_api::ProviderEvent,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        use forge_provider_api::{ItemEvent, ItemStart, ProviderEvent, TurnEvent};
+        if !self.owns_scope(scope) {
             return Ok(false);
+        }
+        let (thread_id, turn_id) = match event {
+            ProviderEvent::Turn {
+                thread_id, turn_id, ..
+            }
+            | ProviderEvent::Item {
+                thread_id, turn_id, ..
+            } => (thread_id, turn_id),
+            _ => return Ok(false),
         };
-        if (scope.exchange_id != forge_provider_api::ExchangeId::from(self.id.as_str())
-            && !self.turn.iter().any(|turn| &turn.provider().scope == scope))
-            || scope.owner.session_id
-                != forge_provider_api::SessionId::from(self.session_id.as_str())
-            || scope.owner.agent_id != forge_provider_api::AgentId::from(self.agent_id.as_str())
+        let address = crate::provider::TurnAddress {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            scope: scope.invocation().expect("validated invocation").clone(),
+        };
+        if let ProviderEvent::Turn {
+            event: TurnEvent::Started(start),
+            ..
+        } = event
         {
+            if let Some(existing) = self.turn.iter().find(|turn| turn.provider() == &address) {
+                anyhow::ensure!(
+                    existing.started_at_ms() == start.started_at_ms,
+                    "native start timestamp cannot change"
+                );
+                return Ok(false);
+            }
+            self.start_turn(address, start.started_at_ms)?;
+            return Ok(true);
+        }
+        let Some(index) = self
+            .turn
+            .iter()
+            .position(|turn| turn.provider() == &address)
+        else {
             return Ok(false);
-        }
-        if let ProviderEvent::Retry { update, .. } = event {
-            if self.state() != ExchangeState::Running
-                || self.is_finished()
-                || !self.turn.iter().any(|turn| &turn.provider().scope == scope)
-            {
-                return Ok(false);
-            }
-            self.provider_retry = update.clone();
-            return Ok(true);
-        }
-        let Some(address) = event.turn_address() else {
-            self.metrics.observe_elapsed(self.elapsed(now_ms));
-            return Ok(true);
         };
-        if let ProviderEvent::Usage { update, .. } = event {
-            let Some(index) = self.turn.iter().position(|turn| turn.provider() == address) else {
-                return Ok(false);
-            };
-            if let Some(usage) = self.metrics.usage(address, update.clone()) {
-                self.turn[index].record_usage(usage);
-                self.metrics
-                    .record_throughput(self.usage().output, self.elapsed(now_ms));
-            }
-            self.metrics.observe_elapsed(self.elapsed(now_ms));
-            return Ok(true);
-        }
         match event {
             ProviderEvent::Turn {
-                update: TurnUpdate::Started { started_at_ms },
+                event: TurnEvent::Completed(completed),
                 ..
             } => {
-                self.start_turn(address.clone(), *started_at_ms)?;
-            }
-            ProviderEvent::Turn {
-                update: TurnUpdate::CallFinished { completed_at_ms },
-                ..
-            } => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
+                let mut candidate = self.turn[index].clone();
+                if !candidate.complete(completed)? {
                     return Ok(false);
-                };
-                turn.finish_call(*completed_at_ms);
-            }
-            ProviderEvent::Turn {
-                update: TurnUpdate::Summary { summary },
-                ..
-            } => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
-                    return Ok(false);
-                };
-                turn.record_summary(summary);
-            }
-            ProviderEvent::Turn {
-                update:
-                    TurnUpdate::Finished {
-                        outcome,
-                        completed_at_ms,
-                    },
-                ..
-            } => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
-                    return Ok(false);
-                };
-                let turn_id = turn.id().to_owned();
-                turn.finish(*outcome, *completed_at_ms)?;
-                self.finish_tools(&turn_id, *outcome, *completed_at_ms);
+                }
+                self.metrics.complete_turn(&address, completed.result())?;
+                candidate.set_usage(self.metrics.turn_usage(&address));
+                self.turn[index] = candidate;
+                let turn_id = self.turn[index].id().to_owned();
+                self.finish_tools(
+                    &turn_id,
+                    completed.result().outcome(),
+                    completed.result().completed_at_ms(),
+                );
                 self.rebuild_tool_counter();
-                let prefix = format!("tool:{turn_id}:");
+                let ids = self
+                    .tools_for_turn(&turn_id)
+                    .map(|tool| format!("tool:{turn_id}:{}", tool.id))
+                    .collect::<Vec<_>>();
                 let elapsed = self.elapsed(now_ms);
-                for id in self
-                    .turn
-                    .iter()
-                    .find(|turn| turn.provider() == address)
-                    .into_iter()
-                    .flat_map(|turn| self.tools_for_turn(turn.id()))
-                    .map(|tool| format!("{prefix}{}", tool.id))
-                    .collect::<Vec<_>>()
-                {
+                for id in ids {
                     self.metrics.block(id, false, elapsed);
                 }
             }
-            ProviderEvent::Message { .. }
-            | ProviderEvent::Tool { .. }
-            | ProviderEvent::Checklist { .. } => {
-                let late_update = match event {
-                    ProviderEvent::Tool { address, update } => {
-                        self.accepts_settled_tool_update(address, update)
+            ProviderEvent::Turn {
+                event: TurnEvent::Usage(report),
+                ..
+            } => {
+                let mut candidate = self.turn[index].clone();
+                if !candidate.record_usage_report(report)? {
+                    return Ok(false);
+                }
+                self.metrics.usage_report(&address, report)?;
+                candidate.set_usage(self.metrics.turn_usage(&address));
+                self.turn[index] = candidate;
+            }
+            ProviderEvent::Turn {
+                event: TurnEvent::ChecklistUpdated(_),
+                ..
+            } => {
+                anyhow::ensure!(
+                    self.turn[index].completed().is_none(),
+                    "completed turn rejects checklist updates"
+                );
+                // The broker owns checklist aggregation after this original-turn admission check.
+            }
+            ProviderEvent::Turn {
+                event: TurnEvent::ModelResolved(model),
+                ..
+            } => {
+                if !self.turn[index].record_model(model)? {
+                    return Ok(false);
+                }
+            }
+            ProviderEvent::Turn {
+                event: TurnEvent::Error { error },
+                ..
+            } => {
+                if !self.turn[index].record_error(*error) {
+                    return Ok(false);
+                }
+            }
+            ProviderEvent::Item { item_id, event, .. } => {
+                let tool = matches!(
+                    event,
+                    ItemEvent::Started(
+                        ItemStart::CommandExecution(_)
+                            | ItemStart::FileChange(_)
+                            | ItemStart::ToolCall(_)
+                    ) | ItemEvent::Tool { .. }
+                        | ItemEvent::Completed(
+                            forge_provider_api::ItemCompletion::CommandExecution(_)
+                                | forge_provider_api::ItemCompletion::FileChange(_)
+                                | forge_provider_api::ItemCompletion::ToolCall(_)
+                        )
+                );
+                // A finished turn ignores late messages and tools it never admitted. Late updates to
+                // an admitted tool continue to record_tool_event, which accepts certified background
+                // completion and rejects contradictory foreground output.
+                let admitted_tool = tool
+                    && self.turn[index].items().iter().any(|item| {
+                        matches!(item, crate::turn::TurnItem::Tool { id } if id == item_id.as_str())
+                    });
+                if self.turn[index].state() != crate::turn::TurnState::Running && !admitted_tool {
+                    return Ok(false);
+                }
+                let turn_id = self.turn[index].id().to_owned();
+                let item_count = self.turn[index].items().len();
+                if tool {
+                    if !self.turn[index].items().iter().any(|item| matches!(item, crate::turn::TurnItem::Tool { id } if id == item_id.as_str())) {
+                        anyhow::ensure!(!self.turn[index].messages().iter().any(|message| message.provider_id() == item_id), "item cannot change content family");
+                        self.turn[index].admit_tool(item_id.as_str())?;
                     }
-                    _ => false,
-                };
-                let existing_tool = match event {
-                    ProviderEvent::Tool {
-                        address: tool_address,
-                        ..
-                    } => self
-                        .turn
-                        .iter()
-                        .find(|turn| turn.provider() == address)
-                        .is_some_and(|turn| {
-                            self.tools_for_turn(turn.id())
-                                .any(|tool| tool.id == tool_address.tool_id.as_str())
-                        }),
-                    _ => false,
-                };
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
-                    return Ok(false);
-                };
-                let retained_output = matches!(event, ProviderEvent::Message { .. })
-                    && turn.state()
-                        == (TurnState::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                        });
-                if turn.state() != TurnState::Running && !late_update && !retained_output {
-                    return Ok(false);
+                } else {
+                    self.turn[index].record_item_message(item_id, event)?;
                 }
-                let item_count = turn.items().len();
-                if let ProviderEvent::Tool { address, .. } = event
-                    && !existing_tool
-                {
-                    turn.admit_tool(address.tool_id.as_str())?;
-                }
-                if let ProviderEvent::Message { address, update } = event {
-                    turn.record_message(address, update)?;
-                }
-                let turn_id = turn.id().to_owned();
-                for item in turn.items()[item_count..].iter().cloned() {
+                for item in self.turn[index].items()[item_count..].iter().cloned() {
                     let item_id = match &item {
                         crate::turn::TurnItem::Message { id }
                         | crate::turn::TurnItem::Tool { id } => id,
                     };
+                    // A native user message that echoes a Forge submission repeats the prompt the
+                    // broker already rendered for that admitted action, so it stays turn evidence
+                    // without a transcript node. Native input from another client keeps its row.
+                    if let crate::turn::TurnItem::Message { id } = &item
+                        && self.turn[index]
+                            .messages()
+                            .iter()
+                            .any(|message| message.id() == id && message.submission_id().is_some())
+                    {
+                        continue;
+                    }
                     self.node_list.push(ExchangeNode::TurnContent {
                         id: format!("{turn_id}:content:{item_id}"),
                         turn_id: turn_id.clone(),
                         item,
                     });
                 }
-                self.reconcile_entries()?;
-                if let ProviderEvent::Tool { address, update } = event {
-                    self.record_tool_event(&turn_id, address, update, now_ms)?;
+                if tool {
+                    self.record_tool_event(&turn_id, &address, item_id, event, now_ms)?;
                     let tool = self
                         .tools_for_turn(&turn_id)
-                        .find(|tool| tool.id == address.tool_id.as_str())
-                        .expect("admitted tool has a durable record");
-                    let terminal = tool.state() != crate::turn::ToolState::Running;
-                    let started = tool.started_at_ms.is_some();
-                    let running = !terminal && started;
-                    if terminal && !started {
+                        .find(|tool| tool.id == item_id.as_str())
+                        .expect("recorded tool");
+                    let running = tool.state() == crate::turn::ToolState::Running
+                        && tool.started_at_ms.is_some();
+                    if tool.state() != crate::turn::ToolState::Running
+                        && tool.started_at_ms.is_none()
+                    {
                         self.metrics.timing_complete = false;
                     }
-                    let id = format!("tool:{turn_id}:{}", address.tool_id);
-                    let elapsed = self.clock.elapsed(now_ms);
-                    self.metrics.block(id, running, elapsed);
-                    if let crate::provider::ToolUpdate::SkillRead { read } = update {
-                        for read in read {
-                            let id = format!("{turn_id}:skill:{}", read.resource_id);
-                            if !self.node_list.iter().any(|node| node.id() == id) {
-                                self.node_list.push(ExchangeNode::SkillRead {
-                                    id,
-                                    turn_id: turn_id.clone(),
-                                    read: read.clone(),
-                                });
+                    let elapsed = self.elapsed(now_ms);
+                    self.metrics
+                        .block(format!("tool:{turn_id}:{item_id}"), running, elapsed);
+                }
+            }
+            _ => return Ok(false),
+        }
+        for turn in &mut self.turn {
+            turn.set_usage(self.metrics.turn_usage(turn.provider()));
+        }
+        self.reconcile_entries()?;
+        self.metrics.observe_elapsed(self.elapsed(now_ms));
+        Ok(true)
+    }
+
+    /// Keep host policy transitions separate from native turn lifecycle evidence.
+    pub(crate) fn observe_host_event(
+        &mut self,
+        scope: &crate::provider::EventScope,
+        event: &crate::provider::HostEvent,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        use crate::provider::{HostEvent, PermissionApprovalEvent, RetryEvent};
+        if !self.owns_scope(scope) {
+            return Ok(false);
+        }
+        match event {
+            HostEvent::RetryUpdated {
+                thread_id,
+                turn_id,
+                event,
+            } => {
+                if self.state() != ExchangeState::Running
+                    || self.is_finished()
+                    || !self.turn.iter().any(|turn| {
+                        turn.provider().thread_id == *thread_id
+                            && turn.provider().turn_id == *turn_id
+                            && &turn.provider().scope
+                                == scope.invocation().expect("validated scope")
+                    })
+                {
+                    return Ok(false);
+                }
+                self.provider_retry = match event {
+                    RetryEvent::Scheduled(retry) => Some(retry.clone()),
+                    RetryEvent::Cleared => None,
+                };
+            }
+            HostEvent::PermissionApproval {
+                event:
+                    event @ (PermissionApprovalEvent::Resolved(_)
+                    | PermissionApprovalEvent::Cancelled(_)),
+                ..
+            } => {
+                let request_id = match event {
+                    PermissionApprovalEvent::Resolved(value) => &value.request_id,
+                    PermissionApprovalEvent::Cancelled(value) => &value.request_id,
+                    PermissionApprovalEvent::Requested(_) => {
+                        unreachable!("terminal transition matched")
+                    }
+                };
+                if let Some(previous) =
+                    self.approval_resolution
+                        .iter()
+                        .find(|previous| match previous {
+                            PermissionApprovalEvent::Resolved(value) => {
+                                &value.request_id == request_id
                             }
-                        }
+                            PermissionApprovalEvent::Cancelled(value) => {
+                                &value.request_id == request_id
+                            }
+                            PermissionApprovalEvent::Requested(_) => false,
+                        })
+                {
+                    anyhow::ensure!(
+                        serde_json::to_value(previous)? == serde_json::to_value(event)?,
+                        "permission terminal resolution cannot change"
+                    );
+                    return Ok(false);
+                }
+                self.approval_resolution.push(event.clone());
+            }
+            HostEvent::SkillRead {
+                thread_id,
+                turn_id,
+                read,
+                ..
+            } => {
+                let Some(turn) = self.turn.iter().find(|turn| {
+                    turn.provider().thread_id == *thread_id
+                        && turn.provider().turn_id == *turn_id
+                        && &turn.provider().scope == scope.invocation().expect("validated scope")
+                }) else {
+                    return Ok(false);
+                };
+                let turn_id = turn.id().to_owned();
+                for read in read {
+                    let id = format!("{turn_id}:skill:{}", read.resource_id);
+                    if !self.node_list.iter().any(|node| node.id() == id) {
+                        self.node_list.push(ExchangeNode::SkillRead {
+                            id,
+                            turn_id: turn_id.clone(),
+                            read: read.clone(),
+                        });
                     }
                 }
             }
-            _ => {}
+            // The broker owns pending approvals, grants, child waits, capability adoption, and
+            // host failure presentation; none of them changes persisted exchange content.
+            HostEvent::PermissionApproval {
+                event: PermissionApprovalEvent::Requested(_),
+                ..
+            }
+            | HostEvent::DirectoryAccessGranted(_)
+            | HostEvent::ChildWait { .. }
+            | HostEvent::CapabilitiesNegotiated { .. }
+            | HostEvent::Failure { .. } => return Ok(false),
         }
-        self.reconcile_entries()?;
         self.metrics.observe_elapsed(self.elapsed(now_ms));
         Ok(true)
     }
@@ -627,7 +923,7 @@ impl Exchange {
             "completed exchange rejects new turns"
         );
         anyhow::ensure!(
-            !address.thread_id.is_empty() && !address.turn_id.as_str().is_empty(),
+            !address.thread_id.as_str().is_empty() && !address.turn_id.as_str().is_empty(),
             "provider turn address is incomplete"
         );
         anyhow::ensure!(
@@ -636,12 +932,16 @@ impl Exchange {
                     .turn
                     .iter()
                     .any(|turn| turn.provider().scope == address.scope))
-                && address.scope.owner.session_id
+                && *address.scope.owner.session_id()
                     == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && address.scope.owner.agent_id
-                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
+                && address.scope.owner.agent_id().as_str() == self.agent_id
                 && !address.scope.invocation_id.as_str().is_empty(),
             "provider invocation does not belong to this exchange"
+        );
+        anyhow::ensure!(
+            address.thread_id == address.scope.owner.thread_id()
+                && address.turn_id == address.scope.turn_id()?,
+            "native turn identity disagrees with original owner"
         );
         if let Some(index) = self
             .turn
@@ -649,8 +949,8 @@ impl Exchange {
             .position(|turn| turn.provider() == &address)
         {
             anyhow::ensure!(
-                self.turn[index].state() == crate::turn::TurnState::Running,
-                "completed provider turn cannot restart"
+                self.turn[index].started_at_ms() == now_ms,
+                "native start timestamp cannot change"
             );
             return Ok(());
         }
@@ -676,58 +976,6 @@ impl Exchange {
             .ok_or_else(|| anyhow::anyhow!("provider event has no admitted turn"))
     }
 
-    /// Reopen only a positively correlated new native execution under its retained invocation.
-    pub(crate) fn reopen_provider_execution(
-        &mut self,
-        address: crate::provider::TurnAddress,
-        now_ms: i64,
-    ) -> anyhow::Result<bool> {
-        if self.turn.iter().any(|turn| turn.provider() == &address) {
-            return Ok(false);
-        }
-        anyhow::ensure!(
-            self.state() == ExchangeState::Complete
-                || self.state() == ExchangeState::Finalizing
-                    && self.finalization_outcome() == Some(ExchangeOutcome::Complete),
-            "only successfully settled work can reopen from native activity"
-        );
-        anyhow::ensure!(
-            self.disposition() == HistoryDisposition::Current,
-            "superseded work cannot reopen"
-        );
-        anyhow::ensure!(
-            self.turn
-                .iter()
-                .any(|turn| turn.provider().scope == address.scope),
-            "native continuation has no retained invocation"
-        );
-        anyhow::ensure!(
-            address.scope.owner.session_id
-                == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && address.scope.owner.agent_id
-                    == forge_provider_api::AgentId::from(self.agent_id.as_str()),
-            "native continuation belongs to another owner"
-        );
-        anyhow::ensure!(
-            !address.thread_id.is_empty() && !address.turn_id.as_str().is_empty(),
-            "native continuation has no turn identity"
-        );
-        let ordinal = self
-            .turn
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("provider turn count overflowed"))?;
-        let turn = crate::turn::Turn::new(format!("{}:turn:{ordinal}", self.id), address, now_ms);
-        self.phase = super::ExchangePhase::Running;
-        self.finalization_error = None;
-        self.checkpoint_after = None;
-        self.checkpoint_diff_text = None;
-        self.attributed_matches_checkpoint = false;
-        self.clock.resume(now_ms);
-        self.turn.push(turn);
-        Ok(true)
-    }
-
     /// Revalidate host prerequisites for the same retained invocation after a stale ticket.
     pub(crate) fn revalidate_host_settlement(
         &mut self,
@@ -741,10 +989,9 @@ impl Exchange {
         );
         anyhow::ensure!(
             scope.exchange_id == forge_provider_api::ExchangeId::from(self.id.as_str())
-                && scope.owner.session_id
+                && *scope.owner.session_id()
                     == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && scope.owner.agent_id
-                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
+                && scope.owner.agent_id().as_str() == self.agent_id
                 && self
                     .turn
                     .last()
@@ -855,12 +1102,45 @@ impl Exchange {
         Ok(())
     }
 
+    /// Report an open exchange whose execution is paused with no provider turn still running.
+    ///
+    /// Collection leaves this state after [`Self::pause_for_restart`]. Only a continuation
+    /// selected for that exact exchange or a later admission closes it.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.state() == ExchangeState::Running
+            && self.execution_started_at_ms().is_none()
+            && self
+                .turn
+                .iter()
+                .all(|turn| turn.state() != crate::turn::TurnState::Running)
+    }
+
     /// Return accumulated execution time without allowing terminal history to tick.
     pub fn elapsed(&self, now_ms: i64) -> u64 {
         if self.state() == ExchangeState::Running {
             self.clock.elapsed(now_ms)
         } else {
             self.clock.duration_ms()
+        }
+    }
+
+    /// Read the clock that tool timers share with the Working timer.
+    ///
+    /// While the exchange runs this is its active execution clock, so approval and input
+    /// waits pause tool time exactly as they pause Working. After settlement it continues
+    /// in wall time from the frozen duration, so background commands keep counting.
+    pub(crate) fn tool_instant(&self, now_ms: i64) -> crate::turn::ToolInstant {
+        let active_ms = if self.state() == ExchangeState::Running {
+            self.clock.elapsed(now_ms)
+        } else {
+            let since_settled = self.completed_at_ms().map_or(0, |settled_at_ms| {
+                u64::try_from(now_ms.saturating_sub(settled_at_ms)).unwrap_or(0)
+            });
+            self.clock.duration_ms().saturating_add(since_settled)
+        };
+        crate::turn::ToolInstant {
+            wall_ms: now_ms,
+            active_ms: Some(active_ms),
         }
     }
 
@@ -876,7 +1156,6 @@ impl Exchange {
                     turn.state(),
                     crate::turn::TurnState::Finished {
                         outcome: crate::turn::TurnOutcome::Interrupted
-                            | crate::turn::TurnOutcome::Cancelled
                     }
                 )
             })
@@ -947,6 +1226,47 @@ impl Exchange {
         self.phase.set_disposition(disposition)
     }
 
+    /// Settle provider turns whose native terminal will not arrive with the exchange outcome.
+    ///
+    /// Collection that closes the observation stream can drop a turn's terminal event. Failure
+    /// finalization settles those turns before its checkpoint, which requires terminal native work.
+    pub(crate) fn settle_running_turns(
+        &mut self,
+        outcome: ExchangeOutcome,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        for turn in &mut self.turn {
+            if turn.state() == crate::turn::TurnState::Running {
+                anyhow::ensure!(
+                    outcome != ExchangeOutcome::Complete,
+                    "exchange completion requires settled provider turns"
+                );
+                turn.finish(
+                    match outcome {
+                        ExchangeOutcome::Cancelled => crate::turn::TurnOutcome::Interrupted,
+                        ExchangeOutcome::Interrupted => crate::turn::TurnOutcome::Interrupted,
+                        ExchangeOutcome::Failed => crate::turn::TurnOutcome::Failed {
+                            error: forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::TurnStart,
+                                forge_provider_api::ProviderFailureKind::Unknown,
+                            )
+                            .at_phase(
+                                forge_provider_api::ProviderPhase::Observation,
+                                forge_provider_api::FailureDisposition::Uncertain,
+                            ),
+                            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+                        },
+                        ExchangeOutcome::Complete => crate::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                    },
+                    now_ms,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Settle every execution segment before publishing the terminal outcome.
     pub fn finish(&mut self, outcome: ExchangeOutcome, now_ms: i64) -> anyhow::Result<()> {
         self.provider_retry = None;
@@ -957,23 +1277,7 @@ impl Exchange {
             );
             return Ok(());
         }
-        for turn in &mut self.turn {
-            if turn.state() == crate::turn::TurnState::Running {
-                anyhow::ensure!(
-                    outcome != ExchangeOutcome::Complete,
-                    "exchange completion requires settled provider turns"
-                );
-                turn.finish(
-                    match outcome {
-                        ExchangeOutcome::Cancelled => crate::turn::TurnOutcome::Cancelled,
-                        ExchangeOutcome::Interrupted => crate::turn::TurnOutcome::Interrupted,
-                        ExchangeOutcome::Failed => crate::turn::TurnOutcome::Failed,
-                        ExchangeOutcome::Complete => crate::turn::TurnOutcome::Completed,
-                    },
-                    now_ms,
-                )?;
-            }
-        }
+        self.settle_running_turns(outcome, now_ms)?;
         self.settle_tools(now_ms);
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
@@ -1143,15 +1447,7 @@ impl Exchange {
 
     /// Sum usage across owned turns, retaining unavailable categories.
     pub fn usage(&self) -> crate::provider::usage::TokenUsage {
-        let mut turn = self.turn.iter().filter_map(|turn| turn.usage());
-        let Some(first) = turn.next() else {
-            return Default::default();
-        };
-        let mut usage = first.clone();
-        for turn in turn {
-            usage.accumulate(turn);
-        }
-        usage
+        self.metrics.usage()
     }
 
     /// End the current streamed message at a provider wait or input boundary.
@@ -1207,43 +1503,107 @@ pub struct ExchangeComment {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::provider::{HarnessEvent, HostEvent, RetryEvent};
+    use forge_provider_api::{
+        AgentMessageRole, InspectableArguments, ItemCompletion, ItemEvent, ItemStart,
+        MessageCompletion, MessageOutcome, ToolCompletion, ToolDescriptor, ToolItemEvent,
+    };
+
+    /// Preserve the original admitted owner for native turn fixtures.
+    fn turn_event(
+        address: &crate::provider::TurnAddress,
+        event: forge_provider_api::TurnEvent,
+    ) -> HarnessEvent {
+        crate::provider::test_support::native_event(
+            address.scope.clone(),
+            forge_provider_api::ProviderEvent::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event,
+            },
+        )
+    }
+
+    /// Build one inspectable native tool descriptor for lifecycle fixtures.
+    fn descriptor() -> ToolDescriptor {
+        ToolDescriptor {
+            semantics: Default::default(),
+            name: "probe".into(),
+            title: "Probe".into(),
+            arguments: InspectableArguments::new(serde_json::json!({})),
+        }
+    }
+
+    /// Preserve immutable item ownership for native activity fixtures.
+    fn item_event(
+        address: &crate::provider::TurnAddress,
+        id: &str,
+        event: ItemEvent,
+    ) -> HarnessEvent {
+        crate::turn::test_support::item_event(address, id, event)
+    }
 
     #[test]
     fn input_timeout_approval_provenance_survives_exchange_serialization() {
+        use crate::provider::{
+            ApprovalDecisionSource, ApprovalRequestId, ApprovalScope, ApprovalTargetId,
+            PermissionApprovalEvent, PermissionApprovalResolution, PermissionDecision,
+            ResolvedPermissionTarget,
+        };
         let mut exchange = interaction();
-        exchange.approval_resolution.push(
-            serde_json::from_value(serde_json::json!({
-                "id":"timed-out", "provider":"test", "exchange_id":exchange.id, "turn_id":null,
-                "reason":"Inspect source", "item_list":[], "deadline":{"expires_at_ms":1000},
-                "resolution_source":"timeout"
-            }))
-            .unwrap(),
-        );
-        let encoded = serde_json::to_value(&exchange).unwrap();
-        let restored: Exchange = serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(
-            restored.approval_resolution[0].resolution_source,
-            crate::session::ResolutionSource::Timeout
-        );
-        assert_eq!(
-            restored.approval_resolution[0]
-                .deadline
-                .as_ref()
-                .unwrap()
-                .expires_at_ms,
-            1000
-        );
-        let mut legacy = encoded;
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("approval_resolution");
-        assert!(
-            serde_json::from_value::<Exchange>(legacy)
-                .unwrap()
-                .approval_resolution
-                .is_empty()
-        );
+        let address = crate::turn::test_support::address(&exchange, "approval");
+        let resolution = PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
+            request_id: ApprovalRequestId::new("timed-out").unwrap(),
+            scope: ApprovalScope::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+            },
+            targets: vec![ResolvedPermissionTarget {
+                target_id: ApprovalTargetId::new("source").unwrap(),
+                decision: PermissionDecision::TimedOut,
+                source: ApprovalDecisionSource::Timeout,
+                rules: vec![],
+                directory_grants: vec![],
+            }],
+            resolved_at_ms: 1000,
+        });
+        let event = HarnessEvent::Host {
+            scope: address.scope.into(),
+            event: HostEvent::PermissionApproval {
+                execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                event: resolution,
+            },
+        };
+        assert!(exchange.observe_event(&event, 1000).unwrap());
+        let mut restored: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        assert!(!restored.observe_event(&event, 1001).unwrap());
+        let PermissionApprovalEvent::Resolved(resolved) = &restored.approval_resolution[0] else {
+            panic!("timeout resolution must remain terminal");
+        };
+        assert!(matches!(
+            resolved.targets[0].source,
+            ApprovalDecisionSource::Timeout
+        ));
+        assert!(matches!(
+            resolved.targets[0].decision,
+            PermissionDecision::TimedOut
+        ));
+        assert_eq!(resolved.resolved_at_ms, 1000);
+        let mut conflict = event;
+        if let HarnessEvent::Host {
+            event:
+                HostEvent::PermissionApproval {
+                    event: PermissionApprovalEvent::Resolved(resolved),
+                    ..
+                },
+            ..
+        } = &mut conflict
+        {
+            resolved.resolved_at_ms = 1002;
+        }
+        assert!(restored.observe_event(&conflict, 1002).is_err());
+        assert_eq!(restored.approval_resolution.len(), 1);
     }
 
     #[test]
@@ -1293,6 +1653,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,
@@ -1310,7 +1671,6 @@ mod test {
 
     #[test]
     fn retry_state_requires_known_turn_and_clears_after_recovery() -> anyhow::Result<()> {
-        use crate::provider::ProviderEvent;
         use crate::session::state_machine::SessionPhase;
         let mut exchange = interaction();
         exchange.resume(1000)?;
@@ -1320,64 +1680,77 @@ mod test {
             max_attempts: 5,
             retry_at_ms: Some(2000),
         };
-        let mut event = ProviderEvent::Retry {
-            scope: address.scope.clone(),
-            update: Some(retry.clone()),
+        let retry_event = |event| HarnessEvent::Host {
+            scope: address.scope.clone().into(),
+            event: HostEvent::RetryUpdated {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event,
+            },
         };
-        assert!(!exchange.observe_turn(&event, 1000)?);
+        let mut event = retry_event(RetryEvent::Scheduled(retry.clone()));
+        assert!(!exchange.observe_event(&event, 1000)?);
         exchange.start_turn(address.clone(), 1000)?;
-        exchange
-            .turn_mut(&address)?
-            .finish(crate::turn::TurnOutcome::Failed, 1001)?;
-        assert!(exchange.observe_turn(&event, 1001)?);
+        exchange.turn_mut(&address)?.finish(
+            crate::turn::TurnOutcome::Failed {
+                error: forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                ),
+                retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+            },
+            1001,
+        )?;
+        assert!(exchange.observe_event(&event, 1001)?);
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::RetryingProvider { .. }
         ));
-        if let ProviderEvent::Retry { update, .. } = &mut event {
-            *update = None;
-        }
-        assert!(exchange.observe_turn(&event, 2000)?);
+        event = retry_event(RetryEvent::Cleared);
+        assert!(exchange.observe_event(&event, 2000)?);
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working { .. }
         ));
-        if let ProviderEvent::Retry { update, .. } = &mut event {
-            *update = Some(retry);
-        }
+        event = retry_event(RetryEvent::Scheduled(retry));
         exchange.finish(crate::exchange::ExchangeOutcome::Failed, 2001)?;
-        assert!(!exchange.observe_turn(&event, 2002)?);
+        assert!(!exchange.observe_event(&event, 2002)?);
         assert!(exchange.provider_retry.is_none());
         Ok(())
     }
 
     #[test]
     fn tool_timing_excludes_user_input_pauses_and_rejects_missing_start_evidence() {
-        use crate::provider::{ProviderEvent, ToolOutcome, ToolUpdate};
         let mut exchange = interaction();
         exchange.resume(1000).unwrap();
         let address = crate::turn::test_support::address(&exchange, "one");
         exchange.start_turn(address.clone(), 1000).unwrap();
-        let mut event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address,
-                tool_id: "call".into(),
-            },
-            update: ToolUpdate::Requested {
-                invocation: crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::Command,
-                    name: "probe".into(),
-                    title: "Probe".into(),
-                    arguments: serde_json::json!({}),
-                },
-            },
-        };
-        exchange.observe_turn(&event, 2000).unwrap();
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Started;
-        }
-        exchange.observe_turn(&event, 2000).unwrap();
+        exchange
+            .observe_event(
+                &item_event(
+                    &address,
+                    "call",
+                    ItemEvent::Started(ItemStart::CommandExecution(descriptor())),
+                ),
+                2000,
+            )
+            .unwrap();
+        exchange
+            .observe_event(
+                &item_event(
+                    &address,
+                    "call",
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                ),
+                2000,
+            )
+            .unwrap();
         exchange.pause(3000);
         assert_eq!(exchange.elapsed(90000), 2000);
         assert_eq!(
@@ -1385,76 +1758,86 @@ mod test {
             Some(1000)
         );
         exchange.resume(90000).unwrap();
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            };
-        }
-        exchange.observe_turn(&event, 92000).unwrap();
+        let completed = || {
+            ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
+                outcome: forge_provider_api::ToolOutcome::Succeeded,
+                descriptor: None,
+                output: None,
+                changes: Default::default(),
+            }))
+        };
+        exchange
+            .observe_event(&item_event(&address, "call", completed()), 92000)
+            .unwrap();
         assert_eq!(exchange.elapsed(93000), 5000);
         assert_eq!(exchange.metrics.response_ms(5000), Some(2000));
-        if let ProviderEvent::Tool { address, update } = &mut event {
-            address.tool_id = "second".into();
-            *update = ToolUpdate::Requested {
-                invocation: crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::Command,
-                    name: "probe".into(),
-                    title: "Probe".into(),
-                    arguments: serde_json::json!({}),
-                },
-            };
-        }
-        exchange.observe_turn(&event, 93000).unwrap();
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Started;
-        }
-        exchange.observe_turn(&event, 93000).unwrap();
+        exchange
+            .observe_event(
+                &item_event(
+                    &address,
+                    "second",
+                    ItemEvent::Started(ItemStart::CommandExecution(descriptor())),
+                ),
+                93000,
+            )
+            .unwrap();
+        exchange
+            .observe_event(
+                &item_event(
+                    &address,
+                    "second",
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                ),
+                93000,
+            )
+            .unwrap();
         assert_eq!(exchange.metrics.response_ms(6000), Some(2000));
-        if let ProviderEvent::Tool { address, update } = &mut event {
-            address.tool_id = "missing-start".into();
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            };
-        }
-        assert!(exchange.observe_turn(&event, 94000).is_err());
+        assert!(
+            exchange
+                .observe_event(&item_event(&address, "missing-start", completed()), 94000)
+                .is_err()
+        );
         assert_eq!(exchange.metrics.response_ms(6000), Some(2000));
     }
 
     #[test]
     fn message_snapshots_reconcile_without_duplicating_or_reordering_content() {
-        use crate::provider::{MessageRole, MessageUpdate, ProviderEvent};
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
         let mut event = crate::turn::test_support::message(
             &address,
             "one",
-            Some(MessageRole::Commentary),
+            Some(AgentMessageRole::Commentary),
             "Checking",
         );
-        exchange.observe_turn(&event, 11).unwrap();
+        exchange.observe_event(&event, 11).unwrap();
         exchange
             .append_input(InputIntent::Steering, "Also tests".into(), 12)
             .unwrap();
         exchange
-            .observe_turn(
+            .observe_event(
                 &crate::turn::test_support::message(
                     &address,
                     "two",
-                    Some(MessageRole::Response),
+                    Some(AgentMessageRole::Response),
                     "Done",
                 ),
                 13,
             )
             .unwrap();
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Completed {
+        event = item_event(
+            &address,
+            "one",
+            ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
                 text: "Checking files.".into(),
-            };
-        }
-        exchange.observe_turn(&event, 14).unwrap();
-        exchange.observe_turn(&event, 15).unwrap();
+                outcome: MessageOutcome::Completed,
+            })),
+        );
+        exchange.observe_event(&event, 14).unwrap();
+        exchange.observe_event(&event, 15).unwrap();
         assert_eq!(exchange.node_list.len(), 3);
         assert_eq!(exchange.turn[0].messages().len(), 2);
         assert_eq!(exchange.turn[0].messages()[0].text(), "Checking files.");
@@ -1468,44 +1851,56 @@ mod test {
             ExchangeNode::ExchangeInput { .. }
         ));
         exchange.turn[0]
-            .finish(crate::turn::TurnOutcome::Completed, 16)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                16,
+            )
             .unwrap();
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Completed {
+        event = item_event(
+            &address,
+            "one",
+            ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
                 text: "Late correction".into(),
-            };
-        }
-        assert!(!exchange.observe_turn(&event, 17).unwrap());
+                outcome: MessageOutcome::Completed,
+            })),
+        );
+        assert!(!exchange.observe_event(&event, 17).unwrap());
         assert_eq!(exchange.turn[0].messages()[0].text(), "Checking files.");
     }
 
     #[test]
     fn active_turn_exposes_only_its_latest_readable_reasoning_summary() {
-        use crate::provider::MessageRole;
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 10).unwrap();
-        let event = crate::turn::test_support::message(
+        let event = crate::turn::test_support::reasoning(
             &address,
             "reasoning:summary:0",
-            Some(MessageRole::ThoughtSummary),
+            forge_provider_api::ReasoningKind::Summary,
             "Inspecting the repository",
         );
-        exchange.observe_turn(&event, 11).unwrap();
-        let event = crate::turn::test_support::message(
+        exchange.observe_event(&event, 11).unwrap();
+        let event = crate::turn::test_support::reasoning(
             &address,
             "reasoning",
-            Some(MessageRole::Thought),
+            forge_provider_api::ReasoningKind::Full,
             "private chain of thought",
         );
-        exchange.observe_turn(&event, 12).unwrap();
+        exchange.observe_event(&event, 12).unwrap();
 
         assert_eq!(
             exchange.latest_reasoning_summary(),
             Some("Inspecting the repository")
         );
         exchange.turn[0]
-            .finish(crate::turn::TurnOutcome::Completed, 13)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                13,
+            )
             .unwrap();
         assert_eq!(exchange.latest_reasoning_summary(), None);
     }
@@ -1565,26 +1960,204 @@ mod test {
         assert_eq!(kind_list, ["agent", "steering"]);
     }
 
+    /// Canonical completion commits final accounting once and preserves independently reported timing.
+    #[test]
+    fn canonical_completion_retains_exact_result_and_final_usage_after_reload() {
+        use forge_provider_api::TurnEvent;
+        let mut exchange = interaction();
+        let address = crate::turn::test_support::address(&exchange, "canonical");
+        exchange
+            .observe_event(
+                &turn_event(
+                    &address.clone(),
+                    TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 10 }),
+                ),
+                10,
+            )
+            .unwrap();
+        let report_id = forge_provider_api::identity::UsageReportId::new("report").unwrap();
+        let initial = forge_provider_api::TurnUsageReport::accounting(
+            report_id.clone(),
+            11,
+            Some(crate::provider::usage::TokenUsage {
+                input: Some(2),
+                output: None,
+                cached_input: None,
+                reasoning: None,
+            }),
+            None,
+        )
+        .unwrap();
+        exchange
+            .observe_event(&turn_event(&address.clone(), TurnEvent::Usage(initial)), 11)
+            .unwrap();
+        let final_usage = forge_provider_api::TurnUsageReport::accounting(
+            report_id,
+            19,
+            Some(crate::provider::usage::TokenUsage {
+                input: None,
+                output: Some(3),
+                cached_input: None,
+                reasoning: None,
+            }),
+            Some(5),
+        )
+        .unwrap();
+        let native = forge_provider_api::TurnResult::new(
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Refusal,
+            },
+            20,
+            Some(12),
+            vec![forge_provider_api::CoveredInput::new(
+                "input".try_into().unwrap(),
+                forge_provider_api::DeliveryAttemptId::new("attempt").unwrap(),
+            )],
+            vec![final_usage],
+            Some(forge_provider_api::CheckpointId::new("checkpoint").unwrap()),
+        )
+        .unwrap();
+        let completed =
+            crate::provider::test_support::completed_turn(address.scope.clone(), native).unwrap();
+        let event = turn_event(&address.clone(), TurnEvent::Completed(completed.clone()));
+        assert!(exchange.observe_event(&event, 30).unwrap());
+        assert!(!exchange.observe_event(&event, 31).unwrap());
+        let mut exchange: Exchange =
+            serde_json::from_str(&serde_json::to_string(&exchange).unwrap()).unwrap();
+        assert!(!exchange.observe_event(&event, 32).unwrap());
+        assert_eq!(exchange.turn[0].completed(), Some(&completed));
+        let timing = forge_provider_api::TurnUsageReport::timing(
+            forge_provider_api::identity::UsageReportId::new("late-timing").unwrap(),
+            33,
+            7,
+        );
+        exchange
+            .observe_event(&turn_event(&address, TurnEvent::Usage(timing)), 33)
+            .unwrap();
+        let original_start = turn_event(
+            &exchange.turn[0].provider().clone(),
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 10,
+            }),
+        );
+        assert!(!exchange.observe_event(&original_start, 34).unwrap());
+        let before = serde_json::to_value(&exchange).unwrap();
+        let conflicting_start = turn_event(
+            &exchange.turn[0].provider().clone(),
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 35,
+            }),
+        );
+        assert!(exchange.observe_event(&conflicting_start, 35).is_err());
+        assert_eq!(serde_json::to_value(&exchange).unwrap(), before);
+        let turn = &exchange.turn[0];
+        assert_eq!(turn.duration_ms(), Some(12));
+        assert_eq!(turn.usage().unwrap().input, Some(2));
+        assert_eq!(turn.usage().unwrap().output, Some(3));
+        let valid = serde_json::to_value(turn).unwrap();
+        let _: crate::turn::Turn = serde_json::from_value(valid.clone()).unwrap();
+        let mut invalid = valid.clone();
+        invalid["completed"]["result"]["outcome"] = serde_json::json!("interrupted");
+        assert!(serde_json::from_value::<crate::turn::Turn>(invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid["reported_duration_ms"] = serde_json::json!(13);
+        assert!(serde_json::from_value::<crate::turn::Turn>(invalid).is_err());
+        let mut invalid = valid;
+        invalid["usage_reports"]["report"]["usage"]["output"] = serde_json::json!(4);
+        assert!(serde_json::from_value::<crate::turn::Turn>(invalid).is_err());
+    }
+
+    /// Correlated errors retain their original turn without establishing terminal or retry evidence.
+    #[test]
+    fn turn_error_observation_is_idempotent_and_nonterminal_after_reload() {
+        use forge_provider_api::TurnEvent;
+        let mut exchange = interaction();
+        let address = crate::turn::test_support::address(&exchange, "original");
+        exchange
+            .observe_event(
+                &turn_event(
+                    &address.clone(),
+                    TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 10 }),
+                ),
+                10,
+            )
+            .unwrap();
+        let failure = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::RateLimited,
+        );
+        let error = turn_event(&address.clone(), TurnEvent::Error { error: failure });
+        assert!(exchange.observe_event(&error, 11).unwrap());
+        let mut exchange: Exchange =
+            serde_json::from_str(&serde_json::to_string(&exchange).unwrap()).unwrap();
+        assert!(!exchange.observe_event(&error, 12).unwrap());
+        assert_eq!(exchange.turn[0].state(), crate::turn::TurnState::Running);
+        assert_eq!(exchange.turn[0].errors(), &[failure]);
+        let unknown = turn_event(
+            &crate::turn::test_support::address(&exchange, "unknown"),
+            TurnEvent::Error { error: failure },
+        );
+        assert!(!exchange.observe_event(&unknown, 13).unwrap());
+        assert_eq!(exchange.turn.len(), 1);
+        exchange
+            .observe_event(
+                &crate::turn::test_support::completed_event(
+                    &address,
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    20,
+                ),
+                20,
+            )
+            .unwrap();
+        assert!(matches!(
+            exchange.turn[0].state(),
+            crate::turn::TurnState::Finished {
+                outcome: crate::turn::TurnOutcome::Completed { .. }
+            }
+        ));
+        let completed = exchange.turn[0].completed().cloned();
+        let late_failure = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::Runtime,
+        );
+        let late_error = turn_event(
+            &address,
+            TurnEvent::Error {
+                error: late_failure,
+            },
+        );
+        assert!(exchange.observe_event(&late_error, 21).unwrap());
+        assert!(!exchange.observe_event(&late_error, 22).unwrap());
+        assert_eq!(exchange.turn[0].completed(), completed.as_ref());
+        assert_eq!(exchange.turn[0].errors(), &[failure, late_failure]);
+        let mut exchange: Exchange =
+            serde_json::from_str(&serde_json::to_string(&exchange).unwrap()).unwrap();
+        assert!(!exchange.observe_event(&late_error, 23).unwrap());
+        assert_eq!(exchange.turn[0].completed(), completed.as_ref());
+        assert_eq!(exchange.turn[0].provider(), &address);
+        assert_eq!(exchange.turn[0].errors(), &[failure, late_failure]);
+    }
+
     #[test]
     fn provider_turn_identity_survives_steering_and_rejects_late_tools() {
-        use crate::provider::{
-            MessageRole, ProviderEvent, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
-        };
+        use crate::provider::TurnEvent;
         use crate::turn::{TurnOutcome, TurnState};
         let mut exchange = interaction();
         let address = crate::turn::test_support::address(&exchange, "first");
-        let mut event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Started { started_at_ms: 10 },
-        };
-        assert!(exchange.observe_turn(&event, 10).unwrap());
+        let mut event = turn_event(
+            &address.clone(),
+            TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 10 }),
+        );
+        assert!(exchange.observe_event(&event, 10).unwrap());
         event = crate::turn::test_support::message(
             &address,
             "message-one",
-            Some(MessageRole::Commentary),
+            Some(AgentMessageRole::Commentary),
             "Before steering",
         );
-        assert!(exchange.observe_turn(&event, 10).unwrap());
+        assert!(exchange.observe_event(&event, 10).unwrap());
         exchange
             .append_input(
                 crate::exchange::InputIntent::Steering,
@@ -1595,14 +2168,14 @@ mod test {
         event = crate::turn::test_support::message(
             &address,
             "message-two",
-            Some(MessageRole::Response),
+            Some(AgentMessageRole::Response),
             "After steering",
         );
-        assert!(exchange.observe_turn(&event, 11).unwrap());
+        assert!(exchange.observe_event(&event, 11).unwrap());
         assert_eq!(exchange.turn[0].messages().len(), 2);
         assert_eq!(
             exchange.turn[0].messages()[0].provider_id(),
-            &crate::provider::MessageId::Native("message-one".into())
+            &forge_provider_api::ItemId::new("message-one").unwrap()
         );
         assert_eq!(
             exchange.turn[0].messages()[0].delivery(),
@@ -1611,7 +2184,7 @@ mod test {
         assert_eq!(exchange.turn[0].messages()[1].text(), "After steering");
         assert_eq!(
             exchange.turn[0].messages()[1].provider_id(),
-            &crate::provider::MessageId::Native("message-two".into())
+            &forge_provider_api::ItemId::new("message-two").unwrap()
         );
         assert_eq!(
             exchange.turn[0].messages()[1].delivery(),
@@ -1623,28 +2196,31 @@ mod test {
             &mut exchange,
             &address,
             "change",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: crate::provider::ToolActivityKind::FileChange,
+            ItemStart::FileChange(ToolDescriptor {
                 name: "edit".into(),
                 title: "edit".into(),
-                arguments: serde_json::json!({}),
-            },
+                ..descriptor()
+            }),
             [
-                ToolUpdate::Started,
-                ToolUpdate::Changes {
-                    changes: crate::provider::ProviderChangeSet {
+                ItemEvent::Tool {
+                    event: ToolItemEvent::ExecutionStarted,
+                },
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Changes(crate::provider::ProviderChangeSet {
                         file: vec![crate::provider::ProviderFileChange {
                             path: "owned.rs".into(),
                             move_path: None,
                             kind: crate::provider::ProviderChangeKind::Add,
                             diff: "+owned".into(),
                         }],
-                    },
+                    }),
                 },
-                ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
+                ItemEvent::Completed(ItemCompletion::FileChange(ToolCompletion {
+                    outcome: forge_provider_api::ToolOutcome::Succeeded,
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                })),
             ],
             12,
         )
@@ -1656,26 +2232,28 @@ mod test {
             "attribution depended on presentation segments"
         );
         assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
-        event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome: TurnOutcome::Completed,
-                completed_at_ms: 20,
+        event = crate::turn::test_support::completed_event(
+            &address.clone(),
+            TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        assert!(exchange.observe_turn(&event, 20).unwrap());
-        event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "late".into(),
+            20,
+        );
+        assert!(exchange.observe_event(&event, 20).unwrap());
+        event = item_event(
+            &address,
+            "late",
+            ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
             },
-            update: ToolUpdate::Started,
-        };
-        assert!(!exchange.observe_turn(&event, 30).unwrap());
+        );
+        assert!(!exchange.observe_event(&event, 30).unwrap());
         assert_eq!(
             exchange.turn[0].state(),
             TurnState::Finished {
-                outcome: TurnOutcome::Completed
+                outcome: TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal
+                }
             }
         );
         assert!(exchange.start_turn(address, 40).is_err());
@@ -1695,7 +2273,7 @@ mod test {
         assert_eq!(
             exchange.turn[1].state(),
             TurnState::Finished {
-                outcome: TurnOutcome::Cancelled
+                outcome: TurnOutcome::Interrupted
             }
         );
     }
@@ -1852,7 +2430,12 @@ mod test {
         exchange
             .turn_mut(&address)
             .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 30)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                30,
+            )
             .unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Complete, 30)
@@ -1863,7 +2446,7 @@ mod test {
             .finish(crate::exchange::ExchangeOutcome::Complete, 900)
             .unwrap();
         assert_eq!(exchange.completed_at_ms(), Some(30));
-        assert_eq!(exchange.turn[0].duration_ms(), 20);
+        assert_eq!(exchange.turn[0].duration_ms(), None);
         assert!(
             exchange
                 .finish(crate::exchange::ExchangeOutcome::Failed, 901)
@@ -1879,7 +2462,12 @@ mod test {
         exchange
             .turn_mut(&first)
             .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 20)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                20,
+            )
             .unwrap();
         exchange
             .start_turn(crate::turn::test_support::address(&exchange, "second"), 30)
@@ -1887,12 +2475,12 @@ mod test {
         exchange
             .finish(crate::exchange::ExchangeOutcome::Cancelled, 50)
             .unwrap();
-        assert_eq!(exchange.turn[0].duration_ms(), 10);
-        assert_eq!(exchange.turn[1].duration_ms(), 20);
+        assert_eq!(exchange.turn[0].duration_ms(), None);
+        assert_eq!(exchange.turn[1].duration_ms(), None);
         assert_eq!(
             exchange.turn[1].state(),
             crate::turn::TurnState::Finished {
-                outcome: crate::turn::TurnOutcome::Cancelled
+                outcome: crate::turn::TurnOutcome::Interrupted
             }
         );
     }
@@ -2037,7 +2625,12 @@ mod test {
         interaction
             .turn_mut(&address)
             .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 210)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                210,
+            )
             .unwrap();
 
         assert_eq!(interaction.node_list.len(), 1);
@@ -2045,66 +2638,211 @@ mod test {
             interaction.node_list[0],
             ExchangeNode::ArtifactChange { .. }
         ));
-        assert_eq!(interaction.turn[0].duration_ms(), 200);
+        assert_eq!(interaction.turn[0].duration_ms(), None);
     }
-    /// Replayed native identity never reopens a completed exchange, but a new correlated turn does.
+    /// Exact native replay stays terminal while unregistered new foreground ownership is rejected.
     #[test]
     fn native_reopening_preserves_original_history_and_rejects_replayed_start() {
         let mut exchange = interaction();
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root(&exchange.session_id),
-            exchange.id.clone(),
+        let first = crate::turn::test_support::address(&exchange, "first");
+        let start = turn_event(
+            &first,
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 10,
+            }),
         );
-        let first = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "native".into(),
-            turn_id: "first".into(),
-        };
-        exchange.start_turn(first.clone(), 10).unwrap();
+        assert!(exchange.observe_event(&start, 10).unwrap());
         exchange
-            .turn_mut(&first)
-            .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 20)
+            .observe_event(
+                &crate::turn::test_support::completed_event(
+                    &first,
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    20,
+                ),
+                20,
+            )
             .unwrap();
         exchange.finish(ExchangeOutcome::Complete, 20).unwrap();
-        let checkpoint = exchange.checkpoint_before.clone();
-        let prompt = exchange.prompt.clone();
-        assert!(!exchange.reopen_provider_execution(first, 30).unwrap());
-        assert_eq!(exchange.state(), ExchangeState::Complete);
-        let next = crate::provider::TurnAddress {
-            scope,
-            thread_id: "native".into(),
-            turn_id: "second".into(),
+        let before = serde_json::to_value(&exchange).unwrap();
+        assert!(!exchange.observe_event(&start, 30).unwrap());
+        let unknown = crate::provider::TurnAddress {
+            turn_id: forge_provider_api::TurnId::new("unregistered").unwrap(),
+            ..first.clone()
         };
-        assert!(exchange.reopen_provider_execution(next, 30).unwrap());
-        assert_eq!(exchange.state(), ExchangeState::Running);
-        assert_eq!(exchange.turn.len(), 2);
-        assert_eq!(exchange.prompt, prompt);
-        assert_eq!(exchange.checkpoint_before, checkpoint);
+        let new_work = turn_event(
+            &unknown,
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 30,
+            }),
+        );
+        assert!(exchange.observe_event(&new_work, 30).is_err());
+        let foreign = crate::provider::TurnAddress {
+            thread_id: forge_provider_api::ThreadId::new("foreign").unwrap(),
+            ..first
+        };
+        let wrong_source = turn_event(
+            &foreign,
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 10,
+            }),
+        );
+        assert!(exchange.observe_event(&wrong_source, 31).is_err());
+        assert_eq!(serde_json::to_value(&exchange).unwrap(), before);
+        assert_eq!(exchange.state(), ExchangeState::Complete);
+        assert_eq!(exchange.turn.len(), 1);
     }
 
-    /// Explicit cancellation revokes permission for unsolicited native resumption.
+    /// Explicit cancellation cannot admit a new unregistered native response cycle.
     #[test]
     fn native_reopening_rejects_cancelled_exchange() {
         let mut exchange = interaction();
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root(&exchange.session_id),
-            exchange.id.clone(),
-        );
-        let first = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "native".into(),
-            turn_id: "first".into(),
-        };
-        exchange.start_turn(first, 10).unwrap();
+        let first = crate::turn::test_support::address(&exchange, "first");
+        exchange.start_turn(first.clone(), 10).unwrap();
         exchange.finish(ExchangeOutcome::Cancelled, 20).unwrap();
-        let next = crate::provider::TurnAddress {
-            scope,
-            thread_id: "native".into(),
-            turn_id: "second".into(),
+        let before = serde_json::to_value(&exchange).unwrap();
+        let unknown = crate::provider::TurnAddress {
+            turn_id: forge_provider_api::TurnId::new("unregistered").unwrap(),
+            ..first
         };
-        assert!(exchange.reopen_provider_execution(next, 30).is_err());
+        let new_work = turn_event(
+            &unknown,
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 30,
+            }),
+        );
+        assert!(exchange.observe_event(&new_work, 30).is_err());
+        assert_eq!(serde_json::to_value(&exchange).unwrap(), before);
         assert_eq!(exchange.state(), ExchangeState::Cancelled);
         assert_eq!(exchange.turn.len(), 1);
+    }
+
+    /// Identified accounting replay cannot charge tokens or requests twice after history reload.
+    #[test]
+    fn canonical_usage_report_charges_once_after_reload() -> anyhow::Result<()> {
+        let mut exchange = interaction();
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 1)?;
+        let report = forge_provider_api::TurnUsageReport::accounting(
+            forge_provider_api::identity::UsageReportId::new("report")?,
+            2,
+            Some(forge_provider_api::usage::TokenUsage {
+                input: Some(3),
+                cached_input: Some(0),
+                reasoning: Some(0),
+                output: Some(4),
+            }),
+            Some(15),
+        )?;
+        let event = turn_event(&address, crate::provider::TurnEvent::Usage(report));
+        assert!(exchange.observe_event(&event, 2)?);
+        assert_eq!(exchange.usage().input, Some(3));
+        assert_eq!(exchange.usage().output, Some(4));
+        assert_eq!(exchange.metrics.request_count, 1);
+        let mut restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+        assert!(!restored.observe_event(&event, 3)?);
+        assert_eq!(restored.usage().input, Some(3));
+        assert_eq!(restored.usage().output, Some(4));
+        assert_eq!(restored.metrics.request_count, 1);
+        Ok(())
+    }
+
+    /// Complementary measurements complete one retained charge instead of becoming a second request.
+    #[test]
+    fn complementary_usage_reports_fill_missing_counts_without_recharging() -> anyhow::Result<()> {
+        let mut exchange = interaction();
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 1)?;
+        for usage in [
+            forge_provider_api::usage::TokenUsage {
+                input: Some(3),
+                cached_input: Some(0),
+                reasoning: Some(0),
+                output: None,
+            },
+            forge_provider_api::usage::TokenUsage {
+                input: None,
+                cached_input: None,
+                reasoning: None,
+                output: Some(4),
+            },
+        ] {
+            let report = forge_provider_api::TurnUsageReport::accounting(
+                forge_provider_api::identity::UsageReportId::new("report")?,
+                2,
+                Some(usage),
+                None,
+            )?;
+            exchange.observe_event(
+                &turn_event(&address.clone(), crate::provider::TurnEvent::Usage(report)),
+                2,
+            )?;
+            exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+        }
+        assert_eq!(exchange.usage().input, Some(3));
+        assert_eq!(exchange.usage().output, Some(4));
+        assert_eq!(exchange.metrics.request_count, 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod observed_tests {
+    use super::*;
+    use forge_provider_api::{
+        AgentId, AgentMessageStart, EventScope, InvocationScope, ItemEvent, ItemId, ItemStart,
+        MessageClassification, ProviderEvent, ThreadOwner, TurnAddress,
+    };
+
+    #[test]
+    fn observed_child_retains_original_scope_without_a_user_submission() -> anyhow::Result<()> {
+        let scope = InvocationScope {
+            owner: ThreadOwner::new("session".into(), AgentId::new("native-child")?)?,
+            exchange_id: "parent-exchange".into(),
+            invocation_id: "child-invocation".into(),
+        };
+        let address = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id()?,
+            scope: scope.clone(),
+        };
+        let mut exchange =
+            Exchange::observed("observed-child-exchange".into(), 1, address.clone(), 1)?;
+        assert!(exchange.prompt.is_empty());
+        assert!(exchange.input_message_id.is_none());
+        assert_eq!(
+            exchange.origin,
+            crate::exchange::ExchangeOrigin::NativeAgent
+        );
+        let event = ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: ItemId::new("child-message")?,
+            event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                text: "Child work".into(),
+                classification: MessageClassification::Unclassified,
+            })),
+        };
+        let original = EventScope::Invocation {
+            invocation: scope.clone(),
+        };
+        assert!(exchange.observe_provider_event(&original, &event, 2)?);
+        let snapshot = serde_json::to_value(&exchange)?;
+        let mut foreign = scope.clone();
+        foreign.invocation_id = "successor-invocation".into();
+        assert!(!exchange.observe_provider_event(
+            &EventScope::Invocation {
+                invocation: foreign
+            },
+            &event,
+            3
+        )?);
+        assert_eq!(serde_json::to_value(&exchange)?, snapshot);
+        let restored: Exchange = serde_json::from_value(snapshot)?;
+        assert_eq!(restored.turn[0].provider(), &address);
+        assert_eq!(restored.turn[0].messages()[0].text(), "Child work");
+        assert_eq!(restored.agent_id, "native-child");
+        Ok(())
     }
 }

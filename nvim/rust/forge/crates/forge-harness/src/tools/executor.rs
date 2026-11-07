@@ -7,10 +7,14 @@ use tokio::sync::{Notify, watch};
 
 /// Owns tool execution and cancellation for one provider turn.
 pub(crate) struct ControlToolExecutor {
+    lsp_mutations: std::sync::Arc<super::lsp::MutationWork>,
+    completion: std::sync::Arc<crate::provider::CompletionSlot>,
     task_controller: Option<std::sync::Arc<crate::task::SessionTaskController>>,
     task_permit: Option<crate::task::TaskPermit>,
     authority: Option<super::TaskAuthority>,
     mode: crate::provider::PromptMode,
+    observed_lsp: Option<std::sync::Arc<super::lsp::LspScope>>,
+    observed_repository: Option<std::sync::Arc<super::repository::RepositoryToolScope>>,
     runtime: tokio::sync::Mutex<ControlToolRuntime>,
     admission: Mutex<Admission>,
     cancelled: watch::Sender<bool>,
@@ -18,14 +22,31 @@ pub(crate) struct ControlToolExecutor {
 }
 
 impl ControlToolExecutor {
+    /// Get whether original mutation collection retained a failure despite a lost tool waiter.
+    pub(crate) fn mutation_failed(&self) -> bool {
+        self.lsp_mutations.failed()
+    }
+
     /// Creates a fresh execution generation from the broker's turn context.
     pub(crate) fn new(context: ControlTurnContext) -> Self {
+        let completion = context.provider_completion.clone();
+        let runtime = ControlToolRuntime::new(context.clone());
         Self {
+            lsp_mutations: runtime.lsp_mutations.clone(),
+            completion,
             task_controller: context.task_controller.clone(),
             task_permit: context.task_permit.clone(),
             authority: super::TaskAuthority::capture(&context),
             mode: context.mode,
-            runtime: tokio::sync::Mutex::new(ControlToolRuntime::new(context)),
+            observed_lsp: context
+                .observed_file_changes
+                .as_ref()
+                .and(context.lsp.clone()),
+            observed_repository: context
+                .observed_file_changes
+                .as_ref()
+                .and(context.repository.clone()),
+            runtime: tokio::sync::Mutex::new(runtime),
             admission: Mutex::new(Admission::default()),
             cancelled: watch::channel(false).0,
             settled: Notify::new(),
@@ -149,6 +170,12 @@ impl ControlToolExecutor {
 
     /// Revokes this generation without waiting for the runtime's execution lock.
     pub(crate) fn cancel(&self) {
+        if let Some(lsp) = &self.observed_lsp {
+            lsp.retire();
+        }
+        if let Some(repository) = &self.observed_repository {
+            repository.retire();
+        }
         self.admission
             .lock()
             .expect("control admission lock poisoned")
@@ -179,6 +206,20 @@ impl ControlToolExecutor {
                 .active
                 == 0
             {
+                if let Some(lsp) = &self.observed_lsp {
+                    lsp.retire();
+                }
+                if let Some(repository) = &self.observed_repository {
+                    repository.retire();
+                }
+                if let Some(failure) = self.lsp_mutations.finish().await {
+                    let _ = self
+                        .completion
+                        .publish(crate::provider::ProviderCompletion {
+                            control_error: Some(failure.to_string()),
+                            ..Default::default()
+                        });
+                }
                 return;
             }
             settled.await;

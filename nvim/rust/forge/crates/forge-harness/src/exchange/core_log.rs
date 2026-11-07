@@ -68,12 +68,13 @@ impl CoreRecord {
     pub(crate) fn provider_event_metadata(
         binding: BindingId,
         sequence: EventSequence,
+        scope: EventScope,
         event: &ProviderEvent,
     ) -> Self {
         Self::ProviderEventConsumed {
             binding,
             sequence,
-            scope: event.scope(),
+            scope,
             kind: CoreProviderEventKind::from(event),
             evidence: CoreProviderEvidence::from_event(event),
         }
@@ -81,157 +82,116 @@ impl CoreRecord {
 
     /// Capture event correlation for durable log fixtures without retaining message content.
     #[cfg(test)]
-    pub(crate) fn provider_event(event: &forge_provider_api::BoundProviderEvent) -> Self {
-        Self::provider_event_metadata(event.binding_id.clone(), event.sequence, &event.event)
+    pub(crate) fn provider_event(
+        scope: EventScope,
+        event: &forge_provider_api::BoundProviderEvent,
+    ) -> Self {
+        Self::provider_event_metadata(
+            event.binding_id.clone(),
+            event.sequence,
+            scope,
+            &event.event,
+        )
     }
 }
 
-/// Preserve asynchronous execution failure independently of successful input acceptance.
+/// Preserve native completion and failures independently of successful input acceptance.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "evidence", rename_all = "snake_case")]
 pub(crate) enum CoreProviderEvidence {
-    /// Native execution began at an exact turn.
-    ExecutionStarted {
-        address: forge_provider_api::TurnAddress,
+    /// Retain the original host identities and positive native start timestamp.
+    TurnStarted {
+        thread_id: forge_provider_api::ThreadId,
+        turn_id: forge_provider_api::TurnId,
+        started_at_ms: i64,
     },
-    /// Native execution reached terminal evidence.
-    ExecutionFinished { outcome: CoreExecutionOutcome },
-    /// Required host publication failed after a known native result.
-    PublicationFailed {
-        failure: forge_provider_api::HostEffectFailure,
-        outcome: CoreExecutionOutcome,
+    /// Retain the exact canonical native reason and provider collection boundary.
+    TurnCompleted {
+        thread_id: forge_provider_api::ThreadId,
+        turn_id: forge_provider_api::TurnId,
+        completed: forge_provider_api::CompletedTurn,
     },
-    /// Native observation failed independently of delivery.
-    ObservationLost {
-        failure: forge_provider_api::ObservationFailure,
+    /// Retain native thread failure without inventing turn attribution.
+    ThreadError {
+        thread_id: forge_provider_api::ThreadId,
+        error: ProviderFailure,
     },
-    /// Collection completed with the original native outcome.
-    Settled { outcome: CoreExecutionOutcome },
-    /// Collection failed with a complete normalized phase and disposition.
-    SettlementFailed { failure: ProviderFailure },
-    /// A diagnostic supplied a normalized reason without exposing display text.
-    Diagnostic {
-        kind: ProviderFailureKind,
-        fatal: bool,
+    /// Retain positively correlated turn failure without inventing completion.
+    TurnError {
+        thread_id: forge_provider_api::ThreadId,
+        turn_id: forge_provider_api::TurnId,
+        error: ProviderFailure,
+    },
+    /// Retain connection failure independently of any native completion certificate.
+    ProviderUnavailable { failure: ProviderFailure },
+    /// Retain recoverable warning scope and category without display contents.
+    Warning {
+        scope: forge_provider_api::WarningScope,
+        kind: forge_provider_api::ProviderWarningKind,
+    },
+    /// Retain feature observation failure without erasing the previous successful snapshot.
+    TerminalsFailed {
+        thread_id: forge_provider_api::ThreadId,
+        error: ProviderFailure,
     },
 }
 
 impl CoreProviderEvidence {
-    /// Select lifecycle and failure metadata while excluding arbitrary event payloads.
+    /// Select lifecycle and failure metadata without copying message, tool, or warning text.
     fn from_event(event: &ProviderEvent) -> Option<Self> {
-        use forge_provider_api::ExecutionUpdate;
+        use forge_provider_api::{ProviderConnectionEvent, ThreadEvent, TurnEvent};
         match event {
-            ProviderEvent::Execution { observation } => Some(match observation.update() {
-                ExecutionUpdate::Started { address } => Self::ExecutionStarted {
-                    address: address.clone(),
-                },
-                ExecutionUpdate::Finished { result, .. }
-                | ExecutionUpdate::ResolvedWithoutExecution { result, .. } => {
-                    Self::ExecutionFinished {
-                        outcome: CoreExecutionOutcome::from(result),
-                    }
+            ProviderEvent::Provider { event } => match event {
+                ProviderConnectionEvent::Unavailable(unavailable) => {
+                    Some(Self::ProviderUnavailable {
+                        failure: unavailable.failure,
+                    })
                 }
-                ExecutionUpdate::PublicationFailed {
-                    failure, result, ..
-                }
-                | ExecutionUpdate::ResolutionPublicationFailed {
-                    failure, result, ..
-                } => Self::PublicationFailed {
-                    failure: *failure,
-                    outcome: CoreExecutionOutcome::from(result),
-                },
-                ExecutionUpdate::ObservationLost { failure, .. } => Self::ObservationLost {
-                    failure: failure.clone(),
-                },
-            }),
-            ProviderEvent::Settled { settlement } => Some(Self::Settled {
-                outcome: CoreExecutionOutcome::from(&settlement.result),
-            }),
-            ProviderEvent::SettlementFailed { failure, .. } => {
-                Some(Self::SettlementFailed { failure: *failure })
-            }
-            ProviderEvent::Diagnostic { diagnostic, .. } => Some(Self::Diagnostic {
-                kind: diagnostic.kind,
-                fatal: diagnostic.fatal,
-            }),
-            ProviderEvent::CapabilitiesChanged { .. }
-            | ProviderEvent::SessionIdentity { .. }
-            | ProviderEvent::Terminals { .. }
-            | ProviderEvent::Message { .. }
-            | ProviderEvent::Tool { .. }
-            | ProviderEvent::Turn { .. }
-            | ProviderEvent::Usage { .. }
-            | ProviderEvent::Runtime { .. }
-            | ProviderEvent::Compaction { .. }
-            | ProviderEvent::Agent { .. }
-            | ProviderEvent::Checklist { .. }
-            | ProviderEvent::Approval { .. }
-            | ProviderEvent::DirectoryAccess { .. }
-            | ProviderEvent::InputAccepted { .. }
-            | ProviderEvent::Retry { .. }
-            | ProviderEvent::ParentBoundary { .. } => None,
-        }
-    }
-}
-
-/// Persist terminal execution outcome without assistant contents or completion metrics.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub(crate) enum CoreExecutionOutcome {
-    /// Native execution completed normally.
-    Completed,
-    /// Native execution confirmed cancellation.
-    Cancelled,
-    /// Native execution failed after acceptance may already have succeeded.
-    Failed { failure: CoreExecutionFailure },
-}
-
-impl From<&forge_provider_api::ExecutionResult> for CoreExecutionOutcome {
-    /// Exclude completion payloads while preserving the native terminal result.
-    fn from(result: &forge_provider_api::ExecutionResult) -> Self {
-        match result {
-            forge_provider_api::ExecutionResult::Completed { .. } => Self::Completed,
-            forge_provider_api::ExecutionResult::Cancelled { .. } => Self::Cancelled,
-            forge_provider_api::ExecutionResult::Failed { failure, .. } => Self::Failed {
-                failure: CoreExecutionFailure::from(failure),
+                ProviderConnectionEvent::Warning(warning) => Some(Self::Warning {
+                    scope: warning.scope.clone(),
+                    kind: warning.kind.clone(),
+                }),
+                ProviderConnectionEvent::CapabilitiesChanged(_) => None,
             },
-        }
-    }
-}
-
-/// Preserve typed terminal and retry metadata without native diagnostic text.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "failure", rename_all = "snake_case")]
-pub(crate) enum CoreExecutionFailure {
-    /// Native execution was positively rejected.
-    Rejected,
-    /// A permanent failure has a normalized category.
-    Terminal { kind: ProviderFailureKind },
-    /// Shared retry policy receives the exact native turn and any provider-directed wait.
-    Retryable {
-        address: forge_provider_api::TurnAddress,
-        category: forge_provider_api::retry::RetryCategory,
-        retry_after: Option<std::time::Duration>,
-    },
-}
-
-impl From<&forge_provider_api::ExecutionFailure> for CoreExecutionFailure {
-    /// Preserve terminal classification and provider-directed waits without copying output.
-    fn from(failure: &forge_provider_api::ExecutionFailure) -> Self {
-        match failure {
-            forge_provider_api::ExecutionFailure::Rejected => Self::Rejected,
-            forge_provider_api::ExecutionFailure::Terminal { kind } => {
-                Self::Terminal { kind: *kind }
-            }
-            forge_provider_api::ExecutionFailure::Retryable {
-                address,
-                category,
-                retry_after,
-            } => Self::Retryable {
-                address: address.clone(),
-                category: *category,
-                retry_after: *retry_after,
+            ProviderEvent::Thread { thread_id, event } => match event {
+                ThreadEvent::Error { error } => Some(Self::ThreadError {
+                    thread_id: thread_id.clone(),
+                    error: *error,
+                }),
+                ThreadEvent::TerminalsUpdated(Err(error)) => Some(Self::TerminalsFailed {
+                    thread_id: thread_id.clone(),
+                    error: *error,
+                }),
+                ThreadEvent::IdentityResolved(_)
+                | ThreadEvent::ContextUsage(_)
+                | ThreadEvent::TerminalsUpdated(Ok(_))
+                | ThreadEvent::CompactionUpdated(_) => None,
             },
+            ProviderEvent::Turn {
+                thread_id,
+                turn_id,
+                event,
+            } => match event {
+                TurnEvent::Started(started) => Some(Self::TurnStarted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    started_at_ms: started.started_at_ms,
+                }),
+                TurnEvent::Completed(completed) => Some(Self::TurnCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    completed: completed.clone(),
+                }),
+                TurnEvent::Error { error } => Some(Self::TurnError {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    error: *error,
+                }),
+                TurnEvent::ModelResolved(_)
+                | TurnEvent::Usage(_)
+                | TurnEvent::ChecklistUpdated(_) => None,
+            },
+            ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => None,
         }
     }
 }
@@ -251,7 +211,7 @@ pub(crate) enum CoreOperation {
         kind: ProviderOperation,
         binding: Option<BindingId>,
         scope: EventScope,
-        invocation: Option<InvocationScope>,
+        invocation: Option<Box<InvocationScope>>,
     },
 }
 
@@ -325,9 +285,10 @@ impl CoreOutcome {
     /// Classify a durable command result without copying its domain payload or error text.
     pub(crate) fn command(result: &Result<CommandOutcome, CommandFailure>) -> Self {
         match result {
-            Ok(CommandOutcome::Cancelled(super::command::CancellationOutcome::Cancelled {
-                ..
-            })) => Self::Cancelled,
+            Ok(CommandOutcome::Cancelled(
+                super::command::CancellationOutcome::Cancelled { .. }
+                | super::command::CancellationOutcome::Retracted { .. },
+            )) => Self::Cancelled,
             Ok(
                 CommandOutcome::Cancelled(super::command::CancellationOutcome::NoWork)
                 | CommandOutcome::Agent(_)
@@ -383,76 +344,31 @@ impl CoreOutcome {
     }
 }
 
-/// Preserve the closed provider event vocabulary without text, tool arguments, or native payloads.
+/// Identify the exact native event family without persisting its contents.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CoreProviderEventKind {
-    /// Foreground collection completed.
-    Settled,
-    /// Foreground collection failed.
-    SettlementFailed,
-    /// Effective capabilities changed.
-    CapabilitiesChanged,
-    /// Durable native history identity resolved.
-    SessionIdentity,
-    /// Background terminal inventory changed.
-    Terminals,
-    /// Execution lifecycle evidence arrived.
-    Execution,
-    /// Assistant message content changed.
-    Message,
-    /// Tool output or lifecycle changed.
-    Tool,
-    /// Native turn lifecycle changed.
+    /// Connection support, warnings, or unavailability changed.
+    Provider,
+    /// Conversation metadata changed.
+    Thread,
+    /// Canonical turn lifecycle or metadata changed.
     Turn,
-    /// Provider usage changed.
-    Usage,
-    /// Runtime metadata changed.
-    Runtime,
-    /// Context compaction progressed.
-    Compaction,
-    /// Native descendant state changed.
+    /// An item was admitted, updated, or completed.
+    Item,
+    /// A native child relationship or lifecycle changed.
     Agent,
-    /// Provider checklist changed.
-    Checklist,
-    /// Approval state changed.
-    Approval,
-    /// Directory authority changed.
-    DirectoryAccess,
-    /// Exact input acceptance was observed.
-    InputAccepted,
-    /// Native retry information changed.
-    Retry,
-    /// A normalized diagnostic arrived.
-    Diagnostic,
-    /// Native parent boundary changed.
-    ParentBoundary,
 }
 
 impl From<&ProviderEvent> for CoreProviderEventKind {
-    /// Classify every provider observation exhaustively without retaining its content.
+    /// Classify native event families exhaustively without retaining payload content.
     fn from(event: &ProviderEvent) -> Self {
         match event {
-            ProviderEvent::Settled { .. } => Self::Settled,
-            ProviderEvent::SettlementFailed { .. } => Self::SettlementFailed,
-            ProviderEvent::CapabilitiesChanged { .. } => Self::CapabilitiesChanged,
-            ProviderEvent::SessionIdentity { .. } => Self::SessionIdentity,
-            ProviderEvent::Terminals { .. } => Self::Terminals,
-            ProviderEvent::Execution { .. } => Self::Execution,
-            ProviderEvent::Message { .. } => Self::Message,
-            ProviderEvent::Tool { .. } => Self::Tool,
+            ProviderEvent::Provider { .. } => Self::Provider,
+            ProviderEvent::Thread { .. } => Self::Thread,
             ProviderEvent::Turn { .. } => Self::Turn,
-            ProviderEvent::Usage { .. } => Self::Usage,
-            ProviderEvent::Runtime { .. } => Self::Runtime,
-            ProviderEvent::Compaction { .. } => Self::Compaction,
+            ProviderEvent::Item { .. } => Self::Item,
             ProviderEvent::Agent { .. } => Self::Agent,
-            ProviderEvent::Checklist { .. } => Self::Checklist,
-            ProviderEvent::Approval { .. } => Self::Approval,
-            ProviderEvent::DirectoryAccess { .. } => Self::DirectoryAccess,
-            ProviderEvent::InputAccepted { .. } => Self::InputAccepted,
-            ProviderEvent::Retry { .. } => Self::Retry,
-            ProviderEvent::Diagnostic { .. } => Self::Diagnostic,
-            ProviderEvent::ParentBoundary { .. } => Self::ParentBoundary,
         }
     }
 }
@@ -489,6 +405,7 @@ pub(crate) enum CoreTransitionKind {
 pub(crate) struct CoreEventLog {
     root: PathBuf,
     sessions: Mutex<HashMap<String, CommandJournal>>,
+    operations: std::sync::Arc<crate::provider::operation::OperationRegistry>,
 }
 
 impl CoreEventLog {
@@ -497,7 +414,15 @@ impl CoreEventLog {
         Self {
             root,
             sessions: Mutex::new(HashMap::new()),
+            operations: Default::default(),
         }
+    }
+
+    /// Get the shared registry of original native operation ownership.
+    pub(crate) fn operations(
+        &self,
+    ) -> std::sync::Arc<crate::provider::operation::OperationRegistry> {
+        self.operations.clone()
     }
 
     /// Append safe metadata using the existing schema and transaction sequence allocator.
@@ -550,60 +475,62 @@ pub(crate) fn persist_test_session(root: &std::path::Path, id: &str) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    /// Session-only failure metadata survives persistence without inventing turn attribution.
+    #[test]
+    fn thread_error_metadata_preserves_scope_and_failure() {
+        let owner = forge_provider_api::ThreadOwner::root("thread-error-session");
+        let thread_id = owner.thread_id();
+        let failure = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::Runtime,
+        );
+        let event = forge_provider_api::ProviderEvent::Thread {
+            thread_id: thread_id.clone(),
+            event: forge_provider_api::ThreadEvent::Error { error: failure },
+        };
+        let record = super::CoreRecord::provider_event_metadata(
+            forge_provider_api::BindingId::new("thread-error-binding").unwrap(),
+            forge_provider_api::EventSequence::default(),
+            EventScope::Binding {
+                owner: owner.clone(),
+            },
+            &event,
+        );
+        let loaded: super::CoreRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert!(matches!(loaded, super::CoreRecord::ProviderEventConsumed {
+            scope: forge_provider_api::EventScope::Binding { owner: retained_owner },
+            evidence: Some(super::CoreProviderEvidence::ThreadError { thread_id: retained_thread, error }), ..
+        } if retained_owner == owner && retained_thread == thread_id && error == failure));
+    }
+
     use super::*;
 
-    /// A successful acceptance operation cannot erase later native execution or collection failure evidence.
+    /// Native connection failure survives accepted input without copying sanitized display text.
     #[test]
     fn asynchronous_failure_evidence_survives_successful_input_acceptance() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         persist_test_session(root.path(), "session")?;
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         let log = CoreEventLog::new(root.path().to_owned());
-        let scope = InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("session"),
-            "exchange",
-        );
+        let scope =
+            InvocationScope::new(forge_provider_api::ThreadOwner::root("session"), "exchange");
         let binding = BindingId::new("binding")?;
         log.append(
             "session",
             &CoreRecord::OperationCompleted {
                 operation: CoreOperation::Provider {
                     id: OperationId::new("accepted-input")?,
-                    kind: ProviderOperation::InputSubmit,
+                    kind: ProviderOperation::TurnStart,
                     binding: Some(binding.clone()),
                     scope: scope.clone().into(),
-                    invocation: Some(scope.clone()),
+                    invocation: Some(Box::new(scope.clone())),
                 },
                 outcome: CoreOutcome::Succeeded,
             },
         )?;
-        let mut completion = forge_provider_api::completion::ProviderCompletion::default();
-        completion.runtime.provider = "private-runtime-payload".into();
-        let observation = forge_provider_api::ExecutionObservation::new(
-            scope.clone(),
-            forge_provider_api::ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions: vec![forge_provider_api::SubmissionId::try_from(
-                    "input".to_owned(),
-                )?],
-                completed_at_ms: 1,
-                result: forge_provider_api::ExecutionResult::Failed {
-                    completion: completion.into(),
-                    failure: forge_provider_api::ExecutionFailure::Terminal {
-                        kind: ProviderFailureKind::Quota,
-                    },
-                },
-            },
-        )?;
-        log.append(
-            "session",
-            &CoreRecord::provider_event_metadata(
-                binding.clone(),
-                EventSequence::new(1),
-                &ProviderEvent::Execution { observation },
-            ),
-        )?;
         let failure =
-            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Transport)
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
                 .at_phase(
                     forge_provider_api::ProviderPhase::Collection,
                     forge_provider_api::FailureDisposition::Invalidated,
@@ -612,38 +539,30 @@ mod tests {
             "session",
             &CoreRecord::provider_event_metadata(
                 binding,
-                EventSequence::new(2),
-                &ProviderEvent::SettlementFailed { scope, failure },
+                EventSequence::new(1),
+                scope.clone().into(),
+                &ProviderEvent::Provider {
+                    event: forge_provider_api::ProviderConnectionEvent::Unavailable(
+                        forge_provider_api::ProviderUnavailable {
+                            failure,
+                            message: forge_provider_api::SanitizedMessage::new(
+                                "private display sentinel",
+                            )?,
+                        },
+                    ),
+                },
             ),
         )?;
-        let execution: String = database.query_row(
+        let stored: String = database.query_row(
             "SELECT record FROM owner_core_log WHERE sequence=2",
             [],
             |row| row.get(0),
         )?;
-        assert!(!execution.contains("private-runtime-payload"));
-        assert!(matches!(
-            serde_json::from_str::<CoreRecord>(&execution)?,
-            CoreRecord::ProviderEventConsumed {
-                evidence: Some(CoreProviderEvidence::ExecutionFinished {
-                    outcome: CoreExecutionOutcome::Failed {
-                        failure: CoreExecutionFailure::Terminal {
-                            kind: ProviderFailureKind::Quota
-                        }
-                    }
-                }),
-                ..
-            }
-        ));
-        let collection: String = database.query_row(
-            "SELECT record FROM owner_core_log WHERE sequence=3",
-            [],
-            |row| row.get(0),
-        )?;
+        assert!(!stored.contains("private display sentinel"));
         assert!(
-            matches!(serde_json::from_str::<CoreRecord>(&collection)?, CoreRecord::ProviderEventConsumed {
-            evidence: Some(CoreProviderEvidence::SettlementFailed { failure: observed }), ..
-        } if observed == failure)
+            matches!(serde_json::from_str::<CoreRecord>(&stored)?, CoreRecord::ProviderEventConsumed {
+            scope: EventScope::Invocation { invocation }, evidence: Some(CoreProviderEvidence::ProviderUnavailable { failure: retained }), ..
+        } if invocation == scope && retained == failure)
         );
         Ok(())
     }
@@ -661,7 +580,7 @@ mod tests {
             },
         };
         assert_eq!(log.append("session", &record)?, None);
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         assert_eq!(
             database.query_row("SELECT COUNT(*) FROM session_record", [], |row| row
                 .get::<_, i64>(0))?,

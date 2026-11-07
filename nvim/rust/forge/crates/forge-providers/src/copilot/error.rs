@@ -22,6 +22,26 @@ pub(crate) fn session_failure_kind(data: &serde_json::Value) -> ProviderFailureK
     }
 }
 
+/// Preserve native session failures as nonterminal observations of their mapped conversation.
+pub(crate) fn session_error(
+    thread_id: forge_provider_api::ThreadId,
+    contents: &serde_json::Value,
+) -> forge_provider_api::AdapterActivity {
+    forge_provider_api::AdapterActivity::Thread {
+        thread_id,
+        event: forge_provider_api::ThreadEvent::Error {
+            error: ProviderFailure::new(
+                ProviderOperation::TurnStart,
+                session_failure_kind(contents),
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+        },
+    }
+}
+
 /// Classify native tool diagnostics independently of the tool's actual output.
 pub(crate) fn tool_failure_kind(data: &serde_json::Value) -> ProviderFailureKind {
     match data
@@ -102,11 +122,11 @@ mod tests {
     fn native_codes_and_statuses_have_normalized_categories() {
         let nested = ProviderError::Combined {
             primary: Box::new(native_failure(
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 ProviderFailureKind::Timeout,
             )),
             secondary: vec![native_failure(
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 ProviderFailureKind::Rejected,
             )],
         };

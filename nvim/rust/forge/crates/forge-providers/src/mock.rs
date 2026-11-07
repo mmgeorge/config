@@ -6,12 +6,7 @@ use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
     approval::ApprovalMode,
     compaction::CompactionResult,
-    completion::ProviderCompletion,
     events::{self, ProviderEventSink},
-    lifecycle::{
-        ExecutionFailure, ExecutionObservation, ExecutionResult, ExecutionUpdate,
-        ObservationFailure,
-    },
     permissions::{PermissionRequest, PermissionResponse, PermissionTarget},
     provider::Provider,
     session::{
@@ -192,7 +187,7 @@ impl MockOperation {
     }
 }
 
-type SettlementResult = Result<InvocationSettlement, ProviderError>;
+type SettlementResult = Result<CompletedTurn, ProviderError>;
 type SharedReceipts = Arc<Mutex<HashMap<(SubmissionId, DeliveryAttemptId), AcceptedInput>>>;
 
 /// Admit steering only while the exact response still accepts input.
@@ -216,12 +211,6 @@ enum PromptDelivery {
     Accepted,
 }
 
-/// Distinguish a native response from loss of the observation needed for acceptance.
-enum PromptFinish {
-    Terminal,
-    ObservationLost,
-}
-
 /// Native provider-neutral mock used by shared Harness acceptance and lifecycle flows.
 #[derive(Clone)]
 pub(crate) struct MockProvider {
@@ -230,7 +219,7 @@ pub(crate) struct MockProvider {
     admission: Arc<Mutex<()>>,
     closed_bindings: Arc<Mutex<HashMap<BindingId, Result<(), ProviderError>>>>,
     receipts: SharedReceipts,
-    owners: Arc<Mutex<HashMap<ExecutionOwner, BindingId>>>,
+    owners: Arc<Mutex<HashMap<ThreadOwner, BindingId>>>,
     control: Arc<MockControl>,
     operations: Arc<MockOperations>,
     shutdown_lock: Arc<Mutex<()>>,
@@ -288,21 +277,19 @@ impl MockProvider {
         request: PromptRequest,
         pending: &PendingInput,
     ) -> Result<InputAcceptance, ProviderError> {
-        let session = self
-            .binding(binding, ProviderOperation::InputSubmit)
-            .await?;
-        ensure_open(&session, ProviderOperation::InputSubmit)?;
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        let session = self.binding(binding, ProviderOperation::TurnStart).await?;
+        ensure_open(&session, ProviderOperation::TurnStart)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         let _admission = tokio::select! {
             admission = session.admission.lock() => admission,
-            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::InputSubmit)
+            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::TurnStart)
                 .expect_err("pending cancellation is sticky before admission")),
         };
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         operation
-            .admit(ProviderOperation::InputSubmit)
+            .admit(ProviderOperation::TurnStart)
             .map_err(|cause| ProviderError::PreparationFailed(Box::new(cause)))?;
-        ensure_open(&session, ProviderOperation::InputSubmit)?;
+        ensure_open(&session, ProviderOperation::TurnStart)?;
         if request.scope.owner != session.owner
             || request.receipt.id() != &request.submission_id
             || request.receipt.attempt_id()? != request.attempt_id
@@ -314,7 +301,7 @@ impl MockProvider {
             )
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -325,7 +312,7 @@ impl MockProvider {
             .contains_key(&(request.submission_id.clone(), request.attempt_id.clone()))
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::HistoryConflict,
             ));
         }
@@ -336,13 +323,13 @@ impl MockProvider {
             .contains_key(&request.scope)
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         if session.isolated && (!request.tools.is_empty() || request.tool_endpoint.is_some()) {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Policy,
             ));
         }
@@ -351,19 +338,19 @@ impl MockProvider {
         }
         let preparation = tokio::select! {
             result = request.turn_control.before_send(&request.scope) => result,
-            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::InputSubmit)
+            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::TurnStart)
                 .expect_err("pending cancellation is sticky during preparation")),
         };
         if let Err(error) = preparation {
             return Err(reject_before_dispatch(&request.receipt, error).await);
         }
-        pending.check_admission(ProviderOperation::InputSubmit)?;
-        ensure_open(&session, ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
+        ensure_open(&session, ProviderOperation::TurnStart)?;
         // Admission serializes replacement, so reject occupied sessions before
         // consuming the scenario reserved for the next admissible prompt.
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
@@ -371,7 +358,7 @@ impl MockProvider {
         if let Some(script) = &script {
             match &script.terminal {
                 TestPromptTerminal::RejectedBeforeDispatch(kind) => {
-                    let error = failure(ProviderOperation::InputSubmit, *kind);
+                    let error = failure(ProviderOperation::TurnStart, *kind);
                     return match request.receipt.clone().record_rejected(error.clone()).await {
                         Ok(()) => Err(ProviderError::PreparationFailed(Box::new(error))),
                         Err(cleanup) => Err(ProviderError::PreparationCleanup {
@@ -396,7 +383,7 @@ impl MockProvider {
                         .into_bytes(),
                     )
                     .map_err(|_| {
-                        failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown)
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown)
                     })?;
                     request.receipt.clone().record_sending(Some(token)).await?;
                     request
@@ -412,9 +399,9 @@ impl MockProvider {
                 | TestPromptTerminal::ObservationLost(_) => {}
             }
         }
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         operation
-            .dispatch(ProviderOperation::InputSubmit)
+            .dispatch(ProviderOperation::TurnStart)
             .map_err(|cause| ProviderError::PreparationFailed(Box::new(cause)))?;
         let (cancelled, cancel_receiver) = watch::channel(false);
         let (settled, _) = watch::channel(None);
@@ -439,59 +426,38 @@ impl MockProvider {
                 .cancelled
                 .send_replace(true);
         }
-        let control = self.control.clone();
-        let for_task = session.clone();
-        let worker = tokio::spawn(async move {
-            run_prompt(
-                for_task,
-                control,
+        let address = TurnAddress {
+            scope: scope.clone(),
+            thread_id: request.thread_id.clone(),
+            turn_id: request.turn_id.clone(),
+        };
+        let driver = Arc::new(MockTurnDriver {
+            session: session.clone(),
+            scope: scope.clone(),
+            input: Mutex::new(Some(MockRun {
+                control: self.control.clone(),
                 request,
                 script,
-                cancel_receiver,
+                cancelled: cancel_receiver,
                 accepted,
-            )
-            .await
+            })),
         });
+        let runner = Arc::new(crate::turn_runner::RetainedTurn::spawn(
+            driver,
+            session.sink.clone(),
+            address,
+        )?);
         let for_collection = session.clone();
+        let for_start = runner.clone();
         tokio::spawn(async move {
-            let result = match worker.await {
-                Ok(result) => result,
-                Err(_) => Err(failure(
-                    ProviderOperation::Cancel,
-                    ProviderFailureKind::Unknown,
-                )),
-            };
+            let result = runner.join().await;
             let _admission = for_collection.admission.lock().await;
-            let result = settle_invocation(&for_collection, &scope, result)
-                .await
-                .map_err(|error| match error {
-                    ProviderError::Failure(cause) => ProviderError::Failure(
-                        cause.at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated),
-                    ),
-                    other => other,
-                });
-            if let Err(error) = &result {
+            if result.is_err() {
                 *for_collection
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     MockBindingState::Invalidated;
-                if let Ok(sink) = for_collection.sink.invocation_sink(&scope) {
-                    let cause = match error {
-                        ProviderError::Failure(cause) => *cause,
-                        _ => ProviderFailure::new(
-                            ProviderOperation::Cancel,
-                            ProviderFailureKind::Unknown,
-                        ),
-                    }
-                    .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated);
-                    let _ = sink
-                        .send_wait(ProviderEvent::SettlementFailed {
-                            scope: scope.clone(),
-                            failure: cause,
-                        })
-                        .await;
-                }
             }
             for_collection
                 .settlements
@@ -505,19 +471,22 @@ impl MockProvider {
         });
         pending.registered();
         drop(_admission);
-        acceptance
+        let accepted = acceptance
             .await
-            .unwrap_or_else(|_| Err(ProviderError::DeliveryUncertain))
+            .unwrap_or_else(|_| Err(ProviderError::DeliveryUncertain));
+        for_start.started().await?;
+        accepted
     }
 }
 
 #[async_trait]
 impl Provider for MockProvider {
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: OperationContext,
         request: SessionRequest,
     ) -> Result<OpenedSession, ProviderError> {
+        request.validate_thread_owner()?;
         let payload = request.identity();
         let operation = MockOperation::new(context.clone());
         let native_operation = operation.clone();
@@ -526,10 +495,10 @@ impl Provider for MockProvider {
         let cleanup_owner = request.owner.clone();
         let cleanup = self.clone();
         self.operations
-            .session_open
+            .thread_open
             .take(
                 context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -539,7 +508,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::SessionOpen);
+                        operation.interrupt(reason, ProviderOperation::ThreadOpen);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -553,7 +522,7 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -567,10 +536,10 @@ impl Provider for MockProvider {
         let cleanup_binding = binding.clone();
         let cleanup = self.clone();
         self.operations
-            .session_configure
+            .thread_configure
             .observe(
                 context,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -582,7 +551,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::SessionConfigure);
+                        operation.interrupt(reason, ProviderOperation::ThreadConfigure);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -596,7 +565,7 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: OperationContext,
         request: SessionForkRequest,
@@ -607,10 +576,10 @@ impl Provider for MockProvider {
         let native = self.clone();
 
         self.operations
-            .session_fork
+            .thread_fork
             .observe(
                 context,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -620,7 +589,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::SessionFork);
+                        operation.interrupt(reason, ProviderOperation::ThreadFork);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -632,7 +601,7 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -646,10 +615,10 @@ impl Provider for MockProvider {
         let cleanup_binding = binding.clone();
         let cleanup = self.clone();
         self.operations
-            .session_compact
+            .thread_compact
             .observe(
                 context,
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -661,7 +630,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::SessionCompact);
+                        operation.interrupt(reason, ProviderOperation::ThreadCompact);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -675,7 +644,7 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -687,10 +656,10 @@ impl Provider for MockProvider {
         let native_binding = binding.clone();
 
         self.operations
-            .session_close
+            .thread_close
             .observe(
                 context,
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -702,7 +671,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::SessionClose);
+                        operation.interrupt(reason, ProviderOperation::ThreadClose);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -714,12 +683,12 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
+    ) -> Result<TurnInterruptResult, ProviderError> {
         let payload = (binding.clone(), request.clone());
         let operation = MockOperation::new(context.clone());
         let native_operation = operation.clone();
@@ -730,7 +699,7 @@ impl Provider for MockProvider {
             .cancel
             .observe(
                 context,
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -742,7 +711,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::Cancel);
+                        operation.interrupt(reason, ProviderOperation::TurnInterrupt);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -754,12 +723,13 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: PromptRequest,
     ) -> Result<InputAcceptance, ProviderError> {
+        request.validate_turn_identity()?;
         let payload = (binding.clone(), request.identity());
         let pending = self
             .pending_inputs
@@ -772,10 +742,10 @@ impl Provider for MockProvider {
         let cleanup_scope = request.scope.clone();
         let cleanup = self.clone();
         self.operations
-            .input_submit
+            .turn_start
             .observe(
                 context,
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -787,7 +757,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::InputSubmit);
+                        operation.interrupt(reason, ProviderOperation::TurnStart);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => {
@@ -809,7 +779,7 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn input_steer(
+    async fn turn_steer(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -824,10 +794,10 @@ impl Provider for MockProvider {
         let cleanup_scope = request.scope.clone();
         let cleanup = self.clone();
         self.operations
-            .input_steer
+            .turn_steer
             .observe(
                 context,
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 payload,
                 async move {
                     let completed = native_operation.clone();
@@ -839,7 +809,7 @@ impl Provider for MockProvider {
                 },
                 move |reason| {
                     let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::InputSteer);
+                        operation.interrupt(reason, ProviderOperation::TurnSteer);
                     Interruption::new(observation, async move {
                         match dispatched {
                             NativeDispatch::Preparing => Ok(()),
@@ -1240,13 +1210,13 @@ impl MockProvider {
         request: SessionRequest,
     ) -> Result<OpenedSession, ProviderError> {
         let _admission = self.admission.lock().await;
-        operation.admit(ProviderOperation::SessionOpen)?;
+        operation.admit(ProviderOperation::ThreadOpen)?;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -1259,13 +1229,13 @@ impl MockProvider {
                 || !request.configuration.resources.mcp.is_empty())
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Policy,
             ));
         }
         if self.owners.lock().await.contains_key(&request.owner) {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -1280,6 +1250,7 @@ impl MockProvider {
             )
         });
         let binding = SessionBinding {
+            thread_id: request.thread_id.clone(),
             id: binding_id.clone(),
             provider_session_id,
         };
@@ -1316,10 +1287,21 @@ impl MockProvider {
         });
         let mut bindings = self.bindings.lock().await;
         let mut owners = self.owners.lock().await;
-        operation.dispatch(ProviderOperation::SessionOpen)?;
+        operation.dispatch(ProviderOperation::ThreadOpen)?;
+        let identity_writer = session.sink.activity_writer();
         bindings.insert(binding_id.clone(), session);
         owners.insert(request.owner, binding_id);
-        operation.finish(ProviderOperation::SessionOpen)?;
+        drop(owners);
+        drop(bindings);
+        if let Some(history) = &binding.provider_session_id {
+            identity_writer
+                .send_wait(AdapterActivity::Thread {
+                    thread_id: binding.thread_id.clone(),
+                    event: ThreadEvent::IdentityResolved(history.clone()),
+                })
+                .await?;
+        }
+        operation.finish(ProviderOperation::ThreadOpen)?;
         Ok(OpenedSession {
             binding,
             capabilities: mock_capabilities(),
@@ -1334,13 +1316,13 @@ impl MockProvider {
         configuration: SessionConfiguration,
     ) -> Result<ConfiguredSession, ProviderError> {
         let session = self
-            .binding(binding, ProviderOperation::SessionConfigure)
+            .binding(binding, ProviderOperation::ThreadConfigure)
             .await?;
         let _admission = session.admission.lock().await;
-        ensure_open(&session, ProviderOperation::SessionConfigure)?;
+        ensure_open(&session, ProviderOperation::ThreadConfigure)?;
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
@@ -1350,16 +1332,16 @@ impl MockProvider {
                 || !configuration.resources.mcp.is_empty())
         {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Policy,
             ));
         }
-        operation.dispatch(ProviderOperation::SessionConfigure)?;
+        operation.dispatch(ProviderOperation::ThreadConfigure)?;
         *session.model.lock().await = configuration.model.clone();
         *session.access.lock().await = configuration.access.clone();
         *session.approval.lock().await = configuration.approval;
         *session.selection.lock().await = configuration.resources.clone();
-        operation.finish(ProviderOperation::SessionConfigure)?;
+        operation.finish(ProviderOperation::ThreadConfigure)?;
         Ok(ConfiguredSession {
             configuration,
             capabilities: mock_capabilities(),
@@ -1382,18 +1364,18 @@ impl MockProvider {
             }
         };
         let source = self
-            .binding(&source_id, ProviderOperation::SessionFork)
+            .binding(&source_id, ProviderOperation::ThreadFork)
             .await?;
         let _admission = source.admission.lock().await;
-        ensure_open(&source, ProviderOperation::SessionFork)?;
+        ensure_open(&source, ProviderOperation::ThreadFork)?;
         if source.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
         validate_model_selection(&request.target.configuration.model)?;
-        operation.dispatch(ProviderOperation::SessionFork)?;
+        operation.dispatch(ProviderOperation::ThreadFork)?;
         let result = ProviderForkResult::unprofiled(
             uuid::Uuid::new_v4()
                 .to_string()
@@ -1410,33 +1392,28 @@ impl MockProvider {
         request: CompactionRequest,
     ) -> Result<forge_provider_api::CompactionResult, ProviderError> {
         let session = self
-            .binding(binding, ProviderOperation::SessionCompact)
+            .binding(binding, ProviderOperation::ThreadCompact)
             .await?;
         let _admission = session.admission.lock().await;
-        ensure_open(&session, ProviderOperation::SessionCompact)?;
+        ensure_open(&session, ProviderOperation::ThreadCompact)?;
         request.validate_context(&operation.context)?;
         if request.scope.owner() != &session.owner {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
         let _operation = session.operation.lock().await;
-        operation.dispatch(ProviderOperation::SessionCompact)?;
+        operation.dispatch(ProviderOperation::ThreadCompact)?;
         let result = Compaction {
             id: operation.context.id().as_str().to_owned(),
-            thread_id: session
-                .binding
-                .provider_session_id
-                .as_ref()
-                .map(|id| id.as_str().to_owned())
-                .unwrap_or_default(),
+            thread_id: session.owner.thread_id().as_str().to_owned(),
             state: CompactionState::Completed,
             manual: true,
             started_at_ms: None,
@@ -1447,16 +1424,18 @@ impl MockProvider {
                 ),
                 pre_compaction_tokens: Some(80_000),
                 post_compaction_tokens: Some(20_000),
+                context_tokens_after: Some(20_000),
                 tokens_removed: Some(60_000),
                 ..Default::default()
             },
         };
         let sink = session.sink.bind_scope(request.scope)?;
-        sink.send_wait(ProviderEvent::Compaction {
-            scope: sink.scope().clone(),
-            update: Box::new(result.clone()),
-        })
-        .await?;
+        sink.activity_writer()
+            .send_wait(AdapterActivity::Thread {
+                thread_id: session.binding.thread_id.clone(),
+                event: ThreadEvent::CompactionUpdated(Box::new(result.clone())),
+            })
+            .await?;
         let result = forge_provider_api::CompactionResult {
             compaction: result,
             watermark: sink.watermark(),
@@ -1470,12 +1449,12 @@ impl MockProvider {
         operation: MockOperation,
         binding: &BindingId,
     ) -> Result<(), ProviderError> {
-        operation.dispatch(ProviderOperation::SessionClose)?;
+        operation.dispatch(ProviderOperation::ThreadClose)?;
         self.close_binding(binding).await
     }
 
     /// Close an allocated open result after its allocation boundary has completed.
-    async fn close_open_owner(&self, owner: &ExecutionOwner) -> Result<(), ProviderError> {
+    async fn close_open_owner(&self, owner: &ThreadOwner) -> Result<(), ProviderError> {
         let admission = self.admission.lock().await;
         let binding = self.owners.lock().await.get(owner).cloned();
         drop(admission);
@@ -1492,7 +1471,10 @@ impl MockProvider {
         scope: &InvocationScope,
     ) -> Result<(), ProviderError> {
         self.pending_inputs.cancel(binding, scope).await;
-        let session = match self.binding(binding, ProviderOperation::Cancel).await {
+        let session = match self
+            .binding(binding, ProviderOperation::TurnInterrupt)
+            .await
+        {
             Ok(session) => session,
             Err(ProviderError::Failure(cause))
                 if matches!(
@@ -1532,7 +1514,7 @@ impl MockProvider {
             return result;
         }
         let session = self
-            .binding(binding, ProviderOperation::SessionClose)
+            .binding(binding, ProviderOperation::ThreadClose)
             .await?;
         *session
             .state
@@ -1584,9 +1566,24 @@ impl MockProvider {
         operation: MockOperation,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
-        operation.dispatch(ProviderOperation::Cancel)?;
-        self.cancel_exact(binding, request).await
+    ) -> Result<TurnInterruptResult, ProviderError> {
+        operation.dispatch(ProviderOperation::TurnInterrupt)?;
+        let scope = request.scope.clone();
+        self.cancel_exact(binding, request).await?;
+        let session = self
+            .binding(binding, ProviderOperation::TurnInterrupt)
+            .await?;
+        Ok(TurnInterruptResult {
+            operation_id: operation.context.id().clone(),
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().map_err(|_| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?,
+            watermark: session.sink.watermark(),
+        })
     }
 
     /// Interrupt only the matching invocation while retaining its collection receiver.
@@ -1594,9 +1591,11 @@ impl MockProvider {
         &self,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
+    ) -> Result<CompletedTurn, ProviderError> {
         self.pending_inputs.cancel(binding, &request.scope).await;
-        let session = self.binding(binding, ProviderOperation::Cancel).await?;
+        let session = self
+            .binding(binding, ProviderOperation::TurnInterrupt)
+            .await?;
         let admission = session.admission.lock().await;
         if let Some(result) = session
             .settlements
@@ -1614,7 +1613,7 @@ impl MockProvider {
                 .filter(|invocation| invocation.scope == request.scope)
                 .ok_or_else(|| {
                     failure(
-                        ProviderOperation::Cancel,
+                        ProviderOperation::TurnInterrupt,
                         ProviderFailureKind::WrongInvocation,
                     )
                 })?;
@@ -1641,9 +1640,9 @@ impl MockProvider {
         binding: &BindingId,
         request: SteeringRequest,
     ) -> Result<session::SteeringAcceptance, ProviderError> {
-        let session = self.binding(binding, ProviderOperation::InputSteer).await?;
+        let session = self.binding(binding, ProviderOperation::TurnSteer).await?;
         let _admission = session.admission.lock().await;
-        ensure_open(&session, ProviderOperation::InputSteer)?;
+        ensure_open(&session, ProviderOperation::TurnSteer)?;
         {
             let active = session.active.lock().await;
             if active.as_ref().is_none_or(|invocation| {
@@ -1652,7 +1651,7 @@ impl MockProvider {
                     || !matches!(invocation.phase, MockInputPhase::Receiving(_))
             }) {
                 return Err(failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::WrongInvocation,
                 ));
             }
@@ -1667,7 +1666,7 @@ impl MockProvider {
                 .contains_key(&(receipt.id().clone(), attempt.clone()))
             {
                 return Err(failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::HistoryConflict,
                 ));
             }
@@ -1685,7 +1684,7 @@ impl MockProvider {
                 )
                 .into_bytes(),
             )
-            .map_err(|_| failure(ProviderOperation::InputSteer, ProviderFailureKind::Protocol))?;
+            .map_err(|_| failure(ProviderOperation::TurnSteer, ProviderFailureKind::Protocol))?;
             receipt.clone().record_sending(Some(token)).await?;
             Some((receipt.clone(), attempt))
         } else {
@@ -1706,7 +1705,7 @@ impl MockProvider {
         }
         {
             let mut active = session.active.lock().await;
-            ensure_open(&session, ProviderOperation::InputSteer)?;
+            ensure_open(&session, ProviderOperation::TurnSteer)?;
             let invocation = active
                 .as_mut()
                 .filter(|invocation| {
@@ -1714,17 +1713,17 @@ impl MockProvider {
                 })
                 .ok_or_else(|| {
                     failure(
-                        ProviderOperation::InputSteer,
+                        ProviderOperation::TurnSteer,
                         ProviderFailureKind::WrongInvocation,
                     )
                 })?;
             let MockInputPhase::Receiving(pending) = &mut invocation.phase else {
                 return Err(failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::WrongInvocation,
                 ));
             };
-            if let Err(error) = operation.dispatch(ProviderOperation::InputSteer) {
+            if let Err(error) = operation.dispatch(ProviderOperation::TurnSteer) {
                 drop(active);
                 return Err(match request.delivery.receipt() {
                     Some(receipt) => reject_before_dispatch(receipt, error).await,
@@ -1734,6 +1733,9 @@ impl MockProvider {
             pending.push(MockSteering {
                 text,
                 submission: submission_id.clone(),
+                covered: sending.as_ref().map(|(receipt, attempt)| {
+                    CoveredInput::new(receipt.id().clone(), attempt.clone())
+                }),
             });
         }
         if let Some((receipt, attempt)) = sending {
@@ -1751,7 +1753,7 @@ impl MockProvider {
                 )
                 .into_bytes(),
             )
-            .map_err(|_| failure(ProviderOperation::InputSteer, ProviderFailureKind::Protocol))?;
+            .map_err(|_| failure(ProviderOperation::TurnSteer, ProviderFailureKind::Protocol))?;
             session.receipts.lock().await.insert(
                 (receipt.id().clone(), attempt),
                 AcceptedInput {
@@ -1853,7 +1855,7 @@ impl MockProvider {
             None => InputRetractOutcome::Unavailable(InputRetractUnavailable::WrongInvocation),
             Some(Err(_)) => InputRetractOutcome::Unavailable(InputRetractUnavailable::NotCancelled),
             Some(Ok(settlement)) => {
-                if !matches!(settlement.result, ExecutionResult::Cancelled { .. }) {
+                if !matches!(settlement.result().outcome(), TurnOutcome::Interrupted) {
                     InputRetractOutcome::Unavailable(InputRetractUnavailable::NotCancelled)
                 } else if !session
                     .receipts
@@ -2083,14 +2085,14 @@ impl MockProvider {
 
 struct MockOperations {
     identities: Arc<IdentityRegistry>,
-    session_open: Store<SessionRequestIdentity, OpenedSession>,
-    session_configure: Store<(BindingId, SessionConfiguration), ConfiguredSession>,
-    session_fork: Store<SessionForkRequest, ProviderForkResult>,
-    session_compact: Store<(BindingId, CompactionRequest), forge_provider_api::CompactionResult>,
-    session_close: Store<BindingId, ()>,
-    cancel: Store<(BindingId, CancelRequest), InvocationSettlement>,
-    input_submit: Store<(BindingId, PromptRequestIdentity), InputAcceptance>,
-    input_steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
+    thread_open: Store<SessionRequestIdentity, OpenedSession>,
+    thread_configure: Store<(BindingId, SessionConfiguration), ConfiguredSession>,
+    thread_fork: Store<SessionForkRequest, ProviderForkResult>,
+    thread_compact: Store<(BindingId, CompactionRequest), forge_provider_api::CompactionResult>,
+    thread_close: Store<BindingId, ()>,
+    cancel: Store<(BindingId, CancelRequest), TurnInterruptResult>,
+    turn_start: Store<(BindingId, PromptRequestIdentity), InputAcceptance>,
+    turn_steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
     input_reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
     input_retract: Store<(BindingId, InputRetractRequest), InputRetractOutcome>,
     inspect: Store<WorkspaceContext, ProviderSetup>,
@@ -2108,14 +2110,14 @@ impl MockOperations {
     fn new() -> Self {
         let identities = Arc::new(IdentityRegistry::new());
         Self {
-            session_open: Store::registered(identities.clone()),
-            session_configure: Store::registered(identities.clone()),
-            session_fork: Store::registered(identities.clone()),
-            session_compact: Store::registered(identities.clone()),
-            session_close: Store::registered(identities.clone()),
+            thread_open: Store::registered(identities.clone()),
+            thread_configure: Store::registered(identities.clone()),
+            thread_fork: Store::registered(identities.clone()),
+            thread_compact: Store::registered(identities.clone()),
+            thread_close: Store::registered(identities.clone()),
             cancel: Store::registered(identities.clone()),
-            input_submit: Store::registered(identities.clone()),
-            input_steer: Store::registered(identities.clone()),
+            turn_start: Store::registered(identities.clone()),
+            turn_steer: Store::registered(identities.clone()),
             input_reconcile: Store::registered(identities.clone()),
             input_retract: Store::registered(identities.clone()),
             inspect: Store::registered(identities.clone()),
@@ -2133,28 +2135,28 @@ impl MockOperations {
     /// Join retained workers after native resources close; serialized shutdown observers cannot join each other.
     async fn join_all_except(&self, excluded: &OperationId) -> Result<(), ProviderError> {
         let mut failures = Vec::new();
-        if let Err(error) = self.session_open.join_all_except(excluded).await {
+        if let Err(error) = self.thread_open.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.session_configure.join_all_except(excluded).await {
+        if let Err(error) = self.thread_configure.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.session_fork.join_all_except(excluded).await {
+        if let Err(error) = self.thread_fork.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.session_compact.join_all_except(excluded).await {
+        if let Err(error) = self.thread_compact.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.session_close.join_all_except(excluded).await {
+        if let Err(error) = self.thread_close.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.cancel.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.input_submit.join_all_except(excluded).await {
+        if let Err(error) = self.turn_start.join_all_except(excluded).await {
             failures.push(error);
         }
-        if let Err(error) = self.input_steer.join_all_except(excluded).await {
+        if let Err(error) = self.turn_steer.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.input_reconcile.join_all_except(excluded).await {
@@ -2203,7 +2205,7 @@ struct AcceptedInput {
 
 struct MockSession {
     binding: SessionBinding,
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     receipts: SharedReceipts,
     sink: ProviderEventSink,
     _resource_lease: Option<Arc<dyn session::ResourceLease>>,
@@ -2215,7 +2217,7 @@ struct MockSession {
     state: std::sync::Mutex<MockBindingState>,
     isolated: bool,
     settlements: Mutex<HashMap<InvocationScope, SettlementResult>>,
-    terminal: Mutex<Option<ExecutionResult>>,
+    terminal: Mutex<Option<TurnResult>>,
     operation: Mutex<()>,
     admission: Mutex<()>,
     active: Mutex<Option<MockInvocation>>,
@@ -2237,14 +2239,84 @@ struct MockInvocation {
     phase: MockInputPhase,
 }
 
+/// Retain the native scripted operation without coupling its worker to a result waiter.
+struct MockTurnDriver {
+    session: Arc<MockSession>,
+    scope: InvocationScope,
+    input: Mutex<Option<MockRun>>,
+}
+
+struct MockRun {
+    control: Arc<MockControl>,
+    request: PromptRequest,
+    script: Option<TestPromptScript>,
+    cancelled: watch::Receiver<bool>,
+    accepted: tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>,
+}
+
+#[async_trait]
+impl crate::turn_runner::NativeTurnDriver for MockTurnDriver {
+    /// Run the one admitted native script and retain exact terminal evidence.
+    async fn run(&self, start: NativeTurnStart) -> Result<TurnResult, ProviderError> {
+        let input = self
+            .input
+            .lock()
+            .await
+            .take()
+            .expect("the retained runner starts its native driver once");
+        let MockRun {
+            control,
+            request,
+            script,
+            cancelled,
+            accepted,
+        } = input;
+        run_prompt(
+            self.session.clone(),
+            control,
+            request,
+            script,
+            cancelled,
+            accepted,
+            start,
+        )
+        .await?;
+        self.session
+            .terminal
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
+    }
+    /// Signal the original script's cancellation channel without changing its result.
+    async fn interrupt(&self) -> Result<(), ProviderError> {
+        if let Some(active) = self
+            .session
+            .active
+            .lock()
+            .await
+            .as_ref()
+            .filter(|active| active.scope == self.scope)
+        {
+            active.cancelled.send_replace(true);
+        }
+        Ok(())
+    }
+    /// Observe synchronous script/callback collection after its run future released ownership.
+    async fn collect(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
 struct MockSteering {
     text: String,
     submission: Option<SubmissionId>,
+    covered: Option<CoveredInput>,
 }
 
 struct ResponseHold {
     id: TestHoldId,
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     any_owner: bool,
     mode: Option<PromptMode>,
     state: watch::Sender<HoldState>,
@@ -2253,13 +2325,13 @@ struct ResponseHold {
 #[derive(Default)]
 struct MockControl {
     holds: std::sync::Mutex<VecDeque<Arc<ResponseHold>>>,
-    scripts: std::sync::Mutex<HashMap<ExecutionOwner, VecDeque<testing::TestPromptScript>>>,
+    scripts: std::sync::Mutex<HashMap<ThreadOwner, VecDeque<testing::TestPromptScript>>>,
 }
 
 impl MockControl {
     fn find(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         id: &TestHoldId,
     ) -> Result<Arc<ResponseHold>, ProviderError> {
         self.holds
@@ -2268,12 +2340,7 @@ impl MockControl {
             .iter()
             .find(|hold| hold.owner == *owner && hold.id == *id)
             .cloned()
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Rejected,
-                )
-            })
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected))
     }
 
     fn remove(&self, id: &TestHoldId) {
@@ -2285,13 +2352,13 @@ impl MockControl {
 impl ProviderTestControl for MockControl {
     async fn dispatch(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         command: TestControlCommand,
     ) -> Result<TestControlResult, ProviderError> {
         match command {
             TestControlCommand::Hold { mode, any_owner } => {
                 let id = TestHoldId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
-                    failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown)
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown)
                 })?;
                 let (state, _) = watch::channel(HoldState::Armed);
                 self.holds.lock().unwrap().push_back(Arc::new(ResponseHold {
@@ -2314,7 +2381,7 @@ impl ProviderTestControl for MockControl {
                         HoldState::Armed | HoldState::Released => {}
                     }
                     state.changed().await.map_err(|_| {
-                        failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown)
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown)
                     })?;
                 }
             }
@@ -2322,7 +2389,7 @@ impl ProviderTestControl for MockControl {
                 let hold = self.find(owner, &id)?;
                 if !matches!(*hold.state.borrow(), HoldState::Pending(_)) {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::Rejected,
                     ));
                 }
@@ -2350,7 +2417,7 @@ impl ProviderTestControl for MockControl {
 
     async fn arrive(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         mode: PromptMode,
         prompt: String,
     ) -> Result<(), ProviderError> {
@@ -2382,13 +2449,14 @@ impl ProviderTestControl for MockControl {
                 HoldState::Cancelled => return Err(ProviderError::Cancelled),
                 HoldState::Armed | HoldState::Pending(_) => {}
             }
-            state.changed().await.map_err(|_| {
-                failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown)
-            })?;
+            state
+                .changed()
+                .await
+                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
         }
     }
 
-    fn cancel_owner(&self, owner: Option<&ExecutionOwner>) {
+    fn cancel_owner(&self, owner: Option<&ThreadOwner>) {
         self.holds.lock().unwrap().retain(|hold| {
             let matched_owner = owner.is_none_or(|owner| hold.owner == *owner
                 || matches!(&*hold.state.borrow(), HoldState::Pending(PendingTestResponse { owner: actual, .. }) if actual == owner));
@@ -2404,7 +2472,7 @@ impl ProviderTestControl for MockControl {
         }
     }
 
-    fn take_script(&self, owner: &ExecutionOwner) -> Option<testing::TestPromptScript> {
+    fn take_script(&self, owner: &ThreadOwner) -> Option<testing::TestPromptScript> {
         let mut scripts = self.scripts.lock().unwrap();
         let queue = scripts.get_mut(owner)?;
         let script = queue.pop_front();
@@ -2416,10 +2484,9 @@ impl ProviderTestControl for MockControl {
 }
 
 struct PromptProgress {
-    scope: InvocationScope,
-    sink: Option<ProviderEventSink>,
     delivery: PromptDelivery,
-    terminal_published: bool,
+    start: NativeTurnStart,
+    covered: Vec<CoveredInput>,
 }
 
 /// Reject admission immediately after local authority revocation.
@@ -2445,31 +2512,9 @@ fn ensure_open(session: &MockSession, operation: ProviderOperation) -> Result<()
     }
 }
 
-/// Join provider work before publishing the invocation's distinct settlement barrier.
-async fn settle_invocation(
-    session: &MockSession,
-    scope: &InvocationScope,
-    result: Result<(), ProviderError>,
-) -> Result<InvocationSettlement, ProviderError> {
-    result?;
-    let terminal = session
-        .terminal
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| failure(ProviderOperation::Cancel, ProviderFailureKind::Unknown))?;
-    let sink = session.sink.invocation_sink(scope)?;
-    let settlement = InvocationSettlement {
-        binding_id: session.binding.id.clone(),
-        scope: scope.clone(),
-        result: terminal,
-        watermark: sink.watermark(),
-    };
-    sink.send_settlement(settlement).await.map_err(Into::into)
-}
-
 /// Reject unsupported mock input configuration before the receipt records dispatch.
 fn validate_invocation(request: &PromptRequest) -> Result<(), ProviderError> {
+    request.validate_turn_identity()?;
     validate_model_selection(&request.configuration.model)
 }
 
@@ -2488,7 +2533,7 @@ fn validate_model_selection(model: &session::ModelSelection) -> Result<(), Provi
         .is_some_and(|model| model != "mock-model")
     {
         return Err(failure(
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Rejected,
         ));
     }
@@ -2534,12 +2579,12 @@ async fn run_prompt(
     script: Option<TestPromptScript>,
     cancelled: watch::Receiver<bool>,
     accepted: tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>,
+    start: NativeTurnStart,
 ) -> Result<(), ProviderError> {
     let mut progress = PromptProgress {
-        scope: request.scope.clone(),
-        sink: None,
         delivery: PromptDelivery::Preparing,
-        terminal_published: false,
+        start,
+        covered: request.input_coverage(),
     };
     let mut accepted = Some(accepted);
     let result = run_prompt_inner(
@@ -2552,33 +2597,9 @@ async fn run_prompt(
         &mut progress,
     )
     .await;
-    let result = match result {
-        Ok(PromptFinish::Terminal) => {
-            accept_prompt(&session, &request, &mut accepted, &mut progress).await
-        }
-        Ok(PromptFinish::ObservationLost) => match progress.delivery {
-            PromptDelivery::Accepted => Ok(()),
-            PromptDelivery::Preparing | PromptDelivery::Dispatched => {
-                Err(ProviderError::DeliveryUncertain)
-            }
-        },
+    match result {
+        Ok(()) => accept_prompt(&session, &request, &mut accepted, &mut progress).await,
         Err(error) => Err(error),
-    };
-    let Err(primary) = result else {
-        return Ok(());
-    };
-    if matches!(progress.delivery, PromptDelivery::Preparing) || progress.terminal_published {
-        return Err(primary);
-    }
-    let Some(sink) = progress.sink.as_ref() else {
-        return Err(primary);
-    };
-    match publish_unobserved_failure(&session, sink, &progress.scope, &primary).await {
-        Ok(()) => Err(primary),
-        Err(cleanup) => Err(ProviderError::Combined {
-            primary: Box::new(primary),
-            secondary: vec![cleanup],
-        }),
     }
 }
 
@@ -2590,12 +2611,15 @@ async fn run_prompt_inner(
     mut cancelled: watch::Receiver<bool>,
     accepted: &mut Option<tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>>,
     progress: &mut PromptProgress,
-) -> Result<PromptFinish, ProviderError> {
+) -> Result<(), ProviderError> {
     let _operation = session.operation.lock().await;
+    if *cancelled.borrow() {
+        return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
+    }
+
     let owner = session.owner.clone();
     let scope = request.scope.clone();
-    let sink = session.sink.invocation_sink(&scope)?;
-    progress.sink = Some(sink.clone());
+    let sink = session.sink.invocation_sink(&scope)?.activity_writer();
     let token = RecoveryToken::new(
         format!(
             "mock-sending\n{}\n{}\n{}",
@@ -2610,14 +2634,14 @@ async fn run_prompt_inner(
         )
         .into_bytes(),
     )
-    .map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown))?;
+    .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
     request
         .receipt
         .clone()
         .record_sending(Some(token))
         .await
         .map_err(|error| ProviderError::PreparationFailed(Box::new(error)))?;
-    ensure_open(&session, ProviderOperation::InputSubmit)?;
+    ensure_open(&session, ProviderOperation::TurnStart)?;
     request.dispatch.confirm();
     progress.delivery = PromptDelivery::Dispatched;
     let timing = script
@@ -2628,33 +2652,27 @@ async fn run_prompt_inner(
         accept_prompt(&session, request, accepted, progress).await?;
     }
 
-    let thread_id = session
-        .binding
-        .provider_session_id
-        .as_ref()
-        .map(|id| id.as_str().to_owned())
-        .unwrap_or_else(|| "mock-session".into());
+    // A cancellation observed after dispatch reaches the arrival select below, which retains an
+    // interrupted terminal. Returning an error here would invalidate the binding instead.
     let turn = TurnAddress {
         scope: scope.clone(),
-        thread_id,
-        turn_id: uuid::Uuid::new_v4().to_string().into(),
+        thread_id: request.thread_id.clone(),
+        turn_id: request.turn_id.clone(),
     };
-    sink.send_wait(ProviderEvent::Execution {
-        observation: lifecycle(
-            &scope,
-            ExecutionUpdate::Started {
-                address: turn.clone(),
-            },
-        )?,
-    })
-    .await?;
-    sink.send_wait(ProviderEvent::Turn {
-        address: turn.clone(),
-        update: TurnUpdate::Started {
-            started_at_ms: now_ms(),
-        },
-    })
-    .await?;
+    progress.start.observed(now_ms()).await?;
+    if let Some(model_id) = session.invocation_model.lock().await.clone() {
+        sink.send_wait(AdapterActivity::Turn {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            event: TurnMetadataEvent::ModelResolved(ResolvedModel {
+                model_id: ModelId::new(model_id).map_err(|_| {
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                })?,
+                observed_at_ms: now_ms(),
+            }),
+        })
+        .await?;
+    }
     let mut prompt_parts = Vec::new();
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
         prompt_parts.push(format!(
@@ -2675,9 +2693,8 @@ async fn run_prompt_inner(
     if !request.recovered_inputs.is_empty() {
         prompt_parts.push("Newest user input:".into());
     }
-    if !request.instructions.is_empty() {
-        prompt_parts.push(request.instructions.clone());
-    }
+    // Harness workflow instructions are a provider contract, not user-visible prompt text, so
+    // response holds and echoes report only what the user and task supplied.
     if let Some(task) = &request.task {
         prompt_parts.push(task.heading());
     }
@@ -2701,7 +2718,7 @@ async fn run_prompt_inner(
             .ok_or_else(|| {
                 ProviderError::Failure(
                     ProviderFailure::new(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::WrongInvocation,
                     )
                     .at_phase(ProviderPhase::Observation, FailureDisposition::Invalidated),
@@ -2714,25 +2731,28 @@ async fn run_prompt_inner(
     };
     let mut submissions = vec![request.submission_id.clone()];
     submissions.extend(steering.iter().filter_map(|input| input.submission.clone()));
+    progress
+        .covered
+        .extend(steering.iter().filter_map(|input| input.covered.clone()));
     if let Err(error) = hold {
         if matches!(error, ProviderError::Cancelled) {
-            publish_terminal(
+            retain_terminal(
                 &session,
                 &sink,
                 &scope,
                 Some(turn.clone()),
-                TurnOutcome::Cancelled,
-                &submissions,
+                TurnOutcome::Interrupted,
+                &progress.covered,
                 None,
             )
             .await?;
-            progress.terminal_published = true;
             *session.cancelled_submission.lock().await = Some(request.submission_id.clone());
-            return Ok(PromptFinish::Terminal);
+            return Ok(());
         }
         return Err(error);
     }
 
+    let unscripted = script.is_none();
     let script = match script {
         Some(script) => script,
         None => {
@@ -2748,64 +2768,129 @@ async fn run_prompt_inner(
                         .join("\n")
                 )
             };
+            let mut steps = planning_steps(request, &prompt);
+            steps.push(TestPromptStep::Message {
+                content: TestMessageContent::Response,
+                text: format!("Mock response: {prompt}{steering}"),
+            });
             TestPromptScript {
                 acceptance: testing::TestInputAcceptance::BeforeResponse,
-                steps: vec![TestPromptStep::Message {
-                    role: MessageRole::Response,
-                    text: format!("Mock response: {prompt}{steering}"),
-                }],
+                steps,
                 terminal: TestPromptTerminal::Completed,
             }
         }
     };
     let steps = if script.steps.is_empty() {
         vec![TestPromptStep::Message {
-            role: MessageRole::Response,
+            content: TestMessageContent::Response,
             text: format!("Mock response: {prompt}"),
         }]
     } else {
         script.steps.clone()
     };
+    if unscripted {
+        let configured = tokio::select! {
+            result = configure_unset_checks(&session, request, &prompt, &sink, &turn) => result,
+            _ = cancelled.wait_for(|value| *value) => Err(ProviderError::Cancelled),
+        };
+        if let Err(error) = configured {
+            if matches!(error, ProviderError::Cancelled) {
+                retain_terminal(
+                    &session,
+                    &sink,
+                    &scope,
+                    Some(turn),
+                    TurnOutcome::Interrupted,
+                    &progress.covered,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
     for step in steps {
         match step {
-            TestPromptStep::Message { role, text } => {
-                let address = MessageAddress {
-                    turn: turn.clone(),
-                    message_id: MessageId::Synthetic(uuid::Uuid::new_v4().to_string()),
-                };
-                sink.send_wait(ProviderEvent::Message {
-                    address: address.clone(),
-                    update: MessageUpdate::Started {
-                        classification: MessageClassification::Known(role),
+            TestPromptStep::Message { content, text } => {
+                let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
+                    .expect("allocated item ID is nonempty");
+                let start = match content {
+                    TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Full) => {
+                        ItemStart::Reasoning(ReasoningStart {
+                            text: text.clone(),
+                            kind: ReasoningKind::Full,
+                        })
+                    }
+                    TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Summary) => {
+                        ItemStart::Reasoning(ReasoningStart {
+                            text: text.clone(),
+                            kind: ReasoningKind::Summary,
+                        })
+                    }
+                    TestMessageContent::Commentary => ItemStart::AgentMessage(AgentMessageStart {
                         text: text.clone(),
-                    },
+                        classification: MessageClassification::Known(AgentMessageRole::Commentary),
+                    }),
+                    TestMessageContent::Response => ItemStart::AgentMessage(AgentMessageStart {
+                        text: text.clone(),
+                        classification: MessageClassification::Known(AgentMessageRole::Response),
+                    }),
+                };
+                let completion = MessageCompletion {
+                    text,
+                    outcome: MessageOutcome::Completed,
+                };
+                let completion = match content {
+                    TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Full)
+                    | TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Summary) => {
+                        ItemCompletion::Reasoning(completion)
+                    }
+                    TestMessageContent::Commentary | TestMessageContent::Response => {
+                        ItemCompletion::AgentMessage(completion)
+                    }
+                };
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id: item_id.clone(),
+                    event: ItemEvent::Started(start),
                 })
                 .await?;
-                sink.send_wait(ProviderEvent::Message {
-                    address,
-                    update: MessageUpdate::Completed { text },
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id,
+                    event: ItemEvent::Completed(completion),
+                })
+                .await?;
+            }
+            TestPromptStep::Checklist { update } => {
+                sink.send_wait(AdapterActivity::Turn {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    event: forge_provider_api::TurnMetadataEvent::ChecklistUpdated(update),
                 })
                 .await?;
             }
             TestPromptStep::ToolCall { name, arguments } => {
                 let called = tokio::select! {
-                    result = run_tool_call(&session, request, &sink, &turn, &name, arguments) => result,
+                    result = run_tool_call(&session, request, &sink, &turn, &name, arguments) => result.map(drop),
                     _ = cancelled.wait_for(|value| *value) => Err(ProviderError::Cancelled),
                 };
                 if let Err(error) = called {
                     if matches!(error, ProviderError::Cancelled) {
-                        publish_terminal(
+                        retain_terminal(
                             &session,
                             &sink,
                             &scope,
                             Some(turn),
-                            TurnOutcome::Cancelled,
-                            &submissions,
+                            TurnOutcome::Interrupted,
+                            &progress.covered,
                             None,
                         )
                         .await?;
-                        progress.terminal_published = true;
-                        return Ok(PromptFinish::Terminal);
+                        return Ok(());
                     }
                     return Err(error);
                 }
@@ -2814,76 +2899,44 @@ async fn run_prompt_inner(
     }
     let terminal = script.terminal.clone();
     let outcome = match &terminal {
-        TestPromptTerminal::Completed => TurnOutcome::Completed,
-        TestPromptTerminal::Cancelled => TurnOutcome::Cancelled,
-        TestPromptTerminal::Failed(_) => TurnOutcome::Failed,
+        TestPromptTerminal::Completed => TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+        },
+        TestPromptTerminal::Cancelled => TurnOutcome::Interrupted,
+        TestPromptTerminal::Failed(_) => TurnOutcome::Failed {
+            error: forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Unknown,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+        },
         TestPromptTerminal::ObservationLost(_) => TurnOutcome::Interrupted,
         TestPromptTerminal::RejectedBeforeDispatch(_) | TestPromptTerminal::DeliveryUncertain => {
             unreachable!("pre-dispatch terminals are handled before task creation")
         }
     };
-    let status = match request.turn_control.status(&scope).await {
-        Ok(status) => status,
-        Err(_) => {
-            publish_publication_failed(
-                &session,
-                &sink,
-                &scope,
-                turn,
-                &submissions,
-                outcome,
-                session::HostEffectFailure::Uncertain,
-            )
-            .await?;
-            progress.terminal_published = true;
-            return Ok(PromptFinish::Terminal);
-        }
-    };
-    let outcome = if status.cancelled {
-        TurnOutcome::Cancelled
-    } else if status.error.is_some() {
-        TurnOutcome::Failed
-    } else {
-        outcome
-    };
     if let TestPromptTerminal::ObservationLost(failure) = terminal.clone() {
-        sink.send_wait(ProviderEvent::Turn {
-            address: turn.clone(),
-            update: TurnUpdate::Finished {
-                outcome: TurnOutcome::Interrupted,
-                completed_at_ms: now_ms(),
-            },
-        })
-        .await?;
-        sink.send_wait(ProviderEvent::Execution {
-            observation: lifecycle(
-                &scope,
-                ExecutionUpdate::ObservationLost {
-                    failure,
-                    completion: Some(completion(&session, None).await.into()),
-                },
-            )?,
-        })
-        .await?;
-        progress.terminal_published = true;
-        return Ok(PromptFinish::ObservationLost);
+        return Err(ProviderError::Observation(failure));
     }
     let failure = match terminal {
         TestPromptTerminal::Failed(kind) => Some(kind),
         _ => None,
     };
-    publish_terminal(
+    retain_terminal(
         &session,
         &sink,
         &scope,
         Some(turn),
         outcome,
-        &submissions,
+        &progress.covered,
         failure,
     )
     .await?;
-    progress.terminal_published = true;
-    Ok(PromptFinish::Terminal)
+    Ok(())
 }
 
 /// Commit native acceptance once, independently of dispatch and response observation.
@@ -2910,7 +2963,7 @@ async fn accept_prompt(
         )
         .into_bytes(),
     )
-    .map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown))?;
+    .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
     if let Some(history) = &session.binding.provider_session_id {
         session.receipts.lock().await.insert(
             (request.submission_id.clone(), request.attempt_id.clone()),
@@ -2935,270 +2988,353 @@ async fn accept_prompt(
     Ok(())
 }
 
-async fn publish_unobserved_failure(
-    session: &MockSession,
-    sink: &ProviderEventSink,
-    scope: &InvocationScope,
-    error: &ProviderError,
-) -> Result<(), ProviderError> {
-    let failure = if matches!(error, ProviderError::DeliveryUncertain) {
-        ObservationFailure::DeliveryUncertain
-    } else {
-        ObservationFailure::Protocol
+/// Draft and submit one plan through the host plan tools when an unscripted Plan turn carries a
+/// declaration design.
+///
+/// Harness renders the canonical design as a JSON block in the planning instructions or, on a
+/// continuation, in the turn input. The overview edit names that document's version so every
+/// revision changes content; the mock then adds one declaration file and submits the version
+/// those edits produce. Turns without plan tools or a readable design keep the plain response.
+fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> {
+    let has_plan_tools = ["plan_overview_edit", "plan_file_edit", "plan_submit"]
+        .iter()
+        .all(|name| request.tools.iter().any(|tool| tool.name == *name));
+    if request.mode != PromptMode::Plan || !has_plan_tools {
+        return Vec::new();
+    }
+    // A revision keeps the original design in its instructions and renders the current design in
+    // its input, so the newer version names the document the edits must revise.
+    let Some(declaration) = [
+        declaration_identity(&request.instructions),
+        declaration_identity(prompt),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|identity| identity.version) else {
+        return Vec::new();
     };
-    sink.send_wait(ProviderEvent::Execution {
-        observation: lifecycle(
-            scope,
-            ExecutionUpdate::ObservationLost {
-                failure,
-                completion: Some(completion(session, None).await.into()),
-            },
-        )?,
-    })
-    .await?;
-    Ok(())
+    let objective = declaration.request.trim();
+    let mut steps = vec![TestPromptStep::ToolCall {
+        name: "plan_overview_edit".into(),
+        arguments: serde_json::json!({
+            "plan_id": declaration.plan_id,
+            "expected_version": declaration.version,
+            "title": "Implement the requested change",
+            "objective": if objective.is_empty() { "Implement the requested change." } else { objective },
+            "background": format!(
+                "The mock provider drafted this overview from declaration version {}.",
+                declaration.version
+            ),
+            "requirements": ["Preserve the requested behavior at its owning boundary."],
+            "design": "Apply the requested behavior at its owning boundary.",
+            "verification": ["Confirm the requested interface behaves as designed."],
+        }),
+    }];
+    let mut submitted_version = declaration.version + 1;
+    // A revision already declares the mock file, and adding it again would reject the edit.
+    if !declaration.declares_mock_file {
+        steps.push(TestPromptStep::ToolCall {
+            name: "plan_file_edit".into(),
+            arguments: serde_json::json!({
+                "plan_id": declaration.plan_id,
+                "expected_version": submitted_version,
+                "patch": MOCK_DECLARATION_PATCH,
+            }),
+        });
+        submitted_version += 1;
+    }
+    steps.push(TestPromptStep::ToolCall {
+        name: "plan_submit".into(),
+        arguments: serde_json::json!({
+            "plan_id": declaration.plan_id,
+            "expected_version": submitted_version,
+        }),
+    });
+    steps
 }
 
+/// Workspace-relative declaration file that the mock planner adds.
+const MOCK_DECLARATION_PATH: &str = "src/change.rs";
+
+/// Declaration file the mock planner proposes: one new public callable with the Algorithm that
+/// Harness requires of every added callable.
+const MOCK_DECLARATION_PATCH: &str = "*** Begin Patch\n*** Add File: src/change.rs\n\
+    +/// Apply the requested behavior.\n+pub fn requested_change();\n+Algorithm\n+  return none\n\
+    *** End Patch";
+
+/// Identity of the declaration design a planning turn must revise.
+struct DeclarationIdentity {
+    plan_id: String,
+    version: u64,
+    request: String,
+    /// The design already declares [`MOCK_DECLARATION_PATH`].
+    declares_mock_file: bool,
+}
+
+/// Read the first fenced JSON block that names a plan and its version.
+fn declaration_identity(text: &str) -> Option<DeclarationIdentity> {
+    let mut remaining = text;
+    while let Some(offset) = remaining.find("```json\n") {
+        let json_start = offset + "```json\n".len();
+        let json_end = json_start + remaining[json_start..].find("\n```")?;
+        if let Ok(document) =
+            serde_json::from_str::<serde_json::Value>(&remaining[json_start..json_end])
+            && let (Some(plan_id), Some(version)) = (
+                document.get("plan_id").and_then(serde_json::Value::as_str),
+                document.get("version").and_then(serde_json::Value::as_u64),
+            )
+        {
+            let request = document
+                .get("request")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let declares_mock_file = document
+                .pointer("/declaration_files/paths")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .any(|path| path.as_str() == Some(MOCK_DECLARATION_PATH))
+                });
+            return Some(DeclarationIdentity {
+                plan_id: plan_id.to_owned(),
+                version,
+                request: request.to_owned(),
+                declares_mock_file,
+            });
+        }
+        remaining = &remaining[json_end + "\n```".len()..];
+    }
+    None
+}
+
+/// Execute a scripted host tool while retaining its original item ownership.
 async fn run_tool_call(
     session: &MockSession,
     request: &PromptRequest,
-    sink: &ProviderEventSink,
+    sink: &AdapterActivityWriter,
     turn: &TurnAddress,
     name: &str,
     arguments: serde_json::Value,
-) -> Result<(), ProviderError> {
+) -> Result<Option<String>, ProviderError> {
     if !request.tools.iter().any(|tool| tool.name == name) {
         return Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ));
     }
-    let address = ToolAddress {
-        turn: turn.clone(),
-        tool_id: uuid::Uuid::new_v4().to_string().into(),
+    let item_id =
+        ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated tool identity is nonempty");
+    let item = |event| AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: item_id.clone(),
+        event,
     };
-    let invocation = ToolInvocation {
+    let descriptor = ToolDescriptor {
         semantics: Default::default(),
-        kind: ToolActivityKind::ToolCall,
         name: name.into(),
         title: name.into(),
-        arguments: arguments.clone(),
+        arguments: InspectableArguments::new(arguments.clone()),
     };
-    sink.send_wait(ProviderEvent::Tool {
-        address: address.clone(),
-        update: ToolUpdate::Requested { invocation },
-    })
-    .await?;
+    sink.send_wait(item(ItemEvent::Started(ItemStart::ToolCall(descriptor))))
+        .await?;
     let permission = PermissionRequest {
         id: uuid::Uuid::new_v4().to_string(),
         provider: ProviderId::new("mock").expect("mock ID is valid"),
         reason: None,
         target_list: vec![PermissionTarget::HostTool { name: name.into() }],
     };
-    ensure_open(session, ProviderOperation::InputSubmit)?;
+    ensure_open(session, ProviderOperation::TurnStart)?;
     request.permissions.before_tool(&request.scope).await?;
-    match request
+    let (outcome, output, cancelled) = match request
         .permissions
         .authorize(&request.scope, permission)
         .await
     {
         PermissionResponse::Allow => {
-            ensure_open(session, ProviderOperation::InputSubmit)?;
-            sink.send_wait(ProviderEvent::Tool {
-                address: address.clone(),
-                update: ToolUpdate::Started,
-            })
+            ensure_open(session, ProviderOperation::TurnStart)?;
+            sink.send_wait(item(ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
+            }))
             .await?;
             match request
                 .provider_tools
                 .call(
                     &request.scope,
                     control::ToolCall {
-                        id: control::ToolCallId::new(address.tool_id.as_str())
-                            .expect("fixture tool IDs are nonempty"),
+                        id: control::ToolCallId::new(item_id.as_str())
+                            .expect("allocated tool identity is nonempty"),
                         name: name.into(),
                         arguments,
                     },
                 )
                 .await
             {
-                Ok(output) => {
-                    sink.send_wait(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update: ToolUpdate::Output {
-                            update: TextUpdate::Replace(output),
+                Ok(output) => (ToolOutcome::Succeeded, Some(output), false),
+                Err(_) => (
+                    ToolOutcome::Failed {
+                        diagnostic: ToolDiagnostic {
+                            kind: ProviderFailureKind::Unknown,
+                            message: SanitizedMessage::new("host tool failed")
+                                .expect("static tool failure is sanitized"),
                         },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Tool {
-                        address,
-                        update: ToolUpdate::Finished {
-                            outcome: ToolOutcome::Succeeded,
-                        },
-                    })
-                    .await?;
-                }
-                Err(_) => {
-                    sink.send_wait(ProviderEvent::Tool {
-                        address,
-                        update: ToolUpdate::Finished {
-                            outcome: ToolOutcome::Failed {
-                                diagnostic: ToolDiagnostic {
-                                    kind: ProviderFailureKind::Unknown,
-                                    message: diagnostic::SanitizedMessage::new("host tool failed")
-                                        .expect("static diagnostic is valid"),
-                                },
-                            },
-                        },
-                    })
-                    .await?
-                }
+                    },
+                    None,
+                    false,
+                ),
             }
         }
-        PermissionResponse::Deny { reason } => {
-            sink.send_wait(ProviderEvent::Tool {
-                address,
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Denied {
-                        reason: forge_provider_api::diagnostic::SanitizedMessage::new(
-                            reason
-                                .filter(|text| !text.trim().is_empty())
-                                .unwrap_or_else(|| "Permission denied".into()),
-                        )
-                        .expect("denial fallback is nonempty"),
-                    },
-                },
-            })
-            .await?;
-        }
-        PermissionResponse::Cancelled => {
-            sink.send_wait(ProviderEvent::Tool {
-                address,
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Cancelled,
-                },
-            })
-            .await?;
-            return Err(ProviderError::Cancelled);
-        }
-    }
-    Ok(())
-}
-
-async fn publish_publication_failed(
-    session: &MockSession,
-    sink: &ProviderEventSink,
-    scope: &InvocationScope,
-    address: TurnAddress,
-    submissions: &[SubmissionId],
-    outcome: TurnOutcome,
-    failure: session::HostEffectFailure,
-) -> Result<(), ProviderError> {
-    sink.send_wait(ProviderEvent::Turn {
-        address: address.clone(),
-        update: TurnUpdate::Finished {
-            outcome,
-            completed_at_ms: now_ms(),
-        },
-    })
-    .await?;
-    let completion = completion(session, None).await;
-    let result = match outcome {
-        TurnOutcome::Completed => ExecutionResult::Completed {
-            completion: completion.into(),
-        },
-        TurnOutcome::Cancelled => ExecutionResult::Cancelled {
-            completion: completion.into(),
-        },
-        TurnOutcome::Failed | TurnOutcome::Interrupted => ExecutionResult::Failed {
-            completion: completion.into(),
-            failure: ExecutionFailure::Terminal {
-                kind: ProviderFailureKind::Unknown,
+        PermissionResponse::Deny { reason } => (
+            ToolOutcome::Denied {
+                reason: SanitizedMessage::new(
+                    reason
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "Permission denied".into()),
+                )
+                .expect("denial fallback is nonempty"),
             },
+            None,
+            false,
+        ),
+        PermissionResponse::Cancelled => (ToolOutcome::Cancelled, None, true),
+    };
+    let result = output.clone();
+    sink.send_wait(item(ItemEvent::Completed(ItemCompletion::ToolCall(
+        ToolCompletion {
+            outcome,
+            output,
+            descriptor: None,
+            changes: Default::default(),
         },
+    ))))
+    .await?;
+    if cancelled {
+        return Err(ProviderError::Cancelled);
+    }
+    Ok(result)
+}
+
+/// Save the project's current check catalog when an unscripted planning or check-setup turn finds
+/// checks unconfigured or invalid.
+///
+/// Planning needs a saved check configuration before it can select coverage. Harness asks for that
+/// configuration in a Chat-mode turn that directs the provider to the harness-checks skill, so the
+/// mock treats a Plan turn or a turn naming that skill as setup. It reads the catalog, then submits
+/// its valid definitions through check_definition_edit, which follows the session's tool-approval
+/// mode like any other edit. An invalid configuration lists no definitions and reports its parse
+/// error, so the resubmission replaces it with an empty valid configuration.
+async fn configure_unset_checks(
+    session: &MockSession,
+    request: &PromptRequest,
+    prompt: &str,
+    sink: &AdapterActivityWriter,
+    turn: &TurnAddress,
+) -> Result<(), ProviderError> {
+    let has_check_tools = [
+        "check_definition_list",
+        "check_definition_details",
+        "check_definition_edit",
+    ]
+    .iter()
+    .all(|name| request.tools.iter().any(|tool| tool.name == *name));
+    let requests_setup = request.mode == PromptMode::Plan || prompt.contains("harness-checks");
+    if !requests_setup || !has_check_tools {
+        return Ok(());
+    }
+    let read = |output: Option<String>| -> Result<serde_json::Value, ProviderError> {
+        output
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
     };
-    let update = ExecutionUpdate::PublicationFailed {
-        address,
-        covered_submissions: submissions.to_vec(),
-        completed_at_ms: now_ms(),
-        result,
-        failure,
-    };
-    sink.send_wait(ProviderEvent::Execution {
-        observation: lifecycle(scope, update)?,
-    })
+    let catalog = read(
+        run_tool_call(
+            session,
+            request,
+            sink,
+            turn,
+            "check_definition_list",
+            serde_json::json!({}),
+        )
+        .await?,
+    )?;
+    let needs_setup =
+        catalog["configured"] == serde_json::Value::Bool(false) || !catalog["error"].is_null();
+    if !needs_setup {
+        return Ok(());
+    }
+    let mut config = serde_json::Map::new();
+    for definition in catalog["definitions"].as_array().into_iter().flatten() {
+        let Some(check_id) = definition["check_id"].as_str() else {
+            return Err(failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Protocol,
+            ));
+        };
+        let details = read(
+            run_tool_call(
+                session,
+                request,
+                sink,
+                turn,
+                "check_definition_details",
+                serde_json::json!({ "check_id": check_id }),
+            )
+            .await?,
+        )?;
+        config.insert(check_id.to_owned(), details["definition"].clone());
+    }
+    run_tool_call(
+        session,
+        request,
+        sink,
+        turn,
+        "check_definition_edit",
+        serde_json::json!({ "expected_revision": catalog["revision"], "config": config }),
+    )
     .await?;
     Ok(())
 }
 
-async fn publish_terminal(
+/// Retain native completion evidence without publishing a lifecycle event.
+async fn retain_terminal(
     session: &MockSession,
-    sink: &ProviderEventSink,
-    scope: &InvocationScope,
-    address: Option<TurnAddress>,
+    _sink: &AdapterActivityWriter,
+    _scope: &InvocationScope,
+    _address: Option<TurnAddress>,
     outcome: TurnOutcome,
-    submissions: &[SubmissionId],
+    covered: &[CoveredInput],
     failure_kind: Option<ProviderFailureKind>,
 ) -> Result<(), ProviderError> {
-    if matches!(outcome, TurnOutcome::Cancelled) {
-        *session.cancelled_submission.lock().await = submissions.first().cloned();
+    if matches!(outcome, TurnOutcome::Interrupted) {
+        *session.cancelled_submission.lock().await =
+            covered.first().map(|input| input.submission_id().clone());
     }
-    *session.history_boundary.lock().await = submissions
-        .last()
-        .map(|id| CheckpointId::new(id.as_str()).expect("submission IDs are nonempty"));
-    let mut completion = completion(session, None).await;
-    completion.provider_checkpoint_id = submissions.last().map(|id| id.as_str().to_owned());
-    if let Some(address) = address.clone() {
-        sink.send_wait(ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome,
-                completed_at_ms: now_ms(),
-            },
-        })
-        .await?;
-    }
-    let result = match outcome {
-        TurnOutcome::Completed => ExecutionResult::Completed {
-            completion: completion.into(),
+    let checkpoint = covered.last().map(|input| {
+        CheckpointId::new(input.submission_id().as_str())
+            .expect("covered journal input is nonempty")
+    });
+    *session.history_boundary.lock().await = checkpoint.clone();
+    let outcome = match outcome {
+        TurnOutcome::Failed { error, retry } => TurnOutcome::Failed {
+            error: ProviderFailure::new(error.operation(), failure_kind.unwrap_or(error.kind()))
+                .at_phase(error.phase(), error.disposition()),
+            retry,
         },
-        TurnOutcome::Cancelled => ExecutionResult::Cancelled {
-            completion: completion.into(),
-        },
-        TurnOutcome::Failed | TurnOutcome::Interrupted => ExecutionResult::Failed {
-            completion: completion.into(),
-            failure: ExecutionFailure::Terminal {
-                kind: failure_kind.unwrap_or(ProviderFailureKind::Unknown),
-            },
-        },
+        TurnOutcome::Completed { .. } | TurnOutcome::Interrupted => outcome,
     };
-    *session.terminal.lock().await = Some(result.clone());
-    let update = if let Some(address) = address {
-        ExecutionUpdate::Finished {
-            address,
-            covered_submissions: submissions.to_vec(),
-            completed_at_ms: now_ms(),
-            result,
-        }
-    } else {
-        ExecutionUpdate::ResolvedWithoutExecution {
-            covered_submissions: submissions.to_vec(),
-            completed_at_ms: now_ms(),
-            result,
-        }
-    };
-    sink.send_wait(ProviderEvent::Execution {
-        observation: lifecycle(scope, update)?,
-    })
-    .await?;
+    *session.terminal.lock().await = Some(
+        TurnResult::new(
+            outcome,
+            now_ms(),
+            None,
+            covered.to_vec(),
+            vec![],
+            checkpoint,
+        )
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?,
+    );
     Ok(())
-}
-
-fn lifecycle(
-    scope: &InvocationScope,
-    update: ExecutionUpdate,
-) -> Result<ExecutionObservation, ProviderError> {
-    ExecutionObservation::new(scope.clone(), update).map_err(Into::into)
 }
 
 fn render_input(input: &PromptInput) -> String {
@@ -3264,38 +3400,24 @@ fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-async fn completion(session: &MockSession, model: Option<String>) -> ProviderCompletion {
-    let kind = ProviderId::new("mock").expect("mock provider ID is valid");
-    let selected_model = session.invocation_model.lock().await.clone();
-    ProviderCompletion {
-        provider_session_id: session.binding.provider_session_id.clone(),
-        capability: crate::registry::descriptor(&kind)
-            .expect("mock provider is registered")
-            .capability,
-        runtime: ProviderRuntime {
-            provider: "Mock provider".into(),
-            model: model.or(selected_model),
-        },
-        ..Default::default()
-    }
-}
-
+/// Classify a mock operation rejection before native effects.
 fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
-
 /// Wait on retained collection evidence without holding adapter admission.
 async fn wait_settlement(
     receiver: &mut watch::Receiver<Option<SettlementResult>>,
-) -> Result<InvocationSettlement, ProviderError> {
+) -> Result<CompletedTurn, ProviderError> {
     loop {
         if let Some(result) = receiver.borrow_and_update().clone() {
             return result;
         }
-        receiver
-            .changed()
-            .await
-            .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Unknown))?;
+        receiver.changed().await.map_err(|_| {
+            failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Unknown,
+            )
+        })?;
     }
 }
 
@@ -3318,7 +3440,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use forge_provider_api::ProviderEventStream;
-    use forge_provider_api::lifecycle::{ExecutionResult, ExecutionUpdate};
+    use forge_provider_api::{CompletedTurn, ProviderConnectionEvent, TurnEvent};
     use forge_provider_api::{
         control::{ProviderTools, ToolCall},
         permissions::{PermissionRequest, PermissionResponse, ProviderPermissions},
@@ -3442,12 +3564,13 @@ mod tests {
 
     async fn initialized(
         provider: &MockProvider,
-    ) -> (SessionBinding, ExecutionOwner, ProviderEventStream) {
+    ) -> (SessionBinding, ThreadOwner, ProviderEventStream) {
         let owner = make_owner("mock-lifecycle");
         let binding = provider
-            .session_open(
+            .thread_open(
                 test_context(),
                 SessionRequest {
+                    thread_id: (owner.clone()).thread_id(),
                     owner: owner.clone(),
                     mode: SessionMode::Interactive,
                     workspace: ".".into(),
@@ -3467,7 +3590,7 @@ mod tests {
 
     fn prompt(
         binding: &BindingId,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         exchange: &str,
         receipt: Arc<Receipt>,
     ) -> PromptRequest {
@@ -3479,6 +3602,11 @@ mod tests {
             receipt.attempt_id().unwrap(),
         );
         PromptRequest {
+            thread_id: (scope).owner.thread_id(),
+            turn_id: (scope)
+                .turn_id()
+                .expect("admitted scope has a nonempty host turn identity"),
+
             scope,
             dispatch,
             mode: PromptMode::Chat,
@@ -3505,8 +3633,8 @@ mod tests {
         }
     }
 
-    fn make_owner(name: &str) -> ExecutionOwner {
-        ExecutionOwner::root(name)
+    fn make_owner(name: &str) -> ThreadOwner {
+        ThreadOwner::root(name)
     }
 
     #[tokio::test]
@@ -3648,7 +3776,7 @@ mod tests {
     }
 
     /// Arm the next response barrier for this owner.
-    async fn hold(provider: &MockProvider, owner: &ExecutionOwner) -> TestHoldId {
+    async fn hold(provider: &MockProvider, owner: &ThreadOwner) -> TestHoldId {
         let TestControlResult::Held { id } = provider
             .fixture_control()
             .dispatch(
@@ -3667,18 +3795,74 @@ mod tests {
     }
 
     /// Wait for native settlement while preserving the ordered binding stream.
-    async fn settled(stream: &mut ProviderEventStream) -> InvocationSettlement {
+    async fn settled(stream: &mut ProviderEventStream) -> CompletedTurn {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let event = stream.recv().await.unwrap().unwrap();
-                if let ProviderEvent::Settled { settlement } = event.event {
-                    assert!(settlement.watermark <= event.sequence);
-                    return *settlement;
+                if let ProviderEvent::Turn {
+                    event: TurnEvent::Completed(completed),
+                    ..
+                } = event.event
+                {
+                    assert!(completed.collected_at_ms() >= completed.result().completed_at_ms());
+                    return completed;
                 }
             }
         })
         .await
         .unwrap()
+    }
+    /// Publish actual native history before any prompt and keep compaction identities canonical.
+    #[tokio::test]
+    async fn opened_native_history_is_published_before_compaction() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, mut events) = initialized(&provider).await;
+        let identity = events.recv().await.unwrap().unwrap();
+        match identity.event {
+            ProviderEvent::Thread {
+                thread_id,
+                event: ThreadEvent::IdentityResolved(history),
+            } => {
+                assert_eq!(thread_id, owner.thread_id());
+                assert_eq!(Some(history), binding.provider_session_id);
+            }
+            event => panic!("native open did not publish its actual identity: {event:?}"),
+        }
+        assert!(
+            events.try_next().unwrap().is_none(),
+            "native open manufactured a response lifecycle"
+        );
+        let context = test_context();
+        let result = provider
+            .thread_compact(
+                context.clone(),
+                &binding.id,
+                CompactionRequest {
+                    scope: EventScope::SessionOperation {
+                        owner: owner.clone(),
+                        operation_id: context.id().clone(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.compaction.thread_id, owner.thread_id().as_str());
+        match events.recv().await.unwrap().unwrap().event {
+            ProviderEvent::Thread {
+                thread_id,
+                event: ThreadEvent::CompactionUpdated(compaction),
+            } => {
+                assert_eq!(thread_id, owner.thread_id());
+                assert_eq!(compaction.thread_id, thread_id.as_str());
+                assert_eq!(compaction.id, context.id().as_str());
+            }
+            event => panic!("native compaction changed observation family: {event:?}"),
+        }
+        provider
+            .thread_close(test_context(), &binding.id)
+            .await
+            .unwrap();
+        provider.shutdown(test_context()).await.unwrap();
     }
 
     /// Preserve terminal/collection ordering and prevent repeated cancellation from touching a successor.
@@ -3689,36 +3873,50 @@ mod tests {
         let request = prompt(&binding.id, owner.clone(), "first", receipt("first"));
         let scope = request.scope.clone();
         provider
-            .input_submit(test_context(), &binding.id, request)
+            .turn_start(test_context(), &binding.id, request)
             .await
             .unwrap();
-        let mut terminal_sequence = None;
+        let mut started_sequence = None;
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let event = events.recv().await.unwrap().unwrap();
                 match event.event {
-                    ProviderEvent::Execution { observation }
-                        if matches!(observation.update(), ExecutionUpdate::Finished { .. }) =>
-                    {
-                        terminal_sequence = Some(event.sequence)
+                    ProviderEvent::Turn {
+                        event: TurnEvent::Started(_),
+                        ..
+                    } => started_sequence = Some(event.sequence),
+                    ProviderEvent::Turn {
+                        thread_id,
+                        turn_id,
+                        event: TurnEvent::Completed(completed),
+                    } => {
+                        assert!(started_sequence.unwrap() < event.sequence);
+                        assert_eq!(thread_id, scope.owner.thread_id());
+                        assert_eq!(turn_id, scope.turn_id().unwrap());
+                        assert!(
+                            completed.collected_at_ms() >= completed.result().completed_at_ms()
+                        );
+                        break completed;
                     }
-                    ProviderEvent::Settled { settlement } => {
-                        assert!(terminal_sequence.unwrap() < event.sequence);
-                        assert_eq!(settlement.watermark, event.sequence);
-                        break *settlement;
-                    }
-                    _ => {}
+                    ProviderEvent::Provider { .. }
+                    | ProviderEvent::Thread { .. }
+                    | ProviderEvent::Turn { .. }
+                    | ProviderEvent::Item { .. }
+                    | ProviderEvent::Agent { .. } => {}
                 }
             }
         })
         .await
         .unwrap();
-        assert!(matches!(first.result, ExecutionResult::Completed { .. }));
+        assert!(matches!(
+            first.result().outcome(),
+            TurnOutcome::Completed { .. }
+        ));
         let id = hold(&provider, &owner).await;
         let request = prompt(&binding.id, owner.clone(), "second", receipt("second"));
         let successor = request.scope.clone();
         provider
-            .input_submit(test_context(), &binding.id, request)
+            .turn_start(test_context(), &binding.id, request)
             .await
             .unwrap();
         provider
@@ -3727,13 +3925,19 @@ mod tests {
             .await
             .unwrap();
         let repeated = provider
-            .cancel(test_context(), &binding.id, CancelRequest { scope })
+            .turn_interrupt(
+                test_context(),
+                &binding.id,
+                CancelRequest {
+                    scope: scope.clone(),
+                },
+            )
             .await
             .unwrap();
-        assert!(matches!(repeated.result, ExecutionResult::Completed { .. }));
+        assert_eq!(repeated.turn_id, scope.turn_id().unwrap());
         assert_eq!(
             provider
-                .binding(&binding.id, ProviderOperation::InputSubmit)
+                .binding(&binding.id, ProviderOperation::TurnStart)
                 .await
                 .unwrap()
                 .active
@@ -3745,7 +3949,7 @@ mod tests {
             successor
         );
         let cancelled = provider
-            .cancel(
+            .turn_interrupt(
                 test_context(),
                 &binding.id,
                 CancelRequest {
@@ -3754,12 +3958,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            cancelled.result,
-            ExecutionResult::Cancelled { .. }
-        ));
+        let interrupted = settled(&mut events).await;
+        assert_eq!(interrupted.result().outcome(), TurnOutcome::Interrupted);
+        assert_eq!(cancelled.turn_id, successor.turn_id().unwrap());
         let repeated = provider
-            .cancel(
+            .turn_interrupt(
                 test_context(),
                 &binding.id,
                 CancelRequest { scope: successor },
@@ -3798,35 +4001,35 @@ mod tests {
         requests.push(changed);
         for request in requests {
             let error = provider
-                .input_submit(test_context(), &binding.id, request)
+                .turn_start(test_context(), &binding.id, request)
                 .await
                 .unwrap_err();
             assert!(matches!(error, ProviderError::Failure(failure)
                 if failure.kind() == ProviderFailureKind::WrongInvocation
-                    && failure.operation() == ProviderOperation::InputSubmit
+                    && failure.operation() == ProviderOperation::TurnStart
                     && failure.phase() == ProviderPhase::Admission
                     && failure.disposition() == FailureDisposition::Unchanged));
         }
         assert!(!receipt.state.lock().unwrap().sending);
         assert!(!receipt.state.lock().unwrap().accepted);
         provider
-            .session_close(test_context(), &binding.id)
+            .thread_close(test_context(), &binding.id)
             .await
             .unwrap();
         let closed_receipt = self::receipt("closed");
         let input = prompt(&binding.id, owner, "closed", closed_receipt.clone());
         let scope = input.scope.clone();
         let error = provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderError::Failure(failure)
             if failure.kind() == ProviderFailureKind::BindingClosed
-                && failure.operation() == ProviderOperation::InputSubmit
+                && failure.operation() == ProviderOperation::TurnStart
                 && failure.phase() == ProviderPhase::Admission
                 && failure.disposition() == FailureDisposition::Closed));
         let error = provider
-            .input_steer(
+            .turn_steer(
                 test_context(),
                 &binding.id,
                 SteeringRequest {
@@ -3843,7 +4046,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ProviderError::Failure(failure)
             if failure.kind() == ProviderFailureKind::BindingClosed
-                && failure.operation() == ProviderOperation::InputSteer
+                && failure.operation() == ProviderOperation::TurnSteer
                 && failure.phase() == ProviderPhase::Admission
                 && failure.disposition() == FailureDisposition::Closed));
         assert!(!closed_receipt.state.lock().unwrap().sending);
@@ -3859,12 +4062,12 @@ mod tests {
         let request = prompt(&binding.id, owner, "first", receipt("first"));
         let scope = request.scope.clone();
         provider
-            .input_submit(test_context(), &binding.id, request)
+            .turn_start(test_context(), &binding.id, request)
             .await
             .unwrap();
         settled(&mut events).await;
         let result = provider
-            .input_steer(
+            .turn_steer(
                 test_context(),
                 &binding.id,
                 SteeringRequest {
@@ -3880,13 +4083,13 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation
-                && failure.operation() == ProviderOperation::InputSteer
+                && failure.operation() == ProviderOperation::TurnSteer
                 && failure.phase() == ProviderPhase::Admission
                 && failure.disposition() == FailureDisposition::Unchanged)
         );
         assert!(
             provider
-                .binding(&binding.id, ProviderOperation::InputSubmit)
+                .binding(&binding.id, ProviderOperation::TurnStart)
                 .await
                 .unwrap()
                 .active
@@ -3906,7 +4109,7 @@ mod tests {
         let mut request = prompt(&binding.id, owner.clone(), "first", receipt("first"));
         request.configuration.model.model = Some("mock-model".into());
         provider
-            .input_submit(test_context(), &binding.id, request)
+            .turn_start(test_context(), &binding.id, request)
             .await
             .unwrap();
         provider
@@ -3915,14 +4118,14 @@ mod tests {
             .await
             .unwrap();
         let rejected = provider
-            .session_configure(test_context(), &binding.id, configuration())
+            .thread_configure(test_context(), &binding.id, configuration())
             .await;
         assert!(
             matches!(rejected, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::ExecutionActive)
         );
         assert!(
             provider
-                .binding(&binding.id, ProviderOperation::InputSubmit)
+                .binding(&binding.id, ProviderOperation::TurnStart)
                 .await
                 .unwrap()
                 .model
@@ -3938,24 +4141,46 @@ mod tests {
             .unwrap();
         settled(&mut events).await;
         let applied = provider
-            .session_configure(test_context(), &binding.id, configuration())
+            .thread_configure(test_context(), &binding.id, configuration())
             .await
             .unwrap();
         assert!(applied.configuration.model.model.is_none());
         provider
-            .input_submit(
+            .turn_start(
                 test_context(),
                 &binding.id,
                 prompt(&binding.id, owner, "second", receipt("second")),
             )
             .await
             .unwrap();
-        let result = settled(&mut events).await;
-        let ExecutionResult::Completed { completion } = result.result else {
-            panic!("not completed")
-        };
-        let completion: ProviderCompletion = completion.into();
-        assert!(completion.runtime.model.is_none());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap().unwrap();
+                assert!(
+                    !matches!(
+                        event.event,
+                        ProviderEvent::Turn {
+                            event: TurnEvent::ModelResolved(_),
+                            ..
+                        }
+                    ),
+                    "an invocation override must not become the next turn's confirmed model"
+                );
+                if let ProviderEvent::Turn {
+                    event: TurnEvent::Completed(completed),
+                    ..
+                } = event.event
+                {
+                    break completed;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.result().outcome(),
+            TurnOutcome::Completed { .. }
+        ));
         provider.shutdown(test_context()).await.unwrap();
     }
 
@@ -3986,7 +4211,7 @@ mod tests {
         let task_binding = binding.id.clone();
         let submitted = tokio::spawn(async move {
             task_provider
-                .input_submit(test_context(), &task_binding, request)
+                .turn_start(test_context(), &task_binding, request)
                 .await
         });
         provider
@@ -4016,7 +4241,7 @@ mod tests {
         submitted.await.unwrap().unwrap();
         settled(&mut events).await;
         provider
-            .session_close(test_context(), &binding.id)
+            .thread_close(test_context(), &binding.id)
             .await
             .unwrap();
         assert!(matches!(
@@ -4064,7 +4289,7 @@ mod tests {
         let task_binding = binding.id.clone();
         let submitted = tokio::spawn(async move {
             task_provider
-                .input_submit(test_context(), &task_binding, request)
+                .turn_start(test_context(), &task_binding, request)
                 .await
         });
         provider
@@ -4074,12 +4299,18 @@ mod tests {
             .unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            provider.cancel(test_context(), &binding.id, CancelRequest { scope }),
+            provider.turn_interrupt(
+                test_context(),
+                &binding.id,
+                CancelRequest {
+                    scope: scope.clone(),
+                },
+            ),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(result.result, ExecutionResult::Cancelled { .. }));
+        assert_eq!(result.turn_id, scope.turn_id().unwrap());
         submitted.await.unwrap().unwrap();
         settled(&mut events).await;
         provider.shutdown(test_context()).await.unwrap();
@@ -4091,24 +4322,24 @@ mod tests {
         let provider = MockProvider::new().unwrap();
         let (first, _, _events) = initialized(&provider).await;
         provider
-            .session_close(test_context(), &first.id)
+            .thread_close(test_context(), &first.id)
             .await
             .unwrap();
         provider
-            .session_close(test_context(), &first.id)
+            .thread_close(test_context(), &first.id)
             .await
             .unwrap();
         let (second, _, _events) = initialized(&provider).await;
         assert_ne!(first.id, second.id);
         assert!(
             provider
-                .session_configure(test_context(), &first.id, configuration())
+                .thread_configure(test_context(), &first.id, configuration())
                 .await
                 .is_err()
         );
         assert!(
             provider
-                .binding(&second.id, ProviderOperation::InputSubmit)
+                .binding(&second.id, ProviderOperation::TurnStart)
                 .await
                 .is_ok()
         );
@@ -4120,6 +4351,7 @@ mod tests {
         let provider = MockProvider::new().unwrap();
         let (persistent, _, _events) = initialized(&provider).await;
         let request = SessionRequest {
+            thread_id: (make_owner("isolated")).thread_id(),
             owner: make_owner("isolated"),
             mode: SessionMode::Background,
             workspace: ".".into(),
@@ -4148,12 +4380,9 @@ mod tests {
                 tools: None,
             });
         assert!(
-            matches!(provider.session_open(test_context(), invalid).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Policy)
+            matches!(provider.thread_open(test_context(), invalid).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Policy)
         );
-        let opened = provider
-            .session_open(test_context(), request)
-            .await
-            .unwrap();
+        let opened = provider.thread_open(test_context(), request).await.unwrap();
         let isolated_id = opened.binding.id.clone();
         let mut events = opened.events;
         let mut input = prompt(
@@ -4164,23 +4393,23 @@ mod tests {
         );
         input.input = PromptInput::Text("temporary text".into());
         provider
-            .input_submit(test_context(), &isolated_id, input)
+            .turn_start(test_context(), &isolated_id, input)
             .await
             .unwrap();
         settled(&mut events).await;
         provider
-            .session_close(test_context(), &isolated_id)
+            .thread_close(test_context(), &isolated_id)
             .await
             .unwrap();
         assert!(
             provider
-                .binding(&isolated_id, ProviderOperation::InputSubmit)
+                .binding(&isolated_id, ProviderOperation::TurnStart)
                 .await
                 .is_err()
         );
         assert!(
             provider
-                .binding(&persistent.id, ProviderOperation::InputSubmit)
+                .binding(&persistent.id, ProviderOperation::TurnStart)
                 .await
                 .unwrap()
                 .model
@@ -4208,7 +4437,7 @@ mod tests {
         let scope = input.scope.clone();
         let attempt_id = input.attempt_id.clone();
         provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap();
         provider
@@ -4217,7 +4446,7 @@ mod tests {
             .await
             .unwrap();
         provider
-            .cancel(
+            .turn_interrupt(
                 test_context(),
                 &binding.id,
                 CancelRequest {
@@ -4245,7 +4474,7 @@ mod tests {
         let next_scope = next.scope.clone();
         let next_attempt = next.attempt_id.clone();
         provider
-            .input_submit(test_context(), &binding.id, next)
+            .turn_start(test_context(), &binding.id, next)
             .await
             .unwrap();
         settled(&mut events).await;
@@ -4272,7 +4501,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .binding(&binding.id, ProviderOperation::InputSubmit)
+                .binding(&binding.id, ProviderOperation::TurnStart)
                 .await
                 .unwrap()
                 .history_boundary
@@ -4321,7 +4550,7 @@ mod tests {
         let input = prompt(&binding.id, owner.clone(), "first", receipt("first"));
         let scope = input.scope.clone();
         provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap();
         provider
@@ -4346,7 +4575,7 @@ mod tests {
             .await
             .unwrap();
         let rejected = provider
-            .input_submit(
+            .turn_start(
                 test_context(),
                 &binding.id,
                 prompt(&binding.id, owner.clone(), "occupied", receipt("occupied")),
@@ -4354,17 +4583,23 @@ mod tests {
             .await;
         assert!(
             matches!(rejected, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::ExecutionActive
-                && failure.operation() == ProviderOperation::InputSubmit
+                && failure.operation() == ProviderOperation::TurnStart
                 && failure.phase() == ProviderPhase::Admission
                 && failure.disposition() == FailureDisposition::Unchanged)
         );
         provider
-            .cancel(test_context(), &binding.id, CancelRequest { scope })
+            .turn_interrupt(
+                test_context(),
+                &binding.id,
+                CancelRequest {
+                    scope: scope.clone(),
+                },
+            )
             .await
             .unwrap();
         settled(&mut events).await;
         let rejected = provider
-            .input_submit(
+            .turn_start(
                 test_context(),
                 &binding.id,
                 prompt(&binding.id, owner, "next", receipt("next")),
@@ -4434,7 +4669,7 @@ mod tests {
         });
         input.permissions = permissions.clone();
         provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap();
         tokio::time::timeout(
@@ -4444,7 +4679,7 @@ mod tests {
         .await
         .unwrap();
         provider
-            .session_close(test_context(), &binding.id)
+            .thread_close(test_context(), &binding.id)
             .await
             .unwrap();
         assert!(
@@ -4454,17 +4689,18 @@ mod tests {
         );
         loop {
             let event = events.recv().await.unwrap().unwrap();
-            if let ProviderEvent::Execution { observation } = &event.event {
-                assert!(!matches!(
-                    observation.update(),
-                    ExecutionUpdate::ObservationLost { .. }
-                ));
-            }
-            if let ProviderEvent::Settled { settlement } = event.event {
-                assert!(matches!(
-                    settlement.result,
-                    ExecutionResult::Cancelled { .. }
-                ));
+            assert!(!matches!(
+                &event.event,
+                ProviderEvent::Provider {
+                    event: ProviderConnectionEvent::Unavailable(_)
+                }
+            ));
+            if let ProviderEvent::Turn {
+                event: TurnEvent::Completed(completed),
+                ..
+            } = event.event
+            {
+                assert_eq!(completed.result().outcome(), TurnOutcome::Interrupted);
                 break;
             }
         }
@@ -4493,21 +4729,19 @@ mod tests {
             .await
             .unwrap();
         let input = prompt(&binding.id, owner, "failure", receipt("failure"));
-        let scope = input.scope.clone();
         provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let event = events.recv().await.unwrap().unwrap();
-                if let ProviderEvent::SettlementFailed {
-                    scope: failed,
-                    failure,
+                if let ProviderEvent::Provider {
+                    event: ProviderConnectionEvent::Unavailable(unavailable),
                 } = event.event
                 {
-                    assert_eq!(failed, scope);
-                    assert_eq!(failure.phase(), ProviderPhase::Collection);
+                    let failure = unavailable.failure;
+                    assert_eq!(failure.phase(), ProviderPhase::Observation);
                     assert_eq!(failure.disposition(), FailureDisposition::Invalidated);
                     break;
                 }
@@ -4516,26 +4750,27 @@ mod tests {
         .await
         .unwrap();
         let error = provider
-            .session_configure(test_context(), &binding.id, configuration())
+            .thread_configure(test_context(), &binding.id, configuration())
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderError::Failure(failure)
             if failure.kind() == ProviderFailureKind::BindingInvalidated
-                && failure.operation() == ProviderOperation::SessionConfigure
+                && failure.operation() == ProviderOperation::ThreadConfigure
                 && failure.phase() == ProviderPhase::Admission
                 && failure.disposition() == FailureDisposition::Invalidated));
         for _ in 0..2 {
             let error = provider
-                .session_close(test_context(), &binding.id)
+                .thread_close(test_context(), &binding.id)
                 .await
                 .unwrap_err();
-            assert!(
-                matches!(error, ProviderError::Failure(failure) if failure.disposition() == FailureDisposition::Closed && failure.phase() == ProviderPhase::Collection)
-            );
+            assert!(matches!(
+                error,
+                ProviderError::Observation(ObservationFailure::Disconnected)
+            ));
         }
         assert!(
             provider
-                .binding(&binding.id, ProviderOperation::SessionClose)
+                .binding(&binding.id, ProviderOperation::ThreadClose)
                 .await
                 .is_err()
         );
@@ -4604,7 +4839,7 @@ mod tests {
             let submitted_binding = binding.id.clone();
             let submitted = tokio::spawn(async move {
                 submitted_provider
-                    .input_submit(test_context(), &submitted_binding, input)
+                    .turn_start(test_context(), &submitted_binding, input)
                     .await
             });
             tokio::time::timeout(
@@ -4616,7 +4851,7 @@ mod tests {
             if close {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    provider.session_close(test_context(), &binding.id),
+                    provider.thread_close(test_context(), &binding.id),
                 )
                 .await
                 .unwrap()
@@ -4624,7 +4859,13 @@ mod tests {
             } else {
                 let error = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    provider.cancel(test_context(), &binding.id, CancelRequest { scope }),
+                    provider.turn_interrupt(
+                        test_context(),
+                        &binding.id,
+                        CancelRequest {
+                            scope: scope.clone(),
+                        },
+                    ),
                 )
                 .await
                 .unwrap()
@@ -4638,14 +4879,14 @@ mod tests {
             if close {
                 assert!(matches!(error, ProviderError::Failure(failure)
                     if failure.kind() == ProviderFailureKind::BindingClosed
-                        && failure.operation() == ProviderOperation::InputSubmit
+                        && failure.operation() == ProviderOperation::TurnStart
                         && failure.phase() == ProviderPhase::Admission
                         && failure.disposition() == FailureDisposition::Invalidated));
             } else {
                 assert!(matches!(error, ProviderError::PreparationFailed(cause)
                     if matches!(*cause, ProviderError::Failure(failure)
                         if failure.kind() == ProviderFailureKind::Cancelled
-                            && failure.operation() == ProviderOperation::InputSubmit
+                            && failure.operation() == ProviderOperation::TurnStart
                             && failure.phase() == ProviderPhase::Admission
                             && failure.disposition() == FailureDisposition::Unchanged)));
             }
@@ -4653,7 +4894,7 @@ mod tests {
             assert!(!receipt.state.lock().unwrap().accepted);
             if !close {
                 provider
-                    .input_submit(
+                    .turn_start(
                         test_context(),
                         &binding.id,
                         prompt(
@@ -4666,8 +4907,8 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(matches!(
-                    settled(&mut events).await.result,
-                    ExecutionResult::Completed { .. }
+                    settled(&mut events).await.result().outcome(),
+                    TurnOutcome::Completed { .. }
                 ));
             }
         }
@@ -4682,9 +4923,15 @@ mod tests {
         let receipt = receipt("late-first-poll");
         let input = prompt(&binding.id, owner, "late-first-poll", receipt.clone());
         let scope = input.scope.clone();
-        let submitted = provider.input_submit(test_context(), &binding.id, input);
+        let submitted = provider.turn_start(test_context(), &binding.id, input);
         let error = provider
-            .cancel(test_context(), &binding.id, CancelRequest { scope })
+            .turn_interrupt(
+                test_context(),
+                &binding.id,
+                CancelRequest {
+                    scope: scope.clone(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -4694,7 +4941,7 @@ mod tests {
         assert!(matches!(error, ProviderError::PreparationFailed(cause)
             if matches!(*cause, ProviderError::Failure(failure)
                 if failure.kind() == ProviderFailureKind::Cancelled
-                    && failure.operation() == ProviderOperation::InputSubmit
+                    && failure.operation() == ProviderOperation::TurnStart
                     && failure.phase() == ProviderPhase::Admission
                     && failure.disposition() == FailureDisposition::Unchanged)));
         assert!(!receipt.state.lock().unwrap().sending);
@@ -4748,13 +4995,13 @@ mod tests {
         input.turn_control = Arc::new(PendingHostBarriers);
         input.host_effects = Arc::new(PendingHostBarriers);
         provider
-            .input_submit(test_context(), &binding.id, input)
+            .turn_start(test_context(), &binding.id, input)
             .await
             .unwrap();
         let settlement = settled(&mut events).await;
         assert!(matches!(
-            settlement.result,
-            ExecutionResult::Completed { .. }
+            settlement.result().outcome(),
+            TurnOutcome::Completed { .. }
         ));
         provider.shutdown(test_context()).await.unwrap();
     }
@@ -4775,12 +5022,12 @@ mod tests {
         };
         let fork_context = test_context();
         let result = provider
-            .session_fork(fork_context.clone(), request.clone())
+            .thread_fork(fork_context.clone(), request.clone())
             .await
             .unwrap();
         assert_eq!(
             provider
-                .session_fork(fork_context.clone(), request.clone())
+                .thread_fork(fork_context.clone(), request.clone())
                 .await
                 .unwrap()
                 .provider_session_id,
@@ -4828,17 +5075,17 @@ mod tests {
         changed.push(resources);
         for altered in changed {
             assert!(
-                matches!(provider.session_fork(fork_context.clone(), altered).await, Err(ProviderError::Failure(failure))
-                if failure.operation() == ProviderOperation::SessionFork && failure.kind() == ProviderFailureKind::OperationConflict)
+                matches!(provider.thread_fork(fork_context.clone(), altered).await, Err(ProviderError::Failure(failure))
+                if failure.operation() == ProviderOperation::ThreadFork && failure.kind() == ProviderFailureKind::OperationConflict)
             );
         }
         provider
-            .session_close(test_context(), &binding.id)
+            .thread_close(test_context(), &binding.id)
             .await
             .unwrap();
         assert_eq!(
             provider
-                .session_fork(fork_context, request)
+                .thread_fork(fork_context, request)
                 .await
                 .unwrap()
                 .provider_session_id,
@@ -4929,7 +5176,7 @@ mod tests {
         let submitted_binding = binding.id.clone();
         let submitted = tokio::spawn(async move {
             submitted_provider
-                .input_submit(context, &submitted_binding, request)
+                .turn_start(context, &submitted_binding, request)
                 .await
         });
         tokio::time::timeout(
@@ -4947,21 +5194,173 @@ mod tests {
         delayed.release.notify_one();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            provider.operations.input_submit.join_all(),
+            provider.operations.turn_start.join_all(),
         )
         .await
         .unwrap()
         .unwrap();
         let accepted = provider
-            .input_submit(retained_context, &binding.id, retained_request)
+            .turn_start(retained_context, &binding.id, retained_request)
             .await
             .unwrap();
         assert_eq!(accepted.submission_id, receipt.id);
         assert!(receipt.state.lock().unwrap().accepted);
         let settled = settled(&mut events).await;
         assert!(
-            matches!(settled.result, ExecutionResult::Completed { .. }),
+            matches!(settled.result().outcome(), TurnOutcome::Completed { .. }),
             "late interruption replaced independently observed normal completion"
+        );
+        provider.shutdown(test_context()).await.unwrap();
+    }
+    /// A well-typed foreign thread cannot allocate a native binding or poison retained open identity.
+    #[tokio::test]
+    async fn thread_open_rejects_foreign_host_identity_before_native_admission() {
+        let provider = MockProvider::new().unwrap();
+        let owner = make_owner("thread-owner");
+        let request = SessionRequest {
+            thread_id: owner.thread_id(),
+            owner,
+            mode: SessionMode::Interactive,
+            workspace: ".".into(),
+            history: SessionHistory::Durable { resume: None },
+            configuration: configuration(),
+            resource_lease: None,
+            tools: Vec::new(),
+            tool_endpoint: None,
+            system_instructions: String::new(),
+            trace: Arc::new(Trace),
+        };
+        let mut foreign = request.clone();
+        foreign.thread_id = make_owner("other-owner").thread_id();
+        assert!(request.identity() != foreign.identity());
+        let context = test_context();
+        assert!(
+            matches!(provider.thread_open(context.clone(), foreign).await,
+            Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)
+        );
+        assert!(provider.bindings.lock().await.is_empty());
+        assert!(provider.owners.lock().await.is_empty());
+        let opened = provider.thread_open(context, request).await.unwrap();
+        assert_eq!(provider.bindings.lock().await.len(), 1);
+        assert_eq!(
+            opened.binding.thread_id,
+            make_owner("thread-owner").thread_id()
+        );
+        provider
+            .thread_close(test_context(), &opened.binding.id)
+            .await
+            .unwrap();
+    }
+
+    /// Normalized ownership mismatches must reject before committing any delivery receipt.
+    #[tokio::test]
+    async fn turn_start_rejects_foreign_normalized_ids_before_dispatch() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, _events) = initialized(&provider).await;
+        for foreign_thread in [true, false] {
+            let receipt = receipt(if foreign_thread {
+                "foreign-thread"
+            } else {
+                "foreign-turn"
+            });
+            let mut request = prompt(&binding.id, owner.clone(), "exchange", receipt.clone());
+            if foreign_thread {
+                request.thread_id = make_owner("other").thread_id();
+            } else {
+                request.turn_id = forge_provider_api::TurnId::new("another-turn").unwrap();
+            }
+            assert!(
+                matches!(provider.turn_start(test_context(), &binding.id, request).await,
+                Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)
+            );
+            let state = receipt.state.lock().unwrap();
+            assert!(!state.sending);
+            assert!(!state.accepted);
+        }
+        provider
+            .thread_close(test_context(), &binding.id)
+            .await
+            .unwrap();
+    }
+    /// Retain original attempts when one admitted prompt accepts recovered inputs together.
+    #[tokio::test]
+    async fn grouped_prompt_completion_covers_recovered_and_current_attempts() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, mut events) = initialized(&provider).await;
+        let current = receipt("current");
+        let original = CoveredInput::new(
+            SubmissionId::try_from("original").unwrap(),
+            DeliveryAttemptId::new("original-attempt").unwrap(),
+        );
+        let current_coverage = CoveredInput::new(current.id.clone(), current.attempt_id().unwrap());
+        let mut request = prompt(&binding.id, owner, "grouped", current);
+        request.recovered_inputs.push(session::RecoveredInput {
+            covered_input: original.clone(),
+            input: PromptInput::Text("Earlier prepared input".into()),
+            attachments: vec![],
+            instructions: String::new(),
+        });
+        provider
+            .turn_start(test_context(), &binding.id, request)
+            .await
+            .unwrap();
+        let completed = settled(&mut events).await;
+        assert_eq!(
+            completed.result().covered_inputs(),
+            &[original, current_coverage]
+        );
+        provider.shutdown(test_context()).await.unwrap();
+    }
+
+    /// A revision submits the newer design without adding its already-declared file again.
+    #[tokio::test]
+    async fn revision_planning_revises_the_current_design_without_readding_its_file() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, _events) = initialized(&provider).await;
+        let mut request = prompt(&binding.id, owner, "revision", receipt("revision"));
+        request.mode = PromptMode::Plan;
+        for name in ["plan_overview_edit", "plan_file_edit", "plan_submit"] {
+            request.tools.push(control::ControlToolDefinition {
+                name,
+                description: "Edit the plan",
+                input_schema: serde_json::json!({}),
+            });
+        }
+        let design = |version: u64, paths: serde_json::Value| {
+            format!(
+                "Active declaration design:\n```json\n{}\n```",
+                serde_json::json!({"plan_id":"plan","version":version,"request":"add a greeting",
+                    "declaration_files":{"paths":paths}})
+            )
+        };
+        request.instructions = design(1, serde_json::json!([]));
+        let steps = planning_steps(
+            &request,
+            &design(4, serde_json::json!([MOCK_DECLARATION_PATH])),
+        );
+        let calls = steps
+            .iter()
+            .map(|step| match step {
+                TestPromptStep::ToolCall { name, arguments } => {
+                    (name.as_str(), arguments["expected_version"].as_u64())
+                }
+                other => panic!("planner produced a non-tool step: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [("plan_overview_edit", Some(4)), ("plan_submit", Some(5))]
+        );
+        let initial = planning_steps(&request, "");
+        assert_eq!(
+            initial
+                .iter()
+                .filter_map(|step| match step {
+                    TestPromptStep::ToolCall { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["plan_overview_edit", "plan_file_edit", "plan_submit"]
         );
         provider.shutdown(test_context()).await.unwrap();
     }

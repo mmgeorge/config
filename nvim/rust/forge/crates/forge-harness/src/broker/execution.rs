@@ -13,6 +13,19 @@ use std::sync::atomic::Ordering;
 pub(super) const CHECKPOINT_WARNING: &str =
     "Workspace-wide deviation detection is unavailable without a repository checkpoint.";
 
+/// Retain an exact completed tool owner alongside its inspectable verification projection.
+#[derive(serde::Serialize)]
+pub(super) struct VerificationToolEvidence {
+    pub(super) id: String,
+    /// Provider tool that produced this evidence. Harness check commands have no
+    /// provider tool, so their results are cited by check command ID alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<crate::turn::ToolAddress>,
+    title: String,
+    state: &'static str,
+    output_preview: String,
+}
+
 pub(super) struct ExecutionCapture {
     pub(super) permit: crate::task::TaskPermit,
     pub(super) record: PlanExecutionRecord,
@@ -416,25 +429,70 @@ impl HarnessBroker {
         })
     }
 
-    fn verification_evidence(
+    pub(super) fn verification_evidence(
         &self,
         execution_id: &str,
         interaction: &Exchange,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<VerificationToolEvidence>> {
         let exchanges = self.store.list_exchange(&self.session.id)?;
         let execution = self
             .current_execution()?
             .filter(|execution| execution.id == execution_id)
             .context("execution evidence owner changed")?;
-        Ok(exchanges.iter()
-            .filter(|exchange| exchange.id != interaction.id && exchange.created_at_ms >= execution.created_at_ms)
+        let mut evidence = Vec::new();
+        for exchange in exchanges
+            .iter()
+            .filter(|exchange| {
+                exchange.id != interaction.id && exchange.created_at_ms >= execution.created_at_ms
+            })
             .chain(std::iter::once(interaction))
-            .flat_map(|exchange| exchange.tools())
-            .filter(|(_, tool)| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
-            .map(|(turn, tool)| json!({"id":tool.id,"call_id":format!("{}:{}", turn.id(), tool.id),"title":tool.title.chars().take(240).collect::<String>(),
-                "state":if tool.state() == crate::turn::ToolState::Failed { "failed" } else { "completed" },
-                "output_preview":tool.output.chars().take(512).collect::<String>()}))
-            .collect())
+        {
+            for entry in &exchange.entry {
+                let crate::exchange::ExchangeEntry::Commentary { commentary } = entry else {
+                    continue;
+                };
+                for tools in &commentary.tool {
+                    for tool in tools.store.iter().filter(|tool| {
+                        matches!(
+                            tool.state(),
+                            crate::turn::ToolState::Completed | crate::turn::ToolState::Failed
+                        )
+                    }) {
+                        let execution = tools
+                            .store
+                            .execution(&tool.id)
+                            .context("verification tool has no original execution owner")?;
+                        let address = crate::turn::ToolAddress {
+                            turn: execution.address.clone(),
+                            item_id: execution.item_id.clone(),
+                        };
+                        evidence.push(VerificationToolEvidence {
+                            id: serde_json::to_string(&address)?,
+                            address: Some(address),
+                            title: tool.title.chars().take(240).collect(),
+                            state: if tool.state() == crate::turn::ToolState::Failed {
+                                "failed"
+                            } else {
+                                "completed"
+                            },
+                            output_preview: tool.output.chars().take(512).collect(),
+                        });
+                    }
+                }
+            }
+        }
+        // Verify tells the model to cite automated checks Harness already passed rather
+        // than rerun them, so the passing run for this revision must be citable.
+        for command in execution.passed_check_commands() {
+            evidence.push(VerificationToolEvidence {
+                id: command.id.clone(),
+                address: None,
+                title: format!("Harness check · {}", command.command),
+                state: "completed",
+                output_preview: "passed".into(),
+            });
+        }
+        Ok(evidence)
     }
 
     pub(super) fn execution_status(
@@ -900,17 +958,15 @@ impl HarnessBroker {
                         .chain(report.checks.iter().flat_map(|check| &check.evidence))
                     {
                         anyhow::ensure!(
-                            tools
-                                .iter()
-                                .any(|tool| tool["id"].as_str() == Some(reference.as_str())),
-                            "verification evidence {reference} is not a completed tool result in this execution. Call plan_overview_read with plan_id and use exact IDs from execution.verification_evidence."
+                            tools.iter().any(|tool| tool.id == *reference),
+                            "verification evidence {reference} is not a completed tool result or passed Harness check in this execution. Call plan_overview_read with plan_id and use exact IDs from execution.verification_evidence."
                         );
-                        if let Some(call_id) = tools
+                        let tool = tools
                             .iter()
-                            .find(|tool| tool["id"].as_str() == Some(reference.as_str()))
-                            .and_then(|tool| tool["call_id"].as_str())
-                        {
-                            verification_tools.insert(reference.clone(), call_id.to_owned());
+                            .find(|tool| tool.id == *reference)
+                            .context("validated verification evidence disappeared")?;
+                        if let Some(address) = &tool.address {
+                            verification_tools.insert(reference.clone(), address.clone());
                         }
                     }
                     let reused = execution.verification.iter().any(|evidence| {

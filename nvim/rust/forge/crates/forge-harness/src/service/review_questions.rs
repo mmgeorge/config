@@ -132,10 +132,14 @@ mod tests {
         let (retained, updates) = crate::broker::publication::channel();
         retained
             .send_wait(crate::broker::publication::SessionUpdate::Diagnostic {
-                diagnostic: crate::provider::ProviderDiagnostic {
+                diagnostic: crate::broker::publication::DiagnosticView {
                     kind: forge_provider_api::ProviderFailureKind::Rejected,
                     message: forge_provider_api::SanitizedMessage::new("child open rejected")?,
-                    fatal: true,
+                    severity: crate::broker::publication::DiagnosticSeverity::Error,
+                    scope: crate::provider::EventScope::Binding {
+                        owner: crate::provider::ThreadOwner::root("review-answer"),
+                    },
+                    native_scope: forge_provider_api::WarningScope::Provider,
                 },
             })
             .await?;
@@ -143,7 +147,7 @@ mod tests {
         assert!(futures_util::poll!(flushed.as_mut()).is_pending());
         let failure =
             crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::SessionOpen,
+                forge_provider_api::ProviderOperation::ThreadOpen,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ));
         let error = tokio::time::timeout(
@@ -157,7 +161,7 @@ mod tests {
         assert!(
             matches!(error.downcast_ref::<crate::provider::ProviderError>(),
                 Some(crate::provider::ProviderError::Failure(failure))
-                    if failure.operation() == forge_provider_api::ProviderOperation::SessionOpen
+                    if failure.operation() == forge_provider_api::ProviderOperation::ThreadOpen
                         && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
             )
         );

@@ -1,7 +1,6 @@
 use super::*;
 use crate::provider::{
-    ProviderChangeKind, ProviderChangeSet, ProviderFileChange, TextUpdate, ToolActivityKind,
-    ToolInvocation, ToolOutcome, ToolUpdate,
+    ProviderChangeKind, ProviderChangeSet, ProviderFileChange, TextUpdate, ToolOutcome,
 };
 use serde_json::json;
 
@@ -22,6 +21,7 @@ fn render(exchange: &Exchange) -> ProjectedEntry {
     project(
         ProjectionSource::Exchange(exchange),
         &WidthProfile::default(),
+        crate::buffer::projection::FIXTURE_NOW_MS,
         false,
         &HashMap::new(),
         &HashMap::new(),
@@ -159,12 +159,16 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
     .enumerate()
     {
         let mut update = vec![
-            ToolUpdate::Started,
-            ToolUpdate::Output {
-                update: TextUpdate::Replace(format!("operation-{index}")),
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::ExecutionStarted,
             },
-            ToolUpdate::Changes {
-                changes: if index == 5 {
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Replace(format!(
+                    "operation-{index}"
+                ))),
+            },
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Changes(if index == 5 {
                     ProviderChangeSet::default()
                 } else {
                     ProviderChangeSet {
@@ -175,7 +179,7 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
                             diff: format!("@@ -1 +1 @@\n-before-{index}\n+after-{index}\n"),
                         }],
                     }
-                },
+                }),
             },
         ];
         let outcome = match status {
@@ -196,19 +200,27 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
             _ => None,
         };
         if let Some(outcome) = outcome {
-            update.push(ToolUpdate::Finished { outcome });
+            update.push(forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::FileChange(
+                    forge_provider_api::ToolCompletion {
+                        outcome,
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    },
+                ),
+            ));
         }
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             &format!("write-{index}"),
-            ToolInvocation {
+            forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),
-                arguments: serde_json::json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
+            }),
             update,
             index as i64 + 1,
         )

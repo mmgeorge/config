@@ -13,7 +13,7 @@ impl ControlToolRegistry {
     /// Register a stable superset without granting invocation authority to disabled tools.
     pub(crate) fn registration_definitions(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
         mode: crate::provider::PromptMode,
     ) -> Vec<ControlToolDefinition> {
         if mode == crate::provider::PromptMode::Background {
@@ -140,7 +140,7 @@ impl ControlToolRegistry {
     /// Advertise optional root tools before a provider transport admits its first turn.
     pub fn definition_list_for_owner(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
         agent_tools: bool,
         lsp_tools: bool,
     ) -> Vec<ControlToolDefinition> {

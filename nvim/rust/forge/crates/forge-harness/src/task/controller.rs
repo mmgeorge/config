@@ -214,6 +214,7 @@ impl SessionTaskController {
                 execution.record.findings = vec![diagnostic];
                 execution.record.generation += 1;
             }
+            #[cfg(test)]
             super::TaskEvent::VerificationInputsChanged(source) => {
                 let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
                     anyhow::bail!("verification invalidation requires execution");
@@ -840,6 +841,7 @@ impl SessionTaskController {
     }
 
     /// Count a completed response once; interruption and failure never consume the plan budget.
+    /// Planning observes only responses accepted by [`latest_turn_completed_normally`].
     pub(crate) fn observe_plan_response(
         &self,
         store: &mut SqliteStore,
@@ -848,19 +850,8 @@ impl SessionTaskController {
         canonical_progress: bool,
         now_ms: i64,
     ) -> Result<Option<(crate::plan::PlanRecord, bool)>> {
-        use crate::turn::{TurnOutcome, TurnState};
-
-        let Some(response) = exchange.turn.last() else {
+        if !latest_turn_completed_normally(exchange) {
             return Ok(None);
-        };
-        match response.state() {
-            TurnState::Finished {
-                outcome: TurnOutcome::Completed,
-            } => {}
-            TurnState::Running
-            | TurnState::Finished {
-                outcome: TurnOutcome::Cancelled | TurnOutcome::Interrupted | TurnOutcome::Failed,
-            } => return Ok(None),
         }
         ensure!(
             exchange.session_id == self.session_id,
@@ -2124,6 +2115,37 @@ pub(super) fn validate_execution_update(
     Ok(())
 }
 
+/// Report whether an exchange's latest turn completed normally, the only outcome that may advance
+/// planning or check setup. Running, interrupted, failed, limited, and refused turns leave the plan
+/// where it stands, so a user stop never starts the retained planning request on its own.
+pub(crate) fn latest_turn_completed_normally(exchange: &crate::exchange::Exchange) -> bool {
+    use crate::turn::{TurnOutcome, TurnState};
+
+    let Some(response) = exchange.turn.last() else {
+        return false;
+    };
+    match response.state() {
+        TurnState::Finished {
+            outcome:
+                TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+        } => true,
+        TurnState::Running
+        | TurnState::Finished {
+            outcome:
+                TurnOutcome::Interrupted
+                | TurnOutcome::Failed { .. }
+                | TurnOutcome::Completed {
+                    stop_reason:
+                        forge_provider_api::turn::TurnCompletionReason::TokenLimit
+                        | forge_provider_api::turn::TurnCompletionReason::RequestLimit
+                        | forge_provider_api::turn::TurnCompletionReason::Refusal,
+                },
+        } => false,
+    }
+}
+
 /// Archive displaced live task work without changing completed history or a same-task phase transition.
 fn clear_effect(
     session_id: &str,
@@ -2545,7 +2567,12 @@ mod tests {
                 2,
             )?
             .unwrap();
-        let completed = planning_response(1, Some(crate::turn::TurnOutcome::Completed))?;
+        let completed = planning_response(
+            1,
+            Some(crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            }),
+        )?;
         let (plan, _) = controller
             .observe_plan_response(&mut store, &task.permit(), &completed, true, 3)?
             .unwrap();
@@ -2593,9 +2620,27 @@ mod tests {
         for completed in 1..=7 {
             for outcome in [
                 None,
-                Some(TurnOutcome::Cancelled),
                 Some(TurnOutcome::Interrupted),
-                Some(TurnOutcome::Failed),
+                Some(TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::TokenLimit,
+                }),
+                Some(TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::RequestLimit,
+                }),
+                Some(TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Refusal,
+                }),
+                Some(TurnOutcome::Failed {
+                    error: forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnStart,
+                        forge_provider_api::ProviderFailureKind::Unknown,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    ),
+                    retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+                }),
             ] {
                 ordinal += 1;
                 let response = planning_response(ordinal, outcome)?;
@@ -2611,7 +2656,12 @@ mod tests {
                 );
             }
             ordinal += 1;
-            let response = planning_response(ordinal, Some(TurnOutcome::Completed))?;
+            let response = planning_response(
+                ordinal,
+                Some(TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                }),
+            )?;
             let task = controller.current()?.unwrap();
             let changed = completed == 2;
             let (plan, continuing) = controller

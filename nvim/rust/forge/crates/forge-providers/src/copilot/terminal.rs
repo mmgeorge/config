@@ -11,7 +11,7 @@ pub(super) enum TerminalSource {
 
 /// Serialize complete binding inventories instead of letting independent readers replace each other.
 pub(super) struct TerminalPublisher {
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     sink: forge_provider_api::ProviderEventSink,
     state: std::sync::Mutex<PublishedInventories>,
     publication: tokio::sync::Mutex<()>,
@@ -20,7 +20,7 @@ pub(super) struct TerminalPublisher {
 impl TerminalPublisher {
     /// Create an empty binding inventory before either native reader is attached.
     pub(super) fn new(
-        owner: forge_provider_api::ExecutionOwner,
+        owner: forge_provider_api::ThreadOwner,
         sink: forge_provider_api::ProviderEventSink,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -123,11 +123,12 @@ impl TerminalSourceHandle {
             current.snapshot = snapshot;
             state.snapshot()
         };
+        let writer = self.publisher.sink.activity_writer();
         tokio::select! {
             biased;
             _ = lease.changed() => Ok(()),
-            result = self.publisher.sink.send_wait(forge_provider_api::ProviderEvent::Terminals {
-                scope:forge_provider_api::EventScope::Binding {owner:self.publisher.owner.clone()}, snapshot:merged,
+            result = writer.send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: self.publisher.owner.thread_id(), event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(merged)),
             }) => result.map_err(Into::into),
         }
     }
@@ -217,7 +218,7 @@ impl TerminalRegistry {
 /// Publish inventory through the binding's normalized stream and opaque handle registry.
 #[derive(Clone)]
 pub(super) struct TerminalPublication {
-    pub(super) owner: forge_provider_api::ExecutionOwner,
+    pub(super) owner: forge_provider_api::ThreadOwner,
     pub(super) sink: forge_provider_api::ProviderEventSink,
     pub(super) registry: Arc<tokio::sync::Mutex<TerminalRegistry>>,
     pub(super) publisher: Option<Arc<TerminalPublisher>>,
@@ -257,7 +258,7 @@ impl CopilotTerminalMonitor {
             session,
             |event| event.event_type == "session.background_tasks_changed",
             trace,
-            publication.owner.session_id.to_string(),
+            publication.owner.session_id().to_string(),
         );
         Self::from_stream(event, Arc::downgrade(&session.inner), publication)
     }
@@ -328,21 +329,23 @@ impl CopilotTerminalMonitor {
                         previous = Some(snapshot.clone());
                     }
                     if result.is_err() {
-                        let diagnostic = forge_provider_api::ProviderDiagnostic {
-                            kind: forge_provider_api::ProviderFailureKind::Runtime,
-                            message: forge_provider_api::diagnostic::SanitizedMessage::new(
-                                "Background terminal inventory is unavailable.",
-                            )
-                            .expect("nonempty diagnostic"),
-                            fatal: false,
-                        };
+                        previous = None;
+                        let failure = forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TerminalList,
+                            forge_provider_api::ProviderFailureKind::Runtime,
+                        )
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Observation,
+                            forge_provider_api::FailureDisposition::Unchanged,
+                        );
                         if publication
                             .sink
-                            .send_wait(forge_provider_api::ProviderEvent::Diagnostic {
-                                scope: forge_provider_api::EventScope::Binding {
-                                    owner: publication.owner.clone(),
-                                },
-                                diagnostic,
+                            .activity_writer()
+                            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                                thread_id: publication.owner.thread_id(),
+                                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(
+                                    failure,
+                                )),
                             })
                             .await
                             .is_err()
@@ -369,7 +372,7 @@ impl CopilotTerminalMonitor {
             tokio::select! { _ = closing => {}, _ = observe => {} }
             event.close().await.map_err(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::SessionClose,
+                    forge_provider_api::ProviderOperation::ThreadClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 )
             })
@@ -413,7 +416,7 @@ impl CopilotTerminalMonitor {
         };
         let result = task.await.map_err(|_| {
             native_failure(
-                forge_provider_api::ProviderOperation::SessionClose,
+                forge_provider_api::ProviderOperation::ThreadClose,
                 forge_provider_api::ProviderFailureKind::Runtime,
             )
         });
@@ -438,7 +441,7 @@ mod tests {
     /// Independent inventories remain visible when either source changes or its reader is replaced.
     #[tokio::test]
     async fn terminal_publication_merges_sources_and_rejects_retired_readers() {
-        let owner = forge_provider_api::ExecutionOwner::root("terminal-union");
+        let owner = forge_provider_api::ThreadOwner::root("terminal-union");
         let (sink, mut events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-union").unwrap(),
             forge_provider_api::EventScope::Binding {
@@ -477,7 +480,11 @@ mod tests {
             vec!["replacement"],
         ] {
             let event = events.recv().await.unwrap().unwrap().event;
-            let forge_provider_api::ProviderEvent::Terminals { snapshot, .. } = event else {
+            let forge_provider_api::ProviderEvent::Thread {
+                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(snapshot)),
+                ..
+            } = event
+            else {
                 panic!("unexpected non-terminal event")
             };
             assert_eq!(
@@ -495,7 +502,7 @@ mod tests {
     /// Source revocation interrupts publication even while another sender owns its serialization lock.
     #[tokio::test]
     async fn retired_terminal_source_cancels_waiting_publication() {
-        let owner = forge_provider_api::ExecutionOwner::root("terminal-retirement");
+        let owner = forge_provider_api::ThreadOwner::root("terminal-retirement");
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-retirement").unwrap(),
             forge_provider_api::EventScope::Binding {
@@ -506,7 +513,7 @@ mod tests {
         let old = publisher.source(TerminalSource::Main);
         let _held = publisher.publication.lock().await;
         let mut publishing =
-            Box::pin(old.publish(forge_provider_api::terminal::TerminalSnapshot::default()));
+            std::pin::pin!(old.publish(forge_provider_api::terminal::TerminalSnapshot::default()));
         assert!(futures_util::poll!(publishing.as_mut()).is_pending());
         let _replacement = publisher.source(TerminalSource::Main);
         assert!(matches!(
@@ -518,7 +525,7 @@ mod tests {
     /// A cancelled blocked send must not suppress the replacement reader's identical inventory.
     #[tokio::test]
     async fn retired_terminal_source_republishes_identical_inventory_after_full_sink() {
-        let owner = forge_provider_api::ExecutionOwner::root("terminal-full-sink");
+        let owner = forge_provider_api::ThreadOwner::root("terminal-full-sink");
         let (sink, mut events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-full-sink").unwrap(),
             forge_provider_api::EventScope::Binding {
@@ -530,14 +537,15 @@ mod tests {
         let capacity =
             forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS;
         for _ in 0..capacity {
-            sink.send_wait(forge_provider_api::ProviderEvent::Terminals {
-                scope: forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
-                },
-                snapshot: forge_provider_api::terminal::TerminalSnapshot::default(),
-            })
-            .await
-            .unwrap();
+            sink.activity_writer()
+                .send_wait(forge_provider_api::AdapterActivity::Thread {
+                    thread_id: owner.thread_id(),
+                    event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
+                        forge_provider_api::terminal::TerminalSnapshot::default(),
+                    )),
+                })
+                .await
+                .unwrap();
         }
         let snapshot = forge_provider_api::terminal::TerminalSnapshot {
             supported: true,
@@ -560,8 +568,8 @@ mod tests {
             events.recv().await.unwrap().unwrap();
         }
         replacement.publish(snapshot.clone()).await.unwrap();
-        let forge_provider_api::ProviderEvent::Terminals {
-            snapshot: delivered,
+        let forge_provider_api::ProviderEvent::Thread {
+            event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(delivered)),
             ..
         } = events.recv().await.unwrap().unwrap().event
         else {
@@ -602,7 +610,7 @@ mod tests {
         });
         starting.await.unwrap();
         let stream = event_stream::SessionEventStream::fixture(receive, reader);
-        let owner = forge_provider_api::ExecutionOwner::root("terminal-fixture");
+        let owner = forge_provider_api::ThreadOwner::root("terminal-fixture");
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-fixture").unwrap(),
             forge_provider_api::EventScope::Binding {

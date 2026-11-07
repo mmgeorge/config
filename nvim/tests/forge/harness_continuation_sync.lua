@@ -75,14 +75,17 @@ local success, failure = xpcall(function()
   controller.attach()
   vim.api.nvim_set_current_win(state.composer_win)
   local focused_window = vim.api.nvim_get_current_win()
+  -- Execution activity comes only from owner publications, never from a pending RPC.
+  local owner_activity = vim.deepcopy(state.activity)
   present("plan_acceptance")
   local goal = { state = "active", native = false }
   receive("goal_continue_requested", goal, state.session.id)
   receive("plan_accepted", {}, state.session.id)
   vim.wait(20, function() return false end)
-  assert(goal_requests == 0 and state.busy, "goal advanced before the acceptance response")
+  assert(goal_requests == 0, "goal advanced before the acceptance response")
+  assert(vim.deep_equal(state.activity, owner_activity), "continuation request fabricated execution activity")
   continuation({})
-  assert(not state.busy)
+  assert(not require("forge.views.harness.activity").busy(state))
   local before_stale_reply = snapshot_requests
   receive("plan_accepted", {}, state.session.id)
   state_reply(snapshot(goal, state.active_elicitation))
@@ -91,10 +94,11 @@ local success, failure = xpcall(function()
   assert(goal_requests == 0, "goal advanced using the consumed acceptance snapshot")
   state_reply(snapshot(goal))
   if state.state_sync_pending then state_reply(snapshot(goal)) end
-  assert(goal_requests == 0 and not state.busy, "snapshot dispatched a duplicate host-owned continuation")
+  assert(goal_requests == 0 and not require("forge.views.harness.activity").busy(state), "snapshot dispatched a duplicate host-owned continuation")
   assert(vim.api.nvim_get_current_win() == focused_window, "continuation changed keyboard focus")
 
-  state.busy, state.goal = false, nil
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+  state.goal = nil
   queue("queued after clarification")
   present("interaction")
   receive("question_answered", {}, state.session.id)
@@ -109,7 +113,8 @@ local success, failure = xpcall(function()
   assert(submitted == nil and state.queue[1].text == "queued after clarification",
     "clarification completion duplicated or lost host-owned input")
   assert(goal_requests == 0, "snapshot completion duplicated goal continuation")
-  state.busy, submitted = false, nil
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+  submitted = nil
   state.capability.agent = { catalog = true }
   local followed = false
   state.presentation = { follow_tail = function() followed = true end }
@@ -128,7 +133,8 @@ local success, failure = xpcall(function()
   queued = {}
   input_revision = input_revision + 1
   require("forge.views.harness.input_state").refresh(state)
-  state.busy, state.queue, state.goal = false, {}, nil
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+  state.queue, state.goal = {}, nil
   for _, owner in ipairs({ "plan", "interaction" }) do
     for _, outcome in ipairs({ "retained", "replaced", "withdrawn" }) do
       state.plan_question_open = false
@@ -147,7 +153,7 @@ local success, failure = xpcall(function()
       local count = question_presentations
       host.ask({ question_id = "second", text = "What do you mean?" })
       controller.present_plan_question(true)
-      assert(question_presentations == count and #state.input.pending == 1, "picker reopened during explanation")
+      assert(question_presentations == count and #state.pending_submit == 1, "picker reopened during explanation")
       local pending = vim.deepcopy(state.active_elicitation)
       if outcome == "replaced" then pending.elicitation.revision = 2 end
       if outcome == "withdrawn" then pending = nil end

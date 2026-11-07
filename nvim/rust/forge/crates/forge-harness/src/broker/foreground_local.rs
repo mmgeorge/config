@@ -35,15 +35,7 @@ impl HarnessBroker {
                         json!({"prompt":retracted.prompt}),
                     )
                 } else {
-                    let code = if error.is::<RequestNotAdmitted>() {
-                        "not_admitted"
-                    } else if error.is::<TurnCancelled>() {
-                        "turn_cancelled"
-                    } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
-                        "tool_timeout"
-                    } else {
-                        "request_failed"
-                    };
+                    let code = super::request_failure_code(&error);
                     Response::failure(id, code, crate::storage::error_message(&error))
                 };
                 DispatchResult {
@@ -97,7 +89,7 @@ impl HarnessBroker {
             }
             let registry = self.execution_registry();
             let observer = registry
-                .replace(crate::provider::ExecutionOwner::root(&self.session.id))
+                .replace(crate::provider::ThreadOwner::root(&self.session.id))
                 .await?;
             self.observer.replace_session_events(observer);
             self.task_controller.reset_configuration_generation()?;
@@ -112,22 +104,6 @@ impl HarnessBroker {
             // This standalone driver holds exclusive broker ownership; the previous
             // reducer step is its command/effect boundary, with no service command queue.
             dispatch.authorize_submission();
-            if self
-                .observer
-                .session_events()
-                .take_idle_settlement_request()
-            {
-                let (sink, idle_updates) = publication::channel();
-                if let Some((idle, job)) = self.begin_idle_foreground(sink)? {
-                    let mut result = Box::pin(self.drive_local_foreground_initial(
-                        idle,
-                        idle_updates,
-                        Some(job),
-                    ))
-                    .await?;
-                    forwarded.append(&mut result.event);
-                }
-            }
             let (signal, completed_publication) = if let Some(error) = deferred_failure.take() {
                 (ForegroundSignal::EffectFailed(error), false)
             } else if drain && jobs.is_empty() && publications.is_empty() {
@@ -284,6 +260,8 @@ async fn local_foreground_job(
 mod tests {
     use super::*;
 
+    /// The hour-long deadline never elapses during the test; the coordinator's owner expiry
+    /// fires the same automatic-rejection path that an elapsed deadline takes.
     #[tokio::test]
     async fn approval_timeout_stages_owned_continuation_and_preserves_queued_purpose() -> Result<()>
     {
@@ -293,12 +271,12 @@ mod tests {
         let data = tempfile::tempdir()?;
         let mut broker =
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+        let owner = crate::provider::ThreadOwner::root(&broker.session.id);
         broker.permission_coordinator.configure_timeout(
             &broker.session.id,
             crate::session::InputTimeout {
                 amount: 1,
-                unit: crate::session::TimeoutUnit::S,
+                unit: crate::session::TimeoutUnit::H,
             },
         )?;
         let scope = crate::provider::InvocationScope::new(owner.clone(), "approval-source");
@@ -318,16 +296,19 @@ mod tests {
                             shell: None,
                         }],
                     },
-                    Some(crate::provider::TurnAddress {
-                        scope,
-                        thread_id: "thread".into(),
-                        turn_id: "turn".into(),
-                    }),
+                    Some(crate::provider::test_support::address(&scope)),
                     Some(&sink),
                 )
                 .await
         });
         anyhow::ensure!(events.recv().await?.is_some(), "approval was not observed");
+        anyhow::ensure!(
+            broker
+                .permission_coordinator
+                .expire_pending_for_owner(&owner)?
+                == 1,
+            "timed approval was not pending"
+        );
         anyhow::ensure!(
             tokio::time::timeout(std::time::Duration::from_secs(3), waiter).await???
                 == ApprovalResolution::TimedOut,
@@ -406,13 +387,13 @@ mod tests {
                 entries
                     .iter()
                     .any(|entry| entry["event"] == "lua.rpc.received"
-                        && entry["payload"]["id"] == id),
+                        && entry["payload"]["request_id"] == id),
                 "request trace missing for {id}"
             );
             anyhow::ensure!(
                 entries
                     .iter()
-                    .any(|entry| entry["event"] == terminal && entry["payload"]["id"] == id),
+                    .any(|entry| entry["event"] == terminal && entry["payload"]["request_id"] == id),
                 "terminal trace missing for {id}"
             );
         }

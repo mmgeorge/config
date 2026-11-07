@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Describes one complete native checklist replacement.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderChecklistUpdate {
     pub scope_id: String,
     pub name: Option<String>,
@@ -12,7 +12,7 @@ pub struct ProviderChecklistUpdate {
 }
 
 /// Describes one entry in a native checklist.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderChecklistEntry {
     pub provider_id: Option<String>,
     pub content: String,

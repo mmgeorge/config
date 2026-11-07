@@ -110,25 +110,29 @@ impl TimelineStream {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let crate::provider::ProviderEvent::Message {
-            address: message_address,
+        let crate::provider::ProviderEvent::Item {
+            thread_id,
+            turn_id,
+            item_id,
             ..
         } = event
         else {
             return Ok(None);
         };
-        let address = &message_address.turn;
-        let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else {
+        let Some(source) = exchange.turn.iter().find(|turn| {
+            &turn.provider().thread_id == thread_id && &turn.provider().turn_id == turn_id
+        }) else {
             return Ok(None);
         };
         let Some(message) = source
             .messages()
             .iter()
             .rev()
-            .find(|message| message.provider_id() == &message_address.message_id)
+            .find(|message| message.provider_id() == item_id)
         else {
             return Ok(None);
         };
+        let address = source.provider();
         let entry_id = self.entry_list[index].id();
         let main_exchange = matches!(&self.entry_list[index],TimelineEntry::Exchange { exchange:owner,.. } if owner.id == exchange.id);
         let target = self.entry_list[index]
@@ -146,7 +150,13 @@ impl TimelineStream {
             self.revision < forge_buffer::MAX_COUNTER,
             "timeline revision exhausted"
         );
-        target.observe_turn(event, exchange.created_at_ms)?;
+        target.observe_provider_event(
+            &crate::provider::EventScope::Invocation {
+                invocation: address.scope.clone(),
+            },
+            event,
+            exchange.created_at_ms,
+        )?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         self.revision += 1;
@@ -203,17 +213,27 @@ impl TimelineStream {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
             return Ok(None);
         };
-        let crate::provider::ProviderEvent::Tool {
-            address: tool_address,
-            update,
+        let crate::provider::ProviderEvent::Item {
+            thread_id,
+            turn_id,
+            item_id,
+            event:
+                item_event @ forge_provider_api::ItemEvent::Tool {
+                    event:
+                        forge_provider_api::ToolItemEvent::Output(
+                            forge_provider_api::TextUpdate::Append(output),
+                        ),
+                },
         } = event
         else {
             return Ok(None);
         };
-        let Some(output) = event.tool_output_delta() else {
+        let Some(source) = exchange.turn.iter().find(|turn| {
+            &turn.provider().thread_id == thread_id && &turn.provider().turn_id == turn_id
+        }) else {
             return Ok(None);
         };
-        let address = &tool_address.turn;
+        let address = source.provider();
         if exchange
             .turn
             .iter()
@@ -221,12 +241,13 @@ impl TimelineStream {
             .and_then(|turn| {
                 exchange
                     .tools_for_turn(turn.id())
-                    .find(|tool| tool.id == tool_address.tool_id.as_str())
+                    .find(|tool| tool.id == item_id.as_str())
             })
             .is_some_and(|tool| tool.kind == "file_change")
         {
             return Ok(None);
         }
+        let address = source.provider();
         let entry_id = self.entry_list[index].id();
         let target = self.entry_list[index]
             .exchange_mut(&exchange.id)
@@ -241,12 +262,21 @@ impl TimelineStream {
         let turn_id = turn.id().to_owned();
         if !target
             .tools_for_turn(&turn_id)
-            .any(|tool| tool.id == tool_address.tool_id.as_str())
+            .any(|tool| tool.id == item_id.as_str())
         {
             return Ok(None);
         }
-        let call = crate::turn::ToolAddress::new(&turn_id, tool_address.tool_id.as_str());
-        target.record_tool_event(&turn_id, tool_address, update, exchange.created_at_ms)?;
+        let call = crate::turn::ToolAddress {
+            turn: address.clone(),
+            item_id: item_id.clone(),
+        };
+        target.record_tool_event(
+            &turn_id,
+            address,
+            item_id,
+            item_event,
+            exchange.created_at_ms,
+        )?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         ensure!(
@@ -748,6 +778,15 @@ fn ticking(entry: &TimelineEntry) -> bool {
                         }))
             }) || agent.iter().any(ticking)
         }
+        TimelineEntry::ObservedAgent {
+            agent, children, ..
+        } => {
+            agent.availability() == crate::agent::ObservedAgentAvailability::Available
+                && agent.exchanges().iter().any(|exchange| {
+                    !exchange.is_finished() && exchange.execution_started_at_ms().is_some()
+                })
+                || children.iter().any(ticking)
+        }
         TimelineEntry::Status { status, checks, .. } => status.ticking() || checks.is_some(),
         TimelineEntry::Checks { .. } => false,
         _ => false,
@@ -1038,9 +1077,9 @@ mod test {
 
     #[test]
     fn file_edit_output_reconciles_the_change_node_without_a_tool_cache() -> anyhow::Result<()> {
-        use crate::provider::{
-            ProviderEvent, TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation,
-            ToolOutcome, ToolUpdate,
+        use forge_provider_api::{
+            InspectableArguments, ItemCompletion, ItemEvent, ItemId, ItemStart, ProviderEvent,
+            TextUpdate, ToolCompletion, ToolDescriptor, ToolDiagnostic, ToolItemEvent, ToolOutcome,
         };
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
             "id":"edit", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -1054,14 +1093,15 @@ mod test {
             &mut exchange,
             &address,
             "patch",
-            ToolInvocation {
+            ItemStart::FileChange(ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::FileChange,
                 name: "patch".into(),
-                arguments: serde_json::json!({}),
+                arguments: InspectableArguments::new(serde_json::json!({})),
                 title: "file changes".into(),
-            },
-            [ToolUpdate::Started],
+            }),
+            [ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
+            }],
             1,
         )?;
         let mut stream = TimelineStream::new("session".into());
@@ -1073,31 +1113,40 @@ mod test {
 
             agent_by_id: Default::default(),
         }])?;
-        let tool_address = crate::provider::ToolAddress {
-            turn: address,
-            tool_id: "patch".into(),
-        };
-        let event = ProviderEvent::Tool {
-            address: tool_address.clone(),
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("Patch context did not match".into()),
+        let event = ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: ItemId::new("patch").unwrap(),
+            event: ItemEvent::Tool {
+                event: ToolItemEvent::Output(TextUpdate::Append(
+                    "Patch context did not match".into(),
+                )),
             },
         };
-        exchange.observe_turn(&event, 2)?;
-        exchange.observe_turn(
-            &ProviderEvent::Tool {
-                address: tool_address,
-                update: ToolUpdate::Finished {
+        let scope = crate::provider::EventScope::Invocation {
+            invocation: address.scope.clone(),
+        };
+        exchange.observe_provider_event(&scope, &event, 2)?;
+        exchange.observe_provider_event(
+            &scope,
+            &ProviderEvent::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: ItemId::new("patch").unwrap(),
+                event: ItemEvent::Completed(ItemCompletion::FileChange(ToolCompletion {
                     outcome: ToolOutcome::Failed {
                         diagnostic: ToolDiagnostic {
                             kind: forge_provider_api::ProviderFailureKind::Unknown,
                             message: forge_provider_api::SanitizedMessage::new(
                                 "Patch context did not match",
                             )
-                            .expect("host diagnostic is nonempty"),
+                            .unwrap(),
                         },
                     },
-                },
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                })),
             },
             2,
         )?;

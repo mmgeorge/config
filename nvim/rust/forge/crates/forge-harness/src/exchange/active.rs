@@ -101,11 +101,14 @@ impl ActiveCommand {
     }
 
     /// Commit cancellation's local intent before any asynchronous acquisition can time out.
-    pub(super) fn pin_cancellation_target(
+    ///
+    /// Only cancellation locks the broker. Every other command starts without waiting on a
+    /// busy session's broker, so local policy commits while a turn holds it.
+    pub(super) async fn pin_cancellation_target(
         &mut self,
         foreground: &ForegroundStatus,
         dispatch: Option<&mut crate::broker::ForegroundDispatch>,
-        broker: &mut crate::broker::HarnessBroker,
+        broker: &tokio::sync::Mutex<crate::broker::HarnessBroker>,
         services: &OwnerServices,
     ) -> Result<
         (
@@ -119,6 +122,8 @@ impl ActiveCommand {
                 command,
                 transition,
             } => {
+                let mut broker = broker.lock().await;
+                let broker = &mut *broker;
                 transition.pin_cancellation_target(
                     foreground,
                     broker,
@@ -127,6 +132,10 @@ impl ActiveCommand {
                 let Command::CancelExchange(request) = &command.record.request.command else {
                     unreachable!("the active cancellation retains its cancellation request")
                 };
+                let foreground_absent = matches!(
+                    dispatch.as_deref(),
+                    None | Some(crate::broker::ForegroundDispatch::Done(_))
+                );
                 // Mark the canonical foreground before pausing its task revokes callback authority.
                 // Otherwise the same update can misclassify that intentional revocation as failure.
                 if let Some(dispatch) = dispatch {
@@ -152,14 +161,26 @@ impl ActiveCommand {
                 }
                 broker
                     .cancel_question_delivery()
-                    .map_err(|error| super::transition::TransitionFailure::Domain(error))?;
-                let input = services
+                    .map_err(super::transition::TransitionFailure::Domain)?;
+                let mut input = services
                     .input
                     .suspend(true, Some(command.record.request.id.as_str()))
-                    .map_err(|error| super::transition::TransitionFailure::Domain(error.into()))?;
+                    .map_err(super::transition::TransitionFailure::Domain)?;
+                // Without foreground work, a restoring cancel targets the prompt that was
+                // submitted but not yet claimed; only retraction keeps it from being
+                // stranded behind the suspension.
+                if foreground_absent
+                    && request.input == super::command::CancelledInputPolicy::RestoreIfUnconsumed
+                    && let Some(retracted) = services
+                        .input
+                        .retract_unclaimed_submission(command.record.request.id.as_str())
+                        .map_err(super::transition::TransitionFailure::Domain)?
+                {
+                    input = retracted;
+                }
                 let (prior, events) = broker
                     .owner_cancel_local(None)
-                    .map_err(|error| super::transition::TransitionFailure::Domain(error))?;
+                    .map_err(super::transition::TransitionFailure::Domain)?;
                 debug_assert!(
                     prior.is_none(),
                     "task-only cancellation has no exchange finalization"

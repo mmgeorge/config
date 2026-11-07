@@ -1655,7 +1655,9 @@ impl PlanFileStore {
             && let Some(prior) = crate::storage::SqliteStore::read_only(&self.root)?
                 .load_plan(&revision.document.plan_id)?
         {
-            self.journal_revision_locked(&prior, None, &revision.document, &revision.rendered)?;
+            measure(trace, "persist.journal_revision", || {
+                self.journal_revision_locked(&prior, None, &revision.document, &revision.rendered)
+            })?;
             return Ok(revision.into_parts());
         }
         let plan_directory = self.plan_dir(session_id, &revision.document.plan_id);
@@ -2721,18 +2723,18 @@ mod test {
             "Initial"
         );
         assert!(
-            crate::storage::state::directory(&temporary.path())
+            crate::storage::state::directory(temporary.path())
                 .join("plans/session/plan/revisions/submitted-0001.json")
                 .exists()
         );
         assert!(
-            crate::storage::state::directory(&temporary.path())
+            crate::storage::state::directory(temporary.path())
                 .join("plans/session/plan/revisions/submitted-0001.index.json")
                 .exists()
         );
         store.delete_session("session").unwrap();
         assert!(
-            !crate::storage::state::directory(&temporary.path())
+            !crate::storage::state::directory(temporary.path())
                 .join("plans/session")
                 .exists()
         );
@@ -2750,7 +2752,7 @@ mod test {
         store
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
-        let working_markdown_path = crate::storage::state::directory(&temporary.path())
+        let working_markdown_path = crate::storage::state::directory(temporary.path())
             .join("plans/session/plan/working.md");
         let submitted_markdown = fs::read_to_string(&working_markdown_path).unwrap();
 

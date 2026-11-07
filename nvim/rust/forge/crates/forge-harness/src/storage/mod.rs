@@ -1,4 +1,5 @@
 pub(crate) mod admission;
+mod agent_policy;
 mod archive;
 pub(crate) mod configuration;
 mod current;
@@ -7,6 +8,7 @@ pub(crate) mod inspection;
 pub(crate) mod lifecycle;
 pub(crate) mod model_pin;
 pub mod objects;
+mod observed_agent;
 mod ownership;
 mod preferences;
 mod question;
@@ -40,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-const SESSION_FORMAT_VERSION: u32 = 64;
+const SESSION_FORMAT_VERSION: u32 = 65;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
@@ -88,28 +90,6 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Returns the last resolved provider default in the same workspace and provider.
-    pub(crate) fn latest_resolved_default_model(
-        &self,
-        workspace: &str,
-        provider: &str,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT json_extract(payload,'$.session.resolved_model') FROM session_record \
-             WHERE workspace=?1 AND json_extract(payload,'$.format_version')=?2 \
-             AND COALESCE(json_extract(payload,'$.session.provider'),json_extract(payload,'$.session.backend'))=?3 \
-             AND json_extract(payload,'$.session.model')='default' \
-             AND json_type(payload,'$.session.resolved_model')='text' \
-             AND trim(json_extract(payload,'$.session.resolved_model'))<>'' \
-             ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1",
-                params![workspace, SESSION_FORMAT_VERSION, provider],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
     /// Keeps related observations on one committed SQLite snapshot while writers continue.
     pub(crate) fn read_snapshot<Value>(
         &self,
@@ -416,6 +396,7 @@ impl SqliteStore {
         agent: &Agent,
         task: &crate::agent::AgentTask,
         parent: &Exchange,
+        authorization: Option<&forge_provider_api::ExchangeId>,
     ) -> Result<()> {
         anyhow::ensure!(
             agent.session_id == task.session_id && parent.session_id == task.session_id,
@@ -438,6 +419,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        agent_policy::admit(&transaction, agent, task, authorization)?;
         let conflict: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE session_id=?1 AND id!=?2 AND json_extract(payload,'$.task_name')=?3)",
             params![agent.session_id, agent.id, agent.task_name], |row| row.get(0))?;
@@ -570,9 +552,9 @@ impl SqliteStore {
                 AND json_extract(provider_turn.value, '$.provider.turn_id')=?3 \
                 AND json_extract(provider_turn.value, '$.provider.scope.invocation_id')=?6 \
                 AND json_extract(provider_turn.value, '$.provider.scope.owner.session_id')=?7) LIMIT 1",
-                params![session_id, address.thread_id, address.turn_id.as_str(),
-                    address.scope.exchange_id.as_str(), address.scope.owner.agent_id.as_str(),
-                    address.scope.invocation_id.as_str(), address.scope.owner.session_id.as_str()],
+                params![session_id, address.thread_id.as_str(), address.turn_id.as_str(),
+                    address.scope.exchange_id.as_str(), address.scope.owner.agent_id().as_str(),
+                    address.scope.invocation_id.as_str(), address.scope.owner.session_id().as_str()],
             )?
             .pop())
     }
@@ -1113,10 +1095,24 @@ impl SqliteStore {
 
     /// Load child-agent runs in creation order for one Harness session.
     pub fn list_agent_run(&self, session_id: &str) -> Result<Vec<Agent>> {
-        self.list_payload(
-            "SELECT payload FROM agent_run_record WHERE session_id=?1 ORDER BY rowid",
-            [session_id],
-        )
+        let mut statement = self.connection.prepare(
+            "SELECT id,payload FROM agent_run_record WHERE session_id=?1 ORDER BY rowid",
+        )?;
+        statement
+            .query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (id, payload) = row?;
+                let agent: Agent = decode(&payload)?;
+                anyhow::ensure!(
+                    agent.id == id && agent.session_id == session_id,
+                    "stored child identity changes its persisted owner"
+                );
+                agent_policy::validate(&self.connection, &agent)?;
+                Ok(agent)
+            })
+            .collect()
     }
 
     /// Load exchanges in admission order for one child agent.
@@ -1300,6 +1296,10 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use forge_provider_api::{
+        InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion, ToolDescriptor,
+        ToolItemEvent,
+    };
 
     /// Reject unsupported contracts before changed fields decode while preserving new-session resume.
     #[test]
@@ -1413,96 +1413,77 @@ mod test {
     }
 
     #[test]
-    fn default_model_cache_is_scoped_and_ignores_explicit_or_incompatible_sessions() -> Result<()> {
+    fn configured_defaults_persist_without_inheriting_actual_turn_models() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let mut store = SqliteStore::open(temporary.path())?;
-        assert_eq!(
-            store.latest_resolved_default_model("D:/work", "fixture-beta")?,
-            None
-        );
-        for (ordinal, (id, workspace, provider, model, resolved)) in [
-            (
-                "older",
-                "D:/work",
-                "fixture-beta",
-                "default",
-                Some("older-default"),
-            ),
-            (
-                "latest",
-                "D:/work",
-                "fixture-beta",
-                "default",
-                Some("latest-default"),
-            ),
-            (
-                "explicit",
-                "D:/work",
-                "fixture-beta",
-                "chosen",
-                Some("chosen"),
-            ),
-            ("empty", "D:/work", "fixture-beta", "default", Some("")),
-            ("unresolved", "D:/work", "fixture-beta", "default", None),
-            (
-                "workspace",
-                "D:/elsewhere",
-                "fixture-beta",
-                "default",
-                Some("workspace-default"),
-            ),
-            (
-                "provider",
-                "D:/work",
-                "fixture-alpha",
-                "default",
-                Some("fixture-alpha-default"),
-            ),
-            (
-                "incompatible",
-                "D:/work",
-                "fixture-beta",
-                "default",
-                Some("obsolete"),
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut record = session(id, workspace);
-            record.provider = provider.into();
-            record.model = model.into();
-            record.resolved_model = resolved.map(str::to_owned);
-            record.updated_at_ms = ordinal as i64;
+        let preference = HarnessPreference {
+            access: Default::default(),
+            shell: Default::default(),
+            model: "default".into(),
+            effort: "medium".into(),
+            model_setting: Default::default(),
+            service_tier: crate::provider::ServiceTier::Standard,
+            plan_executor: Default::default(),
+            plan_compact: false,
+            approval_timeout: Default::default(),
+            tool_timeout: Default::default(),
+        };
+        store.save_preference("D:/work", "fixture-beta", &preference)?;
+        for (id, configured) in [
+            ("known", "default"),
+            ("unknown", "default"),
+            ("explicit", "chosen"),
+        ] {
+            let mut record = session(id, "D:/work");
+            record.model = configured.into();
             store.save_session(&record)?;
         }
-        store.connection.execute(
-            "UPDATE session_record SET payload=json_set(payload,'$.format_version',?1) WHERE id='incompatible'",
-            [SESSION_FORMAT_VERSION - 1],
-        )?;
+        let mut exchange = Exchange::agent_admission("known", 1, "inspect".into(), 1);
+        let address = crate::turn::test_support::address(&exchange, "native");
+        exchange.start_turn(address.clone(), 1)?;
+        let confirmed = forge_provider_api::ResolvedModel {
+            model_id: forge_provider_api::ModelId::new("actual-native-model")?,
+            observed_at_ms: 2,
+        };
+        let event = crate::provider::test_support::native_event(
+            crate::provider::EventScope::Invocation {
+                invocation: address.scope.clone(),
+            },
+            forge_provider_api::ProviderEvent::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event: forge_provider_api::TurnEvent::ModelResolved(confirmed.clone()),
+            },
+        );
+        exchange.observe_event(&event, 2)?;
+        store.save_exchange(&exchange)?;
         drop(store);
         let store = SqliteStore::open(temporary.path())?;
         assert_eq!(
             store
-                .latest_resolved_default_model("D:/work", "fixture-beta")?
-                .as_deref(),
-            Some("latest-default")
+                .load_preference("D:/work", "fixture-beta")?
+                .unwrap()
+                .model,
+            "default"
         );
-        assert_eq!(
+        assert!(store.load_preference("D:/work", "fixture-alpha")?.is_none());
+        assert!(
             store
-                .latest_resolved_default_model("D:/work", "fixture-alpha")?
-                .as_deref(),
-            Some("fixture-alpha-default")
+                .load_preference("D:/elsewhere", "fixture-beta")?
+                .is_none()
         );
+        let known = store.load_session("known")?.unwrap();
+        assert_eq!(known.model, "default");
+        assert!(known.resolved_model.is_none());
+        let unknown = store.load_session("unknown")?.unwrap();
+        assert_eq!(unknown.model, "default");
+        assert!(unknown.resolved_model.is_none());
+        let explicit = store.load_session("explicit")?.unwrap();
+        assert_eq!(explicit.model, "chosen");
+        assert!(explicit.resolved_model.is_none());
         assert_eq!(
-            store
-                .latest_resolved_default_model("D:/elsewhere", "fixture-beta")?
-                .as_deref(),
-            Some("workspace-default")
-        );
-        assert_eq!(
-            store.latest_resolved_default_model("D:/missing", "fixture-beta")?,
-            None
+            store.load_exchange(&exchange.id)?.unwrap().turn[0].resolved_model(),
+            Some(&confirmed)
         );
         Ok(())
     }
@@ -1542,7 +1523,7 @@ mod test {
             task_id: Some(task.id.clone()),
             created_at_ms: 1,
         });
-        store.admit_agent_task(&agent, &task, &parent)?;
+        store.admit_agent_task(&agent, &task, &parent, None)?;
         assert_eq!(store.list_agent_task("session")?.len(), 1);
         assert_eq!(store.list_agent_exchange(&agent.id)?.len(), 1);
         let other = Agent::pending("session", "different", "another task", 2);
@@ -1554,7 +1535,7 @@ mod test {
         invalid_parent.append_agent_task(&invalid_task)?;
         assert!(
             store
-                .admit_agent_task(&other, &invalid_task, &invalid_parent)
+                .admit_agent_task(&other, &invalid_task, &invalid_parent, None)
                 .is_err()
         );
         assert!(store.load_exchange("invalid-task")?.is_none());
@@ -1637,9 +1618,7 @@ mod test {
 
     #[test]
     fn streamed_output_reopens_and_commits_completion_atomically() -> Result<()> {
-        use crate::provider::{
-            ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-        };
+        use crate::provider::{ProviderEvent, TextUpdate, ToolOutcome};
         let directory = tempfile::tempdir()?;
         let mut store = SqliteStore::open(directory.path())?;
         store.save_session(&session("session", "D:/work"))?;
@@ -1656,34 +1635,42 @@ mod test {
             &mut exchange,
             &address,
             "call",
-            ToolInvocation {
+            ItemStart::CommandExecution(ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 name: "read".into(),
                 title: "read".into(),
-                arguments: serde_json::json!({}),
-            },
-            [ToolUpdate::Started],
+                arguments: InspectableArguments::new(serde_json::json!({})),
+            }),
+            [ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
+            }],
             2,
         )?;
-        let mut event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address,
-                tool_id: "call".into(),
-            },
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append(String::new()),
+        let mut event = ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: forge_provider_api::ItemId::new("call")?,
+            event: ItemEvent::Tool {
+                event: ToolItemEvent::Output(TextUpdate::Append(String::new())),
             },
         };
-        exchange.observe_turn(&event, 2)?;
+        exchange.observe_provider_event(
+            &exchange.turn[0].provider().scope.clone().into(),
+            &event,
+            2,
+        )?;
         store.save_exchange(&exchange)?;
         for chunk in ["\u{1b}[31", "mλ\r\n", "tail"] {
-            if let ProviderEvent::Tool { update, .. } = &mut event {
-                *update = ToolUpdate::Output {
-                    update: TextUpdate::Append(chunk.into()),
+            if let ProviderEvent::Item { event: update, .. } = &mut event {
+                *update = ItemEvent::Tool {
+                    event: ToolItemEvent::Output(TextUpdate::Append(chunk.into())),
                 };
             }
-            exchange.observe_turn(&event, 3)?;
+            exchange.observe_provider_event(
+                &exchange.turn[0].provider().scope.clone().into(),
+                &event,
+                3,
+            )?;
             store.save_tool_output_delta(&exchange, &event)?;
         }
         let expected = "\u{1b}[31mλ\r\ntail";
@@ -1724,18 +1711,29 @@ mod test {
                 .output,
             expected
         );
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Output {
-                update: TextUpdate::Replace("authoritative λ\n".into()),
+        if let ProviderEvent::Item { event: update, .. } = &mut event {
+            *update = ItemEvent::Tool {
+                event: ToolItemEvent::Output(TextUpdate::Replace("authoritative λ\n".into())),
             };
         }
-        exchange.observe_turn(&event, 4)?;
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Finished {
+        exchange.observe_provider_event(
+            &exchange.turn[0].provider().scope.clone().into(),
+            &event,
+            4,
+        )?;
+        if let ProviderEvent::Item { event: update, .. } = &mut event {
+            *update = ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
                 outcome: ToolOutcome::Succeeded,
-            };
+                descriptor: None,
+                output: None,
+                changes: Default::default(),
+            }));
         }
-        exchange.observe_turn(&event, 4)?;
+        exchange.observe_provider_event(
+            &exchange.turn[0].provider().scope.clone().into(),
+            &event,
+            4,
+        )?;
         store.connection.execute_batch("CREATE TRIGGER reject_chunk BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'storage failure'); END;")?;
         assert!(store.save_exchange(&exchange).is_err());
         let recovered = store.list_exchange("session")?;
@@ -1970,6 +1968,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 10,
@@ -2067,6 +2066,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 3,

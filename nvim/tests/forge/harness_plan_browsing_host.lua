@@ -10,6 +10,7 @@ client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local errors = {}
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local function request(method, params, rejected)
   local result, failure, done
@@ -22,11 +23,11 @@ local function submit_plan(title, previous)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan " .. title })
   controller.submit()
   assert(vim.wait(15000, function()
-    return #errors > 0 or not state.busy and not state.task_operation and state.active_plan
+    return #errors > 0 or not require("forge.views.harness.activity").busy(state) and not state.task_operation and state.active_plan
       and state.active_plan.id ~= previous and state.active_plan.state == "awaiting_review"
   end, 10), "planning did not settle")
   assert(#errors == 0, table.concat(errors, "\n"))
-  return request("session.state.get", {})
+  return state_snapshot.get()
 end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
@@ -38,17 +39,15 @@ local success, failure = xpcall(function()
   local selected = second.session.active_task.revision
   for _, params in ipairs({ { plan_id = first.active_plan.id }, { plan_id = first.active_plan.id, revision = 1 } }) do
     assert(request("session.plan.get", params).id == first.active_plan.id)
-    local observed = request("session.state.get", {})
+    local observed = state_snapshot.get()
     assert(observed.session.active_task.revision == selected and observed.active_plan.id == second.active_plan.id,
       "viewing the earlier plan changed workflow ownership")
   end
   request("session.preview", { session_id = "missing-session" }, true)
   request("session.plan.get", { plan_id = "missing-plan" }, true)
-  local observed = request("session.state.get", {})
+  local observed = state_snapshot.get()
   assert(observed.session.active_task.revision == selected and observed.active_plan.id == second.active_plan.id)
-  for _, task in ipairs(observed.task) do
-    if task.id == selected then assert(task.status == "waiting", "failed lookup changed task status") end
-  end
+  assert(observed.session.active_task.status == "waiting", "failed lookup changed task status")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

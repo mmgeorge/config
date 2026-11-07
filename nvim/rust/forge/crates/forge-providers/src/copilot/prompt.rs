@@ -1,12 +1,11 @@
 use super::event_decoder::CopilotEventDecoder;
 use super::turn::{CopilotTurnEvent, CopilotTurnEventGuard};
-use super::{rejection, retry};
 use forge_provider_api::completion::ProviderCompletion;
 use forge_provider_api::input::{MessageInput, PromptInput};
 use forge_provider_api::submission::InputReceipt;
 use forge_provider_api::turn_control::TurnControl;
 use forge_provider_api::{
-    ProviderCapability, ProviderError, ProviderEvent, ProviderEventSink, ProviderRuntime,
+    ProviderCapability, ProviderError, ProviderRuntime,
     error::{ProviderFailure, ProviderFailureKind, ProviderOperation},
 };
 use github_copilot_sdk::rpc::{CommandsInvokeRequest, SlashCommandInvocationResult};
@@ -35,29 +34,49 @@ pub struct TurnOptions {
     pub accepted: Option<tokio::sync::oneshot::Sender<std::result::Result<(), ProviderError>>>,
 }
 
-pub struct TurnResult {
-    #[cfg(test)]
-    pub completion: ProviderCompletion,
-}
-
 pub async fn run(
     session: &Arc<super::handle::CopilotSession>,
-    turn_event: &CopilotTurnEvent,
     turn_event_guard: &CopilotTurnEventGuard<'_>,
+    native_start: &forge_provider_api::NativeTurnStart,
     mut options: TurnOptions,
-    sink: &ProviderEventSink,
+    owner_sink: &forge_provider_api::ProviderEventSink,
     control: &dyn TurnControl,
-    native_callbacks: &dyn super::provider::NativeCallbackRouter,
-) -> Result<TurnResult, ProviderError> {
+    native_callbacks: Arc<dyn super::provider::NativeCallbackRouter>,
+) -> Result<forge_provider_api::TurnResult, ProviderError> {
+    let writer = owner_sink.activity_writer();
+    let sink = &writer;
+    let turn_event = turn_event_guard.events();
+    match (&options.submission_id, &options.receipt) {
+        (Some(submission), Some(receipt)) if submission == receipt.id() => {
+            let coverage = options
+                .recovered
+                .iter()
+                .map(|input| input.covered_input.clone())
+                .chain(std::iter::once(forge_provider_api::CoveredInput::new(
+                    submission.clone(),
+                    receipt.attempt_id()?,
+                )))
+                .collect();
+            normalize_internal(
+                turn_event.register_combined_inputs(&options.scope, submission, coverage),
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::WrongInvocation,
+            )?;
+        }
+        (None, None) => {}
+        (Some(_), Some(_) | None) | (None, Some(_)) => {
+            return Err(native_failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::WrongInvocation,
+            ));
+        }
+    }
     session.ensure_healthy()?;
     let owned_session = session;
     let session = &session.inner;
     let output = ProviderCompletion {
         provider_session_id: Some(session.id().to_string().try_into().map_err(|_| {
-            native_failure(
-                ProviderOperation::SessionOpen,
-                ProviderFailureKind::Protocol,
-            )
+            native_failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
         })?),
         capability: options.capability,
         runtime: ProviderRuntime {
@@ -67,7 +86,9 @@ pub async fn run(
         ..Default::default()
     };
     let decoder =
-        CopilotEventDecoder::new(sink.invocation_scope()?.clone(), options.workspace.clone());
+        CopilotEventDecoder::new(sink.invocation_scope()?.clone(), options.workspace.clone())
+            .with_callbacks(native_callbacks)
+            .with_turn_owner(owner_sink.clone());
     let retained_context = Arc::new(tokio::sync::Mutex::new(super::intake::TurnContext {
         decoder,
         output,
@@ -87,10 +108,7 @@ pub async fn run(
         .read_sql_todos_with_dependencies()
         .await
         .map_err(|_| {
-            native_failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Transport,
-            )
+            native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
         })?;
     let initial_task_data = serde_json::to_value(initial_task_snapshot).unwrap_or(Value::Null);
     if initial_task_data
@@ -148,7 +166,7 @@ pub async fn run(
                             options.scope.owner.clone(),
                             options.submission_id.clone().ok_or_else(|| {
                                 native_failure(
-                                    ProviderOperation::InputSubmit,
+                                    ProviderOperation::TurnStart,
                                     ProviderFailureKind::Rejected,
                                 )
                             })?,
@@ -173,7 +191,7 @@ pub async fn run(
                         .record_accepted(Some(accepted_recovery_token(
                             options.submission_id.clone().ok_or_else(|| {
                                 native_failure(
-                                    ProviderOperation::InputSubmit,
+                                    ProviderOperation::TurnStart,
                                     ProviderFailureKind::Rejected,
                                 )
                             })?,
@@ -190,35 +208,45 @@ pub async fn run(
         )
         .await;
     if let Err(error) = sending {
-        let acceptance_error = error
-            .downcast_ref::<ProviderError>()
-            .and_then(|error| match error {
-                ProviderError::NotConsumed => Some(ProviderError::NotConsumed),
-                ProviderError::Failure(failure)
-                    if failure.phase() == forge_provider_api::ProviderPhase::Admission
-                        && failure.disposition()
-                            == forge_provider_api::FailureDisposition::Unchanged =>
-                {
-                    Some(error.clone())
-                }
-                ProviderError::Contract(_)
-                | ProviderError::Failure(_)
-                | ProviderError::Combined { .. }
-                | ProviderError::Cleanup(_)
-                | ProviderError::Unsupported(_)
-                | ProviderError::Observation(_)
-                | ProviderError::RuntimeVersion(_)
-                | ProviderError::PreparationFailed(_)
-                | ProviderError::PreparationCleanup { .. }
-                | ProviderError::DeliveryUncertain
-                | ProviderError::Cancelled
-                | ProviderError::Retryable(_)
-                | ProviderError::Delivery(_) => None,
-            })
-            .unwrap_or(ProviderError::DeliveryUncertain);
+        let acceptance_error =
+            if super::operation::current().is_some_and(|operation| !operation.dispatched()) {
+                error
+                    .downcast_ref::<ProviderError>()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown)
+                    })
+            } else {
+                error
+                    .downcast_ref::<ProviderError>()
+                    .and_then(|error| match error {
+                        ProviderError::NotConsumed => Some(ProviderError::NotConsumed),
+                        ProviderError::Failure(failure)
+                            if failure.phase() == forge_provider_api::ProviderPhase::Admission
+                                && failure.disposition()
+                                    == forge_provider_api::FailureDisposition::Unchanged =>
+                        {
+                            Some(error.clone())
+                        }
+                        ProviderError::Contract(_)
+                        | ProviderError::Failure(_)
+                        | ProviderError::Combined { .. }
+                        | ProviderError::Cleanup(_)
+                        | ProviderError::Unsupported(_)
+                        | ProviderError::Observation(_)
+                        | ProviderError::RuntimeVersion(_)
+                        | ProviderError::PreparationFailed(_)
+                        | ProviderError::PreparationCleanup { .. }
+                        | ProviderError::DeliveryUncertain
+                        | ProviderError::Cancelled
+                        | ProviderError::Retryable(_)
+                        | ProviderError::Delivery(_) => None,
+                    })
+                    .unwrap_or(ProviderError::DeliveryUncertain)
+            };
         let acceptance_error =
             if super::operation::current().is_some_and(|operation| operation.dispatched()) {
-                super::error::after_input_dispatch(acceptance_error, ProviderOperation::InputSubmit)
+                super::error::after_input_dispatch(acceptance_error, ProviderOperation::TurnStart)
             } else {
                 acceptance_error
             };
@@ -240,27 +268,18 @@ pub async fn run(
     }
     let mut tool_names = std::collections::HashMap::new();
     let mut execution_turn_stopped = false;
-    let mut foreground_emitted = false;
-    let mut transient_failure: Option<(
-        forge_provider_api::TurnAddress,
-        forge_provider_api::retry::RetryCategory,
-    )> = None;
-    let mut rejection = rejection::RejectionState::default();
     let mut provider_aborted = false;
     let processing: std::result::Result<super::turn::IdleOutcome, ProviderError> = async {
         loop {
             tokio::select! {
                 settled = turn_event.idle_settled() => {
-                    normalize_internal(settled, ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)?;
-                    return normalize_internal(turn_event.terminal_outcome(), ProviderOperation::InputSubmit, ProviderFailureKind::Protocol);
+                    normalize_internal(settled, ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
+                    return normalize_internal(turn_event.terminal_outcome(), ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
                 },
                 provider_event = subscription.recv() => {
-                    let provider_event = provider_event.map_err(|_| native_failure(ProviderOperation::SessionClose, ProviderFailureKind::Transport))?;
-                    if let Some(call_id) = provider_event.data.get("toolCallId").and_then(Value::as_str) {
-                        native_callbacks.bind_native_call(call_id, &options.scope).await;
-                    }
-                    normalize_internal(turn_event.observe(&provider_event), ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)?;
-                    rejection.observe(&provider_event);
+                    let provider_event = provider_event.map_err(|_| native_failure(ProviderOperation::ThreadClose, ProviderFailureKind::Transport))?;
+                    let observed_at_ms = subscription.observed_at(&provider_event);
+                    normalize_internal(turn_event.observe(&provider_event), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
                     if provider_event.agent_id.is_none()
                         && provider_event.event_type == "assistant.idle"
                     {
@@ -271,7 +290,7 @@ pub async fn run(
                         if decoder.root_address().is_none() && !aborted {
                             continue;
                         }
-                        decoder.decode(&provider_event, output, sink).await?;
+                        decoder.decode_at(&provider_event, observed_at_ms, output, sink).await?;
                         output.provider_checkpoint_id = if provider_event.ephemeral == Some(true) {
                             provider_event.parent_id.clone()
                         } else {
@@ -280,7 +299,7 @@ pub async fn run(
                         let outcome = if execution_turn_stopped { super::turn::IdleOutcome::HostHandoff }
                             else if aborted { super::turn::IdleOutcome::Aborted }
                             else { super::turn::IdleOutcome::Completed };
-                        normalize_internal(turn_event.observe_idle_at(&provider_event, outcome), ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)?;
+                        normalize_internal(turn_event.observe_idle_timestamp(&provider_event, outcome, observed_at_ms), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
                         continue;
                     }
                     if provider_event.event_type == "session.todos_changed" {
@@ -289,7 +308,7 @@ pub async fn run(
                             .plan()
                             .read_sql_todos_with_dependencies()
                             .await
-                            .map_err(|_| native_failure(ProviderOperation::InputSubmit, ProviderFailureKind::Transport))?;
+                            .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))?;
                         decoder.publish_task_snapshot(
                             serde_json::to_value(task_snapshot).unwrap_or(Value::Null),
                             provider_event
@@ -301,32 +320,14 @@ pub async fn run(
                         ).await?;
                         continue;
                     }
-                    let terminal_error = provider_event.event_type == "session.error"
-                        && !provider_event.is_transient_error();
                     if matches!(provider_event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
-                        && options.background_compaction_observed {
+                        && options.background_compaction_observed && provider_event.agent_id.is_none() {
                         continue;
                     }
-                    if terminal_error
-                        && let Some(category) = retry::transient_category(&provider_event.data)
-                        && provider_event.agent_id.is_none()
-                        && decoder.replay_safe()
-                        && (native_replay_safe(output) && control.status(&options.scope).await?.replay_safe)
-                        && let Some(address) = decoder.root_address()
-                    {
-                        transient_failure = Some((address, category));
-                        continue;
+                    if provider_event.agent_id.is_none() && provider_event.event_type == "assistant.turn_start" {
+                        native_start.observed(observed_at_ms).await?;
                     }
-                    decoder.decode(&provider_event, output, sink).await?;
-                    if !foreground_emitted
-                        && let (Some((_, event_id)), Some(root)) = (normalize_internal(turn_event.foreground_anchor(), ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)?, decoder.root_address()) {
-                            let address = forge_provider_api::TurnAddress { turn_id: event_id.into(), ..root };
-                            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                                address.scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
-                            )?;
-                            sink.send_wait(forge_provider_api::ProviderEvent::Execution { observation }).await?;
-                            foreground_emitted = true;
-                    }
+                    decoder.decode_at(&provider_event, observed_at_ms, output, sink).await?;
                     if provider_event.agent_id.is_none() && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
                         if provider_event.event_type == "tool.execution_start"
@@ -335,19 +336,13 @@ pub async fn run(
                         }
                         if provider_event.event_type == "tool.execution_complete" {
                             let name = call_id.and_then(|id| tool_names.remove(id));
-                            if let Some(call_id) = call_id {
-                                native_callbacks.release_native_call(call_id).await;
-                            }
                         if control.tool_finished(&options.scope, name.as_deref()) {
-                                session.abort().await.map_err(|_| native_failure(ProviderOperation::Cancel, ProviderFailureKind::Transport))?;
+                                session.abort().await.map_err(|_| native_failure(ProviderOperation::TurnInterrupt, ProviderFailureKind::Transport))?;
                                 execution_turn_stopped = true;
                             }
                         }
                     }
-                    if terminal_error {
-                        decoder.finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink).await?;
-                        return Err(native_failure(ProviderOperation::InputSubmit, super::error::session_failure_kind(&provider_event.data)));
-                    }
+
                 }
                 result = control.receive(&options.scope) => { result?; }
 
@@ -355,95 +350,21 @@ pub async fn run(
         }
         }.await;
     let native_cancelled = matches!(processing, Ok(super::turn::IdleOutcome::Aborted));
-    let host_status = control.status(&options.scope).await?;
     if let Err(error) = processing {
-        let outcome = if matches!(error, ProviderError::Cancelled) {
-            forge_provider_api::turn::TurnOutcome::Cancelled
-        } else {
-            forge_provider_api::turn::TurnOutcome::Failed
-        };
-        decoder.finish_failure(outcome, sink).await?;
-        publish_observation_lost(sink, output).await?;
+        decoder.interrupt_content(sink).await?;
         return Err(super::error::after_input_dispatch(
             error,
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
         ));
     }
     subscription.ensure_healthy()?;
-    if let Some((address, category)) = transient_failure {
-        decoder
-            .finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink)
-            .await?;
-        publish_terminal_executions(
-            session.id().as_ref(),
-            turn_event,
-            sink,
-            output,
-            TerminalPublication::Retryable {
-                address: address.clone(),
-                category,
-            },
-        )
-        .await?;
-        return Err(ProviderError::Retryable(Box::new(
-            forge_provider_api::retry::RetryableFailure {
-                address,
-                category,
-                retry_after: None,
-            },
-        )));
-    }
-    if native_cancelled || host_status.cancelled {
-        decoder
-            .finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink)
-            .await?;
-        publish_terminal_executions(
-            session.id().as_ref(),
-            turn_event,
-            sink,
-            output,
-            TerminalPublication::Settled,
-        )
-        .await?;
+    if native_cancelled && decoder.root_address().is_none() {
         return Err(ProviderError::Cancelled);
     }
-    if !execution_turn_stopped && rejection.finish(host_status.control_handoff).is_err() {
-        decoder
-            .finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink)
-            .await?;
-        return Err(native_failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Rejected,
-        ));
-    }
-    if host_status.error.is_some() {
-        decoder
-            .finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink)
-            .await?;
-        return Err(native_failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Rejected,
-        ));
-    }
-    if execution_turn_stopped {
-        decoder
-            .finish_failure(forge_provider_api::turn::TurnOutcome::Interrupted, sink)
-            .await?;
-    } else {
-        decoder.finish_success(sink).await?;
-    }
-    publish_terminal_executions(
-        session.id().as_ref(),
-        turn_event,
-        sink,
-        output,
-        TerminalPublication::Settled,
-    )
-    .await?;
-    Ok(TurnResult {
-        #[cfg(test)]
-        completion: output.clone(),
-    })
+    let native = normalized_result(turn_event, output)?;
+    decoder.finish_native(native.outcome(), sink).await?;
+    drop(active_context);
+    Ok(native)
 }
 
 fn with_attachment_context(
@@ -467,166 +388,50 @@ fn with_attachment_context(
     prompt
 }
 
-/// Distinguish a collected foreground from one whose required host publication failed.
-#[derive(Clone)]
-enum TerminalPublication {
-    Settled,
-    Retryable {
-        address: forge_provider_api::TurnAddress,
-        category: forge_provider_api::retry::RetryCategory,
-    },
-}
-
-/// Publish every consumed execution's start before any terminal can settle the invocation.
-async fn publish_terminal_executions(
-    thread_id: &str,
+/// Freeze the retained native idle outcome and its exact accepted input attempts once.
+fn normalized_result(
     turn_event: &CopilotTurnEvent,
-    sink: &ProviderEventSink,
     completion: &ProviderCompletion,
-    publication: TerminalPublication,
-) -> Result<(), ProviderError> {
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
-
-    normalize_internal(
-        turn_event.retain_completion(completion),
-        ProviderOperation::InputSubmit,
-        ProviderFailureKind::Protocol,
-    )?;
-    let scope = sink.invocation_scope()?.clone();
-    let completed_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
-    let mut executions = normalize_internal(
-        turn_event.terminal_executions(),
-        ProviderOperation::InputSubmit,
-        ProviderFailureKind::Protocol,
-    )?;
-    if let TerminalPublication::Retryable { address, .. } = &publication {
-        let index = executions
-            .iter()
-            .position(|(event, _, _)| {
-                address.scope == scope
-                    && address.thread_id == thread_id
-                    && address.turn_id.as_str() == event
-            })
-            .ok_or_else(|| {
-                native_failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
-        // Publish retry eligibility last, after every other consumed execution is settled.
-        let retry = executions.remove(index);
-        executions.push(retry);
-    }
-
-    // Register steering's distinct native execution before the first input's terminal is visible.
-    // Repeating the already-published foreground start preserves the same immutable identity.
-    for (native_event, _, _) in &executions {
-        let observation = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Started {
-                address: forge_provider_api::TurnAddress {
-                    scope: scope.clone(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: native_event.clone().into(),
-                },
-            },
-        )?;
-        sink.send_wait(ProviderEvent::Execution { observation })
-            .await?;
-    }
-    for (native_event, covered_submissions, result) in executions {
-        let address = forge_provider_api::TurnAddress {
-            scope: scope.clone(),
-            thread_id: thread_id.to_owned(),
-            turn_id: native_event.into(),
-        };
-        let result = match result {
-            ExecutionResult::Completed { .. } => ExecutionResult::Completed {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Cancelled { .. } => ExecutionResult::Cancelled {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Failed { failure, .. } => ExecutionResult::Failed {
-                completion: completion.clone().into(),
-                failure,
-            },
-        };
-        let result = match &publication {
-            TerminalPublication::Retryable {
-                address: retry,
-                category,
-            } if retry == &address => ExecutionResult::Failed {
-                completion: completion.clone().into(),
-                failure: forge_provider_api::lifecycle::ExecutionFailure::Retryable {
-                    address: address.clone(),
-                    category: *category,
-                    retry_after: None,
-                },
-            },
-            TerminalPublication::Settled | TerminalPublication::Retryable { .. } => result,
-        };
-        let update = ExecutionUpdate::Finished {
-            address,
-            covered_submissions,
-            completed_at_ms,
-            result,
-        };
-        let observation = ExecutionObservation::new(scope.clone(), update)?;
-        sink.send_wait(ProviderEvent::Execution { observation })
-            .await?;
-    }
-    if let Some(covered_submissions) = normalize_internal(
-        turn_event.cancelled_without_execution(),
-        ProviderOperation::InputSubmit,
+) -> Result<forge_provider_api::TurnResult, ProviderError> {
+    let outcome = match normalize_internal(
+        turn_event.terminal_outcome(),
+        ProviderOperation::TurnStart,
         ProviderFailureKind::Protocol,
     )? {
-        let result = ExecutionResult::Cancelled {
-            completion: completion.clone().into(),
-        };
-        let update = ExecutionUpdate::ResolvedWithoutExecution {
-            covered_submissions,
-            completed_at_ms,
-            result,
-        };
-        sink.send_wait(ProviderEvent::Execution {
-            observation: ExecutionObservation::new(scope, update)?,
-        })
-        .await?;
-    }
-    Ok(())
-}
-/// Report lost terminal observation without turning an operation error into native success.
-async fn publish_observation_lost(
-    sink: &ProviderEventSink,
-    completion: &ProviderCompletion,
-) -> Result<(), ProviderError> {
-    let scope = sink.invocation_scope()?.clone();
-    let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-        scope,
-        forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
-            failure: forge_provider_api::lifecycle::ObservationFailure::Protocol,
-            completion: Some(completion.clone().into()),
+        super::turn::IdleOutcome::Completed => forge_provider_api::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
         },
+        super::turn::IdleOutcome::Aborted | super::turn::IdleOutcome::HostHandoff => {
+            forge_provider_api::turn::TurnOutcome::Interrupted
+        }
+    };
+    let inputs = normalize_internal(
+        turn_event.covered_inputs(),
+        ProviderOperation::TurnStart,
+        ProviderFailureKind::Protocol,
     )?;
-    sink.send_wait(ProviderEvent::Execution { observation })
-        .await?;
-    Ok(())
+    let checkpoint = completion
+        .provider_checkpoint_id
+        .clone()
+        .map(forge_provider_api::CheckpointId::new)
+        .transpose()
+        .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+    let completed_at_ms = normalize_internal(
+        turn_event.completed_at_ms(),
+        ProviderOperation::TurnStart,
+        ProviderFailureKind::Protocol,
+    )?;
+    forge_provider_api::TurnResult::new(
+        outcome,
+        completed_at_ms,
+        None,
+        inputs,
+        Vec::new(),
+        checkpoint,
+    )
+    .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
 }
 
-fn native_replay_safe(output: &ProviderCompletion) -> bool {
-    !output.evidence.tool_called
-        && !output.evidence.workspace_changed
-        && !output.evidence.structured_complete
-        && !output.evidence.structured_blocked
-}
-
-/// Convert one classified SDK failure into the normalized provider error contract.
 fn native_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
@@ -638,7 +443,7 @@ pub(super) enum NativeRecoveryEvidence {
         version: u8,
         submission_id: forge_provider_api::SubmissionId,
         attempt_id: forge_provider_api::DeliveryAttemptId,
-        owner: forge_provider_api::ExecutionOwner,
+        owner: forge_provider_api::ThreadOwner,
         workspace: String,
         session_id: String,
         cursor: String,
@@ -649,7 +454,7 @@ pub(super) enum NativeRecoveryEvidence {
         version: u8,
         submission_id: forge_provider_api::SubmissionId,
         attempt_id: forge_provider_api::DeliveryAttemptId,
-        owner: forge_provider_api::ExecutionOwner,
+        owner: forge_provider_api::ThreadOwner,
         session_id: String,
         message_id: String,
     },
@@ -663,7 +468,7 @@ pub(super) struct NativeDeliveryBoundary {
 }
 
 pub(super) fn sending_recovery_token(
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     submission_id: forge_provider_api::SubmissionId,
     attempt_id: forge_provider_api::DeliveryAttemptId,
     boundary: NativeDeliveryBoundary,
@@ -691,7 +496,7 @@ pub(super) fn sending_recovery_token(
 pub(super) fn accepted_recovery_token(
     submission_id: forge_provider_api::SubmissionId,
     attempt_id: forge_provider_api::DeliveryAttemptId,
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     session_id: String,
     message_id: String,
 ) -> Result<forge_provider_api::RecoveryToken, ProviderError> {
@@ -719,18 +524,10 @@ pub(super) fn decode_recovery_token(
 fn recovery_token(
     evidence: NativeRecoveryEvidence,
 ) -> Result<forge_provider_api::RecoveryToken, ProviderError> {
-    let bytes = serde_json::to_vec(&evidence).map_err(|_| {
-        native_failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
-        )
-    })?;
-    forge_provider_api::RecoveryToken::new(bytes).map_err(|_| {
-        native_failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
-        )
-    })
+    let bytes = serde_json::to_vec(&evidence)
+        .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+    forge_provider_api::RecoveryToken::new(bytes)
+        .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
 }
 
 async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<String, ProviderError> {
@@ -743,17 +540,14 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
                 .list()
                 .await
                 .map_err(|_| {
-                    native_failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Protocol,
-                    )
+                    native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
                 })?
                 .skills
                 .into_iter()
                 .any(|skill| skill.name == *name && skill.enabled && skill.user_invocable);
             if !skill_available {
                 return Err(native_failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -767,15 +561,12 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
                 })
                 .await
                 .map_err(|_| {
-                    native_failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Rejected,
-                    )
+                    native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
                 })? {
                 SlashCommandInvocationResult::AgentPrompt(result) => result.prompt,
                 _ => {
                     return Err(native_failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::Protocol,
                     ));
                 }
@@ -824,140 +615,115 @@ mod tests {
 
     /// Register steering's separate execution before publishing either input's terminal coverage.
     #[tokio::test]
-    async fn steering_terminals_follow_all_matching_starts() -> anyhow::Result<()> {
-        use forge_provider_api::lifecycle::ExecutionUpdate;
-        let turn = CopilotTurnEvent::default();
-        let guard = turn.activate(None, None)?;
-        let first = forge_provider_api::SubmissionId::try_from("first".to_owned())?;
-        let second = forge_provider_api::SubmissionId::try_from("second".to_owned())?;
-        guard
-            .send("cursor".into(), Some(first.clone()), async {
-                Ok("receipt-first".into())
-            })
-            .await?;
-        turn.steer(Some(second.clone()), async { Ok("receipt-second".into()) })
-            .await?;
-        for (id, kind, data) in [
-            (
-                "user-first",
-                "user.message",
-                serde_json::json!({"messageId":"receipt-first","turnId":"0"}),
-            ),
-            (
-                "start-first",
-                "assistant.turn_start",
-                serde_json::json!({"turnId":"0"}),
-            ),
-            (
-                "end-first",
-                "assistant.turn_end",
-                serde_json::json!({"turnId":"0"}),
-            ),
-            (
-                "start-second",
-                "assistant.turn_start",
-                serde_json::json!({"turnId":"1"}),
-            ),
-            (
-                "user-second",
-                "user.message",
-                serde_json::json!({"messageId":"receipt-second","turnId":"1"}),
-            ),
-            (
-                "end-second",
-                "assistant.turn_end",
-                serde_json::json!({"turnId":"1"}),
-            ),
+    async fn one_collected_turn_covers_all_native_model_calls_and_inputs() -> anyhow::Result<()> {
+        for idle_outcome in [
+            super::super::turn::IdleOutcome::Completed,
+            super::super::turn::IdleOutcome::Aborted,
+            super::super::turn::IdleOutcome::HostHandoff,
         ] {
-            turn.observe(&serde_json::from_value(serde_json::json!({"id":id,"type":kind,"timestamp":"2026-11-03T00:00:00Z","data":data}))?)?;
-        }
-        let idle = serde_json::from_value(
-            serde_json::json!({"id":"idle","type":"session.idle","timestamp":"2026-11-03T00:00:00Z","data":{}}),
-        )?;
-        turn.observe(&idle)?;
-        turn.observe_idle_at(&idle, super::super::turn::IdleOutcome::Completed)?;
-        let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("session"),
-            "invocation",
-        );
-        for publication in [
-            TerminalPublication::Settled,
-            TerminalPublication::Retryable {
-                address: forge_provider_api::TurnAddress {
-                    scope: scope.clone(),
-                    thread_id: "thread".into(),
-                    turn_id: "start-first".into(),
-                },
-                category: forge_provider_api::retry::RetryCategory::TemporaryTransport,
-            },
-        ] {
-            let retrying = matches!(publication, TerminalPublication::Retryable { .. });
-            let (sink, mut stream) = forge_provider_api::events::channel(
-                forge_provider_api::BindingId::new("binding")?,
+            let scope = forge_provider_api::InvocationScope::new(
+                forge_provider_api::ThreadOwner::root("session"),
+                "invocation",
+            );
+            let (authority, _activity) = forge_provider_api::events::channel(
+                forge_provider_api::BindingId::new("authority")?,
                 scope.clone(),
             );
-            publish_terminal_executions(
-                "thread",
-                &turn,
-                &sink,
-                &ProviderCompletion::default(),
-                publication,
-            )
-            .await?;
-            let mut starts = std::collections::HashSet::new();
-            let mut covered = std::collections::HashSet::new();
-            for index in 0..4 {
-                let event = stream.recv().await?.unwrap();
-                let ProviderEvent::Execution { observation } = event.event else {
-                    panic!("expected execution observation")
-                };
-                match observation.update() {
-                    ExecutionUpdate::Started { address } => {
-                        assert!(
-                            index < 2,
-                            "all executions must be admitted before terminal settlement"
-                        );
-                        starts.insert(address.turn_id.clone());
-                    }
-                    ExecutionUpdate::Finished {
-                        address,
-                        covered_submissions,
-                        result,
-                        ..
-                    }
-                    | ExecutionUpdate::PublicationFailed {
-                        address,
-                        covered_submissions,
-                        result,
-                        ..
-                    } => {
-                        assert!(starts.contains(&address.turn_id));
-                        covered.extend(covered_submissions.iter().cloned());
-                        assert_eq!(
-                            matches!(result, forge_provider_api::ExecutionResult::Failed { .. }),
-                            retrying && index == 3
-                        );
-                        if retrying && index == 3 {
-                            assert_eq!(address.turn_id.as_str(), "start-first");
-                        }
-                    }
-                    other => panic!("unexpected terminal sequence: {other:?}"),
-                }
-            }
-            assert_eq!(starts.len(), 2);
-            assert_eq!(
-                covered,
-                std::collections::HashSet::from([first.clone(), second.clone()])
+            let turn = CopilotTurnEvent::default();
+            let guard = turn.activate(Some(authority), None)?;
+            let first = forge_provider_api::SubmissionId::try_from("first".to_owned())?;
+            let second = forge_provider_api::SubmissionId::try_from("second".to_owned())?;
+            let first_input = forge_provider_api::CoveredInput::new(
+                first.clone(),
+                forge_provider_api::DeliveryAttemptId::new("first-attempt")?,
             );
+            let second_input = forge_provider_api::CoveredInput::new(
+                second.clone(),
+                forge_provider_api::DeliveryAttemptId::new("second-attempt")?,
+            );
+            let recovered = forge_provider_api::CoveredInput::new(
+                "recovered".try_into()?,
+                forge_provider_api::DeliveryAttemptId::new("recovered-attempt")?,
+            );
+            turn.register_combined_inputs(
+                &scope,
+                &first,
+                vec![recovered.clone(), first_input.clone()],
+            )?;
+            turn.register_input(&scope, second_input.clone())?;
+            guard
+                .send("cursor".into(), Some(first.clone()), async {
+                    Ok("receipt-first".into())
+                })
+                .await?;
+            turn.steer(Some(second.clone()), async { Ok("receipt-second".into()) })
+                .await?;
+            for (id, kind, data) in [
+                (
+                    "user-first",
+                    "user.message",
+                    serde_json::json!({"messageId":"receipt-first","turnId":"0"}),
+                ),
+                (
+                    "start-first",
+                    "assistant.turn_start",
+                    serde_json::json!({"turnId":"0"}),
+                ),
+                (
+                    "end-first",
+                    "assistant.turn_end",
+                    serde_json::json!({"turnId":"0"}),
+                ),
+                (
+                    "start-second",
+                    "assistant.turn_start",
+                    serde_json::json!({"turnId":"1"}),
+                ),
+                (
+                    "user-second",
+                    "user.message",
+                    serde_json::json!({"messageId":"receipt-second","turnId":"1"}),
+                ),
+                (
+                    "end-second",
+                    "assistant.turn_end",
+                    serde_json::json!({"turnId":"1"}),
+                ),
+            ] {
+                turn.observe(&serde_json::from_value(serde_json::json!({"id":id,"type":kind,"timestamp":"2026-11-03T00:00:00Z","data":data}))?)?;
+            }
+            let idle = serde_json::from_value(
+                serde_json::json!({"id":"idle","type":"session.idle","timestamp":"2026-11-03T00:00:00Z","data":{}}),
+            )?;
+            turn.observe(&idle)?;
+            turn.observe_idle_at(&idle, idle_outcome)?;
+            let native = normalized_result(&turn, &ProviderCompletion::default())?;
+            assert_eq!(native.covered_inputs().len(), 3);
+            assert!(
+                [recovered, first_input, second_input]
+                    .iter()
+                    .all(|input| native.covered_inputs().contains(input))
+            );
+            let expected = match idle_outcome {
+                super::super::turn::IdleOutcome::Completed => {
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    }
+                }
+                super::super::turn::IdleOutcome::Aborted
+                | super::super::turn::IdleOutcome::HostHandoff => {
+                    forge_provider_api::turn::TurnOutcome::Interrupted
+                }
+            };
+            assert_eq!(native.outcome(), expected);
         }
         Ok(())
     }
 
     /// Abort after accepted consumption but before turn-start preserves coverage without inventing execution.
     #[tokio::test]
-    async fn cancelled_before_turn_start_publishes_consumed_resolution_without_execution()
+    async fn cancelled_before_start_preserves_accepted_input_without_a_native_turn()
     -> anyhow::Result<()> {
-        use forge_provider_api::lifecycle::ExecutionUpdate;
         for native_turn in [None, Some("not-started")] {
             let turn = CopilotTurnEvent::default();
             let guard = turn.activate(None, None)?;
@@ -1007,46 +773,9 @@ mod tests {
             turn.observe_idle_at(&cancelled, super::super::turn::IdleOutcome::Aborted)?;
             pending.await?;
             assert_eq!(turn.covered_submissions()?, vec![submission.clone()]);
-            assert!(turn.terminal_executions()?.is_empty());
-            let scope = forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("no-start"),
-                "invocation",
-            );
-            let (sink, mut stream) = forge_provider_api::events::channel(
-                forge_provider_api::BindingId::new("binding")?,
-                scope,
-            );
-            publish_terminal_executions(
-                "native-session",
-                &turn,
-                &sink,
-                &ProviderCompletion::default(),
-                TerminalPublication::Settled,
-            )
-            .await?;
-            let ProviderEvent::Execution { observation } = stream.recv().await?.unwrap().event
-            else {
-                panic!("missing consumed cancellation resolution");
-            };
-            match observation.update() {
-                ExecutionUpdate::ResolvedWithoutExecution {
-                    covered_submissions,
-                    result,
-                    ..
-                } => {
-                    assert_eq!(covered_submissions, &[submission]);
-                    assert!(matches!(
-                        result,
-                        forge_provider_api::ExecutionResult::Cancelled { .. }
-                    ));
-                }
-                other => panic!("fabricated a started native execution: {other:?}"),
-            }
-            assert!(stream.try_next()?.is_none());
-            assert!(matches!(
-                turn.settlement_result()?,
-                forge_provider_api::ExecutionResult::Cancelled { .. }
-            ));
+            assert!(turn.terminal_native_roots()?.is_empty());
+            assert!(turn.foreground_anchor()?.is_none());
+            assert_eq!(turn.cancelled_without_execution()?, Some(vec![submission]));
         }
         Ok(())
     }
@@ -1069,5 +798,22 @@ mod tests {
         assert!(completes_exchange(&event));
         event.agent_id = Some("child".into());
         assert!(!completes_exchange(&event));
+    }
+    /// Publication cannot manufacture success before any correlated native terminal exists.
+    #[tokio::test]
+    async fn missing_native_terminal_does_not_publish_or_return_success() -> anyhow::Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let _guard = turn.activate(None, None)?;
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("missing-terminal"),
+            "exchange",
+        );
+        let (_sink, mut stream) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("binding")?,
+            scope,
+        );
+        assert!(normalized_result(&turn, &ProviderCompletion::default()).is_err());
+        assert!(stream.try_next()?.is_none());
+        Ok(())
     }
 }

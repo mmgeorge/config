@@ -49,12 +49,12 @@ impl Provider for StartupProvider {
         }])
     }
 
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: forge_provider_api::OperationContext,
         request: SessionRequest,
     ) -> std::result::Result<forge_provider_api::OpenedSession, ProviderError> {
-        context.check_admission(ProviderOperation::SessionOpen)?;
+        context.check_admission(ProviderOperation::ThreadOpen)?;
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.request.lock().unwrap().push(request.clone());
         self.starting.store(true, Ordering::Release);
@@ -63,10 +63,10 @@ impl Provider for StartupProvider {
             permit = self.release.acquire() => permit.map_err(|_| ProviderError::Cancelled)?.forget(),
             interruption = context.interrupted() => {
                 self.starting.store(false, Ordering::Release);
-                return Err(interruption.failure(ProviderOperation::SessionOpen, forge_provider_api::ProviderPhase::Preparation, forge_provider_api::FailureDisposition::Unchanged));
+                return Err(interruption.failure(ProviderOperation::ThreadOpen, forge_provider_api::ProviderPhase::Preparation, forge_provider_api::FailureDisposition::Unchanged));
             }
         }
-        if let Err(error) = context.check_admission(ProviderOperation::SessionOpen) {
+        if let Err(error) = context.check_admission(ProviderOperation::ThreadOpen) {
             self.starting.store(false, Ordering::Release);
             return Err(error);
         }
@@ -77,19 +77,19 @@ impl Provider for StartupProvider {
         {
             self.starting.store(false, Ordering::Release);
             return Err(startup_failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::SessionMissing,
             ));
         }
         if self.fail {
             self.starting.store(false, Ordering::Release);
             return Err(startup_failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Initialization,
             ));
         }
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
-            startup_failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown)
+            startup_failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown)
         })?;
         let scope = forge_provider_api::EventScope::Binding {
             owner: request.owner.clone(),
@@ -103,6 +103,7 @@ impl Provider for StartupProvider {
             ),
             events: stream,
             binding: SessionBinding {
+                thread_id: request.thread_id.clone(),
                 id: binding_id,
                 provider_session_id: Some(request.history.resume_id().cloned().unwrap_or_else(
                     || {
@@ -116,48 +117,48 @@ impl Provider for StartupProvider {
         })
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: forge_provider_api::OperationContext,
         _: &BindingId,
         _: PromptRequest,
     ) -> std::result::Result<InputAcceptance, ProviderError> {
-        context.check_admission(ProviderOperation::InputSubmit)?;
+        context.check_admission(ProviderOperation::TurnStart)?;
         Err(startup_failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: forge_provider_api::OperationContext,
         _: &BindingId,
         _: forge_provider_api::SessionConfiguration,
     ) -> std::result::Result<forge_provider_api::ConfiguredSession, ProviderError> {
-        context.check_admission(ProviderOperation::SessionConfigure)?;
+        context.check_admission(ProviderOperation::ThreadConfigure)?;
         Err(startup_failure(
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &BindingId,
     ) -> std::result::Result<(), ProviderError> {
-        context.check_admission(ProviderOperation::SessionClose)?;
+        context.check_admission(ProviderOperation::ThreadClose)?;
         self.sinks.lock().await.remove(binding);
         Ok(())
     }
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: forge_provider_api::OperationContext,
         _: &BindingId,
         _: forge_provider_api::CancelRequest,
-    ) -> std::result::Result<forge_provider_api::InvocationSettlement, ProviderError> {
-        context.check_admission(ProviderOperation::Cancel)?;
+    ) -> std::result::Result<forge_provider_api::TurnInterruptResult, ProviderError> {
+        context.check_admission(ProviderOperation::TurnInterrupt)?;
         Err(startup_failure(
-            ProviderOperation::Cancel,
+            ProviderOperation::TurnInterrupt,
             ProviderFailureKind::Rejected,
         ))
     }
@@ -219,9 +220,43 @@ fn startup_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> P
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
-/// Discard an inherited context override before any native session or prompt can consume it.
+/// Publish a fixture provider into the controller and its broker before startup runs.
+async fn install_startup_provider(
+    controller: &Arc<SessionController>,
+    provider: &Arc<StartupProvider>,
+) -> Result<ProviderTestSession> {
+    let provider_fixture =
+        ProviderTestSession::from_registered(forge_providers::registry::RegisteredProvider::new(
+            provider.descriptor(),
+            provider.clone(),
+            None,
+        ))?;
+    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+    controller
+        .broker
+        .lock()
+        .await
+        .set_provider_for_test(provider_fixture.provider_handle());
+    Ok(provider_fixture)
+}
+
+/// Run interactive startup to completion and return the failure it published, if any.
+async fn finish_startup(controller: &Arc<SessionController>) -> Result<Option<String>> {
+    let (sink, _output) = forge_protocol::outbound::channel();
+    controller.start_provider(&sink).await;
+    controller
+        .provider_startup
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .await?;
+    Ok(controller.provider_startup_error.lock().unwrap().clone())
+}
+
+/// Discard an inherited context override without opening a native conversation at startup.
 #[tokio::test]
-async fn saved_context_is_resolved_before_native_startup() -> Result<()> {
+async fn saved_context_is_resolved_without_native_startup() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let initialize: InitializeRequest = serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
@@ -267,158 +302,60 @@ async fn saved_context_is_resolved_before_native_startup() -> Result<()> {
         session.service_tier,
         forge_provider_api::ServiceTier::Ultrafast
     );
+    assert_eq!(finish_startup(&controller).await?, None);
+    assert!(controller.provider_ready().await);
     assert_eq!(provider.calls.load(Ordering::Acquire), 0);
-    let request = controller
-        .broker
-        .lock()
-        .await
-        .initialization_request()?
-        .unwrap();
-    assert!(request.context_window.is_none());
-    let (sink, _output) = forge_protocol::outbound::channel();
-    controller.start_provider(&sink).await;
-    controller
-        .provider_startup
-        .lock()
-        .await
-        .take()
-        .unwrap()
-        .await?;
-    {
-        let opened = provider.request.lock().unwrap();
-        assert_eq!(opened.len(), 1);
-        assert!(opened[0].configuration.model.context_window.is_none());
-    }
+    assert!(provider.request.lock().unwrap().is_empty());
+    assert!(
+        controller
+            .observer
+            .snapshot()?
+            .session
+            .context_window
+            .is_none()
+    );
     controller.finish_exchange_owner().await?;
     Ok(())
 }
 
+/// Keep a new chat local through startup instead of allocating an unused native conversation.
 #[tokio::test]
-async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_failure() -> Result<()>
-{
-    for (fail, stale) in [(false, false), (true, false), (false, true)] {
-        let fixture = tempfile::tempdir()?;
-        let initialize = serde_json::from_value(json!({
-            "workspace":fixture.path(), "data_root":fixture.path().join("data"),
-            "client_id":"startup-fixture", "provider":{"kind":"mock","command":[]},
-        }))?;
-        let broker = HarnessBroker::initialize(initialize)?;
-        let controller = SessionController::new(broker).await?;
-        let provider = Arc::new(StartupProvider::new(fail, 0));
-        let provider_fixture = ProviderTestSession::from_registered(
-            forge_providers::registry::RegisteredProvider::new(
-                provider.descriptor(),
-                provider.clone(),
-                None,
-            ),
-        )?;
-        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+async fn provider_startup_registers_observation_without_native_open() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let initialize = serde_json::from_value(json!({
+        "workspace":fixture.path(), "data_root":fixture.path().join("data"),
+        "client_id":"startup-fixture", "provider":{"kind":"mock","command":[]},
+    }))?;
+    let broker = HarnessBroker::initialize(initialize)?;
+    let controller = SessionController::new(broker).await?;
+    // A failing open proves that startup never reaches it, not that startup tolerated it.
+    let provider = Arc::new(StartupProvider::new(true, 0));
+    let _provider_fixture = install_startup_provider(&controller, &provider).await?;
+    assert_eq!(finish_startup(&controller).await?, None);
+    assert!(controller.provider_ready().await);
+    assert_eq!(provider.calls.load(Ordering::Acquire), 0);
+    let snapshot = controller.observer.snapshot()?;
+    assert!(snapshot.session.provider_session_id.is_none());
+    assert!(
         controller
-            .broker
-            .lock()
+            .catalog_request
+            .read()
             .await
-            .set_provider_for_test(provider_fixture.provider_handle());
-        let (sink, mut output) = forge_protocol::outbound::channel();
-        controller.start_provider(&sink).await;
-        provider.entered.notified().await;
-        assert!(!controller.provider_ready().await);
-        assert!(controller.background_terminals().await?.starting);
-        controller.start_provider(&sink).await;
-        assert_eq!(provider.calls.load(Ordering::Acquire), 1);
-        let before = controller.observer.snapshot()?;
-        assert!(before.session.provider_session_id.is_none());
-        assert!(
-            SqliteStore::read_only(&controller.data_root)?
-                .list_exchange(&before.session.id)?
-                .is_empty()
-        );
-        assert!(
-            controller.broker.try_lock().is_ok(),
-            "startup held the broker during network work"
-        );
-        if stale {
-            controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
-        }
-        provider.release.add_permits(1);
-        controller
-            .provider_startup
-            .lock()
-            .await
-            .as_mut()
-            .unwrap()
-            .await?;
-        if stale {
-            assert!(
-                controller
-                    .observer
-                    .snapshot()?
-                    .session
-                    .provider_session_id
-                    .is_none()
-            );
-            continue;
-        }
-        let expected_event = if fail {
-            "provider_event"
-        } else {
-            "session_configured"
-        };
-        let mut observed = Vec::new();
-        let event = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let frame = output.recv().await?.context("startup output closed")?;
-                let event: Value = serde_json::from_slice(frame.bytes())?;
-                observed.push(event.clone());
-                if event["event"] == expected_event {
-                    return Ok::<_, anyhow::Error>(event);
-                }
-            }
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "startup event was not observed: {observed:?}; failure={:?}",
-                controller.provider_startup_error.lock().unwrap()
-            )
-        })??;
-        if fail {
-            assert_eq!(event["event"], "provider_event");
-            assert!(event["payload"]["text"].as_str().is_some());
-            assert!(controller.provider_startup_error.lock().unwrap().is_some());
-        } else {
-            assert_eq!(event["event"], "session_configured");
-            assert_eq!(
-                controller
-                    .observer
-                    .snapshot()?
-                    .session
-                    .provider_session_id
-                    .as_deref(),
-                Some("prepared-provider-thread")
-            );
-            assert!(
-                SqliteStore::read_only(&controller.data_root)?
-                    .list_exchange(&before.session.id)?
-                    .is_empty()
-            );
-            assert_eq!(
-                controller
-                    .catalog_request
-                    .read()
-                    .await
-                    .provider_session_id
-                    .as_ref()
-                    .map(|id| id.as_str()),
-                Some("prepared-provider-thread")
-            );
-        }
-    }
+            .provider_session_id
+            .is_none()
+    );
+    assert!(
+        SqliteStore::read_only(&controller.data_root)?
+            .list_exchange(&snapshot.session.id)?
+            .is_empty()
+    );
+    controller.finish_exchange_owner().await?;
     Ok(())
 }
 
-/// Replace an unused thread before startup but preserve one with a recorded checkpoint.
+/// Clear only an unused saved identity, and leave established history for first-use resume.
 #[tokio::test]
-async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
+async fn provider_startup_retains_saved_history_until_first_use() -> Result<()> {
     for (checkpoint, has_exchange) in [(None, false), (Some("durable-turn"), false), (None, true)] {
         let fixture = tempfile::tempdir()?;
         let parameters = json!({
@@ -454,84 +391,35 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
         let broker = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
         let controller = SessionController::new(broker).await?;
         let provider = Arc::new(StartupProvider::new(false, 2));
-        let provider_fixture = ProviderTestSession::from_registered(
-            forge_providers::registry::RegisteredProvider::new(
-                provider.descriptor(),
-                provider.clone(),
-                None,
-            ),
-        )?;
-        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
-        controller
-            .broker
-            .lock()
-            .await
-            .set_provider_for_test(provider_fixture.provider_handle());
-        let (sink, _output) = forge_protocol::outbound::channel();
-        controller.start_provider(&sink).await;
-        controller
-            .provider_startup
-            .lock()
-            .await
-            .as_mut()
-            .unwrap()
-            .await?;
+        let _provider_fixture = install_startup_provider(&controller, &provider).await?;
+        // Missing native history surfaces when the first input resumes it, not at startup.
+        assert_eq!(finish_startup(&controller).await?, None);
+        assert!(controller.provider_ready().await);
+        assert_eq!(provider.calls.load(Ordering::Acquire), 0);
         let persisted = SqliteStore::read_only(&controller.data_root)?
             .load_session(&session.id)?
             .unwrap();
-        if checkpoint.is_none() && !has_exchange {
-            assert_eq!(provider.calls.load(Ordering::Acquire), 1);
-            assert!(controller.provider_ready().await);
-            assert!(
-                provider.request.lock().unwrap()[0]
-                    .history
-                    .resume_id()
-                    .is_none()
-            );
-            assert_eq!(
-                persisted.provider_session_id.as_deref(),
-                Some("prepared-provider-thread")
-            );
-            assert_eq!(
-                controller
-                    .catalog_request
-                    .read()
-                    .await
-                    .provider_session_id
-                    .as_ref()
-                    .map(|id| id.as_str()),
-                Some("prepared-provider-thread")
-            );
-        } else {
-            assert_eq!(provider.calls.load(Ordering::Acquire), 1);
-            assert!(!controller.provider_ready().await);
-            assert_eq!(
-                provider.request.lock().unwrap()[0]
-                    .history
-                    .resume_id()
-                    .cloned()
-                    .map(String::from),
-                session.provider_session_id
-            );
-            assert_eq!(persisted.provider_session_id, session.provider_session_id);
-            assert!(
-                controller
-                    .provider_startup_error
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .contains("retained conversation was preserved")
-            );
-        }
+        let expected = (checkpoint.is_some() || has_exchange).then_some("missing-provider-thread");
+        assert_eq!(persisted.provider_session_id.as_deref(), expected);
+        assert_eq!(
+            controller
+                .catalog_request
+                .read()
+                .await
+                .provider_session_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            expected
+        );
         assert_eq!(persisted.name, "Renamed before the first exchange");
+        controller.finish_exchange_owner().await?;
     }
     Ok(())
 }
 
-/// Preserve local renames before and during startup while keeping an empty session replaceable.
+/// Preserve local renames around startup without creating a native conversation.
 #[tokio::test]
-async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -> Result<()> {
+async fn rename_without_exchanges_is_local_across_provider_startup() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let parameters = json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
@@ -540,50 +428,18 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
     let broker = HarnessBroker::initialize(serde_json::from_value(parameters.clone())?)?;
     let controller = SessionController::new(broker).await?;
     let provider = Arc::new(StartupProvider::new(false, 0));
-    let provider_fixture =
-        ProviderTestSession::from_registered(forge_providers::registry::RegisteredProvider::new(
-            provider.descriptor(),
-            provider.clone(),
-            None,
-        ))?;
-    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
-    controller
-        .broker
-        .lock()
-        .await
-        .set_provider_for_test(provider_fixture.provider_handle());
+    let _provider_fixture = install_startup_provider(&controller, &provider).await?;
     let session_id = controller.observer.session_id().to_owned();
     controller.observer.query(
         RuntimeMethod::SessionRename,
-        json!({
-            "session_id":session_id,"name":"Before provider startup"
-        }),
+        json!({"session_id":session_id,"name":"Before provider startup"}),
+    )?;
+    assert_eq!(finish_startup(&controller).await?, None);
+    controller.observer.query(
+        RuntimeMethod::SessionRename,
+        json!({"session_id":session_id,"name":"After provider startup"}),
     )?;
     assert_eq!(provider.calls.load(Ordering::Acquire), 0);
-    let (sink, _output) = forge_protocol::outbound::channel();
-    controller.start_provider(&sink).await;
-    provider.entered.notified().await;
-    controller.observer.query(
-        RuntimeMethod::SessionRename,
-        json!({
-            "session_id":session_id,"name":"While provider startup is pending"
-        }),
-    )?;
-    provider.release.add_permits(1);
-    while !controller.provider_ready().await {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        controller.observer.snapshot()?.session.name,
-        "While provider startup is pending"
-    );
-    controller.observer.query(
-        RuntimeMethod::SessionRename,
-        json!({
-            "session_id":session_id,"name":"After provider startup"
-        }),
-    )?;
-    assert_eq!(provider.calls.load(Ordering::Acquire), 1);
     assert!(
         SqliteStore::read_only(&controller.data_root)?
             .list_exchange(&session_id)?
@@ -596,5 +452,101 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
     assert_eq!(snapshot.session.id, session_id);
     assert_eq!(snapshot.session.name, "After provider startup");
     assert!(snapshot.session.provider_session_id.is_none());
+    Ok(())
+}
+
+/// Retain the history identity that a lazy first open reports only in its result.
+///
+/// Codex, Copilot, and ACP report a new conversation's identity in the open result rather than
+/// as `Thread.IdentityResolved`, so a restart must still resume the conversation the first
+/// input created.
+#[tokio::test]
+async fn first_input_retains_history_reported_only_by_open_result() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    crate::checks::configure_fixture(fixture.path());
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+    )
+    .expect("mock fixture descriptor");
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |request, _, start, _| async move {
+            start.observed(1).await?;
+            Ok(crate::provider::test_support::native_result(
+                &request,
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+            ))
+        },
+    );
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"mock-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
+    let provider_fixture = ProviderTestSession::from_native(native)?;
+    let parameters = json!({
+        "workspace":fixture.path(), "data_root":fixture.path().join("data"),
+        "client_id":"lazy-identity-fixture", "provider":{"kind":"mock","command":[]},
+    });
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
+    broker.set_provider_for_test(provider_fixture.provider_handle());
+    let controller = SessionController::new(broker).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.start_provider(&sink).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !controller.provider_ready().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        controller.observer.snapshot()?.session.provider_session_id,
+        None
+    );
+    controller.attach_input(&sink).await?;
+    super::prompt::apply(
+        &controller,
+        forge_protocol::message::Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"first-input","text":"Open the conversation"}),
+        },
+        &sink,
+    )
+    .await?;
+    let session = controller.observer.session_id().to_owned();
+    let retained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(history) = SqliteStore::read_only(&controller.data_root)?
+                .load_session(&session)?
+                .and_then(|session| session.provider_session_id)
+            {
+                return Ok::<_, anyhow::Error>(history);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("first input did not persist the opened native history"))??;
+    assert_eq!(
+        controller
+            .observer
+            .snapshot()?
+            .session
+            .provider_session_id
+            .as_deref(),
+        Some(retained.as_str())
+    );
+    controller.input_stopping.store(true, Ordering::Release);
+    controller.coordinator.submissions.changed.notify_one();
+    controller.finish_exchange_owner().await?;
+    provider_fixture.provider_handle().shutdown().await?;
+    controller.finish_session_events().await?;
+    reader.abort();
     Ok(())
 }

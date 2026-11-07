@@ -78,5 +78,5 @@ request.callback(nil, "Submission failed")
 assert(#vim.fn.win_findbuf(review.buf) == 1, "failed submission did not restore the review")
 assert(vim.bo[review.buf].modified and comments.capture(review.buf)[1].source.body == "Preserve this feedback",
   "failed submission lost the unsaved comment")
-assert(not harness.busy and notice[#notice]:find("Submission failed", 1, true))
+assert(not require("forge.views.harness.activity").busy(harness) and notice[#notice]:find("Submission failed", 1, true))
 print("plan_review_submission_close: accept/reject hide immediately, completion closes, failure restores exact draft")

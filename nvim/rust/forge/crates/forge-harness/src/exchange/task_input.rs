@@ -13,8 +13,9 @@ use crate::{
 pub(super) enum TaskInputProduction {
     /// No eligible model input exists at this committed task boundary.
     Idle,
-    /// The input journal created or refreshed this task's original input identity.
-    Updated(InputUpdate),
+    /// The input journal retired stale task input or created or refreshed this task's input
+    /// identity. Updates are ordered by the journal revisions they committed.
+    Updated(Vec<InputUpdate>),
     /// User input superseded the identified pending continuation.
     ContinuationCancelled {
         task: crate::task::TaskId,
@@ -26,10 +27,27 @@ pub(super) enum TaskInputProduction {
 
 /// Reconcile one current entry/continuation while task replacement remains excluded during queue commit.
 pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction, InputOfferError> {
+    let mut updates = Vec::new();
     // Capture dependent input changes under the task mutation fence; never recursively mutate the task there.
     let prepared = services
         .tasks
         .with_task_snapshot(|task| {
+            // Readiness serves pending input in order and waits on input whose authority is not
+            // current, so a permanently stale task input at the head would block all later input.
+            let retired: Vec<_> = services
+                .input
+                .snapshot()?
+                .messages
+                .iter()
+                .filter(|message| message.delivery() == InputDelivery::Queued)
+                .filter(|message| task_input_retired(task.as_ref(), &message.purpose))
+                .map(|message| (message.id.clone(), message.revision))
+                .collect();
+            if !retired.is_empty()
+                && let Some(update) = services.input.retire_task_input(&retired)?
+            {
+                updates.push(update);
+            }
             let Some(task) = task else {
                 return Ok(PreparedProduction::Idle);
             };
@@ -122,8 +140,16 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
 
     // Apply a cancellation through its own fenced transaction after releasing the snapshot guard.
     match prepared {
-        PreparedProduction::Idle => Ok(TaskInputProduction::Idle),
-        PreparedProduction::Updated(update) => Ok(TaskInputProduction::Updated(update)),
+        PreparedProduction::Idle if updates.is_empty() => Ok(TaskInputProduction::Idle),
+        PreparedProduction::Idle => Ok(TaskInputProduction::Updated(updates)),
+        PreparedProduction::Updated(update) => {
+            updates.push(update);
+            Ok(TaskInputProduction::Updated(updates))
+        }
+        // Publish committed retirements before a separately fenced cancellation; readiness retries.
+        PreparedProduction::Cancel { .. } if !updates.is_empty() => {
+            Ok(TaskInputProduction::Updated(updates))
+        }
         PreparedProduction::Cancel { permit, input } => {
             let mut store = crate::storage::SqliteStore::open(&services.root)
                 .map_err(InputOfferError::Queue)?;
@@ -148,6 +174,45 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 Err(error) => Err(InputOfferError::Queue(error.into())),
             }
         }
+    }
+}
+
+/// Report whether queued task input can never regain authority under committed task state.
+///
+/// Task revisions are fresh identities that never repeat, and a completed turn or cancelled
+/// continuation is never reopened. Status is deliberately ignored: a paused task keeps its pending
+/// input, which becomes current again when the same revision resumes.
+fn task_input_retired(task: Option<&crate::task::Task>, purpose: &InputPurpose) -> bool {
+    let (revision, input_id) = match purpose {
+        InputPurpose::TaskEntry { revision, id, .. }
+        | InputPurpose::TaskContinuation { revision, id, .. } => (revision, id),
+        InputPurpose::Clarification { .. }
+        | InputPurpose::User
+        | InputPurpose::Question { .. }
+        | InputPurpose::QuestionContinuation { .. }
+        | InputPurpose::WorkflowContinuation { .. } => return false,
+    };
+    let Some(task) = task.filter(|task| &task.revision == revision) else {
+        return true;
+    };
+    match purpose {
+        InputPurpose::TaskEntry { .. } => task.entry.as_ref().is_none_or(|entry| {
+            &entry.id != input_id || entry.delivery == TaskInputDelivery::Cancelled
+        }),
+        InputPurpose::TaskContinuation {
+            completed_turn_id, ..
+        } => task.turn.as_ref().is_none_or(|turn| {
+            &turn.id != completed_turn_id
+                || turn.continuation.as_ref().is_none_or(|continuation| {
+                    &continuation.id != input_id
+                        || continuation.delivery == TaskInputDelivery::Cancelled
+                })
+        }),
+        InputPurpose::Clarification { .. }
+        | InputPurpose::User
+        | InputPurpose::Question { .. }
+        | InputPurpose::QuestionContinuation { .. }
+        | InputPurpose::WorkflowContinuation { .. } => false,
     }
 }
 

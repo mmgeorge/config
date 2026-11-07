@@ -10,7 +10,9 @@ mod mock;
 mod pending_input;
 mod retained_task;
 mod terminal;
+pub mod testing;
 mod tool_display;
+mod turn_runner;
 
 mod error;
 mod profile;

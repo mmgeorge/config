@@ -310,7 +310,7 @@ mod tests {
         let clone = context.clone();
         assert_eq!(context, clone);
         context
-            .check_admission(ProviderOperation::InputSubmit)
+            .check_admission(ProviderOperation::TurnStart)
             .unwrap();
         let interrupted = context.interrupted();
         tokio::pin!(interrupted);
@@ -416,7 +416,7 @@ mod tests {
         assert!(!cancellation.is_cancelled());
         assert!(
             context
-                .check_admission(ProviderOperation::SessionOpen)
+                .check_admission(ProviderOperation::ThreadOpen)
                 .is_ok()
         );
         let (source, cancellation) = OperationCancellation::channel();
@@ -440,14 +440,14 @@ mod tests {
         .unwrap();
         source.cancel();
         let ProviderError::Failure(failure) = context
-            .check_admission(ProviderOperation::InputSubmit)
+            .check_admission(ProviderOperation::TurnStart)
             .unwrap_err()
         else {
             panic!("interruption lost its typed failure");
         };
         assert_eq!(failure.kind(), ProviderFailureKind::Cancelled);
         assert_eq!(failure.disposition(), FailureDisposition::Unchanged);
-        assert_eq!(failure.operation(), ProviderOperation::InputSubmit);
+        assert_eq!(failure.operation(), ProviderOperation::TurnStart);
     }
 
     /// Observe the immutable deadline even when no host cancellation source remains alive.

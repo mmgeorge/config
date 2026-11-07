@@ -320,13 +320,13 @@ mod tests {
             crate::turn::test_support::message(
                 &address,
                 id,
-                Some(crate::provider::MessageRole::Commentary),
+                Some(forge_provider_api::AgentMessageRole::Commentary),
                 id,
             )
         };
-        source.observe_turn(&commentary("first"), 1)?;
+        source.observe_event(&commentary("first"), 1)?;
         let admitted = run(TimelineOwner::exchange(&source));
-        source.observe_turn(&commentary("second"), 2)?;
+        source.observe_event(&commentary("second"), 2)?;
         insert_event(
             &mut source,
             TimelineEvent::Check {

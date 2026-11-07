@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local state_snapshot = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/state.lua")
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
@@ -27,6 +28,8 @@ local success, failure = xpcall(function()
   end, 10))
   assert(#errors == 0, table.concat(errors, "\n"))
   local function request(method, params)
+    -- Snapshot reads replay their publication page; see support/state.lua.
+    if method == "session.state.get" then return state_snapshot.get() end
     local result, request_error, completed
     client.request({ method = method, params = params, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error)
       result, request_error, completed = value, error, true
@@ -44,15 +47,19 @@ local success, failure = xpcall(function()
     prompt_finished, prompt_error = true, error
   end)
   held:wait()
-  assert(not prompt_finished, "mock turn must remain active during configuration")
+  -- Submission resolves at admission; the held provider turn keeps the session working.
+  local activity = require("forge.views.harness.activity")
+  assert(vim.wait(10000, function() return prompt_finished end, 10), "prompt admission did not complete")
+  assert(not prompt_error, prompt_error)
+  assert(vim.wait(10000, function() return activity.busy(session.harness) end, 10),
+    "mock turn must remain active during configuration")
   local updated = request("session.input.timeout.configure", {
     approval_timeout = { amount = 2, unit = "s" }, tool_timeout = { amount = 3, unit = "m" },
   })
   assert(updated.approval_timeout.amount == 2 and updated.tool_timeout.amount == 3)
-  assert(not prompt_finished, "configuration waited for or interrupted the provider")
+  assert(activity.busy(session.harness), "configuration waited for or interrupted the provider")
   held:release()
-  assert(vim.wait(10000, function() return prompt_finished end, 10))
-  assert(not prompt_error, prompt_error)
+  assert(vim.wait(10000, function() return not activity.busy(session.harness) end, 10), "mock turn did not settle")
   local snapshot = request("session.state.get", {})
   assert(vim.deep_equal(snapshot.session.approval_timeout, updated.approval_timeout))
   assert(vim.deep_equal(snapshot.session.tool_timeout, updated.tool_timeout))

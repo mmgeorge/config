@@ -1,4 +1,5 @@
 use super::AcpKind as ProviderKind;
+use super::tool_semantics::{ToolKind, normalize_descriptor};
 use super::{AcpConnectionError, AcpHandler};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -12,6 +13,14 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, RwLock};
 
+/// Distinguish ACP's native reasoning stream from progressively classified assistant prose.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AcpMessageRole {
+    Reasoning,
+    Commentary,
+    Response,
+}
+
 /// Owns native ACP events and conversation state, delegating policy to the host.
 pub struct AcpSessionState {
     kind: ProviderKind,
@@ -24,7 +33,9 @@ pub struct AcpSessionState {
     active: RwLock<Option<ActiveTurn>>,
     retained: RwLock<Option<ActiveTurn>>,
     history_replay: AtomicBool,
-    callback_work: RwLock<()>,
+    callback_work: Arc<RwLock<()>>,
+    child_permissions: Mutex<HashMap<String, ChildPermissionAuthority>>,
+    child_turns: Mutex<HashMap<TurnAddress, Arc<super::child_turn::AcpChildTurn>>>,
     operation: RwLock<Option<ActiveOperation>>,
     output: Mutex<forge_provider_api::completion::ProviderCompletion>,
     catalog: RwLock<Value>,
@@ -38,19 +49,34 @@ pub struct AcpSessionState {
     tool: Mutex<HashMap<(String, String), Value>>,
     tool_owner: Mutex<HashMap<(String, String), TurnAddress>>,
     finished_tool: Mutex<HashSet<(String, String)>>,
+    admitted_tool: Mutex<HashMap<(String, String), AcpToolItem>>,
+    started_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
     children: Mutex<super::children::AcpChildren>,
     message: Mutex<HashMap<TurnAddress, Vec<AcpMessage>>>,
+    usage_owner: Mutex<HashMap<UsageReportId, TurnAddress>>,
+    unsupported_updates: Mutex<HashSet<String>>,
 }
 
+/// Capture immutable callback routing for the admitted provider turn.
 #[derive(Clone)]
-/// Captures immutable callback routing for the admitted provider turn.
 struct ActiveTurn {
     generation: Arc<()>,
     revocation: tokio_util::sync::CancellationToken,
     sink: ProviderEventSink,
     permissions: Option<Arc<dyn forge_provider_api::permissions::ProviderPermissions>>,
     execution_started: bool,
+    native_start: Option<NativeTurnStart>,
+}
+
+/// Retain independently observed child permission work after parent foreground collection.
+#[derive(Clone)]
+struct ChildPermissionAuthority {
+    generation: Arc<()>,
+    parent_scope: InvocationScope,
+    permissions: Arc<dyn forge_provider_api::permissions::ProviderPermissions>,
+    revocation: tokio_util::sync::CancellationToken,
+    callback_work: Arc<RwLock<()>>,
 }
 
 struct ActiveOperation {
@@ -58,9 +84,16 @@ struct ActiveOperation {
     sink: ProviderEventSink,
 }
 
+/// Retain the immutable normalized item kind after native metadata becomes sufficient.
+struct AcpToolItem {
+    item_id: ItemId,
+    kind: ToolKind,
+}
+
 struct AcpMessage {
-    address: MessageAddress,
-    role: Option<MessageRole>,
+    address: TurnAddress,
+    item_id: ItemId,
+    role: Option<AcpMessageRole>,
     text: String,
     closed: bool,
 }
@@ -106,7 +139,9 @@ impl AcpSessionState {
             active: RwLock::new(None),
             retained: RwLock::new(None),
             history_replay: AtomicBool::new(false),
-            callback_work: RwLock::new(()),
+            callback_work: Arc::new(RwLock::new(())),
+            child_permissions: Mutex::new(HashMap::new()),
+            child_turns: Mutex::new(HashMap::new()),
             operation: RwLock::new(None),
             output: Mutex::new(forge_provider_api::completion::ProviderCompletion::default()),
             catalog: RwLock::new(json!({})),
@@ -114,9 +149,13 @@ impl AcpSessionState {
             tool: Mutex::new(HashMap::new()),
             tool_owner: Mutex::new(HashMap::new()),
             finished_tool: Mutex::new(HashSet::new()),
+            admitted_tool: Mutex::new(HashMap::new()),
+            started_tool: Mutex::new(HashSet::new()),
             compaction: Mutex::new(HashMap::new()),
             children: Mutex::new(super::children::AcpChildren::default()),
             message: Mutex::new(HashMap::new()),
+            usage_owner: Mutex::new(HashMap::new()),
+            unsupported_updates: Mutex::new(HashSet::new()),
         }
     }
 
@@ -133,18 +172,36 @@ impl AcpSessionState {
         *self.retained.write().await = None;
         *self.output.lock().await = forge_provider_api::completion::ProviderCompletion::default();
         self.compaction.lock().await.clear();
-        self.tool.lock().await.clear();
-        self.finished_tool.lock().await.clear();
-        self.message.lock().await.clear();
-        *self.children.lock().await = super::children::AcpChildren::new(session_id.into(), scope);
+        self.tool
+            .lock()
+            .await
+            .retain(|(session, _), _| session != session_id);
+        self.tool_owner
+            .lock()
+            .await
+            .retain(|(session, _), _| session != session_id);
+        self.finished_tool
+            .lock()
+            .await
+            .retain(|(session, _)| session != session_id);
+        self.admitted_tool
+            .lock()
+            .await
+            .retain(|(session, _), _| session != session_id);
+        self.started_tool
+            .lock()
+            .await
+            .retain(|(session, _)| session != session_id);
+        self.children.lock().await.begin(session_id.into(), scope);
         let mut active = self.active.write().await;
-        self.ensure_admission(ProviderOperation::InputSubmit)?;
+        self.ensure_admission(ProviderOperation::TurnStart)?;
         *active = Some(ActiveTurn {
             generation: Arc::new(()),
             revocation: tokio_util::sync::CancellationToken::new(),
             sink,
             permissions: None,
             execution_started: false,
+            native_start: None,
         });
         Ok(())
     }
@@ -158,7 +215,7 @@ impl AcpSessionState {
     ) -> Result<(), ProviderError> {
         self.begin(session_id, sink).await?;
         if let Some(active) = self.active.write().await.as_mut() {
-            self.ensure_admission(ProviderOperation::InputSubmit)?;
+            self.ensure_admission(ProviderOperation::TurnStart)?;
             if active.revocation.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
@@ -177,38 +234,115 @@ impl AcpSessionState {
         })
     }
 
-    /// Publish live observations through active or retained original invocation ownership.
-    pub async fn emit(&self, event: ProviderEvent) -> Result<(), ProviderError> {
+    /// Install the shared runner's positive-start authority before prompt dispatch.
+    pub(super) async fn install_native_start(&self, start: NativeTurnStart) {
+        if let Some(active) = self.active.write().await.as_mut() {
+            active.native_start = Some(start);
+        }
+    }
+
+    /// Record positive processing evidence independently of input acceptance.
+    pub(super) async fn observe_native_start(
+        &self,
+        observed_at_ms: i64,
+    ) -> Result<(), ProviderError> {
+        let start = {
+            let mut active = self.active.write().await;
+            let active = active
+                .as_mut()
+                .ok_or_else(|| provider_failure(ProviderFailureKind::WrongInvocation))?;
+            active.execution_started = true;
+            active.native_start.clone()
+        };
+        if let Some(start) = start {
+            start.observed(observed_at_ms).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish activity through the callback's original invocation ownership.
+    pub async fn emit(&self, event: AdapterActivity) -> Result<(), ProviderError> {
+        let root = self.children.lock().await.root_address();
+        let starts_root = match &event {
+            AdapterActivity::Item {
+                thread_id, turn_id, ..
+            }
+            | AdapterActivity::Turn {
+                thread_id,
+                turn_id,
+                event: TurnMetadataEvent::ChecklistUpdated(_) | TurnMetadataEvent::Usage(_),
+                ..
+            } => {
+                self.active.read().await.is_some()
+                    && root.as_ref().is_some_and(|root| {
+                        &root.thread_id == thread_id && &root.turn_id == turn_id
+                    })
+            }
+            AdapterActivity::Thread { .. }
+            | AdapterActivity::Turn { .. }
+            | AdapterActivity::Agent { .. }
+            | AdapterActivity::Warning(_) => false,
+        };
+        if starts_root {
+            self.observe_native_start(super::children::timestamp())
+                .await?;
+        }
+        if let AdapterActivity::Item {
+            thread_id, turn_id, ..
+        }
+        | AdapterActivity::Turn {
+            thread_id,
+            turn_id,
+            event: TurnMetadataEvent::Usage(_) | TurnMetadataEvent::ChecklistUpdated(_),
+            ..
+        } = &event
+        {
+            let child = self
+                .child_turns
+                .lock()
+                .await
+                .iter()
+                .find(|(address, _)| &address.thread_id == thread_id && &address.turn_id == turn_id)
+                .map(|(_, child)| child.clone());
+            if let Some(child) = child {
+                child.observe(super::children::timestamp()).await?;
+            }
+        }
         let sink = self
             .publication_sink()
             .await
             .ok_or_else(|| provider_failure(ProviderFailureKind::Rejected))?;
-        let address = match event.turn_address().cloned() {
-            Some(address) => Some(address),
-            None => self.children.lock().await.root_address(),
-        };
-        let started = {
-            let mut active = self.active.write().await;
-            if let (Some(active), Some(address)) = (active.as_mut(), address) {
-                if !active.execution_started {
-                    active.execution_started = true;
-                    Some((active.sink.clone(), address))
-                } else {
-                    None
-                }
-            } else {
-                None
+        let writer = sink.activity_writer();
+        let address = match &event {
+            AdapterActivity::Turn {
+                event: TurnMetadataEvent::Usage(report),
+                ..
+            } => self
+                .usage_owner
+                .lock()
+                .await
+                .get(report.report_id())
+                .cloned(),
+            AdapterActivity::Item {
+                thread_id, turn_id, ..
             }
+            | AdapterActivity::Turn {
+                thread_id, turn_id, ..
+            } => self
+                .children
+                .lock()
+                .await
+                .observed_address(thread_id, turn_id),
+            AdapterActivity::Thread { thread_id, .. } => {
+                self.children.lock().await.thread_address(thread_id)
+            }
+            AdapterActivity::Agent { .. } | AdapterActivity::Warning(_) => None,
         };
-        if let Some((sink, address)) = started {
-            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                address.scope.clone(),
-                forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
-            )?;
-            sink.send_wait(ProviderEvent::Execution { observation })
-                .await?;
-        }
-        sink.send_wait(event).await?;
+        let writer = match address {
+            Some(address) => writer.register_observed_turn(address)?,
+            None => writer,
+        };
+        writer.send_wait(event).await?;
         Ok(())
     }
 
@@ -242,9 +376,9 @@ impl AcpSessionState {
         self.admission_revocation.cancel();
     }
 
-    /// Get whether native failure revoked this binding before deliberate close.
-    pub(super) async fn is_invalidated(&self) -> bool {
-        self.first_failure.lock().await.is_some()
+    /// Get the original failure after admission was revoked by native observation.
+    pub(super) async fn binding_failure(&self) -> Option<ProviderError> {
+        self.first_failure.lock().await.clone()
     }
 
     /// Retain the original typed binding failure across cleanup retries.
@@ -303,7 +437,30 @@ impl AcpSessionState {
     /// Revoke invocation callback authority before a fenced process is collected.
     pub async fn revoke_callbacks(&self) {
         self.revoke_authority().await;
+        let children = self
+            .child_permissions
+            .lock()
+            .await
+            .drain()
+            .map(|(_, child)| child)
+            .collect::<Vec<_>>();
+        for child in &children {
+            child.revocation.cancel();
+        }
         let _collected = self.callback_work.write().await;
+        for child in children {
+            let _collected = child.callback_work.write().await;
+        }
+        let turns = self
+            .child_turns
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for child in turns {
+            child.close().await;
+        }
     }
 
     /// Revoke only the named invocation when cancellation races with a successor.
@@ -342,16 +499,21 @@ impl AcpSessionState {
         if let Some(operation) = self.operation.read().await.as_ref() {
             return Some(operation.sink.clone());
         }
-        self.retained
+        if let Some(retained) = self.retained.read().await.as_ref() {
+            return Some(retained.sink.clone());
+        }
+        self.capabilities
             .read()
             .await
             .as_ref()
-            .map(|retained| retained.sink.clone())
+            .map(|(_, sink, _)| sink.clone())
     }
 
     /// Recognize observation context without granting permission to start new work.
     async fn has_observation_context(&self) -> bool {
-        self.active.read().await.is_some() || self.retained.read().await.is_some()
+        self.active.read().await.is_some()
+            || self.retained.read().await.is_some()
+            || self.capabilities.read().await.is_some()
     }
 
     pub async fn begin_compaction(
@@ -389,7 +551,14 @@ impl AcpSessionState {
     }
 
     pub async fn has_active_work(&self) -> bool {
-        self.active.read().await.is_some() || self.operation.read().await.is_some()
+        self.active.read().await.is_some()
+            || self.operation.read().await.is_some()
+            || self
+                .child_turns
+                .lock()
+                .await
+                .values()
+                .any(|child| !child.is_finished())
     }
 
     async fn event_scope(&self) -> Result<EventScope> {
@@ -415,65 +584,72 @@ impl AcpSessionState {
         self.children.lock().await.address(session_id, false)
     }
 
-    pub async fn scope(&self) -> Result<InvocationScope, ProviderError> {
-        Ok(self
-            .publication_sink()
-            .await
-            .ok_or_else(|| provider_failure(ProviderFailureKind::Rejected))?
-            .invocation_scope()?
-            .clone())
-    }
-
+    /// Append text to the identified native stream without inventing empty items.
     async fn message_chunk(
         &self,
         session_id: &str,
-        role: Option<MessageRole>,
+        role: Option<AcpMessageRole>,
         text: &str,
     ) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
-        let Some(turn) = self.address(session_id).await else {
-            return Ok(());
-        };
+        let turn = self
+            .address(session_id)
+            .await
+            .context("ACP message has no known turn")?;
         let event = {
             let mut messages = self.message.lock().await;
             let messages = messages.entry(turn.clone()).or_default();
-            if let Some(message) = messages
+            let (item_id, event) = if let Some(message) = messages
                 .last_mut()
                 .filter(|message| !message.closed && message.role == role)
             {
                 message.text.push_str(text);
-                ProviderEvent::Message {
-                    address: message.address.clone(),
-                    update: MessageUpdate::Delta { text: text.into() },
-                }
+                (
+                    message.item_id.clone(),
+                    ItemEvent::Message {
+                        event: MessageItemEvent::Delta(text.into()),
+                    },
+                )
             } else {
-                let address = MessageAddress {
-                    turn,
-                    message_id: MessageId::Synthetic(uuid::Uuid::new_v4().to_string()),
-                };
+                let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())?;
                 messages.push(AcpMessage {
-                    address: address.clone(),
+                    address: turn.clone(),
+                    item_id: item_id.clone(),
                     role,
                     text: text.into(),
                     closed: false,
                 });
-                ProviderEvent::Message {
-                    address,
-                    update: MessageUpdate::Started {
-                        classification: role
-                            .map(MessageClassification::Known)
-                            .unwrap_or(MessageClassification::Unclassified),
+                let start = if role == Some(AcpMessageRole::Reasoning) {
+                    ItemStart::Reasoning(ReasoningStart {
                         text: text.into(),
-                    },
-                }
+                        kind: ReasoningKind::Full,
+                    })
+                } else {
+                    ItemStart::AgentMessage(AgentMessageStart {
+                        text: text.into(),
+                        classification: message_classification(role),
+                    })
+                };
+                (item_id, ItemEvent::Started(start))
+            };
+            AdapterActivity::Item {
+                thread_id: turn.thread_id.clone(),
+                turn_id: turn.turn_id.clone(),
+                item_id,
+                event,
             }
         };
         Ok(self.emit(event).await?)
     }
 
-    async fn classify_messages(&self, address: &TurnAddress, last_role: MessageRole) -> Result<()> {
+    /// Classify prose at native tool boundaries while preserving reasoning identity.
+    async fn classify_messages(
+        &self,
+        address: &TurnAddress,
+        last_role: AcpMessageRole,
+    ) -> Result<()> {
         let updates = {
             let mut messages = self.message.lock().await;
             let pending = messages.entry(address.clone()).or_default();
@@ -481,7 +657,7 @@ impl AcpSessionState {
                 .iter()
                 .filter(|message| message.role.is_none())
                 .count();
-            let updates = pending
+            pending
                 .iter_mut()
                 .filter(|message| message.role.is_none())
                 .enumerate()
@@ -489,20 +665,20 @@ impl AcpSessionState {
                     let role = if index + 1 == count {
                         last_role
                     } else {
-                        MessageRole::Commentary
+                        AcpMessageRole::Commentary
                     };
                     message.role = Some(role);
                     message.closed = true;
-                    ProviderEvent::Message {
-                        address: message.address.clone(),
-                        update: MessageUpdate::Classified { role },
+                    AdapterActivity::Item {
+                        thread_id: address.thread_id.clone(),
+                        turn_id: address.turn_id.clone(),
+                        item_id: message.item_id.clone(),
+                        event: ItemEvent::Message {
+                            event: MessageItemEvent::Classified(message_classification(Some(role))),
+                        },
                     }
                 })
-                .collect::<Vec<_>>();
-            for message in pending {
-                message.closed = true;
-            }
-            updates
+                .collect::<Vec<_>>()
         };
         for update in updates {
             self.emit(update).await?;
@@ -520,44 +696,12 @@ impl AcpSessionState {
             return Ok(());
         }
         let result: Result<(), ProviderError> = async {
-            let addresses = {
-                self.message
-                    .lock()
-                    .await
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
-            for address in addresses {
+            let root = self.children.lock().await.root_address();
+            if let Some(address) = root {
                 self.finish_messages(&address, outcome)
                     .await
                     .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
-            }
-            let events = self
-                .children
-                .lock()
-                .await
-                .finish()
-                .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
-            for event in events {
-                self.emit(event).await?;
-            }
-            let root = self.children.lock().await.root_address();
-            let started = self
-                .active
-                .read()
-                .await
-                .as_ref()
-                .is_some_and(|active| active.execution_started);
-            if started && let Some(address) = root {
-                self.emit(ProviderEvent::Turn {
-                    address,
-                    update: TurnUpdate::Finished {
-                        outcome,
-                        completed_at_ms: super::children::timestamp(),
-                    },
-                })
-                .await?;
+                self.finish_tools(&address).await?;
             }
             Ok(())
         }
@@ -571,8 +715,11 @@ impl AcpSessionState {
         address: &TurnAddress,
         outcome: forge_provider_api::turn::TurnOutcome,
     ) -> Result<(), ProviderError> {
-        if outcome == forge_provider_api::turn::TurnOutcome::Completed {
-            self.classify_messages(address, MessageRole::Response)
+        if matches!(
+            outcome,
+            forge_provider_api::turn::TurnOutcome::Completed { .. }
+        ) {
+            self.classify_messages(address, AcpMessageRole::Response)
                 .await
                 .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
         }
@@ -583,14 +730,27 @@ impl AcpSessionState {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|message| {
-                    let update = if outcome == forge_provider_api::turn::TurnOutcome::Completed {
-                        MessageUpdate::Completed { text: message.text }
-                    } else {
-                        MessageUpdate::Interrupted
+                    let completion = MessageCompletion {
+                        text: message.text,
+                        outcome: if matches!(
+                            outcome,
+                            forge_provider_api::turn::TurnOutcome::Completed { .. }
+                        ) {
+                            MessageOutcome::Completed
+                        } else {
+                            MessageOutcome::Interrupted
+                        },
                     };
-                    ProviderEvent::Message {
-                        address: message.address,
-                        update,
+                    let completion = if message.role == Some(AcpMessageRole::Reasoning) {
+                        ItemCompletion::Reasoning(completion)
+                    } else {
+                        ItemCompletion::AgentMessage(completion)
+                    };
+                    AdapterActivity::Item {
+                        thread_id: message.address.thread_id,
+                        turn_id: message.address.turn_id,
+                        item_id: message.item_id,
+                        event: ItemEvent::Completed(completion),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -601,22 +761,112 @@ impl AcpSessionState {
         Ok(())
     }
 
+    /// Close unfinished foreground operations at native end before provider collection waits.
+    async fn finish_tools(&self, address: &TurnAddress) -> Result<(), ProviderError> {
+        let keys = self
+            .tool_owner
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, owner)| *owner == address)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            if !self.finished_tool.lock().await.insert(key.clone()) {
+                continue;
+            }
+            let snapshot = self
+                .tool
+                .lock()
+                .await
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| provider_failure(ProviderFailureKind::Protocol))?;
+            let (kind, descriptor) = normalize_tool_descriptor(&snapshot);
+            let (item_id, admitted) = {
+                let mut items = self.admitted_tool.lock().await;
+                if let Some(item) = items.get(&key) {
+                    if item.kind != kind {
+                        return Err(provider_failure(ProviderFailureKind::Protocol));
+                    }
+                    (item.item_id.clone(), false)
+                } else {
+                    let id = ItemId::new(uuid::Uuid::new_v4().to_string())
+                        .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
+                    items.insert(
+                        key,
+                        AcpToolItem {
+                            item_id: id.clone(),
+                            kind,
+                        },
+                    );
+                    (id, true)
+                }
+            };
+            if admitted {
+                let start = match kind {
+                    ToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
+                    ToolKind::FileChange => ItemStart::FileChange(descriptor.clone()),
+                    ToolKind::ToolCall => ItemStart::ToolCall(descriptor.clone()),
+                };
+                self.emit(item_activity(address, &item_id, ItemEvent::Started(start)))
+                    .await?;
+            }
+            let completion = ToolCompletion {
+                outcome: ToolOutcome::Interrupted,
+                descriptor: Some(descriptor),
+                output: None,
+                changes: Default::default(),
+            };
+            let completion = match kind {
+                ToolKind::Command => ItemCompletion::CommandExecution(completion),
+                ToolKind::FileChange => ItemCompletion::FileChange(completion),
+                ToolKind::ToolCall => ItemCompletion::ToolCall(completion),
+            };
+            self.emit(item_activity(
+                address,
+                &item_id,
+                ItemEvent::Completed(completion),
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn authorize(&self, parameter: Value) -> Result<Value> {
         if !self.is_admitting() {
             return Ok(json!({"outcome":{"outcome":"cancelled"}}));
         }
-        let active = self
-            .active
-            .read()
-            .await
-            .clone()
-            .context("ACP permission request has no active turn")?;
+        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+        let child_authority = self.child_permissions.lock().await.get(session_id).cloned();
+        let active = self.active.read().await.clone();
+        let (parent_scope, permissions, revocation, callback_work, generation) =
+            if let Some(child) = &child_authority {
+                (
+                    child.parent_scope.clone(),
+                    Some(child.permissions.clone()),
+                    child.revocation.clone(),
+                    child.callback_work.clone(),
+                    child.generation.clone(),
+                )
+            } else {
+                ensure!(
+                    self.is_root(session_id).await,
+                    "ACP child has no registered permission authority"
+                );
+                let active = active
+                    .as_ref()
+                    .context("ACP permission request has no active root turn")?;
+                (
+                    active.sink.invocation_scope()?.clone(),
+                    active.permissions.clone(),
+                    active.revocation.clone(),
+                    self.callback_work.clone(),
+                    active.generation.clone(),
+                )
+            };
+        let _callback = callback_work.read().await;
         let authorizing = async {
-            if let Some(permissions) = &active.permissions {
-                permissions
-                    .before_tool(active.sink.invocation_scope()?)
-                    .await?;
-            }
             let session_id = parameter["sessionId"].as_str().unwrap_or_default();
             let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
                 self.tool_owner
@@ -627,6 +877,21 @@ impl AcpSessionState {
             } else {
                 None
             };
+            if address.is_none()
+                && parameter["toolCall"]["toolCallId"].is_string()
+                && !["title", "kind", "rawInput", "locations", "content"]
+                    .iter()
+                    .any(|field| {
+                        parameter["toolCall"]
+                            .get(*field)
+                            .is_some_and(|value| !value.is_null())
+                    })
+            {
+                return Err(ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                )
+                .into());
+            }
             let address = match address {
                 Some(address) => address,
                 None => self
@@ -634,11 +899,34 @@ impl AcpSessionState {
                     .await
                     .context("ACP permission request has no active session owner")?,
             };
-            if active.sink.invocation_scope()? != &address.scope {
-                return Err(ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-                )
-                .into());
+            let child = child_authority.is_some();
+            if !child {
+                self.observe_native_start(super::children::timestamp())
+                    .await?;
+            } else {
+                let turn = self
+                    .child_turns
+                    .lock()
+                    .await
+                    .get(&address)
+                    .cloned()
+                    .context("ACP child permission has no retained native turn owner")?;
+                turn.observe(super::children::timestamp()).await?;
+            }
+            ensure!(
+                child || parent_scope == address.scope,
+                "ACP permission request changed its original root owner"
+            );
+            if let Some(permissions) = &permissions {
+                if child {
+                    permissions
+                        .before_observed_child(&parent_scope, &address)
+                        .await?;
+                } else {
+                    permissions.before_tool(&address.scope).await?;
+                }
+            } else if child {
+                return Ok(json!({"outcome":{"outcome":"cancelled"}}));
             }
             let supplied = &parameter["toolCall"];
             let item_id = supplied["toolCallId"].as_str();
@@ -661,8 +949,15 @@ impl AcpSessionState {
                 }
             }
             let request = super::permission::permission_request(self.kind, &tool)?;
-            let resolution = if let Some(permissions) = &active.permissions {
-                match permissions.authorize(&address.scope, request).await {
+            let resolution = if let Some(permissions) = &permissions {
+                let decision = if child {
+                    permissions
+                        .authorize_observed_child(&parent_scope, &address, request)
+                        .await
+                } else {
+                    permissions.authorize(&address.scope, request).await
+                };
+                match decision {
                     forge_provider_api::permissions::PermissionResponse::Allow => {
                         PermissionResponse::Allow
                     }
@@ -678,17 +973,28 @@ impl AcpSessionState {
             } else {
                 return Err(
                     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Rejected,
                     ))
                     .into(),
                 );
             };
-            if !self.active.read().await.as_ref().is_some_and(|current| {
-                Arc::ptr_eq(&current.generation, &active.generation)
-                    && !current.revocation.is_cancelled()
-                    && self.is_admitting()
-            }) {
+            let current = if child {
+                self.child_permissions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .is_some_and(|current| {
+                        Arc::ptr_eq(&current.generation, &generation)
+                            && !current.revocation.is_cancelled()
+                    })
+            } else {
+                self.active.read().await.as_ref().is_some_and(|current| {
+                    Arc::ptr_eq(&current.generation, &generation)
+                        && !current.revocation.is_cancelled()
+                })
+            };
+            if !current || !self.is_admitting() {
                 return Ok(json!({"outcome":{"outcome":"cancelled"}}));
             }
             if matches!(resolution, PermissionResponse::Allow)
@@ -716,7 +1022,7 @@ impl AcpSessionState {
         tokio::select! {
             biased;
             _ = self.admission_revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
-            _ = active.revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
+            _ = revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
             result = authorizing => result,
         }
     }
@@ -728,11 +1034,7 @@ impl AcpSessionState {
             return Ok(());
         }
         if method == "_claude/sdkMessage" && self.kind == ProviderKind::Claude {
-            if !self.has_observation_context().await
-                || !self
-                    .is_root(parameter["sessionId"].as_str().unwrap_or_default())
-                    .await
-            {
+            if !self.has_observation_context().await {
                 return Ok(());
             }
             let message = &parameter["message"];
@@ -751,37 +1053,45 @@ impl AcpSessionState {
                     reasoning: None,
                     output: usage["output_tokens"].as_u64(),
                 };
-                if let Some(id) = message["uuid"].as_str() {
-                    let update = forge_provider_api::usage::UsageUpdate {
-                        context_adjustment: false,
-                        id: id.into(),
-                        usage: usage.clone(),
-                        cumulative: None,
-                        cumulative_total: None,
-                    };
-                    if let Some(address) = self
-                        .address(parameter["sessionId"].as_str().unwrap_or_default())
-                        .await
-                    {
-                        self.emit(ProviderEvent::Usage { address, update }).await?;
-                    }
-                }
-                if let Some(duration_ms) = message["duration_ms"].as_u64()
-                    && let Some(address) = self
-                        .address(parameter["sessionId"].as_str().unwrap_or_default())
-                        .await
-                {
-                    self.emit(ProviderEvent::Turn {
-                        address,
-                        update: TurnUpdate::Summary {
-                            summary: TurnSummary {
-                                duration_ms,
-                                usage: Some(usage),
-                            },
-                        },
-                    })
-                    .await?;
-                }
+                let id = message["uuid"]
+                    .as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::Protocol,
+                        )
+                    })?;
+                let invalid = || {
+                    ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::Protocol,
+                    )
+                };
+                let report = TurnUsageReport::accounting(
+                    forge_provider_api::identity::UsageReportId::new(id).map_err(|_| invalid())?,
+                    super::children::timestamp(),
+                    Some(usage),
+                    message["duration_ms"].as_u64(),
+                )
+                .map_err(|_| invalid())?;
+                let observed_address = self
+                    .children
+                    .lock()
+                    .await
+                    .address(parameter["sessionId"].as_str().unwrap_or_default(), true)
+                    .ok_or_else(invalid)?;
+                let address = self
+                    .usage_owner
+                    .lock()
+                    .await
+                    .entry(report.report_id().clone())
+                    .or_insert(observed_address)
+                    .clone();
+                self.emit(AdapterActivity::Turn {
+                    thread_id: address.thread_id,
+                    turn_id: address.turn_id,
+                    event: TurnMetadataEvent::Usage(report),
+                })
+                .await?;
             }
             return Ok(());
         }
@@ -814,8 +1124,9 @@ impl AcpSessionState {
         let idle_root = self.active.read().await.is_none() && self.is_root(session_id).await;
         let starts_unowned_work = idle_root
             && match update["sessionUpdate"].as_str() {
+                Some("agent_message_chunk" | "agent_thought_chunk" | "plan") => true,
                 Some("subagent_spawned") => true,
-                Some("tool_call") => match update["toolCallId"].as_str() {
+                Some("tool_call" | "tool_call_update") => match update["toolCallId"].as_str() {
                     Some(id) => !self
                         .tool
                         .lock()
@@ -826,28 +1137,129 @@ impl AcpSessionState {
                 _ => false,
             };
         if starts_unowned_work {
-            let failure = forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable;
-            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                self.scope().await?,
-                forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
-                    failure: failure.clone(),
-                    completion: None,
-                },
-            )?;
-            self.emit(ProviderEvent::Execution { observation }).await?;
-            return Err(ProviderError::Observation(failure).into());
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+            )
+            .into());
         }
         let lifecycle = self.children.lock().await.lifecycle(session_id, update)?;
-        if let Some(events) = lifecycle {
-            for event in events {
-                if let ProviderEvent::Turn {
-                    address,
-                    update: TurnUpdate::Finished { outcome, .. },
-                } = &event
-                {
-                    self.finish_messages(address, *outcome).await?;
+        if let Some(observation) = lifecycle {
+            let completed_at_ms = super::children::timestamp();
+            let child_id = update["subagentSessionId"]
+                .as_str()
+                .context("ACP child has no native identity")?;
+            let sink = self
+                .publication_sink()
+                .await
+                .context("ACP child has no observation owner")?;
+            let child_turn = {
+                let mut turns = self.child_turns.lock().await;
+                match turns.entry(observation.address.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let child = Arc::new(super::child_turn::AcpChildTurn::new(
+                            sink.clone(),
+                            observation.address.clone(),
+                            super::child_turn::ChildResources::new(),
+                        )?);
+                        entry.insert(child.clone());
+                        child
+                    }
                 }
-                self.emit(event).await?;
+            };
+            let resources = child_turn.resources();
+            if observation.outcome.is_none()
+                && !self.child_permissions.lock().await.contains_key(child_id)
+            {
+                let parent_scope = self
+                    .children
+                    .lock()
+                    .await
+                    .address(session_id, true)
+                    .context("ACP child has no original delegating turn")?
+                    .scope;
+                let permissions = if self.is_root(session_id).await {
+                    self.active
+                        .read()
+                        .await
+                        .as_ref()
+                        .and_then(|active| active.permissions.clone())
+                } else {
+                    self.child_permissions
+                        .lock()
+                        .await
+                        .get(session_id)
+                        .map(|parent| parent.permissions.clone())
+                };
+                if let Some(permissions) = permissions {
+                    self.child_permissions.lock().await.insert(
+                        child_id.into(),
+                        ChildPermissionAuthority {
+                            generation: Arc::new(()),
+                            parent_scope,
+                            permissions,
+                            revocation: resources.revocation(),
+                            callback_work: resources.callbacks(),
+                        },
+                    );
+                }
+            }
+            let delegation = if let AdapterActivity::Agent {
+                event: AgentEvent::Lifecycle { event },
+                ..
+            } = &observation.activity
+            {
+                let agent = match event {
+                    AgentLifecycleEvent::Started { agent, .. }
+                    | AgentLifecycleEvent::Updated { agent, .. }
+                    | AgentLifecycleEvent::Finished { agent, .. } => agent,
+                };
+                agent.delegation.as_ref()
+            } else {
+                None
+            };
+            let original_root = self
+                .children
+                .lock()
+                .await
+                .root_address()
+                .is_some_and(|root| {
+                    delegation.is_some_and(|delegation| {
+                        delegation.parent_thread_id == root.thread_id
+                            && delegation.parent_turn_id == root.turn_id
+                    })
+                });
+            if self.active.read().await.is_some() && self.is_root(session_id).await && original_root
+            {
+                self.observe_native_start(super::children::timestamp())
+                    .await?;
+            }
+            let writer = sink
+                .activity_writer()
+                .register_observed_turn(observation.address.clone())?;
+            if let Some(outcome) = observation.outcome {
+                if !matches!(outcome, turn::TurnOutcome::Interrupted) {
+                    child_turn.observe(completed_at_ms).await?;
+                }
+                self.child_permissions.lock().await.remove(child_id);
+                self.finish_messages(&observation.address, outcome).await?;
+                self.finish_tools(&observation.address).await?;
+            }
+            let starts_child = matches!(
+                &observation.activity,
+                AdapterActivity::Agent {
+                    event: AgentEvent::Lifecycle {
+                        event: AgentLifecycleEvent::Started { .. }
+                    },
+                    ..
+                }
+            );
+            writer.send_wait(observation.activity).await?;
+            if starts_child {
+                child_turn.relationship_published();
+            }
+            if let Some(outcome) = observation.outcome {
+                child_turn.complete(outcome, completed_at_ms).await?;
             }
             return Ok(());
         }
@@ -866,25 +1278,90 @@ impl AcpSessionState {
                 self.update_catalog(json!({"configOptions": update["configOptions"]}))
                     .await;
             }
+            "plan" => {
+                use agent_client_protocol::schema::v1::{
+                    PlanEntry, PlanEntryPriority, PlanEntryStatus,
+                };
+                let invalid = || {
+                    ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::Protocol,
+                    )
+                };
+                let entries: Vec<PlanEntry> =
+                    serde_json::from_value(update.get("entries").cloned().ok_or_else(invalid)?)
+                        .map_err(|_| invalid())?;
+                let address = self.address(session_id).await.ok_or_else(invalid)?;
+                let mut entry_list = Vec::new();
+                for (provider_ordinal, entry) in entries.into_iter().enumerate() {
+                    let status = match entry.status {
+                        PlanEntryStatus::Pending => forge_provider_api::ChecklistStatus::Pending,
+                        PlanEntryStatus::InProgress => {
+                            forge_provider_api::ChecklistStatus::InProgress
+                        }
+                        PlanEntryStatus::Completed => {
+                            forge_provider_api::ChecklistStatus::Completed
+                        }
+                        _ => return Err(invalid().into()),
+                    };
+                    let priority = match entry.priority {
+                        PlanEntryPriority::High => "high",
+                        PlanEntryPriority::Medium => "medium",
+                        PlanEntryPriority::Low => "low",
+                        _ => return Err(invalid().into()),
+                    };
+                    entry_list.push(forge_provider_api::ProviderChecklistEntry {
+                        provider_id: None,
+                        content: entry.content,
+                        priority: Some(priority.into()),
+                        status,
+                        provider_ordinal,
+                    });
+                }
+                self.emit(AdapterActivity::Turn {
+                    event: TurnMetadataEvent::ChecklistUpdated(
+                        forge_provider_api::ProviderChecklistUpdate {
+                            scope_id: format!("acp:plan:{}", address.turn_id),
+                            name: None,
+                            complete: entry_list.iter().all(|entry| {
+                                entry.status == forge_provider_api::ChecklistStatus::Completed
+                            }),
+                            replace_entries: true,
+                            entry_list,
+                        },
+                    ),
+                    thread_id: address.thread_id,
+                    turn_id: address.turn_id,
+                })
+                .await?;
+            }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let thought = update["sessionUpdate"] == "agent_thought_chunk";
                 let text = update
                     .pointer("/content/text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.message_chunk(session_id, thought.then_some(MessageRole::Thought), text)
-                    .await?;
+                self.message_chunk(
+                    session_id,
+                    thought.then_some(AcpMessageRole::Reasoning),
+                    text,
+                )
+                .await?;
             }
             "tool_call" | "tool_call_update" => {
                 let Some(id) = update["toolCallId"].as_str().filter(|id| !id.is_empty()) else {
                     return Ok(());
                 };
-                if let Some(address) = self.address(session_id).await {
+                let turn = self.address(session_id).await.ok_or_else(|| {
+                    ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                    )
+                })?;
+                {
                     let mut owners = self.tool_owner.lock().await;
                     let owner = owners
                         .entry((session_id.to_owned(), id.to_owned()))
-                        .or_insert_with(|| address.clone());
-                    if owner != &address {
+                        .or_insert_with(|| turn.clone());
+                    if owner != &turn {
                         return Err(ProviderError::Observation(
                             forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
                         )
@@ -892,34 +1369,35 @@ impl AcpSessionState {
                     }
                 }
                 let mut tool_map = self.tool.lock().await;
-                let first = !tool_map.contains_key(&(session_id.to_owned(), id.to_owned()));
                 let snapshot = tool_map
                     .entry((session_id.to_owned(), id.to_owned()))
                     .or_insert_with(|| json!({}));
-                let invocation_changed = ["title", "kind", "rawInput"].into_iter().any(|field| {
-                    update
-                        .get(field)
-                        .is_some_and(|value| !value.is_null() && snapshot.get(field) != Some(value))
-                });
-                if let Some(field_map) = update.as_object() {
-                    for (field, value) in field_map {
-                        if !value.is_null() {
-                            snapshot[field] = value.clone();
-                        }
-                    }
+                let finished = self
+                    .finished_tool
+                    .lock()
+                    .await
+                    .contains(&(session_id.to_owned(), id.to_owned()));
+                if finished
+                    && ["title", "kind", "rawInput", "status"]
+                        .into_iter()
+                        .any(|field| {
+                            update.get(field).is_some_and(|value| {
+                                !value.is_null() && snapshot.get(field) != Some(value)
+                            })
+                        })
+                {
+                    return Err(ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                    )
+                    .into());
                 }
+                let invocation_changed = merge_tool_snapshot(snapshot, update)?;
                 let snapshot = snapshot.clone();
                 drop(tool_map);
                 let update = &snapshot;
-                let Some(turn) = self.address(session_id).await else {
-                    return Ok(());
-                };
-                self.classify_messages(&turn, MessageRole::Commentary)
+                self.classify_messages(&turn, AcpMessageRole::Commentary)
                     .await?;
-                let address = ToolAddress {
-                    turn,
-                    tool_id: id.into(),
-                };
+                let native_key = (session_id.to_owned(), id.to_owned());
                 let status = update["status"].as_str().unwrap_or("in_progress");
                 let status = match status {
                     "pending" | "in_progress" => ToolStatus::Running,
@@ -930,39 +1408,70 @@ impl AcpSessionState {
                     "interrupted" => ToolStatus::Interrupted,
                     _ => return Err(provider_failure(ProviderFailureKind::Protocol).into()),
                 };
-                let invocation = crate::acp::normalize_invocation(ToolInvocation {
-                    semantics: Default::default(),
-                    kind: match update["kind"].as_str() {
-                        Some("edit" | "delete" | "move") => ToolActivityKind::FileChange,
-                        Some("execute") => ToolActivityKind::Command,
-                        _ => ToolActivityKind::ToolCall,
-                    },
-                    title: update["title"].as_str().unwrap_or("Tool").into(),
-                    name: update["title"].as_str().unwrap_or("Tool").into(),
-                    arguments: update.get("rawInput").cloned().unwrap_or(Value::Null),
-                });
-                if first || invocation_changed {
-                    self.emit(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update: ToolUpdate::Requested { invocation },
-                    })
+                // Delay immutable type admission until native metadata establishes its category.
+                if update.get("kind").is_none_or(Value::is_null) && status == ToolStatus::Running {
+                    return Ok(());
+                }
+                let (kind, descriptor) = normalize_tool_descriptor(update);
+                let (item_id, admitted) = {
+                    let mut items = self.admitted_tool.lock().await;
+                    match items.entry(native_key.clone()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            if entry.get().kind != kind {
+                                return Err(ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict).into());
+                            }
+                            (entry.get().item_id.clone(), false)
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let id = ItemId::new(uuid::Uuid::new_v4().to_string())?;
+                            entry.insert(AcpToolItem {
+                                item_id: id.clone(),
+                                kind,
+                            });
+                            (id, true)
+                        }
+                    }
+                };
+                if admitted {
+                    let start = match kind {
+                        ToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
+                        ToolKind::FileChange => ItemStart::FileChange(descriptor.clone()),
+                        ToolKind::ToolCall => ItemStart::ToolCall(descriptor.clone()),
+                    };
+                    self.emit(item_activity(&turn, &item_id, ItemEvent::Started(start)))
+                        .await?;
+                } else if invocation_changed {
+                    self.emit(item_activity(
+                        &turn,
+                        &item_id,
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::DescriptorUpdated(descriptor.clone()),
+                        },
+                    ))
                     .await?;
                 }
-                if first {
-                    self.emit(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update: ToolUpdate::Started,
-                    })
+                if update["status"] == "in_progress"
+                    && self.started_tool.lock().await.insert(native_key.clone())
+                {
+                    self.emit(item_activity(
+                        &turn,
+                        &item_id,
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::ExecutionStarted,
+                        },
+                    ))
                     .await?;
                     self.output.lock().await.evidence.tool_called = true;
                 }
-                if let Some(output) = tool_output(update)? {
-                    self.emit(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update: ToolUpdate::Output {
-                            update: TextUpdate::Replace(output),
+                let output = tool_output(update)?;
+                if let Some(output) = &output {
+                    self.emit(item_activity(
+                        &turn,
+                        &item_id,
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Output(TextUpdate::Replace(output.clone())),
                         },
-                    })
+                    ))
                     .await?;
                 }
                 let changes = file_changes(update);
@@ -970,10 +1479,13 @@ impl AcpSessionState {
                     if status == ToolStatus::Succeeded {
                         self.output.lock().await.evidence.workspace_changed = true;
                     }
-                    self.emit(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update: ToolUpdate::Changes { changes },
-                    })
+                    self.emit(item_activity(
+                        &turn,
+                        &item_id,
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Changes(changes.clone()),
+                        },
+                    ))
                     .await?;
                 }
                 let outcome = match status {
@@ -1004,10 +1516,22 @@ impl AcpSessionState {
                         .await
                         .insert((session_id.to_owned(), id.to_owned()))
                 {
-                    self.emit(ProviderEvent::Tool {
-                        address,
-                        update: ToolUpdate::Finished { outcome },
-                    })
+                    let completion = ToolCompletion {
+                        outcome,
+                        descriptor: Some(descriptor),
+                        output,
+                        changes,
+                    };
+                    let completion = match kind {
+                        ToolKind::Command => ItemCompletion::CommandExecution(completion),
+                        ToolKind::FileChange => ItemCompletion::FileChange(completion),
+                        ToolKind::ToolCall => ItemCompletion::ToolCall(completion),
+                    };
+                    self.emit(item_activity(
+                        &turn,
+                        &item_id,
+                        ItemEvent::Completed(completion),
+                    ))
                     .await?;
                 }
             }
@@ -1015,10 +1539,8 @@ impl AcpSessionState {
                 if !self.is_root(session_id).await {
                     return Ok(());
                 }
-                if let Some(mut compaction) = normalize_compaction(
-                    update,
-                    parameter["sessionId"].as_str().unwrap_or_default(),
-                ) {
+                let thread_id = self.event_scope().await?.owner().thread_id();
+                if let Some(mut compaction) = normalize_compaction(update, thread_id.as_str()) {
                     compaction.manual |= self.operation.read().await.is_some();
                     let mut compaction_map = self.compaction.lock().await;
                     if let Some(previous) = compaction_map.get(&compaction.id) {
@@ -1030,10 +1552,20 @@ impl AcpSessionState {
                     }
                     compaction_map.insert(compaction.id.clone(), compaction.clone());
                     drop(compaction_map);
-                    self.emit(ProviderEvent::Compaction {
-                        scope: self.event_scope().await?,
-                        update: Box::new(compaction),
+                    self.emit(AdapterActivity::Thread {
+                        thread_id: self.event_scope().await?.owner().thread_id(),
+                        event: ThreadEvent::CompactionUpdated(Box::new(compaction)),
                     })
+                    .await?;
+                } else {
+                    self.emit(AdapterActivity::Warning(ProviderWarning {
+                        scope: WarningScope::Thread { thread_id },
+                        kind: ProviderWarningKind::IncompleteCompactionMetadata,
+                        message: SanitizedMessage::new(
+                            "Provider omitted usable compaction metadata",
+                        )
+                        .expect("static compaction warning is sanitized"),
+                    }))
                     .await?;
                 }
             }
@@ -1054,18 +1586,26 @@ impl AcpSessionState {
                             .push_str(text);
                         let compaction = compaction.clone();
                         drop(compaction_map);
-                        self.emit(ProviderEvent::Compaction {
-                            scope: self.event_scope().await?,
-                            update: Box::new(compaction),
+                        self.emit(AdapterActivity::Thread {
+                            thread_id: self.event_scope().await?.owner().thread_id(),
+                            event: ThreadEvent::CompactionUpdated(Box::new(compaction)),
                         })
                         .await?;
                     }
                 }
             }
             "usage_update" => {
-                if !self.is_root(session_id).await {
-                    return Ok(());
-                }
+                let root = self.is_root(session_id).await;
+                let thread_id = if root {
+                    self.event_scope().await?.owner().thread_id()
+                } else {
+                    self.children
+                        .lock()
+                        .await
+                        .address(session_id, true)
+                        .context("ACP context usage has no known child thread")?
+                        .thread_id
+                };
                 if let Some(context) = update["used"]
                     .as_u64()
                     .zip(update["size"].as_u64())
@@ -1073,23 +1613,63 @@ impl AcpSessionState {
                         forge_provider_api::context::ContextUsage::reported(used, size)
                     })
                 {
-                    self.output.lock().await.metrics.context_usage = Some(context.clone());
-                    if self.has_observation_context().await {
-                        self.emit(ProviderEvent::Runtime {
-                            scope: self.scope().await?,
-                            update: RuntimeUpdate::ContextUsage { usage: context },
-                        })
-                        .await?;
+                    if root {
+                        self.output.lock().await.metrics.context_usage = Some(context.clone());
                     }
+                    self.emit(AdapterActivity::Thread {
+                        thread_id,
+                        event: ThreadEvent::ContextUsage(context),
+                    })
+                    .await?;
                 }
             }
-            _ => {}
+            // Mode and session-title metadata have no normalized event. Outside history replay,
+            // Harness already retains the accepted user input, so an echoed user chunk must not
+            // create a second native user item.
+            "current_mode_update" | "session_info_update" | "user_message_chunk" => {}
+            other => self.unsupported_update(session_id, other).await?,
         }
         Ok(())
     }
 
+    /// Warn once per binding about a v1 session update kind this adapter does not apply.
+    async fn unsupported_update(&self, session_id: &str, update_kind: &str) -> Result<()> {
+        let update_kind = if update_kind.trim().is_empty() {
+            "(missing sessionUpdate)"
+        } else {
+            update_kind
+        };
+        if !self
+            .unsupported_updates
+            .lock()
+            .await
+            .insert(update_kind.to_owned())
+        {
+            return Ok(());
+        }
+        let root_thread = self.event_scope().await?.owner().thread_id();
+        let thread_id = if self.is_root(session_id).await {
+            root_thread
+        } else {
+            self.children
+                .lock()
+                .await
+                .address(session_id, true)
+                .map_or(root_thread, |address| address.thread_id)
+        };
+        self.emit(AdapterActivity::Warning(ProviderWarning {
+            scope: WarningScope::Thread { thread_id },
+            kind: ProviderWarningKind::UnsupportedNativeEvent,
+            message: SanitizedMessage::new(format!(
+                "ACP agent reported session update `{update_kind}`, which Forge does not apply"
+            ))
+            .context("unsupported ACP update message is empty")?,
+        }))
+        .await?;
+        Ok(())
+    }
+
     async fn handle_request(&self, method: &str, parameter: Value) -> Result<Value> {
-        let _callback = self.callback_work.read().await;
         if self.history_replay.load(Ordering::Acquire) {
             return match method {
                 "session/request_permission" => Ok(json!({"outcome":{"outcome":"cancelled"}})),
@@ -1105,7 +1685,7 @@ impl AcpSessionState {
 
 fn provider_failure(kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::InputSubmit,
+        forge_provider_api::ProviderOperation::TurnStart,
         kind,
     ))
 }
@@ -1185,34 +1765,60 @@ fn file_changes(update: &Value) -> ProviderChangeSet {
     ProviderChangeSet { file }
 }
 
-fn normalize_compaction(update: &Value, session_id: &str) -> Option<Compaction> {
-    let mut value = update.clone();
-    value["id"] = value.get("compactionId")?.clone();
-    value["state"] = json!(match update["status"].as_str()? {
-        "in_progress" | "started" | "running" => "running",
-        "completed" => "completed",
-        "failed" => "failed",
-        "cancelled" => "unconfirmed",
+/// Normalize optional compaction evidence without exposing native error text.
+fn normalize_compaction(update: &Value, thread_id: &str) -> Option<Compaction> {
+    let id = update["compactionId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())?;
+    let state = match update["status"].as_str()? {
+        "in_progress" | "started" | "running" => CompactionState::Running,
+        "completed" => CompactionState::Completed,
+        "failed" => CompactionState::Failed,
+        "cancelled" => CompactionState::Unconfirmed,
         _ => return None,
-    });
-    value["thread_id"] = json!(session_id);
-    value["manual"] = json!(
-        update.pointer("/_meta/trigger").and_then(Value::as_str) == Some("manual")
-            || update["trigger"].as_str() == Some("manual")
-    );
-    value["result"] = json!({});
-    if let Some(error) = update["error"].as_str() {
-        value["result"]["error"] = json!(error);
-    }
-    if let Some(summary) = update["summary"].as_array() {
-        let text = summary
+    };
+    let summary_content = update["summary"].as_array().map(|contents| {
+        contents
             .iter()
             .filter_map(|content| content["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("");
-        value["result"]["summaryContent"] = json!(text);
-    }
-    serde_json::from_value(value).ok()
+            .collect::<String>()
+    });
+    let error = (state == CompactionState::Failed).then(|| {
+        ProviderFailure::new(
+            ProviderOperation::ThreadCompact,
+            ProviderFailureKind::Unknown,
+        )
+        .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
+    });
+    let now = super::children::timestamp();
+    Some(Compaction {
+        id: id.into(),
+        thread_id: thread_id.into(),
+        state,
+        manual: update.pointer("/_meta/trigger").and_then(Value::as_str) == Some("manual")
+            || update["trigger"].as_str() == Some("manual"),
+        started_at_ms: (state == CompactionState::Running).then_some(now),
+        completed_at_ms: (state != CompactionState::Running).then_some(now),
+        result: compaction::CompactionResult {
+            context_tokens_before: None,
+            context_tokens_after: None,
+            model: None,
+            before_context: None,
+            custom_instructions: None,
+            summary_content,
+            error,
+            pre_compaction_tokens: None,
+            post_compaction_tokens: None,
+            tokens_removed: None,
+            pre_compaction_messages_length: None,
+            messages_removed: None,
+            compaction_tokens_used: None,
+            context_window: None,
+            conversation_tokens: None,
+            system_tokens: None,
+            tool_definitions_tokens: None,
+        },
+    })
 }
 
 #[async_trait]
@@ -1220,13 +1826,15 @@ impl AcpHandler for AcpSessionState {
     async fn notification(&self, method: &str, parameter: Value) -> Result<(), AcpConnectionError> {
         match self.handle_notification(method, parameter).await {
             Ok(()) => Ok(()),
-            Err(_) => {
+            Err(error) => {
+                let observation = match error.downcast_ref::<ProviderError>() {
+                    Some(ProviderError::Observation(failure)) => failure.clone(),
+                    _ => forge_provider_api::lifecycle::ObservationFailure::Protocol,
+                };
                 let cause = provider_failure(ProviderFailureKind::Protocol);
                 self.invalidate_binding(cause.clone()).await;
                 if let Some(sink) = self.publication_sink().await {
-                    sink.fail(events::EventDeliveryError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::Protocol,
-                    ));
+                    sink.fail(events::EventDeliveryError::Observation(observation));
                 }
                 Err(AcpConnectionError::Callback(Box::new(cause)))
             }
@@ -1315,14 +1923,11 @@ impl AcpSessionState {
         if !self.is_admitting() {
             return;
         }
-        let event = ProviderEvent::CapabilitiesChanged {
-            scope: sink.scope().clone(),
-            capabilities,
-        };
+        let event = capabilities;
         let delivery = tokio::select! {
             biased;
             _ = self.admission_revocation.cancelled() => return,
-            delivery = sink.send_wait(event) => delivery,
+            delivery = sink.capabilities_changed(event) => delivery,
         };
         if let Err(error) = delivery {
             sink.fail(error.clone());
@@ -1347,6 +1952,77 @@ impl AcpSessionState {
     }
 }
 
+/// Merge a native descriptor only after checking every immutable category constraint.
+fn merge_tool_snapshot(snapshot: &mut Value, update: &Value) -> Result<bool, ProviderError> {
+    let present = |value: &Value| !value.is_null();
+    if let Some(previous) = snapshot.get("kind").filter(|kind| present(kind))
+        && let Some(next) = update.get("kind").filter(|kind| present(kind))
+        && normalized_tool_kind(previous) != normalized_tool_kind(next)
+    {
+        return Err(ProviderError::Observation(
+            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+        ));
+    }
+    let invocation_changed = ["title", "kind", "rawInput"].into_iter().any(|field| {
+        update
+            .get(field)
+            .is_some_and(|value| present(value) && snapshot.get(field) != Some(value))
+    });
+    if let Some(fields) = update.as_object() {
+        for (field, value) in fields {
+            if present(value) {
+                snapshot[field] = value.clone();
+            }
+        }
+    }
+    Ok(invocation_changed)
+}
+
+/// Normalize one complete native snapshot before publishing its immutable item type and descriptor.
+fn normalize_tool_descriptor(snapshot: &Value) -> (ToolKind, ToolDescriptor) {
+    normalize_descriptor(
+        normalized_tool_kind(&snapshot["kind"]),
+        ToolDescriptor {
+            semantics: Default::default(),
+            name: snapshot["title"].as_str().unwrap_or("Tool").into(),
+            title: snapshot["title"].as_str().unwrap_or("Tool").into(),
+            arguments: InspectableArguments::new(
+                snapshot.get("rawInput").cloned().unwrap_or(Value::Null),
+            ),
+        },
+    )
+}
+
+/// Preserve the normalized item category across native descriptor revisions.
+fn normalized_tool_kind(kind: &Value) -> ToolKind {
+    match kind.as_str() {
+        Some("edit" | "delete" | "move") => ToolKind::FileChange,
+        Some("execute") => ToolKind::Command,
+        Some(_) | None => ToolKind::ToolCall,
+    }
+}
+
+/// Preserve prose classification independently from reasoning streams.
+fn message_classification(role: Option<AcpMessageRole>) -> MessageClassification {
+    match role {
+        Some(AcpMessageRole::Commentary) => {
+            MessageClassification::Known(AgentMessageRole::Commentary)
+        }
+        Some(AcpMessageRole::Response) => MessageClassification::Known(AgentMessageRole::Response),
+        Some(AcpMessageRole::Reasoning) | None => MessageClassification::Unclassified,
+    }
+}
+
+/// Attribute one typed item event to its retained original turn.
+fn item_activity(turn: &TurnAddress, item_id: &ItemId, event: ItemEvent) -> AdapterActivity {
+    AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: item_id.clone(),
+        event,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,11 +2033,11 @@ mod tests {
         let state = AcpSessionState::new_native(ProviderKind::Claude);
         state.close_admission();
         assert!(
-            matches!(state.ensure_admission(ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Invalidated)
+            matches!(state.ensure_admission(ProviderOperation::ThreadConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Invalidated)
         );
         state.mark_collected();
         assert!(
-            matches!(state.ensure_admission(ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
+            matches!(state.ensure_admission(ProviderOperation::ThreadConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
         );
     }
 
@@ -1372,7 +2048,7 @@ mod tests {
         let (sink, mut stream) = events::channel(
             BindingId::new("revoked-capability")?,
             EventScope::Binding {
-                owner: ExecutionOwner::root("host"),
+                owner: ThreadOwner::root("host"),
             },
         );
         let mut manifest = forge_provider_api::capability::CapabilityManifest::from_descriptor(
@@ -1420,7 +2096,7 @@ mod tests {
         let (sink, mut stream) = events::channel(
             BindingId::new("effort-category")?,
             EventScope::Binding {
-                owner: ExecutionOwner::root("host"),
+                owner: ThreadOwner::root("host"),
             },
         );
         let mut manifest = CapabilityManifest::from_descriptor(
@@ -1449,7 +2125,9 @@ mod tests {
         assert_eq!(manifest.effective_revision, 1);
         assert!(matches!(
             stream.try_next()?.map(|event| event.event),
-            Some(ProviderEvent::CapabilitiesChanged { .. })
+            Some(ProviderEvent::Provider {
+                event: ProviderConnectionEvent::CapabilitiesChanged(_)
+            })
         ));
         Ok(())
     }
@@ -1482,7 +2160,7 @@ mod tests {
         let permission = Arc::new(PendingPermission {
             started: tokio::sync::Notify::new(),
         });
-        let scope = InvocationScope::new(ExecutionOwner::root("host"), "cancelled");
+        let scope = InvocationScope::new(ThreadOwner::root("host"), "cancelled");
         let (sink, _stream) = events::channel(BindingId::new("binding")?, scope.clone());
         state
             .begin_native("native", sink, permission.clone())
@@ -1500,7 +2178,7 @@ mod tests {
         .await?;
         assert_eq!(callback.await??["outcome"]["outcome"], "cancelled");
         state
-            .finish(forge_provider_api::turn::TurnOutcome::Cancelled)
+            .finish(forge_provider_api::turn::TurnOutcome::Interrupted)
             .await?;
         let successor = InvocationScope::new(scope.owner.clone(), "successor");
         let (sink, _stream) = events::channel(BindingId::new("successor-binding")?, successor);
@@ -1525,7 +2203,7 @@ mod tests {
     -> Result<()> {
         for active in [false, true] {
             let state = AcpSessionState::new_native(ProviderKind::Claude);
-            let owner = ExecutionOwner::root("capability-host");
+            let owner = ThreadOwner::root("capability-host");
             let (sink, mut stream) = events::channel(
                 BindingId::new("capability-binding")?,
                 EventScope::Binding {
@@ -1566,14 +2244,12 @@ mod tests {
             );
             state.notification("session/update", json!({"sessionId":"native","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"effort","options":[{"value":"high"}]}]}})).await?;
             let event = stream.recv().await?.unwrap();
-            let ProviderEvent::CapabilitiesChanged {
-                scope,
-                capabilities,
+            let ProviderEvent::Provider {
+                event: ProviderConnectionEvent::CapabilitiesChanged(capabilities),
             } = event.event
             else {
                 panic!("catalog change must publish effective capabilities");
             };
-            assert_eq!(scope, EventScope::Binding { owner });
             assert_eq!(capabilities.effective_revision, 1);
             assert!(!capabilities.task_steering.contains(&TaskKind::Goal));
             assert!(
@@ -1607,7 +2283,7 @@ mod tests {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let (sink, _stream) = events::channel(
             BindingId::new("binding")?,
-            InvocationScope::new(ExecutionOwner::root("host"), "exchange"),
+            InvocationScope::new(ThreadOwner::root("host"), "exchange"),
         );
         state.begin("native", sink).await?;
         state.notification("session/update", json!({"sessionId":"native","update":{
@@ -1619,7 +2295,9 @@ mod tests {
             assert!(!tools.contains_key(&("other".into(), "edit".into())));
         }
         state
-            .finish(forge_provider_api::turn::TurnOutcome::Completed)
+            .finish(forge_provider_api::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            })
             .await?;
         assert!(
             state
@@ -1630,7 +2308,7 @@ mod tests {
         );
         let (next_sink, _next_stream) = events::channel(
             BindingId::new("next-binding")?,
-            InvocationScope::new(ExecutionOwner::root("host"), "next"),
+            InvocationScope::new(ThreadOwner::root("host"), "next"),
         );
         state.begin("native", next_sink).await?;
         assert!(state.tool.lock().await.is_empty());
@@ -1651,11 +2329,13 @@ mod tests {
     async fn retained_history_reload_does_not_republish_old_transcript_or_tools() -> Result<()> {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let binding = BindingId::new("history-reload-binding".to_owned())?;
-        let scope = InvocationScope::new(ExecutionOwner::root("host"), "original-exchange");
+        let scope = InvocationScope::new(ThreadOwner::root("host"), "original-exchange");
         let (sink, mut stream) = events::channel(binding, scope);
         state.begin("native", sink).await?;
         state
-            .finish(forge_provider_api::turn::TurnOutcome::Completed)
+            .finish(forge_provider_api::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            })
             .await?;
         while stream.try_next()?.is_some() {}
 
@@ -1696,7 +2376,7 @@ mod tests {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let (sink, mut stream) = events::channel(
             BindingId::new("tool-diagnostic-binding")?,
-            InvocationScope::new(ExecutionOwner::root("host"), "tool-diagnostic-exchange"),
+            InvocationScope::new(ThreadOwner::root("host"), "tool-diagnostic-exchange"),
         );
         state.begin("native", sink).await?;
 
@@ -1720,17 +2400,13 @@ mod tests {
         let outputs = events
             .iter()
             .filter_map(|event| match event {
-                ProviderEvent::Tool {
-                    address,
-                    update:
-                        ToolUpdate::Output {
-                            update: TextUpdate::Replace(text),
+                ProviderEvent::Item {
+                    event:
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Output(TextUpdate::Replace(text)),
                         },
-                } if address.tool_id == forge_provider_api::ToolId::from("denied-tool")
-                    || address.tool_id == forge_provider_api::ToolId::from("failed-tool") =>
-                {
-                    Some(text.as_str())
-                }
+                    ..
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1742,26 +2418,22 @@ mod tests {
         let outcomes = events
             .iter()
             .filter_map(|event| match event {
-                ProviderEvent::Tool {
-                    address,
-                    update: ToolUpdate::Finished { outcome },
-                } if address.tool_id == forge_provider_api::ToolId::from("denied-tool")
-                    || address.tool_id == forge_provider_api::ToolId::from("failed-tool") =>
-                {
-                    Some((address.tool_id.as_str(), outcome))
-                }
+                ProviderEvent::Item {
+                    event: ItemEvent::Completed(ItemCompletion::ToolCall(completion)),
+                    ..
+                } => Some(&completion.outcome),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(outcomes.len(), 2);
         match outcomes[0] {
-            ("denied-tool", ToolOutcome::Denied { reason }) => {
+            ToolOutcome::Denied { reason } => {
                 assert_eq!(reason.as_str(), "Tool execution was denied by the provider");
             }
             _ => panic!("expected a normalized denied outcome"),
         }
         match outcomes[1] {
-            ("failed-tool", ToolOutcome::Failed { diagnostic }) => {
+            ToolOutcome::Failed { diagnostic } => {
                 assert_eq!(
                     diagnostic.message.as_str(),
                     "Provider tool execution failed"
@@ -1769,7 +2441,7 @@ mod tests {
             }
             _ => panic!("expected a normalized failed outcome"),
         }
-        assert!(outcomes.iter().all(|(_, outcome)| {
+        assert!(outcomes.iter().all(|outcome| {
             match outcome {
                 ToolOutcome::Denied { reason } => {
                     !reason.as_str().contains("native diagnostic sentinel")
@@ -1782,5 +2454,25 @@ mod tests {
             }
         }));
         Ok(())
+    }
+
+    /// An incomplete descriptor may acquire a category without erasing earlier arguments.
+    #[test]
+    fn descriptor_merge_refines_missing_kind_and_rejects_conflict_atomically() {
+        let mut snapshot = json!({"title":"Pending", "rawInput":{"path":"old"}});
+        assert!(
+            merge_tool_snapshot(&mut snapshot, &json!({"kind":"execute", "title":"Run"})).unwrap()
+        );
+        assert_eq!(snapshot["rawInput"]["path"], "old");
+        let retained = snapshot.clone();
+        assert!(!merge_tool_snapshot(&mut snapshot, &retained).unwrap());
+        assert!(
+            merge_tool_snapshot(
+                &mut snapshot,
+                &json!({"kind":"edit", "title":"Invalid", "rawInput":{"path":"new"}})
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot, retained);
     }
 }

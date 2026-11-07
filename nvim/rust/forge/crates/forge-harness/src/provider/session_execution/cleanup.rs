@@ -337,7 +337,7 @@ mod tests {
         let receiver = ledger.start(CleanupWorkKind::OwnerFence, async {
             Err(
                 crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::SessionClose,
+                    forge_provider_api::ProviderOperation::ThreadClose,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
                 .into(),
@@ -345,7 +345,7 @@ mod tests {
         })?;
         drop(receiver);
         let error = ledger.collect().await.unwrap_err();
-        assert!(std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |error| error.source()).any(|cause| matches!(cause.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Failure(failure)) if failure.operation() == forge_provider_api::ProviderOperation::SessionClose && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)));
+        assert!(std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |error| error.source()).any(|cause| matches!(cause.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Failure(failure)) if failure.operation() == forge_provider_api::ProviderOperation::ThreadClose && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)));
         Ok(())
     }
 
@@ -413,7 +413,7 @@ mod tests {
         assert!(!debug.contains("private-native-panic-marker"));
         assert!(!debug.contains("credential-marker"));
         let normalized = crate::provider::lifecycle_error::classify_source(
-            forge_provider_api::ProviderOperation::SessionClose,
+            forge_provider_api::ProviderOperation::ThreadClose,
             &report,
         );
         assert!(
@@ -450,7 +450,7 @@ mod tests {
             .all(|error| !error.is::<tokio::task::JoinError>())
         );
         let normalized = crate::provider::lifecycle_error::classify_source(
-            forge_provider_api::ProviderOperation::SessionClose,
+            forge_provider_api::ProviderOperation::ThreadClose,
             &report,
         );
         assert!(

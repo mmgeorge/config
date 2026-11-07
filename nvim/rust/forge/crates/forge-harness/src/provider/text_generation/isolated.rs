@@ -52,7 +52,7 @@ impl TextGenerationJobs {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -78,7 +78,7 @@ impl TextGenerationJobs {
         }
         receive
             .await
-            .map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Runtime))?
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?
     }
 
     /// Close utility admission and join every retained worker without holding its state lock.
@@ -190,7 +190,7 @@ impl api::permissions::ProviderPermissions for IsolatedCallbacks {
     /// Reject native tools even if an adapter violates its isolated policy.
     async fn before_tool(&self, _: &api::InvocationScope) -> Result<(), ProviderError> {
         Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Policy,
         ))
     }
@@ -205,7 +205,7 @@ impl api::control::ProviderTools for IsolatedCallbacks {
         _: api::control::ToolCall,
     ) -> Result<String, ProviderError> {
         Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Policy,
         ))
     }
@@ -280,12 +280,8 @@ async fn generate(
     let selected = models.iter().find(|model| {
         model.id == request.model || (request.model == "default" && model.is_default)
     });
-    let selected = selected.ok_or_else(|| {
-        failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Rejected,
-        )
-    })?;
+    let selected = selected
+        .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected))?;
     let reasoning = match request.reasoning {
         api::ReasoningSelection::Default => api::ReasoningSelection::Default,
         api::ReasoningSelection::Lowest => api::generation::lowest_effort(selected)?.map_or(
@@ -295,7 +291,7 @@ async fn generate(
         api::ReasoningSelection::Level(level) => {
             if !selected.reasoning.contains(&level) {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -312,17 +308,18 @@ async fn generate(
         write_access: api::access::WriteScope::Off,
         ..Default::default()
     };
-    let owner = api::ExecutionOwner::root(format!("utility-{}", uuid::Uuid::new_v4()));
+    let owner = api::ThreadOwner::root(format!("utility-{}", uuid::Uuid::new_v4()));
     let scope = api::InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string());
-    let open_operation = OperationControl::fresh(ProviderOperation::SessionOpen)?;
+    let open_operation = OperationControl::fresh(ProviderOperation::ThreadOpen)?;
     let opened = observe_operation(
         &open_operation,
         &cancellation,
         api::ProviderPhase::Preparation,
         api::FailureDisposition::Uncertain,
-        provider.session_open(
+        provider.thread_open(
             open_operation.context(),
             api::SessionRequest {
+                thread_id: owner.thread_id(),
                 owner,
                 mode: api::SessionMode::Background,
                 workspace: request.workspace,
@@ -363,6 +360,11 @@ async fn generate(
     );
     let callbacks = Arc::new(IsolatedCallbacks);
     let prompt = api::PromptRequest {
+        thread_id: (scope.clone()).owner.thread_id(),
+        turn_id: (scope.clone())
+            .turn_id()
+            .expect("admitted scope has a nonempty host turn identity"),
+
         scope: scope.clone(),
         mode: api::PromptMode::Chat,
         configuration: api::InvocationConfiguration {
@@ -375,7 +377,7 @@ async fn generate(
         tool_endpoint: None,
         resource_lease: None,
         submission_id: submission_id.clone(),
-        attempt_id,
+        attempt_id: attempt_id.clone(),
         input: api::PromptInput::Text(request.input),
         dispatch,
         recovered_inputs: Vec::new(),
@@ -387,7 +389,7 @@ async fn generate(
         turn_control: callbacks.clone(),
         host_effects: callbacks,
     };
-    let submit_operation = OperationControl::fresh(ProviderOperation::InputSubmit)?;
+    let submit_operation = OperationControl::fresh(ProviderOperation::TurnStart)?;
     let result = observe_operation(
         &submit_operation,
         &cancellation,
@@ -395,12 +397,12 @@ async fn generate(
         api::FailureDisposition::Uncertain,
         async {
             let (accepted, text) = tokio::try_join!(
-                provider.input_submit(submit_operation.context(), &binding, prompt),
-                collect(&mut events, &binding, &scope, &submission_id)
+                provider.turn_start(submit_operation.context(), &binding, prompt),
+                collect(&mut events, &binding, &scope, &submission_id, &attempt_id)
             )?;
             if accepted.submission_id != submission_id {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Protocol,
                 ));
             }
@@ -413,7 +415,7 @@ async fn generate(
     }
 
     // Closing revokes callbacks and collects even after validation or explicit cancellation.
-    let close_operation = OperationControl::fresh(ProviderOperation::SessionClose)?;
+    let close_operation = OperationControl::fresh(ProviderOperation::ThreadClose)?;
     let closed = close(provider.as_ref(), &close_operation, &binding, &mut events).await;
     match (result, closed) {
         (Ok(text), Ok(())) => Ok(text),
@@ -455,7 +457,7 @@ async fn close(
     events: &mut api::ProviderEventStream,
 ) -> Result<(), ProviderError> {
     let context = control.context();
-    let collection = provider.session_close(context.clone(), binding);
+    let collection = provider.thread_close(context.clone(), binding);
     tokio::pin!(collection);
     let mut stream_open = true;
     loop {
@@ -463,7 +465,7 @@ async fn close(
             result = &mut collection => return result,
             interruption = context.interrupted() => {
                 control.cancel();
-                return Err(interruption.failure(ProviderOperation::SessionClose, api::ProviderPhase::Close, api::FailureDisposition::Invalidated));
+                return Err(interruption.failure(ProviderOperation::ThreadClose, api::ProviderPhase::Close, api::FailureDisposition::Invalidated));
             }
             event = events.recv(), if stream_open => {
                 match event {
@@ -475,153 +477,255 @@ async fn close(
     }
 }
 
-/// Collect final response messages while excluding reasoning, commentary, and tool output.
+/// Preserve message item kind while selecting only explicit final-answer prose.
+enum IsolatedMessage {
+    Agent {
+        classification: api::MessageClassification,
+        text: String,
+    },
+    Other,
+}
+
+/// Collect explicit response items through the authoritative provider-collection boundary.
 async fn collect(
     events: &mut api::ProviderEventStream,
     binding: &api::BindingId,
     scope: &api::InvocationScope,
     submission: &api::SubmissionId,
+    attempt: &api::DeliveryAttemptId,
 ) -> Result<String, ProviderError> {
-    let mut messages = HashMap::<api::MessageId, (api::MessageClassification, String)>::new();
+    let mut thread_errors = Vec::new();
+    let mut messages = HashMap::<api::ItemId, IsolatedMessage>::new();
     let mut order = Vec::new();
-    let mut terminal = false;
-    let mut sequence = api::EventSequence::default();
-    while let Some(event) = events.recv().await.map_err(|_| {
+    let thread_id = scope.owner.thread_id();
+    let turn_id = scope.turn_id().map_err(|_| {
         failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
+            ProviderOperation::TurnStart,
+            ProviderFailureKind::WrongInvocation,
         )
-    })? {
-        if &event.binding_id != binding {
+    })?;
+    let mut sequence = api::EventSequence::default();
+    while let Some(envelope) = events.recv().await? {
+        if &envelope.binding_id != binding || envelope.sequence <= sequence {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Protocol,
             ));
         }
-        if event.sequence <= sequence {
-            return Err(failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            ));
-        }
-        sequence = event.sequence;
-        match event.event {
-            api::ProviderEvent::Message { address, update } => {
-                if &address.turn.scope != scope {
+        sequence = envelope.sequence;
+        match envelope.event {
+            api::ProviderEvent::Provider { event } => match event {
+                api::ProviderConnectionEvent::Unavailable(unavailable) => {
+                    return Err(unavailable.failure.into());
+                }
+                api::ProviderConnectionEvent::CapabilitiesChanged(_)
+                | api::ProviderConnectionEvent::Warning(_) => {}
+            },
+            api::ProviderEvent::Thread {
+                thread_id: observed_thread,
+                event,
+            } => {
+                if observed_thread != thread_id {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Protocol,
+                        ProviderOperation::TurnStart,
+                        ProviderFailureKind::WrongInvocation,
                     ));
                 }
-                let message = messages
-                    .entry(address.message_id.clone())
-                    .or_insert_with(|| {
-                        order.push(address.message_id.clone());
-                        (api::MessageClassification::Unclassified, String::new())
-                    });
-                match update {
-                    api::MessageUpdate::Started {
-                        classification,
-                        text,
-                    } => *message = (classification, text),
-                    api::MessageUpdate::Delta { text } => message.1.push_str(&text),
-                    api::MessageUpdate::Completed { text } => message.1 = text,
-                    api::MessageUpdate::Classified { role } => {
-                        message.0 = api::MessageClassification::Known(role)
+                match event {
+                    api::ThreadEvent::Error { error } => {
+                        thread_errors.push(ProviderError::Failure(error))
                     }
-                    api::MessageUpdate::Interrupted => {}
+                    api::ThreadEvent::IdentityResolved(_)
+                    | api::ThreadEvent::ContextUsage(_)
+                    | api::ThreadEvent::TerminalsUpdated(_)
+                    | api::ThreadEvent::CompactionUpdated(_) => {}
                 }
             }
-            api::ProviderEvent::Execution { observation } => {
-                if observation.scope() != scope {
+            api::ProviderEvent::Turn {
+                thread_id: observed_thread,
+                turn_id: observed_turn,
+                event,
+            } => {
+                if observed_thread != thread_id || observed_turn != turn_id {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Protocol,
+                        ProviderOperation::TurnStart,
+                        ProviderFailureKind::WrongInvocation,
                     ));
                 }
-                match observation.update() {
-                    api::ExecutionUpdate::Finished {
-                        covered_submissions,
-                        result,
-                        ..
-                    }
-                    | api::ExecutionUpdate::ResolvedWithoutExecution {
-                        covered_submissions,
-                        result,
-                        ..
-                    } => {
-                        if !covered_submissions.contains(submission)
-                            || !matches!(result, api::ExecutionResult::Completed { .. })
-                        {
+                match event {
+                    api::TurnEvent::Completed(completed) => {
+                        let result = completed.result();
+                        if !result.covered_inputs().iter().any(|input| {
+                            input.submission_id() == submission && input.attempt_id() == attempt
+                        }) {
                             return Err(failure(
-                                ProviderOperation::InputSubmit,
-                                ProviderFailureKind::Rejected,
+                                ProviderOperation::TurnStart,
+                                ProviderFailureKind::Protocol,
                             ));
                         }
-                        terminal = true;
+                        match result.outcome() {
+                            api::turn::TurnOutcome::Completed {
+                                stop_reason: api::turn::TurnCompletionReason::Normal,
+                            } => {}
+                            api::turn::TurnOutcome::Completed {
+                                stop_reason:
+                                    api::turn::TurnCompletionReason::TokenLimit
+                                    | api::turn::TurnCompletionReason::RequestLimit
+                                    | api::turn::TurnCompletionReason::Refusal,
+                            } => {
+                                return Err(failure(
+                                    ProviderOperation::TurnStart,
+                                    ProviderFailureKind::Rejected,
+                                ));
+                            }
+                            api::turn::TurnOutcome::Failed { error, .. } => {
+                                return Err(error.into());
+                            }
+                            api::turn::TurnOutcome::Interrupted => {
+                                return Err(ProviderError::Cancelled);
+                            }
+                        }
+                        return Ok(order
+                            .iter()
+                            .filter_map(|id| match messages.get(id) {
+                                Some(IsolatedMessage::Agent {
+                                    classification:
+                                        api::MessageClassification::Known(
+                                            api::AgentMessageRole::Response,
+                                        ),
+                                    text,
+                                }) => Some(text.as_str()),
+                                Some(IsolatedMessage::Agent { .. } | IsolatedMessage::Other)
+                                | None => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"));
                     }
-                    api::ExecutionUpdate::Started { .. } => {}
-                    api::ExecutionUpdate::PublicationFailed { .. }
-                    | api::ExecutionUpdate::ResolutionPublicationFailed { .. }
-                    | api::ExecutionUpdate::ObservationLost { .. } => {
+                    api::TurnEvent::Error { error } => thread_errors.push(error.into()),
+                    api::TurnEvent::Started(_)
+                    | api::TurnEvent::ModelResolved(_)
+                    | api::TurnEvent::Usage(_)
+                    | api::TurnEvent::ChecklistUpdated(_) => {}
+                }
+            }
+            api::ProviderEvent::Item {
+                thread_id: observed_thread,
+                turn_id: observed_turn,
+                item_id,
+                event,
+            } => {
+                if observed_thread != thread_id || observed_turn != turn_id {
+                    return Err(failure(
+                        ProviderOperation::TurnStart,
+                        ProviderFailureKind::WrongInvocation,
+                    ));
+                }
+                match event {
+                    api::ItemEvent::Started(start) => {
+                        if messages.contains_key(&item_id) {
+                            return Err(failure(
+                                ProviderOperation::TurnStart,
+                                ProviderFailureKind::Protocol,
+                            ));
+                        }
+                        let message = match start {
+                            api::ItemStart::AgentMessage(start) => IsolatedMessage::Agent {
+                                classification: start.classification,
+                                text: start.text,
+                            },
+                            api::ItemStart::UserMessage(_) | api::ItemStart::Reasoning(_) => {
+                                IsolatedMessage::Other
+                            }
+                            api::ItemStart::CommandExecution(_)
+                            | api::ItemStart::FileChange(_)
+                            | api::ItemStart::ToolCall(_) => {
+                                return Err(failure(
+                                    ProviderOperation::TurnStart,
+                                    ProviderFailureKind::Policy,
+                                ));
+                            }
+                        };
+                        order.push(item_id.clone());
+                        messages.insert(item_id, message);
+                    }
+                    api::ItemEvent::Message { event } => {
+                        let message = messages.get_mut(&item_id).ok_or_else(|| {
+                            failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                        })?;
+                        if let IsolatedMessage::Agent {
+                            classification,
+                            text,
+                        } = message
+                        {
+                            match event {
+                                api::MessageItemEvent::Classified(observed) => {
+                                    *classification = observed
+                                }
+                                api::MessageItemEvent::Delta(delta) => text.push_str(&delta),
+                            }
+                        }
+                    }
+                    api::ItemEvent::Completed(completion) => {
+                        let message = messages.get_mut(&item_id).ok_or_else(|| {
+                            failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                        })?;
+                        match completion {
+                            api::ItemCompletion::AgentMessage(completion) => {
+                                let IsolatedMessage::Agent { text, .. } = message else {
+                                    return Err(failure(
+                                        ProviderOperation::TurnStart,
+                                        ProviderFailureKind::Protocol,
+                                    ));
+                                };
+                                *text = completion.text;
+                                if completion.outcome == api::MessageOutcome::Interrupted {
+                                    return Err(ProviderError::Cancelled);
+                                }
+                            }
+                            api::ItemCompletion::UserMessage(_)
+                            | api::ItemCompletion::Reasoning(_) => {
+                                if matches!(message, IsolatedMessage::Agent { .. }) {
+                                    return Err(failure(
+                                        ProviderOperation::TurnStart,
+                                        ProviderFailureKind::Protocol,
+                                    ));
+                                }
+                            }
+                            api::ItemCompletion::CommandExecution(_)
+                            | api::ItemCompletion::FileChange(_)
+                            | api::ItemCompletion::ToolCall(_) => {
+                                return Err(failure(
+                                    ProviderOperation::TurnStart,
+                                    ProviderFailureKind::Policy,
+                                ));
+                            }
+                        }
+                    }
+                    api::ItemEvent::Tool { .. } => {
                         return Err(failure(
-                            ProviderOperation::InputSubmit,
-                            ProviderFailureKind::Protocol,
+                            ProviderOperation::TurnStart,
+                            ProviderFailureKind::Policy,
                         ));
                     }
                 }
             }
-            api::ProviderEvent::Settled { settlement } => {
-                if settlement.binding_id != *binding
-                    || settlement.scope != *scope
-                    || !terminal
-                    || settlement.watermark > sequence
-                    || !matches!(settlement.result, api::ExecutionResult::Completed { .. })
-                {
-                    return Err(failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Protocol,
-                    ));
-                }
-                return Ok(order
-                    .iter()
-                    .filter_map(|id| messages.get(id))
-                    .filter(|(role, _)| {
-                        *role == api::MessageClassification::Known(api::MessageRole::Response)
-                    })
-                    .map(|(_, text)| text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"));
-            }
-            api::ProviderEvent::SettlementFailed { failure, .. } => {
-                return Err(ProviderError::Failure(failure));
-            }
-            api::ProviderEvent::Tool { .. } | api::ProviderEvent::Approval { .. } => {
+            api::ProviderEvent::Agent { .. } => {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Policy,
                 ));
             }
-            api::ProviderEvent::Terminals { .. }
-            | api::ProviderEvent::CapabilitiesChanged { .. }
-            | api::ProviderEvent::SessionIdentity { .. }
-            | api::ProviderEvent::Turn { .. }
-            | api::ProviderEvent::Usage { .. }
-            | api::ProviderEvent::Runtime { .. }
-            | api::ProviderEvent::Compaction { .. }
-            | api::ProviderEvent::Agent { .. }
-            | api::ProviderEvent::Checklist { .. }
-            | api::ProviderEvent::DirectoryAccess { .. }
-            | api::ProviderEvent::InputAccepted { .. }
-            | api::ProviderEvent::Retry { .. }
-            | api::ProviderEvent::Diagnostic { .. }
-            | api::ProviderEvent::ParentBoundary { .. } => {}
         }
     }
-    Err(failure(
-        ProviderOperation::InputSubmit,
-        ProviderFailureKind::Protocol,
-    ))
+    let primary = failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
+    Err(if thread_errors.is_empty() {
+        primary
+    } else {
+        ProviderError::Combined {
+            primary: Box::new(primary),
+            secondary: thread_errors,
+        }
+    })
 }
 
 /// Classify shared utility failures without exposing native protocol details.
@@ -652,7 +756,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::AcqRel);
             if self.reject {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -679,61 +783,64 @@ mod tests {
         })).expect("fixture normalized model")]
     }
 
-    /// Publish native terminal evidence; the fixture separately collects and publishes settlement.
+    /// Supply native response-cycle evidence to the fixture's actual retained runner.
     async fn finish(
         request: &api::PromptRequest,
-        sink: &api::ProviderEventSink,
+        sink: &api::AdapterActivityWriter,
+        start: &api::NativeTurnStart,
         cancelled: bool,
-    ) -> Result<(), ProviderError> {
-        let address = crate::provider::test_support::address(
-            &request.scope,
-            "utility-history",
-            "utility-turn",
-        );
-        sink.send_wait(api::ProviderEvent::Execution {
-            observation: api::ExecutionObservation::new(
-                request.scope.clone(),
-                api::ExecutionUpdate::Started {
-                    address: address.clone(),
-                },
-            )?,
-        })
-        .await?;
-        for event in crate::provider::test_support::message(
-            &address,
-            "reasoning",
-            Some(api::MessageRole::Thought),
-            "excluded reasoning",
-        ) {
-            sink.send_wait(event).await?;
-        }
-        for event in crate::provider::test_support::message(
-            &address,
-            "answer",
-            Some(api::MessageRole::Response),
-            "final text",
-        ) {
-            sink.send_wait(event).await?;
-        }
-        let completion = api::completion::ProviderCompletion::default().into();
-        let result = if cancelled {
-            api::ExecutionResult::Cancelled { completion }
-        } else {
-            api::ExecutionResult::Completed { completion }
+    ) -> Result<api::TurnResult, ProviderError> {
+        start.observed(0).await?;
+        let address = api::TurnAddress {
+            scope: request.scope.clone(),
+            thread_id: request.thread_id.clone(),
+            turn_id: request.turn_id.clone(),
         };
-        sink.send_wait(api::ProviderEvent::Execution {
-            observation: api::ExecutionObservation::new(
-                request.scope.clone(),
-                api::ExecutionUpdate::Finished {
-                    address,
-                    covered_submissions: vec![request.submission_id.clone()],
-                    completed_at_ms: 1,
-                    result,
-                },
-            )?,
-        })
-        .await?;
-        Ok(())
+        for (id, role, text) in [
+            (
+                "reasoning",
+                api::TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Full),
+                "excluded reasoning",
+            ),
+            ("answer", api::TestMessageContent::Response, "final text"),
+        ] {
+            for event in crate::provider::test_support::message(&address, id, Some(role), text) {
+                let api::ProviderEvent::Item {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    event,
+                } = event
+                else {
+                    unreachable!("message fixture emits only item activity")
+                };
+                sink.send_wait(api::AdapterActivity::Item {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    event,
+                })
+                .await?;
+            }
+        }
+        api::TurnResult::new(
+            if cancelled {
+                api::turn::TurnOutcome::Interrupted
+            } else {
+                api::turn::TurnOutcome::Completed {
+                    stop_reason: api::turn::TurnCompletionReason::Normal,
+                }
+            },
+            1,
+            None,
+            vec![api::CoveredInput::new(
+                request.submission_id.clone(),
+                request.attempt_id.clone(),
+            )],
+            vec![],
+            None,
+        )
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
     }
 
     /// Preserve worker ownership after dropped waiters and close history after validator rejection.
@@ -748,7 +855,7 @@ mod tests {
             let descriptor = forge_providers::registry::descriptor(
                 &forge_providers::registry::nonselectable_id().expect("fixture identity"),
             )?;
-            let native = EventFixtureProvider::new(descriptor, move |request, sink, _| {
+            let native = EventFixtureProvider::new(descriptor, move |request, sink, start, _| {
                 let entered = entered_worker.clone();
                 let release = release_worker.clone();
                 async move {
@@ -758,7 +865,7 @@ mod tests {
                         .await
                         .expect("test gate remains open")
                         .forget();
-                    finish(&request, &sink, false).await
+                    finish(&request, &sink, &start, false).await
                 }
             })
             .with_models(models());
@@ -806,17 +913,18 @@ mod tests {
         let descriptor = forge_providers::registry::descriptor(
             &forge_providers::registry::nonselectable_id().expect("fixture identity"),
         )?;
-        let native = EventFixtureProvider::new(descriptor, move |request, sink, mut cancelled| {
-            let entered = entered_worker.clone();
-            async move {
-                entered.notify_one();
-                if !*cancelled.borrow() {
-                    let _ = cancelled.changed().await;
+        let native =
+            EventFixtureProvider::new(descriptor, move |request, sink, start, mut cancelled| {
+                let entered = entered_worker.clone();
+                async move {
+                    entered.notify_one();
+                    if !*cancelled.borrow() {
+                        let _ = cancelled.changed().await;
+                    }
+                    finish(&request, &sink, &start, true).await
                 }
-                finish(&request, &sink, true).await
-            }
-        })
-        .with_models(models());
+            })
+            .with_models(models());
         let closed = Arc::new(AtomicUsize::new(0));
         let observed_close = closed.clone();
         native.with_session_close(move |_| {
@@ -855,17 +963,18 @@ mod tests {
         let descriptor = forge_providers::registry::descriptor(
             &forge_providers::registry::nonselectable_id().expect("fixture identity"),
         )?;
-        let native = EventFixtureProvider::new(descriptor, move |request, sink, mut cancelled| {
-            let entered = entered_worker.clone();
-            async move {
-                entered.notify_one();
-                if !*cancelled.borrow() {
-                    let _ = cancelled.changed().await;
+        let native =
+            EventFixtureProvider::new(descriptor, move |request, sink, start, mut cancelled| {
+                let entered = entered_worker.clone();
+                async move {
+                    entered.notify_one();
+                    if !*cancelled.borrow() {
+                        let _ = cancelled.changed().await;
+                    }
+                    finish(&request, &sink, &start, true).await
                 }
-                finish(&request, &sink, true).await
-            }
-        })
-        .with_models(models());
+            })
+            .with_models(models());
         let closed = Arc::new(AtomicUsize::new(0));
         let observed_close = closed.clone();
         native.with_session_close(move |_| {
@@ -899,33 +1008,65 @@ mod tests {
         let descriptor = forge_providers::registry::descriptor(
             &forge_providers::registry::nonselectable_id().expect("fixture identity"),
         )?;
-        let native = EventFixtureProvider::new(descriptor, move |request, sink, _| async move {
-            let address = crate::provider::test_support::address(
-                &request.scope,
-                "utility-history",
-                "oversized-turn",
-            );
-            for event in crate::provider::test_support::message(
-                &address,
-                "oversized",
-                Some(api::MessageRole::Response),
-                "x".repeat(1024 * 1024 + 1),
-            ) {
-                sink.send_wait(event).await?;
-            }
-            for index in 0..1025 {
+        let native =
+            EventFixtureProvider::new(descriptor, move |request, sink, start, _| async move {
+                let address = api::TurnAddress {
+                    scope: request.scope.clone(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                };
+                start.observed(0).await?;
                 for event in crate::provider::test_support::message(
                     &address,
-                    format!("extra-{index}"),
-                    Some(api::MessageRole::Response),
-                    "extra",
+                    "oversized",
+                    Some(api::TestMessageContent::Response),
+                    "x".repeat(1024 * 1024 + 1),
                 ) {
-                    sink.send_wait(event).await?;
+                    let api::ProviderEvent::Item {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        event,
+                    } = event
+                    else {
+                        unreachable!("message fixture emits item activity")
+                    };
+                    sink.send_wait(api::AdapterActivity::Item {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        event,
+                    })
+                    .await?;
                 }
-            }
-            finish(&request, &sink, false).await
-        })
-        .with_models(models());
+                for index in 0..1025 {
+                    for event in crate::provider::test_support::message(
+                        &address,
+                        format!("extra-{index}"),
+                        Some(api::TestMessageContent::Response),
+                        "extra",
+                    ) {
+                        let api::ProviderEvent::Item {
+                            thread_id,
+                            turn_id,
+                            item_id,
+                            event,
+                        } = event
+                        else {
+                            unreachable!("message fixture emits item activity")
+                        };
+                        sink.send_wait(api::AdapterActivity::Item {
+                            thread_id,
+                            turn_id,
+                            item_id,
+                            event,
+                        })
+                        .await?;
+                    }
+                }
+                finish(&request, &sink, &start, false).await
+            })
+            .with_models(models());
         let closed = Arc::new(AtomicUsize::new(0));
         let observed_close = closed.clone();
         native.with_session_close(move |_| {

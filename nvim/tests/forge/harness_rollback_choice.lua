@@ -3,7 +3,8 @@ local state = require("forge.session").harness
 local client = require("forge.client")
 local controller = require("forge.views.harness.controller")
 state.session = { id = "rollback-choice" }
-state.busy, state.no_checkpoint = false, true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+state.no_checkpoint = true
 local history = {
   { id = "first", ordinal = 1, prompt = "first prompt", state = "complete", disposition = "current" },
   { id = "second", ordinal = 2, prompt = "second prompt", state = "complete", disposition = "current" },
@@ -43,7 +44,8 @@ assert(requests[#requests].params.rollback.scope == "conversation")
 assert(requests[#requests].params.rollback.exchange_id == "second"
   and requests[#requests].params.rollback.latest_exchange_id == "second")
 state.restore_applying = nil
-state.busy, state.task_operation = false, nil
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+state.task_operation = nil
 state.no_checkpoint = false
 history[2].checkpoint_before = "checkpoint"
 controller.open_undo_picker()

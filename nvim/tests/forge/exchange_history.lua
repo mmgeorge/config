@@ -41,7 +41,8 @@ local ok, failure = xpcall(function()
 
   local state = require("forge.session").harness
   state.session = { id = "history-session" }
-  state.busy, state.no_checkpoint = false, false
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+  state.no_checkpoint = false
   local history = {}
   for _, spec in ipairs({
     { "complete", "current" }, { "interrupted", "current" },

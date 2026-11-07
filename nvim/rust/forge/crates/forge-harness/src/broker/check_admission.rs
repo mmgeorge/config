@@ -21,7 +21,6 @@ pub(crate) struct AutomaticCheckRefresh {
     owner: crate::timeline::TimelineOwner,
     exchange_id: String,
     scope: Option<InvocationScope>,
-    revision: Option<u64>,
     shell: crate::session::CheckShell,
     sink: Option<SessionUpdateSink>,
     cancelled: Arc<TurnCancellationSignal>,
@@ -335,11 +334,15 @@ impl HarnessBroker {
         }
         if let Some(reason) = &tx.automatic.blocked {
             let update = super::publication::SessionUpdate::Diagnostic {
-                diagnostic: crate::provider::ProviderDiagnostic {
+                diagnostic: super::publication::DiagnosticView {
                     kind: forge_provider_api::ProviderFailureKind::Unknown,
                     message: forge_provider_api::SanitizedMessage::new(reason.clone())
                         .expect("host diagnostic is nonempty"),
-                    fatal: false,
+                    severity: super::publication::DiagnosticSeverity::Warning,
+                    scope: crate::provider::EventScope::Binding {
+                        owner: crate::provider::ThreadOwner::root(&self.session.id),
+                    },
+                    native_scope: forge_provider_api::WarningScope::Provider,
                 },
             };
             tx.result.0["automatic_checks"] = json!({"run_id":run.id,"blocked":reason});
@@ -403,10 +406,11 @@ impl HarnessBroker {
             .store
             .load_exchange(&tx.interaction.id)?
             .ok_or_else(|| anyhow::anyhow!("automatic check exchange disappeared"))?;
-        if interaction.turn.last().is_some_and(|turn| {
-            self.reopened_execution.active(&turn.provider().scope)
-                || self.reopened_execution.is_settling(&turn.provider().scope)
-        }) {
+        if interaction
+            .turn
+            .last()
+            .is_some_and(|turn| self.host_settlement.is_settling(&turn.provider().scope))
+        {
             return Ok(AutomaticCheckAction::Revalidate);
         }
         if interaction.state() != ExchangeState::Complete
@@ -432,9 +436,7 @@ impl HarnessBroker {
             .turn
             .last()
             .map(|turn| turn.provider().scope.clone());
-        let revision = scope
-            .as_ref()
-            .map(|scope| self.reopened_execution.revision(scope));
+
         Ok(AutomaticCheckRefresh {
             supervisor: self.check_runner.clone(),
             owner: self
@@ -442,7 +444,6 @@ impl HarnessBroker {
                 .capture_timeline_owner(&self.session.id, &interaction.id)?,
             exchange_id: interaction.id.clone(),
             scope,
-            revision,
             shell: self.session.shell,
             sink: self.event_sink.clone(),
             cancelled: self.turn_cancellation.capture(),
@@ -511,11 +512,10 @@ impl HarnessBroker {
                     .capture_timeline_owner(&self.session.id, &interaction.id)?
                     == capture.owner)
             && interaction.turn.last().map(|turn| &turn.provider().scope) == capture.scope.as_ref()
-            && capture.scope.as_ref().is_none_or(|scope| {
-                capture.revision == Some(self.reopened_execution.revision(scope))
-                    && !self.reopened_execution.active(scope)
-                    && !self.reopened_execution.is_settling(scope)
-            }))
+            && capture
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !self.host_settlement.is_settling(scope)))
     }
 }
 

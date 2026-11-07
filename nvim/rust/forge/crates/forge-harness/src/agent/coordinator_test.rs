@@ -105,12 +105,20 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
     assert!(!ninth.launch);
     let first = &admitted[0];
     coordinator
-        .settled(&first.agent.id, &first.task.id, true)
+        .settled(
+            &first.agent.id,
+            &first.task.id,
+            super::AgentSettlementDisposition::CleanupFailed,
+        )
         .unwrap();
     assert_eq!(coordinator.active_count(), 8);
     assert!(coordinator.ready_launch().unwrap().is_none());
     coordinator
-        .settled(&first.agent.id, &first.task.id, false)
+        .settled(
+            &first.agent.id,
+            &first.task.id,
+            super::AgentSettlementDisposition::Ready,
+        )
         .unwrap();
     let launched = coordinator.ready_launch().unwrap().unwrap();
     assert_eq!(launched.task.id, ninth.task.id);
@@ -280,7 +288,11 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
     );
     assert!(
         coordinator
-            .settled(&first.agent.id, &first.task.id, false)
+            .settled(
+                &first.agent.id,
+                &first.task.id,
+                super::AgentSettlementDisposition::Ready
+            )
             .unwrap()
             .is_none()
     );
@@ -302,9 +314,128 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
     );
     assert!(
         coordinator
-            .settled(&first.agent.id, &first.task.id, false)
+            .settled(
+                &first.agent.id,
+                &first.task.id,
+                super::AgentSettlementDisposition::Ready
+            )
             .is_err()
     );
+}
+
+/// Reject a delayed explicit grant after another exact task owns the durable stop policy.
+#[test]
+fn stale_child_authorization_cannot_clear_a_newer_stop() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admit(&coordinator, "first", "review");
+    let mut agent = first.agent.clone();
+    let mut task = first.task.clone();
+    task.state = crate::exchange::ExchangeState::Cancelled;
+    task.completed_at_ms = Some(3);
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: task.id.clone().into(),
+    };
+    coordinator.retain(agent.clone(), task.clone()).unwrap();
+    coordinator
+        .settled(
+            &agent.id,
+            &task.id,
+            super::AgentSettlementDisposition::RequiresAuthorization,
+        )
+        .unwrap();
+    let request = AgentRequest {
+        operation_id: "grant".into(),
+        source: AgentSource::User,
+        operation: AgentOperation::Followup {
+            target: agent.id.clone(),
+            message: "continue".into(),
+        },
+    };
+    let admission = coordinator
+        .reserve_followup(&request, &agent.id, "continue", "parent", 4)
+        .unwrap();
+    assert_eq!(
+        admission.continuation_authorization().unwrap().as_str(),
+        task.id
+    );
+    let mut newer = task.clone();
+    newer.id = "newer-stopped-task".into();
+    newer.operation_id = "newer-operation".into();
+    newer.ordinal += 1;
+    newer.completed_at_ms = Some(5);
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: newer.id.clone().into(),
+    };
+    coordinator.retain(agent.clone(), newer).unwrap();
+    assert!(admission.commit().is_err());
+    assert_eq!(
+        coordinator.resolve(&agent.id).unwrap().continuation,
+        agent.continuation
+    );
+    assert!(coordinator.ready_launch().unwrap().is_none());
+}
+
+/// Preserve queued tasks after a stopped child until an explicit user authorizes its exact policy.
+#[test]
+fn stopped_child_retains_queue_until_explicit_user_authorization() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admit(&coordinator, "first", "review");
+    let request = AgentRequest {
+        operation_id: "queued".into(),
+        source: AgentSource::Model,
+        operation: AgentOperation::Followup {
+            target: first.agent.id.clone(),
+            message: "queued".into(),
+        },
+    };
+    let queued = coordinator
+        .reserve_followup(&request, &first.agent.id, "queued", "parent", 2)
+        .unwrap();
+    let queued = match queued.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("fixture admission must be new"),
+    };
+    let mut agent = first.agent.clone();
+    let mut task = first.task.clone();
+    task.state = crate::exchange::ExchangeState::Cancelled;
+    task.completed_at_ms = Some(3);
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: task.id.clone().into(),
+    };
+    coordinator.retain(agent.clone(), task.clone()).unwrap();
+    assert!(
+        coordinator
+            .settled(
+                &agent.id,
+                &task.id,
+                super::AgentSettlementDisposition::RequiresAuthorization
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(coordinator.active_count(), 0);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    assert!(coordinator.task(&queued.task.id).is_some());
+    assert!(agent.authorize_continuation(&"wrong-task".into()).is_err());
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    let explicit = AgentRequest {
+        operation_id: "explicit".into(),
+        source: AgentSource::User,
+        operation: AgentOperation::Followup {
+            target: agent.id.clone(),
+            message: "continue".into(),
+        },
+    };
+    let admission = coordinator
+        .reserve_followup(&explicit, &agent.id, "continue", "parent", 4)
+        .unwrap();
+    assert!(matches!(
+        admission.agent.continuation,
+        super::AgentContinuationPolicy::Ready
+    ));
+    admission.commit().unwrap();
+    let next = coordinator.ready_launch().unwrap().unwrap();
+    assert_eq!(next.task.id, queued.task.id);
 }
 
 #[test]
@@ -327,7 +458,11 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
         AgentCommit::Existing(_) => panic!("new follow-up reused an admission"),
     };
     let next = coordinator
-        .settled(&first.agent.id, &first.task.id, false)
+        .settled(
+            &first.agent.id,
+            &first.task.id,
+            super::AgentSettlementDisposition::Ready,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(next.task.id, second.task.id);
@@ -339,7 +474,11 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
     assert_eq!(coordinator.active_count(), 1);
     assert!(
         coordinator
-            .settled(&second.agent.id, &second.task.id, false)
+            .settled(
+                &second.agent.id,
+                &second.task.id,
+                super::AgentSettlementDisposition::Ready
+            )
             .unwrap()
             .is_none()
     );
@@ -552,7 +691,11 @@ fn queued_children_resume_after_quiescence_without_launching_cancelled_work() {
     assert_eq!(retired[0].id, cancelled.task.id);
     let quiescence = coordinator.begin_quiescence();
     coordinator
-        .settled(&active[0].agent.id, &active[0].task.id, false)
+        .settled(
+            &active[0].agent.id,
+            &active[0].task.id,
+            super::AgentSettlementDisposition::Ready,
+        )
         .unwrap();
     assert!(coordinator.ready_launch().unwrap().is_none());
     drop(quiescence);
@@ -581,7 +724,11 @@ fn queued_reservation_claims_capacity_released_before_commit() {
         .unwrap();
     assert!(!reservation.launch);
     coordinator
-        .settled(&active[0].agent.id, &active[0].task.id, false)
+        .settled(
+            &active[0].agent.id,
+            &active[0].task.id,
+            super::AgentSettlementDisposition::Ready,
+        )
         .unwrap();
     let ready = match reservation.commit().unwrap() {
         AgentCommit::Admitted(work) => work,

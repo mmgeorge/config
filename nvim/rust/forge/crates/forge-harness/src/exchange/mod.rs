@@ -61,7 +61,7 @@ mod rollback_run;
 pub(crate) use reconnect::{ReconnectConfirmation, ReconnectError, ReconnectSnapshot};
 mod settings;
 mod shutdown;
-pub(crate) use owner::ExchangeOwner;
+pub(crate) use owner::{ExchangeOwner, ProviderObservationError};
 mod record;
 mod thought;
 

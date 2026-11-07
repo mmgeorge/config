@@ -72,11 +72,14 @@ function M.proposed(review, selection, captured, commit)
     clear()
     if value == "" or value:find("[\r\n]") or not review.owner.is_current(captured) then return end
     for _, edit in ipairs(selection.preview) do
-      local _, row = review.owner.replica.sequence:position(edit.block)
-      if row then
-        row = require("forge.buffer").physical_row(review.owner.replica, row)
-        vim.api.nvim_buf_set_extmark(review.buf, namespace, row, edit.column, {
-          end_col = edit.column + edit.length, hl_group = "Substitute",
+      local _, source_row = review.owner.replica.sequence:position(edit.block)
+      if source_row then
+        -- Preview columns address canonical block text, while declaration rows render with a display indent.
+        local buffer = require("forge.buffer")
+        local row = buffer.physical_row(review.owner.replica, source_row)
+        local column = buffer.physical_column(review.owner.replica, source_row, edit.column)
+        vim.api.nvim_buf_set_extmark(review.buf, namespace, row, column, {
+          end_col = column + edit.length, hl_group = "Substitute",
           conceal = "", virt_text = { { value, "Substitute" } }, virt_text_pos = "inline", priority = 250,
         })
       end

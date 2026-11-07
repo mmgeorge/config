@@ -6,7 +6,7 @@ client.session_events_subscribe = function() return function() end end
 state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
   layout.open("session-name-manual")
 state.session = { id = "session-name-manual", name = "Existing session", model = "selected-model", effort = "high" }
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 local buffer = require("forge.buffer")
 local transcript = buffer.open("session-name-status", {})
 state.transcript_buf = transcript.buffer

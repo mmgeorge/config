@@ -9,7 +9,8 @@ vim.fn.writefile({ "pub fn value() -> u32 { 7 }" }, workspace .. "/src/item.rs")
 local git = vim.system({ "git", "init", "--quiet", workspace }, { text = true }):wait(10000)
 assert(git.code == 0, git.stderr)
 local binary = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)

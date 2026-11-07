@@ -52,7 +52,7 @@ async fn failed_completion_checkpoint_can_finalize_as_failed() {
     let mut exchange = running(&broker, &before.id);
     std::fs::write(repository.path().join("seed.txt"), "changed\n").unwrap();
     let connection =
-        rusqlite::Connection::open(crate::storage::state::database(&data.path())).unwrap();
+        rusqlite::Connection::open(crate::storage::state::database(data.path())).unwrap();
     connection.execute_batch("CREATE TRIGGER reject_checkpoint BEFORE INSERT ON checkpoint_record BEGIN SELECT RAISE(ABORT, 'injected capture persistence failure'); END;").unwrap();
     assert!(
         broker
@@ -117,7 +117,7 @@ async fn checkpoint_commit_failure_preserves_previous_comparison() {
         let previous = exchange.clone();
         std::fs::write(repository.path().join("seed.txt"), "replacement\n").unwrap();
         let connection =
-            rusqlite::Connection::open(crate::storage::state::database(&data.path())).unwrap();
+            rusqlite::Connection::open(crate::storage::state::database(data.path())).unwrap();
         connection.execute_batch("CREATE TRIGGER reject_checkpoint BEFORE INSERT ON checkpoint_record BEGIN SELECT RAISE(ABORT, 'injected checkpoint commit failure'); END;").unwrap();
         let error = broker
             .capture_final_checkpoint(&mut exchange, outcome)
@@ -231,6 +231,7 @@ async fn captured_workspace_result_survives_formatting_external_edits_and_reopen
     let projected = crate::buffer::projection::project(
         crate::buffer::projection::ProjectionSource::Exchange(&restored),
         &forge_buffer::width::WidthProfile::default(),
+        crate::buffer::projection::FIXTURE_NOW_MS,
         false,
         &Default::default(),
         &Default::default(),

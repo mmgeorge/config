@@ -82,6 +82,13 @@ pub enum TimelineEntry {
         exchange: Vec<Exchange>,
         agent: Vec<TimelineEntry>,
     },
+    /// Present provider-observed work without managed AgentTask controls or ownership.
+    ObservedAgent {
+        id: String,
+        created_at_ms: i64,
+        agent: Box<crate::agent::ObservedAgent>,
+        children: Vec<TimelineEntry>,
+    },
     SessionEvent {
         id: String,
         created_at_ms: i64,
@@ -177,6 +184,7 @@ impl TimelineEntry {
             Self::Inherited { entry, .. } => entry.id(),
             Self::Exchange { id, .. }
             | Self::AgentLifecycle { id, .. }
+            | Self::ObservedAgent { id, .. }
             | Self::SessionEvent { id, .. }
             | Self::Checks { id, .. }
             | Self::Status { id, .. } => id.clone(),
@@ -204,6 +212,16 @@ impl TimelineEntry {
                 }
                 for agent in agent {
                     agent.index_exchanges(owner, index);
+                }
+            }
+            Self::ObservedAgent {
+                agent, children, ..
+            } => {
+                for exchange in agent.exchanges() {
+                    index.insert(exchange.id.clone(), owner);
+                }
+                for child in children {
+                    child.index_exchanges(owner, index);
                 }
             }
             _ => {}
@@ -248,6 +266,19 @@ impl TimelineEntry {
                     Ok(false)
                 }
             }
+            Self::ObservedAgent {
+                agent, children, ..
+            } => {
+                if agent.replace_exchange(replacement)? {
+                    return Ok(true);
+                }
+                for child in children {
+                    if child.replace_exchange(replacement)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
             _ => Ok(false),
         }
     }
@@ -277,6 +308,7 @@ impl TimelineEntry {
             Self::Inherited { entry, .. } => entry.created_at_ms(),
             Self::Exchange { created_at_ms, .. }
             | Self::AgentLifecycle { created_at_ms, .. }
+            | Self::ObservedAgent { created_at_ms, .. }
             | Self::SessionEvent { created_at_ms, .. }
             | Self::Checks { created_at_ms, .. }
             | Self::Status { created_at_ms, .. } => *created_at_ms,
@@ -290,6 +322,32 @@ impl TimelineEntry {
             self.id(),
         )
     }
+}
+
+/// Build one native child subtree without rebinding unresolved ancestors to the current root.
+fn observed_entry(
+    index: usize,
+    agents: &[crate::agent::ObservedAgent],
+    parent: &[Option<usize>],
+    visited: &mut std::collections::HashSet<usize>,
+) -> Result<TimelineEntry> {
+    anyhow::ensure!(
+        visited.insert(index),
+        "native child hierarchy contains a cycle"
+    );
+    let mut children = Vec::new();
+    for child in 0..agents.len() {
+        if parent[child] == Some(index) {
+            children.push(observed_entry(child, agents, parent, visited)?);
+        }
+    }
+    let agent = &agents[index];
+    Ok(TimelineEntry::ObservedAgent {
+        id: agent.storage_id(),
+        created_at_ms: agent.created_at_ms(),
+        agent: Box::new(agent.clone()),
+        children,
+    })
 }
 
 /// Resolves durable records into one ordered session presentation.
@@ -311,6 +369,27 @@ pub struct TimelineProjection<'a> {
 }
 
 impl TimelineProjector {
+    /// Attach native observed children by their original generation and trusted ancestry.
+    pub(crate) fn with_observed_agents(
+        mut timeline: Vec<TimelineEntry>,
+        observed: Vec<crate::agent::ObservedAgent>,
+    ) -> Result<Vec<TimelineEntry>> {
+        timeline.retain(|entry| !matches!(entry, TimelineEntry::ObservedAgent { .. }));
+        let parent = crate::agent::ObservedAgent::hierarchy(&observed)?;
+        let mut visited = std::collections::HashSet::new();
+        for index in 0..observed.len() {
+            if parent[index].is_none() {
+                timeline.push(observed_entry(index, &observed, &parent, &mut visited)?);
+            }
+        }
+        anyhow::ensure!(
+            visited.len() == observed.len(),
+            "native child hierarchy contains a cycle"
+        );
+        timeline.sort_by_key(TimelineEntry::order_key);
+        Ok(timeline)
+    }
+
     /// Merges durable check groups with plan-owned groups while preserving one identity per run.
     pub(crate) fn with_checks(
         mut timeline: Vec<TimelineEntry>,
@@ -723,6 +802,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 1,
@@ -756,6 +836,7 @@ mod test {
             inbox: Vec::new(),
             nickname: None,
             state: AgentState::Ready,
+            continuation: crate::agent::AgentContinuationPolicy::Ready,
             created_at_ms: 2,
             updated_at_ms: 3,
         }

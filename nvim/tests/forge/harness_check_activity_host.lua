@@ -37,7 +37,9 @@ vim.fn.writefile({ vim.json.encode({ checks = {
   ["unused"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c", "exit 9"  }, label = "Unused fixture", directory = ".", category = "test", after = {} } }
 } }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
+local check_storage = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/check_storage.lua")
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -46,30 +48,28 @@ end }
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
-local errors, answered = {}, {}
+local errors = {}
+local approval = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/approval.lua")
+local responder = approval.responder()
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
 end
 
 local function answer_permissions()
-  for _, approval in ipairs(state.approval or {}) do
-    if not answered[approval.id] then
-      answered[approval.id] = true
-      local answers = {}
-      for _, item in ipairs(approval.item_list) do
-        answers[#answers + 1] = { item_id = item.id, choice_id = "allow_once" }
-      end
-      client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answers }, session_id = assert(require("forge.session").harness.session).id }, function(_, failure)
-        assert(not failure, failure)
-      end)
-    end
-  end
+  approval.answer_pending(responder)
 end
 
 ---@param method string
 ---@param params? table
 ---@return table
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua. Polling loops read state
+  -- before other requests, so answer pending approvals here too or polling never unblocks them.
+  if method == "session.state.get" then
+    answer_permissions()
+    return state_snapshot.get()
+  end
   local settled, value, failure
   client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, message) value, failure, settled = result, message, true end)
   assert(vim.wait(10000, function() answer_permissions() return settled end, 10), method .. " timed out")
@@ -137,15 +137,23 @@ local succeeded, failure = xpcall(function()
   local _, count = presentation_text():gsub("Checks finished", "")
   assert(count == 1, "result history was duplicated")
   assert(not presentation_text():find("retained check output", 1, true), "result output was not collapsed")
-  local _, check_row = state.presentation.transcript.sequence:position(run_id .. ":checks")
+  -- check_run admits an invocation-owned run, so the transcript groups its result under the owning
+  -- exchange's aggregate (`<exchange>:results`) rather than a standalone `<run>:checks` heading.
+  assert(type(result.owner) == "table" and result.owner.kind == "exchange", vim.inspect(result.owner))
+  local result_group = result.owner.exchange_id .. ":results"
+  local sequence_node = state.presentation.transcript.sequence.node
+  assert(sequence_node[result_group .. ":checks"], "check result heading is missing: " .. vim.inspect(vim.tbl_filter(function(identity)
+    return identity:find("check", 1, true) ~= nil
+  end, vim.tbl_keys(sequence_node))))
+  local _, check_row = state.presentation.transcript.sequence:position(result_group .. ":checks")
   assert(check_row ~= nil, "check result heading is missing")
   vim.api.nvim_set_current_win(state.transcript_win)
   vim.api.nvim_win_set_cursor(state.transcript_win, { check_row + 1, 0 })
   assert(state.presentation.toggle_heading(state.transcript_win), "check results did not expand")
   local category_row
   assert(vim.wait(3000, function()
-    if not state.presentation.transcript.sequence.node[run_id .. ":category:test"] then return false end
-    _, category_row = state.presentation.transcript.sequence:position(run_id .. ":category:test")
+    if not state.presentation.transcript.sequence.node[result_group .. ":category:test"] then return false end
+    _, category_row = state.presentation.transcript.sequence:position(result_group .. ":category:test")
     return category_row ~= nil
   end, 10), "test category is missing")
   vim.api.nvim_win_set_cursor(state.transcript_win, { category_row + 1, 0 })
@@ -201,7 +209,7 @@ local succeeded, failure = xpcall(function()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "first host did not stop")
 
   -- Seed the provider-owned persisted form of this actual run before the next host opens it.
-  local record_path = data .. "/forge/harness/" .. session_id .. "/checks/" .. run_id .. "/record.json"
+  local record_path = check_storage.path(data, session_id, run_id .. "/record.json")
   local record = vim.json.decode(table.concat(vim.fn.readfile(record_path), "\n"))
   record.run.owner = { kind = "exchange", session_id = session_id, exchange_id = exchange.id, node_count = 0 }
   vim.fn.writefile({ vim.json.encode(record) }, record_path)

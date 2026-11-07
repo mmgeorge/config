@@ -139,7 +139,7 @@ end
 ---@param destination ForgeHarnessProviderDestination
 function M.switch_provider(provider, destination)
   local state = session.harness
-  local provider_config = config.options.harness.providers[provider]
+  local provider_config = client.provider_map()[provider]
   if not provider_config or provider_config.selectable == false then
     notifications.error("Unknown Harness provider: " .. tostring(provider), "Harness provider")
     return

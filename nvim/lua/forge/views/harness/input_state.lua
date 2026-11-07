@@ -103,7 +103,6 @@ function M.receive(state, update)
       local index = index_of(input.confirmed, id)
       if index then table.remove(input.confirmed, index) end
       discard_draft(input, id)
-      input.retraction[id] = nil
     end
     for _, message in ipairs(update.upsert or {}) do
       local index = index_of(input.confirmed, message.id)
@@ -111,7 +110,13 @@ function M.receive(state, update)
       elseif update.prepend then table.insert(input.confirmed, 1, vim.deepcopy(message))
       else input.confirmed[#input.confirmed + 1] = vim.deepcopy(message) end
       discard_draft(input, message.id)
-      if message.delivery == "accepted" then input.retraction[message.id] = nil end
+      -- A claimed or accepted submission stays retractable until its exchange proves output.
+      -- Only the newest submission can be retracted, so a newer acceptance retires older callbacks.
+      if message.delivery == "accepted" then
+        for id in pairs(input.retraction) do
+          if id ~= message.id then input.retraction[id] = nil end
+        end
+      end
     end
     input.revision, input.suspended = update.revision, update.suspended
     input.control_revision = update.control_revision or input.control_revision

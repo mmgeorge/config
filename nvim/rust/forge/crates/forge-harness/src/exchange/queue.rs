@@ -11,6 +11,13 @@ use super::journal::{CommandJournal, CommandJournalError, CommandRecord};
 /// Resolve one observer independently of the command's lifetime and retained result.
 pub(super) type CommandReply = oneshot::Sender<Result<CommandResult, ExecuteCommandError>>;
 
+/// Transfer one identified command and its admitted completion/capacity ownership together.
+pub(super) struct CommandAdmission {
+    pub(super) request: CommandRequest,
+    pub(super) reply: CommandReply,
+    pub(super) task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Own durable FIFO admission without launching I/O or changing exchange state.
 pub(super) struct CommandQueue {
     journal: CommandJournal,
@@ -150,14 +157,17 @@ impl CommandQueue {
     /// Attach/replay an existing identity or durably append one FIFO admission.
     pub(super) fn admit(
         &mut self,
-        request: CommandRequest,
-        reply: CommandReply,
-        task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: CommandAdmission,
         active: Option<&mut QueuedCommand>,
         trace: &crate::trace::TraceStore,
         session: &str,
         step: u64,
     ) {
+        let CommandAdmission {
+            request,
+            reply,
+            task_admission,
+        } = admission;
         let response_log = CommandResponseLog {
             id: &request.id,
             trace,
@@ -665,9 +675,11 @@ mod tests {
         let (active_reply, active_response) = oneshot::channel();
         let active_request = request("active");
         queue.admit(
-            active_request.clone(),
-            active_reply,
-            None,
+            CommandAdmission {
+                request: active_request.clone(),
+                reply: active_reply,
+                task_admission: None,
+            },
             None,
             &trace,
             "session",
@@ -676,15 +688,17 @@ mod tests {
         let active = queue.start(&trace, "session", 2).unwrap();
         let (pending_reply, pending_response) = oneshot::channel();
         queue.admit(
-            request("pending"),
-            pending_reply,
-            None,
+            CommandAdmission {
+                request: request("pending"),
+                reply: pending_reply,
+                task_admission: None,
+            },
             None,
             &trace,
             "session",
             3,
         );
-        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         database.execute_batch("CREATE TRIGGER reject_core_response BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='command_responded' BEGIN SELECT RAISE(ABORT,'fixture core response failure'); END;")?;
         queue.finish(
             active,

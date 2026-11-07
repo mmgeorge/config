@@ -34,6 +34,30 @@ pub trait ProviderPermissions: Send + Sync {
         request: PermissionRequest,
     ) -> PermissionResponse;
 
+    /// Authorize an explicitly registered native child under its original parent authority.
+    /// Implementations must validate binding, ancestry, child turn ownership, and independent revocation.
+    async fn authorize_observed_child(
+        &self,
+        parent: &crate::InvocationScope,
+        child: &crate::TurnAddress,
+        request: PermissionRequest,
+    ) -> PermissionResponse {
+        let _ = (parent, child, request);
+        PermissionResponse::Deny {
+            reason: Some("Native child permission authority is unavailable".into()),
+        }
+    }
+
+    /// Wait for the original child's host barrier after validating its registered parent relationship.
+    async fn before_observed_child(
+        &self,
+        parent: &crate::InvocationScope,
+        child: &crate::TurnAddress,
+    ) -> Result<(), ProviderError> {
+        let _ = (parent, child);
+        Err(ProviderError::Cancelled)
+    }
+
     /// Authorize verified private session storage while preserving host policy and revocation.
     /// The adapter must first prove every target is a read/write beneath this binding's own
     /// canonical storage directory, including symlink resolution. Ordinary work never uses this.

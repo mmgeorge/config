@@ -9,7 +9,7 @@ local session_picker = require('forge.views.harness.session_picker')
 local preview = require('forge.views.harness.session_preview')
 local state = session.harness
 state.session = { id = 'source', provider = 'fixture_alpha', workspace = 'workspace' }
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.queue, state.pending_steer = {}, {}
 local spec, selected, list_failure, empty_list, previewed, notifications
 local preview_request_list = {}

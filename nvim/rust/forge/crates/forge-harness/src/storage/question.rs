@@ -202,6 +202,16 @@ pub(super) fn retire_task_questions(
     if let Some(acceptance) = plan.review.take() {
         question.push(acceptance.elicitation);
     }
+    // A set whose every question already has an answer was resolved, not withdrawn.
+    // Acceptance clears such a review, and retiring it would record a false withdrawal.
+    question.retain(|elicitation| {
+        elicitation.question_set.questions.iter().any(|item| {
+            !elicitation
+                .answer
+                .iter()
+                .any(|answer| answer.question_id == item.id)
+        })
+    });
     if question.is_empty() {
         return Ok(());
     }
@@ -553,6 +563,53 @@ mod tests {
             );
             assert!(store.load_plan("plan")?.unwrap().elicitation.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn retiring_a_fully_answered_question_set_records_no_withdrawal() -> Result<()> {
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let question =
+            crate::plan::PlanQuestionSet::freeform("Which scope should be implemented?".into())
+                .normalize()?;
+        let mut elicitation = PlanElicitation::new(question.clone());
+        elicitation.answer = question
+            .questions
+            .iter()
+            .map(|item| crate::plan::PlanQuestionAnswer {
+                source: crate::session::ResolutionSource::User,
+                question_id: item.id.clone(),
+                response: crate::plan::PlanQuestionResponse::Other {
+                    text: "Only the CLI flag".into(),
+                },
+            })
+            .collect();
+        let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
+            "id":"plan","session_id":"session","request":"Plan the change","state":"awaiting_input",
+            "working_path":"","model_revision":1,"user_revision":0,"created_at_ms":0,"updated_at_ms":0,
+            "elicitation":elicitation
+        }))?;
+        let current = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&current.revision),
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::plan(plan, 1)?)),
+            1,
+        )?;
+        let active = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&active.revision),
+            crate::task::TaskChange::Clear,
+            2,
+        )?;
+        assert!(
+            !store
+                .list_plan_lifecycle("session")?
+                .iter()
+                .any(|event| event.kind == crate::plan::PlanLifecycleKind::QuestionWithdrawn),
+            "an answered question set must not be reported as withdrawn"
+        );
         Ok(())
     }
 

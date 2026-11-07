@@ -163,7 +163,6 @@ impl LspService {
             policy,
             mutation_policy: std::sync::RwLock::new(None),
             protected_path: std::sync::RwLock::new(None),
-            changes: super::changes::ChangePublication::default(),
             cancelled,
             active: watch::channel(true).0,
             authority: std::sync::RwLock::new(None),
@@ -386,7 +385,6 @@ impl LspService {
 
 /// Limits LSP access to one authenticated live interaction and preference generation.
 pub(crate) struct LspScope {
-    pub(super) changes: super::changes::ChangePublication,
     pub(super) service: Arc<LspService>,
     pub(super) session: String,
     pub(super) interaction: String,
@@ -403,6 +401,53 @@ pub(crate) struct LspScope {
 }
 
 impl LspScope {
+    /// Fork the captured policy under an independently retired native-child interaction.
+    pub(crate) fn fork_observed(
+        &self,
+        scope: &crate::provider::InvocationScope,
+    ) -> Result<Arc<Self>> {
+        ensure!(
+            scope.owner.session_id().as_str() == self.session,
+            "native child editor scope crosses session"
+        );
+        let protected_path = self
+            .protected_path
+            .read()
+            .map_err(|_| anyhow::anyhow!("LSP protected path lock poisoned"))?
+            .clone();
+        let mutation_policy = self
+            .mutation_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("LSP mutation policy lock poisoned"))?
+            .clone();
+        let authority = self
+            .authority
+            .read()
+            .map_err(|_| anyhow::anyhow!("LSP authority lock poisoned"))?
+            .as_ref()
+            .map(crate::tools::TaskAuthority::snapshot)
+            .transpose()?;
+        Ok(Arc::new(Self {
+            service: self.service.clone(),
+            session: self.session.clone(),
+            interaction: scope.exchange_id.to_string(),
+            workspace: self.workspace.clone(),
+            policy: self.policy.clone(),
+            protected_path: std::sync::RwLock::new(protected_path),
+            mutation_policy: std::sync::RwLock::new(mutation_policy),
+            cancelled: watch::channel(false).1,
+            active: watch::channel(true).0,
+            authority: std::sync::RwLock::new(authority),
+            selection: self.selection.clone(),
+            generation: self.generation,
+        }))
+    }
+
+    /// Retire this editor authority only after its own native-child callback owner stops admission.
+    pub(crate) fn retire(&self) {
+        self.active.send_replace(false);
+    }
+
     /// Reports whether this scope can advertise and invoke editor intelligence.
     pub(crate) fn available(&self) -> bool {
         self.check().is_ok() && self.service.sender.lock().unwrap().is_some()
@@ -494,14 +539,6 @@ impl LspScope {
         let arguments = Arguments::parse(name, value)
             .map_err(|failure| anyhow::anyhow!("invalid_argument: {failure}"))?;
         self.query(arguments).await
-    }
-
-    /// Preserve native tool identity when attaching committed rename changes.
-    pub(crate) fn observe_changes(
-        &self,
-        event: &forge_provider_api::ProviderEvent,
-    ) -> Vec<forge_provider_api::ProviderEvent> {
-        self.changes.observe(event)
     }
 
     /// Bind effective directory access before the provider advertises mutating tools.
@@ -733,6 +770,145 @@ pub(super) fn single_line(text: &str, maximum: usize) -> String {
 mod tests {
     use super::*;
     use crate::tools::lsp::catalog::definitions;
+
+    /// Publish an actual late child rename under its original binding, scope, and host call identity.
+    #[tokio::test]
+    async fn late_child_rename_commits_physical_fact_to_original_binding() -> Result<()> {
+        let (directory, service, lsp, lease, mut editor) = fixture().await;
+        lsp.bind_mutation_policy(
+            Arc::new(crate::permissions::directory::DirectoryPolicy {
+                access: Default::default(),
+                workspace: directory.path().into(),
+                session_id: "session".into(),
+                settings_root: None,
+            }),
+            directory.path().join("protected-state"),
+        )?;
+        let parent_scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "interaction",
+        );
+        let child_scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::new(
+                "session".into(),
+                forge_provider_api::AgentId::new("child-owner")?,
+            )?,
+            "interaction",
+        );
+        let address = forge_provider_api::TurnAddress {
+            thread_id: child_scope.owner.thread_id(),
+            turn_id: child_scope.turn_id()?,
+            scope: child_scope.clone(),
+        };
+        let agent = forge_provider_api::AgentId::new("native-child")?;
+        let proof = crate::provider::test_support::observed_agent_fixture(
+            forge_provider_api::BindingId::new("original-binding")?,
+            parent_scope.clone(),
+            vec![(
+                agent.clone(),
+                forge_provider_api::agent::AgentDescription {
+                    parent_agent_id: Some(parent_scope.owner.agent_id().clone()),
+                    delegation: Some(forge_provider_api::agent::AgentDelegation {
+                        parent_thread_id: parent_scope.owner.thread_id(),
+                        parent_turn_id: parent_scope.turn_id()?,
+                        parent_item_id: None,
+                    }),
+                    thread_id: Some(address.thread_id.clone()),
+                    definition: None,
+                    nickname: None,
+                    task: None,
+                },
+                Some(address.clone()),
+            )],
+            agent,
+            Some(address.turn_id),
+        )?;
+        let (sink, mut facts) = crate::provider::events::observed_file_sink_fixture(&proof)?;
+        let mut parent =
+            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        parent.question_invocation = Some(parent_scope);
+        parent.lsp = Some(lsp.clone());
+        let child = parent.fork_observed(&proof, sink)?;
+        let physical = child.provider_completion.clone();
+        crate::tools::ControlToolExecutor::new(parent)
+            .finish()
+            .await;
+        drop(lease);
+        assert!(!lsp.available());
+        let call = tokio::spawn(async move {
+            let mut runtime = crate::tools::ControlToolRuntime::new(child);
+            runtime
+                .invoke(crate::tools::ControlToolInvocation {
+                    call_id: Some(
+                        forge_provider_api::control::ToolCallId::new("late-child-rename").unwrap(),
+                    ),
+                    task_permit: None,
+                    name: "lsp_rename_file".into(),
+                    arguments: json!({"old_path":"source.rs","new_path":"renamed.rs"}),
+                })
+                .await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), editor.recv())
+            .await??
+            .context("editor request missing")?;
+        let event: Value = serde_json::from_slice(frame.bytes())?;
+        assert_eq!(event["event"], "lsp.mutation");
+        let id = event["payload"]["id"]
+            .as_str()
+            .context("mutation ID missing")?;
+        service.respond("session", id, json!({"operations":[{"kind":"rename","old_path":"source.rs","new_path":"renamed.rs"}]}), None)?;
+        tokio::time::timeout(Duration::from_secs(5), call).await???;
+        assert!(!directory.path().join("source.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("renamed.rs"))?,
+            "pub fn source() {}\n"
+        );
+        let observation = facts.recv().await.context("retained host fact missing")??;
+        assert!(observation.native.is_none());
+        let crate::provider::session_execution::OwnerObservation::HostFileChange {
+            binding_id,
+            scope,
+            change,
+        } = observation.event
+        else {
+            anyhow::bail!("rename invented a native event");
+        };
+        assert_eq!(&binding_id, proof.binding_id());
+        assert_eq!(scope, child_scope);
+        assert_eq!(change.scope, scope);
+        assert_eq!(change.call_id.as_str(), "late-child-rename");
+        assert!(change.native_item_id.is_none());
+        assert_eq!(physical.collected_file_changes(), vec![change]);
+        Ok(())
+    }
+
+    /// Keep child editor lifetime independent while preserving inherited policy generation revocation.
+    #[tokio::test]
+    async fn native_child_editor_lifetime_survives_parent_collection() -> Result<()> {
+        let (_directory, service, parent, lease, _receiver) = fixture().await;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::new(
+                "session".into(),
+                forge_provider_api::AgentId::new("native-child")?,
+            )?,
+            "child-exchange",
+        );
+        let child = parent.fork_observed(&scope)?;
+        assert!(child.available());
+        drop(lease);
+        assert!(!parent.available());
+        assert!(child.available());
+        service.set_enabled("session", false);
+        assert!(!child.available());
+        service.set_enabled("session", true);
+        assert!(
+            !child.available(),
+            "re-enabling editor access cannot replace the captured policy generation"
+        );
+        child.retire();
+        assert!(!child.available());
+        Ok(())
+    }
 
     #[test]
     fn focused_contract_rejects_irrelevant_arguments() {

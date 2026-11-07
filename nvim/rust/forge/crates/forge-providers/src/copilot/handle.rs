@@ -96,7 +96,7 @@ impl CopilotClient {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -151,7 +151,7 @@ impl CopilotClient {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -162,7 +162,7 @@ impl CopilotClient {
         checkpoint: Option<String>,
     ) -> Result<String, ProviderError> {
         let result: Result<String> = async {
-            super::operation::dispatch_for(forge_provider_api::ProviderOperation::SessionFork)?;
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::ThreadFork)?;
             Ok(self
                 .inner
                 .rpc()
@@ -181,7 +181,7 @@ impl CopilotClient {
         result.map_err(|error| {
             error.downcast::<ProviderError>().unwrap_or_else(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::SessionFork,
+                    forge_provider_api::ProviderOperation::ThreadFork,
                     forge_provider_api::ProviderFailureKind::Transport,
                 )
             })
@@ -207,7 +207,7 @@ impl CopilotSession {
     ) -> Result<(), ProviderError> {
         if !self.belongs_to(proof.failed_generation()) {
             return Err(native_failure(
-                forge_provider_api::error::ProviderOperation::Cancel,
+                forge_provider_api::error::ProviderOperation::TurnInterrupt,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -238,7 +238,7 @@ impl CopilotSession {
         }
         let native = self.inner.disconnect().await.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::Cancel,
+                forge_provider_api::error::ProviderOperation::TurnInterrupt,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         });
@@ -262,7 +262,7 @@ impl CopilotSession {
             .map_err(|_| {
                 ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::Cancel,
+                        forge_provider_api::ProviderOperation::TurnInterrupt,
                         forge_provider_api::ProviderFailureKind::Transport,
                     )
                     .at_phase(
@@ -274,7 +274,7 @@ impl CopilotSession {
         if !result.success {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 )
                 .at_phase(
@@ -347,7 +347,7 @@ impl CopilotSession {
             .map(|_| ())
             .map_err(|_| {
                 native_failure(
-                    forge_provider_api::error::ProviderOperation::SessionConfigure,
+                    forge_provider_api::error::ProviderOperation::ThreadConfigure,
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 )
             })
@@ -375,7 +375,7 @@ impl CopilotSession {
             .await
             .map_err(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::SessionConfigure,
+                    forge_provider_api::ProviderOperation::ThreadConfigure,
                     forge_provider_api::ProviderFailureKind::Transport,
                 )
             })?;
@@ -412,7 +412,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -570,7 +570,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -618,7 +618,7 @@ impl CopilotSession {
     pub async fn delivery_boundary(&self) -> Result<(String, Option<String>), ProviderError> {
         let tail = self.inner.rpc().event_log().tail().await.map_err(|_| {
             native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Transport,
             )
         })?;
@@ -639,13 +639,13 @@ impl CopilotSession {
             .await
             .map_err(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Transport,
                 )
             })?;
         if history.cursor_status != EventsCursorStatus::Ok {
             return Err(native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ));
         }
@@ -816,7 +816,7 @@ impl CopilotSession {
     }
     pub async fn compact(&self, id: String) -> Result<Compaction, ProviderError> {
         let result: Result<Compaction> = async {
-            super::operation::dispatch_for(forge_provider_api::ProviderOperation::SessionCompact)?;
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::ThreadCompact)?;
             let result = self
                 .inner
                 .rpc()
@@ -843,7 +843,7 @@ impl CopilotSession {
         result.map_err(|error| {
             error.downcast::<ProviderError>().unwrap_or_else(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::SessionCompact,
+                    forge_provider_api::ProviderOperation::ThreadCompact,
                     forge_provider_api::ProviderFailureKind::Transport,
                 )
             })
@@ -964,7 +964,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -975,7 +975,7 @@ impl CopilotSession {
 fn confirm_model_switch(model: &str, result: &ModelSwitchToResult) -> Result<(), ProviderError> {
     if result.persistence_error.is_some() {
         return Err(native_failure(
-            forge_provider_api::ProviderOperation::SessionConfigure,
+            forge_provider_api::ProviderOperation::ThreadConfigure,
             forge_provider_api::ProviderFailureKind::Runtime,
         ));
     }
@@ -984,7 +984,7 @@ fn confirm_model_switch(model: &str, result: &ModelSwitchToResult) -> Result<(),
         || result.model_id.as_deref() != Some(model)
     {
         return Err(native_failure(
-            forge_provider_api::ProviderOperation::SessionConfigure,
+            forge_provider_api::ProviderOperation::ThreadConfigure,
             forge_provider_api::ProviderFailureKind::Protocol,
         ));
     }

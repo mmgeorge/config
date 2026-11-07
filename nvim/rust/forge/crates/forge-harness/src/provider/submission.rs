@@ -41,7 +41,7 @@ impl SubmissionState {
             Self::Sending { .. } => Err(super::ProviderError::DeliveryUncertain),
             Self::Accepted { .. } => Err(super::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::WrongInvocation,
                 ),
             )),
@@ -104,6 +104,13 @@ pub struct SubmissionRecord {
     pub included: Vec<String>,
     /// Last failure, preserved even when the next prompt cannot reconcile delivery.
     pub error: Option<String>,
+}
+
+impl SubmissionRecord {
+    /// Get whether this journal record came from explicit user input.
+    pub(crate) fn is_user_input(&self) -> bool {
+        matches!(self.origin, JournalOrigin::User)
+    }
 }
 
 /// Preserve the author of a logical input independently of its native delivery attempt.
@@ -378,7 +385,7 @@ impl SubmissionStore {
                 ensure!(
                     existing_provider == provider,
                     super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     ))
                 );
@@ -392,7 +399,7 @@ impl SubmissionStore {
                                 SubmissionState::Prepared | SubmissionState::Cancelled
                             ),
                         super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Protocol,
                         ))
                     );
@@ -460,7 +467,7 @@ impl SubmissionStore {
     /// retirement changes only Prepared to Cancelled, so these states also cover earlier attempts.
     pub(crate) fn proves_session_unconsumed(
         &self,
-        owner: &super::ExecutionOwner,
+        owner: &super::ThreadOwner,
         workspace: &str,
         provider: super::ProviderId,
         input_ids: &[String],
@@ -475,7 +482,7 @@ impl SubmissionStore {
         let expected_runtime = owner.runtime_key();
         let expected_provider = serde_json::to_string(&provider)?;
         let records = statement.query_map(
-            params![expected_runtime, owner.session_id.as_str()],
+            params![expected_runtime, owner.session_id().as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -493,7 +500,7 @@ impl SubmissionStore {
             if runtime != expected_runtime
                 || provider != expected_provider
                 || record.request.owner()? != *owner
-                || record.request.harness_session_id != owner.session_id.as_str()
+                || record.request.harness_session_id != owner.session_id().as_str()
                 || record.request.workspace != workspace
                 || !matches!(
                     record.delivery,
@@ -569,7 +576,7 @@ impl SubmissionStore {
             .await
             .map_err(|_| {
                 super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Persistence,
                 ))
             })?
@@ -641,6 +648,7 @@ impl SubmissionStore {
             approval_mode: catalog.approval_mode,
             provider_session_id: catalog.provider_session_id.clone(),
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         }
@@ -807,7 +815,7 @@ impl Submission {
                     && record.request.harness_session_id == request.harness_session_id
                     && record.request.workspace == request.workspace,
                 super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ))
             );
@@ -819,7 +827,7 @@ impl Submission {
                 SubmissionState::Accepted { .. } => {
                     return Err(super::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ),
                     )
@@ -843,6 +851,7 @@ impl Submission {
                 provider_session_id,
                 submission: _,
                 recovered_input: _,
+                acknowledged_child_reports,
                 control_context: _,
             } = request;
             record.request.execution_owner = execution_owner;
@@ -854,6 +863,7 @@ impl Submission {
             record.request.access = access;
             record.request.approval_mode = approval_mode;
             record.request.provider_session_id = provider_session_id;
+            record.request.acknowledged_child_reports = acknowledged_child_reports;
             Ok(())
         })
         .map_err(journal_failure)
@@ -870,7 +880,7 @@ impl Submission {
     {
         let invalid = || {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ))
         };
@@ -899,7 +909,7 @@ impl Submission {
             .map_err(|_| {
                 forge_provider_api::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     ),
                 )
@@ -1082,6 +1092,35 @@ impl Submission {
             .clone())
     }
 
+    /// Load the original IDs and delivery attempts of every journaled input grouped into this request.
+    pub(crate) fn included_inputs(
+        &self,
+    ) -> Result<Vec<forge_provider_api::CoveredInput>, super::ProviderError> {
+        let record = self.record().map_err(journal_failure)?;
+        let owner = record.request.owner()?;
+        record
+            .included
+            .iter()
+            .map(|id| {
+                let original = self
+                    .store
+                    .submission(id)
+                    .map_err(journal_failure)?
+                    .record()
+                    .map_err(journal_failure)?;
+                if original.id != *id || original.request.owner()? != owner {
+                    return Err(super::ProviderError::Observation(
+                        forge_provider_api::ObservationFailure::OwnershipConflict,
+                    ));
+                }
+                Ok(forge_provider_api::CoveredInput::new(
+                    original.id.try_into()?,
+                    original.attempt_id,
+                ))
+            })
+            .collect()
+    }
+
     /// Preserves commit-before-send ordering without blocking an asynchronous provider task.
     pub(crate) async fn persist(
         self: &Arc<Self>,
@@ -1126,7 +1165,7 @@ impl Submission {
         ensure!(
             attempt.is_none_or(|attempt| attempt == &record.attempt_id),
             super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::WrongInvocation,
             ))
         );
@@ -1137,7 +1176,7 @@ impl Submission {
                     SubmissionState::Sending { .. } | SubmissionState::Accepted { .. }
                 ),
             super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ))
         );
@@ -1281,7 +1320,7 @@ impl Submission {
             ensure!(
                 attempt.is_none_or(|attempt| attempt == &record.attempt_id),
                 super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::WrongInvocation,
                 ))
             );
@@ -1521,7 +1560,7 @@ impl forge_provider_api::submission::InputReceipt for AttemptReceipt {
                     ensure!(
                         record.attempt_id == attempt_id,
                         super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::WrongInvocation,
                         ))
                     );
@@ -1587,7 +1626,7 @@ impl forge_provider_api::submission::InputReceipt for AttemptReceipt {
                     ensure!(
                         record.attempt_id == attempt_id,
                         super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::WrongInvocation,
                         ))
                     );
@@ -1605,14 +1644,14 @@ pub(crate) fn journal_failure(error: anyhow::Error) -> super::ProviderError {
     match error.downcast::<super::ProviderError>() {
         Ok(error) => error,
         Err(error) => {
-            let failure = if error.is::<forge_provider_api::execution::ExecutionOwnerError>() {
+            let failure = if error.is::<forge_provider_api::execution::ThreadOwnerError>() {
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             } else {
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Persistence,
                 )
                 .at_phase(
@@ -1630,7 +1669,7 @@ fn uncertain_journal_failure(error: anyhow::Error) -> super::ProviderError {
     match error.downcast::<super::ProviderError>() {
         Ok(super::ProviderError::Failure(failure)) => super::ProviderError::Failure(
             forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 failure.kind(),
             )
             .at_phase(
@@ -1641,7 +1680,7 @@ fn uncertain_journal_failure(error: anyhow::Error) -> super::ProviderError {
         Ok(error) => super::ProviderError::Combined {
             primary: Box::new(super::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Persistence,
                 )
                 .at_phase(
@@ -1653,7 +1692,7 @@ fn uncertain_journal_failure(error: anyhow::Error) -> super::ProviderError {
         },
         Err(_) => super::ProviderError::Failure(
             forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Persistence,
             )
             .at_phase(
@@ -1755,7 +1794,7 @@ mod tests {
                     &forge_provider_api::submission::DispatchTracker::default(),
                     binding.clone(),
                     forge_provider_api::InvocationScope::new(
-                        forge_provider_api::ExecutionOwner::root("foreign"),
+                        forge_provider_api::ThreadOwner::root("foreign"),
                         "exchange",
                     )
                 )
@@ -1893,7 +1932,7 @@ mod tests {
         let stale_cancel = input.retire_prepared_attempt(&old_attempt).unwrap_err();
         assert!(
             matches!(stale_cancel, super::super::ProviderError::Failure(failure)
-            if failure.operation() == forge_provider_api::ProviderOperation::Cancel
+            if failure.operation() == forge_provider_api::ProviderOperation::TurnInterrupt
                 && failure.kind() == forge_provider_api::ProviderFailureKind::WrongInvocation)
         );
         assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
@@ -1963,7 +2002,7 @@ mod tests {
             };
             assert_eq!(
                 failure.operation(),
-                forge_provider_api::ProviderOperation::InputSubmit
+                forge_provider_api::ProviderOperation::TurnStart
             );
             assert_eq!(
                 failure.kind(),
@@ -2005,7 +2044,7 @@ mod tests {
         let input = store.prepare(&request("rejected input"), fixture_provider_id())?;
         let reason = || {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         };
@@ -2144,15 +2183,18 @@ mod tests {
         let provider = forge_providers::registry::default_id();
         let mut first = request("first owner");
         first.harness_session_id = "a:agent:b".into();
-        first.execution_owner = Some(forge_provider_api::ExecutionOwner::root(
+        first.execution_owner = Some(forge_provider_api::ThreadOwner::root(
             &first.harness_session_id,
         ));
         let mut second = request("second owner");
         second.harness_session_id = "a".into();
-        second.execution_owner = Some(forge_provider_api::ExecutionOwner {
-            session_id: "a".into(),
-            agent_id: "b".into(),
-        });
+        second.execution_owner = Some(
+            forge_provider_api::ThreadOwner::new(
+                "a".into(),
+                forge_provider_api::AgentId::new("b").unwrap(),
+            )
+            .expect("registered session and agent identities are nonempty"),
+        );
         let first_input = store.prepare(&first, provider.clone())?;
         let second_input = store.prepare(&second, provider.clone())?;
         let first_pending = store.pending(&first, provider.clone(), None)?;
@@ -2287,43 +2329,18 @@ mod tests {
                 label: "Generic fixture".into(),
                 capability: Default::default(),
             },
-            move |request, sink, _cancelled| {
+            move |request, _sink, start, _cancelled| {
                 let log = log.clone();
                 async move {
                     log.input.lock().unwrap().push(request.clone());
-                    let count = log.send_count.fetch_add(1, Ordering::SeqCst);
-                    let address = forge_provider_api::TurnAddress {
-                        scope: request.scope.clone(),
-                        thread_id: "fixture-session".into(),
-                        turn_id: format!("turn-{count}").into(),
-                    };
-                    sink.send_wait(forge_provider_api::ProviderEvent::Execution {
-                        observation: forge_provider_api::ExecutionObservation::new(
-                            request.scope.clone(),
-                            forge_provider_api::ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
-                    sink.send_wait(forge_provider_api::ProviderEvent::Execution {
-                        observation: forge_provider_api::ExecutionObservation::new(
-                            request.scope.clone(),
-                            forge_provider_api::ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 1,
-                                result: forge_provider_api::ExecutionResult::Completed {
-                                    completion:
-                                        forge_provider_api::completion::ProviderCompletion::default(
-                                        )
-                                        .into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                    log.send_count.fetch_add(1, Ordering::SeqCst);
+                    start.observed(1).await?;
+                    Ok(crate::provider::test_support::native_result(
+                        &request,
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                    ))
                 }
             },
         );
@@ -2334,7 +2351,7 @@ mod tests {
                 if preparation.fail_before_send.swap(false, Ordering::SeqCst) {
                     return Err(forge_provider_api::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ),
                     ));
@@ -2393,6 +2410,7 @@ mod tests {
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         }
@@ -2933,6 +2951,13 @@ mod tests {
         let mut combined = request("second");
         let provider = recovery_bridge()?;
         next.recover(provider.as_provider(), &mut combined).await?;
+        assert_eq!(
+            next.included_inputs()?,
+            vec![forge_provider_api::CoveredInput::new(
+                original.receipt_id().clone(),
+                original.record()?.attempt_id
+            )]
+        );
         next.sending(Some(token("target")))?;
         store.connection.lock().unwrap().execute_batch(&format!(
             "CREATE TRIGGER fail_ack BEFORE UPDATE ON submission WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'disk commit failure'); END;", original.id()))?;

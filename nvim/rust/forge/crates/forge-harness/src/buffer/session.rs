@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::identity::{DocumentId, DocumentRevision, InputSequence, TargetId, ViewId};
@@ -19,6 +20,8 @@ use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
 
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
+/// Elapsed labels show whole seconds, so a faster refresh would publish identical text.
+const ACTIVITY_REFRESH_INTERVAL_MS: u64 = 1_000;
 
 pub(crate) mod diff_view;
 
@@ -26,7 +29,9 @@ pub struct SessionPresentation {
     session_id: String,
     timeline: TimelineStream,
     open: Option<OpenPresentation>,
-    activity_updated: std::time::Instant,
+    /// Supplies one presentation time to elapsed labels and the activity refresh cadence.
+    clock: Arc<dyn crate::broker::Clock>,
+    activity_refreshed_ms: i64,
 }
 
 struct OpenPresentation {
@@ -298,6 +303,7 @@ impl SessionPresentation {
     }
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
+        let now_ms = self.clock.now_ms();
         match request {
             PresentationRequest::DiffInput { .. } => {
                 anyhow::bail!("timeline diff controls require the asynchronous service owner")
@@ -356,7 +362,7 @@ impl SessionPresentation {
                     } else {
                         super::tool::INITIAL_INLINE_BYTES
                     };
-                    toggle_inline_output(open, &call, expanded, limit)?;
+                    toggle_inline_output(open, &call, expanded, limit, now_ms)?;
                 }
                 open.sections.set(
                     &mut open.transcript,
@@ -390,7 +396,12 @@ impl SessionPresentation {
             } => {
                 let open = OpenPresentation::document_mut(&mut self.open, &document)?;
                 if open.transcript.views.open(view.clone(), width)? {
-                    reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
+                    reflow(
+                        open,
+                        self.timeline.entry_list(),
+                        self.timeline.revision(),
+                        now_ms,
+                    )?;
                 }
                 open.sections.register(view.clone());
                 open.input.entry(view).or_insert(InputSequence(0));
@@ -420,9 +431,12 @@ impl SessionPresentation {
                     return Ok(json!({}));
                 }
                 let previous = std::mem::replace(&mut open.agent_scope, run_id);
-                if let Err(failure) =
-                    reflow(open, self.timeline.entry_list(), self.timeline.revision())
-                {
+                if let Err(failure) = reflow(
+                    open,
+                    self.timeline.entry_list(),
+                    self.timeline.revision(),
+                    now_ms,
+                ) {
                     open.agent_scope = previous;
                     return Err(failure);
                 }
@@ -520,7 +534,12 @@ impl SessionPresentation {
             } => {
                 let open = OpenPresentation::document_mut(&mut self.open, &document)?;
                 if open.transcript.views.resize(&view, width)? {
-                    reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
+                    reflow(
+                        open,
+                        self.timeline.entry_list(),
+                        self.timeline.revision(),
+                        now_ms,
+                    )?;
                 }
                 Ok(json!({"updated":true}))
             }
@@ -530,18 +549,30 @@ impl SessionPresentation {
                 open.sections.close(&mut open.transcript, &view);
                 retain_patches(open, Vec::new())?;
                 if open.transcript.views.close(&view) && open.transcript.views.profile().is_some() {
-                    reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
+                    reflow(
+                        open,
+                        self.timeline.entry_list(),
+                        self.timeline.revision(),
+                        now_ms,
+                    )?;
                 }
                 Ok(json!({"closed":true}))
             }
         }
     }
     pub fn new(session_id: String) -> Self {
+        Self::with_clock(session_id, Arc::new(crate::broker::SystemClock))
+    }
+
+    /// Render elapsed labels and pace activity refreshes from an injected clock.
+    pub(crate) fn with_clock(session_id: String, clock: Arc<dyn crate::broker::Clock>) -> Self {
+        let activity_refreshed_ms = clock.now_ms();
         Self {
             timeline: TimelineStream::new(session_id.clone()),
             session_id,
             open: None,
-            activity_updated: std::time::Instant::now(),
+            clock,
+            activity_refreshed_ms,
         }
     }
 
@@ -608,6 +639,7 @@ impl SessionPresentation {
         view: ViewId,
         width: WidthProfile,
     ) -> Result<PresentationOpen> {
+        let now_ms = self.clock.now_ms();
         let started = std::time::Instant::now();
         let mut startup_timing = std::collections::BTreeMap::new();
         document.validate()?;
@@ -617,7 +649,12 @@ impl SessionPresentation {
                 "session presentation is already owned by another document lifetime"
             );
             if open.transcript.views.open(view.clone(), width)? {
-                reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
+                reflow(
+                    open,
+                    self.timeline.entry_list(),
+                    self.timeline.revision(),
+                    now_ms,
+                )?;
             }
             open.sections.register(view.clone());
             open.input.entry(view).or_insert(InputSequence(0));
@@ -646,6 +683,7 @@ impl SessionPresentation {
             let mut entry = project(
                 ProjectionSource::Entry(entry),
                 &width,
+                now_ms,
                 visible_entry,
                 &HashMap::new(),
                 &HashMap::new(),
@@ -750,15 +788,17 @@ impl SessionPresentation {
         if let Some(failure) = &self.document(document)?.failure {
             return Err(super::TranscriptProjectionFailure::new(failure.clone()).into());
         }
-        if self.activity_updated.elapsed() >= std::time::Duration::from_secs(1)
+        let now_ms = self.clock.now_ms();
+        // Either direction counts, so a wall-clock correction cannot stall the counters.
+        if now_ms.abs_diff(self.activity_refreshed_ms) >= ACTIVITY_REFRESH_INTERVAL_MS
             && self.timeline.ticking_entries().next().is_some()
         {
             let open = self
                 .open
                 .as_mut()
                 .context("session presentation is not open")?;
-            refresh_activity(open, self.timeline.ticking_entries())?;
-            self.activity_updated = std::time::Instant::now();
+            refresh_activity(open, self.timeline.ticking_entries(), now_ms)?;
+            self.activity_refreshed_ms = now_ms;
         }
         let open = self.document(document)?;
         let current = open.sections.document.document.revision();
@@ -1183,6 +1223,7 @@ impl SessionPresentation {
         if patch.is_empty() {
             return;
         }
+        let now_ms = self.clock.now_ms();
         let Some(open) = self.open.as_mut() else {
             return;
         };
@@ -1245,9 +1286,14 @@ impl SessionPresentation {
                         _ => false,
                     })
                     .collect();
-                apply_projection(open, patch, filtered.iter().copied(), &unsettled)
+                apply_projection(open, patch, filtered.iter().copied(), &unsettled, now_ms)
             } else {
-                reflow(open, self.timeline.entry_list(), self.timeline.revision())
+                reflow(
+                    open,
+                    self.timeline.entry_list(),
+                    self.timeline.revision(),
+                    now_ms,
+                )
             }
         } else if patch.operation.iter().any(|operation| match operation {
             TimelineOperation::ToolOutput {
@@ -1265,9 +1311,14 @@ impl SessionPresentation {
                 .is_none(),
             _ => false,
         }) {
-            reflow(open, self.timeline.entry_list(), self.timeline.revision())
+            reflow(
+                open,
+                self.timeline.entry_list(),
+                self.timeline.revision(),
+                now_ms,
+            )
         } else {
-            apply_projection(open, patch, patch.operation.iter(), &unsettled)
+            apply_projection(open, patch, patch.operation.iter(), &unsettled, now_ms)
         };
         if let Err(error) = applied {
             open.failure = Some(format!("{error:#}"));
@@ -1379,6 +1430,7 @@ fn find_agent_exchanges<'source>(
 fn refresh_activity<'source>(
     open: &mut OpenPresentation,
     source: impl IntoIterator<Item = &'source TimelineEntry>,
+    now_ms: i64,
 ) -> Result<()> {
     let width = open
         .transcript
@@ -1388,9 +1440,6 @@ fn refresh_activity<'source>(
         .clone();
     let mut blocks = Vec::new();
     let mut status = Vec::new();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
     for entry in source {
         if open.agent_scope.is_none() {
             status.push(super::status::StatusProjection::render(
@@ -1400,6 +1449,7 @@ fn refresh_activity<'source>(
         for block in super::projection::timing_blocks(
             entry,
             &width,
+            now_ms,
             &open.transcript.document,
             &open.sections.nodes.choice,
             &open.sections.nodes.tool,
@@ -1426,6 +1476,7 @@ fn toggle_inline_output(
     call_id: &super::identity::DisplayId,
     expanded: bool,
     limit: usize,
+    now_ms: i64,
 ) -> Result<()> {
     use forge_buffer::identity::BlockId;
     let source = open
@@ -1438,7 +1489,7 @@ fn toggle_inline_output(
         source.load_prefix(limit)?;
     }
     let owner = source.owner().to_owned();
-    let call = source
+    let (call, captured) = source
         .header()
         .context("inline tool heading source is missing")?;
     let heading_id = BlockId(format!("{call_id}:tool"));
@@ -1468,16 +1519,16 @@ fn toggle_inline_output(
         )
         .max(1);
     let renderer = super::transcript::TranscriptRenderer::new(&width)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
     let mut heading = renderer.tool_header(
         heading_id,
         previous_heading.metadata.target[0].id.clone(),
         crate::buffer::transcript::ToolHeading {
             shell: call.command_shell.as_deref(),
             kind: &call.kind,
-            elapsed_ms: call.elapsed_ms(now),
+            elapsed_ms: call.elapsed_ms(crate::turn::ToolInstant {
+                wall_ms: now_ms,
+                active_ms: captured.active_ms,
+            }),
             failed: call.failed,
             title: &call.title,
             expanded,
@@ -1628,6 +1679,7 @@ fn reflow(
     open: &mut OpenPresentation,
     source: &[TimelineEntry],
     timeline_revision: u64,
+    now_ms: i64,
 ) -> Result<()> {
     let source = match open.agent_scope.as_deref() {
         None => source
@@ -1654,6 +1706,7 @@ fn reflow(
         let mut entry = project(
             entry,
             &width,
+            now_ms,
             visible_entry,
             &open.sections.nodes.choice,
             &open.sections.nodes.tool_limit,
@@ -1723,6 +1776,7 @@ fn apply_projection<'operation>(
     patch: &TimelinePatch,
     operations: impl Iterator<Item = &'operation TimelineOperation> + Clone,
     unsettled: &[String],
+    now_ms: i64,
 ) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
@@ -1976,6 +2030,7 @@ fn apply_projection<'operation>(
                 let mut entry = project(
                     ProjectionSource::Entry(entry),
                     width,
+                    now_ms,
                     *index > 0,
                     &open.sections.nodes.choice,
                     &open.sections.nodes.tool_limit,
@@ -2239,13 +2294,58 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 
 #[cfg(test)]
 mod tests {
+    fn native(event: &crate::provider::HarnessEvent) -> &crate::provider::ProviderEvent {
+        match event {
+            crate::provider::HarnessEvent::Native { event, .. } => event,
+            crate::provider::HarnessEvent::Host { .. } => panic!("native fixture required"),
+        }
+    }
+
+    /// Resolve fixture labels against retained domain owners before querying display identities.
     fn tool_display(
         owner: &SessionPresentation,
         source: &str,
     ) -> super::super::identity::DisplayId {
+        fn in_exchange(exchange: &Exchange, source: &str) -> Option<crate::turn::ToolAddress> {
+            for turn in &exchange.turn {
+                for tool in exchange.tools_for_turn(turn.id()) {
+                    if format!("{}:{}", turn.id(), tool.id) == source {
+                        return Some(crate::turn::ToolAddress {
+                            turn: turn.provider().clone(),
+                            item_id: forge_provider_api::ItemId::new(&tool.id).unwrap(),
+                        });
+                    }
+                }
+            }
+            None
+        }
+        fn find(entry: &TimelineEntry, source: &str) -> Option<crate::turn::ToolAddress> {
+            match entry {
+                TimelineEntry::Inherited { entry, .. } => find(entry, source),
+                TimelineEntry::Exchange {
+                    exchange,
+                    agent_by_id,
+                    ..
+                } => in_exchange(exchange, source)
+                    .or_else(|| agent_by_id.values().find_map(|entry| find(entry, source))),
+                TimelineEntry::AgentLifecycle {
+                    exchange, agent, ..
+                } => exchange
+                    .iter()
+                    .find_map(|exchange| in_exchange(exchange, source))
+                    .or_else(|| agent.iter().find_map(|entry| find(entry, source))),
+                _ => None,
+            }
+        }
+        let address = owner
+            .timeline
+            .entry_list()
+            .iter()
+            .find_map(|entry| find(entry, source))
+            .expect("fixture tool has an original owner");
         let open = owner.open.as_ref().unwrap();
         open.display
-            .tool_occurrences(source)
+            .tool_occurrences(&address)
             .find(|id| open.sections.nodes.tool.contains_key(id))
             .unwrap()
     }
@@ -2310,10 +2410,7 @@ mod tests {
     /// Keep the latest preview reachable through commentary, including synthetic initial activity.
     #[test]
     fn live_commentary_reveals_latest_tool_until_settlement() -> Result<()> {
-        use crate::provider::{
-            MessageRole, ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
-            ToolStatus, ToolUpdate, TurnUpdate,
-        };
+        use crate::provider::{TextUpdate, ToolOutcome, ToolStatus};
         use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
 
         let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
@@ -2351,14 +2448,27 @@ mod tests {
                 &mut exchange,
                 &address,
                 tool_id,
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "inspect".into(),
-                    arguments: serde_json::json!({}),
-                    title: format!("Inspect {tool_id}"),
-                },
+                forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(
+                            serde_json::json!({}),
+                        ),
+                        title: format!("Inspect {tool_id}"),
+                    },
+                ),
                 crate::turn::test_support::tool_updates(
+                    &(forge_provider_api::ItemStart::CommandExecution(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            name: "inspect".into(),
+                            arguments: forge_provider_api::InspectableArguments::new(
+                                serde_json::json!({}),
+                            ),
+                            title: format!("Inspect {tool_id}"),
+                        },
+                    )),
                     ToolStatus::Succeeded,
                     Some(output.into()),
                     Default::default(),
@@ -2388,11 +2498,11 @@ mod tests {
             assert_eq!(thought.display, NodeDisplay::Full);
         }
 
-        exchange.observe_turn(
+        exchange.observe_event(
             &crate::turn::test_support::message(
                 &address,
                 "next",
-                Some(MessageRole::Commentary),
+                Some(forge_provider_api::AgentMessageRole::Commentary),
                 "Inspect the next file",
             ),
             2,
@@ -2401,14 +2511,23 @@ mod tests {
             &mut exchange,
             &address,
             "third",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 name: "inspect".into(),
-                arguments: serde_json::json!({}),
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
                 title: "Inspect third".into(),
-            },
+            }),
             crate::turn::test_support::tool_updates(
+                &(forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(
+                            serde_json::json!({}),
+                        ),
+                        title: "Inspect third".into(),
+                    },
+                )),
                 ToolStatus::Running,
                 Some("third-output".into()),
                 Default::default(),
@@ -2418,17 +2537,21 @@ mod tests {
         let snapshot = publish(&mut owner, &exchange)?;
         assert!(text(&snapshot).contains("third-output"));
         assert!(!text(&snapshot).contains("second-output"));
-        let event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "third".into(),
+        let event = crate::turn::test_support::item_event(
+            &(address.clone()),
+            "third",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(
+                    "\nstreamed-output".into(),
+                )),
             },
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("\nstreamed-output".into()),
-            },
-        };
-        exchange.observe_turn(&event, 4)?;
-        assert!(owner.append_tool_output(&exchange, &event)?.is_some());
+        );
+        exchange.observe_event(&event, 4)?;
+        assert!(
+            owner
+                .append_tool_output(&exchange, native(&event))?
+                .is_some()
+        );
         assert!(text(&owner.snapshot(&document)?).contains("streamed-output"));
         let thoughts = snapshot
             .block
@@ -2454,26 +2577,31 @@ mod tests {
             .choice
             .insert(latest.clone(), true);
 
-        exchange.observe_turn(
-            &ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: address.clone(),
-                    tool_id: "third".into(),
-                },
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
-            },
+        exchange.observe_event(
+            &crate::turn::test_support::item_event(
+                &(address.clone()),
+                "third",
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
+            ),
             5,
         )?;
-        exchange.observe_turn(
-            &ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 6,
+        exchange.observe_event(
+            &crate::turn::test_support::completed_event(
+                &(address),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            },
+                6,
+            ),
             6,
         )?;
         assert!(text(&publish(&mut owner, &exchange)?).contains("streamed-output"));
@@ -2556,10 +2684,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "reply",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "response one\nresponse two\nresponse three\nresponse four\nresponse five",
         );
-        exchange.observe_turn(&event, 3)?;
+        exchange.observe_event(&event, 3)?;
         let mut owner = super::SessionPresentation::new("session".into());
         owner.initialize(vec![entry.clone()])?;
         let document = forge_buffer::identity::DocumentId("message-folds".into());
@@ -2676,10 +2804,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "second-reply",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "next one\nnext two\nnext three\nnext four\nnext five",
         );
-        exchange.observe_turn(&event, 5)?;
+        exchange.observe_event(&event, 5)?;
         owner.reconcile(vec![entry.clone(), second.clone()])?;
         let second_response = owner.open.as_ref().unwrap().entry["second"].response[0].clone();
         assert_eq!(
@@ -2720,10 +2848,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "third-reply",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "third one\nthird two\nthird three\nthird four\nthird five",
         );
-        exchange.observe_turn(&event, 7)?;
+        exchange.observe_event(&event, 7)?;
         owner.reconcile(vec![entry.clone(), second.clone(), third.clone()])?;
         assert_eq!(
             owner
@@ -3401,7 +3529,7 @@ mod tests {
 
     #[test]
     fn expanded_streaming_retains_settled_chunks_and_patches_only_the_mutable_tail() -> Result<()> {
-        use crate::provider::{ProviderEvent, TextUpdate, ToolUpdate};
+        use crate::provider::TextUpdate;
         use forge_buffer::identity::BlockId;
         let output = (0..30000)
             .map(|row| format!("row {row} λ\n"))
@@ -3410,7 +3538,7 @@ mod tests {
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        reopen_turn(&mut active["exchange"]["turn"][0]);
         crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["output"] =
             serde_json::json!(output);
         crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
@@ -3443,11 +3571,13 @@ mod tests {
             .nodes
             .choice
             .insert(format!("{display_id}:tool"), true);
+        let now_ms = owner.clock.now_ms();
         toggle_inline_output(
             owner.open.as_mut().unwrap(),
             &display_id,
             true,
             16 * 1024 * 1024,
+            now_ms,
         )?;
         expand_sections(&mut owner, "view")?;
         {
@@ -3493,17 +3623,17 @@ mod tests {
         let mut revision = opened.revision;
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         for iteration in 0..100 {
-            let event = ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: exchange.turn.last().unwrap().provider().clone(),
-                    tool_id: "tool".into(),
+            let event = crate::turn::test_support::item_event(
+                &(exchange.turn.last().unwrap().provider().clone()),
+                "tool",
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(format!(
+                        "new {iteration} 🦀\n"
+                    ))),
                 },
-                update: ToolUpdate::Output {
-                    update: TextUpdate::Append(format!("new {iteration} 🦀\n")),
-                },
-            };
-            exchange.observe_turn(&event, 10 + iteration)?;
-            owner.append_tool_output(&exchange, &event)?;
+            );
+            exchange.observe_event(&event, 10 + iteration)?;
+            owner.append_tool_output(&exchange, native(&event))?;
             let sync = owner.sync(&document, revision)?;
             assert!(sync.snapshot.is_none());
             for patch in sync.patch {
@@ -3533,6 +3663,7 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("new 99 🦀"))
         }));
+        let now_ms = owner.clock.now_ms();
         refresh_activity(
             owner.open.as_mut().unwrap(),
             &[TimelineEntry::Exchange {
@@ -3543,6 +3674,7 @@ mod tests {
 
                 agent_by_id: HashMap::new(),
             }],
+            now_ms,
         )?;
         let timed_heading = owner
             .open
@@ -3557,11 +3689,13 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_eq!(pointer(&owner, &settled), settled_pointer);
+        let now_ms = owner.clock.now_ms();
         toggle_inline_output(
             owner.open.as_mut().unwrap(),
             &display_id,
             false,
             super::super::tool::INITIAL_INLINE_BYTES,
+            now_ms,
         )?;
         let collapsed_heading = owner
             .open
@@ -3589,21 +3723,21 @@ mod tests {
 
     #[test]
     fn streamed_message_reparses_only_its_owned_block_and_retains_tools() -> Result<()> {
-        use crate::provider::{MessageUpdate, ProviderEvent};
+        use crate::provider::ProviderEvent;
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        reopen_turn(&mut active["exchange"]["turn"][0]);
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let address = exchange.turn[0].provider().clone();
         let mut event = crate::turn::test_support::message(
             &address,
             "message",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "First [link](https://example.com)",
         );
-        exchange.observe_turn(&event, 2)?;
+        exchange.observe_event(&event, 2)?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
 
@@ -3628,14 +3762,21 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Delta {
-                text: "\n\nMore **text** with λ.".into(),
+        if let crate::provider::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item { event: update, .. } = boxed_native_event.as_mut()
+        {
+            *update = forge_provider_api::ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Delta(
+                    "\n\nMore **text** with λ.".into(),
+                ),
             };
         }
-        exchange.observe_turn(&event, 3)?;
+        exchange.observe_event(&event, 3)?;
         let patch = owner
-            .update_message(&exchange, &event)?
+            .update_message(&exchange, native(&event))?
             .expect("owned message");
         assert!(matches!(
             &patch.operation[..],
@@ -3673,37 +3814,44 @@ mod tests {
     #[test]
     fn streamed_thought_retains_owned_tools_and_expansion() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
-        use crate::provider::{
-            MessageUpdate, ProviderEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-        };
+        use crate::provider::{ProviderEvent, ToolOutcome};
         use forge_buffer::node::NodeKind;
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        reopen_turn(&mut active["exchange"]["turn"][0]);
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let address = exchange.turn[0].provider().clone();
         let mut event = crate::turn::test_support::message(
             &address,
             "message",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "First [link](https://example.com)",
         );
-        exchange.observe_turn(&event, 2)?;
+        exchange.observe_event(&event, 2)?;
         let thought_id = exchange.node_list.last().unwrap().id().to_owned();
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             "owned-tool",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 title: "Read owned output".into(),
                 name: "read".into(),
-                arguments: serde_json::json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
+            }),
             crate::turn::test_support::tool_updates(
+                &(forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "Read owned output".into(),
+                        name: "read".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(
+                            serde_json::json!({}),
+                        ),
+                    },
+                )),
                 crate::provider::ToolStatus::Running,
                 Some("Thought-owned output".into()),
                 Default::default(),
@@ -3765,14 +3913,21 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        if let ProviderEvent::Message { update, .. } = &mut event {
-            *update = MessageUpdate::Delta {
-                text: "\n\nMore **text** with λ.".into(),
+        if let crate::provider::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item { event: update, .. } = boxed_native_event.as_mut()
+        {
+            *update = forge_provider_api::ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Delta(
+                    "\n\nMore **text** with λ.".into(),
+                ),
             };
         }
-        exchange.observe_turn(&event, 3)?;
+        exchange.observe_event(&event, 3)?;
         let patch = owner
-            .update_message(&exchange, &event)?
+            .update_message(&exchange, native(&event))?
             .expect("owned message");
         assert!(matches!(
             &patch.operation[..],
@@ -3828,16 +3983,21 @@ mod tests {
                 .0,
             thought_id
         );
-        let tool_event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address,
-                tool_id: "owned-tool".into(),
-            },
-            update: ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            },
-        };
-        exchange.observe_turn(&tool_event, 4)?;
+        let tool_event = crate::turn::test_support::item_event(
+            &(address),
+            "owned-tool",
+            forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::CommandExecution(
+                    forge_provider_api::ToolCompletion {
+                        outcome: ToolOutcome::Succeeded,
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    },
+                ),
+            ),
+        );
+        exchange.observe_event(&tool_event, 4)?;
         owner.reconcile(vec![
             interaction_entry("settled"),
             TimelineEntry::Exchange {
@@ -3868,22 +4028,22 @@ mod tests {
 
     #[test]
     fn streamed_thoughts_appear_only_in_status_when_enabled() -> Result<()> {
-        use crate::provider::{MessageUpdate, ProviderEvent};
+        use crate::provider::ProviderEvent;
         for status_thoughts in [false, true] {
             let mut active = serde_json::to_value(interaction_entry("active"))?;
             active["exchange"]["state"] = serde_json::json!("running");
             active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
             active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-            active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            reopen_turn(&mut active["exchange"]["turn"][0]);
             let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
             let address = exchange.turn[0].provider().clone();
-            let mut event = crate::turn::test_support::message(
+            let mut event = crate::turn::test_support::reasoning(
                 &address,
                 "streamed-summary",
-                Some(crate::provider::MessageRole::ThoughtSummary),
+                forge_provider_api::ReasoningKind::Summary,
                 "Inspect settings.",
             );
-            exchange.observe_turn(&event, 2)?;
+            exchange.observe_event(&event, 2)?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![
                 TimelineEntry::Exchange {
@@ -3915,14 +4075,19 @@ mod tests {
                 ViewId("view".into()),
                 WidthProfile::default(),
             )?;
-            if let ProviderEvent::Message { update, .. } = &mut event {
-                *update = MessageUpdate::Delta {
-                    text: " Next step.".into(),
+            if let crate::provider::HarnessEvent::Native {
+                event: boxed_native_event,
+                ..
+            } = &mut event
+                && let ProviderEvent::Item { event: update, .. } = boxed_native_event.as_mut()
+            {
+                *update = forge_provider_api::ItemEvent::Message {
+                    event: forge_provider_api::MessageItemEvent::Delta(" Next step.".into()),
                 };
             }
-            exchange.observe_turn(&event, 3)?;
+            exchange.observe_event(&event, 3)?;
             let patch = owner
-                .update_message(&exchange, &event)?
+                .update_message(&exchange, native(&event))?
                 .expect("owned thought");
             assert!(matches!(
                 patch.operation.first(),
@@ -4002,12 +4167,12 @@ mod tests {
 
     #[test]
     fn streamed_output_changes_only_the_tool_and_its_fold_endpoints() -> Result<()> {
-        use crate::provider::{ProviderEvent, TextUpdate, ToolUpdate};
+        use crate::provider::TextUpdate;
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        reopen_turn(&mut active["exchange"]["turn"][0]);
         crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
             serde_json::json!("inProgress");
         crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["completed_at_ms"] =
@@ -4064,18 +4229,18 @@ mod tests {
                 .any(|block| block.id.0 == historical_preview)
         );
         let expanded_revision = owner.snapshot(&document)?.revision;
-        let event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: exchange.turn[0].provider().clone(),
-                tool_id: "tool".into(),
+        let event = crate::turn::test_support::item_event(
+            &(exchange.turn[0].provider().clone()),
+            "tool",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(
+                    "\nseventh\n".into(),
+                )),
             },
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("\nseventh\n".into()),
-            },
-        };
-        exchange.observe_turn(&event, 10)?;
+        );
+        exchange.observe_event(&event, 10)?;
         let patch = owner
-            .append_tool_output(&exchange, &event)?
+            .append_tool_output(&exchange, native(&event))?
             .expect("incremental output");
         assert!(matches!(
             &patch.operation[..],
@@ -4134,8 +4299,7 @@ mod tests {
     fn consecutive_file_writes_update_one_expanded_entry_across_turns_and_reload() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::provider::{
-            ProviderChangeKind, ProviderChangeSet, ProviderEvent, ProviderFileChange,
-            ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
+            ProviderChangeKind, ProviderChangeSet, ProviderFileChange, ToolOutcome,
         };
         use forge_buffer::node::{NodeDisplay, NodeKind};
         use serde_json::json;
@@ -4172,10 +4336,10 @@ mod tests {
                 let event = crate::turn::test_support::message(
                     &address,
                     "thought",
-                    Some(crate::provider::MessageRole::Commentary),
+                    Some(forge_provider_api::AgentMessageRole::Commentary),
                     "Write the requested files.\nPreserve their content.",
                 );
-                exchange.observe_turn(&event, 0)?;
+                exchange.observe_event(&event, 0)?;
                 owner.reconcile(vec![entry(&exchange)])?;
                 let snapshot = owner.snapshot(&document)?;
                 let thought = snapshot
@@ -4204,25 +4368,32 @@ mod tests {
                 );
                 assert!(thought.metadata.fold.is_empty());
             }
-            let event = crate::turn::test_support::message(
+            let event = crate::turn::test_support::reasoning(
                 &address,
                 format!("reasoning-{batch}"),
-                Some(crate::provider::MessageRole::ThoughtSummary),
+                forge_provider_api::ReasoningKind::Summary,
                 "Continue writing",
             );
-            exchange.observe_turn(&event, batch as i64 * 10 + 1)?;
+            exchange.observe_event(&event, batch as i64 * 10 + 1)?;
             crate::turn::test_support::tool(
                 &mut exchange,
                 &address,
                 &format!("write-{batch}"),
-                ToolInvocation {
+                forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
                     semantics: Default::default(),
-                    kind: ToolActivityKind::FileChange,
                     title: "file changes".into(),
                     name: "edit".into(),
-                    arguments: json!({}),
-                },
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                }),
                 crate::turn::test_support::tool_updates(
+                    &(forge_provider_api::ItemStart::FileChange(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            title: "file changes".into(),
+                            name: "edit".into(),
+                            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                        },
+                    )),
                     crate::provider::ToolStatus::Running,
                     None,
                     ProviderChangeSet {
@@ -4270,17 +4441,22 @@ mod tests {
                     .unwrap();
                 assert!(group.text.wire_rows().join("").contains("running"));
             }
-            let event = ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: address.clone(),
-                    tool_id: format!("write-{batch}").into(),
-                },
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
-            };
-            exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
-            exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
+            let event = crate::turn::test_support::item_event(
+                &(address.clone()),
+                format!("write-{batch}"),
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::FileChange(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
+            );
+            exchange.observe_event(&event, batch as i64 * 10 + 3)?;
+            exchange.observe_event(&event, batch as i64 * 10 + 3)?;
             if batch == 0 {
                 exchange
                     .node_list
@@ -4302,28 +4478,37 @@ mod tests {
                 &mut exchange,
                 &address,
                 &format!("inspect-{batch}"),
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    title: "Inspect file".into(),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                },
+                forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "Inspect file".into(),
+                        name: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    },
+                ),
                 crate::turn::test_support::tool_updates(
+                    &(forge_provider_api::ItemStart::CommandExecution(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            title: "Inspect file".into(),
+                            name: "inspect".into(),
+                            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                        },
+                    )),
                     crate::provider::ToolStatus::Succeeded,
                     Some("File inspected".into()),
                     Default::default(),
                 ),
                 batch as i64 * 10 + 4,
             )?;
-            let event = ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: batch as i64 * 10 + 5,
+            let event = crate::turn::test_support::completed_event(
+                &(address),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            };
-            exchange.observe_turn(&event, batch as i64 * 10 + 5)?;
+                batch as i64 * 10 + 5,
+            );
+            exchange.observe_event(&event, batch as i64 * 10 + 5)?;
             exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
             owner.reconcile(vec![entry(&exchange)])?;
             let snapshot = owner.snapshot(&document)?;
@@ -5072,7 +5257,16 @@ mod tests {
             let previous = owner.snapshot(&document)?;
             set_evidence(&mut entry, "invalid saved comparison", false, None);
             let revision = owner.timeline.revision();
-            assert!(reflow(owner.open.as_mut().unwrap(), &[entry.clone()], revision).is_err());
+            let now_ms = owner.clock.now_ms();
+            assert!(
+                reflow(
+                    owner.open.as_mut().unwrap(),
+                    &[entry.clone()],
+                    revision,
+                    now_ms
+                )
+                .is_err()
+            );
             assert_eq!(owner.snapshot(&document)?.block, previous.block);
             owner.reconcile(vec![entry.clone()])?;
             assert!(
@@ -5107,9 +5301,7 @@ mod tests {
     #[test]
     fn hidden_parallel_tool_output_stays_cached_until_exchange_completion() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
-        use crate::provider::{
-            ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-        };
+        use crate::provider::{TextUpdate, ToolOutcome};
         use serde_json::{Value, json};
         let mut value = serde_json::to_value(interaction_entry("parallel"))?;
         value["exchange"]["state"] = json!("running");
@@ -5126,14 +5318,21 @@ mod tests {
             &mut exchange,
             &address,
             "latest",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 title: "Latest parallel tool".into(),
                 name: "latest".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             crate::turn::test_support::tool_updates(
+                &(forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "Latest parallel tool".into(),
+                        name: "latest".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    },
+                )),
                 crate::provider::ToolStatus::Running,
                 Some("Latest output".into()),
                 Default::default(),
@@ -5170,18 +5369,18 @@ mod tests {
                 .row_count(),
             1
         );
-        let event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "tool".into(),
+        let event = crate::turn::test_support::item_event(
+            &(address.clone()),
+            "tool",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(
+                    "\nLate older output".into(),
+                )),
             },
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("\nLate older output".into()),
-            },
-        };
-        exchange.observe_turn(&event, 3)?;
+        );
+        exchange.observe_event(&event, 3)?;
         owner
-            .append_tool_output(&exchange, &event)?
+            .append_tool_output(&exchange, native(&event))?
             .expect("hidden tool output delta");
         owner.sync(&document, opened.transcript.revision)?;
         let after = owner.snapshot(&document)?;
@@ -5228,14 +5427,21 @@ mod tests {
             &mut exchange,
             &address,
             "third",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 title: "Third parallel tool".into(),
                 name: "third".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             crate::turn::test_support::tool_updates(
+                &(forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "Third parallel tool".into(),
+                        name: "third".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    },
+                )),
                 crate::provider::ToolStatus::Running,
                 Some("Third output".into()),
                 Default::default(),
@@ -5277,24 +5483,29 @@ mod tests {
             1
         );
         for id in ["tool", "latest", "third"] {
-            let event = ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: address.clone(),
-                    tool_id: id.into(),
-                },
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
-            };
-            exchange.observe_turn(&event, 5)?;
+            let event = crate::turn::test_support::item_event(
+                &(address.clone()),
+                id,
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
+            );
+            exchange.observe_event(&event, 5)?;
         }
         let event = crate::turn::test_support::message(
             &address,
             "continuing",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Tool group complete, continuing the exchange.",
         );
-        exchange.observe_turn(&event, 6)?;
+        exchange.observe_event(&event, 6)?;
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
 
@@ -5435,7 +5646,6 @@ mod tests {
 
     #[tokio::test]
     async fn markdown_responses_keep_source_without_native_syntax_jobs() -> Result<()> {
-        use crate::provider::{ProviderEvent, TurnUpdate};
         let entry_for = |body: &str| {
             let mut entry = interaction_entry("markdown");
             let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
@@ -5458,18 +5668,18 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 "response",
-                Some(crate::provider::MessageRole::Response),
+                Some(forge_provider_api::AgentMessageRole::Response),
                 body,
             );
-            exchange.observe_turn(&event, 2).unwrap();
-            let event = ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 3,
+            exchange.observe_event(&event, 2).unwrap();
+            let event = crate::turn::test_support::completed_event(
+                &(address),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            };
-            exchange.observe_turn(&event, 3).unwrap();
+                3,
+            );
+            exchange.observe_event(&event, 3).unwrap();
             exchange
                 .finish(crate::exchange::ExchangeOutcome::Complete, 3)
                 .unwrap();
@@ -5634,7 +5844,8 @@ mod tests {
             .unwrap()
             .clone();
         assert!(!highlighted.metadata.visible_decoration.is_empty());
-        refresh_activity(owner.open.as_mut().unwrap(), &[entry.clone()])?;
+        let now_ms = owner.clock.now_ms();
+        refresh_activity(owner.open.as_mut().unwrap(), &[entry.clone()], now_ms)?;
         assert_eq!(
             owner
                 .open
@@ -5674,8 +5885,14 @@ mod tests {
         Ok(())
     }
 
+    /// Reopen a serialized fixture turn without retaining its contradictory completion evidence.
+    fn reopen_turn(turn: &mut serde_json::Value) {
+        turn["state"] = serde_json::json!({"kind":"running"});
+        turn["completed"] = serde_json::Value::Null;
+        turn["completed_at_ms"] = serde_json::Value::Null;
+    }
+
     fn interaction_entry(identity: &str) -> TimelineEntry {
-        use crate::provider::{ProviderEvent, ToolActivityKind, ToolInvocation, TurnUpdate};
         let mut interaction = Exchange {
             finalization_error: None,
             check_owner: None,
@@ -5699,6 +5916,7 @@ mod tests {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
             created_at_ms: 0,
@@ -5714,25 +5932,34 @@ mod tests {
         };
         let address = crate::turn::test_support::address(&interaction, identity);
         interaction.start_turn(address.clone(), 0).unwrap();
-        let event = crate::turn::test_support::message(
+        let event = crate::turn::test_support::reasoning(
             &address,
             "thought",
-            Some(crate::provider::MessageRole::Thought),
+            forge_provider_api::ReasoningKind::Full,
             "Completed thought\nwith details",
         );
-        interaction.observe_turn(&event, 0).unwrap();
+        interaction.observe_event(&event, 0).unwrap();
         crate::turn::test_support::tool(
             &mut interaction,
             &address,
             "tool",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 title: "Read output".into(),
                 name: "read".into(),
-                arguments: serde_json::json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
+            }),
             crate::turn::test_support::tool_updates(
+                &(forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "Read output".into(),
+                        name: "read".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(
+                            serde_json::json!({}),
+                        ),
+                    },
+                )),
                 crate::provider::ToolStatus::Succeeded,
                 Some("first\nsecond\nthird\nfourth\nfifth\nsixth".into()),
                 Default::default(),
@@ -5740,14 +5967,14 @@ mod tests {
             1,
         )
         .unwrap();
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 1,
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        interaction.observe_turn(&event, 1).unwrap();
+            1,
+        );
+        interaction.observe_event(&event, 1).unwrap();
         interaction
             .finish(crate::exchange::ExchangeOutcome::Complete, 1)
             .unwrap();
@@ -5843,7 +6070,7 @@ mod tests {
     fn streaming_pages_publish_continuations_without_exceeding_the_loaded_row_budget() -> Result<()>
     {
         use super::super::nodes::{NodeAction, NodeRequest};
-        use crate::provider::{ProviderEvent, TextUpdate, ToolUpdate};
+        use crate::provider::TextUpdate;
         for (rows, initial, delta) in [
             (
                 4096,
@@ -5856,7 +6083,7 @@ mod tests {
             value["exchange"]["state"] = serde_json::json!("running");
             value["exchange"]["completed_at_ms"] = serde_json::Value::Null;
             value["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
-            value["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            reopen_turn(&mut value["exchange"]["turn"][0]);
             crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["output"] =
                 serde_json::json!(initial);
             crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["status"] =
@@ -5899,17 +6126,15 @@ mod tests {
                 },
             })?;
             let projected = owner.open.as_ref().unwrap().sections.projected_entries;
-            let event = ProviderEvent::Tool {
-                address: crate::provider::ToolAddress {
-                    turn: exchange.turn[0].provider().clone(),
-                    tool_id: "tool".into(),
+            let event = crate::turn::test_support::item_event(
+                &(exchange.turn[0].provider().clone()),
+                "tool",
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(delta)),
                 },
-                update: ToolUpdate::Output {
-                    update: TextUpdate::Append(delta),
-                },
-            };
-            exchange.observe_turn(&event, 10)?;
-            owner.append_tool_output(&exchange, &event)?;
+            );
+            exchange.observe_event(&event, 10)?;
+            owner.append_tool_output(&exchange, native(&event))?;
             let snapshot = owner.snapshot(&document)?;
             let state = snapshot
                 .block
@@ -6141,6 +6366,7 @@ mod tests {
                             source: crate::agent::AgentSource::Model,
                             selection: None,
                             inbox: Vec::new(),
+                            continuation: crate::agent::AgentContinuationPolicy::Ready,
                             nickname: None,
                             state: crate::agent::AgentState::Ready,
                             created_at_ms: 0,
@@ -6189,10 +6415,10 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 "response",
-                Some(crate::provider::MessageRole::Response),
+                Some(forge_provider_api::AgentMessageRole::Response),
                 "Second task is running",
             );
-            exchange.observe_turn(&event, 3)?;
+            exchange.observe_event(&event, 3)?;
             let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
             assert_eq!(
                 owner
@@ -6263,7 +6489,7 @@ mod tests {
     fn child_fold_streams_headers_then_collapses_completed_history() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::exchange::ExchangeNode;
-        use crate::provider::{ProviderEvent, TextUpdate, ToolUpdate, TurnUpdate};
+        use crate::provider::TextUpdate;
         let live = |identity: &str| -> Result<Exchange> {
             let TimelineEntry::Exchange { exchange, .. } = interaction_entry(identity) else {
                 unreachable!()
@@ -6272,7 +6498,7 @@ mod tests {
             raw["state"] = serde_json::json!("running");
             raw["completed_at_ms"] = serde_json::Value::Null;
             raw["execution_started_at_ms"] = serde_json::json!(1);
-            raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            reopen_turn(&mut raw["turn"][0]);
             crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
                 serde_json::json!("inProgress");
             crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
@@ -6368,37 +6594,37 @@ mod tests {
             run_id: None,
         })?;
         let address = child.turn[0].provider().clone();
-        let event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "tool".into(),
+        let event = crate::turn::test_support::item_event(
+            &(address.clone()),
+            "tool",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Append(
+                    "\nSTREAMED_CHILD_OUTPUT".into(),
+                )),
             },
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("\nSTREAMED_CHILD_OUTPUT".into()),
-            },
-        };
-        child.observe_turn(&event, 2)?;
+        );
+        child.observe_event(&event, 2)?;
         owner
-            .append_tool_output(&child, &event)?
+            .append_tool_output(&child, native(&event))?
             .expect("child output patch");
         assert!(!contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
         let event = crate::turn::test_support::message(
             &address,
             "response",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "CHILD_FINAL_RESPONSE",
         );
-        child.observe_turn(&event, 3)?;
+        child.observe_event(&event, 3)?;
         owner.reconcile(vec![entry(child.clone())])?;
         assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 4,
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        child.observe_turn(&event, 4)?;
+            4,
+        );
+        child.observe_event(&event, 4)?;
         child.finish(crate::exchange::ExchangeOutcome::Complete, 4)?;
         owner.reconcile(vec![entry(child)])?;
         let completed = owner.snapshot(&document)?;
@@ -6466,7 +6692,7 @@ mod tests {
         raw["state"] = serde_json::json!("running");
         raw["completed_at_ms"] = serde_json::Value::Null;
         raw["execution_started_at_ms"] = serde_json::json!(1);
-        raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        reopen_turn(&mut raw["turn"][0]);
         crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
             serde_json::json!("inProgress");
         crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
@@ -6486,6 +6712,7 @@ mod tests {
                 source: crate::agent::AgentSource::Model,
                 selection: None,
                 inbox: Vec::new(),
+                continuation: crate::agent::AgentContinuationPolicy::Ready,
                 nickname: None,
                 state: AgentState::Ready,
                 created_at_ms: 0,
@@ -6566,18 +6793,18 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("queued while selecting agent"))
         );
-        let event = crate::provider::ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: interaction.turn[0].provider().clone(),
-                tool_id: "tool".into(),
+        let event = crate::turn::test_support::item_event(
+            &(interaction.turn[0].provider().clone()),
+            "tool",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(
+                    crate::provider::TextUpdate::Append("\nscoped output".into()),
+                ),
             },
-            update: crate::provider::ToolUpdate::Output {
-                update: crate::provider::TextUpdate::Append("\nscoped output".into()),
-            },
-        };
-        interaction.observe_turn(&event, 2)?;
+        );
+        interaction.observe_event(&event, 2)?;
         owner
-            .append_tool_output(&interaction, &event)?
+            .append_tool_output(&interaction, native(&event))?
             .expect("scoped output");
         let update = owner.sync(&document, selected.revision)?;
         assert!(
@@ -6612,10 +6839,9 @@ mod tests {
 
     #[test]
     fn compaction_counter_refreshes_without_provider_events() -> Result<()> {
-        let started_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64;
-        let mut owner = SessionPresentation::new("session".into());
+        let started_at_ms = 1_000_000;
+        let clock = Arc::new(crate::broker::ManualClock::new(started_at_ms + 5_000));
+        let mut owner = SessionPresentation::with_clock("session".into(), clock.clone());
         owner.initialize(vec![TimelineEntry::Status {
             checks: None,
             status_thoughts: true,
@@ -6630,31 +6856,37 @@ mod tests {
             ViewId("view:compaction-timer".into()),
             WidthProfile::default(),
         )?;
-        let before = opened.status.block[0]
-            .text
-            .row(0)
-            .unwrap()
-            .strip_prefix("Compacting · ")
-            .unwrap()
-            .trim_end_matches('s')
-            .parse::<u64>()?;
+        let counter_seconds = |snapshot: &BufferSnapshot| -> Result<u64> {
+            Ok(snapshot.block[0]
+                .text
+                .row(0)
+                .context("compaction status row is missing")?
+                .strip_prefix("Compacting · ")
+                .context("compaction status label is missing")?
+                .trim_end_matches('s')
+                .parse::<u64>()?)
+        };
+        assert_eq!(counter_seconds(&opened.status)?, 5);
         let timeline_revision = owner.revision();
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        // Inside the refresh interval the counter holds, even though its label would change.
+        clock.advance(std::time::Duration::from_millis(999));
+        owner.sync(&document, opened.transcript.revision)?;
+        assert_eq!(
+            counter_seconds(&owner.snapshot(&opened.status.document)?)?,
+            5
+        );
+        clock.advance(std::time::Duration::from_millis(101));
         let update = owner.sync(&document, opened.transcript.revision)?;
         assert!(
             update.patch.is_empty(),
             "elapsed time changed the transcript"
         );
         let refreshed = owner.snapshot(&opened.status.document)?;
-        let after = refreshed.block[0]
-            .text
-            .row(0)
-            .unwrap()
-            .strip_prefix("Compacting · ")
-            .unwrap()
-            .trim_end_matches('s')
-            .parse::<u64>()?;
-        assert!(after > before, "compaction counter did not advance");
+        assert_eq!(
+            counter_seconds(&refreshed)?,
+            6,
+            "compaction counter did not advance"
+        );
         assert_eq!(
             owner.revision(),
             timeline_revision,

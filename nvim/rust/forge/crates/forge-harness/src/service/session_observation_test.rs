@@ -1,7 +1,6 @@
 use super::*;
 use crate::provider::{
-    Compaction, CompactionResult, CompactionState, EventScope, ExecutionOwner, ProviderDiagnostic,
-    ProviderEvent,
+    Compaction, CompactionResult, CompactionState, EventScope, ProviderEvent, ThreadOwner,
 };
 use forge_provider_api::provider::Provider as _;
 
@@ -22,13 +21,15 @@ fn observation_descriptor() -> forge_provider_api::ProviderDescriptor {
     }
 }
 
-fn session_test_diagnostic(message: impl Into<String>) -> ProviderDiagnostic {
-    ProviderDiagnostic {
-        kind: forge_provider_api::ProviderFailureKind::Unknown,
+fn session_test_diagnostic(message: impl Into<String>) -> forge_provider_api::AdapterActivity {
+    forge_provider_api::AdapterActivity::Warning(forge_provider_api::ProviderWarning {
+        scope: forge_provider_api::WarningScope::Provider,
+        kind: forge_provider_api::ProviderWarningKind::NativeNotice {
+            category: forge_provider_api::ProviderFailureKind::Unknown,
+        },
         message: forge_provider_api::SanitizedMessage::new(message)
             .expect("fixture diagnostic is nonempty"),
-        fatal: false,
-    }
+    })
 }
 
 fn observation_provider(
@@ -36,41 +37,26 @@ fn observation_provider(
 ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
     crate::provider::test_support::EventFixtureProvider::new(
         observation_descriptor(),
-        move |request, sink, _cancelled| {
+        move |request, _sink, start, _cancelled| {
             let foreground = foreground.clone();
             async move {
                 let Some(foreground) = foreground else {
-                    return Ok(());
+                    return Ok(crate::provider::test_support::native_result(
+                        &request,
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                    ));
                 };
                 foreground.calls.fetch_add(1, Ordering::AcqRel);
                 foreground.active.store(true, Ordering::Release);
                 *foreground.submission_id.lock().unwrap() =
                     Some(request.submission_id.as_str().to_owned());
-                let turn = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id: "fixture-thread".into(),
-                    turn_id: "live-turn".into(),
-                };
-                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                    request.scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                        address: turn.clone(),
-                    },
-                )?;
-                sink.send_wait(ProviderEvent::Execution { observation })
-                    .await?;
-                sink.send_wait(ProviderEvent::Turn {
-                    address: turn,
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                start.observed(1).await?;
                 foreground.fail.notified().await;
                 foreground.active.store(false, Ordering::Release);
                 let failure =
                     forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable;
-                sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
-                    failure.clone(),
-                ));
                 Err(forge_provider_api::ProviderError::Observation(failure))
             }
         },
@@ -86,7 +72,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
         "client_id":"replacement-observation-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
-    let owner = ExecutionOwner::root(&session_id);
+    let owner = ThreadOwner::root(&session_id);
     let provider = observation_provider(None);
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
@@ -117,17 +103,8 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     assert!(failure.to_string().contains("Session observation failed"));
     controller.recover_session_events(&message_sink).await?;
     let replacement = provider.event_sink(&owner).await?;
-    let scope = EventScope::SessionOperation {
-        owner,
-        operation_id: forge_provider_api::OperationId::new("replacement")
-            .expect("fixture operation identity is nonempty"),
-    };
     replacement
-        .bind_scope(scope.clone())?
-        .send_wait(ProviderEvent::Diagnostic {
-            scope,
-            diagnostic: session_test_diagnostic("new generation"),
-        })
+        .send_wait(session_test_diagnostic("new generation"))
         .await?;
     let frame = tokio::time::timeout(Duration::from_secs(5), output.recv())
         .await??
@@ -135,16 +112,9 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     let event: Value = serde_json::from_slice(frame.bytes())?;
     assert!(event.to_string().contains("new generation"));
     assert!(
-        old.send_wait(ProviderEvent::Diagnostic {
-            scope: EventScope::SessionOperation {
-                owner: ExecutionOwner::root(&session_id),
-                operation_id: forge_provider_api::OperationId::new("old")
-                    .expect("fixture operation identity is nonempty")
-            },
-            diagnostic: session_test_diagnostic("stale"),
-        })
-        .await
-        .is_err()
+        old.send_wait(session_test_diagnostic("stale"))
+            .await
+            .is_err()
     );
     Ok(())
 }
@@ -167,7 +137,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
     let foreground = Arc::new(ForegroundObservationLoss::default());
-    let owner = ExecutionOwner::root(&session_id);
+    let owner = ThreadOwner::root(&session_id);
     let provider = observation_provider(Some(foreground.clone()));
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
@@ -367,7 +337,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
         "client_id":"observation-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
-    let owner = ExecutionOwner::root(&session_id);
+    let owner = ThreadOwner::root(&session_id);
     let scope = EventScope::SessionOperation {
         owner: owner.clone(),
         operation_id: forge_provider_api::OperationId::new("observation-fixture")
@@ -384,16 +354,13 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES / 2;
     // Keep the native session stream open after the producer finishes. Dropping
     // its last sender would be an unexpected disconnect, not a drained session.
-    let provider_sink = provider
-        .event_sink(&owner)
-        .await?
-        .bind_scope(scope.clone())?;
+    let provider_sink = provider.event_sink(&owner).await?;
     let session_sink = provider_sink.clone();
     let producer = tokio::spawn(async move {
         provider_sink
-            .send_wait(ProviderEvent::Compaction {
-                scope: scope.clone(),
-                update: Box::new(Compaction {
+            .send_wait(forge_provider_api::AdapterActivity::Thread {
+                thread_id: scope.owner().thread_id(),
+                event: forge_provider_api::ThreadEvent::CompactionUpdated(Box::new(Compaction {
                     id: "durable-observation".into(),
                     thread_id: "native-observation".into(),
                     state: CompactionState::Completed,
@@ -405,15 +372,12 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
                         context_tokens_after: Some(25),
                         ..Default::default()
                     },
-                }),
+                })),
             })
             .await?;
         for sequence in 0..diagnostic_count {
             provider_sink
-                .send_wait(ProviderEvent::Diagnostic {
-                    scope: scope.clone(),
-                    diagnostic: session_test_diagnostic(format!("observation-{sequence}")),
-                })
+                .send_wait(session_test_diagnostic(format!("observation-{sequence}")))
                 .await?;
         }
         Ok::<_, crate::provider::ProviderError>(())
@@ -487,12 +451,7 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         "client_id":"observation-overflow", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
-    let owner = ExecutionOwner::root(&session_id);
-    let scope = EventScope::SessionOperation {
-        owner: owner.clone(),
-        operation_id: forge_provider_api::OperationId::new("overflow")
-            .expect("fixture operation identity is nonempty"),
-    };
+    let owner = ThreadOwner::root(&session_id);
     let provider = observation_provider(None);
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
@@ -500,17 +459,11 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     let controller = SessionController::new(broker).await?;
     let (output, _receiver) = forge_protocol::outbound::channel();
     controller.attach_session_events(&output).await?;
-    let sink = provider
-        .event_sink(&owner)
-        .await?
-        .bind_scope(scope.clone())?;
+    let sink = provider.event_sink(&owner).await?;
     let guard = controller.broker.lock().await;
     for sequence in 0..(forge_protocol::MAX_PENDING_FRAMES * 2) {
         if sink
-            .send_wait(ProviderEvent::Diagnostic {
-                scope: scope.clone(),
-                diagnostic: session_test_diagnostic(format!("observation-{sequence}")),
-            })
+            .send_wait(session_test_diagnostic(format!("observation-{sequence}")))
             .await
             .is_err()
         {
@@ -531,13 +484,22 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         "overflow discarded the accepted prefix"
     );
     for (sequence, event) in accepted.iter().enumerate() {
-        let ProviderEvent::Diagnostic { diagnostic, .. } = event else {
+        let crate::provider::session_execution::OwnerObservation::Event(
+            crate::provider::HarnessEvent::Native {
+                event: native_event,
+                ..
+            },
+        ) = event
+        else {
             panic!("unexpected accepted event: {event:?}")
         };
-        assert_eq!(
-            diagnostic.message.as_str(),
-            format!("observation-{sequence}")
-        );
+        let ProviderEvent::Provider {
+            event: forge_provider_api::ProviderConnectionEvent::Warning(warning),
+        } = native_event.as_ref()
+        else {
+            panic!("unexpected accepted native event: {native_event:?}")
+        };
+        assert_eq!(warning.message.as_str(), format!("observation-{sequence}"));
     }
     let error = inbox
         .drain()
@@ -558,98 +520,150 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
 /// Drain shutdown evidence through the real collector and store before releasing its lease.
 #[tokio::test]
 async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -> Result<()> {
-    use crate::provider::{
-        TextUpdate, ToolActivityKind, ToolAddress, ToolInvocation, ToolOutcome, ToolUpdate,
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart};
+    use forge_provider_api::tool::{
+        InspectableArguments, TextUpdate, ToolCompletion, ToolDescriptor, ToolItemEvent,
+        ToolOutcome, ToolSemantics,
     };
-
+    use forge_provider_api::{AdapterActivity, ItemId};
     let fixture = tempfile::tempdir()?;
+    crate::checks::configure_fixture(fixture.path());
+    let data_root = fixture.path().join("data");
     let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
-        "workspace":fixture.path(), "data_root":fixture.path().join("data"),
+        "workspace":fixture.path(), "data_root":data_root,
         "client_id":"shutdown-observation-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
-    let owner = ExecutionOwner::root(&session_id);
-    let scope = crate::provider::InvocationScope::new(owner.clone(), "background-exchange");
-    let address = ToolAddress {
-        turn: crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "background-thread".into(),
-            turn_id: "background-turn".into(),
+    let recorded = Arc::new(std::sync::Mutex::new(None));
+    let capture = recorded.clone();
+    let provider = crate::provider::test_support::EventFixtureProvider::new(
+        observation_descriptor(),
+        move |request, writer, start, _| {
+            let capture = capture.clone();
+            async move {
+                start.observed(1).await?;
+                *capture.lock().unwrap() = Some(request.scope.clone());
+                let item_id = ItemId::new("background-tool").unwrap();
+                for event in [
+                    ItemEvent::Started(ItemStart::CommandExecution(ToolDescriptor {
+                        name: "exec".into(),
+                        title: "Background command".into(),
+                        semantics: ToolSemantics::Other,
+                        arguments: InspectableArguments::new(Value::Null),
+                    })),
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::Output(TextUpdate::Append("BEGIN\n".into())),
+                    },
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::Backgrounded,
+                    },
+                ] {
+                    writer
+                        .send_wait(AdapterActivity::Item {
+                            thread_id: request.thread_id.clone(),
+                            turn_id: request.turn_id.clone(),
+                            item_id: item_id.clone(),
+                            event,
+                        })
+                        .await?;
+                }
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            }
         },
-        tool_id: "background-tool".into(),
-    };
-    let mut turn =
-        crate::turn::test_support::TestTurn::new("background-turn".into(), address.turn.clone(), 1);
-    for update in [
-        ToolUpdate::Requested {
-            invocation: ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::Command,
-                name: "exec".into(),
-                title: "Background command".into(),
-                arguments: Value::Null,
-            },
-        },
-        ToolUpdate::Started,
-        ToolUpdate::Output {
-            update: TextUpdate::Append("BEGIN\n".into()),
-        },
-        ToolUpdate::Backgrounded,
-    ] {
-        turn.record_tool("background-tool", update, 2)?;
-    }
-    turn.finish(crate::turn::TurnOutcome::Completed, 3)?;
-    let mut exchange = turn.into_exchange();
-    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 3)?;
-    let data_root = fixture.path().join("data");
-    SqliteStore::open(&data_root)?.save_exchange(&exchange)?;
-
-    let provider = observation_provider(None);
-    let delivery = Arc::new(std::sync::Mutex::new(Some(vec![
-        ProviderEvent::Tool {
-            address: address.clone(),
-            update: ToolUpdate::Output {
-                update: TextUpdate::Append("STOPPED\n".into()),
-            },
-        },
-        ProviderEvent::Tool {
-            address,
-            update: ToolUpdate::Finished {
-                outcome: ToolOutcome::Interrupted,
-            },
-        },
-    ])));
+    );
     let weak_provider = Arc::downgrade(&provider);
-    let shutdown_scope = scope.clone();
+    let shutdown_recorded = recorded.clone();
     provider.with_shutdown(move || {
         let provider = weak_provider
             .upgrade()
-            .expect("fixture provider remains alive during shutdown");
-        let delivery = delivery.clone();
-        let scope = shutdown_scope.clone();
+            .expect("fixture remains alive during shutdown");
+        let scope = shutdown_recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("foreground request registered its background item");
         async move {
-            let sink = provider.invocation_sink(&scope).await?;
-            let events = delivery.lock().unwrap().take().unwrap_or_default();
-            for event in events {
-                sink.send_wait(event).await?;
+            let writer = provider.invocation_sink(&scope).await?;
+            for event in [
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Output(TextUpdate::Append("STOPPED\n".into())),
+                },
+                ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
+                    outcome: ToolOutcome::Interrupted,
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                })),
+            ] {
+                writer
+                    .send_wait(AdapterActivity::Item {
+                        thread_id: scope.owner.thread_id(),
+                        turn_id: scope.turn_id().unwrap(),
+                        item_id: ItemId::new("background-tool").unwrap(),
+                        event,
+                    })
+                    .await?;
             }
             Ok(())
         }
     });
-    let _provider_fixture =
+    let provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
-    broker.set_provider_for_test(_provider_fixture.provider_handle());
+    broker.set_provider_for_test(provider_fixture.provider_handle());
     let execution = broker.execution_registry();
-    let initialization = broker
-        .initialization_request()?
-        .context("fixture initialization missing")?;
-    let bridge = broker.provider_handle();
     let controller = SessionController::new(broker).await?;
-    let (message_sink, _output) = forge_protocol::outbound::channel();
+    let (message_sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
     controller.attach_session_events(&message_sink).await?;
-    // Persisted background work requires an opened native binding, not just attached UI output.
-    execution.owner(owner.clone()).await?;
-    bridge.session_open(initialization).await?;
+    controller.attach_input(&message_sink).await?;
+    controller
+        .coordinator
+        .submissions
+        .apply(crate::input::InputOperation {
+            id: "submit-background-command".into(),
+            control_revision: 0,
+            after_control: None,
+            action: crate::input::InputAction::Submit {
+                message: Box::new(crate::input::InputMessage::queued(
+                    crate::input::InputDraft {
+                        id: "background-input".into(),
+                        text: "Run background command".into(),
+                        purpose: crate::input::InputPurpose::User,
+                        intent: crate::input::InputIntent::Auto,
+                        attachments: Vec::new(),
+                        config: None,
+                    },
+                )),
+            },
+        })?;
+    let exchange_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let scope = recorded.lock().unwrap().clone();
+            if let Some(scope) = scope
+                && SqliteStore::read_only(&data_root)?
+                    .load_exchange(scope.exchange_id.as_str())?
+                    .is_some_and(|exchange| {
+                        exchange.state() == crate::exchange::ExchangeState::Complete
+                    })
+            {
+                break Ok::<_, anyhow::Error>(scope.exchange_id.as_str().to_owned());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("background fixture never completed foreground work")??;
     let broker_guard = controller.broker.lock().await;
     let shutdown_controller = controller.clone();
     let shutdown = tokio::spawn(async move {
@@ -691,11 +705,12 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
     tokio::time::timeout(Duration::from_secs(2), shutdown).await???;
 
     let store = SqliteStore::read_only(&data_root)?;
-    let saved = store.load_exchange(&exchange.id)?.unwrap();
+    let saved = store.load_exchange(&exchange_id)?.unwrap();
     let tool = saved.tools().next().unwrap().1;
     assert_eq!(tool.state(), crate::turn::ToolState::Interrupted);
     assert_eq!(tool.output, "BEGIN\nSTOPPED\n");
     assert_eq!(saved.state(), crate::exchange::ExchangeState::Complete);
+    reader.abort();
     assert!(
         store
             .load_session(&session_id)?
@@ -714,7 +729,7 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
         "client_id":"observation-retry-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
-    let _owner = ExecutionOwner::root(&broker.snapshot()?.session.id);
+    let _owner = ThreadOwner::root(&broker.snapshot()?.session.id);
     let provider = observation_provider(None);
     let provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
@@ -749,7 +764,7 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
         "client_id":"saturated-observer", "provider":{"kind":"mock","command":[]},
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
-    let owner = ExecutionOwner::root(&session_id);
+    let owner = ThreadOwner::root(&session_id);
     let provider = observation_provider(None);
     let _provider =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;

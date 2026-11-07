@@ -68,7 +68,7 @@ controller.refresh_winbar = function() end
 state.session = { id = "plan-mode", mode = "write", approval_mode = "ask" }
 state.transcript_win, state.composer_win = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_win()
 state.no_checkpoint = false
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "  /plan  " })
   submit()
@@ -90,11 +90,11 @@ for _, enabled in ipairs({ true, false }) do
   assert(routed, "plan acceptance policy was sent as a new planning request")
 end
 controller.task_transition = task_transition
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan" })
 controller.submit()
 assert(#requests == 3 and #warnings == 0 and #state.queue == 0)
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 state.capability = { fast_mode = true, ultrafast_mode = true }
 state.model_provider, state.model_list = state.session.provider, { { id = state.session.model or "default", is_default = true, service_tiers = { "fast", "ultrafast" } } }
 controller.configure = function(params) state.session.service_tier = params.service_tier end
@@ -106,7 +106,7 @@ for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
     assert(#state.queue == 0, "service-tier command was queued as a prompt")
   end
 end
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 local input = require("forge.views.harness.input_state")
 local input_host
 local request = client.request
@@ -130,10 +130,13 @@ for _, prompt in ipairs({ "/workspace/example.png", "  /workspace/example.PNG\n[
     state.input = nil
     input_host = dofile("nvim/tests/forge/support/input.lua").new(state)
     input.attach(state, function() end)
-    state.busy, state.execution_busy = true, true
+    dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
+    state.execution_busy = true
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(prompt, "\n", { plain = true }))
     submit()
-    local pending = submit == controller.queue_submit and state.queue or state.pending_steer
+    -- An unacknowledged immediate prompt remains an editor submission draft; only the host can
+    -- later route its confirmed message into the active turn as steering.
+    local pending = submit == controller.queue_submit and state.queue or state.pending_submit
     assert(#pending == 1 and vim.trim(pending[1].text) == vim.trim(prompt), "ordinary prompt changed before submission")
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
     state.queue = {}
@@ -160,11 +163,9 @@ for _, case in ipairs({
   { model = "sol", capable = false, visible = false },
   { model = "unknown", capable = true, visible = false },
   { model = "missing", capable = true, visible = false },
-  { model = "sol", pending = "luna", capable = true, visible = false },
-  { model = "luna", pending = "sol", capable = true, visible = true },
 }) do
+  -- Completion follows the host-confirmed session model; Lua keeps no unconfirmed model selection.
   state.session.model = case.model
-  state.task_config = case.pending and { model = case.pending } or nil
   state.capability.ultrafast_mode = case.capable
   local completion
   source.new():get_completions({}, function(result) completion = result end)

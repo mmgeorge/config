@@ -37,6 +37,28 @@ impl From<AgentId> for String {
     }
 }
 
+impl TryFrom<&str> for AgentId {
+    type Error = AgentIdError;
+    /// Validate a borrowed child identity at admission.
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl std::str::FromStr for AgentId {
+    type Err = AgentIdError;
+    /// Parse an opaque identity through the same checked admission constructor.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for AgentId {
+    /// Render an opaque child identity at a presentation boundary.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 /// Reject an empty child identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentIdError;
@@ -49,60 +71,26 @@ impl std::fmt::Display for AgentIdError {
 
 impl std::error::Error for AgentIdError {}
 
-/// Describes the observed lifecycle of one native child-agent run.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentExecutionState {
-    Starting,
-    Running,
-    Waiting,
-    Completed,
-    Failed,
-    Interrupted,
-    Closed,
-}
-
-impl AgentExecutionState {
-    /// Report whether the run can still receive input or interruption.
-    pub fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Waiting)
-    }
-}
-
-/// Carry one normalized child-agent lifecycle observation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLifecycleKind {
-    /// Start a child execution.
-    Started,
-    /// Update a live child execution.
-    Updated,
-    /// Complete or interrupt a child execution.
-    Finished,
-}
-
-/// Carry one normalized child-agent lifecycle observation.
+/// Preserve valid active and terminal child lifecycle payloads.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AgentLifecycleEvent {
-    /// Identify the child independently of native thread or task identifiers.
-    pub agent_id: AgentId,
-    /// Identify the parent child run when nested delegation is present.
-    pub parent_agent_id: Option<AgentId>,
-    /// Carry the opaque conversation identity used in this child's normalized turn addresses.
-    /// Observed children do not acquire host-managed execution authority.
-    pub conversation_id: Option<crate::ProviderSessionId>,
-    /// Classify the normalized lifecycle transition.
-    pub kind: AgentLifecycleKind,
-    /// Identify the normalized child-agent definition when available.
-    pub definition: Option<String>,
-    /// Carry a user-visible child-agent label when available.
-    pub nickname: Option<String>,
-    /// Carry the normalized task summary when available.
-    pub task: Option<String>,
-    /// Report the normalized child-agent lifecycle state.
-    pub state: AgentExecutionState,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentLifecycleEvent {
+    /// Register a new child with its initial active state.
+    Started {
+        agent: AgentDescription,
+        state: AgentActiveState,
+    },
+    /// Refine metadata or active state for a registered child.
+    Updated {
+        agent: AgentDescription,
+        state: AgentActiveState,
+    },
+    /// Preserve a terminal child outcome without inventing cleanup evidence.
+    Finished {
+        agent: AgentDescription,
+        outcome: AgentOutcome,
+    },
 }
-
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 /// Reports Harness-owned execution independently of native provider delegation.
 pub struct AgentCapability {
@@ -122,5 +110,94 @@ impl Default for AgentCapability {
             interrupt: true,
             parallel: true,
         }
+    }
+}
+
+/// Identify the existing parent turn that initiated a child delegation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentDelegation {
+    /// Identify the parent conversation.
+    pub parent_thread_id: crate::ThreadId,
+    /// Identify the original delegating turn.
+    pub parent_turn_id: crate::TurnId,
+    /// Identify an observed delegating item when available.
+    pub parent_item_id: Option<crate::ItemId>,
+}
+
+/// Describe child metadata independently of the enclosing event's child identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentDescription {
+    /// Preserve an observed parent agent relationship.
+    pub parent_agent_id: Option<AgentId>,
+    /// Attribute delegation only to its original known parent turn.
+    pub delegation: Option<AgentDelegation>,
+    /// Identify the child's own normalized conversation when known.
+    pub thread_id: Option<crate::ThreadId>,
+    /// Preserve the normalized agent definition when available.
+    pub definition: Option<String>,
+    /// Preserve the user-visible child label when available.
+    pub nickname: Option<String>,
+    /// Preserve the observed task summary when available.
+    pub task: Option<String>,
+}
+
+/// Associate an agent with its own conversation and native lifecycle.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// Associate this agent with its own normalized conversation.
+    ConversationResolved { thread_id: crate::ThreadId },
+    /// Preserve a typed active or terminal lifecycle observation.
+    Lifecycle { event: AgentLifecycleEvent },
+}
+
+/// Report an active child with live work or a resumable wait.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActiveState {
+    /// Initialize the child before native work begins.
+    Starting,
+    /// Perform native child work.
+    Running,
+    /// Wait for input or another dependency without finishing.
+    Waiting,
+}
+
+/// Report an observed child end without implying resource collection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOutcome {
+    /// Preserve normal native completion.
+    Completed,
+    /// Preserve the classified native failure.
+    Failed(crate::ProviderFailure),
+    /// Preserve a stop without normal completion.
+    Interrupted,
+    /// Preserve explicit child closure.
+    Closed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reject an active state on a terminal lifecycle variant at the transport boundary.
+    #[test]
+    fn terminal_agent_observation_requires_an_outcome() {
+        let description = serde_json::json!({
+            "parent_agent_id":null, "delegation":null, "thread_id":null,
+            "definition":null, "nickname":null, "task":null
+        });
+        let active = serde_json::json!({"kind":"finished", "agent":description, "state":"running"});
+        assert!(serde_json::from_value::<AgentLifecycleEvent>(active).is_err());
+        let finished =
+            serde_json::json!({"kind":"finished", "agent":description, "outcome":"interrupted"});
+        assert!(matches!(
+            serde_json::from_value::<AgentLifecycleEvent>(finished).unwrap(),
+            AgentLifecycleEvent::Finished {
+                outcome: AgentOutcome::Interrupted,
+                ..
+            }
+        ));
     }
 }

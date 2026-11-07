@@ -41,6 +41,30 @@ mod text_generation;
 #[path = "workflows.rs"]
 mod workflows;
 
+/// Select serializable host activity; receipt presentation stays with the production input owner.
+fn event_observation(
+    observation: forge_harness::provider::session_execution::OwnerObservation,
+) -> Option<forge_harness::provider::HarnessEvent> {
+    match observation {
+        forge_harness::provider::session_execution::OwnerObservation::Event(event) => Some(event),
+        forge_harness::provider::session_execution::OwnerObservation::InputAcceptance {
+            ..
+        }
+        // The production collector commits physical facts separately from serializable activity.
+        | forge_harness::provider::session_execution::OwnerObservation::HostFileChange { .. } => None,
+    }
+}
+
+/// Inspect only the native observation inside an already resolved host publication.
+fn native_event(
+    event: &forge_harness::provider::HarnessEvent,
+) -> Option<&forge_provider_api::ProviderEvent> {
+    match event {
+        forge_harness::provider::HarnessEvent::Native { event, .. } => Some(event),
+        forge_harness::provider::HarnessEvent::Host { .. } => None,
+    }
+}
+
 fn build_provider(
     kind: &str,
     command: Vec<String>,
@@ -98,6 +122,7 @@ fn prompt_request(request: &ProviderCatalogRequest) -> ProviderRequest {
         approval_mode: request.approval_mode,
         provider_session_id: request.provider_session_id.clone(),
         submission: None,
+        acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
     }

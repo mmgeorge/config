@@ -7,7 +7,7 @@ use super::{
 use crate::{
     broker::HarnessBroker,
     provider::{
-        ExecutionOwner, Provider,
+        Provider, ThreadOwner,
         session_execution::{SessionExecutionRegistry, SessionObservationInbox},
     },
 };
@@ -46,7 +46,7 @@ pub(super) struct Lease {
     provider: Arc<Provider>,
     registry: Arc<SessionExecutionRegistry>,
     inbox: Arc<SessionObservationInbox>,
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     _control: OwnedSemaphorePermit,
     retirement: OwnedRwLockWriteGuard<()>,
     configuration: tokio::sync::OwnedMutexGuard<()>,
@@ -149,7 +149,7 @@ impl ObservationRecovery {
             let provider = broker.provider_handle();
             let registry = broker.execution_registry();
             let inbox = target.clone();
-            let owner = ExecutionOwner::root(services.observer.session_id());
+            let owner = ThreadOwner::root(services.observer.session_id());
             let control = services.control.clone();
             let lane = services.provider_lane.clone();
             let configuration = services.tasks.configuration_lane();
@@ -216,7 +216,7 @@ impl ObservationRecovery {
                             .map_err(|error| {
                                 ProviderLifecycleFailure::Provider(
                                     crate::provider::lifecycle_error::classify(
-                                        forge_provider_api::ProviderOperation::SessionOpen,
+                                        forge_provider_api::ProviderOperation::ThreadOpen,
                                         error.into(),
                                     ),
                                 )
@@ -366,20 +366,7 @@ impl ObservationRecovery {
                 ));
             }
             RecoveryEvent::Initialized(initialized) => {
-                if let Some(snapshot) = initialized?.commit(broker)? {
-                    services
-                        .publications
-                        .publish(
-                            forge_protocol::message::SessionEvent {
-                                session_id: services.observer.session_id().into(),
-                                event: "session_configured".into(),
-                                payload: serde_json::to_value(snapshot)
-                                    .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?,
-                            },
-                            None,
-                        )
-                        .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?;
-                }
+                initialized?.commit(broker)?;
                 return Ok(true);
             }
         }

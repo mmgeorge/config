@@ -334,11 +334,16 @@ impl SqliteStore {
         exchange: &Exchange,
         event: &crate::provider::ProviderEvent,
     ) -> Result<()> {
-        let crate::provider::ProviderEvent::Tool {
-            address,
-            update:
-                crate::provider::ToolUpdate::Output {
-                    update: crate::provider::TextUpdate::Append(delta),
+        let crate::provider::ProviderEvent::Item {
+            thread_id,
+            turn_id,
+            item_id,
+            event:
+                forge_provider_api::ItemEvent::Tool {
+                    event:
+                        forge_provider_api::ToolItemEvent::Output(
+                            forge_provider_api::TextUpdate::Append(delta),
+                        ),
                 },
         } = event
         else {
@@ -347,11 +352,13 @@ impl SqliteStore {
         let turn = exchange
             .turn
             .iter()
-            .find(|turn| turn.provider() == &address.turn)
+            .find(|turn| {
+                &turn.provider().thread_id == thread_id && &turn.provider().turn_id == turn_id
+            })
             .context("tool output turn is missing")?;
         let tool = exchange
             .tools_for_turn(turn.id())
-            .find(|tool| tool.id == address.tool_id.as_str())
+            .find(|tool| tool.id == item_id.as_str())
             .context("tool output call is missing")?;
         let admitted: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM tool_output_owner WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3)",

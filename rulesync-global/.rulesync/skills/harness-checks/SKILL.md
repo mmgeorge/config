@@ -11,7 +11,7 @@ targets:
 
 # Harness Checks
 
-Configure checks only through `check_definition_edit` when check editing is enabled. Read `check_definition_list` for the current revision, definitions, and live automatic-check policy. Preserve unrelated configuration. Every submission requires review outside YOLO. Configuration does not execute checks or validate helper-language syntax. The list contains input descriptions but omits full commands, history, and previews. Read `check_definition_details` with `check_id` for each existing definition that must be preserved or edited. Publish the complete intended definition map, not a partial replacement. Successful edits return the new revision and changed names.
+Configure checks only through `check_definition_edit` when check editing is enabled. Read `check_definition_list` for the current revision, definitions, live automatic-check policy, and live `check_editing` permission. Preserve unrelated configuration. Every submission requires review outside YOLO. Configuration does not execute checks or validate helper-language syntax. The list contains input descriptions but omits full commands, history, and previews. Read `check_definition_details` with `check_id` for each existing definition that must be preserved or edited. Publish the complete intended definition map, not a partial replacement. Successful edits return the new revision and changed names.
 
 Inspect repository scripts and manifests before choosing commands. The check executor treats all commands as opaque. It never detects Cargo, npm, a language, or a runner, never performs test discovery, and never adds runner flags.
 

@@ -45,7 +45,6 @@ pub(crate) struct OwnedTaskChecks {
     manual: bool,
     workspace_identity: Option<String>,
     scope: Option<crate::provider::InvocationScope>,
-    revision: Option<u64>,
 }
 
 /// Scan conformance and workspace inputs without retaining broker ownership.
@@ -520,9 +519,7 @@ impl HarnessBroker {
             .turn
             .last()
             .map(|turn| turn.provider().scope.clone());
-        let revision = scope
-            .as_ref()
-            .map(|scope| self.reopened_execution.revision(scope));
+
         let state = OwnedTaskChecks {
             source: turn.id.clone(),
             input_id: work.id.clone(),
@@ -535,7 +532,6 @@ impl HarnessBroker {
             interaction,
             workspace_identity: None,
             scope,
-            revision,
         };
         Ok((state, scan))
     }
@@ -806,10 +802,10 @@ impl HarnessBroker {
             .load_exchange(&state.interaction.id)?
             .context("check exchange disappeared")?;
         anyhow::ensure!(
-            state.scope.as_ref().is_none_or(|scope| state.revision
-                == Some(self.reopened_execution.revision(scope))
-                && !self.reopened_execution.active(scope)
-                && !self.reopened_execution.is_settling(scope)),
+            state
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !self.host_settlement.is_settling(scope)),
             "provider execution changed before check commit"
         );
         anyhow::ensure!(
@@ -862,7 +858,6 @@ impl HarnessBroker {
         })
     }
 }
-
 
 impl HarnessBroker {
     /// Record check failure under the admitting permit and return owned publication work.

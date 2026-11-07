@@ -339,6 +339,7 @@ mod tests {
             let rendered = crate::buffer::projection::project(
                 &entry,
                 &Default::default(),
+                crate::buffer::projection::FIXTURE_NOW_MS,
                 false,
                 &Default::default(),
                 &Default::default(),

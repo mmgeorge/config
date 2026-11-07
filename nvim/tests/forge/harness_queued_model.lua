@@ -54,7 +54,8 @@ local configured
 controller.configure = function(config)
   configured = config
 end
-state.busy, state.execution_busy = true, true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
+state.execution_busy = true
 compose("/model settings-only high")
 controller.queue_submit()
 assert(#state.queue == 2 and configured == nil, "queueing a model-only selection configured the active turn")

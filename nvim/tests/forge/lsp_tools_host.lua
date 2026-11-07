@@ -18,7 +18,8 @@ end
 local binary = vim.g.forge_test_executable or require("forge.builder").binary_path()
 if vim.fn.has("win32") == 1 then
   local copy_path = data .. "/forge.exe"
-  assert(vim.uv.fs_copyfile(binary, copy_path))
+  -- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+  copy_path = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
   binary = copy_path
 end
 local original_stdpath = vim.fn.stdpath
@@ -39,7 +40,10 @@ end
 local unsubscribe = client.session_events_subscribe(function(event, payload)
   if event == "provider_event" and payload.kind == "assistant_message" then received[#received + 1] = payload.text end
 end)
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua.
+  if method == "session.state.get" then return state_snapshot.get() end
   local deadline = vim.uv.now() + 20000
   repeat
     local complete, value, failure
@@ -52,46 +56,44 @@ local function request(method, params)
   error(method .. ": execution permit did not become available")
 end
 
+-- The mock provider calls host tools only from a queued script, so each query scripts one
+-- tool call and a closing response marker, then reads the tool's durable result.
+local query_sequence = 0
+---@return string output Tool output, or an empty string when no tool execution was admitted.
+---@return table exchange The completed exchange record.
 local function query(arguments)
-  local marker = string.char(226, 151, 143)
-  local prompt_marker = marker .. " LSP "
-  local before = 0
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:find(prompt_marker, 1, true) then before = before + 1 end
-  end
+  query_sequence = query_sequence + 1
+  local marker = "lsp-query-completed-" .. query_sequence
+  local tool_arguments = vim.deepcopy(arguments)
+  local tool = tool_arguments.tool
+  tool_arguments.tool = nil
+  if next(tool_arguments) == nil then tool_arguments = vim.empty_dict() end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = tool, arguments = tool_arguments },
+    { kind = "message", content = "response", text = marker },
+  }, terminal = "completed" } })
+  local before = #request("session.exchange.list", {})
   request("session.prompt.submit", { text = "LSP " .. vim.json.encode(arguments) })
-  local output
+  local exchange
   assert(vim.wait(75000, function()
-    local lines = vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)
-    local boundary, count = 0, 0
-    for index, line in ipairs(lines) do
-      if line:find(prompt_marker, 1, true) then boundary, count = index, count + 1 end
+    if require("forge.views.harness.activity").busy(state) then return false end
+    local history = request("session.exchange.list", {})
+    exchange = #history > before and history[#history] or nil
+    return exchange ~= nil and exchange.completed_at_ms ~= nil
+  end, 50), "tool result did not arrive: " .. tool .. "\n" .. table.concat(errors, "\n"))
+  local output = {}
+  for _, entry in ipairs(exchange.entry or {}) do
+    for _, group in ipairs((entry.commentary or {}).tool or {}) do
+      for id, execution in pairs(group.store.execution or {}) do
+        if execution.descriptor and execution.descriptor.name == tool then
+          local final = execution.final_snapshot or {}
+          output[#output + 1] = final.output or ((group.store.item or {})[id] or {}).output or ""
+          if execution.outcome and execution.outcome.reason then output[#output + 1] = execution.outcome.reason end
+        end
+      end
     end
-    if count <= before then return false end
-    local response_start
-    for index = boundary + 1, #lines do
-      if lines[index]:sub(1, #marker) == marker then response_start = index break end
-    end
-    if not response_start then return false end
-    for index = response_start + 1, #lines do
-      local line = lines[index]
-      if line ~= "" and line:sub(1, #marker) ~= marker then output = table.concat(lines, "\n", index) return true end
-    end
-    return false
-  end, 10), "tool result did not arrive: " .. arguments.tool)
-  local settled, pending = false, false
-  assert(vim.wait(5000, function()
-    if not pending then
-      pending = true
-      client.request({ method = "session.state.get", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(snapshot)
-        pending = false
-        settled = snapshot and snapshot.status and snapshot.status.kind == "idle"
-      end)
-    end
-    return settled
-  end, 10), "model response did not settle")
-  vim.wait(20, function() return false end, 5)
-  return output
+  end
+  return table.concat(output, "\n"), exchange
 end
 
 local spec = ({
@@ -108,7 +110,7 @@ local identity, buffer
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { provider = "mock", providers = { mock = { command = { "lsp-tools" }, selectable = true } } } })
+    harness = { provider = "mock", providers = { mock = { selectable = true } } } })
   vim.lsp.config("fixture-" .. language, { cmd = spec.cmd, root_dir = workspace,
     filetypes = { spec.filetype }, settings = spec.settings, init_options = spec.init_options })
   vim.lsp.enable("fixture-" .. language)
@@ -116,7 +118,9 @@ local success, failure = xpcall(function()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "Harness did not start")
   assert(#vim.lsp.get_clients({ name = "fixture-" .. language }) == 0, "opening Harness started a server")
   assert(request("session.state.get").lsp_tools == false)
-  assert(query({ tool = "lsp_status" }):find("disabled", 1, true), "disabled tool call was admitted")
+  -- Disabled LSP tools are not offered to the provider, so a call to one is never admitted.
+  local disabled_output, disabled_exchange = query({ tool = "lsp_status" })
+  assert(disabled_output == "", "disabled tool call was admitted: " .. vim.inspect(disabled_exchange))
   request("session.configure", { lsp_tools = true })
   assert(request("session.state.get").lsp_tools == true)
   assert(query({ tool = "lsp_status" }):find("No project language servers", 1, true), "status started a server")
@@ -233,7 +237,8 @@ local success, failure = xpcall(function()
   local unsaved = query(vim.tbl_extend("force", position, { tool = "lsp_context" }))
   assert(unsaved:find("unsaved", 1, true), unsaved)
   request("session.configure", { lsp_tools = false })
-  assert(query({ tool = "lsp_status" }):find("disabled", 1, true))
+  local disabled_again = query({ tool = "lsp_status" })
+  assert(disabled_again == "", "disabled tool call was admitted after disabling: " .. disabled_again)
   assert(#vim.lsp.get_clients() == 1 and vim.lsp.get_client_by_id(identity), "tool changed the project server lifecycle")
   assert(#errors == 0, table.concat(errors, "\n"))
   print("lsp_tools_host: " .. language .. " passed")

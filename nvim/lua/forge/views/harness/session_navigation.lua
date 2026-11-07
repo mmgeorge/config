@@ -98,11 +98,51 @@ local function release_presentation(state)
   return true
 end
 
+---Stop a view's event subscription and document synchronization, whose session no longer exists.
+---Without this, the presentation retries its document reads against the missing session forever.
+---@param state ForgeHarnessPresentationState
+local function detach_session(state)
+  if state.unsubscribe then state.unsubscribe() state.unsubscribe = nil end
+  release_presentation(state)
+end
+
+---Close every view of a deleted session and forget its identity, whether the view is displayed
+---in another tab or retained without one.
+---@param session_id string
+function M.session_deleted(session_id)
+  local deleted_state_set = {}
+  if state_by_session_id[session_id] then deleted_state_set[state_by_session_id[session_id]] = true end
+  if session.harness_by_id[session_id] then deleted_state_set[session.harness_by_id[session_id]] = true end
+  for _, state in pairs(state_by_buffer) do
+    if state.session and state.session.id == session_id then deleted_state_set[state] = true end
+  end
+  state_by_session_id[session_id] = nil
+  session.harness_by_id[session_id] = nil
+  for state in pairs(deleted_state_set) do
+    detach_session(state)
+    require("forge.views.harness.workspace").release(state)
+    local tab = valid_view(state) and state.timeline_tab
+    if tab and #vim.api.nvim_list_tabpages() > 1 then
+      vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+    end
+    for _, buffer in ipairs({ state.transcript_buf, state.composer_buf }) do
+      if buffer then
+        state_by_buffer[buffer] = nil
+        if vim.api.nvim_buf_is_valid(buffer) then vim.api.nvim_buf_delete(buffer, { force = true }) end
+      end
+    end
+    state.session, state.client, state.input = nil, nil, nil
+    state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
+      nil, nil, nil, nil, nil
+    if session.harness == state then session.select_harness(session.new_harness_state()) end
+  end
+  require("forge.views.harness.tabline").refresh()
+end
+
 ---Forget deleted session identities while retaining unsent composer text.
 function M.history_clear()
   for _, state in pairs(state_by_session_id) do
-    if state.unsubscribe then state.unsubscribe() state.unsubscribe = nil end
-    release_presentation(state)
+    detach_session(state)
     state.session, state.client, state.input = nil, nil, nil
     state.ready, state.timeline, state.queue = false, {}, {}
     state.prompt_history, state.prompt_history_index = {}, 0
@@ -116,6 +156,7 @@ function M.history_clear()
   end
   state_by_session_id = {}
   session.harness_by_id = {}
+  require("forge.views.harness.tabline").refresh()
   session.select_harness(session.new_harness_state())
 end
 
@@ -136,7 +177,12 @@ function M.activate(result, options)
   end
   local existing = state_by_session_id[next_session.id]
   local source_state = session.harness
+  -- Opening a session that no tab displays in the current tab targets the current view's windows.
+  -- A retained session would otherwise reopen through `layout.open` in a new last tab while the
+  -- source tab closes. A session displayed elsewhere keeps its tab, and the source tab closes.
   local state = options.state
+    or (options.open_mode == "current" and not (existing and valid_view(existing))
+      and valid_view(source_state) and source_state or nil)
   local reusable_buffer = existing and existing.transcript_buf and existing.composer_buf
     and vim.api.nvim_buf_is_valid(existing.transcript_buf) and vim.api.nvim_buf_is_valid(existing.composer_buf)
   if existing and existing ~= state and (valid_view(existing)

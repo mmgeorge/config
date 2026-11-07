@@ -30,21 +30,12 @@ vim.notify = function(message,level)
     log("AGENT_DIAGNOSTIC " .. tostring(message))
   end
 end
-local resolved_approval = {}
+local approval = dofile(repository .. "/nvim/tests/forge/support/approval.lua")
+local responder = approval.responder(nil, function(failure)
+  errors[#errors+1] = "Approval resolution failed: " .. failure
+end)
 local function approvals()
-  for _,approval in ipairs(state.approval or {}) do
-    if not resolved_approval[approval.id] then
-      resolved_approval[approval.id] = true
-      log("AGENT_APPROVAL " .. approval.id)
-      local answer = {}
-      for _,item in ipairs(approval.item_list or {}) do
-        answer[#answer+1] = {item_id=item.id,choice_id="allow_once"}
-      end
-      client.request({ method = "session.approval.resolve", params = {approval_id=approval.id,answer_list=answer}, session_id = assert(require("forge.session").harness.session).id },function(_,failure)
-        if failure then errors[#errors+1] = "Approval resolution failed: " .. tostring(failure) end
-      end)
-    end
-  end
+  approval.answer_pending(responder, function(pending) log("AGENT_APPROVAL " .. pending.request_id) end)
 end
 local function request(method,params)
   if method ~= "session.state.get" then log("AGENT_REQUEST " .. provider .. " " .. method) end

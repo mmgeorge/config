@@ -8,6 +8,9 @@ local session = require("forge.session")
 local navigation = require("forge.views.harness.session_navigation")
 local generation = 1
 local queue_by_session = {}
+-- The host owns snapshot revisions within one runtime epoch, so state reads report its current revision.
+local host_runtime_epoch = "geometry-runtime"
+local host_revision_by_session = {}
 local failures = {}
 client.host_get_generation = function() return generation end
 client.host_is_accepting = function() return true end
@@ -26,6 +29,9 @@ client.request = function(request, callback)
   local result
   if method == "session.input.get" then
     result = { revision = 0, messages = queue_by_session[request.session_id] or {}, suspended = true, execution_busy = false }
+  elseif method == "session.state.get" then
+    result = { session = { id = request.session_id, provider = "mock", model = "mock", approval_mode = "ask" },
+      runtime_epoch = host_runtime_epoch, snapshot_revision = host_revision_by_session[request.session_id] or 0 }
   elseif method == "session.health.get" then result = { responsive = true }
   elseif method == "session.provider.model.list" then result = {}
   elseif method == "session.document" then
@@ -141,10 +147,13 @@ local ok, failure = xpcall(function()
   assert(require("forge.shared.view_command_set").dispatch(
     require("forge.views.harness.controller").command_set(), "close", second))
   assert(vim.api.nvim_buf_is_valid(draft_buffer), "public close destroyed the unsent draft")
-  second.snapshot_revision = 7
+  host_revision_by_session[second.session.id] = 7
+  second.runtime_epoch, second.snapshot_revision = host_runtime_epoch, 7
   client.session_initialize = function(callback, options)
     assert(options and options.session_id == second.session.id, "reopen did not refresh the retained session")
-    vim.schedule(function() callback({ session = second.session, snapshot_revision = 6 }) end)
+    vim.schedule(function()
+      callback({ session = second.session, runtime_epoch = host_runtime_epoch, snapshot_revision = 6 })
+    end)
   end
   session.activate_harness(second)
   require("forge.views.harness").open()

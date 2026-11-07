@@ -1,3 +1,6 @@
+-- Resolve support paths at load time; host fixtures change into their workspace afterwards.
+local approval = dofile(vim.fs.dirname(vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")))
+  .. "/support/approval.lua")
 local M = {}
 
 ---Start a saved check through a real invocation-owned check_run tool request.
@@ -13,19 +16,9 @@ function M.start(request, arguments)
   } })
   request("session.prompt.submit", { text = "Run the selected fixture checks through check_run." })
   local run_id
-  local answered = {}
+  local responder = approval.responder()
   assert(vim.wait(10000, function()
-    local state = require("forge.session").harness
-    for _, approval in ipairs(state.approval or {}) do
-      if not answered[approval.id] then
-        answered[approval.id] = true
-        local answers = {}
-        for _, item in ipairs(approval.item_list) do
-          answers[#answers + 1] = { item_id = item.id, choice_id = "allow_once" }
-        end
-        request("session.approval.resolve", { approval_id = approval.id, answer_list = answers })
-      end
-    end
+    approval.answer_pending(responder)
     for _, run in ipairs(request("session.check.list").history or {}) do
       if not before[run.id] then run_id = run.id return true end
     end

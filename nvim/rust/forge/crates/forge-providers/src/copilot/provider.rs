@@ -15,13 +15,12 @@ use forge_provider_api::session::{
 use forge_provider_api::turn_control::{HostTurnStatus, TurnControl};
 use forge_provider_api::{
     CancelRequest, CompactionResult, ConfiguredSession, ForkSource, InputReconcileRequest,
-    InputRetractOutcome, InputRetractRequest, InvocationSettlement, OpenedSession,
-    OperationContext, SessionConfiguration, SessionForkRequest, SessionHistory,
+    InputRetractOutcome, InputRetractRequest, OpenedSession, OperationContext,
+    SessionConfiguration, SessionForkRequest, SessionHistory, TurnAddress, TurnInterruptResult,
 };
 use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation, SubmissionEvidence,
 };
-use futures_util::{StreamExt, stream};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,7 +54,7 @@ struct Operations {
     close: forge_provider_api::retained_operation::Store<BindingId, ()>,
     cancel: forge_provider_api::retained_operation::Store<
         (BindingId, CancelRequest),
-        InvocationSettlement,
+        TurnInterruptResult,
     >,
     submit: forge_provider_api::retained_operation::Store<
         (BindingId, forge_provider_api::PromptRequestIdentity),
@@ -222,7 +221,7 @@ enum InterruptedResource {
         scope: forge_provider_api::InvocationScope,
     },
     Opening {
-        owner: forge_provider_api::ExecutionOwner,
+        owner: forge_provider_api::ThreadOwner,
         operation: forge_provider_api::OperationId,
     },
 }
@@ -265,7 +264,7 @@ impl RetainedProfile {
 impl Drop for RetainedProfile {
     /// Leave failed cleanup in the provider registry instead of invoking an unowned keep fallback.
     fn drop(&mut self) {
-        let _ = self.close(ProviderOperation::SessionClose);
+        let _ = self.close(ProviderOperation::ThreadClose);
     }
 }
 
@@ -305,7 +304,7 @@ impl InvocationCallbacks {
             return Ok(());
         }
         Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Authorization,
         ))
     }
@@ -326,10 +325,18 @@ struct CallbackRouter {
     shell: std::sync::OnceLock<Arc<super::shell_session::ShellSession>>,
     active: RwLock<HashMap<forge_provider_api::InvocationScope, CallbackRegistration>>,
     native_calls: RwLock<HashMap<String, InvocationCallbacks>>,
+    retired_native_calls: RwLock<HashSet<String>>,
+    observed_call_owners: RwLock<HashMap<String, TurnAddress>>,
+    observed_agents: RwLock<HashMap<forge_provider_api::InvocationScope, InvocationCallbacks>>,
+    child_resources:
+        RwLock<HashMap<forge_provider_api::InvocationScope, super::child_turn::ChildResources>>,
     mcp_tools: RwLock<HashMap<String, HashSet<String>>>,
+    /// Native session whose MCP servers back `mcp_tools`; a catalog miss reads one server on demand.
+    mcp_session: RwLock<Option<Arc<github_copilot_sdk::session::Session>>>,
     next_generation: AtomicU64,
     revoked: std::sync::Mutex<CallbackAdmission>,
     running_callbacks: AtomicU64,
+    foreground_callbacks: AtomicU64,
     callbacks_changed: tokio::sync::Notify,
     provider_closed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -343,12 +350,34 @@ enum CallbackAdmission {
 }
 
 /// Retain one admitted native callback through asynchronous permission and effect work.
-struct NativeCallbackGuard<'a>(&'a CallbackRouter);
+struct NativeCallbackGuard<'a> {
+    router: &'a CallbackRouter,
+    foreground: bool,
+    child: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl NativeCallbackGuard<'_> {
+    /// Transfer a retained callback to child collection once its exact published owner is known.
+    fn retain_as_child(&mut self) {
+        if self.foreground {
+            self.foreground = false;
+            self.router
+                .foreground_callbacks
+                .fetch_sub(1, Ordering::AcqRel);
+            self.router.callbacks_changed.notify_waiters();
+        }
+    }
+}
 
 impl Drop for NativeCallbackGuard<'_> {
     fn drop(&mut self) {
-        self.0.running_callbacks.fetch_sub(1, Ordering::AcqRel);
-        self.0.callbacks_changed.notify_waiters();
+        self.router.running_callbacks.fetch_sub(1, Ordering::AcqRel);
+        if self.foreground {
+            self.router
+                .foreground_callbacks
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        self.router.callbacks_changed.notify_waiters();
     }
 }
 
@@ -366,7 +395,7 @@ impl CallbackRouter {
         let revoked = self
             .revoked
             .lock()
-            .map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Runtime))?;
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
         if self
             .provider_closed
             .as_ref()
@@ -374,12 +403,83 @@ impl CallbackRouter {
             || !matches!(*revoked, CallbackAdmission::Open)
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         self.running_callbacks.fetch_add(1, Ordering::AcqRel);
-        Ok(NativeCallbackGuard(self))
+        self.foreground_callbacks.fetch_add(1, Ordering::AcqRel);
+        Ok(NativeCallbackGuard {
+            router: self,
+            foreground: true,
+            child: None,
+        })
+    }
+
+    /// Admit known child work independently of foreground retirement, retaining binding revocation.
+    async fn begin_native_callback(
+        &self,
+        call_id: Option<&str>,
+    ) -> Result<NativeCallbackGuard<'_>, ProviderError> {
+        loop {
+            let changed = self.callbacks_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let child = match call_id {
+                Some(call_id) => self.observed_call_owners.read().await.contains_key(call_id),
+                None => false,
+            };
+            if child {
+                break;
+            }
+            let open = self.permits_effect();
+            let retaining_child = !self.observed_agents.read().await.is_empty();
+            let closed = matches!(
+                *self
+                    .revoked
+                    .lock()
+                    .expect("callback admission lock is not poisoned"),
+                CallbackAdmission::Closed
+            ) || self
+                .provider_closed
+                .as_ref()
+                .is_some_and(|closed| closed.load(Ordering::Acquire));
+            if open || !retaining_child || closed || call_id.is_none() {
+                return self.begin_callback();
+            }
+            changed.await;
+        }
+        let admission = self
+            .revoked
+            .lock()
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
+        if matches!(*admission, CallbackAdmission::Closed)
+            || self
+                .provider_closed
+                .as_ref()
+                .is_some_and(|closed| closed.load(Ordering::Acquire))
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        self.running_callbacks.fetch_add(1, Ordering::AcqRel);
+        Ok(NativeCallbackGuard {
+            router: self,
+            foreground: false,
+            child: None,
+        })
+    }
+
+    /// Drain only original foreground callbacks while preserving independently live child authority.
+    async fn collect_foreground_callbacks(&self) {
+        loop {
+            let changed = self.callbacks_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.foreground_callbacks.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Revoke native effect admission without waiting for network or callback completion.
@@ -432,45 +532,48 @@ impl CallbackRouter {
     }
 
     /// Retain canonical tool names independently of the SDK's generated callback aliases.
+    /// Retain the session whose MCP servers answer later permission lookups.
+    ///
+    /// Opening a binding must not wait for MCP startup: a slow or misconfigured server would
+    /// otherwise hold `list_tools` until the open deadline and fail the whole binding. A server
+    /// can only request permission for a tool once it is running, so the catalog reads that
+    /// server's tools when its first permission request arrives.
     async fn register_mcp_tools(
         &self,
         session: &CopilotSession,
-        resources: &forge_provider_api::ResourceSelection,
+        _resources: &forge_provider_api::ResourceSelection,
     ) {
-        let servers = resources
-            .mcp
-            .iter()
-            .map(|server| server.name.clone())
-            .collect::<Vec<_>>();
-        let native = session.inner.clone();
-        let catalog = stream::iter(servers)
-            .map(move |server| {
-                let native = native.clone();
-                async move {
-                    let tools = super::operation::wait(native.rpc().mcp().list_tools(
-                        github_copilot_sdk::rpc::McpListToolsRequest {
-                            server_name: server.clone(),
-                        },
-                    ))
-                    .await
-                    .ok()?
-                    .ok()?;
-                    Some((
-                        server,
-                        tools.tools.into_iter().map(|tool| tool.name).collect(),
-                    ))
-                }
-            })
-            .buffer_unordered(4)
-            .filter_map(futures_util::future::ready)
-            .collect()
-            .await;
-        *self.mcp_tools.write().await = catalog;
+        *self.mcp_session.write().await = Some(session.inner.clone());
+        self.mcp_tools.write().await.clear();
+    }
+
+    /// Read one server's tool names into the catalog unless a previous lookup already did.
+    async fn load_mcp_server_tools(&self, server: &str) {
+        if self.mcp_tools.read().await.contains_key(server) {
+            return;
+        }
+        let Some(native) = self.mcp_session.read().await.clone() else {
+            return;
+        };
+        let Ok(Ok(tools)) = super::operation::wait(native.rpc().mcp().list_tools(
+            github_copilot_sdk::rpc::McpListToolsRequest {
+                server_name: server.to_owned(),
+            },
+        ))
+        .await
+        else {
+            return;
+        };
+        self.mcp_tools.write().await.insert(
+            server.to_owned(),
+            tools.tools.into_iter().map(|tool| tool.name).collect(),
+        );
     }
 
     /// Resolve only one catalog-backed canonical identity; reject unknown or ambiguous aliases.
     async fn canonical_mcp_target(&self, target: &str) -> Option<String> {
         let (server, requested) = target.split_once('/')?;
+        self.load_mcp_server_tools(server).await;
         let catalog = self.mcp_tools.read().await;
         let mut matching = catalog
             .get(server)?
@@ -496,7 +599,7 @@ impl CallbackRouter {
                 || matches!(*admission, CallbackAdmission::Closed)
             {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
@@ -525,7 +628,7 @@ impl CallbackRouter {
             .map(|registration| registration.callbacks.clone())
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::WrongInvocation,
                 )
             })
@@ -535,19 +638,111 @@ impl CallbackRouter {
         let _ = binding;
         self.revoke();
         self.active.write().await.clear();
+        let retired = self
+            .native_calls
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.retired_native_calls.write().await.extend(retired);
         self.native_calls.write().await.clear();
+        self.observed_call_owners.write().await.clear();
+        self.observed_agents.write().await.clear();
+        self.child_resources.write().await.clear();
         Ok(())
     }
 
-    async fn bind_native_call(&self, call_id: &str, scope: &forge_provider_api::InvocationScope) {
-        if let Ok(callbacks) = self.callbacks(scope).await {
-            self.native_calls
-                .write()
-                .await
-                .entry(call_id.to_owned())
-                .or_insert(callbacks);
-            self.callbacks_changed.notify_waiters();
+    /// Bind a positively observed native call only to its original admitted invocation.
+    async fn bind_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        let callbacks = self.callbacks(scope).await?;
+        let mut calls = self.native_calls.write().await;
+        if calls
+            .get(call_id)
+            .is_some_and(|known| known.scope != *scope || known.generation != callbacks.generation)
+            || self.observed_call_owners.read().await.contains_key(call_id)
+        {
+            return Err(failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Protocol,
+            ));
         }
+        self.retired_native_calls.write().await.remove(call_id);
+        calls.entry(call_id.to_owned()).or_insert(callbacks);
+        drop(calls);
+        self.callbacks_changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Bind a child callback only after its native relationship and item were published.
+    async fn bind_observed_call(
+        &self,
+        call_id: &str,
+        parent: &forge_provider_api::InvocationScope,
+        child: TurnAddress,
+    ) -> Result<(), ProviderError> {
+        let callbacks = self
+            .observed_agents
+            .read()
+            .await
+            .get(&child.scope)
+            .cloned()
+            .filter(|callbacks| &callbacks.scope == parent)
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::TurnStart,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?;
+        let mut calls = self.native_calls.write().await;
+        let mut owners = self.observed_call_owners.write().await;
+        if calls
+            .get(call_id)
+            .is_some_and(|known| known.scope != *parent)
+            || owners.get(call_id).is_some_and(|known| known != &child)
+            || (calls.contains_key(call_id) && !owners.contains_key(call_id))
+        {
+            return Err(failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Protocol,
+            ));
+        }
+        self.retired_native_calls.write().await.remove(call_id);
+        owners.insert(call_id.to_owned(), child);
+        calls.entry(call_id.to_owned()).or_insert(callbacks);
+        drop(owners);
+        drop(calls);
+        self.callbacks_changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Attach an exact child callback to its independent collection group before effects.
+    async fn retain_child_callback(
+        &self,
+        callback: &mut NativeCallbackGuard<'_>,
+        child: &TurnAddress,
+    ) -> Result<super::child_turn::ChildResources, ProviderError> {
+        let resources = self
+            .child_resources
+            .read()
+            .await
+            .get(&child.scope)
+            .cloned()
+            .ok_or(ProviderError::Cancelled)?;
+        if resources.revoked.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        let retained = resources.callbacks.clone().read_owned().await;
+        if resources.revoked.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        callback.retain_as_child();
+        callback.child = Some(retained);
+        Ok(resources)
     }
 
     async fn prune_settled_scope(
@@ -561,7 +756,13 @@ impl CallbackRouter {
             .await
             .values()
             .any(|active| active.scope == *scope && active.generation == generation);
-        if !still_owned {
+        let child_owned = self
+            .observed_agents
+            .read()
+            .await
+            .values()
+            .any(|callbacks| callbacks.scope == *scope && callbacks.generation == generation);
+        if !still_owned && !child_owned {
             let mut active = self.active.write().await;
             if active.get(scope).is_some_and(|registration| {
                 registration.callbacks.generation == generation
@@ -594,17 +795,44 @@ impl CallbackRouter {
         &self,
         call_id: &str,
     ) -> Result<InvocationCallbacks, ProviderError> {
-        self.native_calls
-            .read()
-            .await
-            .get(call_id)
-            .cloned()
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::InputSubmit,
+        loop {
+            let changed = self.callbacks_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.retired_native_calls.read().await.contains(call_id) {
+                return Err(failure(
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
-                )
-            })
+                ));
+            }
+            if let Some(callbacks) = self.native_calls.read().await.get(call_id).cloned() {
+                return Ok(callbacks);
+            }
+            let retaining_child = !self.observed_agents.read().await.is_empty();
+            let closed = matches!(
+                *self
+                    .revoked
+                    .lock()
+                    .expect("callback admission lock is not poisoned"),
+                CallbackAdmission::Closed
+            ) || self
+                .provider_closed
+                .as_ref()
+                .is_some_and(|closed| closed.load(Ordering::Acquire));
+            if closed
+                || (!retaining_child
+                    && (!self.permits_effect()
+                        || !self.active.read().await.values().any(|registration| {
+                            matches!(registration.phase, CallbackPhase::Foreground)
+                        })))
+            {
+                return Err(failure(
+                    ProviderOperation::TurnStart,
+                    ProviderFailureKind::Rejected,
+                ));
+            }
+            changed.await;
+        }
     }
 }
 
@@ -714,6 +942,16 @@ impl NativeCallbackRouter for CallbackRouter {
     /// Wait for the exact observed outer call before admitting a helper-side permission or tool.
     async fn before_shell_native(&self, call_id: &str) -> Result<(), ProviderError> {
         let mut cancellation = self.shell().map(|shell| shell.cancellation());
+        let child = self.observed_call_owners.read().await.get(call_id).cloned();
+        if let Some(child) = child {
+            let mut callback = self.begin_native_callback(Some(call_id)).await?;
+            let callbacks = self.callbacks_for_native_call(call_id).await?;
+            let resources = self.retain_child_callback(&mut callback, &child).await?;
+            return tokio::select! {
+                result = callbacks.permissions.before_observed_child(&callbacks.scope, &child) => result,
+                _ = resources.revoked.cancelled() => Err(ProviderError::Cancelled),
+            };
+        }
         let original = if let Some(callbacks) = self.native_calls.read().await.get(call_id).cloned()
         {
             callbacks
@@ -727,15 +965,12 @@ impl NativeCallbackRouter for CallbackRouter {
                 .map(|registration| registration.callbacks.clone());
             if foreground.next().is_some() {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::ResourceConflict,
                 ));
             }
             original.ok_or_else(|| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Rejected,
-                )
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
             })?
         };
         loop {
@@ -744,7 +979,7 @@ impl NativeCallbackRouter for CallbackRouter {
             changed.as_mut().enable();
             if !self.permits_effect() {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
@@ -755,7 +990,7 @@ impl NativeCallbackRouter for CallbackRouter {
                 if callbacks.scope != original.scope || callbacks.generation != original.generation
                 {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::WrongInvocation,
                     ));
                 }
@@ -772,7 +1007,7 @@ impl NativeCallbackRouter for CallbackRouter {
                 })
             {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -786,13 +1021,20 @@ impl NativeCallbackRouter for CallbackRouter {
                 } => return Err(ProviderError::Cancelled),
             }
         }
+        let child = self.observed_call_owners.read().await.get(call_id).cloned();
+        if let Some(child) = child {
+            return original
+                .permissions
+                .before_observed_child(&original.scope, &child)
+                .await;
+        }
         original.permissions.before_tool(&original.scope).await?;
         if original.control.status(&original.scope).await?.cancelled {
             return Err(ProviderError::Cancelled);
         }
         if !self.permits_effect() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -804,19 +1046,23 @@ impl NativeCallbackRouter for CallbackRouter {
         call_id: &str,
         mut call: ToolCall,
     ) -> Result<String, ProviderError> {
-        let _callback = self.begin_callback()?;
-        call.id = forge_provider_api::control::ToolCallId::new(call_id).map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
+        let mut callback = self.begin_native_callback(Some(call_id)).await?;
+        call.id = forge_provider_api::control::ToolCallId::new(call_id)
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
         let callbacks = self.callbacks_for_native_call(call_id).await?;
+        let child = self.observed_call_owners.read().await.get(call_id).cloned();
+        if let Some(child) = child {
+            let _resources = self.retain_child_callback(&mut callback, &child).await?;
+            return callbacks
+                .tools
+                .call_observed_child(&callbacks.scope, &child, call)
+                .await;
+        }
         callbacks.authorize_tool(&call)?;
         callbacks.permissions.before_tool(&callbacks.scope).await?;
         if !self.permits_effect() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -828,7 +1074,7 @@ impl NativeCallbackRouter for CallbackRouter {
         call_id: &str,
         mut request: PermissionRequest,
     ) -> PermissionResponse {
-        let Ok(_callback) = self.begin_callback() else {
+        let Ok(mut callback) = self.begin_native_callback(Some(call_id)).await else {
             return PermissionResponse::Cancelled;
         };
         for target in &mut request.target_list {
@@ -841,25 +1087,34 @@ impl NativeCallbackRouter for CallbackRouter {
                 *target = canonical;
             }
         }
-        let response = match self.callbacks_for_native_call(call_id).await {
-            Ok(callbacks)
-                if callbacks
-                    .session_directory
-                    .as_ref()
-                    .is_some_and(|directory| directory.approves(&request)) =>
-            {
-                callbacks
-                    .permissions
-                    .authorize_session_storage(&callbacks.scope, request)
-                    .await
-            }
-            Ok(callbacks) => {
-                callbacks
-                    .permissions
-                    .authorize(&callbacks.scope, request)
-                    .await
-            }
-            Err(_) => PermissionResponse::Cancelled,
+        let callbacks = match self.callbacks_for_native_call(call_id).await {
+            Ok(callbacks) => callbacks,
+            Err(_) => return PermissionResponse::Cancelled,
+        };
+        let child = self.observed_call_owners.read().await.get(call_id).cloned();
+        if let Some(child) = child {
+            let Ok(resources) = self.retain_child_callback(&mut callback, &child).await else {
+                return PermissionResponse::Cancelled;
+            };
+            return tokio::select! {
+                response = callbacks.permissions.authorize_observed_child(&callbacks.scope, &child, request) => response,
+                _ = resources.revoked.cancelled() => PermissionResponse::Cancelled,
+            };
+        }
+        let response = if callbacks
+            .session_directory
+            .as_ref()
+            .is_some_and(|directory| directory.approves(&request))
+        {
+            callbacks
+                .permissions
+                .authorize_session_storage(&callbacks.scope, request)
+                .await
+        } else {
+            callbacks
+                .permissions
+                .authorize(&callbacks.scope, request)
+                .await
         };
         if self.permits_effect() {
             response
@@ -869,7 +1124,35 @@ impl NativeCallbackRouter for CallbackRouter {
     }
 
     async fn before_tool_native(&self, call_id: Option<&str>) -> Result<(), ProviderError> {
-        let _callback = self.begin_callback()?;
+        // The SDK hook omits call identity. A live child makes its authority ambiguous.
+        if call_id.is_none() && !self.observed_agents.read().await.is_empty() {
+            return Err(failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Policy,
+            ));
+        }
+        let mut callback = self.begin_native_callback(call_id).await?;
+        if let Some(call_id) = call_id {
+            let callbacks = self.callbacks_for_native_call(call_id).await?;
+            let child = self.observed_call_owners.read().await.get(call_id).cloned();
+            if let Some(child) = child {
+                let resources = self.retain_child_callback(&mut callback, &child).await?;
+                tokio::select! {
+                    result = callbacks.permissions.before_observed_child(&callbacks.scope, &child) => result?,
+                    _ = resources.revoked.cancelled() => return Err(ProviderError::Cancelled),
+                }
+                if matches!(
+                    *self
+                        .revoked
+                        .lock()
+                        .expect("callback admission lock is not poisoned"),
+                    CallbackAdmission::Closed
+                ) {
+                    return Err(ProviderError::Cancelled);
+                }
+                return Ok(());
+            }
+        }
         let callbacks = match call_id {
             Some(call_id) => vec![self.callbacks_for_native_call(call_id).await?],
             // The SDK's pre-tool hook has no call identity. Fence all retained invocation
@@ -884,7 +1167,7 @@ impl NativeCallbackRouter for CallbackRouter {
         };
         if callbacks.is_empty() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Rejected,
             ));
         }
@@ -896,19 +1179,124 @@ impl NativeCallbackRouter for CallbackRouter {
         }
         if !self.permits_effect() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         Ok(())
     }
 
-    async fn bind_native_call(&self, call_id: &str, scope: &forge_provider_api::InvocationScope) {
-        CallbackRouter::bind_native_call(self, call_id, scope).await;
+    async fn bind_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        CallbackRouter::bind_native_call(self, call_id, scope).await
+    }
+
+    async fn observe_native_child(
+        &self,
+        parent: &forge_provider_api::InvocationScope,
+        child: TurnAddress,
+        finished: bool,
+    ) -> Result<(), ProviderError> {
+        if finished {
+            let resources = self.child_resources.write().await.remove(&child.scope);
+            if let Some(resources) = resources {
+                resources.collect().await;
+            }
+            let callbacks = self.observed_agents.write().await.remove(&child.scope);
+            if let Some(callbacks) = callbacks {
+                self.prune_settled_scope(&callbacks.scope, callbacks.generation)
+                    .await;
+            }
+        } else {
+            let callbacks = self.callbacks(parent).await?;
+            self.child_resources
+                .write()
+                .await
+                .entry(child.scope.clone())
+                .or_insert_with(super::child_turn::ChildResources::new);
+            self.observed_agents
+                .write()
+                .await
+                .entry(child.scope)
+                .or_insert(callbacks);
+        }
+        self.callbacks_changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn native_child_resources(
+        &self,
+        child: &TurnAddress,
+    ) -> Result<super::child_turn::ChildResources, ProviderError> {
+        self.child_resources
+            .read()
+            .await
+            .get(&child.scope)
+            .cloned()
+            .ok_or(ProviderError::Cancelled)
+    }
+
+    async fn collect_native_child(&self, child: &TurnAddress) -> Result<(), ProviderError> {
+        let resources = self.child_resources.read().await.get(&child.scope).cloned();
+        if let Some(resources) = resources {
+            resources.collect().await;
+        }
+        let callbacks = self.observed_agents.write().await.remove(&child.scope);
+        self.child_resources.write().await.remove(&child.scope);
+        if let Some(callbacks) = callbacks {
+            self.prune_settled_scope(&callbacks.scope, callbacks.generation)
+                .await;
+        }
+        self.callbacks_changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn bind_observed_native_call(
+        &self,
+        call_id: &str,
+        parent: &forge_provider_api::InvocationScope,
+        child: TurnAddress,
+    ) -> Result<(), ProviderError> {
+        self.bind_observed_call(call_id, parent, child).await
+    }
+
+    async fn release_owned_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) {
+        let mut calls = self.native_calls.write().await;
+        let child = self.observed_call_owners.read().await.get(call_id).cloned();
+        let original_scope = child
+            .as_ref()
+            .map(|child| &child.scope)
+            .or_else(|| calls.get(call_id).map(|callbacks| &callbacks.scope));
+        if original_scope != Some(scope) {
+            return;
+        }
+        let callbacks = calls.remove(call_id);
+        self.observed_call_owners.write().await.remove(call_id);
+        self.retired_native_calls
+            .write()
+            .await
+            .insert(call_id.to_owned());
+        drop(calls);
+        if let Some(callbacks) = callbacks {
+            self.prune_settled_scope(&callbacks.scope, callbacks.generation)
+                .await;
+        }
     }
 
     async fn release_native_call(&self, call_id: &str) {
+        self.retired_native_calls
+            .write()
+            .await
+            .insert(call_id.to_owned());
         let callbacks = self.native_calls.write().await.remove(call_id);
+        self.observed_call_owners.write().await.remove(call_id);
         if let Some(callbacks) = callbacks {
             self.prune_settled_scope(&callbacks.scope, callbacks.generation)
                 .await;
@@ -919,7 +1307,7 @@ impl NativeCallbackRouter for CallbackRouter {
 struct BindingState {
     binding: SessionBinding,
     open_operation: forge_provider_api::OperationId,
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     session: RwLock<Arc<CopilotSession>>,
     request: Mutex<SessionRequest>,
     sink: ProviderEventSink,
@@ -931,11 +1319,12 @@ struct BindingState {
     closing: std::sync::atomic::AtomicBool,
     unsafe_history: std::sync::atomic::AtomicBool,
     settlements: Mutex<
-        HashMap<forge_provider_api::InvocationScope, Result<InvocationSettlement, ProviderError>>,
+        HashMap<
+            forge_provider_api::InvocationScope,
+            Result<forge_provider_api::CompletedTurn, ProviderError>,
+        >,
     >,
-    cancellations: Mutex<
-        HashMap<forge_provider_api::InvocationScope, Result<InvocationSettlement, ProviderError>>,
-    >,
+    cancellations: Mutex<HashMap<forge_provider_api::InvocationScope, Result<(), ProviderError>>>,
     retained_resources: Mutex<Option<Arc<RetainedResources>>>,
     retired_resources: Mutex<Vec<Arc<RetainedResources>>>,
     settled: tokio::sync::Notify,
@@ -995,33 +1384,96 @@ struct ActiveExecution {
     task: tokio::task::JoinHandle<Result<(), ProviderError>>,
 }
 
-impl BindingState {
-    /// Publish an invocation receipt through the retained binding stream at its exact scope.
-    async fn publish_invocation_settlement(
-        &self,
-        settlement: InvocationSettlement,
-    ) -> Result<InvocationSettlement, ProviderError> {
-        self.sink
-            .invocation_sink(&settlement.scope)?
-            .send_settlement(settlement)
-            .await
-            .map_err(Into::into)
-    }
+/// Retain the original native prompt and callback collection behind the shared runner.
+struct CopilotTurnDriver {
+    native: crate::retained_task::RetainedTask<forge_provider_api::TurnResult>,
+    start: Mutex<Option<tokio::sync::oneshot::Sender<forge_provider_api::NativeTurnStart>>>,
+    state: Arc<BindingState>,
+    sessions: Arc<CopilotSessions<RetainedResources>>,
+    session: Arc<CopilotSession>,
+    dispatch: Option<super::operation::Admission>,
+    submission: forge_provider_api::SubmissionId,
+}
 
-    /// Keep failed collection scoped to the invocation without poisoning the binding stream.
-    async fn publish_invocation_settlement_failure(
+#[async_trait]
+impl crate::turn_runner::NativeTurnDriver for CopilotTurnDriver {
+    /// Observe the same native worker after giving it sole positive-start authority.
+    async fn run(
         &self,
-        scope: &forge_provider_api::InvocationScope,
-        failure: ProviderFailure,
-    ) -> Result<(), ProviderError> {
-        self.sink
-            .invocation_sink(scope)?
-            .send_wait(forge_provider_api::ProviderEvent::SettlementFailed {
-                scope: scope.clone(),
-                failure,
-            })
+        start: forge_provider_api::NativeTurnStart,
+    ) -> Result<forge_provider_api::TurnResult, ProviderError> {
+        if let Some(sender) = self.start.lock().await.take() {
+            sender
+                .send(start)
+                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
+        }
+        self.native.join().await
+    }
+    /// Fence sends and interrupt this driver's original native turn.
+    async fn interrupt(&self) -> Result<(), ProviderError> {
+        self.state.interrupt().await
+    }
+    /// Collect callbacks and delivery history before the runner may certify completion.
+    async fn collect(&self) -> Result<(), ProviderError> {
+        let outcome = self.native.join().await;
+        let never_dispatched = self
+            .dispatch
+            .as_ref()
+            .is_some_and(|operation| !operation.dispatched());
+        let history = if never_dispatched {
+            Ok(())
+        } else {
+            self.sessions
+                .mark_submitted(&self.state.owner, &self.session)
+                .await
+        };
+        if never_dispatched
+            || matches!(
+                outcome,
+                Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_))
+            )
+        {
+            self.state
+                .unconsumed
+                .lock()
+                .await
+                .insert(self.submission.clone());
+        }
+        self.state.callbacks.revoke();
+        self.state.callbacks.collect_foreground_callbacks().await;
+        let has_children = !self.state.callbacks.observed_agents.read().await.is_empty();
+        let callbacks = if !has_children {
+            self.state.callbacks.collect_callbacks().await;
+            self.state
+                .callbacks
+                .retire_all(&self.state.binding.id)
+                .await
+        } else {
+            Ok(())
+        };
+        match (history, callbacks) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary: vec![secondary],
+            }),
+        }
+    }
+}
+
+impl BindingState {
+    /// Reject native context mutation while its foreground owner or an independent observed child lives.
+    async fn require_native_idle(&self, operation: ProviderOperation) -> Result<(), ProviderError> {
+        let foreground = self
+            .active
+            .lock()
             .await
-            .map_err(Into::into)
+            .as_ref()
+            .is_some_and(|active| !active.task.is_finished());
+        if foreground || !self.callbacks.observed_agents.read().await.is_empty() {
+            return Err(failure(operation, ProviderFailureKind::ExecutionActive));
+        }
+        Ok(())
     }
 
     /// Fence a committed configuration whose confirmation or original operation authority was lost.
@@ -1032,13 +1484,13 @@ impl BindingState {
             .and_then(|operation| {
                 operation
                     .context
-                    .check_admission(ProviderOperation::SessionConfigure)
+                    .check_admission(ProviderOperation::ThreadConfigure)
                     .err()
             })
             .map(|cause| super::error::trace_failure_kind(&cause))
             .unwrap_or(fallback);
         ProviderError::Failure(
-            ProviderFailure::new(ProviderOperation::SessionConfigure, kind).at_phase(
+            ProviderFailure::new(ProviderOperation::ThreadConfigure, kind).at_phase(
                 forge_provider_api::ProviderPhase::Observation,
                 forge_provider_api::FailureDisposition::Invalidated,
             ),
@@ -1052,7 +1504,7 @@ impl BindingState {
             || super::operation::current().is_some_and(|operation| {
                 operation
                     .context
-                    .check_admission(ProviderOperation::SessionConfigure)
+                    .check_admission(ProviderOperation::ThreadConfigure)
                     .is_err()
             })
         {
@@ -1094,9 +1546,12 @@ impl BindingState {
         if let Some(shell) = self.callbacks.shell() {
             shell.cancel_waits();
         }
-        self.turn
-            .request_stop()
-            .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Runtime))?;
+        self.turn.request_stop().map_err(|_| {
+            failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Runtime,
+            )
+        })?;
         if !self.turn.is_active() {
             return Ok(());
         }
@@ -1126,9 +1581,12 @@ impl BindingState {
         };
         let result = (&mut task.task).await;
         active.take();
-        result
-            .map(Some)
-            .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Runtime))
+        result.map(Some).map_err(|_| {
+            failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Runtime,
+            )
+        })
     }
 }
 
@@ -1149,7 +1607,53 @@ pub(super) trait NativeCallbackRouter: Send + Sync {
         request: PermissionRequest,
     ) -> PermissionResponse;
     async fn before_tool_native(&self, call_id: Option<&str>) -> Result<(), ProviderError>;
-    async fn bind_native_call(&self, call_id: &str, scope: &forge_provider_api::InvocationScope);
+    async fn bind_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError>;
+    /// Retain or release the original authority for a positively published child lifetime.
+    async fn observe_native_child(
+        &self,
+        parent: &forge_provider_api::InvocationScope,
+        child: TurnAddress,
+        finished: bool,
+    ) -> Result<(), ProviderError> {
+        let _ = (parent, child, finished);
+        Ok(())
+    }
+    /// Get the independently registered original child callback collection group.
+    async fn native_child_resources(
+        &self,
+        child: &TurnAddress,
+    ) -> Result<super::child_turn::ChildResources, ProviderError> {
+        let _ = child;
+        Ok(super::child_turn::ChildResources::new())
+    }
+    /// Collect only the original child's callbacks after its native terminal boundary.
+    async fn collect_native_child(&self, child: &TurnAddress) -> Result<(), ProviderError> {
+        let _ = child;
+        Ok(())
+    }
+    /// Retain exact observed-child authority after its causal native publications.
+    async fn bind_observed_native_call(
+        &self,
+        call_id: &str,
+        parent: &forge_provider_api::InvocationScope,
+        child: TurnAddress,
+    ) -> Result<(), ProviderError> {
+        let _ = (call_id, parent, child);
+        Err(ProviderError::Cancelled)
+    }
+    /// Release only the positively attributed original invocation when native IDs are reused.
+    async fn release_owned_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) {
+        let _ = scope;
+        self.release_native_call(call_id).await;
+    }
     async fn release_native_call(&self, call_id: &str);
 }
 
@@ -1159,7 +1663,7 @@ pub(super) struct NoopNativeCallbacks;
 impl NativeCallbackRouter for NoopNativeCallbacks {
     async fn call_native(&self, _: &str, _: ToolCall) -> Result<String, ProviderError> {
         Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ))
     }
@@ -1168,11 +1672,17 @@ impl NativeCallbackRouter for NoopNativeCallbacks {
     }
     async fn before_tool_native(&self, _: Option<&str>) -> Result<(), ProviderError> {
         Err(failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn bind_native_call(&self, _: &str, _: &forge_provider_api::InvocationScope) {}
+    async fn bind_native_call(
+        &self,
+        _: &str,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
     async fn release_native_call(&self, _: &str) {}
 }
 
@@ -1184,7 +1694,7 @@ pub struct CopilotProvider {
     runtime_root: PathBuf,
     profiles: Arc<std::sync::Mutex<Vec<ProfileSlot>>>,
     bindings: Arc<Mutex<HashMap<BindingId, Arc<BindingState>>>>,
-    owners: Arc<Mutex<HashMap<forge_provider_api::ExecutionOwner, BindingId>>>,
+    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadOwner, BindingId>>>,
     initialization_lock: Arc<Mutex<()>>,
     shutdown_lock: Arc<Mutex<()>>,
     operations: Arc<Operations>,
@@ -1270,7 +1780,7 @@ impl CopilotProvider {
                 .map_err(|_| {
                     ProviderError::Failure(
                         ProviderFailure::new(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Timeout,
                         )
                         .at_phase(
@@ -1302,13 +1812,14 @@ impl forge_provider_api::trace::ProviderTrace for NullTrace {
 
 #[async_trait]
 impl forge_provider_api::provider::Provider for CopilotProvider {
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: OperationContext,
         request: SessionRequest,
     ) -> Result<OpenedSession, ProviderError> {
+        request.validate_thread_owner()?;
         let admission =
-            super::operation::Admission::new(context.clone(), ProviderOperation::SessionOpen);
+            super::operation::Admission::new(context.clone(), ProviderOperation::ThreadOpen);
         let resource = InterruptedResource::Opening {
             owner: request.owner.clone(),
             operation: context.id().clone(),
@@ -1329,13 +1840,13 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             .open
             .take(
                 context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 payload,
                 work,
                 move |reason| {
                     let dispatched = boundary.dispatched();
                     let observation = reason.failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         if dispatched {
                             forge_provider_api::ProviderPhase::Observation
                         } else {
@@ -1370,7 +1881,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             .await
     }
 
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1383,7 +1894,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.configure,
             context,
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             payload,
             resource,
             async move { provider.configure_binding(&binding, configuration).await },
@@ -1391,7 +1902,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: OperationContext,
         request: SessionForkRequest,
@@ -1402,7 +1913,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.fork,
             context,
-            ProviderOperation::SessionFork,
+            ProviderOperation::ThreadFork,
             payload,
             resource,
             async move { provider.fork_history(request).await },
@@ -1410,7 +1921,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1423,7 +1934,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.compact,
             context,
-            ProviderOperation::SessionCompact,
+            ProviderOperation::ThreadCompact,
             payload,
             resource,
             async move { provider.compact_history(&binding, request).await },
@@ -1431,7 +1942,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1443,7 +1954,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.close,
             context,
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             payload,
             resource,
             async move {
@@ -1456,12 +1967,12 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
+    ) -> Result<TurnInterruptResult, ProviderError> {
         let resource = InterruptedResource::RetainNative;
         let payload = (binding.clone(), request.clone());
         let provider = self.clone();
@@ -1469,7 +1980,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.cancel,
             context,
-            ProviderOperation::Cancel,
+            ProviderOperation::TurnInterrupt,
             payload,
             resource,
             async move { provider.interrupt_invocation(&binding, request).await },
@@ -1477,12 +1988,13 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: PromptRequest,
     ) -> Result<InputAcceptance, ProviderError> {
+        request.validate_turn_identity()?;
         let resource = InterruptedResource::Invocation {
             binding: binding.clone(),
             scope: request.scope.clone(),
@@ -1497,7 +2009,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.submit,
             context,
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             payload,
             resource,
             async move { provider.submit(&binding, request, &pending).await },
@@ -1505,7 +2017,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn input_steer(
+    async fn turn_steer(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1521,7 +2033,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         self.observe(
             &self.operations.steer,
             context,
-            ProviderOperation::InputSteer,
+            ProviderOperation::TurnSteer,
             payload,
             resource,
             async move { provider.steer_input(&binding, request).await },
@@ -1759,7 +2271,7 @@ impl CopilotProvider {
             let result = if work_boundary.dispatched()
                 && matches!(
                     operation,
-                    ProviderOperation::InputSubmit | ProviderOperation::InputSteer
+                    ProviderOperation::TurnStart | ProviderOperation::TurnSteer
                 ) {
                 result.map_err(|cause| super::error::after_input_dispatch(cause, operation))
             } else {
@@ -1777,16 +2289,18 @@ impl CopilotProvider {
                 let read_only = matches!(resource, InterruptedResource::Observe);
                 let phase = if dispatched {
                     match operation {
-                        ProviderOperation::SessionClose | ProviderOperation::Shutdown => {
+                        ProviderOperation::ThreadClose | ProviderOperation::Shutdown => {
                             forge_provider_api::ProviderPhase::Close
                         }
-                        ProviderOperation::Cancel => forge_provider_api::ProviderPhase::Collection,
-                        ProviderOperation::SessionOpen
-                        | ProviderOperation::SessionConfigure
-                        | ProviderOperation::SessionFork
-                        | ProviderOperation::SessionCompact
-                        | ProviderOperation::InputSubmit
-                        | ProviderOperation::InputSteer
+                        ProviderOperation::TurnInterrupt => {
+                            forge_provider_api::ProviderPhase::Collection
+                        }
+                        ProviderOperation::ThreadOpen
+                        | ProviderOperation::ThreadConfigure
+                        | ProviderOperation::ThreadFork
+                        | ProviderOperation::ThreadCompact
+                        | ProviderOperation::TurnStart
+                        | ProviderOperation::TurnSteer
                         | ProviderOperation::InputReconcile
                         | ProviderOperation::InputRetract
                         | ProviderOperation::Inspect
@@ -2242,7 +2756,7 @@ impl CopilotProvider {
         let _initialization = self.initialization_lock.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -2253,13 +2767,13 @@ impl CopilotProvider {
                 || !request.configuration.resources.mcp.is_empty())
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Rejected,
             ));
         }
-        if request.owner.session_id.as_str().is_empty() || request.workspace.trim().is_empty() {
+        if request.owner.session_id().as_str().is_empty() || request.workspace.trim().is_empty() {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Rejected,
             ));
         }
@@ -2270,16 +2784,13 @@ impl CopilotProvider {
                 .capability
                 .validate_access(&request.configuration.access)
                 .map_err(|_| {
-                    failure(
-                        ProviderOperation::SessionOpen,
-                        ProviderFailureKind::Rejected,
-                    )
+                    failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected)
                 })?;
         }
         self.collect_failed_runtime().await?;
         if self.owners.lock().await.contains_key(&request.owner) {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -2294,7 +2805,7 @@ impl CopilotProvider {
             for state in bindings {
                 if state.session.read().await.id() == resume.as_str() {
                     return Err(failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         ProviderFailureKind::ResourceConflict,
                     ));
                 }
@@ -2302,7 +2813,7 @@ impl CopilotProvider {
         }
         let runtime_key = request.owner.clone();
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
             owner: request.owner.clone(),
         };
@@ -2385,7 +2896,7 @@ impl CopilotProvider {
         let provider_tools: Arc<dyn ProviderTools> = callbacks.clone();
         let selection = SessionSelection {
             execution_owner: request.owner.clone(),
-            correlation_id: request.owner.session_id.to_string(),
+            correlation_id: request.owner.session_id().to_string(),
             session_id: request
                 .history
                 .resume_id()
@@ -2430,7 +2941,7 @@ impl CopilotProvider {
             .map_err(|error| {
                 error.downcast::<ProviderError>().unwrap_or_else(|_| {
                     failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         ProviderFailureKind::Initialization,
                     )
                 })
@@ -2439,13 +2950,12 @@ impl CopilotProvider {
             .register_mcp_tools(&session, &request.configuration.resources)
             .await;
         let turn = self.sessions.turn(&runtime_key).await;
-        let provider_session_id = session.id().try_into().map_err(|_| {
-            failure(
-                ProviderOperation::SessionOpen,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
+        let provider_session_id = session
+            .id()
+            .try_into()
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol))?;
         let binding = SessionBinding {
+            thread_id: request.thread_id.clone(),
             id: binding_id.clone(),
             provider_session_id: (!matches!(request.history, SessionHistory::IsolatedText(_)))
                 .then_some(provider_session_id),
@@ -2492,13 +3002,13 @@ impl CopilotProvider {
                 publisher: state.callbacks.shell().map(|shell| shell.publisher()),
             })
             .await
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime))?;
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime))?;
         self.owners.lock().await.insert(request.owner, binding_id);
         if self.closed.load(Ordering::Acquire) {
             self.close_binding(&binding.id).await?;
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     ProviderFailureKind::BindingClosed,
                 )
                 .at_phase(
@@ -2510,13 +3020,13 @@ impl CopilotProvider {
         if let Some(admission) = super::operation::current()
             && admission
                 .context
-                .check_admission(ProviderOperation::SessionOpen)
+                .check_admission(ProviderOperation::ThreadOpen)
                 .is_err()
         {
             let reason = admission.context.interrupted().await;
             self.close_binding(&binding.id).await?;
             return Err(reason.failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 forge_provider_api::ProviderPhase::Close,
                 forge_provider_api::FailureDisposition::Closed,
             ));
@@ -2543,7 +3053,7 @@ impl CopilotProvider {
     ) -> Result<ConfiguredSession, ProviderError> {
         super::operation::check()?;
         let state = self
-            .binding(binding, ProviderOperation::SessionConfigure)
+            .binding(binding, ProviderOperation::ThreadConfigure)
             .await?;
         let weak_state = Arc::downgrade(&state);
         super::operation::fence(move || {
@@ -2555,28 +3065,19 @@ impl CopilotProvider {
         let _admission = state.admission.lock().await;
         if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if state.unsafe_history.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
-        if state
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| !active.task.is_finished())
-        {
-            return Err(failure(
-                ProviderOperation::SessionConfigure,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
+        state
+            .require_native_idle(ProviderOperation::ThreadConfigure)
+            .await?;
         let mut next_request = state.request.lock().await.clone();
         if configuration == next_request.configuration {
             return Ok(ConfiguredSession {
@@ -2589,7 +3090,7 @@ impl CopilotProvider {
         }
         if matches!(next_request.history, SessionHistory::IsolatedText(_)) {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Policy,
             ));
         }
@@ -2609,11 +3110,11 @@ impl CopilotProvider {
             )?;
             state.turn.reset().map_err(|_| {
                 failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Protocol,
                 )
             })?;
-            super::operation::dispatch_for(ProviderOperation::SessionConfigure)?;
+            super::operation::dispatch_for(ProviderOperation::ThreadConfigure)?;
             if let Err(cause) = session
                 .set_model_confirmed(
                     model.as_deref().unwrap_or("auto"),
@@ -2635,16 +3136,7 @@ impl CopilotProvider {
             let capabilities = forge_provider_api::capability::CapabilityManifest::from_descriptor(
                 self.descriptor(),
             );
-            if let Err(error) = state
-                .sink
-                .send_wait(forge_provider_api::ProviderEvent::CapabilitiesChanged {
-                    scope: forge_provider_api::EventScope::Binding {
-                        owner: state.owner.clone(),
-                    },
-                    capabilities: capabilities.clone(),
-                })
-                .await
-            {
+            if let Err(error) = state.sink.capabilities_changed(capabilities.clone()).await {
                 return Err(ProviderError::Combined {
                     primary: Box::new(
                         state.invalidate_configuration(ProviderFailureKind::Transport),
@@ -2666,7 +3158,7 @@ impl CopilotProvider {
                 .map_err(|cause| ProviderError::Combined {
                     primary: Box::new(ProviderError::Failure(
                         ProviderFailure::new(
-                            ProviderOperation::SessionConfigure,
+                            ProviderOperation::ThreadConfigure,
                             super::error::trace_failure_kind(&cause),
                         )
                         .at_phase(
@@ -2682,7 +3174,7 @@ impl CopilotProvider {
         };
         if !terminals.terminal.is_empty() || helper_has_terminals {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -2694,13 +3186,13 @@ impl CopilotProvider {
                 .await
         {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
         state.turn.reset().map_err(|_| {
             failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Protocol,
             )
         })?;
@@ -2717,7 +3209,7 @@ impl CopilotProvider {
                         .try_into()
                         .map_err(|_| {
                             failure(
-                                ProviderOperation::SessionConfigure,
+                                ProviderOperation::ThreadConfigure,
                                 ProviderFailureKind::Protocol,
                             )
                         })?,
@@ -2730,7 +3222,7 @@ impl CopilotProvider {
             .validate_access(&next_request.configuration.access)
             .map_err(|_| {
                 failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Rejected,
                 )
             })?;
@@ -2799,7 +3291,7 @@ impl CopilotProvider {
         let provider_tools: Arc<dyn ProviderTools> = state.callbacks.clone();
         let selection = SessionSelection {
             execution_owner: next_request.owner.clone(),
-            correlation_id: next_request.owner.session_id.to_string(),
+            correlation_id: next_request.owner.session_id().to_string(),
             session_id: next_request
                 .history
                 .resume_id()
@@ -2846,7 +3338,7 @@ impl CopilotProvider {
             Err(error) => {
                 let cause = error.downcast::<ProviderError>().unwrap_or_else(|_| {
                     failure(
-                        ProviderOperation::SessionConfigure,
+                        ProviderOperation::ThreadConfigure,
                         ProviderFailureKind::Runtime,
                     )
                 });
@@ -2863,7 +3355,7 @@ impl CopilotProvider {
                 return Err(ProviderError::Combined {
                     primary: Box::new(ProviderError::Failure(
                         ProviderFailure::new(
-                            ProviderOperation::SessionConfigure,
+                            ProviderOperation::ThreadConfigure,
                             super::error::trace_failure_kind(&cause),
                         )
                         .at_phase(
@@ -2884,7 +3376,7 @@ impl CopilotProvider {
         let native_id = forge_provider_api::ProviderSessionId::try_from(session.id().to_owned())
             .map_err(|_| {
                 failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Protocol,
                 )
             })?;
@@ -2906,7 +3398,7 @@ impl CopilotProvider {
             .await
             .map_err(|_| {
                 failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Runtime,
                 )
             })?;
@@ -2916,7 +3408,7 @@ impl CopilotProvider {
         }
         *state.request.lock().await = next_request;
         if let Err(cause) = state
-            .collect_retired_profiles(ProviderOperation::SessionConfigure)
+            .collect_retired_profiles(ProviderOperation::ThreadConfigure)
             .await
         {
             state.closing.store(true, Ordering::Release);
@@ -2929,7 +3421,7 @@ impl CopilotProvider {
             return Err(ProviderError::Combined {
                 primary: Box::new(ProviderError::Failure(
                     ProviderFailure::new(
-                        ProviderOperation::SessionConfigure,
+                        ProviderOperation::ThreadConfigure,
                         super::error::trace_failure_kind(&cause),
                     )
                     .at_phase(
@@ -2944,11 +3436,10 @@ impl CopilotProvider {
         if identity_changed
             && let Err(error) = state
                 .sink
-                .send_wait(forge_provider_api::ProviderEvent::SessionIdentity {
-                    scope: forge_provider_api::EventScope::Binding {
-                        owner: state.owner.clone(),
-                    },
-                    provider_session_id: native_id,
+                .activity_writer()
+                .send_wait(forge_provider_api::AdapterActivity::Thread {
+                    thread_id: state.owner.thread_id(),
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(native_id),
                 })
                 .await
         {
@@ -2961,14 +3452,11 @@ impl CopilotProvider {
         }
         if let Err(error) = state
             .sink
-            .send_wait(forge_provider_api::ProviderEvent::CapabilitiesChanged {
-                scope: forge_provider_api::EventScope::Binding {
-                    owner: state.owner.clone(),
-                },
-                capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
+            .capabilities_changed(
+                forge_provider_api::capability::CapabilityManifest::from_descriptor(
                     self.descriptor(),
                 ),
-            })
+            )
             .await
         {
             let cause = ProviderError::from(error);
@@ -2994,7 +3482,7 @@ impl CopilotProvider {
         request: SteeringRequest,
     ) -> Result<SteeringAcceptance, ProviderError> {
         super::operation::check()?;
-        let state = self.binding(binding, ProviderOperation::InputSteer).await?;
+        let state = self.binding(binding, ProviderOperation::TurnSteer).await?;
         let weak_state = Arc::downgrade(&state);
         let target_scope = request.scope.clone();
         super::operation::fence(move || {
@@ -3005,7 +3493,7 @@ impl CopilotProvider {
         if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::BindingClosed,
                 )
                 .at_phase(
@@ -3017,7 +3505,7 @@ impl CopilotProvider {
         if state.unsafe_history.load(Ordering::Acquire) {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::BindingInvalidated,
                 )
                 .at_phase(
@@ -3028,20 +3516,20 @@ impl CopilotProvider {
         }
         if request.scope.owner != state.owner {
             return Err(failure(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         let submission_id = request.delivery.submission_id().cloned();
         let receipt = request.delivery.receipt().cloned();
-        if let Some(receipt) = &receipt {
-            receipt.attempt_id().map_err(|_| {
-                failure(
-                    ProviderOperation::InputSteer,
-                    ProviderFailureKind::WrongInvocation,
-                )
-            })?;
-        }
+        let covered_input = receipt
+            .as_ref()
+            .map(|receipt| {
+                receipt.attempt_id().map(|attempt| {
+                    forge_provider_api::CoveredInput::new(receipt.id().clone(), attempt)
+                })
+            })
+            .transpose()?;
         let active_scope = state
             .active
             .lock()
@@ -3053,18 +3541,29 @@ impl CopilotProvider {
             .is_some_and(|scope| scope != &request.scope)
         {
             return Err(failure(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         if !state.turn.is_active() || active_scope.is_none() {
             return Err(ProviderError::NotConsumed);
         }
+        if let Some(input) = covered_input {
+            state
+                .turn
+                .register_input(&request.scope, input)
+                .map_err(|_| {
+                    failure(
+                        ProviderOperation::TurnSteer,
+                        ProviderFailureKind::WrongInvocation,
+                    )
+                })?;
+        }
         let callbacks = state
             .callbacks
             .callbacks(&request.scope)
             .await
-            .map_err(|cause| cause.for_operation(ProviderOperation::InputSteer))?;
+            .map_err(|cause| cause.for_operation(ProviderOperation::TurnSteer))?;
         let input = forge_provider_api::input::MessageInput {
             prompt: {
                 let prompt = match request.input {
@@ -3140,7 +3639,7 @@ impl CopilotProvider {
                 .map_err(|_| {
                     ProviderError::Failure(
                         ProviderFailure::new(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Timeout,
                         )
                         .at_phase(
@@ -3168,7 +3667,7 @@ impl CopilotProvider {
             Err(_) => {
                 failures.push(ProviderError::Failure(
                     ProviderFailure::new(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Timeout,
                     )
                     .at_phase(
@@ -3199,7 +3698,7 @@ impl CopilotProvider {
                     .await
                     .unwrap_or_else(|_| {
                         Err(failure(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Timeout,
                         ))
                     })
@@ -3215,13 +3714,13 @@ impl CopilotProvider {
                 Ok(Err(error)) => {
                     failures.push(error.downcast::<ProviderError>().unwrap_or_else(|_| {
                         failure(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Transport,
                         )
                     }))
                 }
                 Err(_) => failures.push(failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Timeout,
                 )),
             }
@@ -3243,12 +3742,12 @@ impl CopilotProvider {
                 {
                     Ok(Ok(())) => state.history_deleted.store(true, Ordering::Release),
                     Ok(Err(_)) => failures.push(failure(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Transport,
                     )),
                     Err(_) => failures.push(ProviderError::Failure(
                         ProviderFailure::new(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Timeout,
                         )
                         .at_phase(
@@ -3265,7 +3764,7 @@ impl CopilotProvider {
             Err(_) => {
                 failures.push(ProviderError::Failure(
                     ProviderFailure::new(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Timeout,
                     )
                     .at_phase(
@@ -3290,19 +3789,19 @@ impl CopilotProvider {
             && foreground_collected
         {
             if let Some(resources) = state.retained_resources.lock().await.as_ref()
-                && let Err(error) = resources._profile.close(ProviderOperation::SessionClose)
+                && let Err(error) = resources._profile.close(ProviderOperation::ThreadClose)
             {
                 failures.push(error);
             }
             if let Err(error) = state
-                .collect_retired_profiles(ProviderOperation::SessionClose)
+                .collect_retired_profiles(ProviderOperation::ThreadClose)
                 .await
             {
                 failures.push(error);
             }
         } else if failures.is_empty() {
             failures.push(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -3333,41 +3832,35 @@ impl CopilotProvider {
         Ok(())
     }
 
+    /// Interrupt and collect exactly the addressed turn without reclassifying its native outcome.
     async fn interrupt_invocation(
         &self,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
-        // Fence even an absent scope, and wait for queued preparation outside native admission.
+    ) -> Result<TurnInterruptResult, ProviderError> {
         self.pending_inputs.cancel(binding, &request.scope).await;
-        let state = self.binding(binding, ProviderOperation::Cancel).await?;
-        // No queued candidate can register now. Do not wait for an unrelated binding mutation
-        // merely to report the proven absence of this exact invocation's native owner.
-        if !state
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| active.scope == request.scope)
-        {
-            if let Some(result) = state
-                .cancellations
-                .lock()
-                .await
-                .get(&request.scope)
-                .cloned()
-            {
-                return result;
-            }
-            if let Some(result) = state.settlements.lock().await.get(&request.scope).cloned() {
-                return result;
-            }
-            return Err(failure(
-                ProviderOperation::Cancel,
-                ProviderFailureKind::WrongInvocation,
-            ));
-        }
-        let _admission = state.admission.lock().await;
+        let state = self
+            .binding(binding, ProviderOperation::TurnInterrupt)
+            .await?;
+        let operation = super::operation::current().ok_or_else(|| {
+            failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::OperationConflict,
+            )
+        })?;
+        let receipt = || -> Result<TurnInterruptResult, ProviderError> {
+            Ok(TurnInterruptResult {
+                operation_id: operation.context.id().clone(),
+                thread_id: request.scope.owner.thread_id(),
+                turn_id: request.scope.turn_id().map_err(|_| {
+                    failure(
+                        ProviderOperation::TurnInterrupt,
+                        ProviderFailureKind::WrongInvocation,
+                    )
+                })?,
+                watermark: state.sink.watermark(),
+            })
+        };
         if let Some(result) = state
             .cancellations
             .lock()
@@ -3375,15 +3868,12 @@ impl CopilotProvider {
             .get(&request.scope)
             .cloned()
         {
-            return result;
+            result?;
+            return receipt();
         }
-        if let Some(settlement) = state.settlements.lock().await.get(&request.scope).cloned() {
-            state
-                .cancellations
-                .lock()
-                .await
-                .insert(request.scope, settlement.clone());
-            return settlement;
+        if let Some(completed) = state.settlements.lock().await.get(&request.scope).cloned() {
+            completed?;
+            return receipt();
         }
         if !state
             .active
@@ -3393,74 +3883,48 @@ impl CopilotProvider {
             .is_some_and(|active| active.scope == request.scope)
         {
             return Err(failure(
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
-        let trace = state.request.lock().await.trace.clone();
-        trace.record(forge_provider_api::trace::ProviderTraceRecord {
-            binding_id: binding.clone(),
-            event: forge_provider_api::trace::ProviderTraceEvent::CancellationStarted,
-            scope: Some(request.scope.clone()),
-            submission_id: None,
-            failure: None,
-        });
-        super::operation::dispatch_for(ProviderOperation::Cancel)?;
-        let stop_failure = state.interrupt().await.err();
-        trace.record(forge_provider_api::trace::ProviderTraceRecord {
-            binding_id: binding.clone(),
-            event: forge_provider_api::trace::ProviderTraceEvent::CancellationAcknowledged,
-            scope: Some(request.scope.clone()),
-            submission_id: None,
-            failure: stop_failure.as_ref().map(super::error::trace_failure_kind),
-        });
-        // Attempt collection even when interruption failed or its acknowledgement timed out.
-        trace.record(forge_provider_api::trace::ProviderTraceRecord {
-            binding_id: binding.clone(),
-            event: forge_provider_api::trace::ProviderTraceEvent::ExecutionCollectionStarted,
-            scope: Some(request.scope.clone()),
-            submission_id: None,
-            failure: None,
-        });
-        let collection = state.collect_execution().await;
-        let collection_failure = match collection {
-            Ok(None | Some(Ok(()))) => None,
-            Ok(Some(Err(error))) | Err(error) => Some(error),
+        let _admission = state.admission.lock().await;
+        if let Some(completed) = state.settlements.lock().await.get(&request.scope).cloned() {
+            completed?;
+            return receipt();
+        }
+        // Revalidate under admission; an old interruption cannot select a successor.
+        if !state
+            .active
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| active.scope == request.scope)
+        {
+            return Err(failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::WrongInvocation,
+            ));
+        }
+        super::operation::dispatch_for(ProviderOperation::TurnInterrupt)?;
+        let stop = state.interrupt().await;
+        let collected = match state.collect_execution().await {
+            Ok(None | Some(Ok(()))) => Ok(()),
+            Ok(Some(Err(error))) | Err(error) => Err(error),
         };
-        trace.record(forge_provider_api::trace::ProviderTraceRecord {
-            binding_id: binding.clone(),
-            event: forge_provider_api::trace::ProviderTraceEvent::ExecutionCollectionFinished,
-            scope: Some(request.scope.clone()),
-            submission_id: None,
-            failure: collection_failure
-                .as_ref()
-                .map(super::error::trace_failure_kind),
-        });
-        let result = match (stop_failure, collection_failure) {
-            (Some(primary), Some(secondary)) => Err(ProviderError::Combined {
+        let result = match (stop, collected) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
                 primary: Box::new(primary),
                 secondary: vec![secondary],
             }),
-            (Some(error), None) | (None, Some(error)) => Err(error),
-            (None, None) => state
-                .settlements
-                .lock()
-                .await
-                .get(&request.scope)
-                .cloned()
-                .unwrap_or_else(|| {
-                    Err(failure(
-                        ProviderOperation::Cancel,
-                        ProviderFailureKind::Protocol,
-                    ))
-                }),
         };
         state
             .cancellations
             .lock()
             .await
-            .insert(request.scope, result.clone());
-        result
+            .insert(request.scope.clone(), result.clone());
+        result?;
+        receipt()
     }
 
     async fn fork_history(
@@ -3479,7 +3943,7 @@ impl CopilotProvider {
         if let Some(retained) = self.forks.lock().await.get(&operation_id) {
             if retained.context != context || retained.request != request {
                 return Err(failure(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::HistoryConflict,
                 ));
             }
@@ -3488,19 +3952,19 @@ impl CopilotProvider {
         let immutable_request = request.clone();
         if self.closed.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         let (session_id, checkpoint, workspace, source) = match request.source {
             ForkSource::Binding(binding) => {
                 let state = self
-                    .binding(&binding, ProviderOperation::SessionFork)
+                    .binding(&binding, ProviderOperation::ThreadFork)
                     .await?;
                 let workspace = state.request.lock().await.workspace.clone();
                 if state.binding.provider_session_id.is_none() {
                     return Err(failure(
-                        ProviderOperation::SessionFork,
+                        ProviderOperation::ThreadFork,
                         ProviderFailureKind::Rejected,
                     ));
                 }
@@ -3508,10 +3972,7 @@ impl CopilotProvider {
                     state.session.read().await.id().to_owned(),
                 )
                 .map_err(|_| {
-                    failure(
-                        ProviderOperation::SessionFork,
-                        ProviderFailureKind::Protocol,
-                    )
+                    failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol)
                 })?;
                 (id, None, workspace, Some(state))
             }
@@ -3533,33 +3994,24 @@ impl CopilotProvider {
         if let Some(state) = &source {
             if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
                 return Err(failure(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
             if state.unsafe_history.load(Ordering::Acquire) {
                 return Err(failure(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::BindingInvalidated,
                 ));
             }
-            if state
-                .active
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|active| !active.task.is_finished())
-            {
-                return Err(failure(
-                    ProviderOperation::SessionFork,
-                    ProviderFailureKind::ExecutionActive,
-                ));
-            }
+            state
+                .require_native_idle(ProviderOperation::ThreadFork)
+                .await?;
         }
         let client = self.runtime.client(&workspace).await?;
         let unknown = ProviderError::Failure(
             ProviderFailure::new(
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 ProviderFailureKind::Transport,
             )
             .at_phase(
@@ -3581,10 +4033,7 @@ impl CopilotProvider {
             .and_then(|id| {
                 Ok(forge_provider_api::ProviderForkResult::unprofiled(
                     id.try_into().map_err(|_| {
-                        failure(
-                            ProviderOperation::SessionFork,
-                            ProviderFailureKind::Protocol,
-                        )
+                        failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol)
                     })?,
                 ))
             });
@@ -3612,12 +4061,12 @@ impl CopilotProvider {
         let operation_id = context.id().clone();
         request.validate_context(&context)?;
         let state = self
-            .binding(binding, ProviderOperation::SessionCompact)
+            .binding(binding, ProviderOperation::ThreadCompact)
             .await?;
         if !matches!(&request.scope, forge_provider_api::EventScope::SessionOperation { owner, .. } if owner == &state.owner)
         {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -3631,28 +4080,19 @@ impl CopilotProvider {
         let _admission = state.admission.lock().await;
         if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if state.unsafe_history.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
-        if state
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| !active.task.is_finished())
-        {
-            return Err(failure(
-                ProviderOperation::SessionCompact,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
+        state
+            .require_native_idle(ProviderOperation::ThreadCompact)
+            .await?;
         if let Some(result) = state.compactions.lock().await.get(&operation_id).cloned() {
             return result;
         }
@@ -3660,7 +4100,7 @@ impl CopilotProvider {
             operation_id.clone(),
             Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::SessionCompact,
+                    ProviderOperation::ThreadCompact,
                     ProviderFailureKind::Transport,
                 )
                 .at_phase(
@@ -3775,18 +4215,9 @@ impl CopilotProvider {
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
-        if state
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| !active.task.is_finished())
-        {
-            return Err(failure(
-                ProviderOperation::InputRetract,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
+        state
+            .require_native_idle(ProviderOperation::InputRetract)
+            .await?;
         if !state
             .settlements
             .lock()
@@ -3795,8 +4226,8 @@ impl CopilotProvider {
             .is_some_and(|result| {
                 result.as_ref().is_ok_and(|settlement| {
                     matches!(
-                        settlement.result,
-                        forge_provider_api::ExecutionResult::Cancelled { .. }
+                        settlement.result().outcome(),
+                        forge_provider_api::turn::TurnOutcome::Interrupted
                     )
                 })
             })
@@ -3898,10 +4329,8 @@ impl CopilotProvider {
         request: PromptRequest,
         pending: &crate::pending_input::PendingInput,
     ) -> Result<InputAcceptance, ProviderError> {
-        let state = self
-            .binding(binding, ProviderOperation::InputSubmit)
-            .await?;
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        let state = self.binding(binding, ProviderOperation::TurnStart).await?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         super::operation::check()
             .map_err(|cause| ProviderError::PreparationFailed(Box::new(cause)))?;
         let weak_state = Arc::downgrade(&state);
@@ -3914,16 +4343,16 @@ impl CopilotProvider {
         let _admission = tokio::select! {
             biased;
             _ = pending.cancelled() => {
-                pending.check_admission(ProviderOperation::InputSubmit)?;
+                pending.check_admission(ProviderOperation::TurnStart)?;
                 unreachable!("pending cancellation is sticky");
             }
             admission = state.admission.lock() => admission,
         };
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 )
                 .at_phase(
@@ -3935,7 +4364,7 @@ impl CopilotProvider {
         if state.unsafe_history.load(Ordering::Acquire) {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingInvalidated,
                 )
                 .at_phase(
@@ -3946,7 +4375,7 @@ impl CopilotProvider {
         }
         if state.settlements.lock().await.contains_key(&request.scope) {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -3958,7 +4387,7 @@ impl CopilotProvider {
         );
         if isolated_text && (!request.tools.is_empty() || request.tool_endpoint.is_some()) {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Policy,
             ));
         }
@@ -3971,7 +4400,7 @@ impl CopilotProvider {
             || request.receipt.id().as_str() != request.submission_id.as_str()
             || request.receipt.attempt_id().map_err(|_| {
                 failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::WrongInvocation,
                 )
             })? != request.attempt_id
@@ -3983,7 +4412,7 @@ impl CopilotProvider {
             )
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -3992,16 +4421,13 @@ impl CopilotProvider {
                 .capability
                 .validate_access(&request.configuration.access)
                 .map_err(|_| {
-                    failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Rejected,
-                    )
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
                 })?;
         }
         if state.stream.lock().await.is_some() {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingInvalidated,
                 )
                 .at_phase(
@@ -4014,7 +4440,7 @@ impl CopilotProvider {
             let mut active = state.active.lock().await;
             if active.as_ref().is_some_and(|task| !task.task.is_finished()) {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::ExecutionActive,
                 ));
             }
@@ -4026,7 +4452,7 @@ impl CopilotProvider {
                 Ok(Err(_)) => {}
                 Err(_) => {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::Runtime,
                     ));
                 }
@@ -4043,7 +4469,7 @@ impl CopilotProvider {
         let models = tokio::select! {
             biased;
             _ = pending.cancelled() => {
-                pending.check_admission(ProviderOperation::InputSubmit)?;
+                pending.check_admission(ProviderOperation::TurnStart)?;
                 unreachable!("pending cancellation is sticky");
             }
             models = client.models() => models?,
@@ -4053,13 +4479,8 @@ impl CopilotProvider {
             &models,
             &self.descriptor().capability,
         )
-        .map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected))?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         session
             .set_model(
                 selected_model.as_deref().unwrap_or("auto"),
@@ -4067,7 +4488,7 @@ impl CopilotProvider {
                 request.configuration.model.context_window.as_deref(),
             )
             .await?;
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         let callbacks = InvocationCallbacks {
             scope: request.scope.clone(),
             generation: 0,
@@ -4085,7 +4506,7 @@ impl CopilotProvider {
             .repair(&state.owner)
             .await
             .map(|repair| repair.caution().to_owned());
-        if let Err(error) = pending.check_admission(ProviderOperation::InputSubmit) {
+        if let Err(error) = pending.check_admission(ProviderOperation::TurnStart) {
             state.callbacks.retire_all(&state.binding.id).await?;
             return Err(error);
         }
@@ -4128,10 +4549,14 @@ impl CopilotProvider {
         let (registered, registration) = tokio::sync::oneshot::channel();
         let native_operation = super::operation::current();
         let dispatch_evidence = native_operation.clone();
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::operation::scope(native_operation, async move {
             if registration.await.is_err() {
                 return Err(ProviderError::Cancelled);
             }
+            let native_start = start_receiver
+                .await
+                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
             let guard = match turn.activate(Some(event_sink.clone()), None) {
                 Ok(guard) => {
                     let _ = activated.send(Ok(()));
@@ -4139,7 +4564,7 @@ impl CopilotProvider {
                 }
                 Err(_) => {
                     let error = failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::ExecutionActive,
                     );
                     let _ = activated.send(Err(()));
@@ -4148,135 +4573,83 @@ impl CopilotProvider {
             };
             let result = super::prompt::run(
                 &session,
-                &turn,
                 &guard,
+                &native_start,
                 options,
                 &event_sink,
                 control.as_ref(),
-                task_state.callbacks.as_ref(),
+                task_state.callbacks.clone(),
             )
             .await;
+            let native_result = result;
             task_state
                 .callbacks
                 .finish_foreground_scope(&grant_scope, callback_generation)
                 .await;
             drop(guard);
-            match result {
-                Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
-                Err(error) => Err(error),
-            }
+            native_result
         }));
         let collecting = state.clone();
         let history_sessions = self.sessions.clone();
         let history_session = state.session.read().await.clone();
         let collect_scope = invocation_scope.clone();
+        let task = crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, task);
+        let driver = Arc::new(CopilotTurnDriver {
+            native: task,
+            start: Mutex::new(Some(start_sender)),
+            state: collecting.clone(),
+            sessions: history_sessions,
+            session: history_session,
+            dispatch: dispatch_evidence,
+            submission: collecting_submission.clone(),
+        });
+        let address = forge_provider_api::TurnAddress {
+            scope: collect_scope.clone(),
+            thread_id: collect_scope.owner.thread_id(),
+            turn_id: collect_scope.turn_id().map_err(|_| {
+                failure(
+                    ProviderOperation::TurnStart,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?,
+        };
+        let retained = Arc::new(crate::turn_runner::RetainedTurn::spawn(
+            driver,
+            collecting.sink.clone(),
+            address,
+        )?);
+        let collecting_turn = retained.clone();
         let collector = tokio::spawn(async move {
-            let outcome = task
+            let result = collecting_turn.join().await;
+            let rejected = result.as_ref().is_err_and(|error| {
+                matches!(
+                    error,
+                    ProviderError::NotConsumed | ProviderError::PreparationFailed(_)
+                )
+            }) || collecting
+                .unconsumed
+                .lock()
                 .await
-                .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Runtime))
-                .and_then(|result| result);
-            let never_dispatched = dispatch_evidence
-                .as_ref()
-                .is_some_and(|operation| !operation.dispatched());
-            // Configuration waits for this collector; only a possible native send
-            // establishes history that a later replacement must resume.
-            if !never_dispatched {
-                history_sessions
-                    .mark_submitted(&collecting.owner, &history_session)
-                    .await?;
-            }
-            if matches!(outcome, Err(ProviderError::NotConsumed)) || never_dispatched {
-                collecting
-                    .unconsumed
-                    .lock()
-                    .await
-                    .insert(collecting_submission);
-            }
-            collecting.callbacks.revoke();
-            collecting.callbacks.collect_callbacks().await;
-            collecting
-                .callbacks
-                .retire_all(&collecting.binding.id)
-                .await?;
-            let mut settlement = match &outcome {
-                Ok(()) => collecting
-                    .turn
-                    .settlement_result()
-                    .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Protocol))
-                    .map(|result| InvocationSettlement {
-                        binding_id: collecting.binding.id.clone(),
-                        scope: collect_scope.clone(),
-                        result,
-                        watermark: collecting.sink.watermark(),
-                    }),
-                Err(ProviderError::Retryable(retryable)) => Ok(InvocationSettlement {
-                    binding_id: collecting.binding.id.clone(),
-                    scope: collect_scope.clone(),
-                    result: forge_provider_api::ExecutionResult::Failed {
-                        completion: collecting.turn.completion().unwrap_or_default().into(),
-                        failure: forge_provider_api::ExecutionFailure::Retryable {
-                            address: retryable.address.clone(),
-                            category: retryable.category,
-                            retry_after: retryable.retry_after,
-                        },
-                    },
-                    watermark: collecting.sink.watermark(),
-                }),
-                Err(ProviderError::NotConsumed) => Ok(InvocationSettlement {
-                    binding_id: collecting.binding.id.clone(),
-                    scope: collect_scope.clone(),
-                    result: forge_provider_api::ExecutionResult::Failed {
-                        completion: forge_provider_api::completion::ProviderCompletion::default()
-                            .into(),
-                        failure: forge_provider_api::ExecutionFailure::Rejected,
-                    },
-                    watermark: collecting.sink.watermark(),
-                }),
-                Err(_) if never_dispatched => Ok(InvocationSettlement {
-                    binding_id: collecting.binding.id.clone(),
-                    scope: collect_scope.clone(),
-                    result: forge_provider_api::ExecutionResult::Failed {
-                        completion: forge_provider_api::completion::ProviderCompletion::default()
-                            .into(),
-                        failure: forge_provider_api::ExecutionFailure::Rejected,
-                    },
-                    watermark: collecting.sink.watermark(),
-                }),
-                Err(error) => Err(error.clone()),
-            };
-            if let Ok(receipt) = &settlement {
-                match collecting
-                    .publish_invocation_settlement(receipt.clone())
-                    .await
-                {
-                    Ok(published) => settlement = Ok(published),
-                    Err(error) => settlement = Err(error),
-                }
-            }
+                .contains(&collecting_submission);
             collecting
                 .settlements
                 .lock()
                 .await
-                .insert(collect_scope.clone(), settlement.clone());
-            match &settlement {
-                Ok(_) => {}
-                Err(error) => {
-                    collecting.closing.store(true, Ordering::Release);
-                    let failure = ProviderFailure::new(
-                        ProviderOperation::Cancel,
-                        super::error::trace_failure_kind(error),
-                    )
-                    .at_phase(
-                        forge_provider_api::ProviderPhase::Collection,
-                        forge_provider_api::FailureDisposition::Invalidated,
-                    );
-                    let _ = collecting
-                        .publish_invocation_settlement_failure(&collect_scope, failure)
-                        .await;
-                }
-            }
+                .insert(collect_scope.clone(), result.clone());
             collecting.settled.notify_waiters();
-            settlement.map(|_| ())
+            if rejected
+                || result
+                    .as_ref()
+                    .is_err_and(ProviderError::is_clean_cancellation)
+                    && collecting
+                        .turn
+                        .foreground_anchor()
+                        .is_ok_and(|anchor| anchor.is_none())
+            {
+                Ok(())
+            } else {
+                result.map(|_| ())
+            }
         });
         *state.active.lock().await = Some(ActiveExecution {
             scope: invocation_scope,
@@ -4289,13 +4662,13 @@ impl CopilotProvider {
             Ok(Ok(())) => {}
             Ok(Err(())) => {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::ExecutionActive,
                 ));
             }
             Err(_) => {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Runtime,
                 ));
             }
@@ -4304,8 +4677,15 @@ impl CopilotProvider {
         match acceptance.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(ProviderError::DeliveryUncertain),
+            Err(_) => {
+                return Err(retained
+                    .join()
+                    .await
+                    .err()
+                    .unwrap_or(ProviderError::DeliveryUncertain));
+            }
         }
+        retained.started().await?;
         Ok(InputAcceptance { submission_id })
     }
 }
@@ -4317,7 +4697,7 @@ fn make_profile(
     request: &SessionRequest,
 ) -> Result<RetainedResources, ProviderError> {
     let operation = super::operation::current()
-        .map_or(ProviderOperation::SessionOpen, |operation| {
+        .map_or(ProviderOperation::ThreadOpen, |operation| {
             operation.operation
         });
     prepare_profile(
@@ -4426,7 +4806,7 @@ fn resolve_model_selection(
 ) -> Result<(Option<String>, Option<String>), ProviderError> {
     selection.service_tier.validate(capability).map_err(|_| {
         failure(
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Rejected,
         )
     })?;
@@ -4436,7 +4816,7 @@ fn resolve_model_selection(
             .find(|model| model.id == selected)
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Rejected,
                 )
             })?,
@@ -4450,7 +4830,7 @@ fn resolve_model_selection(
         && !model.service_tiers.contains(&selection.service_tier)
     {
         return Err(failure(
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Rejected,
         ));
     }
@@ -4464,7 +4844,7 @@ fn resolve_model_selection(
         }
         ReasoningSelection::Level(_) => {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Rejected,
             ));
         }
@@ -4532,7 +4912,7 @@ pub(super) fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -
 fn accepted_message_ids(
     submission_id: &forge_provider_api::SubmissionId,
     attempt_id: &forge_provider_api::DeliveryAttemptId,
-    owner: &forge_provider_api::ExecutionOwner,
+    owner: &forge_provider_api::ThreadOwner,
     session_id: &str,
     accepted_receipts: &[RecoveryToken],
 ) -> Result<std::collections::HashSet<String>, ProviderError> {
@@ -4567,7 +4947,7 @@ mod callback_tests {
     #[tokio::test]
     async fn unobserved_shell_call_is_released_by_cancellation() {
         let router = Arc::new(CallbackRouter::default());
-        let owner = forge_provider_api::ExecutionOwner::root("missing-shell-start");
+        let owner = forge_provider_api::ThreadOwner::root("missing-shell-start");
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "invocation");
         install(&router, &scope).await;
         let (sink, _events) = events::channel(
@@ -4595,7 +4975,7 @@ mod callback_tests {
     async fn unobserved_shell_call_rejects_already_cancelled_authority() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("pre-cancelled-shell"),
+            forge_provider_api::ThreadOwner::root("pre-cancelled-shell"),
             "invocation",
         );
         install(&router, &scope).await;
@@ -4735,6 +5115,217 @@ mod callback_tests {
         }
     }
 
+    /// Reject ambiguous identity-free hooks while preserving valid root-only pre-execution policy.
+    #[tokio::test]
+    async fn identity_free_hook_requires_unambiguous_root_authority() {
+        let router = CallbackRouter::default();
+        let parent = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("unattributed-hook"),
+            "parent",
+        );
+        install(&router, &parent).await;
+        router
+            .before_tool_native(None)
+            .await
+            .expect("root-only hook has exact authority");
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::new(
+                parent.owner.session_id().clone(),
+                forge_provider_api::agent::AgentId::new("child").unwrap(),
+            )
+            .unwrap(),
+            parent.exchange_id.clone(),
+        );
+        let child = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
+        router
+            .observe_native_child(&parent, child.clone(), false)
+            .await
+            .unwrap();
+        let failure = router.before_tool_native(None).await.unwrap_err();
+        assert!(
+            matches!(failure, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Policy)
+        );
+        router
+            .observe_native_child(&parent, child, true)
+            .await
+            .unwrap();
+        router
+            .before_tool_native(None)
+            .await
+            .expect("finished child no longer makes root hook ambiguous");
+    }
+
+    struct ChildTools {
+        parent: forge_provider_api::InvocationScope,
+        child: TurnAddress,
+    }
+
+    #[async_trait]
+    impl ProviderTools for ChildTools {
+        /// Fail the fixture if the adapter routes an observed child into the root executor.
+        async fn call(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: ToolCall,
+        ) -> Result<String, ProviderError> {
+            panic!("observed child reached the root tool executor")
+        }
+
+        /// Verify exact original child attribution at the dedicated host execution boundary.
+        async fn call_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &TurnAddress,
+            call: ToolCall,
+        ) -> Result<String, ProviderError> {
+            assert_eq!(parent, &self.parent);
+            assert_eq!(child, &self.child);
+            assert_eq!(call.id.as_str(), "child-host-call");
+            Ok("child executor".into())
+        }
+    }
+
+    /// Execute identified child host tools through the independently captured child authority.
+    #[tokio::test]
+    async fn native_child_host_tool_uses_its_original_child_executor_after_root_retirement() {
+        let router = CallbackRouter::default();
+        let parent = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("child-host-tool"),
+            "parent",
+        );
+        install(&router, &parent).await;
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::new(
+                parent.owner.session_id().clone(),
+                forge_provider_api::agent::AgentId::new("child").unwrap(),
+            )
+            .unwrap(),
+            parent.exchange_id.clone(),
+        );
+        let child = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
+        let mut callbacks = router.callbacks(&parent).await.unwrap();
+        callbacks.tools = Arc::new(ChildTools {
+            parent: parent.clone(),
+            child: child.clone(),
+        });
+        router.install(callbacks).await.unwrap();
+        router
+            .observe_native_child(&parent, child.clone(), false)
+            .await
+            .unwrap();
+        router
+            .bind_observed_native_call("child-host-call", &parent, child)
+            .await
+            .unwrap();
+        router.revoke();
+        assert_eq!(
+            router
+                .call_native(
+                    "child-host-call",
+                    ToolCall {
+                        id: forge_provider_api::control::ToolCallId::new("untrusted-native-alias")
+                            .unwrap(),
+                        name: "fixture_tool".into(),
+                        arguments: json!({}),
+                    }
+                )
+                .await
+                .unwrap(),
+            "child executor"
+        );
+    }
+
+    /// Keep child policy distinct from a parent policy that would otherwise allow the request.
+    #[tokio::test]
+    async fn native_child_permission_waits_for_exact_published_owner_without_parent_fallback() {
+        let router = CallbackRouter::default();
+        let parent = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("child-permission"),
+            "parent",
+        );
+        let generation = install(&router, &parent).await;
+        let child_scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::new(
+                parent.owner.session_id().clone(),
+                forge_provider_api::agent::AgentId::new("observed-child").unwrap(),
+            )
+            .unwrap(),
+            parent.exchange_id.clone(),
+        );
+        let child = TurnAddress {
+            thread_id: child_scope.owner.thread_id(),
+            turn_id: child_scope.turn_id().unwrap(),
+            scope: child_scope,
+        };
+        let pending = router.before_tool_native(Some("child-call"));
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        router
+            .observe_native_child(&parent, child.clone(), false)
+            .await
+            .unwrap();
+        assert!(router.before_tool_native(None).await.is_err());
+        router
+            .bind_observed_native_call("child-call", &parent, child.clone())
+            .await
+            .unwrap();
+        assert!(pending.await.is_err());
+        assert!(
+            router
+                .call_native(
+                    "child-call",
+                    ToolCall {
+                        id: forge_provider_api::control::ToolCallId::new("child-call").unwrap(),
+                        name: "fixture_tool".into(),
+                        arguments: json!({}),
+                    }
+                )
+                .await
+                .is_err(),
+            "child host tools must use the dedicated child executor"
+        );
+        let request = PermissionRequest {
+            id: "child-permission".into(),
+            provider: forge_provider_api::ProviderId::new("copilot").unwrap(),
+            reason: None,
+            target_list: vec![forge_provider_api::permissions::PermissionTarget::Unknown],
+        };
+        assert!(matches!(
+            router.authorize_native("child-call", request.clone()).await,
+            PermissionResponse::Deny { .. }
+        ));
+        router.finish_foreground_scope(&parent, generation).await;
+        router.release_native_call("child-call").await;
+        assert!(router.callbacks(&parent).await.is_ok());
+        router.revoke();
+        let later = router.before_tool_native(Some("later-child-call"));
+        tokio::pin!(later);
+        assert!(futures_util::poll!(later.as_mut()).is_pending());
+        router
+            .bind_observed_native_call("later-child-call", &parent, child.clone())
+            .await
+            .unwrap();
+        assert!(later.await.is_err());
+        assert!(matches!(
+            router.authorize_native("later-child-call", request).await,
+            PermissionResponse::Deny { .. }
+        ));
+        router.release_native_call("later-child-call").await;
+        router
+            .observe_native_child(&parent, child, true)
+            .await
+            .unwrap();
+        assert!(router.callbacks(&parent).await.is_err());
+    }
+
     /// Install authority shared by successive native tool callbacks.
     async fn install(router: &CallbackRouter, scope: &forge_provider_api::InvocationScope) -> u64 {
         let authority = Arc::new(Authority);
@@ -4777,7 +5368,7 @@ mod callback_tests {
     #[tokio::test]
     async fn no_tool_exchange_collection_preserves_following_tool_authority() {
         let router = CallbackRouter::default();
-        let owner = forge_provider_api::ExecutionOwner::root("callbacks");
+        let owner = forge_provider_api::ThreadOwner::root("callbacks");
         let first = forge_provider_api::InvocationScope::new(owner.clone(), "no-tools");
         let generation = install(&router, &first).await;
         router.finish_foreground_scope(&first, generation).await;
@@ -4790,7 +5381,7 @@ mod callback_tests {
         let next = forge_provider_api::InvocationScope::new(owner, "uses-tools");
         install(&router, &next).await;
         router.before_tool_native(None).await.unwrap();
-        router.bind_native_call("next-tool", &next).await;
+        router.bind_native_call("next-tool", &next).await.unwrap();
         call(&router, "next-tool").await;
         router.release_native_call("next-tool").await;
         assert!(router.callbacks(&first).await.is_err());
@@ -4802,12 +5393,12 @@ mod callback_tests {
     async fn tool_completion_retains_live_foreground_callbacks() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("callbacks"),
+            forge_provider_api::ThreadOwner::root("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
         for id in ["first", "second"] {
-            router.bind_native_call(id, &scope).await;
+            router.bind_native_call(id, &scope).await.unwrap();
             call(&router, id).await;
             router.release_native_call(id).await;
             router.before_send(&scope).await.unwrap();
@@ -4822,11 +5413,11 @@ mod callback_tests {
     async fn settled_callbacks_live_until_the_last_native_call_finishes() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("callbacks"),
+            forge_provider_api::ThreadOwner::root("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
-        router.bind_native_call("late", &scope).await;
+        router.bind_native_call("late", &scope).await.unwrap();
         router.finish_foreground_scope(&scope, generation).await;
         call(&router, "late").await;
         router.release_native_call("late").await;
@@ -4834,16 +5425,50 @@ mod callback_tests {
         assert!(router.callbacks_for_native_call("late").await.is_err());
     }
 
+    /// Bind reused SDK call IDs only after original completion and ignore late original releases.
+    #[tokio::test]
+    async fn reused_native_call_id_keeps_replacement_scope_after_late_original_release() {
+        let router = CallbackRouter::default();
+        let owner = forge_provider_api::ThreadOwner::root("reused-call");
+        let original = forge_provider_api::InvocationScope::new(owner.clone(), "original");
+        let replacement = forge_provider_api::InvocationScope::new(owner, "replacement");
+        let generation = install(&router, &original).await;
+        router.bind_native_call("reused", &original).await.unwrap();
+        install(&router, &replacement).await;
+        assert!(
+            router
+                .bind_native_call("reused", &replacement)
+                .await
+                .is_err()
+        );
+        router.finish_foreground_scope(&original, generation).await;
+        router.release_owned_native_call("reused", &original).await;
+        router
+            .bind_native_call("reused", &replacement)
+            .await
+            .unwrap();
+        router.release_owned_native_call("reused", &original).await;
+        assert_eq!(
+            router
+                .callbacks_for_native_call("reused")
+                .await
+                .unwrap()
+                .scope,
+            replacement
+        );
+        call(&router, "reused").await;
+    }
+
     /// Completing an old native call cannot revoke replacement foreground authority.
     #[tokio::test]
     async fn old_callback_completion_does_not_retire_a_new_generation() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("callbacks"),
+            forge_provider_api::ThreadOwner::root("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
-        router.bind_native_call("old", &scope).await;
+        router.bind_native_call("old", &scope).await.unwrap();
         router.finish_foreground_scope(&scope, generation).await;
         let next = install(&router, &scope).await;
         router.release_native_call("old").await;
@@ -4855,14 +5480,17 @@ mod callback_tests {
     #[tokio::test]
     async fn cancelled_native_calls_do_not_block_the_next_invocation() {
         let router = CallbackRouter::default();
-        let owner = forge_provider_api::ExecutionOwner::root("callbacks");
+        let owner = forge_provider_api::ThreadOwner::root("callbacks");
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "cancelled");
         install(&router, &scope).await;
         let mut callbacks = router.callbacks(&scope).await.unwrap();
         callbacks.permissions = Arc::new(CancelledAuthority);
         router.install(callbacks).await.unwrap();
         let generation = router.callbacks(&scope).await.unwrap().generation;
-        router.bind_native_call("aborted-tool", &scope).await;
+        router
+            .bind_native_call("aborted-tool", &scope)
+            .await
+            .unwrap();
         router.finish_foreground_scope(&scope, generation).await;
         assert!(matches!(
             router.before_tool_native(None).await,
@@ -4882,7 +5510,7 @@ mod callback_tests {
                 .await
                 .is_err()
         );
-        router.bind_native_call("new-tool", &next).await;
+        router.bind_native_call("new-tool", &next).await.unwrap();
         call(&router, "new-tool").await;
     }
 
@@ -4900,6 +5528,15 @@ mod callback_tests {
         ) -> PermissionResponse {
             PermissionResponse::Cancelled
         }
+        /// Hold the exact child's policy independently from its parent's foreground collection.
+        async fn before_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            _: &TurnAddress,
+        ) -> Result<(), ProviderError> {
+            self.before_tool(parent).await
+        }
+
         /// Hold an admitted callback until revocation has crossed its effect boundary.
         async fn before_tool(
             &self,
@@ -4920,7 +5557,7 @@ mod callback_tests {
     async fn callback_revocation_collects_admitted_work_and_blocks_late_effects() {
         let router = Arc::new(CallbackRouter::default());
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("revocation"),
+            forge_provider_api::ThreadOwner::root("revocation"),
             "invocation",
         );
         install(&router, &scope).await;
@@ -4930,7 +5567,7 @@ mod callback_tests {
             release: Mutex::new(Some(barrier)),
         });
         router.install(callbacks).await.unwrap();
-        router.bind_native_call("held", &scope).await;
+        router.bind_native_call("held", &scope).await.unwrap();
         let callback = router.call_native(
             "held",
             ToolCall {
@@ -4952,6 +5589,56 @@ mod callback_tests {
             "revocation allowed a tool effect after its barrier resumed"
         );
         collecting.await;
+    }
+
+    /// Collect foreground callbacks without waiting for an independently registered child's policy.
+    #[tokio::test]
+    async fn foreground_collection_preserves_pending_independent_child_callback() {
+        let router = CallbackRouter::default();
+        let parent = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("child-collection"),
+            "parent",
+        );
+        install(&router, &parent).await;
+        let (release, barrier) = tokio::sync::oneshot::channel();
+        let mut callbacks = router.callbacks(&parent).await.unwrap();
+        callbacks.permissions = Arc::new(PausedBarrier {
+            release: Mutex::new(Some(barrier)),
+        });
+        router.install(callbacks).await.unwrap();
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::new(
+                parent.owner.session_id().clone(),
+                forge_provider_api::agent::AgentId::new("child").unwrap(),
+            )
+            .unwrap(),
+            parent.exchange_id.clone(),
+        );
+        let child = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
+        router
+            .observe_native_child(&parent, child.clone(), false)
+            .await
+            .unwrap();
+        router
+            .bind_observed_native_call("child-call", &parent, child)
+            .await
+            .unwrap();
+        let callback = router.before_tool_native(Some("child-call"));
+        tokio::pin!(callback);
+        assert!(futures_util::poll!(callback.as_mut()).is_pending());
+        assert_eq!(router.running_callbacks.load(Ordering::Acquire), 1);
+        assert_eq!(router.foreground_callbacks.load(Ordering::Acquire), 0);
+        router.revoke();
+        router.collect_foreground_callbacks().await;
+        release.send(()).unwrap();
+        callback
+            .await
+            .expect("foreground retirement retains exact child policy");
+        assert_eq!(router.running_callbacks.load(Ordering::Acquire), 0);
     }
 
     /// Hide generated MCP prefixes without confusing them with real prefixed tool names.
@@ -5013,16 +5700,16 @@ mod recovery_receipt_tests {
 
     #[test]
     fn prior_receipts_reserve_only_other_submissions_in_the_same_session() {
-        let owner = forge_provider_api::ExecutionOwner::root("recovery-owner");
+        let owner = forge_provider_api::ThreadOwner::root("recovery-owner");
         let current_attempt =
             forge_provider_api::DeliveryAttemptId::new("current-attempt").unwrap();
         let current =
             forge_provider_api::SubmissionId::try_from("current-submission".to_owned()).unwrap();
         let prior =
             forge_provider_api::SubmissionId::try_from("prior-submission".to_owned()).unwrap();
-        let other_owner = forge_provider_api::ExecutionOwner::root("other-owner");
+        let other_owner = forge_provider_api::ThreadOwner::root("other-owner");
         let receipt = |submission_id: forge_provider_api::SubmissionId,
-                       owner: forge_provider_api::ExecutionOwner,
+                       owner: forge_provider_api::ThreadOwner,
                        session: &str,
                        message: &str| {
             super::super::prompt::accepted_recovery_token(
@@ -5206,20 +5893,99 @@ mod retained_recovery_tests {
         }
     }
 
-    fn queued_request(
+    struct AcceptedReceipt {
+        id: forge_provider_api::SubmissionId,
+        attempt: forge_provider_api::DeliveryAttemptId,
+        accepted: AtomicU64,
+    }
+
+    #[async_trait]
+    impl forge_provider_api::submission::InputReceipt for AcceptedReceipt {
+        fn id(&self) -> &forge_provider_api::SubmissionId {
+            &self.id
+        }
+        fn attempt_id(&self) -> Result<forge_provider_api::DeliveryAttemptId, ProviderError> {
+            Ok(self.attempt.clone())
+        }
+        async fn record_sending(
+            self: Arc<Self>,
+            _: Option<RecoveryToken>,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn record_accepted(
+            self: Arc<Self>,
+            _: Option<RecoveryToken>,
+        ) -> Result<(), ProviderError> {
+            self.accepted.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        async fn record_rejected(
+            self: Arc<Self>,
+            error: ProviderError,
+        ) -> Result<(), ProviderError> {
+            Err(error)
+        }
+        async fn record_failure(
+            self: Arc<Self>,
+            error: ProviderError,
+        ) -> Result<(), ProviderError> {
+            Err(error)
+        }
+    }
+
+    struct RejectedPreparation;
+
+    #[async_trait]
+    impl TurnControl for RejectedPreparation {
+        async fn before_send(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+        async fn receive(
+            &self,
+            scope: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            super::callback_tests::Authority.receive(scope).await
+        }
+        async fn close(
+            &self,
+            scope: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            super::callback_tests::Authority.close(scope).await
+        }
+        async fn status(
+            &self,
+            scope: &forge_provider_api::InvocationScope,
+        ) -> Result<HostTurnStatus, ProviderError> {
+            super::callback_tests::Authority.status(scope).await
+        }
+        fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
+            false
+        }
+    }
+
+    fn queued_request<R: forge_provider_api::submission::InputReceipt + 'static>(
         binding: &BindingId,
         scope: forge_provider_api::InvocationScope,
         configuration: SessionConfiguration,
-        receipt: Arc<QueuedReceipt>,
+        receipt: Arc<R>,
     ) -> PromptRequest {
         let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
             binding.clone(),
             scope.clone(),
-            receipt.id.clone(),
-            receipt.attempt.clone(),
+            receipt.id().clone(),
+            receipt.attempt_id().unwrap(),
         );
         let authority = Arc::new(super::callback_tests::Authority);
         PromptRequest {
+            thread_id: (scope).owner.thread_id(),
+            turn_id: (scope)
+                .turn_id()
+                .expect("admitted scope has a nonempty host turn identity"),
+
             scope,
             mode: forge_provider_api::PromptMode::Chat,
             configuration: forge_provider_api::session::InvocationConfiguration {
@@ -5231,8 +5997,8 @@ mod retained_recovery_tests {
             tools: Vec::new(),
             tool_endpoint: None,
             resource_lease: None,
-            submission_id: receipt.id.clone(),
-            attempt_id: receipt.attempt.clone(),
+            submission_id: receipt.id().clone(),
+            attempt_id: receipt.attempt_id().unwrap(),
             input: forge_provider_api::PromptInput::Text("never dispatch".into()),
             dispatch,
             recovered_inputs: Vec::new(),
@@ -5274,7 +6040,7 @@ mod retained_recovery_tests {
     async fn input_preconditions_report_exact_admission_causes_before_dispatch() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::InputSubmit).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnStart).await.unwrap();
             let configuration = state.request.lock().await.configuration.clone();
             for index in 0..7 {
                 let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), format!("precondition-{index}"));
@@ -5283,7 +6049,7 @@ mod retained_recovery_tests {
                 let expected = match index {
                     0 => { state.closing.store(true, Ordering::Release); ProviderFailureKind::BindingClosed }
                     1 => { state.unsafe_history.store(true, Ordering::Release); ProviderFailureKind::BindingInvalidated }
-                    2 => { request.scope.owner = forge_provider_api::ExecutionOwner::root("foreign"); ProviderFailureKind::WrongInvocation }
+                    2 => { request.scope.owner = forge_provider_api::ThreadOwner::root("foreign"); ProviderFailureKind::WrongInvocation }
                     3 => { request.submission_id = forge_provider_api::SubmissionId::try_from("different-input").unwrap(); ProviderFailureKind::WrongInvocation }
                     4 => { request.attempt_id = forge_provider_api::DeliveryAttemptId::new("different-attempt").unwrap(); ProviderFailureKind::WrongInvocation }
                     5 => {
@@ -5296,31 +6062,31 @@ mod retained_recovery_tests {
                     }
                     _ => unreachable!("all fixture preconditions are enumerated"),
                 };
-                assert_admission_failure(provider.input_submit(context(&format!("submit-precondition-{index}")), &opened.binding.id, request).await, ProviderOperation::InputSubmit, expected);
+                assert_admission_failure(provider.turn_start(context(&format!("submit-precondition-{index}")), &opened.binding.id, request).await, ProviderOperation::TurnStart, expected);
                 assert_eq!(receipt.sending.load(Ordering::Acquire), 0);
                 state.closing.store(false, Ordering::Release); state.unsafe_history.store(false, Ordering::Release);
                 if let Some(active) = state.active.lock().await.take() { active.task.abort(); let _ = active.task.await; }
             }
             let steering = SteeringRequest { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "inactive"), delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("never steer".into()), attachments: Vec::new(), task: None };
-            assert!(matches!(provider.input_steer(context("inactive-steer"), &opened.binding.id, steering.clone()).await, Err(ProviderError::NotConsumed)));
+            assert!(matches!(provider.turn_steer(context("inactive-steer"), &opened.binding.id, steering.clone()).await, Err(ProviderError::NotConsumed)));
             state.closing.store(true, Ordering::Release);
-            assert_admission_failure(provider.input_steer(context("closed-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::InputSteer, ProviderFailureKind::BindingClosed);
+            assert_admission_failure(provider.turn_steer(context("closed-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingClosed);
             state.closing.store(false, Ordering::Release); state.unsafe_history.store(true, Ordering::Release);
-            assert_admission_failure(provider.input_steer(context("invalid-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::InputSteer, ProviderFailureKind::BindingInvalidated);
+            assert_admission_failure(provider.turn_steer(context("invalid-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingInvalidated);
             state.unsafe_history.store(false, Ordering::Release);
-            let mut foreign = steering.clone(); foreign.scope.owner = forge_provider_api::ExecutionOwner::root("foreign");
-            assert_admission_failure(provider.input_steer(context("foreign-steer"), &opened.binding.id, foreign).await, ProviderOperation::InputSteer, ProviderFailureKind::WrongInvocation);
+            let mut foreign = steering.clone(); foreign.scope.owner = forge_provider_api::ThreadOwner::root("foreign");
+            assert_admission_failure(provider.turn_steer(context("foreign-steer"), &opened.binding.id, foreign).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
             *state.active.lock().await = Some(ActiveExecution { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "other-active"), task: tokio::spawn(std::future::pending::<Result<(), ProviderError>>()) });
-            assert_admission_failure(provider.input_steer(context("wrong-scope-steer"), &opened.binding.id, steering).await, ProviderOperation::InputSteer, ProviderFailureKind::WrongInvocation);
+            assert_admission_failure(provider.turn_steer(context("wrong-scope-steer"), &opened.binding.id, steering).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
             if let Some(active) = state.active.lock().await.take() { active.task.abort(); let _ = active.task.await; }
-            provider.session_close(context("precondition-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("precondition-close"), &opened.binding.id).await.unwrap();
             let closed_scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "collected");
             let closed_receipt = Arc::new(QueuedReceipt { id: forge_provider_api::SubmissionId::try_from("closed-input").unwrap(), attempt: forge_provider_api::DeliveryAttemptId::new("closed-attempt").unwrap(), sending: AtomicU64::new(0) });
             let closed_prompt = queued_request(&opened.binding.id, closed_scope.clone(), configuration.clone(), closed_receipt.clone());
             let closed_steer = SteeringRequest { scope: closed_scope, delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("cannot reopen".into()), attachments: Vec::new(), task: None };
-            let late_submit = provider.input_submit(context("collected-submit"), &opened.binding.id, closed_prompt).await.expect_err("collected binding admitted input");
-            let late_steer = provider.input_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.expect_err("collected binding admitted steering");
-            for (operation, cause) in [(ProviderOperation::InputSubmit, late_submit), (ProviderOperation::InputSteer, late_steer)] {
+            let late_submit = provider.turn_start(context("collected-submit"), &opened.binding.id, closed_prompt).await.expect_err("collected binding admitted input");
+            let late_steer = provider.turn_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.expect_err("collected binding admitted steering");
+            for (operation, cause) in [(ProviderOperation::TurnStart, late_submit), (ProviderOperation::TurnSteer, late_steer)] {
                 assert!(matches!(cause, ProviderError::Failure(error) if error.operation() == operation
                     && error.kind() == ProviderFailureKind::BindingClosed && error.phase() == forge_provider_api::ProviderPhase::Admission
                     && error.disposition() == forge_provider_api::FailureDisposition::Closed));
@@ -5338,7 +6104,7 @@ mod retained_recovery_tests {
     async fn cancellation_waits_for_queued_input_preparation_and_prevents_late_handoff() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::InputSubmit).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnStart).await.unwrap();
             let configuration = state.request.lock().await.configuration.clone();
             let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "queued-input");
             let receipt = Arc::new(QueuedReceipt {
@@ -5348,13 +6114,13 @@ mod retained_recovery_tests {
             let request = queued_request(&opened.binding.id, scope.clone(), configuration, receipt.clone());
             let operation = context("queued-submit");
             let admission = state.admission.lock().await;
-            let submitting = provider.input_submit(operation.clone(), &opened.binding.id, request.clone());
+            let submitting = provider.turn_start(operation.clone(), &opened.binding.id, request.clone());
             tokio::pin!(submitting);
             assert!(futures_util::poll!(submitting.as_mut()).is_pending());
-            let mut replay = Box::pin(provider.input_submit(operation, &opened.binding.id, request));
+            let mut replay = Box::pin(provider.turn_start(operation, &opened.binding.id, request));
             assert!(futures_util::poll!(replay.as_mut()).is_pending());
             drop(replay);
-            let cancelling = provider.cancel(context("queued-cancel"), &opened.binding.id, CancelRequest { scope: scope.clone() });
+            let cancelling = provider.turn_interrupt(context("queued-cancel"), &opened.binding.id, CancelRequest { scope: scope.clone() });
             tokio::pin!(cancelling);
             assert!(futures_util::poll!(cancelling.as_mut()).is_pending());
             loop {
@@ -5373,13 +6139,352 @@ mod retained_recovery_tests {
             assert_eq!(receipt.sending.load(Ordering::Acquire), 0);
             assert!(!state.closing.load(Ordering::Acquire));
             let successor = provider.pending_inputs.register(&opened.binding.id, &forge_provider_api::InvocationScope::new(state.owner.clone(), "queued-input"), context("successor").id());
-            successor.check_admission(ProviderOperation::InputSubmit).unwrap(); drop(successor);
-            provider.session_close(context("queued-close"), &opened.binding.id).await.unwrap();
+            successor.check_admission(ProviderOperation::TurnStart).unwrap(); drop(successor);
+            provider.thread_close(context("queued-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("queued-shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert!(!requests.iter().any(|request| matches!(request["method"].as_str(), Some("session.send" | "session.abort"))));
             assert_eq!(requests.iter().filter(|request| request["method"] == "models.list").count(), 1, "prevented preparation entered native model admission");
         }).await.expect("queued Copilot cancellation fixture timed out");
+    }
+
+    /// A collected preparation error keeps nonconsumption proof without inventing native completion.
+    #[tokio::test]
+    async fn preparation_cancellation_retains_operation_error_and_reusable_binding() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
+            let binding = opened.binding.id;
+            let mut events = opened.events;
+            let state = provider.binding(&binding, ProviderOperation::TurnStart).await.unwrap();
+            for ordinal in 0..2 {
+                let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), format!("preparation-{ordinal}"));
+                let receipt = Arc::new(QueuedReceipt {
+                    id: format!("input-{ordinal}").try_into().unwrap(),
+                    attempt: forge_provider_api::DeliveryAttemptId::new(format!("attempt-{ordinal}")).unwrap(), sending: AtomicU64::new(0),
+                });
+                let mut request = queued_request(&binding, scope.clone(), state.request.lock().await.configuration.clone(), receipt.clone());
+                request.turn_control = Arc::new(RejectedPreparation);
+                let result = provider.turn_start(context(&format!("submit-{ordinal}")), &binding, request).await;
+                assert!(matches!(result, Err(ProviderError::Cancelled)), "unexpected preparation result: {result:?}");
+                assert!(matches!(state.collect_execution().await.unwrap(), Some(Ok(()))));
+                assert!(matches!(state.settlements.lock().await.get(&scope), Some(Err(ProviderError::Cancelled))));
+                assert!(!state.closing.load(Ordering::Acquire));
+                assert_eq!(receipt.sending.load(Ordering::Acquire), 0);
+                while let Some(event) = events.try_next().unwrap() { assert!(!matches!(event.event, ProviderEvent::Turn { .. } | ProviderEvent::Item { .. })); }
+                assert!(matches!(provider.turn_interrupt(context(&format!("cancel-{ordinal}")), &binding, CancelRequest { scope: scope.clone() }).await,
+                    Err(ProviderError::Cancelled)));
+                assert_eq!(provider.input_retract(context(&format!("retract-{ordinal}")), &binding, InputRetractRequest {
+                    scope, submission_id: receipt.id.clone(), attempt_id: receipt.attempt.clone(),
+                    boundary: forge_provider_api::CheckpointId::new("host-boundary").unwrap(),
+                    authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation,
+                }).await.unwrap(), InputRetractOutcome::NeverConsumed);
+            }
+            provider.thread_close(context("preparation-close"), &binding).await.unwrap();
+            provider.shutdown(context("preparation-shutdown")).await.unwrap();
+            let requests = peer.collected().await;
+            assert!(!requests.iter().any(|request| matches!(request["method"].as_str(), Some("session.send" | "session.abort"))));
+        }).await.expect("pre-start operation collection timed out");
+    }
+
+    /// Accepted input interrupted before positive start remains accepted without a fabricated turn.
+    #[tokio::test]
+    async fn accepted_input_aborted_before_start_preserves_receipt_without_completion() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                AbortAcknowledgement::Success,
+                None,
+                HelperBehavior::AcceptedBeforeStart,
+            )
+            .await;
+            let binding = opened.binding.id;
+            let mut events = opened.events;
+            let state = provider
+                .binding(&binding, ProviderOperation::TurnStart)
+                .await
+                .unwrap();
+            let scope = forge_provider_api::InvocationScope::new(
+                state.owner.clone(),
+                "accepted-before-start",
+            );
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "accepted-before-start".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("accepted-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(
+                &binding,
+                scope.clone(),
+                state.request.lock().await.configuration.clone(),
+                receipt.clone(),
+            );
+            assert!(matches!(
+                provider
+                    .turn_start(context("accepted-submit"), &binding, request)
+                    .await,
+                Err(ProviderError::Cancelled)
+            ));
+            assert!(matches!(
+                state.collect_execution().await.unwrap(),
+                Some(Ok(()))
+            ));
+            assert_eq!(receipt.accepted.load(Ordering::Acquire), 1);
+            assert!(!state.unconsumed.lock().await.contains(&receipt.id));
+            assert!(!state.closing.load(Ordering::Acquire));
+            assert!(matches!(
+                state.settlements.lock().await.get(&scope),
+                Some(Err(ProviderError::Cancelled))
+            ));
+            while let Some(event) = events.try_next().unwrap() {
+                assert!(!matches!(
+                    event.event,
+                    ProviderEvent::Turn { .. } | ProviderEvent::Item { .. }
+                ));
+            }
+            assert!(matches!(
+                provider
+                    .turn_interrupt(
+                        context("accepted-cancel"),
+                        &binding,
+                        CancelRequest { scope }
+                    )
+                    .await,
+                Err(ProviderError::Cancelled)
+            ));
+            provider
+                .thread_close(context("accepted-close"), &binding)
+                .await
+                .unwrap();
+            provider
+                .shutdown(context("accepted-shutdown"))
+                .await
+                .unwrap();
+            let requests = peer.collected().await;
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "session.send")
+                    .count(),
+                1
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request["method"] == "session.abort")
+            );
+        })
+        .await
+        .expect("accepted pre-start interruption timed out");
+    }
+
+    /// A native terminal result waits for admitted callbacks before any root completion is published.
+    #[tokio::test]
+    async fn root_completion_waits_for_callback_collection_and_survives_dropped_waiter() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                AbortAcknowledgement::Success,
+                None,
+                HelperBehavior::CompleteTurn,
+            )
+            .await;
+            let binding = opened.binding.id;
+            let mut events = opened.events;
+            let state = provider
+                .binding(&binding, ProviderOperation::TurnStart)
+                .await
+                .unwrap();
+            let admitted_callback = state.callbacks.begin_callback().unwrap();
+            let scope =
+                forge_provider_api::InvocationScope::new(state.owner.clone(), "collected-root");
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "collected-input".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("collected-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(
+                &binding,
+                scope.clone(),
+                state.request.lock().await.configuration.clone(),
+                receipt.clone(),
+            );
+            provider
+                .turn_start(context("collected-submit"), &binding, request)
+                .await
+                .unwrap();
+            while !matches!(
+                *state.callbacks.revoked.lock().unwrap(),
+                CallbackAdmission::Settled
+            ) {
+                tokio::task::yield_now().await;
+            }
+            assert!(!state.settlements.lock().await.contains_key(&scope));
+            while let Some(event) = events.try_next().unwrap() {
+                assert!(!matches!(
+                    &event.event,
+                    ProviderEvent::Turn {
+                        event: forge_provider_api::TurnEvent::Completed(_),
+                        ..
+                    }
+                ));
+            }
+            let mut abandoned = Box::pin(state.collect_execution());
+            assert!(futures_util::poll!(abandoned.as_mut()).is_pending());
+            drop(abandoned);
+            let mut collecting = Box::pin(state.collect_execution());
+            assert!(futures_util::poll!(collecting.as_mut()).is_pending());
+            drop(admitted_callback);
+            assert!(matches!(collecting.await.unwrap(), Some(Ok(()))));
+            let mut turn_finished = 0;
+            while let Some(event) = events.try_next().unwrap() {
+                if let ProviderEvent::Turn {
+                    thread_id,
+                    turn_id,
+                    event: forge_provider_api::TurnEvent::Completed(completed),
+                } = &event.event
+                {
+                    assert_eq!(turn_id, &scope.turn_id().unwrap());
+                    assert_eq!(thread_id, &scope.owner.thread_id());
+                    assert!(matches!(
+                        completed.result().outcome(),
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal
+                        }
+                    ));
+                    assert_eq!(
+                        completed.result().covered_inputs(),
+                        &[forge_provider_api::CoveredInput::new(
+                            receipt.id.clone(),
+                            receipt.attempt.clone()
+                        )]
+                    );
+                    turn_finished += 1;
+                }
+            }
+            assert_eq!(turn_finished, 1);
+            let interruption = provider
+                .turn_interrupt(
+                    context("collected-late-cancel"),
+                    &binding,
+                    CancelRequest {
+                        scope: scope.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(interruption.turn_id, scope.turn_id().unwrap());
+            provider
+                .thread_close(context("collected-close"), &binding)
+                .await
+                .unwrap();
+            provider
+                .shutdown(context("collected-shutdown"))
+                .await
+                .unwrap();
+            assert!(
+                !peer
+                    .collected()
+                    .await
+                    .iter()
+                    .any(|request| request["method"] == "session.abort")
+            );
+        })
+        .await
+        .expect("root collection boundary timed out");
+    }
+
+    /// Collect an actual child only from its own native end and callbacks while a successor is live.
+    #[tokio::test]
+    async fn native_child_retains_own_turn_across_parent_collection_and_successor() {
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)), None,
+                AbortAcknowledgement::Success, None, HelperBehavior::IndependentChild).await;
+            let binding = opened.binding.id;
+            let mut events = opened.events;
+            let state = provider.binding(&binding, ProviderOperation::TurnStart).await.unwrap();
+            let original = forge_provider_api::InvocationScope::new(state.owner.clone(), "original-parent");
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "original-input".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("original-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(&binding, original.clone(), state.request.lock().await.configuration.clone(), receipt);
+            provider.turn_start(context("original-submit"), &binding, request).await.unwrap();
+            state.collect_execution().await.unwrap().unwrap().unwrap();
+            let mut child_address = None;
+            let mut parent_complete = false;
+            while let Some(bound) = events.try_next().unwrap() {
+                if let ProviderEvent::Turn { thread_id, turn_id, event } = bound.event {
+                    match event {
+                        forge_provider_api::TurnEvent::Started(_) if thread_id != original.owner.thread_id() => {
+                            let scope = state.callbacks.observed_agents.read().await.keys().find(|scope| scope.owner.thread_id() == thread_id).unwrap().clone();
+                            child_address = Some(TurnAddress { scope, thread_id, turn_id });
+                        }
+                        forge_provider_api::TurnEvent::Completed(_) => {
+                            assert_eq!(turn_id, original.turn_id().unwrap(), "child completed before native terminal");
+                            parent_complete = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(parent_complete);
+            let child = child_address.expect("positive child processing publishes its own Started");
+            let resources = state.callbacks.native_child_resources(&child).await.unwrap();
+            let held_callback = resources.callbacks.clone().read_owned().await;
+            let successor = forge_provider_api::InvocationScope::new(state.owner.clone(), "successor-parent");
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "successor-input".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("successor-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(&binding, successor.clone(), state.request.lock().await.configuration.clone(), receipt);
+            provider.turn_start(context("successor-submit"), &binding, request).await.unwrap();
+            let native_id = state.session.read().await.id().to_owned();
+            let notification = |id: &str, parent: &str, kind: &str, agent: Option<&str>, data: Value| json!({
+                "jsonrpc":"2.0","method":"session.event","params":{"sessionId":native_id,"event":{
+                    "id":id,"parentId":parent,"agentId":agent,"type":kind,"timestamp":"2026-11-05T00:00:01Z","data":data}}});
+            peer.notify(notification("child-final", "child-partial", "assistant.message", Some("native-child"),
+                json!({"messageId":"child-message","content":"child final","phase":"final_answer"}))).await;
+            peer.notify(notification("child-call-end", "child-final", "assistant.turn_end", Some("native-child"), json!({"turnId":"0"}))).await;
+            peer.notify(notification("child-terminal", "child-call-end", "subagent.completed", Some("native-child"), json!({}))).await;
+            resources.revoked.cancelled().await;
+            let mut original_child_item = false;
+            while let Some(bound) = events.try_next().unwrap() {
+                match bound.event {
+                    ProviderEvent::Item { thread_id, turn_id, event: forge_provider_api::ItemEvent::Completed(forge_provider_api::ItemCompletion::AgentMessage(message)), .. } => {
+                        assert_eq!(thread_id, child.thread_id);
+                        assert_eq!(turn_id, child.turn_id);
+                        assert_eq!(message.text, "child final");
+                        original_child_item = true;
+                    }
+                    ProviderEvent::Turn { event: forge_provider_api::TurnEvent::Completed(_), .. } => panic!("child completed before callback collection"),
+                    _ => {}
+                }
+            }
+            assert!(original_child_item);
+            drop(held_callback);
+            loop {
+                let bound = events.recv().await.unwrap().unwrap();
+                if let ProviderEvent::Turn { thread_id, turn_id, event: forge_provider_api::TurnEvent::Completed(completed) } = bound.event {
+                    assert_eq!(thread_id, child.thread_id);
+                    assert_eq!(turn_id, child.turn_id);
+                    assert!(matches!(completed.result().outcome(), forge_provider_api::turn::TurnOutcome::Completed { .. }));
+                    break;
+                }
+            }
+            assert!(state.active.lock().await.as_ref().is_some_and(|active| !active.task.is_finished()), "child completion ended its successor");
+            peer.notify(notification("successor-answer", "root-start-1", "assistant.message", None, json!({"messageId":"successor-message","content":"successor final","phase":"final_answer"}))).await;
+            peer.notify(notification("successor-end", "successor-answer", "assistant.turn_end", None, json!({"turnId":"0"}))).await;
+            peer.notify(notification("successor-idle", "successor-end", "session.idle", None, json!({}))).await;
+            state.collect_execution().await.unwrap().unwrap().unwrap();
+            provider.thread_close(context("independent-close"), &binding).await.unwrap();
+            provider.shutdown(context("independent-shutdown")).await.unwrap();
+            assert!(!peer.collected().await.iter().any(|request| request["method"] == "session.abort"));
+        }).await.expect("independent native child lifecycle timed out");
     }
 
     /// Failed binding keeps its allocated profile and independent cleanup failure owned until shutdown.
@@ -5395,7 +6500,7 @@ mod retained_recovery_tests {
             &provider.profiles,
             root.path(),
             None,
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             |profile| {
                 assert_eq!(
                     provider.profiles.lock().unwrap().len(),
@@ -5472,10 +6577,12 @@ mod retained_recovery_tests {
             let client = provider.runtime.client(".").await.unwrap();
             assert!(client.models().await.unwrap().is_empty());
             let result = provider
-                .session_open(
+                .thread_open(
                     context("empty-native-default"),
                     SessionRequest {
-                        owner: forge_provider_api::ExecutionOwner::root("empty-native-default"),
+                        thread_id: (forge_provider_api::ThreadOwner::root("empty-native-default"))
+                            .thread_id(),
+                        owner: forge_provider_api::ThreadOwner::root("empty-native-default"),
                         mode: forge_provider_api::SessionMode::Interactive,
                         workspace: root.path().to_string_lossy().into_owned(),
                         history: SessionHistory::Durable { resume: None },
@@ -5554,8 +6661,9 @@ mod retained_recovery_tests {
             let root = tempfile::tempdir().unwrap();
             let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
             provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
-            let opened = provider.session_open(context("persistent-background"), SessionRequest {
-                owner: forge_provider_api::ExecutionOwner::root("persistent-background"), mode: forge_provider_api::SessionMode::Background,
+            let opened = provider.thread_open(context("persistent-background"), SessionRequest {
+                thread_id: (forge_provider_api::ThreadOwner::root("persistent-background")).thread_id(),
+owner: forge_provider_api::ThreadOwner::root("persistent-background"), mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
                 configuration: SessionConfiguration { model: ModelSelection::default(),
                     access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
@@ -5565,11 +6673,67 @@ mod retained_recovery_tests {
                 }], tool_endpoint: None, system_instructions: "background instructions".into(), trace: Arc::new(NullTrace),
             }).await.unwrap();
             assert!(opened.binding.provider_session_id.is_some());
-            provider.session_close(context("persistent-background-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("persistent-background-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("persistent-background-shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 1);
         }).await.expect("persistent background fixture timed out");
+    }
+
+    /// A selected MCP server that never finishes starting cannot hold the binding open.
+    ///
+    /// The fixture never answers `session.mcp.listTools`, as Copilot behaves while a server is
+    /// still starting. Opening succeeds without asking for the server's tools.
+    #[tokio::test]
+    async fn binding_opens_while_a_selected_mcp_server_is_still_starting() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (reader, writer, peer) = super::super::test_peer::streams(|request| {
+                let result = match request["method"].as_str().unwrap() {
+                    "status.get" => json!({"version":"1.0.103"}),
+                    "models.list" => json!({"models":[{"id":"auto","name":"Auto","capabilities":{}}]}),
+                    "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
+                    "session.skills.list" => json!({"skills":[]}),
+                    "session.skills.reload" | "session.tasks.refresh" | "session.mcp.reload"
+                    | "session.mcp.reloadWithConfig" => json!({}),
+                    "session.tasks.list" => json!({"tasks":[]}),
+                    "session.mcp.listTools" => return Vec::new(),
+                    "session.create" => {
+                        json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                    }
+                    "session.options.update" => json!({"success":true}),
+                    "session.detach" => json!({"success":true}),
+                    _ => json!({}),
+                };
+                vec![super::super::test_peer::response(request, result)]
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
+            provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
+            let owner = forge_provider_api::ThreadOwner::root("starting-mcp");
+            let opened = provider.thread_open(context("starting-mcp"), SessionRequest {
+                thread_id: owner.thread_id(), owner, mode: forge_provider_api::SessionMode::Background,
+                workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
+                configuration: SessionConfiguration { model: ModelSelection::default(),
+                    access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
+                    approval: forge_provider_api::approval::ApprovalMode::Ask,
+                    resources: forge_provider_api::ResourceSelection {
+                        skills: Vec::new(),
+                        mcp: vec![forge_provider_api::McpLaunch {
+                            name: "slow".into(),
+                            transport: forge_provider_api::McpTransport::Stdio {
+                                command: "slow-server".into(), arguments: Vec::new(), environment: Default::default(),
+                            },
+                            timeout: None, working_directory: None,
+                            tools: Some(forge_provider_api::McpToolSelection::All),
+                        }],
+                    } },
+                resource_lease: None, tools: Vec::new(), tool_endpoint: None,
+                system_instructions: String::new(), trace: Arc::new(NullTrace),
+            }).await.expect("a starting MCP server must not fail the binding");
+            provider.thread_close(context("starting-mcp-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("starting-mcp-shutdown")).await.unwrap();
+            assert!(peer.collected().await.iter().all(|request| request["method"] != "session.mcp.listTools"));
+        }).await.expect("opening waited on a starting MCP server");
     }
 
     /// Shared text generation's sandbox request is enforced by zero native authority, not tool sandbox support.
@@ -5612,15 +6776,16 @@ mod retained_recovery_tests {
                 ..Default::default()
             };
             assert!(provider.descriptor().capability.validate_access(&access).is_err(), "fixture must exercise the ordinary native-tool sandbox restriction");
-            let opened = provider.session_open(context("shared-isolated-open"), SessionRequest {
-                owner: forge_provider_api::ExecutionOwner::root("shared-isolated"), mode: forge_provider_api::SessionMode::Background,
+            let opened = provider.thread_open(context("shared-isolated-open"), SessionRequest {
+                thread_id: (forge_provider_api::ThreadOwner::root("shared-isolated")).thread_id(),
+owner: forge_provider_api::ThreadOwner::root("shared-isolated"), mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                 configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: Default::default() },
                 resource_lease: None, tools: Vec::new(), tool_endpoint: None,
                 system_instructions: "Generate isolated text".into(), trace: Arc::new(NullTrace),
             }).await.unwrap();
             assert!(opened.binding.provider_session_id.is_none());
-            provider.session_close(context("shared-isolated-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("shared-isolated-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("shared-isolated-shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 1);
@@ -5663,8 +6828,9 @@ mod retained_recovery_tests {
                 let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
                 provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
                 let access = forge_provider_api::access::AccessPolicy { write_access: forge_provider_api::access::WriteScope::Off, ..Default::default() };
-                let result = provider.session_open(context("isolated-open"), SessionRequest {
-                    owner: forge_provider_api::ExecutionOwner::root("isolated-confirmation"), mode: forge_provider_api::SessionMode::Background,
+                let result = provider.thread_open(context("isolated-open"), SessionRequest {
+                    thread_id: (forge_provider_api::ThreadOwner::root("isolated-confirmation")).thread_id(),
+owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: forge_provider_api::SessionMode::Background,
                     workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                     configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: forge_provider_api::ResourceSelection::default() },
                     resource_lease: None, tools: Vec::new(), tool_endpoint: None, system_instructions: String::new(), trace: Arc::new(NullTrace),
@@ -5690,6 +6856,9 @@ mod retained_recovery_tests {
 
     #[derive(Clone, Copy)]
     enum HelperBehavior {
+        CompleteTurn,
+        IndependentChild,
+        AcceptedBeforeStart,
         PauseRejected,
         ModelApplied,
         ModelDeferred,
@@ -5739,6 +6908,7 @@ mod retained_recovery_tests {
         let mut held_terminal = None;
         let mut helper_ids = HashSet::new();
         let mut helper_tasks = Vec::<Value>::new();
+        let mut independent_sends = 0;
         let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
             let result = match request["method"].as_str().unwrap() {
                 "status.get" => json!({"version":"1.0.103"}),
@@ -5761,6 +6931,96 @@ mod retained_recovery_tests {
                             .insert(request["params"]["sessionId"].as_str().unwrap().to_owned());
                     }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                }
+                "session.send" if matches!(helper_behavior, HelperBehavior::IndependentChild) => {
+                    let ordinal = independent_sends;
+                    independent_sends += 1;
+                    let notification = |id: String,
+                                        parent: Value,
+                                        kind: &str,
+                                        agent: Option<&str>,
+                                        data: Value| {
+                        json!({"jsonrpc":"2.0","method":"session.event",
+                            "params":{"sessionId":request["params"]["sessionId"],"event":{
+                                "id":id,"parentId":parent,"agentId":agent,"type":kind,
+                                "timestamp":"2026-11-05T00:00:00Z","data":data}}})
+                    };
+                    let mut frames = vec![
+                        super::super::test_peer::response(
+                            request,
+                            json!({"messageId":format!("input-{ordinal}")}),
+                        ),
+                        notification(
+                            format!("user-{ordinal}"),
+                            Value::Null,
+                            "user.message",
+                            None,
+                            json!({"messageId":format!("input-{ordinal}"),"turnId":"0"}),
+                        ),
+                        notification(
+                            format!("root-start-{ordinal}"),
+                            json!(format!("user-{ordinal}")),
+                            "assistant.turn_start",
+                            None,
+                            json!({"turnId":"0"}),
+                        ),
+                    ];
+                    if ordinal == 0 {
+                        frames.extend([
+                            notification("delegate-child".into(), json!("root-start-0"), "subagent.started", None, json!({"agentId":"native-child"})),
+                            notification("child-start".into(), json!("delegate-child"), "assistant.turn_start", Some("native-child"), json!({"turnId":"0"})),
+                            notification("child-partial".into(), json!("child-start"), "assistant.message_delta", Some("native-child"), json!({"messageId":"child-message","deltaContent":"child partial"})),
+                            notification("root-answer-0".into(), json!("root-start-0"), "assistant.message", None, json!({"messageId":"root-answer","content":"parent complete","phase":"final_answer"})),
+                            notification("root-end-0".into(), json!("root-answer-0"), "assistant.turn_end", None, json!({"turnId":"0"})),
+                            notification("root-idle-0".into(), json!("root-end-0"), "session.idle", None, json!({})),
+                        ]);
+                    }
+                    return frames;
+                }
+                "session.send"
+                    if matches!(
+                        helper_behavior,
+                        HelperBehavior::AcceptedBeforeStart | HelperBehavior::CompleteTurn
+                    ) =>
+                {
+                    let notification = |id, parent, kind, data| {
+                        json!({"jsonrpc":"2.0","method":"session.event",
+                        "params":{"sessionId":request["params"]["sessionId"],"event":{"id":id,"parentId":parent,
+                            "type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data}}})
+                    };
+                    let mut frames = vec![
+                        super::super::test_peer::response(
+                            request,
+                            json!({"messageId":"accepted-input"}),
+                        ),
+                        notification(
+                            "accepted-user",
+                            Value::Null,
+                            "user.message",
+                            json!({"messageId":"accepted-input","turnId":"0"}),
+                        ),
+                    ];
+                    if matches!(helper_behavior, HelperBehavior::CompleteTurn) {
+                        frames.extend([
+                            notification("native-start", json!("accepted-user"), "assistant.turn_start", json!({"turnId":"0"})),
+                            notification("native-answer", json!("native-start"), "assistant.message", json!({"messageId":"answer", "content":"Native answer", "phase":"final_answer"})),
+                            notification("native-end", json!("native-answer"), "assistant.turn_end", json!({"turnId":"0"})),
+                            notification("native-idle", json!("native-end"), "session.idle", json!({})),
+                        ]);
+                    } else {
+                        frames.push(notification(
+                            "aborted-idle",
+                            json!("accepted-user"),
+                            "session.idle",
+                            json!({"aborted":true}),
+                        ));
+                    }
+                    return frames;
+                }
+                "session.plan.readSqlTodosWithDependencies" => json!({"rows":[],"dependencies":[]}),
+                "session.eventLog.tail" => json!({"cursor":"before-input"}),
+                "session.eventLog.read" => {
+                    json!({"cursor":"anchor", "cursorStatus":"ok", "hasMore":false, "events":[]})
                 }
                 "session.skills.reload" => json!({}),
                 "session.options.update" | "session.detach" => json!({"success":true}),
@@ -5856,10 +7116,12 @@ mod retained_recovery_tests {
             ..Default::default()
         };
         let opened = provider
-            .session_open(
+            .thread_open(
                 context("open"),
                 SessionRequest {
-                    owner: forge_provider_api::ExecutionOwner::root("lifecycle-fixture"),
+                    thread_id: (forge_provider_api::ThreadOwner::root("lifecycle-fixture"))
+                        .thread_id(),
+                    owner: forge_provider_api::ThreadOwner::root("lifecycle-fixture"),
                     mode: forge_provider_api::SessionMode::Interactive,
                     workspace: root.path().to_string_lossy().into_owned(),
                     history: SessionHistory::Durable { resume: None },
@@ -5886,20 +7148,20 @@ mod retained_recovery_tests {
     async fn terminal_list_preserves_failed_helper_startup() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::InputSubmit).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnStart).await.unwrap();
             let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "helper-startup");
             let authority = Arc::new(super::callback_tests::Authority);
             state.callbacks.install(InvocationCallbacks {
                 scope: scope.clone(), generation: 0, permissions: authority.clone(), tools: authority.clone(), control: authority,
                 allowed_tools: HashSet::new(), _resource_lease: None, session_directory: None,
             }).await.unwrap();
-            state.callbacks.bind_native_call("helper-startup-call", &scope).await;
+            state.callbacks.bind_native_call("helper-startup-call", &scope).await.unwrap();
             let shell = state.callbacks.shell().unwrap();
             let tool = if cfg!(windows) { super::super::shell_tools::ShellTool::PowerShell } else { super::super::shell_tools::ShellTool::Bash };
             assert!(shell.execute("helper-startup-call", tool, json!({"command":"fixture", "description":"fixture"})).await.is_err());
             assert!(matches!(provider.terminal_list(context("failed-helper-inventory"), &opened.binding.id).await,
                 Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::Protocol));
-            provider.session_close(context("failed-helper-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("failed-helper-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("failed-helper-shutdown")).await.unwrap();
             peer.collected().await;
         }).await.expect("failed helper inventory fixture timed out");
@@ -5910,14 +7172,14 @@ mod retained_recovery_tests {
     async fn model_configuration_preserves_running_helper_and_rejects_resource_replacement() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelApplied).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
             let shell = running_configuration_helper(&state).await;
             let before = shell.snapshot().await.unwrap();
             assert_eq!(before.terminal.len(), 1);
             let main = state.session.read().await.clone();
             let mut desired = state.request.lock().await.configuration.clone();
             desired.model.model = Some("alternate".into());
-            provider.session_configure(context("model-with-running-helper"), &opened.binding.id, desired.clone()).await.unwrap();
+            provider.thread_configure(context("model-with-running-helper"), &opened.binding.id, desired.clone()).await.unwrap();
             assert!(Arc::ptr_eq(&main, &*state.session.read().await));
             assert_eq!(shell.snapshot().await.unwrap(), before);
             assert_eq!(state.request.lock().await.configuration, desired);
@@ -5927,15 +7189,15 @@ mod retained_recovery_tests {
                 resource_id:None, scope:None, name:"replacement-skill".into(), description:String::new(), enabled:true,
                 user_invocable:true, path:None, source:None, argument_hint:None,
             });
-            assert!(matches!(provider.session_configure(context("resource-with-running-helper"), &opened.binding.id, incompatible).await,
+            assert!(matches!(provider.thread_configure(context("resource-with-running-helper"), &opened.binding.id, incompatible).await,
                 Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::ResourceConflict && error.disposition() == forge_provider_api::FailureDisposition::Unchanged));
             let mut invalid = desired.clone(); invalid.model.model = Some("not-in-catalog".into());
-            assert!(matches!(provider.session_configure(context("invalid-model-with-helper"), &opened.binding.id, invalid).await,
+            assert!(matches!(provider.thread_configure(context("invalid-model-with-helper"), &opened.binding.id, invalid).await,
                 Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::Rejected && error.disposition() == forge_provider_api::FailureDisposition::Unchanged));
             assert_eq!(state.request.lock().await.configuration, desired);
             assert_eq!(shell.snapshot().await.unwrap(), before);
             assert!(!state.closing.load(Ordering::Acquire));
-            provider.session_close(context("model-helper-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("model-helper-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("model-helper-shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 2);
@@ -5949,15 +7211,15 @@ mod retained_recovery_tests {
     async fn deferred_model_configuration_invalidates_without_committing_requested_model() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelDeferred).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
             let original = state.request.lock().await.configuration.clone();
             let mut desired = original.clone(); desired.model.model = Some("alternate".into());
-            assert!(matches!(provider.session_configure(context("deferred-model"), &opened.binding.id, desired).await,
+            assert!(matches!(provider.thread_configure(context("deferred-model"), &opened.binding.id, desired).await,
                 Err(ProviderError::Combined {primary, ..}) if matches!(*primary, ProviderError::Failure(error)
                     if error.kind() == ProviderFailureKind::Protocol && error.disposition() == forge_provider_api::FailureDisposition::Invalidated)));
             assert_eq!(state.request.lock().await.configuration, original);
             assert!(state.closing.load(Ordering::Acquire));
-            provider.session_close(context("deferred-close"), &opened.binding.id).await.unwrap();
+            provider.thread_close(context("deferred-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("deferred-shutdown")).await.unwrap();
             peer.collected().await;
         }).await.expect("deferred model acknowledgement fixture timed out");
@@ -5987,7 +7249,8 @@ mod retained_recovery_tests {
         state
             .callbacks
             .bind_native_call("configuration-helper-call", &scope)
-            .await;
+            .await
+            .unwrap();
         let shell = state.callbacks.shell().unwrap();
         let tool = if cfg!(windows) {
             super::super::shell_tools::ShellTool::PowerShell
@@ -6009,13 +7272,13 @@ mod retained_recovery_tests {
         )
         .await;
         let state = provider
-            .binding(&opened.binding.id, ProviderOperation::SessionOpen)
+            .binding(&opened.binding.id, ProviderOperation::ThreadOpen)
             .await
             .unwrap();
         let request = state.request.lock().await.clone();
         assert!(
-            matches!(provider.session_open(context("duplicate-owner"), request).await,
-            Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::SessionOpen
+            matches!(provider.thread_open(context("duplicate-owner"), request).await,
+            Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::ThreadOpen
                 && failure.kind() == ProviderFailureKind::ResourceConflict)
         );
         assert_eq!(
@@ -6023,7 +7286,7 @@ mod retained_recovery_tests {
             Some(&opened.binding.id)
         );
         provider
-            .session_close(context("owner-close"), &opened.binding.id)
+            .thread_close(context("owner-close"), &opened.binding.id)
             .await
             .unwrap();
         provider.shutdown(context("owner-shutdown")).await.unwrap();
@@ -6044,62 +7307,6 @@ mod retained_recovery_tests {
         );
     }
 
-    /// Both invocation collection paths publish on a real retained binding stream without poisoning it.
-    #[tokio::test]
-    async fn binding_stream_scopes_settlement_and_collection_failure_to_exact_invocations() {
-        // Terminal inventory is independently published on this same binding stream.
-        async fn next_lifecycle_event(
-            events: &mut forge_provider_api::events::ProviderEventStream,
-            binding: &BindingId,
-        ) -> forge_provider_api::BoundProviderEvent {
-            loop {
-                let event = events.recv().await.unwrap().unwrap();
-                assert_eq!(&event.binding_id, binding);
-                if !matches!(event.event, ProviderEvent::Terminals { .. }) {
-                    return event;
-                }
-            }
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (provider, mut opened, _root, peer) = opened_fixture(
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                None,
-                AbortAcknowledgement::Success,
-                None,
-            ).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::Cancel).await.unwrap();
-            let completed_scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "completed");
-            let failed_scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "failed-collection");
-            let receipt = state.publish_invocation_settlement(InvocationSettlement {
-                binding_id: state.binding.id.clone(),
-                scope: completed_scope.clone(),
-                result: forge_provider_api::ExecutionResult::Completed {
-                    completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                },
-                watermark: state.sink.watermark(),
-            }).await.unwrap();
-            let event = next_lifecycle_event(&mut opened.events, &state.binding.id).await;
-            assert_eq!(event.binding_id, state.binding.id);
-            assert_eq!(event.sequence, receipt.watermark);
-            assert!(matches!(event.event, ProviderEvent::Settled { settlement }
-                if settlement.binding_id == receipt.binding_id && settlement.watermark == receipt.watermark
-                && settlement.scope == completed_scope && matches!(settlement.result, forge_provider_api::ExecutionResult::Completed { .. })));
-            let failure = ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Timeout)
-                .at_phase(forge_provider_api::ProviderPhase::Collection, forge_provider_api::FailureDisposition::Invalidated);
-            state.publish_invocation_settlement_failure(&failed_scope, failure).await.unwrap();
-            let event = next_lifecycle_event(&mut opened.events, &state.binding.id).await;
-            assert!(matches!(event.event, ProviderEvent::SettlementFailed { scope, failure: received } if scope == failed_scope && received == failure));
-            state.sink.send_wait(ProviderEvent::CapabilitiesChanged {
-                scope: forge_provider_api::EventScope::Binding { owner: state.owner.clone() },
-                capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(provider.descriptor()),
-            }).await.unwrap();
-            assert!(matches!(next_lifecycle_event(&mut opened.events, &state.binding.id).await.event, ProviderEvent::CapabilitiesChanged { .. }));
-            provider.session_close(context("scoped-settlement-close"), &opened.binding.id).await.unwrap();
-            provider.shutdown(context("scoped-settlement-shutdown")).await.unwrap();
-            peer.collected().await;
-        }).await.expect("binding-scoped settlement fixture timed out");
-    }
-
     /// Retained foreground collection outlives the response budget without poisoning later reuse.
     #[tokio::test(start_paused = true)]
     async fn foreground_collection_retains_late_settlement_without_implicit_expiry() {
@@ -6111,7 +7318,7 @@ mod retained_recovery_tests {
         )
         .await;
         let state = provider
-            .binding(&opened.binding.id, ProviderOperation::Cancel)
+            .binding(&opened.binding.id, ProviderOperation::TurnInterrupt)
             .await
             .unwrap();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -6132,7 +7339,7 @@ mod retained_recovery_tests {
         assert!(matches!(collecting.await, Ok(Some(Ok(())))));
         assert!(state.active.lock().await.is_none());
         provider
-            .session_close(context("late-close"), &opened.binding.id)
+            .thread_close(context("late-close"), &opened.binding.id)
             .await
             .unwrap();
         provider.shutdown(context("late-shutdown")).await.unwrap();
@@ -6147,7 +7354,7 @@ mod retained_recovery_tests {
             let (provider, opened, _root, peer) =
                 opened_fixture(shells.clone(), None, AbortAcknowledgement::Success, None).await;
             let state = provider
-                .binding(&opened.binding.id, ProviderOperation::SessionClose)
+                .binding(&opened.binding.id, ProviderOperation::ThreadClose)
                 .await
                 .unwrap();
             let task = tokio::spawn(std::future::pending::<Result<(), ProviderError>>());
@@ -6161,7 +7368,7 @@ mod retained_recovery_tests {
             });
             assert!(
                 provider
-                    .session_close(context("close-first"), &opened.binding.id)
+                    .thread_close(context("close-first"), &opened.binding.id)
                     .await
                     .is_err()
             );
@@ -6180,7 +7387,7 @@ mod retained_recovery_tests {
                     .contains_key(&opened.binding.id)
             );
             provider
-                .session_close(context("close-retry"), &opened.binding.id)
+                .thread_close(context("close-retry"), &opened.binding.id)
                 .await
                 .unwrap();
             provider.shutdown(context("shutdown")).await.unwrap();
@@ -6204,6 +7411,34 @@ mod retained_recovery_tests {
         .expect("attempt-all close fixture timed out");
     }
 
+    struct FixtureCompletedDriver;
+    #[async_trait]
+    impl crate::turn_runner::NativeTurnDriver for FixtureCompletedDriver {
+        async fn run(
+            &self,
+            start: forge_provider_api::NativeTurnStart,
+        ) -> Result<forge_provider_api::TurnResult, ProviderError> {
+            start.observed(1).await?;
+            forge_provider_api::TurnResult::new(
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                2,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
+        }
+        async fn interrupt(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn collect(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
     /// A rejected or lost abort acknowledgement remains the cancellation result after normal completion.
     #[tokio::test]
     async fn repeated_cancel_preserves_first_stop_failure_after_automatic_settlement() {
@@ -6216,27 +7451,27 @@ mod retained_recovery_tests {
             };
             let (abort, aborted) = tokio::sync::oneshot::channel();
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(abort), abort_acknowledgement, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::Cancel).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnInterrupt).await.unwrap();
             let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "racing-completion");
             let task_state = state.clone(); let task_scope = scope.clone();
             let (ready, running) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 let guard = task_state.turn.activate(None, None).unwrap(); let _ = ready.send(());
                 aborted.await.unwrap();
-                task_state.settlements.lock().await.insert(task_scope.clone(), Ok(InvocationSettlement {
-                    binding_id: task_state.binding.id.clone(), scope: task_scope,
-                    result: forge_provider_api::ExecutionResult::Completed { completion: forge_provider_api::completion::ProviderCompletion::default().into() }, watermark: task_state.sink.watermark(),
-                }));
+                let address = forge_provider_api::TurnAddress { scope: task_scope.clone(), thread_id: task_scope.owner.thread_id(), turn_id: task_scope.turn_id().unwrap() };
+                let runner = crate::turn_runner::RetainedTurn::spawn(Arc::new(FixtureCompletedDriver), task_state.sink.clone(), address).unwrap();
+                let completed = runner.join().await;
+                task_state.settlements.lock().await.insert(task_scope.clone(), completed);
                 drop(guard); Ok(())
             });
             running.await.unwrap();
             *state.active.lock().await = Some(ActiveExecution { scope: scope.clone(), task });
             for attempt in 0..2 {
-                assert!(matches!(provider.cancel(context(&format!("cancel-{attempt}")), &opened.binding.id, CancelRequest { scope: scope.clone() }).await,
+                assert!(matches!(provider.turn_interrupt(context(&format!("cancel-{attempt}")), &opened.binding.id, CancelRequest { scope: scope.clone() }).await,
                     Err(ProviderError::Failure(failure)) if failure.kind() == expected_failure));
             }
             assert!(state.settlements.lock().await.get(&scope).is_some_and(Result::is_ok));
-            provider.session_close(context("close-retry"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
+            provider.thread_close(context("close-retry"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.abort").count(), 1);
             }
@@ -6255,14 +7490,14 @@ mod retained_recovery_tests {
             )
             .await;
             let state = provider
-                .binding(&opened.binding.id, ProviderOperation::SessionConfigure)
+                .binding(&opened.binding.id, ProviderOperation::ThreadConfigure)
                 .await
                 .unwrap();
             let original = state.session.read().await.id().to_owned();
             let mut configuration = state.request.lock().await.configuration.clone();
             configuration.approval = forge_provider_api::approval::ApprovalMode::Allow;
             provider
-                .session_configure(
+                .thread_configure(
                     context("unused-configuration"),
                     &opened.binding.id,
                     configuration,
@@ -6272,8 +7507,8 @@ mod retained_recovery_tests {
             let current = state.session.read().await.id().to_owned();
             assert_ne!(current, original);
             loop {
-                if let ProviderEvent::SessionIdentity {
-                    provider_session_id,
+                if let ProviderEvent::Thread {
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(provider_session_id),
                     ..
                 } = opened.events.recv().await.unwrap().unwrap().event
                 {
@@ -6316,7 +7551,7 @@ mod retained_recovery_tests {
     async fn interrupted_configuration_commit_retains_invalidated_disposition() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
             let native = state.session.read().await.clone();
             provider.sessions.mark_submitted(&state.owner, &native).await.unwrap();
             let mut configuration = state.request.lock().await.configuration.clone();
@@ -6326,7 +7561,7 @@ mod retained_recovery_tests {
             let original = resources.as_ref().unwrap().clone();
             let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
             let operation = OperationContext::new(forge_provider_api::OperationId::new("configure-race").unwrap(), std::time::Duration::from_secs(60), cancellation).unwrap();
-            let configuring = provider.session_configure(operation.clone(), &opened.binding.id, configuration.clone());
+            let configuring = provider.thread_configure(operation.clone(), &opened.binding.id, configuration.clone());
             tokio::pin!(configuring);
             assert!(futures_util::poll!(configuring.as_mut()).is_pending());
             loop {
@@ -6340,7 +7575,7 @@ mod retained_recovery_tests {
             drop(resources);
             provider.operations.configure.join_all().await.unwrap();
             assert_eq!(state.request.lock().await.configuration, configuration, "fixture did not cross the native commit boundary");
-            assert!(matches!(provider.session_configure(operation, &opened.binding.id, configuration).await, Err(ProviderError::Failure(error))
+            assert!(matches!(provider.thread_configure(operation, &opened.binding.id, configuration).await, Err(ProviderError::Failure(error))
                 if error.kind() == ProviderFailureKind::Cancelled && error.phase() == forge_provider_api::ProviderPhase::Observation
                 && error.disposition() == forge_provider_api::FailureDisposition::Invalidated));
             provider.shutdown(context("configure-race-shutdown")).await.unwrap();
@@ -6355,19 +7590,19 @@ mod retained_recovery_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
             let binding = opened.binding.id.clone();
-            let state = provider.binding(&binding, ProviderOperation::SessionConfigure).await.unwrap();
+            let state = provider.binding(&binding, ProviderOperation::ThreadConfigure).await.unwrap();
             let mut configuration = state.request.lock().await.configuration.clone();
             configuration.approval = forge_provider_api::approval::ApprovalMode::Allow;
             drop(opened.events);
-            let result = provider.session_configure(context("configure-delivery"), &binding, configuration.clone()).await;
+            let result = provider.thread_configure(context("configure-delivery"), &binding, configuration.clone()).await;
             assert!(matches!(result, Err(ProviderError::Combined { primary, .. })
-                if matches!(*primary, ProviderError::Failure(error) if error.operation() == ProviderOperation::SessionConfigure
+                if matches!(*primary, ProviderError::Failure(error) if error.operation() == ProviderOperation::ThreadConfigure
                 && error.phase() == forge_provider_api::ProviderPhase::Observation
                 && error.disposition() == forge_provider_api::FailureDisposition::Invalidated)));
             assert_eq!(state.request.lock().await.configuration, configuration);
             assert!(state.closing.load(Ordering::Acquire));
             assert!(state.callbacks.begin_callback().is_err());
-            provider.session_close(context("configure-delivery-close"), &binding).await.unwrap();
+            provider.thread_close(context("configure-delivery-close"), &binding).await.unwrap();
             provider.shutdown(context("configure-delivery-shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 2);
@@ -6380,15 +7615,15 @@ mod retained_recovery_tests {
     async fn configuration_rejects_live_terminals_before_native_refresh() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(true)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
             let original = state.request.lock().await.configuration.clone(); let native = state.session.read().await.id();
             let mut desired = original.clone(); desired.approval = forge_provider_api::approval::ApprovalMode::Allow;
-            assert!(matches!(provider.session_configure(context("configure"), &opened.binding.id, desired).await,
-                Err(ProviderError::Failure(error)) if error.operation() == ProviderOperation::SessionConfigure && error.kind() == ProviderFailureKind::ResourceConflict));
+            assert!(matches!(provider.thread_configure(context("configure"), &opened.binding.id, desired).await,
+                Err(ProviderError::Failure(error)) if error.operation() == ProviderOperation::ThreadConfigure && error.kind() == ProviderFailureKind::ResourceConflict));
             assert_eq!(state.request.lock().await.configuration, original);
             assert_eq!(state.session.read().await.id(), native);
             assert!(!state.closing.load(Ordering::Acquire));
-            provider.session_close(context("close-retry"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
+            provider.thread_close(context("close-retry"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 1);
             assert!(requests.iter().all(|request| request["method"] != "session.resume"));
@@ -6411,9 +7646,10 @@ mod retained_recovery_tests {
                 .await
                 .unwrap();
             let mut request = first_state.request.lock().await.clone();
-            request.owner = forge_provider_api::ExecutionOwner::root("second-owner");
+            request.owner = forge_provider_api::ThreadOwner::root("second-owner");
+            request.thread_id = request.owner.thread_id();
             let second = provider
-                .session_open(context("second-open"), request)
+                .thread_open(context("second-open"), request)
                 .await
                 .unwrap();
             let second_state = provider
@@ -6468,7 +7704,7 @@ mod retained_recovery_tests {
             let rejected = OperationContext::new(forge_provider_api::OperationId::new("pre-cancelled-terminal").unwrap(), std::time::Duration::from_secs(60), cancellation).unwrap();
             assert!(matches!(provider.terminal_terminate(rejected, &opened.binding.id, &terminal).await,
                 Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Cancelled && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged));
-            provider.session_close(context("close"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
+            provider.thread_close(context("close"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.tasks.cancel").count(), 1);
         }).await.expect("interrupted native operation fixture timed out");
@@ -6479,7 +7715,7 @@ mod retained_recovery_tests {
     fn retained_retraction_rejects_changed_request_and_preserves_uncertainty() {
         let request = InputRetractRequest {
             scope: forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("owner"),
+                forge_provider_api::ThreadOwner::root("owner"),
                 "invocation",
             ),
             submission_id: forge_provider_api::SubmissionId::try_from("submission").unwrap(),
@@ -6504,7 +7740,7 @@ mod retained_recovery_tests {
         );
         let mut scope = request.clone();
         scope.scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("owner"),
+            forge_provider_api::ThreadOwner::root("owner"),
             "other-invocation",
         );
         let mut input = request.clone();
@@ -6528,7 +7764,7 @@ mod retained_recovery_tests {
         let request = SessionForkRequest {
             source: ForkSource::Binding(BindingId::new("source").unwrap()),
             target: forge_provider_api::session::ForkTarget {
-                owner: forge_provider_api::ExecutionOwner::root("target"),
+                owner: forge_provider_api::ThreadOwner::root("target"),
                 workspace: root.path().to_string_lossy().into_owned(),
                 configuration: SessionConfiguration {
                     model: ModelSelection::default(),
@@ -6551,18 +7787,18 @@ mod retained_recovery_tests {
             },
         );
         provider
-            .session_fork(operation.clone(), request.clone())
+            .thread_fork(operation.clone(), request.clone())
             .await
             .unwrap();
         let mut source = request.clone();
         source.source = ForkSource::Binding(BindingId::new("different-source").unwrap());
         let mut target = request.clone();
-        target.target.owner = forge_provider_api::ExecutionOwner::root("different-target");
+        target.target.owner = forge_provider_api::ThreadOwner::root("different-target");
         let mut configuration = request;
         configuration.target.configuration.model.model = Some("different-model".into());
         for changed in [source, target, configuration] {
             assert!(
-                matches!(provider.session_fork(operation.clone(), changed).await, Err(ProviderError::Failure(error)) if error.operation() == ProviderOperation::SessionFork && error.kind() == ProviderFailureKind::OperationConflict)
+                matches!(provider.thread_fork(operation.clone(), changed).await, Err(ProviderError::Failure(error)) if error.operation() == ProviderOperation::ThreadFork && error.kind() == ProviderFailureKind::OperationConflict)
             );
         }
         assert_eq!(provider.runtime.start_count(), 0);
@@ -6592,7 +7828,7 @@ mod retained_recovery_tests {
                 let submission = forge_provider_api::SubmissionId::try_from("submission").unwrap();
                 let attempt = forge_provider_api::DeliveryAttemptId::new("attempt").unwrap();
                 let token = super::super::prompt::sending_recovery_token(
-                    forge_provider_api::ExecutionOwner::root("owner"), submission.clone(), attempt.clone(),
+                    forge_provider_api::ThreadOwner::root("owner"), submission.clone(), attempt.clone(),
                     super::super::prompt::NativeDeliveryBoundary {
                         session_id: "native-session".into(), cursor: "old-process-cursor".into(), anchor: Some("before".into()),
                     },

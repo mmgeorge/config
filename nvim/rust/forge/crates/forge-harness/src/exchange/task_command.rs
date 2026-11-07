@@ -616,6 +616,20 @@ impl TaskCommandRun {
                         rejected(error)
                     }
                 })?;
+                // Collection parked any running exchange for a later admission to close. A finite
+                // control that removed the task schedules none, so close it while control is held.
+                let closed = match &committed {
+                    TaskCommitResult::Complete(_)
+                    | TaskCommitResult::ScheduleInput(TaskCommandCheckpoint::Control { .. }) => {
+                        broker
+                            .owner_close_orphaned_parked_exchange()
+                            .map_err(OperationFailure::Domain)?
+                    }
+                    TaskCommitResult::ScheduleInput(
+                        TaskCommandCheckpoint::InputPending { .. }
+                        | TaskCommandCheckpoint::WorkflowInputPending { .. },
+                    ) => Vec::new(),
+                };
                 self.transition.take();
                 self.control.take();
                 if matches!(
@@ -633,7 +647,7 @@ impl TaskCommandRun {
                 match committed {
                     TaskCommitResult::Complete(outcome) => Ok(TaskCommandProgress::Finished {
                         outcome: Ok(outcome),
-                        events: Vec::new(),
+                        events: closed,
                     }),
                     TaskCommitResult::ScheduleInput(committed) => {
                         self.checkpoint = Some(committed.clone());
@@ -641,7 +655,7 @@ impl TaskCommandRun {
                             TaskCommandCheckpoint::Control { outcome } => {
                                 Ok(TaskCommandProgress::Finished {
                                     outcome: Ok(*outcome),
-                                    events: Vec::new(),
+                                    events: closed,
                                 })
                             }
                             TaskCommandCheckpoint::InputPending { .. }
@@ -993,11 +1007,12 @@ impl TaskCommandRun {
         let now_ms = owner_now_ms()?;
         if let TaskCommand::EditPlan(request) = &intent {
             let request = request.clone();
+            let operation_id = self.command.record.request.id.as_str().to_owned();
             self.stage = TaskStage::PreparingOperation {
                 task: tokio::spawn(async move {
                     let change = services
                         .observer
-                        .prepare_owner_plan_edit(&request, current.as_ref(), now_ms)
+                        .prepare_owner_plan_edit(&request, &operation_id, current.as_ref(), now_ms)
                         .await
                         .map_err(rejected)?;
                     Ok(TaskCommit::Mutation {
@@ -1330,7 +1345,9 @@ impl TaskCommandRun {
                 match super::task_input::reconcile(services)
                     .map_err(|_| TaskSynchronizationFailure::StateUnavailable)?
                 {
-                    super::task_input::TaskInputProduction::Updated(update) => updates.push(update),
+                    super::task_input::TaskInputProduction::Updated(produced) => {
+                        updates.extend(produced)
+                    }
                     super::task_input::TaskInputProduction::Idle => {}
                     super::task_input::TaskInputProduction::ContinuationCancelled { .. }
                     | super::task_input::TaskInputProduction::Superseded => {
@@ -2031,13 +2048,17 @@ mod tests {
         let mut queue = CommandQueue::open(root.path(), "session")?;
         let (reply, _response) = oneshot::channel();
         queue.admit(
-            CommandRequest {
-                id: CommandId::new("task-dispatch-correlation")?,
-                command: Command::Task(TaskCommand::StartGoal(NewGoal::new("Start once".into())?)),
-                input_control: InputControl::AtExecution,
+            crate::exchange::queue::CommandAdmission {
+                request: CommandRequest {
+                    id: CommandId::new("task-dispatch-correlation")?,
+                    command: Command::Task(TaskCommand::StartGoal(NewGoal::new(
+                        "Start once".into(),
+                    )?)),
+                    input_control: InputControl::AtExecution,
+                },
+                reply,
+                task_admission: None,
             },
-            reply,
-            None,
             None,
             &trace,
             "session",
@@ -2072,7 +2093,7 @@ mod tests {
         let work = uuid::Uuid::new_v4();
         let receipt = forge_provider_api::SubmissionId::try_from("original-receipt".to_owned())?;
         let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("session"),
+            crate::provider::ThreadOwner::root("session"),
             "exchange",
         );
         let binding = forge_provider_api::BindingId::new("binding")?;

@@ -128,7 +128,7 @@ impl ClientGeneration {
         match self.failure() {
             Some(reason) => Err(ProviderError::Observation(reason)),
             None if self.0.stopped.load(Ordering::Acquire) => Err(native_failure(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::SessionMissing,
             )),
             None => Ok(()),

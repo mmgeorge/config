@@ -95,10 +95,6 @@ pub fn prepare_new_session(
     )?;
     shared.desired.apply(&mut child, native_compact)?;
     shared.apply_provider_defaults(&mut child)?;
-    if child.model == "default" && child.resolved_model.is_none() {
-        child.resolved_model =
-            store.latest_resolved_default_model(&child.workspace, &child.provider)?;
-    }
     store.save_session(&child)?;
     Ok(child)
 }
@@ -108,7 +104,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_conversation_reuses_resolved_default_before_catalog_request() {
+    fn new_conversation_keeps_actual_model_unknown_before_native_confirmation() {
         let fixture = tempfile::tempdir().unwrap();
         let mut broker = crate::broker::HarnessBroker::initialize(
             serde_json::from_value(serde_json::json!({
@@ -138,6 +134,6 @@ mod tests {
         assert_eq!(created.approval_mode, ApprovalMode::Ask);
         assert_eq!(broker.session.approval_mode, ApprovalMode::Allow);
         assert_eq!(created.model, "default");
-        assert_eq!(created.resolved_model.as_deref(), Some("confirmed-default"));
+        assert!(created.resolved_model.is_none());
     }
 }

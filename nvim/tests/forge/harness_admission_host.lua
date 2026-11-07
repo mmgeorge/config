@@ -1,7 +1,8 @@
 vim.loader.enable(false)
 local original_directory = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(original_directory .. "/nvim")
-local evidence = original_directory .. "/.tmp/harness-admission-" .. tostring(vim.uv.hrtime())
+local fixture_evidence = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/evidence_directory.lua")("harness-admission")
+local evidence = fixture_evidence.path
 local workspace, data = evidence .. "/workspace", evidence .. "/data"
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
@@ -16,7 +17,8 @@ vim.fn.writefile({ "Admission fixture" }, workspace .. "/README.md")
 git("add", "README.md")
 git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Fixture baseline")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -44,7 +46,10 @@ local function finish(completion)
   assert(vim.wait(10000, function() return completion.done end, 10), "request did not finish")
   return completion
 end
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua.
+  if method == "session.state.get" then last_snapshot = state_snapshot.get() return last_snapshot end
   local completion = finish(start(method, params))
   assert(not completion.failure, tostring(completion.failure))
   if method == "session.state.get" then last_snapshot = completion.value end
@@ -134,9 +139,12 @@ local success, failure = xpcall(function()
     { kind = "set_approval", mode = "deny" },
     { kind = "set_approval", mode = "allow" },
   }) do
-    controller.task_transition({ action = "permission", change = change })
-    assert(vim.wait(10000, function() return not state.task_operation and not state.busy end, 10),
+    -- Wait for the command response itself; Lua keeps no in-flight task-operation flag.
+    local applied
+    controller.task_transition({ action = "permission", change = change }, nil, function(ok) applied = ok end)
+    assert(vim.wait(10000, function() return applied ~= nil and not require("forge.views.harness.activity").busy(state) end, 10),
       "permission change did not settle while a question waited")
+    assert(applied, "permission change failed while a question waited")
     local waiting = request("session.state.get")
     assert(current_question(waiting).resolution.kind == "pending", "permission change answered the question")
     assert(waiting.session.access.write_access == "off", "approval change restored writes")
@@ -186,5 +194,8 @@ client.host_stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(original_directory)
 vim.fn.stdpath = original_stdpath
+-- Remove passing evidence only after the host exits and releases its files.
+local release_failure = fixture_evidence.release(success and collected)
 assert(success and collected, failure or "host was not collected")
+assert(not release_failure, release_failure)
 print("harness_admission_host: passed")

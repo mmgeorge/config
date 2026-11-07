@@ -1,3 +1,8 @@
+mod continuation_policy;
+mod observed_agents;
+use crate::provider::session_execution::{InputPresentation, OwnerObservation};
+use crate::provider::{ChildWaitEvent, HostEvent, PermissionApprovalEvent};
+use forge_provider_api::ProviderEvent;
 mod owned_task_checks;
 pub(crate) use owned_task_checks::{OwnedTaskCheckRun, TaskCheckEvent, TaskCheckProgress};
 mod clarification;
@@ -5,6 +10,19 @@ mod rollback_effect;
 pub(crate) use rollback_effect::RollbackEffectResult;
 mod acceptance;
 pub(crate) use acceptance::{PlanExecutionPreparation, ValidatedPlanExecution};
+/// Derive the name an unnamed session takes from its first exchange's title.
+///
+/// A leading slash command is dropped so `/plan Add caching` names the session "Add caching".
+pub(crate) fn automatic_session_name(session_title: &str) -> String {
+    let words = session_title.split_whitespace().collect::<Vec<_>>();
+    let words = if words.first().is_some_and(|word| word.starts_with('/')) {
+        &words[1..]
+    } else {
+        &words[..]
+    };
+    words.join(" ").chars().take(30).collect()
+}
+
 #[cfg(test)]
 mod cancellation_test;
 #[cfg(test)]
@@ -20,6 +38,7 @@ pub(crate) use compaction::{CompactionEvidenceError, CompactionProvenance, Compa
 pub(crate) use configuration::{
     ConfigurationCandidate, ConfigurationCatalogResult, ConfigurationEffect,
     ConfigurationPreparation, ConfigurationReconcileJob, ConfigurationReconcileResult,
+    PendingConfigurationRetry, PolicyBaseline,
 };
 mod execution;
 mod execution_progress;
@@ -54,7 +73,7 @@ mod new_session;
 mod observation;
 mod owner_control;
 pub(crate) use checkpoint_settlement::FinalCheckpointResult;
-pub(crate) use owner_control::{ControlExecution, ExchangeControlSelection, ExchangeControlView};
+pub(crate) use owner_control::{ExchangeControlSelection, ExchangeControlView};
 pub(crate) use prior_finalization::PriorFinalization;
 mod plan_checks_update;
 pub(crate) mod plan_entry;
@@ -62,14 +81,14 @@ mod project_checks;
 pub(crate) use check_admission::AutomaticCheckAction;
 #[cfg(test)]
 pub(crate) use plan_checks_update::{PlanChecksUpdateJob, PlanChecksUpdateResult};
-mod reopening;
+mod host_settlement;
 mod review_question;
 pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
-use crate::agent::{Agent, AgentLifecycleEvent, AgentRegistry, AgentState};
+use crate::agent::{Agent, AgentRegistry, AgentState};
 use crate::buffer::session::SessionPresentation;
 use crate::checkpoint::{GitCheckpoint, checkpoint_diff, checkpoint_diff_for_paths};
 use crate::exchange::{
@@ -88,9 +107,9 @@ use crate::plan::{
 use crate::protocol::RuntimeMethod;
 use crate::provider::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::provider::{
-    PromptMode, Provider, ProviderCapability, ProviderCatalogRequest, ProviderCompletion,
-    ProviderError, ProviderEvent, ProviderEventSink, ProviderId, ProviderInput, ProviderLaunch,
-    ProviderRequest,
+    HarnessEvent, HarnessEventSink, PromptMode, Provider, ProviderCapability,
+    ProviderCatalogRequest, ProviderCompletion, ProviderError, ProviderId, ProviderInput,
+    ProviderLaunch, ProviderRequest,
 };
 use crate::session::{
     ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
@@ -133,6 +152,34 @@ impl Clock for SystemClock {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64
+    }
+}
+
+/// Holds test time still until the test advances it, so elapsed-time behavior never waits.
+#[cfg(test)]
+pub(crate) struct ManualClock {
+    now_ms: std::sync::atomic::AtomicI64,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms: std::sync::atomic::AtomicI64::new(now_ms),
+        }
+    }
+
+    /// Move test time forward by an exact interval.
+    pub(crate) fn advance(&self, interval: std::time::Duration) {
+        let interval_ms = i64::try_from(interval.as_millis()).expect("test interval fits in i64");
+        self.now_ms.fetch_add(interval_ms, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        self.now_ms.load(Ordering::Acquire)
     }
 }
 
@@ -187,7 +234,7 @@ fn agent_summaries(
     }).collect()
 }
 
-fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
+fn preview_lines(timeline: &[TimelineEntry], now_ms: i64) -> Result<Vec<String>> {
     let mut display = crate::buffer::identity::DisplayRegistry::default();
     let width = forge_buffer::width::WidthProfile {
         columns: 100,
@@ -198,6 +245,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
         let projected = crate::buffer::projection::project(
             entry,
             &width,
+            now_ms,
             index > 0,
             &Default::default(),
             &Default::default(),
@@ -255,7 +303,8 @@ pub struct BrokerSnapshot {
     pub active_wait: Option<ActiveWait>,
     pub prompt_history: Vec<crate::attachment::PromptDraft>,
     pub agent: AgentSnapshot,
-    pub approval: Vec<ApprovalRequestView>,
+    pub approval: Vec<crate::provider::ApprovalRequestPresentation>,
+    pub observed_agents: Vec<crate::agent::ObservedAgent>,
 }
 
 /// Retains reusable child identities and their durable timelines inside one root.
@@ -410,13 +459,15 @@ pub(crate) enum ForegroundOutcome {
 
 /// Own native waiting resources independently of the broker mutex.
 pub(crate) struct ForegroundWait<T: Send + 'static> {
-    events: crate::provider::events::ProviderEventStream,
+    events: crate::provider::events::HarnessEventStream,
     task: tokio::task::JoinSet<Result<T>>,
     pending_submission:
         Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>>,
     result_pending: bool,
     cancellation: Arc<TurnCancellationSignal>,
     watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
+    /// Keep timeout collection with this foreground until the wait is dropped.
+    _tool_owner: crate::provider::tool_timeout::ForegroundToolOwner,
     stream_open: bool,
 }
 
@@ -424,7 +475,7 @@ pub(crate) struct ForegroundWait<T: Send + 'static> {
 pub(crate) enum NativeForegroundSignal<T> {
     Cancelled,
     ToolExpired(crate::provider::tool_timeout::ToolTimeout),
-    ProviderEvent(ProviderEvent),
+    ProviderEvent(OwnerObservation),
     NativeReady(T),
 }
 
@@ -437,20 +488,23 @@ enum NativeWaitMode {
 impl<T: Send + 'static> ForegroundWait<T> {
     /// Retain an owned provider future until the owner authorizes its submission.
     pub(crate) fn start(
-        events: crate::provider::events::ProviderEventStream,
+        events: crate::provider::events::HarnessEventStream,
         submission: impl std::future::Future<Output = Result<T>> + Send + 'static,
         cancellation: Arc<TurnCancellationSignal>,
         watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             events,
             task: tokio::task::JoinSet::new(),
             pending_submission: Some(Box::pin(submission)),
             result_pending: false,
             cancellation,
+            _tool_owner: crate::provider::tool_timeout::ForegroundToolOwner::attach(
+                watchdog.clone(),
+            )?,
             watchdog,
             stream_open: true,
-        }
+        })
     }
 
     /// Continue the same invocation without replacing its event stream or watchdog.
@@ -556,11 +610,11 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) native: ForegroundWait<ProviderAttempt>,
     pub(crate) native_open: bool,
     pub(crate) collection: Option<ForegroundCollection>,
-    pub(crate) idle_native_active: bool,
-    pub(crate) provider_event_sink: ProviderEventSink,
+    pub(crate) provider_event_sink: HarnessEventSink,
     pub(crate) engine: Arc<crate::provider::session_execution::SessionExecution>,
     pub(crate) steering: ProviderSteering,
     pub(crate) agent_revision: tokio::sync::watch::Receiver<u64>,
+    pub(crate) _agent_foreground_claim: crate::agent::AgentForegroundClaim,
     pub(crate) question_changes: tokio::sync::watch::Receiver<u64>,
     pub(crate) execution_receiver:
         tokio::sync::mpsc::Receiver<crate::plan::execution::ExecutionControl>,
@@ -594,7 +648,7 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) execution_open: bool,
     pub(crate) _agent_lease: crate::agent::AgentToolLease,
     pub(crate) _check_lease: crate::checks::CheckToolLease,
-    pub(crate) pending_session_observations: std::collections::VecDeque<ProviderEvent>,
+    pub(crate) pending_session_observations: std::collections::VecDeque<OwnerObservation>,
     pub(crate) observation_publication_in_flight: bool,
     pub(crate) finalization: Option<Box<foreground_finalization::ForegroundFinalization>>,
     pub(crate) failure_cleanup_active: bool,
@@ -650,7 +704,7 @@ pub(crate) enum ForegroundSignal {
     AgentMessageSteered {
         request: OwnedAgentRequest,
         registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         result: Result<()>,
     },
     ExecutionControl(crate::plan::execution::ExecutionControl),
@@ -895,9 +949,10 @@ pub(crate) struct PendingAgentLaunch {
 
 /// Child completion and the approvals observed before unlocked cancellation.
 pub(crate) struct AgentCompletion {
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     task_id: String,
     output: Result<crate::provider::ProviderCompletion>,
+    host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
     cleanup_error: Option<String>,
     approvals: Vec<ApprovalRequestView>,
 }
@@ -922,7 +977,7 @@ pub(crate) struct OwnedAgentRequest {
 
 struct AgentInterruptItem {
     agent: Agent,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     cancelled: Vec<crate::agent::AgentTask>,
     cleanup: Option<crate::agent::AgentTask>,
     provider: Option<Arc<Provider>>,
@@ -1021,7 +1076,7 @@ pub(crate) enum ForegroundJob {
     },
     AgentMessageSteer {
         registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         message: String,
         request: OwnedAgentRequest,
     },
@@ -1218,15 +1273,18 @@ impl ForegroundJob {
                 trace,
                 scope,
             } => {
-                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_close_started", "cause":format!("{original:#}"),
                 }));
-                let mut cleanup = if original.is::<TurnCancelled>() {
+                // Scoped collection keeps the observation stream open until the interrupted
+                // turn's terminal event is drained; closing the engine drops it and records the
+                // turn as a disconnected failure instead of an interruption.
+                let mut cleanup = if HarnessBroker::collects_exchange_scope(&original) {
                     engine.cancel_exchange(scope.clone()).await
                 } else {
                     engine.close().await
                 };
-                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_closed", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 while let Some(result) = native.join_next().await {
@@ -1234,12 +1292,12 @@ impl ForegroundJob {
                         && cleanup.is_ok()
                     {
                         cleanup = Err(crate::provider::lifecycle_error::classify_source(
-                            forge_provider_api::ProviderOperation::SessionClose,
+                            forge_provider_api::ProviderOperation::ThreadClose,
                             &error,
                         ));
                     }
                 }
-                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"native_joined", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 Ok(ForegroundSignal::CleanupCompleted { original, cleanup })
@@ -1523,7 +1581,7 @@ impl ForegroundJob {
                     if let Err(error) = input.cancel_undispatched().await {
                         return Ok(ForegroundSignal::SettlementCommitted(Err(
                             SettlementError::Provider(crate::provider::lifecycle_error::classify(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 error,
                             )),
                         )));
@@ -1718,7 +1776,7 @@ pub(crate) enum ProviderAttempt {
 pub(crate) struct ProviderSubmission {
     request: ProviderRequest,
     engine: Arc<crate::provider::session_execution::SessionExecution>,
-    sink: crate::provider::ProviderEventSink,
+    sink: crate::provider::HarnessEventSink,
     trace: Arc<TraceStore>,
     store: Arc<crate::provider::submission::SubmissionStore>,
     continuation: Option<crate::provider::SteerCommand>,
@@ -1761,13 +1819,73 @@ pub(crate) struct ExchangeRuntime {
     tool_gate: Option<crate::checkpoint::ToolGate>,
     exchange_id: String,
     checklist: ChecklistTracker,
-    retraction_eligible: bool,
+    retraction_eligibility: RetractionEligibility,
     active_wait: Option<ActiveWait>,
 }
 
 impl ExchangeRuntime {
     fn tools_blocked(&self) -> bool {
         self.tool_gate.as_ref().is_some_and(|gate| !gate.ready())
+    }
+}
+
+/// Track whether a provisional prompt is still output-free, so its cancellation may retract it.
+///
+/// A provider echo of the submitted prompt is not provider activity: Codex reports the prompt as
+/// a native user-message item before any assistant work. Every other item, including reasoning,
+/// is visible model work, and checklist, compaction, and steering acceptance also consume it.
+#[derive(Debug)]
+enum RetractionEligibility {
+    /// Retain echoed user-message items, whose later deltas and completions stay output-free.
+    OutputFree {
+        user_message_items: std::collections::HashSet<forge_provider_api::ItemId>,
+    },
+    /// Persist cancellation as a partial exchange because the provider produced activity.
+    Consumed,
+}
+
+impl RetractionEligibility {
+    /// Create the eligibility of a prompt that the provider has not yet answered.
+    fn output_free() -> Self {
+        Self::OutputFree {
+            user_message_items: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Get whether no provider activity has consumed the prompt.
+    fn is_output_free(&self) -> bool {
+        matches!(self, Self::OutputFree { .. })
+    }
+
+    /// Record provider activity that makes history retraction unsafe.
+    fn consume(&mut self) {
+        *self = Self::Consumed;
+    }
+
+    /// Classify one native item event as a prompt echo or as provider activity.
+    fn observe_item(
+        &mut self,
+        item_id: &forge_provider_api::ItemId,
+        event: &forge_provider_api::ItemEvent,
+    ) {
+        let Self::OutputFree { user_message_items } = self else {
+            return;
+        };
+        let echo = match event {
+            forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                _,
+            )) => {
+                user_message_items.insert(item_id.clone());
+                true
+            }
+            forge_provider_api::ItemEvent::Started(_)
+            | forge_provider_api::ItemEvent::Message { .. }
+            | forge_provider_api::ItemEvent::Tool { .. }
+            | forge_provider_api::ItemEvent::Completed(_) => user_message_items.contains(item_id),
+        };
+        if !echo {
+            self.consume();
+        }
     }
 }
 
@@ -2055,6 +2173,48 @@ impl std::fmt::Display for RequestNotAdmitted {
 impl std::error::Error for RequestNotAdmitted {}
 
 #[derive(Debug)]
+/// Rejects a request naming a durable session that does not exist, which no retry can repair.
+pub struct SessionNotFound {
+    /// Identifies the requested session.
+    pub session_id: String,
+}
+
+impl SessionNotFound {
+    /// Return the loaded session, or the typed absence that clients treat as terminal.
+    pub(crate) fn require<Session>(session: Option<Session>, session_id: &str) -> Result<Session> {
+        session.ok_or_else(|| {
+            Self {
+                session_id: session_id.to_owned(),
+            }
+            .into()
+        })
+    }
+}
+
+impl std::fmt::Display for SessionNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session not found: {}", self.session_id)
+    }
+}
+
+impl std::error::Error for SessionNotFound {}
+
+/// Classify a request failure into the stable wire code clients use to choose retry behavior.
+pub fn request_failure_code(error: &anyhow::Error) -> &'static str {
+    if error.is::<RequestNotAdmitted>() {
+        "not_admitted"
+    } else if error.is::<TurnCancelled>() {
+        "turn_cancelled"
+    } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
+        "tool_timeout"
+    } else if error.is::<SessionNotFound>() {
+        "session_not_found"
+    } else {
+        "request_failed"
+    }
+}
+
+#[derive(Debug)]
 struct TurnRetracted {
     prompt: String,
 }
@@ -2120,6 +2280,9 @@ pub struct HarnessBroker {
     plan_file: Arc<PlanFileStore>,
     check_runner: Arc<crate::checks::CheckSupervisor>,
     check_setup: bool,
+    /// Retain the exchange that an output-free cancellation removed through confirmed retraction,
+    /// so the exchange owner distinguishes that removal from lost history.
+    retracted_exchange_id: Option<String>,
     /// Shares admitted review documents between view requests and serialized question turns.
     pub(crate) plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     pub(crate) revision_review: Arc<crate::plan::revision_review::RevisionReview>,
@@ -2140,16 +2303,11 @@ pub struct HarnessBroker {
     event_sink: Option<publication::SessionUpdateSink>,
     clock: Box<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
-    reopened_execution: reopening::ReopenedExecutions,
-    retained_foregrounds:
-        std::collections::HashMap<crate::provider::InvocationId, reopening::RetainedForeground>,
+    host_settlement: host_settlement::HostSettlementFence,
     pending_host_settlement: Option<Arc<crate::provider::session_execution::SettlementCell>>,
     settlement_events: Vec<SessionEvent>,
     agent_registry: AgentRegistry,
-    observed_agent_conversations: HashSet<(
-        crate::provider::InvocationId,
-        forge_provider_api::ProviderSessionId,
-    )>,
+    native_providers_by_binding: HashMap<forge_provider_api::BindingId, Arc<Provider>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     pub(crate) agent_provider_factory: crate::agent::AgentProviderFactory,
     child_provider_by_agent: HashMap<String, Arc<Provider>>,
@@ -2184,7 +2342,7 @@ impl HarnessBroker {
             self.execution_registry = Arc::new(
                 crate::provider::session_execution::SessionExecutionRegistry::with_observer(
                     self.provider.clone(),
-                    crate::provider::ExecutionOwner::root(&self.session.id),
+                    crate::provider::ThreadOwner::root(&self.session.id),
                     self.observer.session_events(),
                     self.trace.clone(),
                 ),
@@ -2283,9 +2441,8 @@ impl HarnessBroker {
         let mut created_session = false;
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
-                let selected = store
-                    .load_session(session_id)?
-                    .context("session not found")?;
+                let selected =
+                    SessionNotFound::require(store.load_session(session_id)?, session_id)?;
                 anyhow::ensure!(
                     selected.background.is_some() == request.background.is_some(),
                     "Background and interactive sessions cannot share a provider conversation"
@@ -2399,9 +2556,6 @@ impl HarnessBroker {
         if session.provider_label.is_empty() {
             session.provider_label = provider_descriptor.label.clone();
         }
-        if session.resolved_model.is_none() && session.model != "default" {
-            session.resolved_model = Some(session.model.clone());
-        }
         session.updated_at_ms = now_ms;
         let shared = crate::settings::SettingsStore::open(&data_root)?.get(
             &session.workspace,
@@ -2416,10 +2570,6 @@ impl HarnessBroker {
         }
         if request.background.is_some() {
             session.access.write_access = crate::session::WriteScope::Off;
-        }
-        if session.model == "default" && session.resolved_model.is_none() {
-            session.resolved_model =
-                store.latest_resolved_default_model(&session.workspace, &session.provider)?;
         }
         permission_coordinator.configure_timeout(&session.id, session.approval_timeout)?;
         startup_timing.insert(
@@ -2454,7 +2604,7 @@ impl HarnessBroker {
             && !store.has_fork_lineage(&session.id)?
             && let Some(input_ids) = input_ids
             && submission_store.proves_session_unconsumed(
-                &crate::provider::ExecutionOwner::root(&session.id),
+                &crate::provider::ThreadOwner::root(&session.id),
                 &session.workspace,
                 provider_descriptor.kind,
                 &input_ids,
@@ -2553,7 +2703,7 @@ impl HarnessBroker {
             session_events: RwLock::new(
                 runtime
                     .execution_registry
-                    .observer(crate::provider::ExecutionOwner::root(&session.id))?,
+                    .observer(crate::provider::ThreadOwner::root(&session.id))?,
             ),
             data_root: data_root.clone(),
             session_id: session.id.clone(),
@@ -2603,6 +2753,7 @@ impl HarnessBroker {
             plan_file,
             check_runner,
             check_setup: false,
+            retracted_exchange_id: None,
             workspace_kind,
             data_root,
             client_id: request.client_id,
@@ -2622,12 +2773,11 @@ impl HarnessBroker {
             event_sink: None,
             clock,
             exchange_runtime: None,
-            reopened_execution: Default::default(),
-            retained_foregrounds: Default::default(),
+            host_settlement: Default::default(),
             pending_host_settlement: None,
             settlement_events: Vec::new(),
             agent_registry,
-            observed_agent_conversations: HashSet::new(),
+            native_providers_by_binding: HashMap::new(),
             agent_coordinator,
             agent_provider_factory,
             child_provider_by_agent: HashMap::new(),
@@ -2701,38 +2851,16 @@ impl HarnessBroker {
         })
     }
 
-    /// Capture interactive startup settings without creating an exchange or task.
-    pub(crate) fn initialization_request(&self) -> Result<Option<ProviderRequest>> {
+    /// Identify the interactive conversation owner whose native history opens on first use.
+    ///
+    /// Startup registers this owner so the first lazy open can publish into it. The bridge opens
+    /// or resumes the native conversation under input admission, and `retain_session_identity`
+    /// commits the identity that the open publishes.
+    pub(crate) fn interactive_owner(&self) -> Option<crate::provider::ThreadOwner> {
         (self.session.background.is_none()
             && self.session.purpose == crate::session::SessionPurpose::Conversation
             && self.provider_fork_state() == crate::session::ProviderForkState::Ready)
-            .then(|| self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
-            .transpose()
-    }
-
-    /// Persist an initialized provider conversation only while its captured settings remain current.
-    pub(crate) fn retain_initialized_session(
-        &mut self,
-        request: &ProviderRequest,
-        provider_id: String,
-    ) -> Result<Option<BrokerSnapshot>> {
-        if self.session.id != request.harness_session_id
-            || self.session.provider_session_id.as_deref()
-                != request.provider_session_id.as_ref().map(|id| id.as_str())
-            || self.session.model != request.model
-            || self.session.effort != request.effort
-            || self.session.context_window != request.context_window
-            || self.session.service_tier != request.service_tier
-            || self.session.access != request.access
-            || self.session.approval_mode != request.approval_mode
-        {
-            return Ok(None);
-        }
-        if self.session.provider_session_id.as_ref() != Some(&provider_id) {
-            self.session.provider_session_id = Some(provider_id);
-            self.save_session()?;
-        }
-        Ok(Some(self.snapshot()?))
+            .then(|| crate::provider::ThreadOwner::root(&self.session.id))
     }
 
     fn control_turn_context(&self, mode: PromptMode) -> Option<crate::tools::ControlTurnContext> {
@@ -2775,6 +2903,7 @@ impl HarnessBroker {
             questions: Some(self.questions.clone()),
             question_events: self.question_events.clone(),
             live_host_effects: None,
+            observed_file_changes: None,
             question_invocation: None,
             question_exchange_id: self
                 .exchange_runtime
@@ -2962,7 +3091,7 @@ impl HarnessBroker {
             .any(|event| {
                 matches!(&event.detail, SessionEventKind::Compaction { compaction }
                 if compaction.state == crate::provider::CompactionState::Running
-                    && Some(&compaction.thread_id) == self.session.provider_session_id.as_ref())
+                    && compaction.thread_id == crate::provider::ThreadOwner::root(&self.session.id).thread_id().as_str())
             })
         {
             return Ok(());
@@ -3187,15 +3316,7 @@ impl HarnessBroker {
                         event,
                     };
                 }
-                let code = if error.is::<RequestNotAdmitted>() {
-                    "not_admitted"
-                } else if error.downcast_ref::<TurnCancelled>().is_some() {
-                    "turn_cancelled"
-                } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
-                    "tool_timeout"
-                } else {
-                    "request_failed"
-                };
+                let code = request_failure_code(&error);
                 self.record_plan_trace("request_failed", json!({ "request_id": id, "code": code }));
                 self.trace.record(
                     &self.session.id,
@@ -3877,9 +3998,8 @@ impl HarnessBroker {
                         .iter()
                         .any(|approval| {
                             approval.execution_owner.as_ref().is_some_and(|owner| {
-                                owner.agent_id
-                                    == forge_provider_api::AgentId::from(agent.id.as_str())
-                                    && owner.session_id
+                                owner.agent_id().as_str() == agent.id.as_str()
+                                    && *owner.session_id()
                                         == forge_provider_api::SessionId::from(
                                             self.session.id.as_str(),
                                         )
@@ -3977,10 +4097,11 @@ impl HarnessBroker {
                 }
                 let mut delivery = crate::agent::MessageDelivery::Queued;
                 if let Some(registry) = self.child_execution_by_agent.get(&agent.id) {
-                    let owner = crate::provider::ExecutionOwner {
-                        session_id: self.session.id.clone().into(),
-                        agent_id: agent.id.clone().into(),
-                    };
+                    let owner = crate::provider::ThreadOwner::new(
+                        self.session.id.clone().into(),
+                        crate::provider::AgentId::new(agent.id.clone())?,
+                    )
+                    .expect("registered session and agent identities are nonempty");
                     let engine = registry.owner(owner).await?;
                     match engine.steer_current(message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
@@ -4083,8 +4204,12 @@ impl HarnessBroker {
         };
         let persisted = (|| -> Result<()> {
             admitted_parent.append_agent_task(&admission.task)?;
-            self.store
-                .admit_agent_task(&admission.agent, &admission.task, &admitted_parent)
+            self.store.admit_agent_task(
+                &admission.agent,
+                &admission.task,
+                &admitted_parent,
+                admission.continuation_authorization(),
+            )
         })();
         if let Err(error) = persisted {
             return Err(match admission.cancel() {
@@ -4150,7 +4275,7 @@ impl HarnessBroker {
 
     async fn cancel_agent_approvals(
         &mut self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let pending = self
@@ -4165,7 +4290,7 @@ impl HarnessBroker {
         for approval in pending {
             if let Some(runtime) = self
                 .child_exchange_runtime_by_agent
-                .get_mut(owner.agent_id.as_str())
+                .get_mut(owner.agent_id().as_str())
             {
                 runtime.exchange.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -4176,7 +4301,12 @@ impl HarnessBroker {
             }
             self.emit_session_update(
                 SessionUpdate::Approval {
-                    update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval.clone())),
+                    execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                    execution_owner: approval
+                        .execution_owner
+                        .clone()
+                        .context("approval lost original owner")?,
+                    update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
                 },
                 event,
             )
@@ -4191,10 +4321,11 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let agent = self.agent_coordinator.resolve(target)?;
-        let owner = crate::provider::ExecutionOwner {
-            session_id: (self.session.id.clone()).into(),
-            agent_id: (agent.id.clone()).into(),
-        };
+        let owner = crate::provider::ThreadOwner::new(
+            (self.session.id.clone()).into(),
+            crate::provider::AgentId::new(agent.id.clone())?,
+        )
+        .expect("registered session and agent identities are nonempty");
         let cancelled = self.agent_coordinator.interrupt(target)?;
         self.cancel_agent_approvals(&owner, event).await?;
         for mut task in cancelled {
@@ -4233,11 +4364,15 @@ impl HarnessBroker {
             self.store.complete_agent_task(&agent, &task, &exchange)?;
             self.agent_registry.insert(agent.clone());
             self.agent_coordinator.retain(agent, task.clone())?;
-            self.agent_coordinator
-                .settled(owner.agent_id.as_str(), &task.id, false)?;
-            self.child_provider_by_agent.remove(owner.agent_id.as_str());
+            self.agent_coordinator.settled(
+                owner.agent_id().as_str(),
+                &task.id,
+                crate::agent::AgentSettlementDisposition::Ready,
+            )?;
+            self.child_provider_by_agent
+                .remove(owner.agent_id().as_str());
             self.child_execution_by_agent
-                .remove(owner.agent_id.as_str());
+                .remove(owner.agent_id().as_str());
         }
         self.publish_agent_state(event).await?;
         Ok(())
@@ -4249,7 +4384,7 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         if let Some((owner, task_id, error)) = self.begin_managed_agent(admission)? {
-            self.complete_managed_agent(owner, task_id, Err(error), None, event)
+            self.complete_managed_agent(owner, task_id, Err(error), Vec::new(), None, event)
                 .await?;
         }
         Ok(())
@@ -4259,10 +4394,10 @@ impl HarnessBroker {
     fn begin_managed_agent(
         &mut self,
         mut admission: crate::agent::AgentWork,
-    ) -> Result<Option<(crate::provider::ExecutionOwner, String, anyhow::Error)>> {
+    ) -> Result<Option<(crate::provider::ThreadOwner, String, anyhow::Error)>> {
         let owner = admission.owner().clone();
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str()),
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str()),
             "child execution belongs to another session"
         );
         let prepared = (|| -> Result<_> {
@@ -4367,6 +4502,7 @@ impl HarnessBroker {
                                 owner,
                                 task_id,
                                 output: Box::new(Err(error)),
+                                host_file_changes: Vec::new(),
                                 cleanup_error: Some(
                                     "child event delivery or cleanup failed".into(),
                                 ),
@@ -4382,13 +4518,15 @@ impl HarnessBroker {
         Ok(None)
     }
 
-    /// Drain owned mutations through the active prompt or idle controller, never both concurrently.
+    /// Drain owned mutations for the idle controller or a caller-supplied parent exchange.
+    ///
+    /// Without a parent, live model requests go to the active root turn, which authenticates them.
     pub(crate) async fn drain_agent_commands(
         &mut self,
         mut parent: Option<&mut Exchange>,
     ) -> Result<Vec<SessionEvent>> {
         let mut event = Vec::new();
-        while let Some(command) = self.agent_coordinator.try_receive() {
+        while let Some(command) = self.agent_coordinator.try_receive_idle() {
             match command {
                 crate::agent::AgentCommand::Request {
                     request,
@@ -4400,11 +4538,31 @@ impl HarnessBroker {
                     if response.is_closed() {
                         continue;
                     }
+                    // The active root turn authenticates a live model request against its own
+                    // exchange, so a drain without that parent hands the request to the turn.
+                    if parent.is_none()
+                        && request.source == crate::agent::AgentSource::Model
+                        && authority
+                            .as_ref()
+                            .is_some_and(|authority| !*authority.expired.borrow())
+                        && self.agent_coordinator.foreground_claimed()
+                    {
+                        self.agent_coordinator.defer_to_foreground(
+                            crate::agent::AgentCommand::Request {
+                                request,
+                                authority,
+                                target,
+                                response,
+                                task_admission,
+                            },
+                        );
+                        continue;
+                    }
                     let authenticated = if request.source == crate::agent::AgentSource::Model {
                         authority.as_ref().is_some_and(|authority| {
                             !*authority.expired.borrow()
                                 && authority.owner
-                                    == crate::provider::ExecutionOwner::root(&self.session.id)
+                                    == crate::provider::ThreadOwner::root(&self.session.id)
                                 && parent
                                     .as_deref()
                                     .is_some_and(|parent| parent.id == authority.parent_exchange_id)
@@ -4443,12 +4601,14 @@ impl HarnessBroker {
                     owner,
                     task_id,
                     output,
+                    host_file_changes,
                     cleanup_error,
                 } => {
                     Box::pin(self.complete_managed_agent(
                         owner,
                         task_id,
                         *output,
+                        host_file_changes,
                         cleanup_error,
                         &mut event,
                     ))
@@ -4461,9 +4621,9 @@ impl HarnessBroker {
 
     async fn observe_managed_agent(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: &str,
-        provider_event: ProviderEvent,
+        provider_event: OwnerObservation,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let effects =
@@ -4475,131 +4635,166 @@ impl HarnessBroker {
     /// Validate and apply a child observation before staging its publication.
     fn apply_managed_agent_observation(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: &str,
-        mut provider_event: ProviderEvent,
-        event: &mut Vec<SessionEvent>,
+        observation: OwnerObservation,
+        _events: &mut Vec<SessionEvent>,
     ) -> Result<AppliedProviderEvent> {
+        let observation = match observation {
+            OwnerObservation::HostFileChange {
+                binding_id,
+                scope,
+                change,
+            } => {
+                return self.apply_observed_file_change(&binding_id, &scope, &change);
+            }
+            OwnerObservation::Event(event) => event,
+            OwnerObservation::InputAcceptance {
+                scope,
+                receipt,
+                presentation,
+            } => {
+                anyhow::ensure!(
+                    scope.owner == owner && scope.exchange_id.as_str() == task_id,
+                    "child receipt crosses original task"
+                );
+                let mut exchange = self
+                    .store
+                    .load_exchange(task_id)?
+                    .context("child receipt has no original exchange")?;
+                self.apply_durable_input_acceptance(
+                    &mut exchange,
+                    &scope,
+                    &receipt,
+                    &presentation,
+                )?;
+                if let Some(runtime) = self
+                    .child_exchange_runtime_by_agent
+                    .get_mut(owner.agent_id().as_str())
+                {
+                    anyhow::ensure!(
+                        runtime.exchange.id == task_id,
+                        "child receipt cannot mutate a newer task"
+                    );
+                    runtime.exchange = exchange;
+                }
+                return self.prepare_agent_state();
+            }
+        };
+
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
                 && !owner.is_root(),
             "child event crosses execution ownership"
         );
-        let binding = provider_event.scope();
-        anyhow::ensure!(
-            binding.owner() == &owner,
-            "child binding event crosses execution ownership"
-        );
-        match &provider_event {
-            // Child inventories describe their own binding, never the root terminal picker.
-            ProviderEvent::Terminals { .. } => return Ok(AppliedProviderEvent::None),
-            ProviderEvent::Diagnostic { diagnostic, .. } if binding.invocation().is_none() => {
-                return Ok(AppliedProviderEvent::Update(SessionUpdate::Diagnostic {
-                    diagnostic: diagnostic.clone(),
-                }));
-            }
-            _ => {}
+        if let HarnessEvent::Native {
+            source,
+            scope,
+            event: boxed_native_event,
+        } = &observation
+            && let ProviderEvent::Agent { agent_id, event } = boxed_native_event.as_ref()
+        {
+            return self.apply_agent_lifecycle(source, scope, agent_id, event);
         }
-        let scope = binding
-            .invocation()
-            .context("child event requires invocation ownership")?;
+        if observation.scope().owner() != &owner {
+            return self.apply_observed_child(&observation);
+        }
+        let scope = observation.scope();
         anyhow::ensure!(
-            scope.owner == owner
-                && scope.exchange_id == forge_provider_api::ExchangeId::from(task_id),
-            "child provider event has a different execution owner or task"
+            scope.owner() == &owner,
+            "child event crosses original owner"
+        );
+        if let HarnessEvent::Native { event, .. } = &observation {
+            match event.as_ref() {
+                ProviderEvent::Thread { thread_id, .. }
+                | ProviderEvent::Turn { thread_id, .. }
+                | ProviderEvent::Item { thread_id, .. } => {
+                    anyhow::ensure!(
+                        thread_id == &owner.thread_id(),
+                        "child native thread crosses original owner"
+                    );
+                }
+                ProviderEvent::Provider { .. } | ProviderEvent::Agent { .. } => {}
+            }
+            if let ProviderEvent::Thread {
+                event: forge_provider_api::ThreadEvent::IdentityResolved(identity),
+                ..
+            } = event.as_ref()
+            {
+                let task = self
+                    .agent_coordinator
+                    .task(task_id)
+                    .context("child identity has no admitted task")?;
+                anyhow::ensure!(
+                    task.agent_id == owner.agent_id().as_str(),
+                    "child identity crosses original task"
+                );
+                if task.completed_at_ms.is_none() {
+                    let mut agent = self.agent_coordinator.resolve(owner.agent_id().as_str())?;
+                    agent.provider_thread_id = Some(identity.to_string());
+                    self.store.save_agent_run(&agent)?;
+                    self.agent_registry.insert(agent.clone());
+                    self.agent_coordinator.retain(agent, task)?;
+                    return self.prepare_agent_state();
+                }
+                return Ok(AppliedProviderEvent::None);
+            }
+        }
+        if scope.invocation().is_none() {
+            return Ok(match &observation {
+                HarnessEvent::Native { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        ProviderEvent::Thread {
+                            event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(_)),
+                            ..
+                        }
+                    ) =>
+                {
+                    AppliedProviderEvent::None
+                }
+                HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => {
+                    SessionUpdate::from_observation(&observation)
+                        .map_or(AppliedProviderEvent::None, AppliedProviderEvent::Update)
+                }
+            });
+        }
+        let invocation = scope
+            .invocation()
+            .context("child event requires original invocation")?;
+        anyhow::ensure!(
+            invocation.exchange_id == forge_provider_api::ExchangeId::from(task_id),
+            "child event crosses original task"
         );
         let mut task = self
             .agent_coordinator
             .task(task_id)
             .context("child event has no admitted task")?;
         anyhow::ensure!(
-            forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
-            "child event has a different task owner"
+            task.agent_id == owner.agent_id().as_str(),
+            "child task has another owner"
         );
         if task.completed_at_ms.is_some() {
-            return Ok(AppliedProviderEvent::Effects(Vec::new()));
+            return Ok(AppliedProviderEvent::None);
         }
-        if let ProviderEvent::Agent {
-            update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
-            scope,
-        } = &provider_event
-        {
-            self.apply_agent_lifecycle(lifecycle, Some(scope), event)?;
-            return Ok(AppliedProviderEvent::Effects(Vec::new()));
-        }
-        if provider_event.turn_address().is_some_and(|address| {
-            self.observed_agent_conversations
-                .iter()
-                .any(|(invocation, conversation)| {
-                    invocation == &address.scope.invocation_id
-                        && conversation.as_str() == address.thread_id
-                })
-        }) {
-            return Ok(AppliedProviderEvent::Effects(Vec::new()));
-        }
-        let provider_thread_id = match &provider_event {
-            ProviderEvent::Agent {
-                update: crate::provider::AgentUpdate::ConversationResolved { thread_id },
-                ..
-            } => Some(thread_id.as_str()),
-            event => event
-                .turn_address()
-                .map(|address| address.thread_id.as_str()),
-        };
-        if let Some(thread_id) = provider_thread_id.filter(|id| !id.is_empty()) {
-            let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
-            if agent.provider_thread_id.as_deref() != Some(thread_id) {
-                agent.provider_thread_id = Some(thread_id.to_owned());
-                self.store.save_agent_run(&agent)?;
-                self.agent_registry.insert(agent.clone());
-                self.agent_coordinator.retain(agent, task.clone())?;
-            }
-        }
-        if matches!(&provider_event, ProviderEvent::Agent { .. }) {
-            return Ok(AppliedProviderEvent::Effects(Vec::new()));
-        }
-        if let ProviderEvent::Runtime {
-            update: crate::provider::RuntimeUpdate::Resolved { runtime },
-            ..
-        } = &provider_event
-        {
-            let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
-            if let Some(model) = runtime.model.as_ref().filter(|model| !model.is_empty())
-                && let Some(selection) = agent.selection.as_mut()
-            {
-                selection.model = model.clone();
-            }
-            self.store.save_agent_run(&agent)?;
-            self.agent_registry.insert(agent.clone());
-            self.agent_coordinator.retain(agent, task)?;
-            return self.prepare_agent_state();
-        }
-        if task.state == ExchangeState::Queued {
-            task.state = ExchangeState::Running;
-            self.store.save_agent_task(&task)?;
-            self.agent_coordinator.retain(
-                self.agent_coordinator.resolve(owner.agent_id.as_str())?,
-                task.clone(),
-            )?;
-        }
-        anyhow::ensure!(
-            self.child_exchange_runtime_by_agent
-                .get(owner.agent_id.as_str())
-                .is_none_or(|runtime| runtime.exchange.id == task_id),
-            "late child event cannot update a newer task"
-        );
         let mut runtime = match self
             .child_exchange_runtime_by_agent
-            .remove(owner.agent_id.as_str())
+            .remove(owner.agent_id().as_str())
         {
-            Some(runtime) => runtime,
+            Some(runtime) => {
+                anyhow::ensure!(
+                    runtime.exchange.id == task_id,
+                    "late child event cannot update a newer task"
+                );
+                runtime
+            }
             None => {
                 let mut exchange = self
                     .store
                     .load_exchange(task_id)?
                     .context("child task exchange missing")?;
                 if exchange.is_finished() {
-                    return Ok(AppliedProviderEvent::Effects(Vec::new()));
+                    return Ok(AppliedProviderEvent::None);
                 }
                 exchange.phase = crate::exchange::ExchangePhase::Running;
                 exchange.resume(self.clock.now_ms())?;
@@ -4609,72 +4804,70 @@ impl HarnessBroker {
                 }
             }
         };
-        match &mut provider_event {
-            ProviderEvent::Approval {
-                update: crate::provider::ApprovalUpdate::Requested(request),
-                ..
-            } => {
-                let turn = runtime
-                    .exchange
-                    .turn
-                    .iter()
-                    .rev()
-                    .find(|turn| turn.state() == crate::turn::TurnState::Running);
-                let Some(approval) = self.permission_coordinator.bind_owner(
-                    &request.id,
-                    &runtime.exchange.id,
-                    turn.map(|turn| turn.id()),
-                )?
-                else {
-                    self.child_exchange_runtime_by_agent
-                        .insert(owner.agent_id.to_string(), runtime);
-                    return Ok(AppliedProviderEvent::Effects(Vec::new()));
-                };
-                runtime.exchange.observe_blocker(
-                    format!("approval:{}", approval.id),
-                    true,
-                    self.clock.now_ms(),
-                );
-                *request = approval;
-            }
-            ProviderEvent::Approval { update, .. } => {
-                let approval = match update {
-                    crate::provider::ApprovalUpdate::Resolved(approval)
-                    | crate::provider::ApprovalUpdate::Cancelled(approval) => approval,
-                    crate::provider::ApprovalUpdate::Requested(_) => unreachable!(),
-                };
-                runtime.exchange.observe_blocker(
-                    format!("approval:{}", approval.id),
-                    false,
-                    self.clock.now_ms(),
-                );
-                runtime.exchange.approval_resolution.push(approval.clone());
-            }
-            ProviderEvent::Compaction { update, .. } => {
-                runtime
-                    .exchange
-                    .observe_compaction(update.as_ref().clone(), self.clock.now_ms());
-            }
-            observation => {
-                runtime
-                    .exchange
-                    .observe_turn(observation, self.clock.now_ms())?;
-                if let ProviderEvent::Checklist { update, .. } = observation {
+        match &observation {
+            HarnessEvent::Native { scope, event, .. } => {
+                let event = event.as_ref();
+                let changed =
+                    runtime
+                        .exchange
+                        .observe_provider_event(scope, event, self.clock.now_ms())?;
+                if let ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::ChecklistUpdated(update),
+                    ..
+                } = event
+                    && changed
+                {
                     runtime.checklist.replace(update);
                     runtime.exchange.checklist = Some(runtime.checklist.snapshot().clone());
                 }
-                attribute_provider_tool(
-                    &mut runtime.exchange,
-                    &mut runtime.checklist,
-                    observation,
-                )?;
+            }
+            HarnessEvent::Host { scope, event } => {
+                runtime
+                    .exchange
+                    .observe_host_event(scope, event, self.clock.now_ms())?;
+                if let HostEvent::PermissionApproval { event, .. } = event {
+                    let (id, pending) = match event {
+                        PermissionApprovalEvent::Requested(request) => {
+                            (request.request_id.as_str(), true)
+                        }
+                        PermissionApprovalEvent::Resolved(resolution) => {
+                            (resolution.request_id.as_str(), false)
+                        }
+                        PermissionApprovalEvent::Cancelled(cancellation) => {
+                            (cancellation.request_id.as_str(), false)
+                        }
+                    };
+                    runtime.exchange.observe_blocker(
+                        format!("approval:{id}"),
+                        pending,
+                        self.clock.now_ms(),
+                    );
+                }
             }
         }
-        if provider_event.tool_output_delta().is_some() {
-            self.store
-                .save_tool_output_delta(&runtime.exchange, &provider_event)?;
-        } else {
-            self.store.save_exchange(&runtime.exchange)?;
+        match &observation {
+            HarnessEvent::Native { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    ProviderEvent::Item {
+                        event: forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::Output(
+                                forge_provider_api::TextUpdate::Append(_),
+                            ),
+                        },
+                        ..
+                    }
+                ) =>
+            {
+                self.store
+                    .save_tool_output_delta(&runtime.exchange, event)?
+            }
+            HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => {
+                self.store.save_exchange(&runtime.exchange)?
+            }
+        }
+        if task.state == ExchangeState::Queued {
+            task.state = ExchangeState::Running;
         }
         task.last_activity_at_ms = Some(
             task.last_activity_at_ms
@@ -4683,13 +4876,13 @@ impl HarnessBroker {
         );
         self.store.save_agent_task(&task)?;
         self.agent_coordinator.retain(
-            self.agent_coordinator.resolve(owner.agent_id.as_str())?,
+            self.agent_coordinator.resolve(owner.agent_id().as_str())?,
             task,
         )?;
         self.child_exchange_runtime_by_agent
-            .insert(owner.agent_id.to_string(), runtime);
+            .insert(owner.agent_id().to_string(), runtime);
         let mut effects = Vec::new();
-        if let Some(update) = SessionUpdate::from_observation(&provider_event) {
+        if let Some(update) = SessionUpdate::from_observation(&observation) {
             effects.push(AppliedProviderEvent::Update(update));
         }
         effects.push(self.prepare_agent_state()?);
@@ -4699,9 +4892,10 @@ impl HarnessBroker {
 
     async fn complete_managed_agent(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: String,
         output: Result<crate::provider::ProviderCompletion>,
+        host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
         cleanup_error: Option<String>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
@@ -4710,16 +4904,21 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
-                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
             return Ok(());
         }
         self.cancel_agent_approvals(&owner, event).await?;
-        let (effects, next) =
-            self.apply_managed_agent_completion(owner, task_id, output, cleanup_error)?;
+        let (effects, next) = self.apply_managed_agent_completion(
+            owner,
+            task_id,
+            output,
+            host_file_changes,
+            cleanup_error,
+        )?;
         event.extend(self.prepare_provider_delivery(effects)?.deliver().await?);
         if let Some(next) = next {
             Box::pin(self.launch_managed_agent(next, event)).await?;
@@ -4730,9 +4929,10 @@ impl HarnessBroker {
     /// Apply a settled child after its pending approvals have been collected.
     fn apply_managed_agent_completion(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: String,
         output: Result<crate::provider::ProviderCompletion>,
+        host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
         cleanup_error: Option<String>,
     ) -> Result<(AppliedProviderEvent, Option<crate::agent::AgentWork>)> {
         let mut task = self
@@ -4740,30 +4940,21 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
-                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
             return Ok((AppliedProviderEvent::Effects(Vec::new()), None));
         }
-        let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
+        let mut agent = self.agent_coordinator.resolve(owner.agent_id().as_str())?;
         let interrupted = self
             .agent_coordinator
-            .cancellation(owner.agent_id.as_str(), &task_id)
+            .cancellation(owner.agent_id().as_str(), &task_id)
             .is_ok_and(|cancel| *cancel.borrow());
         let provider_cancelled = output
             .as_ref()
             .is_err_and(|error| error.is::<TurnCancelled>());
-        task.state = if cleanup_error.is_some() {
-            ExchangeState::Failed
-        } else if interrupted || provider_cancelled {
-            ExchangeState::Cancelled
-        } else if output.is_err() {
-            ExchangeState::Failed
-        } else {
-            ExchangeState::Complete
-        };
         task.error = cleanup_error
             .clone()
             .or_else(|| output.as_ref().err().map(|error| format!("{error:#}")));
@@ -4777,7 +4968,7 @@ impl HarnessBroker {
         }
         let runtime = self
             .child_exchange_runtime_by_agent
-            .remove(owner.agent_id.as_str());
+            .remove(owner.agent_id().as_str());
         let mut exchange = if let Some(runtime) = runtime {
             runtime.exchange
         } else {
@@ -4785,6 +4976,65 @@ impl HarnessBroker {
                 .load_exchange(&task_id)?
                 .context("child completion exchange missing")?
         };
+        for change in &host_file_changes {
+            if change.scope.owner == owner {
+                exchange.record_host_file_change(change)?;
+            } else {
+                self.record_observed_host_file_change(None, change)?;
+            }
+        }
+        if let Ok(completion) = &output {
+            for change in &completion.host_file_changes {
+                if change.scope.owner == owner {
+                    exchange.record_host_file_change(change)?;
+                } else {
+                    self.record_observed_host_file_change(None, change)?;
+                }
+            }
+        }
+        task.state = if cleanup_error.is_some() {
+            ExchangeState::Failed
+        } else if output.is_err() {
+            if provider_cancelled || interrupted {
+                ExchangeState::Cancelled
+            } else {
+                ExchangeState::Failed
+            }
+        } else {
+            match exchange.turn.last().map(|turn| turn.state()) {
+                Some(crate::turn::TurnState::Finished {
+                    outcome:
+                        crate::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                }) => ExchangeState::Complete,
+                Some(crate::turn::TurnState::Finished {
+                    outcome:
+                        crate::turn::TurnOutcome::Completed {
+                            stop_reason:
+                                forge_provider_api::turn::TurnCompletionReason::TokenLimit
+                                | forge_provider_api::turn::TurnCompletionReason::RequestLimit
+                                | forge_provider_api::turn::TurnCompletionReason::Refusal,
+                        }
+                        | crate::turn::TurnOutcome::Interrupted,
+                }) => ExchangeState::Interrupted,
+                Some(crate::turn::TurnState::Finished {
+                    outcome: crate::turn::TurnOutcome::Failed { .. },
+                }) => ExchangeState::Failed,
+                Some(crate::turn::TurnState::Running) | None => {
+                    if interrupted {
+                        ExchangeState::Cancelled
+                    } else {
+                        ExchangeState::Failed
+                    }
+                }
+            }
+        };
+        if task.state == ExchangeState::Complete
+            && self.requires_explicit_continuation(&exchange)?
+        {
+            task.state = ExchangeState::Interrupted;
+        }
         exchange.finish(task.state.try_into()?, self.clock.now_ms())?;
         exchange.finalization_error = cleanup_error.clone();
         if exchange.turn.is_empty() {
@@ -4824,39 +5074,37 @@ impl HarnessBroker {
             AgentState::Ready
         };
         agent.updated_at_ms = self.clock.now_ms();
+        let requires_authorization = matches!(
+            task.state,
+            ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
+        ) || self.requires_explicit_continuation(&exchange)?;
+        if requires_authorization {
+            agent.continuation = crate::agent::AgentContinuationPolicy::RequiresAuthorization {
+                task_id: task.id.clone().into(),
+            };
+        }
         self.store.complete_agent_task(&agent, &task, &exchange)?;
         self.agent_registry.insert(agent.clone());
         self.agent_coordinator.retain(agent.clone(), task.clone())?;
         let next = self.agent_coordinator.settled(
-            owner.agent_id.as_str(),
+            owner.agent_id().as_str(),
             &task_id,
-            cleanup_error.is_some(),
+            if cleanup_error.is_some() {
+                crate::agent::AgentSettlementDisposition::CleanupFailed
+            } else if requires_authorization {
+                crate::agent::AgentSettlementDisposition::RequiresAuthorization
+            } else {
+                crate::agent::AgentSettlementDisposition::Ready
+            },
         )?;
         if cleanup_error.is_none() {
-            self.child_provider_by_agent.remove(owner.agent_id.as_str());
+            self.child_provider_by_agent
+                .remove(owner.agent_id().as_str());
             self.child_execution_by_agent
-                .remove(owner.agent_id.as_str());
+                .remove(owner.agent_id().as_str());
         }
-        self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
+        self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":*owner.agent_id(),"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
         Ok((self.prepare_agent_state()?, next))
-    }
-
-    fn apply_agent_lifecycle(
-        &mut self,
-        lifecycle: &AgentLifecycleEvent,
-        scope: Option<&crate::provider::InvocationScope>,
-        _event: &mut Vec<SessionEvent>,
-    ) -> Result<Option<Agent>> {
-        if let (Some(scope), Some(conversation)) = (scope, &lifecycle.conversation_id) {
-            self.observed_agent_conversations
-                .insert((scope.invocation_id.clone(), conversation.clone()));
-        }
-        self.trace.record(
-            &self.session.id,
-            "agent.lifecycle",
-            serde_json::to_value(lifecycle)?,
-        );
-        Ok(None)
     }
 
     async fn list_provider_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -4869,30 +5117,8 @@ impl HarnessBroker {
             .store
             .load_preference(&self.session.workspace, &self.session.provider)?;
         crate::provider::select_model_settings(&mut model_list, preference.as_ref());
-        let event = self.resolve_default_model(&model_list)?;
+        let event = Vec::new();
         Ok((serde_json::to_value(model_list)?, event))
-    }
-
-    /// Publishes an unresolved default model without replacing an explicit selection.
-    pub(crate) fn resolve_default_model(
-        &mut self,
-        model_list: &[crate::provider::ProviderModel],
-    ) -> Result<Vec<SessionEvent>> {
-        if self.session.model == "default"
-            && let Some(model) = model_list
-                .iter()
-                .find(|model| model.is_default)
-                .or_else(|| model_list.first())
-            && self.session.resolved_model.as_deref() != Some(model.id.as_str())
-        {
-            self.session.resolved_model = Some(model.id.clone());
-            self.save_session()?;
-            return Ok(vec![self.event(
-                "session_configured",
-                serde_json::to_value(self.session_view()?)?,
-            )?]);
-        }
-        Ok(Vec::new())
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -5584,7 +5810,7 @@ impl HarnessBroker {
         {
             return Ok(false);
         }
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+        let owner = crate::provider::ThreadOwner::root(&self.session.id);
         Ok(!self.active_plan_has_review_questions()?
             && self.permission_coordinator.has_timeout_feedback(&owner)?)
     }
@@ -5823,9 +6049,6 @@ impl HarnessBroker {
                 .turn
                 .last()
                 .map(|turn| turn.provider().scope.clone());
-            let execution_revision = check_scope
-                .as_ref()
-                .map(|scope| self.reopened_execution.revision(scope));
             let run = self
                 .check_runner
                 .run(
@@ -5836,11 +6059,6 @@ impl HarnessBroker {
                 .await?;
             if let Some(scope) = &check_scope {
                 self.refresh_settlement(&mut interaction, scope).await?;
-                if execution_revision != Some(self.reopened_execution.revision(scope)) {
-                    result.1.extend(self.finalize_observed_execution().await?);
-                    // Saved results cannot authorize work from a newer native execution.
-                    continue;
-                }
             }
             if run.state == CheckState::Interrupted {
                 return Err(anyhow::Error::new(TurnCancelled));
@@ -5867,11 +6085,15 @@ impl HarnessBroker {
             if let Some(reason) = &automatic.blocked {
                 self.emit_session_update(
                     SessionUpdate::Diagnostic {
-                        diagnostic: crate::provider::ProviderDiagnostic {
+                        diagnostic: publication::DiagnosticView {
                             kind: forge_provider_api::ProviderFailureKind::Unknown,
                             message: forge_provider_api::SanitizedMessage::new(reason.clone())
                                 .expect("host diagnostic is nonempty"),
-                            fatal: false,
+                            severity: publication::DiagnosticSeverity::Warning,
+                            scope: crate::provider::EventScope::Binding {
+                                owner: crate::provider::ThreadOwner::root(&self.session.id),
+                            },
+                            native_scope: forge_provider_api::WarningScope::Provider,
                         },
                     },
                     &mut result.1,
@@ -5957,7 +6179,7 @@ impl HarnessBroker {
                 .clone()
                 .map(ChecklistTracker::from_snapshot)
                 .unwrap_or_default(),
-            retraction_eligible: true,
+            retraction_eligibility: RetractionEligibility::output_free(),
             active_wait: None,
         });
         Ok(())
@@ -6070,7 +6292,7 @@ impl HarnessBroker {
                 .clone()
                 .map(ChecklistTracker::from_snapshot)
                 .unwrap_or_default(),
-            retraction_eligible: false,
+            retraction_eligibility: RetractionEligibility::Consumed,
             active_wait: None,
         });
         Ok(())
@@ -6088,6 +6310,12 @@ impl HarnessBroker {
     }
 
     fn acknowledge_agent_result(&mut self, mut task: crate::agent::AgentTask) -> Result<()> {
+        if matches!(
+            task.state,
+            ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
+        ) {
+            return Ok(());
+        }
         task.parent_reported = true;
         self.store.save_agent_task(&task)?;
         self.agent_coordinator
@@ -6125,11 +6353,15 @@ impl HarnessBroker {
             );
             self.emit_session_update(
                 SessionUpdate::Diagnostic {
-                    diagnostic: crate::provider::ProviderDiagnostic {
+                    diagnostic: publication::DiagnosticView {
                         kind: forge_provider_api::ProviderFailureKind::Unknown,
                         message: forge_provider_api::SanitizedMessage::new(message.clone())
                             .expect("host diagnostic is nonempty"),
-                        fatal: false,
+                        severity: publication::DiagnosticSeverity::Warning,
+                        scope: crate::provider::EventScope::Binding {
+                            owner: crate::provider::ThreadOwner::root(&self.session.id),
+                        },
+                        native_scope: forge_provider_api::WarningScope::Provider,
                     },
                 },
                 event,
@@ -6236,16 +6468,13 @@ impl HarnessBroker {
             .last()
             .map(|turn| turn.provider().scope.clone());
         if let Some(scope) = &scope {
-            self.reopened_execution.begin_settlement(scope);
+            self.host_settlement.begin_settlement(scope);
         }
         let result: Result<Option<String>> = async {
             loop {
                 if let Some(scope) = &scope {
                     self.refresh_settlement(interaction, scope).await?;
                 }
-                let revision = scope
-                    .as_ref()
-                    .map(|scope| self.reopened_execution.revision(scope));
                 let outcome = interaction.finalization_outcome().unwrap_or(outcome);
                 let descendants: Vec<_> = referenced_child_exchange_list(interaction)
                     .into_iter()
@@ -6271,8 +6500,7 @@ impl HarnessBroker {
                 self.collect_active_initial_checkpoint(interaction).await?;
                 if self.checkpoint.is_none() {
                     if let Some(scope) = &scope
-                        && (self.refresh_settlement(interaction, scope).await?
-                            || revision != Some(self.reopened_execution.revision(scope)))
+                        && self.refresh_settlement(interaction, scope).await?
                     {
                         continue;
                     }
@@ -6288,8 +6516,7 @@ impl HarnessBroker {
                 let capture = self.prepare_final_checkpoint(interaction, outcome)?;
                 let captured = capture.run().await?;
                 if let Some(scope) = &scope
-                    && (self.refresh_settlement(interaction, scope).await?
-                        || revision != Some(self.reopened_execution.revision(scope)))
+                    && self.refresh_settlement(interaction, scope).await?
                 {
                     continue;
                 }
@@ -6301,7 +6528,7 @@ impl HarnessBroker {
         }
         .await;
         if let Some(scope) = &scope {
-            self.reopened_execution.end_settlement(scope);
+            self.host_settlement.end_settlement(scope);
         }
         interaction.finalization_error = result.as_ref().err().map(|error| format!("{error:#}"));
         self.store.save_exchange(interaction)?;
@@ -6348,7 +6575,7 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        provider_event: ProviderEvent,
+        provider_event: HarnessEvent,
         events: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let applied = self.apply_provider_event(runtime, interaction, provider_event, events)?;
@@ -6364,7 +6591,7 @@ impl HarnessBroker {
         scope: crate::provider::InvocationScope,
     ) -> Result<OwnedForegroundTransaction> {
         anyhow::ensure!(
-            scope.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+            scope.owner == crate::provider::ThreadOwner::root(&self.session.id)
                 && scope.exchange_id
                     == forge_provider_api::ExchangeId::from(interaction.id.as_str()),
             "foreground transaction crosses execution ownership"
@@ -6395,10 +6622,13 @@ impl HarnessBroker {
     pub(crate) fn apply_owned_foreground(
         &mut self,
         transaction: &mut OwnedForegroundTransaction,
-        provider_event: ProviderEvent,
+        provider_event: HarnessEvent,
     ) -> Result<(AppliedProviderEvent, Vec<SessionEvent>)> {
+        if provider_event.scope().owner() != &transaction.scope.owner {
+            return Ok((self.apply_observed_child(&provider_event)?, Vec::new()));
+        }
         anyhow::ensure!(
-            transaction.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+            transaction.scope.owner == crate::provider::ThreadOwner::root(&self.session.id)
                 && provider_event.scope().owner() == &transaction.scope.owner,
             "foreground event crosses execution ownership"
         );
@@ -6412,11 +6642,8 @@ impl HarnessBroker {
             .runtime
             .as_mut()
             .context("foreground transaction already committed")?;
-        if let Some(permit) = &runtime.task_permit {
-            // A response can edit its own plan before its remaining events arrive.
-            // User control invalidates observation authority; those plan edits do not.
-            permit.validate_observation(self.task_controller.current()?.as_ref())?;
-        }
+        // Native facts remain attributable to this exact scope after its task ends.
+        // Callback admission and continuation retain their separate authority checks.
         let mut events = Vec::new();
         let effects = self.apply_provider_event(
             runtime,
@@ -6431,22 +6658,46 @@ impl HarnessBroker {
     pub(crate) fn apply_foreground_observation(
         &mut self,
         transaction: &mut ForegroundTransaction,
-        observation: ProviderEvent,
+        observation: OwnerObservation,
     ) -> Result<PendingProviderDelivery> {
-        if let ProviderEvent::Execution { observation } = &observation
-            && let forge_provider_api::ExecutionUpdate::Finished {
-                result: forge_provider_api::ExecutionResult::Cancelled { completion },
-                ..
-            } = observation.update()
-        {
-            let completion: forge_provider_api::completion::ProviderCompletion =
-                completion.clone().into();
-            if let Some(boundary) = completion.provider_checkpoint_id {
-                transaction.retraction_boundary = Some((
-                    observation.scope().clone(),
-                    forge_provider_api::CheckpointId::new(boundary)?,
-                ));
+        let observation = match observation {
+            OwnerObservation::HostFileChange {
+                binding_id,
+                scope,
+                change,
+            } => {
+                let effect = self.apply_observed_file_change(&binding_id, &scope, &change)?;
+                return self.prepare_provider_delivery(effect);
             }
+            OwnerObservation::Event(event) => event,
+            OwnerObservation::InputAcceptance {
+                scope,
+                receipt,
+                presentation,
+            } => {
+                anyhow::ensure!(
+                    scope == transaction.state.scope,
+                    "acceptance receipt crosses foreground invocation"
+                );
+                self.acknowledge_user_child_reports(&scope, &receipt)?;
+                let runtime = transaction
+                    .state
+                    .runtime
+                    .as_mut()
+                    .context("foreground runtime missing")?;
+                let applied = self.apply_input_acceptance(
+                    runtime,
+                    &mut transaction.state.interaction,
+                    &receipt,
+                    &presentation,
+                )?;
+                return self.prepare_provider_delivery(applied);
+            }
+        };
+
+        if observation.scope().owner() != &transaction.state.scope.owner {
+            let applied = self.apply_observed_child(&observation)?;
+            return self.prepare_provider_delivery(applied);
         }
         if let Some(scope) = observation.scope().invocation()
             && scope != &transaction.state.scope
@@ -6459,28 +6710,25 @@ impl HarnessBroker {
             );
             transaction.state.scope = scope.clone();
         }
-        if transaction
-            .finalization
-            .as_ref()
-            .is_some_and(|finalization| finalization.submission.is_none())
-            && let ProviderEvent::Execution { observation } = observation
-        {
-            if let Some(permit) = &transaction.dispatched_task_permit {
-                permit.validate_observation(self.task_controller.current()?.as_ref())?;
-            }
-            let events = self.observe_execution_lifecycle(observation)?;
-            transaction.idle_native_active =
-                self.reopened_execution.active(&transaction.state.scope);
-            transaction.state.interaction = self
-                .store
-                .load_exchange(&transaction.state.interaction.id)?
-                .context("idle continuation exchange disappeared")?;
-            let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::None)?;
-            delivery.events = events;
-            return Ok(delivery);
-        }
+        let retraction_boundary = match &observation {
+            HarnessEvent::Native { event, .. } => match event.as_ref() {
+                ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::Completed(completed),
+                    ..
+                } => completed.result().checkpoint_id().cloned(),
+                ProviderEvent::Provider { .. }
+                | ProviderEvent::Thread { .. }
+                | ProviderEvent::Turn { .. }
+                | ProviderEvent::Item { .. }
+                | ProviderEvent::Agent { .. } => None,
+            },
+            HarnessEvent::Host { .. } => None,
+        };
         let (applied, mut events) =
             self.apply_owned_foreground(&mut transaction.state, observation)?;
+        if let Some(boundary) = retraction_boundary {
+            transaction.retraction_boundary = Some((transaction.state.scope.clone(), boundary));
+        }
         let mut delivery = self.prepare_provider_delivery(applied)?;
         events.append(&mut delivery.events);
         delivery.events = events;
@@ -6524,9 +6772,9 @@ impl HarnessBroker {
     /// Capture a plan scan as owned work that can run without the broker lock.
     pub(crate) fn apply_foreground_agent_observation(
         &mut self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: &str,
-        observation: ProviderEvent,
+        observation: OwnerObservation,
     ) -> Result<ForegroundAction> {
         let mut events = Vec::new();
         let effects =
@@ -6542,9 +6790,10 @@ impl HarnessBroker {
     /// Capture a child completion and cancel only that owner's approvals unlocked.
     pub(crate) fn prepare_foreground_agent_completion(
         &self,
-        owner: crate::provider::ExecutionOwner,
+        owner: crate::provider::ThreadOwner,
         task_id: String,
         output: Result<crate::provider::ProviderCompletion>,
+        host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
         cleanup_error: Option<String>,
     ) -> Result<ForegroundAction> {
         let task = self
@@ -6552,8 +6801,8 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
-                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
@@ -6572,6 +6821,7 @@ impl HarnessBroker {
                     owner,
                     task_id,
                     output,
+                    host_file_changes,
                     cleanup_error,
                     approvals,
                 }),
@@ -6597,6 +6847,7 @@ impl HarnessBroker {
             owner,
             task_id,
             output,
+            host_file_changes,
             cleanup_error,
             approvals,
         } = completion;
@@ -6605,8 +6856,8 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion disappeared")?;
         anyhow::ensure!(
-            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
-                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
+            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion owner changed during approval cancellation"
         );
         if task.completed_at_ms.is_some() {
@@ -6614,7 +6865,7 @@ impl HarnessBroker {
         }
         anyhow::ensure!(
             self.child_exchange_runtime_by_agent
-                .get(owner.agent_id.as_str())
+                .get(owner.agent_id().as_str())
                 .is_none_or(|runtime| runtime.exchange.id == task_id),
             "late child completion cannot settle a newer child exchange"
         );
@@ -6622,7 +6873,7 @@ impl HarnessBroker {
         for approval in approvals {
             if let Some(runtime) = self
                 .child_exchange_runtime_by_agent
-                .get_mut(owner.agent_id.as_str())
+                .get_mut(owner.agent_id().as_str())
             {
                 anyhow::ensure!(
                     runtime.exchange.id == task_id,
@@ -6636,11 +6887,21 @@ impl HarnessBroker {
                 self.store.save_exchange(&runtime.exchange)?;
             }
             effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
-                update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval)),
+                execution_owner: approval
+                    .execution_owner
+                    .clone()
+                    .context("approval lost original owner")?,
+                execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
             }));
         }
-        let (state, next) =
-            self.apply_managed_agent_completion(owner, task_id, output, cleanup_error)?;
+        let (state, next) = self.apply_managed_agent_completion(
+            owner,
+            task_id,
+            output,
+            host_file_changes,
+            cleanup_error,
+        )?;
         effects.push(state);
         if let Some(next) = next {
             transaction
@@ -6686,8 +6947,13 @@ impl HarnessBroker {
         match started {
             Some((owner, task_id, error)) => {
                 transaction.pending_agent_reply = reply;
-                let action =
-                    self.prepare_foreground_agent_completion(owner, task_id, Err(error), None)?;
+                let action = self.prepare_foreground_agent_completion(
+                    owner,
+                    task_id,
+                    Err(error),
+                    Vec::new(),
+                    None,
+                )?;
                 transaction.agent_command_active = matches!(
                     &action,
                     ForegroundAction::Effect(ForegroundJob::AgentCancelApprovals { .. })
@@ -6708,7 +6974,9 @@ impl HarnessBroker {
         &self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
-        if !self.capability.native_steer {
+        if !self.capability.native_steer
+            || self.requires_explicit_continuation(&transaction.state.interaction)?
+        {
             return Ok(ForegroundAction::Wait);
         }
         for task in self.agent_coordinator.unreported_result() {
@@ -6750,10 +7018,11 @@ impl HarnessBroker {
         let captured = (|| -> Result<Vec<AgentInterruptItem>> {
             let mut items = Vec::new();
             let agent = self.agent_coordinator.resolve(&target)?;
-            let owner = crate::provider::ExecutionOwner {
-                session_id: self.session.id.clone().into(),
-                agent_id: agent.id.clone().into(),
-            };
+            let owner = crate::provider::ThreadOwner::new(
+                self.session.id.clone().into(),
+                crate::provider::AgentId::new(agent.id.clone())?,
+            )
+            .expect("registered session and agent identities are nonempty");
             let cancelled = self.agent_coordinator.interrupt(&target)?;
             let cleanup = self.agent_coordinator.cleanup_task(&agent.id);
             let provider = if cleanup.is_some() {
@@ -6835,7 +7104,7 @@ impl HarnessBroker {
                 .context("agent request has no active authenticated root authority")?;
             anyhow::ensure!(
                 !*authority.expired.borrow()
-                    && authority.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+                    && authority.owner == crate::provider::ThreadOwner::root(&self.session.id)
                     && authority.parent_exchange_id == owned.parent_id
                     && self.agent_coordinator.enabled(),
                 "agent request has no active authenticated root authority"
@@ -6854,7 +7123,7 @@ impl HarnessBroker {
         &mut self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
-        let Some(command) = self.agent_coordinator.try_receive() else {
+        let Some(command) = self.agent_coordinator.try_receive_foreground() else {
             if transaction.pending_agent_launch.is_empty()
                 && let Some(work) = self.agent_coordinator.ready_launch()?
             {
@@ -6879,8 +7148,15 @@ impl HarnessBroker {
                 owner,
                 task_id,
                 output,
+                host_file_changes,
                 cleanup_error,
-            } => self.prepare_foreground_agent_completion(owner, task_id, *output, cleanup_error),
+            } => self.prepare_foreground_agent_completion(
+                owner,
+                task_id,
+                *output,
+                host_file_changes,
+                cleanup_error,
+            ),
             crate::agent::AgentCommand::Request {
                 request,
                 authority,
@@ -7046,10 +7322,11 @@ impl HarnessBroker {
                     return Ok(ForegroundAction::Wait);
                 }
                 if let Some(registry) = self.child_execution_by_agent.get(&agent.id) {
-                    let owner = crate::provider::ExecutionOwner {
-                        session_id: self.session.id.clone().into(),
-                        agent_id: agent.id.clone().into(),
-                    };
+                    let owner = crate::provider::ThreadOwner::new(
+                        self.session.id.clone().into(),
+                        crate::provider::AgentId::new(agent.id.clone())?,
+                    )
+                    .expect("registered session and agent identities are nonempty");
                     Ok(ForegroundAction::Effect(ForegroundJob::AgentMessageSteer {
                         registry: registry.clone(),
                         owner,
@@ -7114,8 +7391,8 @@ impl HarnessBroker {
                     .iter()
                     .any(|approval| {
                         approval.execution_owner.as_ref().is_some_and(|owner| {
-                            owner.agent_id == forge_provider_api::AgentId::from(agent.id.as_str())
-                                && owner.session_id
+                            owner.agent_id().as_str() == agent.id.as_str()
+                                && *owner.session_id()
                                     == forge_provider_api::SessionId::from(self.session.id.as_str())
                         })
                     });
@@ -7186,7 +7463,7 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         owned: OwnedAgentRequest,
         captured: Option<(
-            crate::provider::ExecutionOwner,
+            crate::provider::ThreadOwner,
             Arc<crate::provider::session_execution::SessionExecutionRegistry>,
         )>,
         result: Result<()>,
@@ -7206,9 +7483,9 @@ impl HarnessBroker {
             let mut agent = self.agent_coordinator.resolve(target)?;
             if let Some((owner, registry)) = &captured {
                 anyhow::ensure!(
-                    owner.session_id
+                    *owner.session_id()
                         == forge_provider_api::SessionId::from(self.session.id.as_str())
-                        && owner.agent_id == forge_provider_api::AgentId::from(agent.id.as_str())
+                        && owner.agent_id().as_str() == agent.id.as_str()
                         && self
                             .child_execution_by_agent
                             .get(&agent.id)
@@ -7318,8 +7595,12 @@ impl HarnessBroker {
                 _ => anyhow::bail!("child admission has another operation"),
             };
             if let Err(error) = parent.append_agent_task(&admission.task).and_then(|_| {
-                self.store
-                    .admit_agent_task(&admission.agent, &admission.task, &parent)
+                self.store.admit_agent_task(
+                    &admission.agent,
+                    &admission.task,
+                    &parent,
+                    admission.continuation_authorization(),
+                )
             }) {
                 return Err(match admission.cancel() {
                     Ok(()) => error,
@@ -7424,7 +7705,7 @@ impl HarnessBroker {
                     approvals,
                 } = item;
                 anyhow::ensure!(
-                    owner.session_id
+                    *owner.session_id()
                         == forge_provider_api::SessionId::from(self.session.id.as_str())
                         && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
                     "interrupted child authority changed during cleanup"
@@ -7440,7 +7721,7 @@ impl HarnessBroker {
                 for approval in approvals {
                     if let Some(runtime) = self
                         .child_exchange_runtime_by_agent
-                        .get_mut(owner.agent_id.as_str())
+                        .get_mut(owner.agent_id().as_str())
                     {
                         runtime.exchange.observe_blocker(
                             format!("approval:{}", approval.id),
@@ -7450,7 +7731,12 @@ impl HarnessBroker {
                         self.store.save_exchange(&runtime.exchange)?;
                     }
                     effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
-                        update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval)),
+                        execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                        execution_owner: approval
+                            .execution_owner
+                            .clone()
+                            .context("approval lost original owner")?,
+                        update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
                     }));
                 }
                 for mut task in cancelled {
@@ -7493,11 +7779,15 @@ impl HarnessBroker {
                     self.store.complete_agent_task(&agent, &task, &exchange)?;
                     self.agent_registry.insert(agent.clone());
                     self.agent_coordinator.retain(agent, task.clone())?;
-                    self.agent_coordinator
-                        .settled(owner.agent_id.as_str(), &task.id, false)?;
-                    self.child_provider_by_agent.remove(owner.agent_id.as_str());
+                    self.agent_coordinator.settled(
+                        owner.agent_id().as_str(),
+                        &task.id,
+                        crate::agent::AgentSettlementDisposition::Ready,
+                    )?;
+                    self.child_provider_by_agent
+                        .remove(owner.agent_id().as_str());
                     self.child_execution_by_agent
-                        .remove(owner.agent_id.as_str());
+                        .remove(owner.agent_id().as_str());
                 }
                 effects.push(self.prepare_agent_state()?);
             }
@@ -7876,7 +8166,7 @@ impl HarnessBroker {
         transaction: &mut OwnedForegroundTransaction,
     ) -> Result<Exchange> {
         anyhow::ensure!(
-            transaction.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
+            transaction.scope.owner == crate::provider::ThreadOwner::root(&self.session.id),
             "foreground transaction crosses execution ownership"
         );
         anyhow::ensure!(
@@ -7957,93 +8247,164 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        provider_event: ProviderEvent,
-        event: &mut Vec<SessionEvent>,
+        observation: HarnessEvent,
+        _events: &mut Vec<SessionEvent>,
     ) -> Result<AppliedProviderEvent> {
-        let scope = provider_event.scope();
-        if scope.owner() != &crate::provider::ExecutionOwner::root(&self.session.id) {
-            self.trace.record(
-                &self.session.id,
-                "provider.event.rejected",
-                json!({"code":"foreign_execution_owner","scope":scope}),
+        let scope = observation.scope();
+        if scope.owner() != &crate::provider::ThreadOwner::root(&self.session.id) {
+            return self.apply_observed_child(&observation);
+        }
+
+        anyhow::ensure!(
+            scope.owner() == &crate::provider::ThreadOwner::root(&self.session.id),
+            "root event crosses original owner"
+        );
+        if let Some(invocation) = scope.invocation() {
+            anyhow::ensure!(
+                invocation.exchange_id
+                    == forge_provider_api::ExchangeId::from(interaction.id.as_str())
+                    || interaction
+                        .turn
+                        .iter()
+                        .any(|turn| &turn.provider().scope == invocation),
+                "event has no owning exchange"
             );
-            return Ok(AppliedProviderEvent::None);
         }
-        if scope.invocation().is_some_and(|scope| {
-            scope.exchange_id != forge_provider_api::ExchangeId::from(interaction.id.as_str())
-                && !interaction
-                    .turn
-                    .iter()
-                    .any(|turn| &turn.provider().scope == scope)
-        }) {
-            return Ok(AppliedProviderEvent::None);
-        }
-        match provider_event {
-            ProviderEvent::Terminals { snapshot, .. } => {
-                Ok(AppliedProviderEvent::Update(SessionUpdate::Terminals {
-                    snapshot,
-                }))
-            }
-            ProviderEvent::CapabilitiesChanged { capabilities, .. } => {
-                self.apply_effective_capabilities(capabilities)?;
-                Ok(AppliedProviderEvent::None)
-            }
-            ProviderEvent::SessionIdentity {
+        match &observation {
+            HarnessEvent::Native {
+                source,
                 scope,
-                provider_session_id,
-            } => {
-                self.retain_session_identity(scope.owner(), &provider_session_id)?;
-                Ok(AppliedProviderEvent::None)
-            }
-            ProviderEvent::DirectoryAccess { grant, .. } => Ok(AppliedProviderEvent::Update(
-                self.apply_directory_access(grant)?,
-            )),
-            ProviderEvent::Runtime {
-                update: crate::provider::RuntimeUpdate::Resolved { runtime: resolved },
-                ..
-            } => Ok(AppliedProviderEvent::Update(
-                self.apply_resolved_runtime(resolved)?,
-            )),
-            ProviderEvent::Compaction { scope, update } => {
-                let observation = ProviderEvent::Compaction {
-                    scope,
-                    update: update.clone(),
-                };
-                Ok(
+                event,
+            } => match event.as_ref() {
+                ProviderEvent::Agent { agent_id, event } => {
+                    self.apply_agent_lifecycle(source, scope, agent_id, event)
+                }
+                ProviderEvent::Provider {
+                    event: forge_provider_api::ProviderConnectionEvent::Unavailable(_),
+                } => self.apply_observed_child(&observation),
+                ProviderEvent::Provider {
+                    event:
+                        forge_provider_api::ProviderConnectionEvent::CapabilitiesChanged(manifest),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        None,
+                    )? == crate::provider::NativeBindingStatus::Active
+                    {
+                        self.apply_effective_capabilities(manifest.clone())?;
+                    }
+                    Ok(AppliedProviderEvent::None)
+                }
+                ProviderEvent::Thread {
+                    thread_id,
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(id),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        Some(thread_id),
+                    )? == crate::provider::NativeBindingStatus::RetiredKnown
+                    {
+                        return Ok(AppliedProviderEvent::None);
+                    }
+                    self.retain_session_identity(scope.owner(), id)?;
+                    Ok(AppliedProviderEvent::None)
+                }
+                ProviderEvent::Thread {
+                    event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+                    ..
+                } => Ok(
                     match self.apply_compaction_observation(
                         runtime,
                         interaction,
-                        observation,
-                        *update,
+                        observation.clone(),
+                        (**compaction).clone(),
                     )? {
                         Some(patch) => AppliedProviderEvent::Timeline(patch),
                         None => AppliedProviderEvent::None,
                     },
-                )
-            }
-            ProviderEvent::Approval { update, .. } => Ok(
-                match self.apply_approval_observation(interaction, update)? {
-                    Some(pending) => AppliedProviderEvent::Live(pending),
-                    None => AppliedProviderEvent::None,
-                },
-            ),
-            ProviderEvent::ParentBoundary { update, .. } => Ok(AppliedProviderEvent::Live(
-                self.apply_parent_boundary(runtime, interaction, update)?,
-            )),
-            ProviderEvent::Agent {
-                update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
-                scope,
-            } => {
-                self.apply_agent_lifecycle(&lifecycle, Some(&scope), event)?;
-                Ok(AppliedProviderEvent::None)
-            }
-            ProviderEvent::Agent { .. } => Ok(AppliedProviderEvent::None),
-            ProviderEvent::Diagnostic { diagnostic, .. } => {
-                Ok(AppliedProviderEvent::Update(SessionUpdate::Diagnostic {
-                    diagnostic,
-                }))
-            }
-            content => self.apply_exchange_content(runtime, interaction, content),
+                ),
+                ProviderEvent::Thread {
+                    thread_id,
+                    event: forge_provider_api::ThreadEvent::ContextUsage(usage),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        Some(thread_id),
+                    )? == crate::provider::NativeBindingStatus::RetiredKnown
+                    {
+                        return Ok(AppliedProviderEvent::None);
+                    }
+                    self.session.context_usage = Some(usage.clone());
+                    self.context_usage_fresh = true;
+                    self.apply_exchange_content(runtime, interaction, observation)
+                }
+                ProviderEvent::Provider { .. }
+                | ProviderEvent::Thread { .. }
+                | ProviderEvent::Turn { .. }
+                | ProviderEvent::Item { .. } => {
+                    self.apply_exchange_content(runtime, interaction, observation)
+                }
+            },
+            HarnessEvent::Host { scope, event } => match event {
+                HostEvent::CapabilitiesNegotiated {
+                    binding_id,
+                    manifest,
+                    history,
+                } => {
+                    self.apply_negotiated_capabilities(
+                        scope,
+                        binding_id,
+                        manifest,
+                        history.as_ref(),
+                    )?;
+                    Ok(AppliedProviderEvent::None)
+                }
+                HostEvent::DirectoryAccessGranted(grant) => Ok(AppliedProviderEvent::Update(
+                    self.apply_directory_access(vec![grant.grant.clone()])?,
+                )),
+                HostEvent::PermissionApproval {
+                    execution_kind,
+                    event,
+                } => Ok(
+                    match self.apply_approval_observation(
+                        interaction,
+                        scope.clone(),
+                        *execution_kind,
+                        event.clone(),
+                    )? {
+                        Some(pending) => AppliedProviderEvent::Live(pending),
+                        None => AppliedProviderEvent::None,
+                    },
+                ),
+                HostEvent::ChildWait {
+                    thread_id,
+                    turn_id,
+                    event,
+                } => {
+                    anyhow::ensure!(
+                        interaction
+                            .turn
+                            .iter()
+                            .any(|turn| turn.provider().thread_id == *thread_id
+                                && turn.provider().turn_id == *turn_id
+                                && Some(&turn.provider().scope) == scope.invocation()),
+                        "child wait does not address its original parent turn"
+                    );
+                    Ok(AppliedProviderEvent::Live(self.apply_parent_boundary(
+                        runtime,
+                        interaction,
+                        event.clone(),
+                    )?))
+                }
+                HostEvent::RetryUpdated { .. }
+                | HostEvent::SkillRead { .. }
+                | HostEvent::Failure { .. } => {
+                    self.apply_exchange_content(runtime, interaction, observation)
+                }
+            },
         }
     }
 
@@ -8084,6 +8445,37 @@ impl HarnessBroker {
         published.manifest = None;
         self.capability = capability;
         self.latest_manifest = None;
+        Ok(())
+    }
+
+    /// Adopt a bridge-published open or configuration manifest for the root conversation.
+    ///
+    /// Child bindings negotiate their own manifests, which never change the root session's
+    /// persisted fork and compaction support, so this applies only root-owned snapshots. A
+    /// manifest queued by a binding that retired before observation is stale, matching the
+    /// native capability path's active-binding gate.
+    fn apply_negotiated_capabilities(
+        &mut self,
+        scope: &forge_provider_api::EventScope,
+        binding_id: &forge_provider_api::BindingId,
+        manifest: &forge_provider_api::CapabilityManifest,
+        history: Option<&forge_provider_api::ProviderSessionId>,
+    ) -> Result<()> {
+        if scope.owner() == &crate::provider::ThreadOwner::root(&self.session.id)
+            && self
+                .provider
+                .binding_source_status(binding_id, scope.owner(), None)?
+                == crate::provider::NativeBindingStatus::Active
+        {
+            self.apply_effective_capabilities(manifest.clone())?;
+            // The first input opens the native conversation lazily; retaining its reported
+            // history here lets a restart or fork resume that conversation instead of a new one.
+            if let Some(history) = history
+                && self.session.provider_session_id.as_deref() != Some(history.as_str())
+            {
+                self.retain_session_identity(scope.owner(), history)?;
+            }
+        }
         Ok(())
     }
 
@@ -8152,88 +8544,89 @@ impl HarnessBroker {
         Ok(())
     }
 
-    /// Persist resolved native identity and prepare its session update.
-    fn apply_resolved_runtime(
-        &mut self,
-        resolved: crate::provider::ProviderRuntime,
-    ) -> Result<SessionUpdate> {
-        if !resolved.provider.is_empty() {
-            self.session.provider_label = resolved.provider;
-        }
-        if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
-            self.session.resolved_model = Some(model);
-        }
-        self.save_session()?;
-        Ok(SessionUpdate::Runtime {
-            session_id: self.session.id.clone(),
-            runtime: crate::provider::ProviderRuntime {
-                provider: self.session.provider_label.clone(),
-                model: self.session.resolved_model.clone(),
-            },
-        })
-    }
-
     /// Apply approval ownership and return ordered publication work without awaiting delivery.
     fn apply_approval_observation(
         &mut self,
         interaction: &mut Exchange,
-        update: crate::provider::ApprovalUpdate,
+        scope: crate::provider::EventScope,
+        execution_kind: crate::provider::ApprovalExecutionKind,
+        update: PermissionApprovalEvent,
     ) -> Result<Option<PendingLivePublication>> {
-        use crate::provider::ApprovalUpdate;
-        let update = match update {
-            ApprovalUpdate::Requested(request) => {
-                if !self
-                    .permission_coordinator
-                    .pending_list()?
-                    .iter()
-                    .any(|approval| approval.id == request.id)
-                {
-                    return Ok(None);
-                }
-                let turn = interaction
-                    .turn
-                    .iter()
-                    .rev()
-                    .find(|turn| turn.state() == crate::turn::TurnState::Running);
-                let Some(approval) = self.permission_coordinator.bind_owner(
-                    &request.id,
-                    &interaction.id,
-                    turn.map(|turn| turn.id()),
-                )?
-                else {
-                    return Ok(None);
-                };
-                interaction.observe_blocker(
-                    format!("approval:{}", approval.id),
-                    true,
-                    self.clock.now_ms(),
-                );
-                ApprovalUpdate::Requested(approval)
+        let (id, pending) = match &update {
+            PermissionApprovalEvent::Requested(request) => (request.request_id.as_str(), true),
+            PermissionApprovalEvent::Resolved(resolution) => {
+                (resolution.request_id.as_str(), false)
             }
-            update @ (ApprovalUpdate::Resolved(_) | ApprovalUpdate::Cancelled(_)) => {
-                let approval = match &update {
-                    ApprovalUpdate::Resolved(approval) | ApprovalUpdate::Cancelled(approval) => {
-                        approval
-                    }
-                    ApprovalUpdate::Requested(_) => unreachable!(),
-                };
-                interaction.observe_blocker(
-                    format!("approval:{}", approval.id),
-                    false,
-                    self.clock.now_ms(),
-                );
-                interaction.approval_resolution.push(approval.clone());
-                update
+            PermissionApprovalEvent::Cancelled(cancellation) => {
+                (cancellation.request_id.as_str(), false)
             }
         };
+        if pending
+            && !self
+                .permission_coordinator
+                .pending_list()?
+                .iter()
+                .any(|request| request.id == id)
+        {
+            return Ok(None);
+        }
+        if !pending
+            && !interaction.observe_host_event(
+                &scope,
+                &HostEvent::PermissionApproval {
+                    execution_kind,
+                    event: update.clone(),
+                },
+                self.clock.now_ms(),
+            )?
+        {
+            return Ok(None);
+        }
+        interaction.observe_blocker(format!("approval:{id}"), pending, self.clock.now_ms());
         self.store.save_exchange(interaction)?;
         let timeline = self.reconcile_timeline()?;
         Ok(Some(PendingLivePublication {
             update: SessionUpdate::Approval {
+                execution_owner: scope.owner().clone(),
+                execution_kind,
                 update: Box::new(update),
             },
             timeline,
         }))
+    }
+
+    /// Publish actual Harness child-wait transitions under their admitted parent turn.
+    fn publish_child_wait(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        event: ChildWaitEvent,
+    ) -> Result<PendingProviderDelivery> {
+        let scope = transaction.state.scope.clone();
+        let observation = HarnessEvent::Host {
+            scope: scope.clone().into(),
+            event: HostEvent::ChildWait {
+                thread_id: scope.owner.thread_id(),
+                turn_id: scope.turn_id()?,
+                event,
+            },
+        };
+        self.trace.record(
+            &self.session.id,
+            "host.child_wait",
+            serde_json::to_value(&observation)?,
+        );
+        let runtime = transaction
+            .state
+            .runtime
+            .as_mut()
+            .context("child wait has no retained parent runtime")?;
+        let effects = self.apply_provider_event(
+            runtime,
+            &mut transaction.state.interaction,
+            observation,
+            &mut Vec::new(),
+        )?;
+        self.prepare_provider_delivery(effects)
     }
 
     /// Apply a parent wait transition and prepare its ordered publication.
@@ -8241,11 +8634,11 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        update: crate::provider::ParentBoundaryUpdate,
+        update: ChildWaitEvent,
     ) -> Result<PendingLivePublication> {
         let now_ms = self.clock.now_ms();
         match update {
-            crate::provider::ParentBoundaryUpdate::WaitStarted { agent_count } => {
+            ChildWaitEvent::Started { agent_count } => {
                 interaction.observe_blocker("agent_wait".into(), true, now_ms);
                 interaction.close_running_messages();
                 runtime.active_wait = Some(ActiveWait {
@@ -8254,12 +8647,12 @@ impl HarnessBroker {
                     agent_count,
                 });
             }
-            crate::provider::ParentBoundaryUpdate::WaitUpdated { agent_count } => {
+            ChildWaitEvent::Updated { agent_count } => {
                 if let Some(wait) = runtime.active_wait.as_mut() {
                     wait.agent_count = agent_count;
                 }
             }
-            crate::provider::ParentBoundaryUpdate::WaitFinished => {
+            ChildWaitEvent::Finished => {
                 interaction.observe_blocker("agent_wait".into(), false, now_ms);
                 runtime.active_wait = None;
             }
@@ -8276,18 +8669,169 @@ impl HarnessBroker {
         Ok(PendingLivePublication { update, timeline })
     }
 
-    /// Persist a native turn transition and prepare its publication.
-    fn apply_turn_observation(
+    /// Apply an already committed acceptance receipt directly to its original session input owner.
+    pub(crate) fn apply_input_acceptance(
         &mut self,
-        interaction: &Exchange,
-        address: &crate::provider::TurnAddress,
-        update: &crate::provider::TurnUpdate,
-    ) -> Result<Option<SessionUpdate>> {
-        self.store.save_exchange(interaction)?;
-        Ok(SessionUpdate::from_observation(&ProviderEvent::Turn {
-            address: address.clone(),
-            update: update.clone(),
-        }))
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        receipt: &Arc<crate::provider::submission::Submission>,
+        acknowledgement: &InputPresentation,
+    ) -> Result<AppliedProviderEvent> {
+        let input_id = Some(
+            receipt
+                .record()?
+                .input_message_id
+                .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned()),
+        );
+        let mut effects = Vec::new();
+        runtime.retraction_eligibility.consume();
+        let now_ms = self.clock.now_ms();
+        match acknowledgement {
+            InputPresentation::TaskStarted { start, prompt } => {
+                let input_id = input_id
+                    .as_ref()
+                    .context("task entry is missing its input identity")?;
+                if self.task_controller.current()?.is_some_and(|task| {
+                    task.entry.as_ref().is_some_and(|entry| {
+                        entry.id.as_str() == input_id
+                            && entry.review_exchange.as_deref() == Some(&interaction.id)
+                    })
+                }) {
+                    interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                    runtime.active_wait = None;
+                    self.store.save_exchange(interaction)?;
+                    return Ok(AppliedProviderEvent::Effects(effects));
+                }
+                let id = format!("{}:task-start:{input_id}", self.session.id);
+                if let Some(existing) = self.store.load_session_event(&self.session.id, &id)? {
+                    anyhow::ensure!(
+                        matches!(existing.detail,
+                                    SessionEventKind::TaskStarted { start: previous, prompt: previous_prompt }
+                                    if previous == *start && previous_prompt == *prompt),
+                        "task entry identity was reused for different content"
+                    );
+                    return Ok(AppliedProviderEvent::Effects(effects));
+                }
+                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                runtime.active_wait = None;
+                self.store.save_exchange(interaction)?;
+                let task_event = crate::timeline::SessionEventRecord {
+                    id,
+                    session_id: self.session.id.clone(),
+                    owner: self
+                        .store
+                        .capture_timeline_owner(&self.session.id, &interaction.id)?,
+                    created_at_ms: now_ms,
+                    detail: SessionEventKind::TaskStarted {
+                        start: start.clone(),
+                        prompt: prompt.clone(),
+                    },
+                };
+                self.store.save_session_event(&task_event)?;
+                let mut displayed = interaction.clone();
+                crate::timeline::ownership::insert_event(
+                    &mut displayed,
+                    crate::timeline::TimelineEvent::Session {
+                        event: Box::new(task_event),
+                    },
+                )?;
+                effects.push(self.prepare_live_interaction(
+                    SessionUpdate::Timeline {
+                        update: TimelineUpdate::Node { prompt: None },
+                    },
+                    &displayed,
+                )?);
+            }
+            InputPresentation::Steering { text } => {
+                if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
+                                matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
+                                return Ok(AppliedProviderEvent::Effects(effects));
+                            }
+                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                runtime.active_wait = None;
+                interaction.append_acknowledged_input(
+                    input_id.clone(),
+                    crate::exchange::InputIntent::Steering,
+                    text.clone(),
+                    now_ms,
+                )?;
+                self.store.save_exchange(interaction)?;
+                let prompt = interaction.node_list.last().and_then(|node| match node {
+                    ExchangeNode::ExchangeInput { prompt } => Some(prompt.clone()),
+                    _ => None,
+                });
+                effects.push(self.prepare_live_interaction(
+                    SessionUpdate::Timeline {
+                        update: TimelineUpdate::Node { prompt },
+                    },
+                    interaction,
+                )?);
+            }
+        }
+        self.active_wait_projection = runtime.active_wait.clone();
+        effects.push(self.prepare_live_interaction(
+            SessionUpdate::Timeline {
+                update: TimelineUpdate::Wait {
+                    exchange_id: interaction.id.clone(),
+                    wait: runtime.active_wait.clone(),
+                },
+            },
+            interaction,
+        )?);
+        Ok(AppliedProviderEvent::Effects(effects))
+    }
+
+    /// Persist accepted input once under the journal's original owner, including after UI failure.
+    fn apply_durable_input_acceptance(
+        &mut self,
+        interaction: &mut Exchange,
+        scope: &crate::provider::InvocationScope,
+        receipt: &Arc<crate::provider::submission::Submission>,
+        presentation: &InputPresentation,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            scope.exchange_id.as_str() == interaction.id
+                && scope.owner.session_id().as_str() == interaction.session_id
+                && scope.owner.agent_id().as_str() == interaction.agent_id,
+            "accepted input crosses original ownership"
+        );
+        self.acknowledge_user_child_reports(scope, receipt)?;
+        let id = receipt
+            .record()?
+            .input_message_id
+            .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned());
+        let now_ms = self.clock.now_ms();
+        match presentation {
+            InputPresentation::Steering { text } => {
+                if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
+                    interaction.append_acknowledged_input(Some(id), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
+                }
+            }
+            InputPresentation::TaskStarted { start, prompt } => {
+                let event_id = format!("{}:task-start:{id}", self.session.id);
+                if self
+                    .store
+                    .load_session_event(&self.session.id, &event_id)?
+                    .is_none()
+                {
+                    let record = crate::timeline::SessionEventRecord {
+                        id: event_id,
+                        session_id: self.session.id.clone(),
+                        owner: self
+                            .store
+                            .capture_timeline_owner(&self.session.id, &interaction.id)?,
+                        created_at_ms: now_ms,
+                        detail: SessionEventKind::TaskStarted {
+                            start: start.clone(),
+                            prompt: prompt.clone(),
+                        },
+                    };
+                    self.store.save_session_event(&record)?;
+                }
+            }
+        }
+        interaction.observe_blocker("agent_wait".into(), false, now_ms);
+        self.store.save_exchange(interaction)
     }
 
     /// Apply ordinary content and retain ordered publication effects.
@@ -8295,234 +8839,124 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        provider_event: ProviderEvent,
+        observation: HarnessEvent,
     ) -> Result<AppliedProviderEvent> {
-        let mut effects = Vec::new();
-        self.prepare_provider_observation(interaction, &provider_event);
-        if provider_event.turn_address().is_some_and(|address| {
-            self.observed_agent_conversations
-                .iter()
-                .any(|(invocation, conversation)| {
-                    invocation == &address.scope.invocation_id
-                        && conversation.as_str() == address.thread_id
-                })
-                || self
-                    .agent_registry
-                    .get_by_thread(&address.thread_id)
-                    .is_some_and(|agent| !agent.is_primary())
-        }) {
-            return Ok(AppliedProviderEvent::Effects(effects));
-        }
-        if let Some(routed) = self.apply_settled_parent_event(interaction, &provider_event)? {
+        self.prepare_provider_observation(interaction, &observation);
+        if let Some(routed) = self.apply_settled_parent_event(interaction, &observation)? {
             return Ok(routed);
         }
-        if !interaction.observe_turn(&provider_event, self.clock.now_ms())? {
-            self.trace.record(&self.session.id, "provider.event.rejected",
-                    json!({"exchange_id":interaction.id,"code":"execution_unknown_or_settled","event":provider_event}));
-            return Ok(AppliedProviderEvent::Effects(effects));
+        let applied = match &observation {
+            HarnessEvent::Native { scope, event, .. } => {
+                let event = event.as_ref();
+                interaction.observe_provider_event(scope, event, self.clock.now_ms())?
+            }
+            HarnessEvent::Host { scope, event } => {
+                interaction.observe_host_event(scope, event, self.clock.now_ms())?
+            }
+        };
+        if !applied {
+            return Ok(SessionUpdate::from_observation(&observation)
+                .map_or(AppliedProviderEvent::None, AppliedProviderEvent::Update));
         }
-        match &provider_event {
-            ProviderEvent::Turn { address, update } => {
-                let pending = self.apply_turn_observation(interaction, address, update)?;
-                if let Some(update) = pending {
-                    effects.push(AppliedProviderEvent::Update(update));
+        if let HarnessEvent::Native { event, .. } = &observation {
+            match event.as_ref() {
+                ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::ChecklistUpdated(update),
+                    ..
+                } => {
+                    runtime.retraction_eligibility.consume();
+                    runtime.checklist.replace(update);
+                    interaction.checklist = Some(runtime.checklist.snapshot().clone());
                 }
-                return Ok(AppliedProviderEvent::Effects(effects));
-            }
-            ProviderEvent::InputAccepted {
-                acknowledgement, ..
-            } => {
-                runtime.retraction_eligible = false;
-                let now_ms = self.clock.now_ms();
-                match acknowledgement {
-                    crate::provider::InputAcknowledgement::TaskStarted {
-                        input_id,
-                        start,
-                        prompt,
-                    } => {
-                        let input_id = input_id
-                            .as_ref()
-                            .context("task entry is missing its input identity")?;
-                        if self.task_controller.current()?.is_some_and(|task| {
-                            task.entry.as_ref().is_some_and(|entry| {
-                                entry.id.as_str() == input_id
-                                    && entry.review_exchange.as_deref() == Some(&interaction.id)
-                            })
-                        }) {
-                            interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                            runtime.active_wait = None;
-                            self.store.save_exchange(interaction)?;
-                            return Ok(AppliedProviderEvent::Effects(effects));
-                        }
-                        let id = format!("{}:task-start:{input_id}", self.session.id);
-                        if let Some(existing) =
-                            self.store.load_session_event(&self.session.id, &id)?
-                        {
-                            anyhow::ensure!(
-                                matches!(existing.detail,
-                                    SessionEventKind::TaskStarted { start: previous, prompt: previous_prompt }
-                                    if previous == *start && previous_prompt == *prompt),
-                                "task entry identity was reused for different content"
-                            );
-                            return Ok(AppliedProviderEvent::Effects(effects));
-                        }
-                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                        runtime.active_wait = None;
-                        self.store.save_exchange(interaction)?;
-                        let task_event = crate::timeline::SessionEventRecord {
-                            id,
-                            session_id: self.session.id.clone(),
-                            owner: self
-                                .store
-                                .capture_timeline_owner(&self.session.id, &interaction.id)?,
-                            created_at_ms: now_ms,
-                            detail: SessionEventKind::TaskStarted {
-                                start: start.clone(),
-                                prompt: prompt.clone(),
-                            },
-                        };
-                        self.store.save_session_event(&task_event)?;
-                        let mut displayed = interaction.clone();
-                        crate::timeline::ownership::insert_event(
-                            &mut displayed,
-                            crate::timeline::TimelineEvent::Session {
-                                event: Box::new(task_event),
-                            },
-                        )?;
-                        effects.push(self.prepare_live_interaction(
-                            SessionUpdate::Timeline {
-                                update: TimelineUpdate::Node { prompt: None },
-                            },
-                            &displayed,
-                        )?);
-                    }
-                    crate::provider::InputAcknowledgement::Steering { input_id, text } => {
-                        if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
-                                matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
-                                return Ok(AppliedProviderEvent::Effects(effects));
-                            }
-                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                        runtime.active_wait = None;
-                        interaction.append_acknowledged_input(
-                            input_id.clone(),
-                            crate::exchange::InputIntent::Steering,
-                            text.clone(),
-                            now_ms,
-                        )?;
-                        self.store.save_exchange(interaction)?;
-                        let prompt = interaction.node_list.last().and_then(|node| match node {
-                            ExchangeNode::ExchangeInput { prompt } => Some(prompt.clone()),
-                            _ => None,
-                        });
-                        effects.push(self.prepare_live_interaction(
-                            SessionUpdate::Timeline {
-                                update: TimelineUpdate::Node { prompt },
-                            },
-                            interaction,
-                        )?);
-                    }
+                ProviderEvent::Item { item_id, event, .. } => {
+                    runtime.retraction_eligibility.observe_item(item_id, event);
                 }
-                self.active_wait_projection = runtime.active_wait.clone();
-                effects.push(self.prepare_live_interaction(
-                    SessionUpdate::Timeline {
-                        update: TimelineUpdate::Wait {
-                            exchange_id: interaction.id.clone(),
-                            wait: runtime.active_wait.clone(),
-                        },
-                    },
-                    interaction,
-                )?);
-                return Ok(AppliedProviderEvent::Effects(effects));
+                ProviderEvent::Provider { .. }
+                | ProviderEvent::Thread { .. }
+                | ProviderEvent::Turn { .. }
+                | ProviderEvent::Agent { .. } => {}
             }
-            ProviderEvent::Runtime {
-                update: crate::provider::RuntimeUpdate::ContextUsage { usage },
-                ..
-            } => {
-                let thread_id = self.session.provider_session_id.as_deref();
-                if let Some(thread_id) = thread_id
-                        && interaction.observe_compaction_usage(thread_id, usage.used) {
-                        self.store.save_exchange(interaction)?;
-                        let patch = self.reconcile_timeline()?;
-                        effects.push(AppliedProviderEvent::Timeline(patch));
-                    } else if let Some(thread_id) = thread_id
-                        && !interaction.node_list.iter().any(|node| matches!(node,
-                            ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id))
-                        && let Some(mut record) = self.store.list_session_event(&self.session.id)?.into_iter().rev()
-                            .find(|record| matches!(&record.detail, SessionEventKind::Compaction { compaction }
-                                if compaction.thread_id == thread_id))
-                        && let SessionEventKind::Compaction { compaction } = &mut record.detail
-                        && compaction.state == crate::provider::CompactionState::Completed
-                        && compaction.result.context_tokens_before.is_some()
-                        && compaction.result.context_tokens_after.is_none()
-                        && !self.store.list_exchange_metadata(&self.session.id)?.iter().any(|exchange|
-                            exchange.node_list.iter().any(|node| matches!(node,
-                                ExchangeNode::Compaction { compaction, .. }
-                                    if compaction.thread_id == thread_id
-                                        && compaction.started_at_ms.unwrap_or(exchange.created_at_ms) >= record.created_at_ms)))
-                        && compaction.observe_context_usage(usage.used) {
-                        self.store.save_session_event(&record)?;
-                        let patch = self.reconcile_timeline()?;
-                        effects.push(AppliedProviderEvent::Timeline(patch));
-                    }
-                self.session.context_usage = Some(usage.clone());
-                self.context_usage_fresh = true;
-                if let Some(update) = SessionUpdate::from_observation(&provider_event) {
-                    effects.push(AppliedProviderEvent::Update(update));
-                }
-                return Ok(AppliedProviderEvent::Effects(effects));
-            }
-            ProviderEvent::Checklist { update, .. } => {
-                runtime.retraction_eligible = false;
-                runtime.checklist.replace(update);
-                interaction.checklist = Some(runtime.checklist.snapshot().clone());
-                self.store.save_exchange(interaction)?;
-                effects.push(self.prepare_live_interaction(
-                    publication::LiveUpdate::StateChanged,
-                    interaction,
-                )?);
-            }
-            ProviderEvent::Tool { .. } => runtime.retraction_eligible = false,
-            ProviderEvent::Message { update, .. }
-                if update.text().is_some_and(|text| !text.is_empty()) =>
-            {
-                runtime.retraction_eligible = false
-            }
-            _ => {}
         }
-        if provider_event.turn_address().is_some() {
-            attribute_provider_tool(interaction, &mut runtime.checklist, &provider_event)?;
-            if provider_event.tool_output_delta().is_some() {
-                self.store
-                    .save_tool_output_delta(interaction, &provider_event)?;
-            } else {
-                self.store.save_exchange(interaction)?;
-            }
-            effects.push(self.prepare_live_interaction(provider_event, interaction)?);
+        let runtime_update = if let HarnessEvent::Native { scope, event, .. } = &observation
+            && let ProviderEvent::Turn {
+                thread_id,
+                turn_id,
+                event:
+                    forge_provider_api::TurnEvent::Started(_)
+                    | forge_provider_api::TurnEvent::ModelResolved(_),
+            } = event.as_ref()
+            && scope.owner().is_root()
+            && interaction.turn.last().is_some_and(|turn| {
+                &turn.provider().thread_id == thread_id && &turn.provider().turn_id == turn_id
+            }) {
+            self.session.resolved_model = interaction
+                .turn
+                .last()
+                .and_then(|turn| turn.resolved_model())
+                .map(|model| model.model_id.as_str().to_owned());
+            self.save_session()?;
+            Some(SessionUpdate::Runtime {
+                session_id: self.session.id.clone(),
+                runtime: crate::provider::ProviderRuntime {
+                    provider: self.session.provider.clone(),
+                    model: self.session.resolved_model.clone(),
+                },
+            })
         } else {
-            if let Some(update) = SessionUpdate::from_observation(&provider_event) {
-                effects.push(AppliedProviderEvent::Update(update));
+            None
+        };
+        attribute_provider_tool(interaction, &mut runtime.checklist, &observation)?;
+        match &observation {
+            HarnessEvent::Native { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    ProviderEvent::Item {
+                        event: forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::Output(
+                                forge_provider_api::TextUpdate::Append(_),
+                            ),
+                        },
+                        ..
+                    }
+                ) =>
+            {
+                self.store.save_tool_output_delta(interaction, event)?
+            }
+            HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => {
+                self.store.save_exchange(interaction)?
             }
         }
-        Ok(AppliedProviderEvent::Effects(effects))
+        let content = self.prepare_live_interaction(observation, interaction)?;
+        Ok(match runtime_update {
+            Some(update) => {
+                AppliedProviderEvent::Effects(vec![AppliedProviderEvent::Update(update), content])
+            }
+            None => content,
+        })
     }
 
     fn prepare_provider_observation(
         &mut self,
         interaction: &mut Exchange,
-        provider_event: &ProviderEvent,
+        observation: &HarnessEvent,
     ) {
         if !self.capability.compaction.background
+            && let HarnessEvent::Native {
+                event: boxed_native_event,
+                ..
+            } = observation
             && let ProviderEvent::Turn {
-                address,
-                update: crate::provider::TurnUpdate::Finished { .. },
-            } = provider_event
+                thread_id,
+                event: forge_provider_api::TurnEvent::Completed(_),
+                ..
+            } = boxed_native_event.as_ref()
         {
-            let now_ms = provider_event.observed_at_ms(self.clock.now_ms());
-            interaction.unconfirm_compaction(&address.thread_id, now_ms);
+            let now_ms = observation.observed_at_ms(self.clock.now_ms());
+            interaction.unconfirm_compaction(thread_id.as_str(), now_ms);
             for child in self.child_exchange_runtime_by_agent.values_mut() {
                 child
                     .exchange
-                    .unconfirm_compaction(&address.thread_id, now_ms);
+                    .unconfirm_compaction(thread_id.as_str(), now_ms);
             }
         }
     }
@@ -8532,11 +8966,14 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        provider_event: ProviderEvent,
+        provider_event: HarnessEvent,
         mut compaction: crate::provider::Compaction,
     ) -> Result<Option<TimelinePatch>> {
         if compaction.state == crate::provider::CompactionState::Running
-            && self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
+            && compaction.thread_id
+                == crate::provider::ThreadOwner::root(&self.session.id)
+                    .thread_id()
+                    .as_str()
         {
             compaction.result.context_tokens_before = compaction
                 .result
@@ -8566,22 +9003,16 @@ impl HarnessBroker {
             return Ok(Some(patch));
         }
         let child_id = self
-            .agent_registry
-            .get_by_thread(&compaction.thread_id)
-            .map(|agent| agent.id.clone())
-            .filter(|id| self.child_exchange_runtime_by_agent.contains_key(id))
-            .or_else(|| {
-                self.child_exchange_runtime_by_agent
+            .child_exchange_runtime_by_agent
+            .iter()
+            .find(|(_, child)| {
+                child
+                    .exchange
+                    .turn
                     .iter()
-                    .find(|(_, child)| {
-                        child
-                            .exchange
-                            .turn
-                            .iter()
-                            .any(|turn| turn.provider().thread_id == compaction.thread_id)
-                    })
-                    .map(|(id, _)| id.clone())
-            });
+                    .any(|turn| turn.provider().thread_id.as_str() == compaction.thread_id)
+            })
+            .map(|(id, _)| id.clone());
         if let Some(child_id) = child_id {
             let mut child = self
                 .child_exchange_runtime_by_agent
@@ -8594,13 +9025,16 @@ impl HarnessBroker {
                 .and_then(|()| self.reconcile_live_interaction(Some(&child.exchange), None));
             self.child_exchange_runtime_by_agent.insert(child_id, child);
             return Ok(Some(result?));
-        } else if self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        } else if compaction.thread_id
+            == crate::provider::ThreadOwner::root(&self.session.id)
+                .thread_id()
+                .as_str()
             || interaction
                 .turn
                 .iter()
-                .any(|turn| turn.provider().thread_id == compaction.thread_id)
+                .any(|turn| turn.provider().thread_id.as_str() == compaction.thread_id)
         {
-            runtime.retraction_eligible = false;
+            runtime.retraction_eligibility.consume();
             interaction.observe_compaction(compaction, now_ms);
             self.store.save_exchange(interaction)?;
             return Ok(Some(
@@ -8614,39 +9048,78 @@ impl HarnessBroker {
     fn apply_settled_parent_event(
         &mut self,
         current: &Exchange,
-        provider_event: &ProviderEvent,
+        observation: &HarnessEvent,
     ) -> Result<Option<AppliedProviderEvent>> {
-        let Some(address) = provider_event.turn_address() else {
+        let Some(address) = native_turn_address(observation) else {
             return Ok(None);
         };
-        if current.turn.iter().any(|turn| turn.provider() == address)
-            || !matches!(
-                provider_event,
-                ProviderEvent::Usage { .. }
-                    | ProviderEvent::Turn { .. }
-                    | ProviderEvent::Tool { .. }
-            )
-        {
+        if current.turn.iter().any(|turn| turn.provider() == &address) {
             return Ok(None);
         }
+        let HarnessEvent::Native { scope, event, .. } = observation else {
+            return Ok(None);
+        };
+        let event = event.as_ref();
         let Some(mut owner) = self
             .store
-            .load_provider_exchange(&self.session.id, address)?
+            .load_provider_exchange(&self.session.id, &address)?
         else {
             return Ok(None);
         };
-        let mut effects = Vec::new();
-        if matches!(provider_event, ProviderEvent::Usage { .. })
-            || matches!(provider_event, ProviderEvent::Tool { address, update } if owner.accepts_settled_tool_update(address, update))
-        {
-            owner.observe_turn(provider_event, self.clock.now_ms())?;
-            if provider_event.tool_output_delta().is_some() {
-                self.store.save_tool_output_delta(&owner, provider_event)?;
-            } else {
-                self.store.save_exchange(&owner)?;
-            }
-            let status = self.live_interaction_status(Some(current))?;
-            let patch = self
+        // The canonical item owner validates positively established background lifetime and late accounting.
+        if !owner.observe_provider_event(scope, event, self.clock.now_ms())? {
+            return Ok(Some(AppliedProviderEvent::None));
+        }
+        match event {
+            event @ ProviderEvent::Item {
+                event:
+                    forge_provider_api::ItemEvent::Tool {
+                        event:
+                            forge_provider_api::ToolItemEvent::Output(
+                                forge_provider_api::TextUpdate::Append(_),
+                            ),
+                    },
+                ..
+            } => self.store.save_tool_output_delta(&owner, event)?,
+            ProviderEvent::Provider { .. }
+            | ProviderEvent::Thread { .. }
+            | ProviderEvent::Turn { .. }
+            | ProviderEvent::Item { .. }
+            | ProviderEvent::Agent { .. } => self.store.save_exchange(&owner)?,
+        }
+        let status = self.live_interaction_status(Some(current))?;
+        let incremental = match event {
+            event @ ProviderEvent::Item {
+                event:
+                    forge_provider_api::ItemEvent::Tool {
+                        event:
+                            forge_provider_api::ToolItemEvent::Output(
+                                forge_provider_api::TextUpdate::Append(_),
+                            ),
+                    },
+                ..
+            } => self
+                .presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .append_tool_output(&owner, event)?,
+            event @ ProviderEvent::Item {
+                event: forge_provider_api::ItemEvent::Message { .. },
+                ..
+            } => self
+                .presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .update_message(&owner, event)?,
+            ProviderEvent::Provider { .. }
+            | ProviderEvent::Thread { .. }
+            | ProviderEvent::Turn { .. }
+            | ProviderEvent::Item { .. }
+            | ProviderEvent::Agent { .. } => None,
+        };
+        let patch = match incremental {
+            Some(patch) => patch,
+            None => self
                 .presentation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
@@ -8655,12 +9128,13 @@ impl HarnessBroker {
                     None,
                     status,
                     self.observer.status_thoughts.load(Ordering::Relaxed),
-                )?;
-            if let Some(update) = SessionUpdate::from_observation(provider_event) {
-                effects.push(AppliedProviderEvent::Update(update));
-            }
-            effects.push(AppliedProviderEvent::Timeline(patch));
+                )?,
+        };
+        let mut effects = Vec::new();
+        if let Some(update) = SessionUpdate::from_observation(observation) {
+            effects.push(AppliedProviderEvent::Update(update));
         }
+        effects.push(AppliedProviderEvent::Timeline(patch));
         Ok(Some(AppliedProviderEvent::Effects(effects)))
     }
 
@@ -8669,7 +9143,7 @@ impl HarnessBroker {
     async fn test_apply_settled_parent_event(
         &mut self,
         current: &Exchange,
-        provider_event: &ProviderEvent,
+        provider_event: &HarnessEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
         let Some(applied) = self.apply_settled_parent_event(current, provider_event)? else {
@@ -8687,22 +9161,50 @@ impl HarnessBroker {
         interaction: &Exchange,
     ) -> Result<AppliedProviderEvent> {
         let update = update.into();
-        let incremental = if let publication::LiveUpdate::Observation(observation) = &update {
-            if observation.tool_output_delta().is_some() {
-                self.presentation
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                    .append_tool_output(interaction, observation)?
-            } else if observation.message_delta().is_some() {
-                self.presentation
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                    .update_message(interaction, observation)?
-            } else {
+        let incremental = match &update {
+            publication::LiveUpdate::Observation(observation) => match observation.as_ref() {
+                HarnessEvent::Native { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        ProviderEvent::Item {
+                            event: forge_provider_api::ItemEvent::Tool {
+                                event: forge_provider_api::ToolItemEvent::Output(
+                                    forge_provider_api::TextUpdate::Append(_),
+                                ),
+                            },
+                            ..
+                        }
+                    ) =>
+                {
+                    self.presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                        .append_tool_output(interaction, event)?
+                }
+                HarnessEvent::Native { event, .. }
+                    if matches!(
+                        event.as_ref(),
+                        ProviderEvent::Item {
+                            event: forge_provider_api::ItemEvent::Message { .. }
+                                | forge_provider_api::ItemEvent::Completed(
+                                    forge_provider_api::ItemCompletion::UserMessage(_)
+                                        | forge_provider_api::ItemCompletion::AgentMessage(_)
+                                        | forge_provider_api::ItemCompletion::Reasoning(_),
+                                ),
+                            ..
+                        }
+                    ) =>
+                {
+                    self.presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                        .update_message(interaction, event)?
+                }
+                HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => None,
+            },
+            publication::LiveUpdate::StateChanged | publication::LiveUpdate::Notification(_) => {
                 None
             }
-        } else {
-            None
         };
         let update = match update {
             publication::LiveUpdate::StateChanged => None,
@@ -8843,7 +9345,7 @@ impl HarnessBroker {
         now_ms: i64,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
         let (interaction, admitted, mut events, effects) =
-            self.stage_interaction_for_turn(text, admit_exchange, now_ms, None)?;
+            self.stage_interaction_for_turn(text, text, admit_exchange, now_ms, None)?;
         for effect in effects {
             let delivery = self.prepare_provider_delivery(effect)?;
             events.extend(delivery.deliver().await?);
@@ -8852,9 +9354,43 @@ impl HarnessBroker {
     }
 
     /// Admit a turn and stage any previous-exchange presentation work without delivery.
+    ///
+    /// `session_title` names an unnamed session on its first exchange. Task starts pass their
+    /// title rather than the internal instruction that becomes the exchange prompt.
+    /// Close an open exchange that no continuation will resume, keeping checkpoint capture owned.
+    ///
+    /// The outcome follows the provider turns the exchange actually started. A still-running
+    /// turn makes it interrupted, and recorded turns complete it. An exchange without any turn
+    /// never reached the provider, so it is cancelled rather than reported as completed work.
+    /// A captured baseline leaves the exchange finalizing for prior finalization to settle.
+    pub(super) fn close_superseded_exchange(
+        &mut self,
+        exchange: &mut Exchange,
+        now_ms: i64,
+    ) -> Result<()> {
+        let outcome = if exchange
+            .turn
+            .iter()
+            .any(|turn| turn.state() == crate::turn::TurnState::Running)
+        {
+            crate::exchange::ExchangeOutcome::Interrupted
+        } else if exchange.turn.is_empty() {
+            crate::exchange::ExchangeOutcome::Cancelled
+        } else {
+            crate::exchange::ExchangeOutcome::Complete
+        };
+        if exchange.checkpoint_before.is_some() {
+            exchange.begin_finalization(outcome, now_ms)?;
+        } else {
+            exchange.finish(outcome, now_ms)?;
+        }
+        self.store.save_exchange(exchange)
+    }
+
     fn stage_interaction_for_turn(
         &mut self,
         text: &str,
+        session_title: &str,
         admit_exchange: bool,
         now_ms: i64,
         selected: Option<&crate::provider::ExchangeId>,
@@ -8870,20 +9406,11 @@ impl HarnessBroker {
             return Ok((interaction, false, Vec::new(), Vec::new()));
         }
         if current.latest.is_none() && self.session.name.trim().is_empty() {
-            let words = text.split_whitespace().collect::<Vec<_>>();
-            let title = if words.first().is_some_and(|word| word.starts_with('/')) {
-                words[1..].join(" ")
-            } else {
-                words.join(" ")
-            };
+            let title = automatic_session_name(session_title);
             if !title.is_empty() {
                 self.session.name = self
                     .store
-                    .initialize_session_name(
-                        &self.session.id,
-                        &self.client_id,
-                        &title.chars().take(30).collect::<String>(),
-                    )?
+                    .initialize_session_name(&self.session.id, &self.client_id, &title)?
                     .name;
                 self.save_session()?;
             }
@@ -8897,21 +9424,7 @@ impl HarnessBroker {
                 .store
                 .load_exchange(&previous.id)?
                 .context("previous running exchange disappeared")?;
-            let outcome = if previous
-                .turn
-                .iter()
-                .any(|turn| turn.state() == crate::turn::TurnState::Running)
-            {
-                crate::exchange::ExchangeOutcome::Interrupted
-            } else {
-                crate::exchange::ExchangeOutcome::Complete
-            };
-            if previous.checkpoint_before.is_some() {
-                previous.begin_finalization(outcome, now_ms)?;
-            } else {
-                previous.finish(outcome, now_ms)?;
-            }
-            self.store.save_exchange(&previous)?;
+            self.close_superseded_exchange(&mut previous, now_ms)?;
             effects.push(
                 self.prepare_live_interaction(publication::LiveUpdate::StateChanged, &previous)?,
             );
@@ -8938,6 +9451,7 @@ impl HarnessBroker {
                 checkpoint_diff_text: None,
                 attributed_matches_checkpoint: false,
                 approval_resolution: Vec::new(),
+                host_file_changes: Vec::new(),
                 check_setup: None,
                 turn: Vec::new(),
                 created_at_ms: now_ms,
@@ -9653,15 +10167,26 @@ impl HarnessBroker {
         self.store.record_rollback(&session, exchange_ids)?;
         self.session = session;
         self.context_usage_fresh = false;
+        self.rolled_back_events(first)
+    }
+
+    /// Announce a committed conversation rollback together with the transcript
+    /// patch that removes the rolled-back exchanges. Lua treats
+    /// `interaction_rolled_back` as a state refresh, which never rewrites the
+    /// transcript document, so the patch must travel with the event.
+    pub(super) fn rolled_back_events(&mut self, first: &str) -> Result<Vec<SessionEvent>> {
         let exchange = self
             .store
             .load_exchange(first)?
             .filter(|exchange| exchange.session_id == self.session.id)
             .context("rolled-back interaction disappeared")?;
-        Ok(vec![self.event(
-            "interaction_rolled_back",
-            serde_json::to_value(exchange)?,
-        )?])
+        let mut events =
+            vec![self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?];
+        let patch = self.reconcile_timeline()?;
+        if !patch.is_empty() {
+            events.push(self.event("document_changed", patch.notification())?);
+        }
+        Ok(events)
     }
 
     fn rollback_context(
@@ -9821,10 +10346,8 @@ impl HarnessBroker {
 
     async fn resume_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let session_id = required_text(&params, "session_id")?;
-        let mut session = self
-            .store
-            .load_session(&session_id)?
-            .context("session not found")?;
+        let mut session =
+            SessionNotFound::require(self.store.load_session(&session_id)?, &session_id)?;
         anyhow::ensure!(
             crate::workspace::same(&session.workspace, &self.session.workspace),
             "cross-worktree resume requires native fork"
@@ -9929,7 +10452,10 @@ impl HarnessBroker {
         now_ms: i64,
     ) -> Result<()> {
         if compaction.state == crate::provider::CompactionState::Running
-            && self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
+            && compaction.thread_id
+                == crate::provider::ThreadOwner::root(&self.session.id)
+                    .thread_id()
+                    .as_str()
         {
             compaction.result.context_tokens_before = compaction
                 .result
@@ -9988,47 +10514,33 @@ impl HarnessBroker {
     /// Retain session notifications after provider execution has released the broker.
     pub(crate) fn observe_session_event(
         &mut self,
-        event: ProviderEvent,
+        observation: OwnerObservation,
     ) -> Result<Vec<SessionEvent>> {
-        if let ProviderEvent::CapabilitiesChanged {
-            scope,
-            capabilities,
-        } = &event
-        {
-            anyhow::ensure!(
-                scope.owner() == &crate::provider::ExecutionOwner::root(&self.session.id),
-                "capability update crosses root ownership"
-            );
-            self.apply_effective_capabilities(capabilities.clone())?;
-            return Ok(Vec::new());
-        }
-        if let ProviderEvent::SessionIdentity {
-            scope,
-            provider_session_id,
-        } = &event
-        {
-            self.retain_session_identity(scope.owner(), provider_session_id)?;
-            return Ok(Vec::new());
-        }
-        if let ProviderEvent::Execution { observation } = event {
-            return self.observe_execution_lifecycle(observation);
-        }
-        let now_ms = event.observed_at_ms(self.clock.now_ms());
-        if let Some(scope) = event.scope().invocation()
-            && (self.reopened_execution.active(scope)
-                || matches!(
-                    event,
-                    ProviderEvent::Usage { .. } | ProviderEvent::Message { .. }
-                ))
-        {
-            anyhow::ensure!(
-                scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
-                "late output crosses root ownership"
-            );
-            if let Some(mut owner) = self.store.load_exchange(scope.exchange_id.as_str())?
-                && owner.observe_turn(&event, now_ms)?
-            {
-                self.store.save_exchange(&owner)?;
+        let observation = match observation {
+            OwnerObservation::HostFileChange {
+                binding_id,
+                scope,
+                change,
+            } => {
+                let effect = self.apply_observed_file_change(&binding_id, &scope, &change)?;
+                return Ok(self.prepare_provider_delivery(effect)?.events);
+            }
+            OwnerObservation::Event(event) => event,
+            OwnerObservation::InputAcceptance {
+                scope,
+                receipt,
+                presentation,
+            } => {
+                let mut interaction = self
+                    .store
+                    .load_exchange(scope.exchange_id.as_str())?
+                    .context("accepted receipt has no original exchange")?;
+                self.apply_durable_input_acceptance(
+                    &mut interaction,
+                    &scope,
+                    &receipt,
+                    &presentation,
+                )?;
                 let patch = self.reconcile_timeline()?;
                 return Ok(if patch.is_empty() {
                     Vec::new()
@@ -10036,69 +10548,211 @@ impl HarnessBroker {
                     vec![self.event("document_changed", patch.notification())?]
                 });
             }
+        };
+
+        anyhow::ensure!(
+            observation.scope().owner().session_id().as_str() == self.session.id,
+            "session observation crosses original ownership"
+        );
+        if observation.scope().owner() != &crate::provider::ThreadOwner::root(&self.session.id)
+            || matches!(
+                &observation,
+                HarnessEvent::Native {
+                    event: boxed_native_event,
+                    ..
+                }
+             if matches!(boxed_native_event.as_ref(), ProviderEvent::Agent { .. }))
+        {
+            return self.observe_child_session_event(&observation);
+        }
+        if matches!(
+           &observation,
+           HarnessEvent::Native {
+               event: boxed_native_event,
+               ..
+           }
+        if matches!(boxed_native_event.as_ref(), ProviderEvent::Provider {
+                   event: forge_provider_api::ProviderConnectionEvent::Unavailable(_)
+               }))
+        {
+            return self.observe_child_session_event(&observation);
+        }
+        if let HarnessEvent::Host {
+            scope,
+            event:
+                HostEvent::CapabilitiesNegotiated {
+                    binding_id,
+                    manifest,
+                    history,
+                },
+        } = &observation
+        {
+            self.apply_negotiated_capabilities(scope, binding_id, manifest, history.as_ref())?;
             return Ok(Vec::new());
         }
-        if let ProviderEvent::Tool { address, update } = &event {
-            anyhow::ensure!(
-                address.turn.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
-                "session tool event crosses execution ownership"
-            );
-            let Some(mut owner) = self
-                .store
-                .load_provider_exchange(&self.session.id, &address.turn)?
-            else {
-                return Ok(Vec::new());
-            };
-            if !owner.accepts_settled_tool_update(address, update) {
-                return Ok(Vec::new());
-            }
-            if !owner.observe_turn(&event, now_ms)? {
-                return Ok(Vec::new());
-            }
-            if event.tool_output_delta().is_some() {
-                self.store.save_tool_output_delta(&owner, &event)?;
-            } else {
-                self.store.save_exchange(&owner)?;
-            }
-            let patch = self.reconcile_timeline()?;
-            return Ok(if patch.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.event("document_changed", patch.notification())?]
-            });
-        }
-        let ProviderEvent::Compaction {
+        let now_ms = observation.observed_at_ms(self.clock.now_ms());
+        if let HarnessEvent::Native {
+            source,
             scope,
-            update: compaction,
-        } = event
-        else {
-            return Ok(match SessionUpdate::from_observation(&event) {
-                Some(update) => vec![self.event(
-                    "provider_event",
-                    publication::encode_session_update(&update)?,
-                )?],
-                None => Vec::new(),
-            });
-        };
-        anyhow::ensure!(
-            scope.owner().session_id
-                == forge_provider_api::SessionId::from(self.session.id.as_str()),
-            "compaction crosses session ownership"
-        );
-        self.retain_external_compaction(*compaction, now_ms)?;
-        let patch = self.reconcile_timeline()?;
-        Ok(if patch.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.event("document_changed", patch.notification())?]
+            event,
+        } = &observation
+        {
+            let event = event.as_ref();
+            match event {
+                ProviderEvent::Provider {
+                    event:
+                        forge_provider_api::ProviderConnectionEvent::CapabilitiesChanged(manifest),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        None,
+                    )? == crate::provider::NativeBindingStatus::Active
+                    {
+                        self.apply_effective_capabilities(manifest.clone())?;
+                    }
+                    return Ok(Vec::new());
+                }
+                ProviderEvent::Thread {
+                    thread_id,
+                    event: forge_provider_api::ThreadEvent::ContextUsage(usage),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        Some(thread_id),
+                    )? == crate::provider::NativeBindingStatus::RetiredKnown
+                    {
+                        return Ok(Vec::new());
+                    }
+                    self.session.context_usage = Some(usage.clone());
+                    self.context_usage_fresh = true;
+                    self.save_session()?;
+                }
+                ProviderEvent::Thread {
+                    thread_id,
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(id),
+                } => {
+                    if self.provider.binding_source_status(
+                        &source.binding_id,
+                        scope.owner(),
+                        Some(thread_id),
+                    )? == crate::provider::NativeBindingStatus::RetiredKnown
+                    {
+                        return Ok(Vec::new());
+                    }
+                    self.retain_session_identity(scope.owner(), id)?;
+                    return Ok(Vec::new());
+                }
+                ProviderEvent::Thread {
+                    event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+                    ..
+                } => {
+                    self.retain_external_compaction((**compaction).clone(), now_ms)?;
+                    let patch = self.reconcile_timeline()?;
+                    return Ok(if patch.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![self.event("document_changed", patch.notification())?]
+                    });
+                }
+                ProviderEvent::Provider { .. }
+                | ProviderEvent::Thread { .. }
+                | ProviderEvent::Turn { .. }
+                | ProviderEvent::Item { .. }
+                | ProviderEvent::Agent { .. } => {}
+            }
+        }
+        if let Some(invocation) = observation.scope().invocation()
+            && let Some(mut owner) = self.store.load_exchange(invocation.exchange_id.as_str())?
+        {
+            let changed = match &observation {
+                HarnessEvent::Native { scope, event, .. } => {
+                    let event = event.as_ref();
+                    owner.observe_provider_event(scope, event, now_ms)?
+                }
+                HarnessEvent::Host { scope, event } => {
+                    owner.observe_host_event(scope, event, now_ms)?
+                }
+            };
+            if changed {
+                self.store.save_exchange(&owner)?;
+                let mut updates = Vec::new();
+                if let HarnessEvent::Native {
+                    source,
+                    scope,
+                    event: boxed_native_event,
+                } = &observation
+                    && let ProviderEvent::Turn {
+                        thread_id,
+                        turn_id,
+                        event: forge_provider_api::TurnEvent::ModelResolved(_),
+                    } = boxed_native_event.as_ref()
+                {
+                    let current_root =
+                        self.store
+                            .latest_exchange(&self.session.id)?
+                            .is_some_and(|current| {
+                                current.id == owner.id
+                                    && current.turn.last().is_some_and(|turn| {
+                                        &turn.provider().scope == invocation
+                                            && &turn.provider().thread_id == thread_id
+                                            && &turn.provider().turn_id == turn_id
+                                    })
+                            });
+                    let current_binding = self
+                        .provider
+                        .binding_source_status(&source.binding_id, scope.owner(), Some(thread_id))
+                        .is_ok_and(|status| status == crate::provider::NativeBindingStatus::Active);
+                    if current_root && current_binding {
+                        self.session.resolved_model = owner
+                            .turn
+                            .last()
+                            .and_then(|turn| turn.resolved_model())
+                            .map(|model| model.model_id.as_str().to_owned());
+                        self.save_session()?;
+                        updates.push(self.event(
+                            "provider_event",
+                            publication::encode_session_update(&SessionUpdate::Runtime {
+                                session_id: self.session.id.clone(),
+                                runtime: crate::provider::ProviderRuntime {
+                                    provider: self.session.provider.clone(),
+                                    model: self.session.resolved_model.clone(),
+                                },
+                            })?,
+                        )?);
+                    }
+                }
+                let patch = self.reconcile_timeline()?;
+                if !patch.is_empty() {
+                    updates.push(self.event("document_changed", patch.notification())?);
+                }
+                if !updates.is_empty() {
+                    return Ok(updates);
+                }
+            }
+        }
+        Ok(match SessionUpdate::from_observation(&observation) {
+            Some(update) => vec![self.event(
+                "provider_event",
+                publication::encode_session_update(&update)?,
+            )?],
+            None => Vec::new(),
         })
     }
 
     /// Preserve the local driver's compatibility entry while sharing owned compaction settlement.
     async fn compact_session(&mut self, manual: bool) -> Result<(Value, Vec<SessionEvent>)> {
+        // The first input opens the native conversation, so compacting an unused chat would
+        // open an empty provider conversation solely to compact it.
+        anyhow::ensure!(
+            self.session.provider_session_id.is_some()
+                || !self.store.list_exchange(&self.session.id)?.is_empty(),
+            "Nothing to compact: this conversation has no provider history yet"
+        );
         let registry = self.execution_registry();
         registry
-            .owner(crate::provider::ExecutionOwner::root(&self.session.id))
+            .owner(crate::provider::ThreadOwner::root(&self.session.id))
             .await?;
         let provenance = if manual {
             compaction::CompactionProvenance::Manual
@@ -10148,7 +10802,11 @@ impl HarnessBroker {
     }
 
     /// Bind the current foreground's input decorations and tool context to an invocation snapshot.
-    fn provider_request(&self, input: ProviderInput, mode: PromptMode) -> Result<ProviderRequest> {
+    pub(crate) fn provider_request(
+        &self,
+        input: ProviderInput,
+        mode: PromptMode,
+    ) -> Result<ProviderRequest> {
         let mut request = self.input_submission_request(input, mode)?;
         if !self.submitted_attachments.is_empty() {
             request.input = request
@@ -10181,6 +10839,23 @@ impl HarnessBroker {
             event: name.into(),
             payload,
         })
+    }
+
+    /// Return a session named only by its retracted first prompt to the unnamed state.
+    ///
+    /// The first exchange names an unnamed session when it starts. Retracting that exchange
+    /// restores its prompt to the composer, so the name would otherwise describe a prompt the
+    /// transcript no longer contains. A name that differs from the derived one was chosen by the
+    /// user or a later exchange and stays.
+    pub(crate) fn release_automatic_session_name(&mut self, retracted_prompt: &str) -> Result<()> {
+        if self.session.name.is_empty()
+            || self.session.name != automatic_session_name(retracted_prompt)
+            || !self.store.list_exchange(&self.session.id)?.is_empty()
+        {
+            return Ok(());
+        }
+        self.session.name.clear();
+        self.save_session()
     }
 
     fn save_session(&mut self) -> Result<()> {
@@ -10257,23 +10932,89 @@ impl Drop for HarnessBroker {
     }
 }
 
+/// Attribute an identified native tool item to the active checklist step.
 fn attribute_provider_tool(
     exchange: &mut Exchange,
     checklist: &mut ChecklistTracker,
-    event: &ProviderEvent,
+    observation: &HarnessEvent,
 ) -> Result<()> {
-    let ProviderEvent::Tool { address, .. } = event else {
+    let HarnessEvent::Native { event, .. } = observation else {
         return Ok(());
     };
-    let Some(checklist_item_id) = checklist.attribution_target().map(str::to_owned) else {
+    let ProviderEvent::Item { item_id, event, .. } = event.as_ref() else {
         return Ok(());
     };
-    let turn_id = exchange.turn_mut(&address.turn)?.id().to_owned();
-    if exchange.attribute_tool(&turn_id, address.tool_id.as_str(), &checklist_item_id)? {
-        checklist.mark_attributed(&checklist_item_id);
+    use forge_provider_api::message::{ItemEvent, ItemStart};
+    if !matches!(
+        event,
+        ItemEvent::Started(
+            ItemStart::CommandExecution(_) | ItemStart::FileChange(_) | ItemStart::ToolCall(_)
+        ) | ItemEvent::Tool { .. }
+    ) {
+        return Ok(());
+    }
+    let Some(address) = native_turn_address(observation) else {
+        return Ok(());
+    };
+    let Some(target) = checklist.attribution_target().map(str::to_owned) else {
+        return Ok(());
+    };
+    let turn_id = exchange.turn_mut(&address)?.id().to_owned();
+    if exchange.attribute_tool(&turn_id, item_id.as_str(), &target)? {
+        checklist.mark_attributed(&target);
         exchange.checklist = Some(checklist.snapshot().clone());
     }
     Ok(())
+}
+
+/// Preserve cancellation ownership when clearing an approval from a child workflow.
+fn approval_cancelled(
+    view: &crate::provider::approval::ApprovalRequestView,
+    now_ms: i64,
+) -> Result<PermissionApprovalEvent> {
+    let owner = view
+        .execution_owner
+        .as_ref()
+        .context("cancelled approval has no original owner")?;
+    let scope = match &view.turn_id {
+        Some(turn_id) => crate::provider::ApprovalScope::Turn {
+            thread_id: owner.thread_id(),
+            turn_id: forge_provider_api::TurnId::new(turn_id.as_str())?,
+        },
+        None => crate::provider::ApprovalScope::Thread {
+            thread_id: owner.thread_id(),
+        },
+    };
+    Ok(PermissionApprovalEvent::Cancelled(
+        crate::provider::PermissionApprovalCancellation {
+            request_id: crate::provider::ApprovalRequestId::new(view.id.clone())?,
+            scope,
+            reason: crate::provider::ApprovalCancellationReason::TurnInterrupted,
+            cancelled_at_ms: now_ms,
+        },
+    ))
+}
+
+/// Resolve the original typed native turn using the already retained operational owner.
+fn native_turn_address(observation: &HarnessEvent) -> Option<crate::provider::TurnAddress> {
+    let HarnessEvent::Native { scope, event, .. } = observation else {
+        return None;
+    };
+    match event.as_ref() {
+        ProviderEvent::Turn {
+            thread_id, turn_id, ..
+        }
+        | ProviderEvent::Item {
+            thread_id, turn_id, ..
+        } => Some(crate::provider::TurnAddress {
+            scope: scope.invocation()?.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        }),
+        ProviderEvent::Provider { .. }
+        | ProviderEvent::Thread { .. }
+        | ProviderEvent::Agent { .. } => None,
+    }
 }
 
 /// Collect exact child exchanges for recursive change attribution.

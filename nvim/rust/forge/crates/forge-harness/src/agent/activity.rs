@@ -100,7 +100,8 @@ impl AgentActivity {
                         let (text, truncated) = preview(message.text(), 4000);
                         json!({"kind":"thought", "source":match message.kind() {
                             MessageKind::Reasoning | MessageKind::ReasoningSummary => "reasoning_summary",
-                            MessageKind::Assistant | MessageKind::Unknown => "commentary",
+                            MessageKind::Assistant => "commentary",
+                            MessageKind::User | MessageKind::Unknown => continue,
                         }, "text":text, "truncated":truncated})
                     }
                     TurnItem::Tool { id } => {
@@ -114,7 +115,7 @@ impl AgentActivity {
                         let (name, name_truncated) = preview(&tool.title, 512);
                         json!({"kind":"tool", "name":name, "category":category,
                             "truncated":name_truncated || category_truncated, "status":status(tool),
-                            "failed":tool.failed, "duration_ms":tool.elapsed_ms(now_ms),
+                            "failed":tool.failed, "duration_ms":tool.elapsed_ms(exchange.tool_instant(now_ms)),
                             "call_ref":AgentToolReference::encode(exchange,turn.id(),&tool.id)?})
                     }
                 };

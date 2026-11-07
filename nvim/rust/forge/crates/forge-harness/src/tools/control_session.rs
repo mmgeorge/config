@@ -2,7 +2,7 @@ use super::{
     ControlToolDefinition, ControlToolExecutor, ControlToolInvocation, ControlTurnContext,
     ToolError, ToolResult,
 };
-use crate::provider::{ProviderCompletion, ProviderDiagnostic, ProviderEvent, ProviderEventSink};
+use crate::provider::{HarnessEventSink, HostEvent, ProviderCompletion};
 use async_trait::async_trait;
 use forge_provider_api::control::ToolCall;
 use serde::Serialize;
@@ -23,7 +23,7 @@ pub(crate) struct ControlReply {
 
 struct ActiveControl {
     executor: Arc<ControlToolExecutor>,
-    sink: ProviderEventSink,
+    sink: HarnessEventSink,
     tools: std::collections::HashSet<String>,
     output: Mutex<ProviderCompletion>,
 }
@@ -68,6 +68,16 @@ impl Drop for PendingControlCall<'_> {
 }
 
 impl ControlSession {
+    /// Get whether the current executor retained a physical mutation collection failure.
+    pub(crate) fn mutation_failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .is_some_and(|active| active.executor.mutation_failed())
+    }
+
     pub(crate) fn new(definitions: Vec<ControlToolDefinition>) -> Self {
         Self {
             definitions: RwLock::new(definitions),
@@ -90,7 +100,7 @@ impl ControlSession {
             Some(HostDelegate { scope, tools });
     }
 
-    pub(crate) async fn begin(&self, mut context: ControlTurnContext, sink: ProviderEventSink) {
+    pub(crate) async fn begin(&self, mut context: ControlTurnContext, sink: HarnessEventSink) {
         context.question_invocation = sink.invocation_scope().ok().cloned();
         self.close().await;
         self.host
@@ -258,20 +268,15 @@ impl ControlEndpoint for ControlSession {
                     &error,
                     outcome.plan_document.as_ref(),
                 );
-                sink.send_wait(ProviderEvent::Diagnostic {
-                    scope: sink
-                        .invocation_scope()
-                        .map_err(|error| ToolError::Operation(Box::new(error)))?
-                        .clone()
-                        .into(),
-                    diagnostic: ProviderDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Rejected,
-                        message: forge_provider_api::SanitizedMessage::new(
-                            "Host tool execution failed",
-                        )
-                        .expect("static diagnostic is nonempty"),
-                        fatal: false,
-                    },
+                sink.send_host(HostEvent::Failure {
+                    failure: forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnStart,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ),
+                    message: forge_provider_api::SanitizedMessage::new(
+                        "Host tool execution failed",
+                    )
+                    .expect("static diagnostic is nonempty"),
                 })
                 .await
                 .map_err(|error| ToolError::Operation(Box::new(error)))?;
@@ -290,13 +295,13 @@ impl ControlEndpoint for ControlSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ExecutionOwner, InvocationScope, PromptMode, events};
+    use crate::provider::{InvocationScope, PromptMode, ThreadOwner, events};
     use anyhow::Result;
     use serde_json::{Value, json};
 
-    fn channel() -> (ProviderEventSink, events::ProviderEventStream) {
+    fn channel() -> (HarnessEventSink, events::HarnessEventStream) {
         events::channel(InvocationScope::new(
-            ExecutionOwner::root("control"),
+            ThreadOwner::root("control"),
             "exchange",
         ))
     }
@@ -385,7 +390,7 @@ mod tests {
                 .any(|item| item["path"] == "provider" && item["code"] == "unknown_field")
         );
         assert!(
-            matches!(stream.try_next()?, Some(ProviderEvent::Diagnostic { diagnostic, .. }) if diagnostic.kind == forge_provider_api::ProviderFailureKind::Rejected && diagnostic.message.as_str() == "Host tool execution failed")
+            matches!(stream.try_next()?, Some(crate::provider::session_execution::OwnerObservation::Event(crate::provider::HarnessEvent::Host { event: HostEvent::Failure { failure, message }, .. })) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected && message.as_str() == "Host tool execution failed")
         );
         Ok(())
     }

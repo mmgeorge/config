@@ -96,6 +96,15 @@ function M.attach(state)
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = owner.group, callback = function() M.release(state) end,
   })
+  -- Neovim's :windo, :bufdo, and related commands split a 'winfixbuf' window whose previous window
+  -- is also pinned, and leave the unowned split focused. Netrw runs :windo from a non-nested VimEnter
+  -- handler, which suppresses WinNew, so opening Harness from a startup command otherwise leaves a
+  -- second composer window current. SafeState runs after every command and handler returns, when
+  -- :new or :split {file} has already replaced the copied buffer, so only Harness duplicates remain.
+  vim.api.nvim_create_autocmd("SafeState", {
+    group = owner.group,
+    callback = function() M.reject_unowned_splits(state) end,
+  })
   vim.api.nvim_create_autocmd("WinClosed", {
     group = owner.group,
     callback = function()
@@ -108,6 +117,30 @@ function M.attach(state)
       end)
     end,
   })
+end
+
+---Close splits in the Harness tab that display a pane buffer without being that pane, and return
+---focus from a closed split to the pane whose buffer it displayed.
+---@param state ForgeHarnessPresentationState
+function M.reject_unowned_splits(state)
+  local owner = owner_by_state[state]
+  local transcript_win = state.transcript_win
+  if not owner or not transcript_win or not vim.api.nvim_win_is_valid(transcript_win) then return end
+  for _, window in ipairs(vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(transcript_win))) do
+    local displayed = vim.api.nvim_win_get_buf(window)
+    local pane = (displayed == state.composer_buf and state.composer_win)
+      or (displayed == state.transcript_buf and state.transcript_win) or nil
+    if pane and pane ~= window and owner.window[window] == nil
+      and vim.api.nvim_win_get_config(window).relative == "" then
+      local focused = vim.api.nvim_get_current_win() == window
+      local closed, failure = pcall(vim.api.nvim_win_close, window, true)
+      if not closed then
+        vim.notify("Harness could not close an unowned split of its pane: " .. tostring(failure), vim.log.levels.ERROR)
+      elseif focused and vim.api.nvim_win_is_valid(pane) then
+        vim.api.nvim_set_current_win(pane)
+      end
+    end
+  end
 end
 
 ---@param window integer

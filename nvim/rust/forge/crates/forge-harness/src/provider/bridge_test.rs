@@ -16,6 +16,13 @@ use std::{
 
 struct BridgeFixtureProvider {
     sinks: Mutex<HashMap<BindingId, ProviderEventSink>>,
+    duplicate_sinks: Mutex<Vec<ProviderEventSink>>,
+    open_binding_override: Mutex<Option<BindingId>>,
+    shutdown_failed: std::sync::atomic::AtomicBool,
+    shutdown_calls: AtomicUsize,
+    shutdown_callback: tokio::sync::Mutex<
+        Option<tokio::task::JoinHandle<forge_provider_api::permissions::PermissionResponse>>,
+    >,
     fail_fence: bool,
     close_failed: std::sync::atomic::AtomicBool,
     retire_calls: AtomicUsize,
@@ -38,7 +45,10 @@ struct BridgeFixtureProvider {
             forge_provider_api::SessionRequestIdentity,
         )>,
     >,
+    open_instructions: Mutex<Vec<String>>,
+    open_models: Mutex<Vec<Option<String>>>,
     input_failure: Mutex<Option<ProviderError>>,
+    open_thread_override: Mutex<Option<forge_provider_api::ThreadId>>,
     open_identity: Mutex<Option<forge_provider_api::ProviderSessionId>>,
     configured_identity: Mutex<Option<forge_provider_api::ProviderSessionId>>,
     fork_attempts: Mutex<
@@ -64,6 +74,11 @@ impl BridgeFixtureProvider {
     fn new(fail_fence: bool) -> Arc<Self> {
         Arc::new(Self {
             sinks: Mutex::new(HashMap::new()),
+            duplicate_sinks: Mutex::new(Vec::new()),
+            open_binding_override: Mutex::new(None),
+            shutdown_failed: std::sync::atomic::AtomicBool::new(false),
+            shutdown_calls: AtomicUsize::new(0),
+            shutdown_callback: tokio::sync::Mutex::new(None),
             fail_fence,
             close_failed: std::sync::atomic::AtomicBool::new(false),
             retire_calls: AtomicUsize::new(0),
@@ -81,7 +96,10 @@ impl BridgeFixtureProvider {
             open_failure: Mutex::new(None),
             open_persistent_failure: Mutex::new(None),
             open_attempts: Mutex::new(Vec::new()),
+            open_instructions: Mutex::new(Vec::new()),
+            open_models: Mutex::new(Vec::new()),
             input_failure: Mutex::new(None),
+            open_thread_override: Mutex::new(None),
             open_identity: Mutex::new(None),
             configured_identity: Mutex::new(None),
             fork_attempts: Mutex::new(Vec::new()),
@@ -111,7 +129,7 @@ impl BridgeFixtureProvider {
 
 #[async_trait::async_trait]
 impl NativeProvider for BridgeFixtureProvider {
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: forge_provider_api::OperationContext,
         request: forge_provider_api::SessionForkRequest,
@@ -123,14 +141,14 @@ impl NativeProvider for BridgeFixtureProvider {
                 .any(|(id, previous)| id == context.id() && previous != &request)
             {
                 return Err(provider_failure(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::OperationConflict,
                 ));
             }
             attempts.push((context.id().clone(), request));
             if attempts.len() == 1 && !self.fork_blocked.load(Ordering::Acquire) {
                 return Err(ProviderFailure::new(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::Transport,
                 )
                 .at_phase(
@@ -143,7 +161,7 @@ impl NativeProvider for BridgeFixtureProvider {
         if self.fork_blocked.load(Ordering::Acquire) {
             self.fork_started.notify_one();
             return Err(context.interrupted().await.failure(
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 forge_provider_api::ProviderPhase::Observation,
                 forge_provider_api::FailureDisposition::Uncertain,
             ));
@@ -156,7 +174,7 @@ impl NativeProvider for BridgeFixtureProvider {
         ))
     }
 
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &BindingId,
@@ -168,14 +186,14 @@ impl NativeProvider for BridgeFixtureProvider {
             id == context.id() && (previous_binding != binding || previous != &request)
         }) {
             return Err(provider_failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::OperationConflict,
             ));
         }
         attempts.push((context.id().clone(), binding.clone(), request));
         if attempts.len() == 1 {
             return Err(ProviderFailure::new(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::Transport,
             )
             .at_phase(
@@ -201,7 +219,7 @@ impl NativeProvider for BridgeFixtureProvider {
         })
     }
 
-    async fn session_open(
+    async fn thread_open(
         &self,
         operation: forge_provider_api::OperationContext,
         request: forge_provider_api::SessionRequest,
@@ -209,7 +227,15 @@ impl NativeProvider for BridgeFixtureProvider {
         if let Some(error) = self.open_persistent_failure.lock().unwrap().clone() {
             return Err(error);
         }
-        operation.check_admission(ProviderOperation::SessionOpen)?;
+        operation.check_admission(ProviderOperation::ThreadOpen)?;
+        self.open_instructions
+            .lock()
+            .unwrap()
+            .push(request.system_instructions.clone());
+        self.open_models
+            .lock()
+            .unwrap()
+            .push(request.configuration.model.model.clone());
         {
             let mut attempts = self.open_attempts.lock().unwrap();
             let identity = request.identity();
@@ -218,7 +244,7 @@ impl NativeProvider for BridgeFixtureProvider {
                 .any(|(id, prior)| id == operation.id() && prior != &identity)
             {
                 return Err(provider_failure(
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     ProviderFailureKind::OperationConflict,
                 ));
             }
@@ -230,29 +256,41 @@ impl NativeProvider for BridgeFixtureProvider {
         if self.open_blocked.load(Ordering::Acquire) {
             self.open_started.notify_one();
             return Err(operation.interrupted().await.failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 forge_provider_api::ProviderPhase::Preparation,
                 forge_provider_api::FailureDisposition::Unchanged,
             ));
         }
-        let binding = BindingId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
-            provider_failure(
-                ProviderOperation::SessionOpen,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
+        let binding = self
+            .open_binding_override
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| BindingId::new(uuid::Uuid::new_v4().to_string()).unwrap());
         let (sink, events) = events::channel(
             binding.clone(),
             forge_provider_api::EventScope::Binding {
                 owner: request.owner,
             },
         );
-        self.sinks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(binding.clone(), sink);
+        let mut sinks = self.sinks.lock().unwrap();
+        match sinks.entry(binding.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(sink);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.duplicate_sinks.lock().unwrap().push(sink)
+            }
+        }
+        drop(sinks);
         Ok(forge_provider_api::OpenedSession {
             binding: forge_provider_api::SessionBinding {
+                thread_id: self
+                    .open_thread_override
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| request.thread_id.clone()),
                 id: binding,
                 provider_session_id: self.open_identity.lock().unwrap().clone(),
             },
@@ -263,13 +301,13 @@ impl NativeProvider for BridgeFixtureProvider {
         })
     }
 
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         operation: forge_provider_api::OperationContext,
         binding: &BindingId,
         configuration: forge_provider_api::SessionConfiguration,
     ) -> Result<forge_provider_api::ConfiguredSession, ProviderError> {
-        operation.check_admission(ProviderOperation::SessionConfigure)?;
+        operation.check_admission(ProviderOperation::ThreadConfigure)?;
         self.configuration_deadlines
             .lock()
             .unwrap()
@@ -284,16 +322,17 @@ impl NativeProvider for BridgeFixtureProvider {
             .cloned()
             .ok_or_else(|| {
                 provider_failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::SessionMissing,
                 )
             })?;
         if let Some(provider_session_id) = identity {
-            sink.send_wait(ProviderEvent::SessionIdentity {
-                scope: sink.scope().clone(),
-                provider_session_id,
-            })
-            .await?;
+            sink.activity_writer()
+                .send_wait(forge_provider_api::AdapterActivity::Thread {
+                    thread_id: sink.scope().owner().thread_id(),
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(provider_session_id),
+                })
+                .await?;
         }
         Ok(forge_provider_api::ConfiguredSession {
             configuration,
@@ -304,7 +343,7 @@ impl NativeProvider for BridgeFixtureProvider {
         })
     }
 
-    async fn session_close(
+    async fn thread_close(
         &self,
         operation: forge_provider_api::OperationContext,
         binding: &BindingId,
@@ -318,17 +357,15 @@ impl NativeProvider for BridgeFixtureProvider {
         {
             return Err(error);
         }
-        operation.check_admission(ProviderOperation::SessionClose)?;
+        operation.check_admission(ProviderOperation::ThreadClose)?;
         self.retire_calls.fetch_add(1, Ordering::AcqRel);
         self.close_contexts
             .lock()
             .unwrap()
             .push(operation.id().clone());
         if self.fail_fence && !self.close_failed.swap(true, Ordering::AcqRel) {
-            let error = provider_failure(
-                ProviderOperation::SessionClose,
-                ProviderFailureKind::Runtime,
-            );
+            let error =
+                provider_failure(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime);
             self.close_failures
                 .lock()
                 .unwrap()
@@ -338,48 +375,50 @@ impl NativeProvider for BridgeFixtureProvider {
         let sink = self.sinks.lock().unwrap().get(binding).cloned();
         if let Some(sink) = sink {
             for _ in 0..self.close_event_count.load(Ordering::Acquire) {
-                sink.send_wait(ProviderEvent::Diagnostic {
-                    scope: sink.scope().clone(),
-                    diagnostic: forge_provider_api::ProviderDiagnostic {
-                        kind: ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new("cleanup progress")
-                            .unwrap(),
-                        fatal: false,
-                    },
-                })
-                .await?;
+                sink.activity_writer()
+                    .send_wait(forge_provider_api::AdapterActivity::Warning(
+                        forge_provider_api::ProviderWarning {
+                            scope: forge_provider_api::WarningScope::Provider,
+                            kind: forge_provider_api::ProviderWarningKind::NativeNotice {
+                                category: ProviderFailureKind::Unknown,
+                            },
+                            message: forge_provider_api::SanitizedMessage::new("cleanup progress")
+                                .unwrap(),
+                        },
+                    ))
+                    .await?;
             }
         }
         self.close_native_stream(binding);
         Ok(())
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         operation: forge_provider_api::OperationContext,
         _: &BindingId,
         _: forge_provider_api::PromptRequest,
     ) -> Result<forge_provider_api::InputAcceptance, ProviderError> {
-        operation.check_admission(ProviderOperation::InputSubmit)?;
+        operation.check_admission(ProviderOperation::TurnStart)?;
         if let Some(error) = self.input_failure.lock().unwrap().clone() {
             return Err(error);
         }
         Err(provider_failure(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ))
     }
 
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         operation: forge_provider_api::OperationContext,
         _: &BindingId,
         _: forge_provider_api::CancelRequest,
-    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
-        operation.check_admission(ProviderOperation::Cancel)?;
+    ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
+        operation.check_admission(ProviderOperation::TurnInterrupt)?;
         self.cancel_calls.fetch_add(1, Ordering::AcqRel);
         Err(provider_failure(
-            ProviderOperation::Cancel,
+            ProviderOperation::TurnInterrupt,
             ProviderFailureKind::WrongInvocation,
         ))
     }
@@ -400,7 +439,32 @@ impl NativeProvider for BridgeFixtureProvider {
         &self,
         operation: forge_provider_api::OperationContext,
     ) -> Result<(), ProviderError> {
-        operation.check_admission(ProviderOperation::Shutdown)
+        operation.check_admission(ProviderOperation::Shutdown)?;
+        self.shutdown_calls.fetch_add(1, Ordering::AcqRel);
+        let callback = self.shutdown_callback.lock().await.take();
+        if let Some(callback) = callback {
+            let response = callback.await.map_err(|_| {
+                provider_failure(ProviderOperation::Shutdown, ProviderFailureKind::Runtime)
+            })?;
+            if !matches!(
+                response,
+                forge_provider_api::permissions::PermissionResponse::Deny { .. }
+            ) {
+                return Err(provider_failure(
+                    ProviderOperation::Shutdown,
+                    ProviderFailureKind::Authorization,
+                ));
+            }
+        }
+        if self.shutdown_failed.load(Ordering::Acquire) {
+            return Err(provider_failure(
+                ProviderOperation::Shutdown,
+                ProviderFailureKind::Transport,
+            ));
+        }
+        self.sinks.lock().unwrap().clear();
+        self.duplicate_sinks.lock().unwrap().clear();
+        Ok(())
     }
 
     async fn terminal_list(
@@ -424,6 +488,26 @@ fn provider_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> 
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
+/// Consume the host-owned manifest that every successful binding open publishes first.
+fn expect_negotiated_capabilities(events: &mut HostEventStream) {
+    let observed = events
+        .try_recv()
+        .expect("a successful open publishes its negotiated capabilities");
+    assert!(
+        observed.native.is_none(),
+        "negotiated capabilities are a host publication without a native sequence"
+    );
+    assert!(matches!(
+        observed.event,
+        super::super::session_execution::OwnerObservation::Event(
+            super::super::HarnessEvent::Host {
+                scope: forge_provider_api::EventScope::Binding { .. },
+                event: super::super::HostEvent::CapabilitiesNegotiated { .. },
+            }
+        )
+    ));
+}
+
 fn provider_request(root: &std::path::Path) -> ProviderRequest {
     ProviderRequest {
         dispatch: forge_provider_api::submission::DispatchTracker::default(),
@@ -440,6 +524,7 @@ fn provider_request(root: &std::path::Path) -> ProviderRequest {
         approval_mode: Default::default(),
         provider_session_id: None,
         submission: None,
+        acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
     }
@@ -457,19 +542,175 @@ async fn bridge(
     ))
 }
 
+/// Quarantine a reused generation and retain both streams until provider-wide collection succeeds.
+#[tokio::test]
+async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
+-> anyhow::Result<()> {
+    let stage = std::sync::Mutex::new("open original");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let root = tempfile::tempdir()?;
+        drop(crate::storage::SqliteStore::open(root.path())?);
+        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
+        database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}'),('second-bridge-owner','workspace',1,'{}')", [])?;
+        let native = BridgeFixtureProvider::new(false);
+        let provider = Arc::new(bridge(root.path(), native.clone()).await?);
+        let binding = BindingId::new("duplicate-generation").unwrap();
+        *native.open_binding_override.lock().unwrap() = Some(binding.clone());
+        let request = provider_request(root.path());
+        let first_owner = request.owner()?;
+        let mut original_events = provider.session_events(first_owner.clone()).await?;
+        let observing = provider.clone();
+        let observer = tokio::spawn(async move {
+            while let Some(event) = original_events.recv().await? {
+                if let Some((binding, sequence)) = event.native { observing.event_consumed(&binding, sequence).await?; }
+            }
+            Ok::<_, ProviderError>(())
+        });
+        provider.thread_open(request).await?;
+        let original = provider
+            .ownership
+            .lock()
+            .unwrap()
+            .get(&binding)
+            .unwrap()
+            .clone();
+        let original_scope =
+            forge_provider_api::InvocationScope::new(first_owner.clone(), "original-exchange");
+        original.lock().unwrap().prepare(original_scope.clone())?;
+        let original_sink = native.sinks.lock().unwrap().get(&binding).unwrap().clone();
+        let child_scope = forge_provider_api::InvocationScope::new(
+            ThreadOwner::new(first_owner.session_id().clone(), forge_provider_api::AgentId::new("pending-native-child-owner")?)?,
+            original_scope.exchange_id.clone(),
+        );
+        let child_address = forge_provider_api::TurnAddress { thread_id: child_scope.owner.thread_id(), turn_id:child_scope.turn_id()?, scope:child_scope.clone() };
+        let agent_id = forge_provider_api::AgentId::new("pending-native-child")?;
+        let proof = {
+            let mut registry = original.lock().unwrap();
+            registry.resolve(&binding, &ProviderEvent::Agent { agent_id:agent_id.clone(), event:forge_provider_api::agent::AgentEvent::Lifecycle { event:forge_provider_api::agent::AgentLifecycleEvent::Started {
+                agent:forge_provider_api::agent::AgentDescription { parent_agent_id:Some(first_owner.agent_id().clone()),delegation:Some(forge_provider_api::agent::AgentDelegation {parent_thread_id:first_owner.thread_id(),parent_turn_id:original_scope.turn_id()?,parent_item_id:None}),thread_id:Some(child_address.thread_id.clone()),definition:None,nickname:None,task:None },
+                state:forge_provider_api::agent::AgentActiveState::Running,
+            } } })?;
+            registry.admit_observed(child_address.clone())?;
+            registry.observed_agent(&agent_id, Some(&child_address.turn_id))?
+        };
+        let mut original_request = provider_request(root.path());
+        original_request.approval_mode = crate::session::ApprovalMode::Ask;
+        let _directories = provider.permissions.directories(Some(root.path()), &original_request, &original_scope)?;
+        provider.permissions.store().write().unwrap().set_rule_list(&[(crate::permissions::document::CATEGORY_TOOL.into(), "fixture-pending-child".into(), crate::permissions::document::PermissionDecision::Ask)])?;
+        let template = crate::permissions::provider::ProviderPermissionContext::new(provider.permissions.clone());
+        template.bind_provider_fence(provider.closed.clone())?;
+        template.configure(first_owner.clone(), crate::session::ApprovalMode::Ask, root.path().display().to_string(), Some(crate::provider::events::channel(original_scope.clone()).0))?;
+        let (child_sink, mut child_events) = crate::provider::events::channel(child_scope.clone());
+        let child_policy = template.fork_observed(&proof, child_sink)?;
+        provider.sessions.lock().await.get(&first_owner).unwrap().observed_contexts.lock().unwrap().insert(child_address.turn_id.clone(), child_policy.clone());
+        let mut callback = tokio::spawn(async move {
+            use forge_provider_api::permissions::ProviderPermissions;
+            child_policy.authorize(&child_scope, forge_provider_api::permissions::PermissionRequest { id:"native-pending".into(),provider:forge_providers::registry::nonselectable_id().unwrap(),reason:None,target_list:vec![forge_provider_api::permissions::PermissionTarget::Tool {target:"fixture-pending-child".into()}] }).await
+        });
+        *stage.lock().unwrap() = "await child approval";
+        loop {
+            let event = tokio::select! {
+                event = child_events.recv() => event?.expect("pending native child approval is published"),
+                result = &mut callback => anyhow::bail!("child approval finished before request: {result:?}"),
+            };
+            if matches!(event, super::super::session_execution::OwnerObservation::Event(crate::provider::HarnessEvent::Host {event:crate::provider::HostEvent::PermissionApproval {event:crate::provider::PermissionApprovalEvent::Requested(_),..},..})) { break; }
+        }
+        assert!(!callback.is_finished());
+        *native.shutdown_callback.lock().await = Some(callback);
+        *stage.lock().unwrap() = "open duplicate";
+        *native.open_binding_override.lock().unwrap() = Some(binding.clone());
+        let mut second = provider_request(root.path());
+        second.harness_session_id = "second-bridge-owner".into();
+        let second_owner = second.owner()?;
+        database.execute_batch("CREATE TRIGGER reject_duplicate_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='thread_open' BEGIN SELECT RAISE(ABORT,'duplicate completion evidence failure'); END;")?;
+        assert!(matches!(provider.thread_open(second).await, Err(ProviderError::Combined { .. })));
+        assert!(Arc::ptr_eq(
+            &original,
+            provider.ownership.lock().unwrap().get(&binding).unwrap()
+        ));
+        assert_eq!(
+            original.lock().unwrap().source_status(&first_owner, None)?,
+            NativeBindingStatus::Active
+        );
+        let started = ProviderEvent::Turn {
+            thread_id: first_owner.thread_id(),
+            turn_id: original_scope.turn_id()?,
+            event: forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 1,
+            }),
+        };
+        assert_eq!(
+            original.lock().unwrap().resolve(&binding, &started)?,
+            original_scope.into()
+        );
+        let rejected = provider
+            .sessions
+            .lock()
+            .await
+            .get(&second_owner)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            rejected.open_operation.quarantined_binding(),
+            Some(binding.clone())
+        );
+        let rejected_sink = native.duplicate_sinks.lock().unwrap()[0].clone();
+        assert!(provider.session_close_owner(&second_owner).await.is_err());
+        assert_eq!(native.retire_calls.load(Ordering::Acquire), 0);
+        let capabilities =
+            forge_provider_api::CapabilityManifest::from_descriptor(native.descriptor());
+        original_sink.capabilities_changed(capabilities.clone()).await?;
+        rejected_sink.capabilities_changed(capabilities.clone()).await?;
+        native.shutdown_failed.store(true, Ordering::Release);
+        *stage.lock().unwrap() = "first shutdown";
+        assert!(provider.shutdown().await.is_err());
+        assert!(
+            rejected
+                .initialized
+                .get()
+                .unwrap()
+                .rejected_events
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .is_some()
+        );
+        assert_eq!(native.retire_calls.load(Ordering::Acquire), 0);
+        original_sink.capabilities_changed(capabilities.clone()).await?;
+        rejected_sink.capabilities_changed(capabilities.clone()).await?;
+        native.shutdown_failed.store(false, Ordering::Release);
+        *stage.lock().unwrap() = "second shutdown";
+        provider.shutdown().await?;
+        assert_eq!(native.retire_calls.load(Ordering::Acquire), 0);
+        assert_eq!(native.shutdown_calls.load(Ordering::Acquire), 2);
+        assert!(provider.sessions.lock().await.is_empty());
+        *stage.lock().unwrap() = "collect observer";
+        observer.await??;
+        assert!(
+            rejected_sink
+                .capabilities_changed(capabilities.clone()).await
+                .is_err()
+        );
+        assert!(original_sink.capabilities_changed(capabilities).await.is_err());
+        Ok::<_, anyhow::Error>(())
+    })
+    .await.map_err(|error| anyhow::anyhow!("{error} at {}", *stage.lock().unwrap()))?
+}
+
 /// Failed post-allocation core evidence closes the exact returned binding without losing its sole stream.
 #[tokio::test]
 async fn open_completion_log_failure_collects_allocated_binding_and_stream() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
-    database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='session_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
+    database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='thread_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
     let native = BridgeFixtureProvider::new(false);
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    let error = bridge.session_open(request).await.unwrap_err();
+    let error = bridge.thread_open(request).await.unwrap_err();
     assert!(matches!(error, ProviderError::Failure(failure)
         if failure.kind() == ProviderFailureKind::Persistence
             && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
@@ -495,15 +736,15 @@ async fn open_log_failure_retries_native_cleanup_and_drains_retained_stream() ->
 {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
-    database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='session_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
+    database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='thread_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
     let native = BridgeFixtureProvider::new(true);
     native.close_event_count.store(4097, Ordering::Release);
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    assert!(bridge.session_open(request).await.is_err());
+    assert!(bridge.thread_open(request).await.is_err());
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     assert_eq!(native.sinks.lock().unwrap().len(), 1);
     tokio::time::timeout(
@@ -512,10 +753,11 @@ async fn open_log_failure_retries_native_cleanup_and_drains_retained_stream() ->
     )
     .await??;
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 2);
-    let contexts = native.close_contexts.lock().unwrap();
-    assert_eq!(contexts.len(), 2);
-    assert_ne!(contexts[0], contexts[1]);
-    drop(contexts);
+    {
+        let contexts = native.close_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_ne!(contexts[0], contexts[1]);
+    }
     assert!(native.sinks.lock().unwrap().is_empty());
     assert!(!bridge.sessions.lock().await.contains_key(&owner));
     Ok(())
@@ -527,12 +769,12 @@ async fn retained_open_cleanup_bypasses_failed_core_start_and_preserves_uncertai
 -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
     let native = BridgeFixtureProvider::new(false);
     *native.open_persistent_failure.lock().unwrap() = Some(
         ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Transport,
         )
         .at_phase(
@@ -544,13 +786,13 @@ async fn retained_open_cleanup_bypasses_failed_core_start_and_preserves_uncertai
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    assert!(bridge.session_open(request).await.is_err());
+    assert!(bridge.thread_open(request).await.is_err());
     database.execute_batch("CREATE TRIGGER reject_open_evidence BEFORE INSERT ON owner_core_log BEGIN SELECT RAISE(ABORT,'fixture core unavailable'); END;")?;
     assert!(bridge.session_close_owner(&owner).await.is_err());
     assert!(bridge.sessions.lock().await.contains_key(&owner));
     *native.open_persistent_failure.lock().unwrap() = Some(
         ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Cancelled,
         )
         .at_phase(
@@ -577,12 +819,12 @@ async fn fork_retry_preserves_complete_original_request() -> anyhow::Result<()> 
         target_harness_session_id: "fork-target".into(),
         checkpoint_id: Some("checkpoint-one".into()),
     };
-    assert!(bridge.session_fork(first.clone()).await.is_err());
+    assert!(bridge.thread_fork(first.clone()).await.is_err());
     let mut retry = first;
     retry.source.model = "changed-model".into();
     retry.source.effort = "high".into();
     retry.checkpoint_id = Some("checkpoint-two".into());
-    bridge.session_fork(retry).await?;
+    bridge.thread_fork(retry).await?;
     let attempts = native.fork_attempts.lock().unwrap();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0], attempts[1]);
@@ -599,10 +841,10 @@ async fn compact_retry_preserves_original_binding_and_scope() -> anyhow::Result<
         id: "retained-compaction".into(),
         request: provider_request(root.path()),
     };
-    assert!(bridge.session_compact(first.clone()).await.is_err());
+    assert!(bridge.thread_compact(first.clone()).await.is_err());
     let mut retry = first;
     retry.request.harness_session_id = "different-owner".into();
-    bridge.session_compact(retry).await?;
+    bridge.thread_compact(retry).await?;
     assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
     let attempts = native.compact_attempts.lock().unwrap();
     assert_eq!(attempts.len(), 2);
@@ -620,7 +862,7 @@ async fn history_identity_conflict_does_not_open_compaction_target() -> anyhow::
     source.provider_session_id = Some("source-history".to_owned().try_into()?);
     assert!(
         bridge
-            .session_fork(super::super::ProviderForkRequest {
+            .thread_fork(super::super::ProviderForkRequest {
                 source,
                 target_harness_session_id: "shared-id".into(),
                 checkpoint_id: Some("checkpoint".into()),
@@ -629,7 +871,7 @@ async fn history_identity_conflict_does_not_open_compaction_target() -> anyhow::
             .is_err()
     );
     let error = bridge
-        .session_compact(super::super::ProviderCompactionRequest {
+        .thread_compact(super::super::ProviderCompactionRequest {
             id: "fork/shared-id".into(),
             request: provider_request(root.path()),
         })
@@ -660,14 +902,14 @@ async fn history_shutdown_cancels_pending_fork() -> anyhow::Result<()> {
     let pending = tokio::spawn({
         let bridge = bridge.clone();
         let request = request.clone();
-        async move { bridge.session_fork(request).await }
+        async move { bridge.thread_fork(request).await }
     });
     native.fork_started.notified().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
     assert!(
         matches!(pending.await?, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Cancelled)
     );
-    assert!(bridge.session_fork(request).await.is_err());
+    assert!(bridge.thread_fork(request).await.is_err());
     assert_eq!(native.fork_attempts.lock().unwrap().len(), 1);
     Ok(())
 }
@@ -683,10 +925,10 @@ async fn history_shutdown_cancels_compaction_watermark_wait() -> anyhow::Result<
         id: "pending-watermark".into(),
         request: provider_request(root.path()),
     };
-    assert!(bridge.session_compact(request.clone()).await.is_err());
+    assert!(bridge.thread_compact(request.clone()).await.is_err());
     let pending = tokio::spawn({
         let bridge = bridge.clone();
-        async move { bridge.session_compact(request).await }
+        async move { bridge.thread_compact(request).await }
     });
     native.compact_started.notified().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
@@ -706,7 +948,7 @@ async fn terminal_observation_holds_retirement_until_response_after_waiter_is_dr
     let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     let querying = bridge.clone();
     let query =
         tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
@@ -885,7 +1127,7 @@ async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() 
         let native = BridgeFixtureProvider::new(false);
         *native.input_failure.lock().unwrap() = Some(
             ProviderFailure::new(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             )
             .at_phase(phase, disposition)
@@ -903,17 +1145,14 @@ async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() 
             forge_providers::registry::nonselectable_id().unwrap(),
         )?);
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "native-rejection");
-        let error = bridge
-            .input_submit(request, scope.clone())
-            .await
-            .unwrap_err();
+        let error = bridge.turn_start(request, scope.clone()).await.unwrap_err();
         let cause = match error {
             ProviderError::PreparationFailed(cause) if unconsumed => *cause,
             error if !unconsumed => error,
             error => panic!("positive native admission proof was lost: {error:?}"),
         };
         assert!(matches!(cause, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::InputSubmit
+            if failure.operation() == ProviderOperation::TurnStart
                 && failure.kind() == ProviderFailureKind::WrongInvocation
                 && failure.phase() == phase && failure.disposition() == disposition));
         assert_eq!(
@@ -939,6 +1178,81 @@ async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() 
     Ok(())
 }
 
+/// Keep pre-input settings local, then open one native conversation for the first input.
+#[tokio::test]
+async fn first_input_opens_one_native_conversation_after_local_configuration() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let selection = crate::settings::PortableSettings::default();
+    let mut request = provider_request(root.path());
+    // A first `/plan` turn opens the conversation, but later chat turns must not inherit its
+    // task contract from the open-time instructions.
+    request.mode = crate::provider::PromptMode::Plan;
+    let owner = request.owner()?;
+    let mut events = bridge.session_events(owner.clone()).await?;
+    for configured_model in [
+        "first-local-model",
+        "second-local-model",
+        "third-local-model",
+    ] {
+        request.model = configured_model.into();
+        let receipt = bridge
+            .thread_configure(request.clone(), &selection, None)
+            .await?;
+        assert!(matches!(receipt, ConfigureReceipt::Deferred));
+    }
+    assert!(native.open_attempts.lock().unwrap().is_empty());
+    assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 0);
+    // Deferred configuration retains nothing native; the open must use the admitted request.
+    request.model = "admitted-model".into();
+
+    let store = super::super::submission::SubmissionStore::open(
+        root.path(),
+        Arc::new(crate::trace::TraceStore::open(root.path())?),
+    )?;
+    request.submission = Some(store.prepare(
+        &request,
+        forge_providers::registry::nonselectable_id().unwrap(),
+    )?);
+    let scope = forge_provider_api::InvocationScope::new(owner.clone(), "first-input");
+    // The fixture rejects every input, which still proves the open preceded native dispatch.
+    let rejected = bridge.turn_start(request.clone(), scope).await.unwrap_err();
+    assert!(
+        matches!(&rejected, ProviderError::PreparationFailed(cause)
+            if matches!(cause.as_ref(), ProviderError::Failure(failure)
+                if failure.operation() == ProviderOperation::TurnStart
+                    && failure.kind() == ProviderFailureKind::Rejected)),
+        "{rejected:?}"
+    );
+    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
+    assert_eq!(native.sinks.lock().unwrap().len(), 1);
+    let chat_baseline = crate::provider::ProviderRequest {
+        mode: crate::provider::PromptMode::Chat,
+        ..request.clone()
+    }
+    .system_message();
+    assert_eq!(
+        *native.open_instructions.lock().unwrap(),
+        vec![chat_baseline]
+    );
+    assert_eq!(
+        *native.open_models.lock().unwrap(),
+        vec![Some("admitted-model".to_owned())]
+    );
+    expect_negotiated_capabilities(&mut events);
+
+    // After the first open captured settings, configuration follows the native ordered path.
+    bridge
+        .thread_configure(request.clone(), &selection, None)
+        .await?;
+    assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
+    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
+    bridge.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn cold_configuration_defers_native_write_until_initialization() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
@@ -948,29 +1262,29 @@ async fn cold_configuration_defers_native_write_until_initialization() -> anyhow
     let selection = crate::settings::PortableSettings::default();
 
     let receipt = bridge
-        .session_configure(request.clone(), &selection, None)
+        .thread_configure(request.clone(), &selection, None)
         .await?;
     assert!(matches!(receipt, ConfigureReceipt::Deferred));
     let _events = bridge.session_events(request.owner()?).await?;
     let receipt = bridge
-        .session_configure(request.clone(), &selection, None)
+        .thread_configure(request.clone(), &selection, None)
         .await?;
     assert!(matches!(receipt, ConfigureReceipt::Deferred));
     assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 0);
 
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     bridge
-        .session_configure(request.clone(), &selection, None)
+        .thread_configure(request.clone(), &selection, None)
         .await?;
     assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
 
     bridge.shutdown().await?;
     assert!(matches!(
         bridge
-            .session_configure(request.clone(), &selection, None)
+            .thread_configure(request.clone(), &selection, None)
             .await,
         Err(ProviderError::Failure(failure))
-            if failure.operation() == ProviderOperation::SessionConfigure
+            if failure.operation() == ProviderOperation::ThreadConfigure
                 && failure.kind() == ProviderFailureKind::BindingClosed
     ));
     assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
@@ -990,14 +1304,14 @@ async fn configuration_receipt_rejects_new_operation_identity_and_retired_genera
         let request = provider_request(root.path());
         let owner = request.owner()?;
         let mut events = bridge.session_events(owner.clone()).await?;
-        bridge.session_open(request.clone()).await?;
+        bridge.thread_open(request.clone()).await?;
 
         // A configured result cannot certify identity before the owner consumes its exact publication.
         let applying = bridge.clone();
         let desired = request.clone();
         let configured = tokio::spawn(async move {
             applying
-                .session_configure(desired, &crate::settings::PortableSettings::default(), None)
+                .thread_configure(desired, &crate::settings::PortableSettings::default(), None)
                 .await
         });
         let (binding, watermark) = identity_boundary(&mut events, "after-first").await?;
@@ -1022,14 +1336,10 @@ async fn configuration_receipt_rejects_new_operation_identity_and_retired_genera
             Some("after-first")
         );
         first.validate(&owner)?;
+        assert!(first.validate(&ThreadOwner::root("foreign-owner")).is_err());
         assert!(
             first
-                .validate(&ExecutionOwner::root("foreign-owner"))
-                .is_err()
-        );
-        assert!(
-            first
-                .observed_history(&ExecutionOwner::root("foreign-owner"))
+                .observed_history(&ThreadOwner::root("foreign-owner"))
                 .is_err()
         );
 
@@ -1039,7 +1349,7 @@ async fn configuration_receipt_rejects_new_operation_identity_and_retired_genera
         let desired = request.clone();
         let configured = tokio::spawn(async move {
             applying
-                .session_configure(desired, &crate::settings::PortableSettings::default(), None)
+                .thread_configure(desired, &crate::settings::PortableSettings::default(), None)
                 .await
         });
         let (binding, watermark) = identity_boundary(&mut events, "after-second").await?;
@@ -1083,11 +1393,14 @@ async fn configuration_receipt_rejects_new_operation_identity_and_retired_genera
         // A later consumed history change and binding retirement independently invalidate the receipt.
         {
             let sink = native.sinks.lock().unwrap().get(&binding).cloned().unwrap();
-            sink.send_wait(ProviderEvent::SessionIdentity {
-                scope: sink.scope().clone(),
-                provider_session_id: "later-history".try_into()?,
-            })
-            .await?;
+            sink.activity_writer()
+                .send_wait(forge_provider_api::AdapterActivity::Thread {
+                    thread_id: sink.scope().owner().thread_id(),
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(
+                        "later-history".try_into()?,
+                    ),
+                })
+                .await?;
         }
         let (binding, watermark) = identity_boundary(&mut events, "later-history").await?;
         bridge.event_consumed(&binding, watermark).await?;
@@ -1126,10 +1439,16 @@ async fn identity_boundary(
             .recv()
             .await?
             .ok_or_else(|| anyhow::anyhow!("identity observation closed"))?;
-        if let ProviderEvent::SessionIdentity {
-            provider_session_id,
-            ..
-        } = event.event
+        if let crate::provider::session_execution::OwnerObservation::Event(
+            crate::provider::HarnessEvent::Native {
+                event: boxed_native_event,
+                ..
+            },
+        ) = event.event
+            && let ProviderEvent::Thread {
+                event: forge_provider_api::ThreadEvent::IdentityResolved(provider_session_id),
+                ..
+            } = boxed_native_event.as_ref()
         {
             assert_eq!(provider_session_id.as_str(), expected);
             return event
@@ -1163,9 +1482,9 @@ async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow:
             Arc::new(crate::trace::TraceStore::open(root.path())?),
         );
         let engine = registry.owner(owner.clone()).await?;
-        bridge.session_open(request.clone()).await?;
+        bridge.thread_open(request.clone()).await?;
         let ConfigureReceipt::Applied(receipt) = bridge
-            .session_configure(request, &crate::settings::PortableSettings::default(), None)
+            .thread_configure(request, &crate::settings::PortableSettings::default(), None)
             .await?
         else {
             anyhow::bail!("initialized configuration was deferred");
@@ -1174,22 +1493,16 @@ async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow:
         // Drain a FIFO marker before gating consumption, excluding bootstrap publications from the assertion.
         let host = bridge.session(owner.clone()).await;
         host.sender
-            .send(Ok(HostEvent::host(ProviderEvent::Diagnostic {
-                scope: forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
-                },
-                diagnostic: forge_provider_api::ProviderDiagnostic {
-                    kind: ProviderFailureKind::Unknown,
-                    message: forge_provider_api::SanitizedMessage::new(
-                        "identity-publication-marker",
-                    )?,
-                    fatal: false,
+            .send(Ok(ProviderObservation::host(crate::provider::HarnessEvent::Host {
+                scope: forge_provider_api::EventScope::Binding { owner: owner.clone() },
+                event: crate::provider::HostEvent::Failure {
+                    failure: forge_provider_api::ProviderFailure::new(ProviderOperation::ThreadConfigure, ProviderFailureKind::Unknown),
+                    message: forge_provider_api::SanitizedMessage::new("identity-publication-marker")?,
                 },
             })))?;
         loop {
             if inbox.drain()?.iter().any(|event| {
-                matches!(event, ProviderEvent::Diagnostic { diagnostic, .. }
-                if diagnostic.message.as_str() == "identity-publication-marker")
+                matches!(event, crate::provider::session_execution::OwnerObservation::Event(crate::provider::HarnessEvent::Host { event: crate::provider::HostEvent::Failure { message, .. }, .. }) if message.as_str() == "identity-publication-marker")
             }) {
                 break;
             }
@@ -1203,10 +1516,7 @@ async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow:
         {
             let binding = &host.initialized.get().unwrap().binding.id;
             let sink = native.sinks.lock().unwrap().get(binding).cloned().unwrap();
-            sink.send_wait(ProviderEvent::SessionIdentity {
-                scope: sink.scope().clone(),
-                provider_session_id: "advanced".try_into()?,
-            })
+            sink.activity_writer().send_wait(forge_provider_api::AdapterActivity::Thread { thread_id: sink.scope().owner().thread_id(), event: forge_provider_api::ThreadEvent::IdentityResolved("advanced".try_into()?) })
             .await?;
         }
         consuming.await;
@@ -1232,8 +1542,8 @@ async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow:
         loop {
             let events = inbox.drain()?;
             if events.iter().any(|event| {
-                matches!(event, ProviderEvent::SessionIdentity { provider_session_id, .. }
-                if provider_session_id.as_str() == "advanced")
+                matches!(event, crate::provider::session_execution::OwnerObservation::Event(crate::provider::HarnessEvent::Native { event: boxed_native_event, .. })
+                 if matches!(boxed_native_event.as_ref(), ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::IdentityResolved(provider_session_id), .. } if provider_session_id.as_str() == "advanced"))
             }) {
                 assert_eq!(
                     receipt
@@ -1266,11 +1576,9 @@ async fn unexpected_native_eof_retains_failed_close_for_retry() -> anyhow::Resul
     let request = provider_request(root.path());
     let owner = request.owner()?;
     let mut events = bridge.session_events(owner).await?;
-    bridge.session_open(request).await?;
-    assert!(matches!(
-        events.recv().await?.map(|event| event.event),
-        Some(ProviderEvent::CapabilitiesChanged { .. })
-    ));
+    bridge.thread_open(request).await?;
+    expect_negotiated_capabilities(&mut events);
+    assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
 
     let session = bridge
         .sessions
@@ -1305,11 +1613,11 @@ async fn foreground_cleanup_does_not_cancel_a_settled_invocation_observer() -> a
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    bridge.session_open(request).await?;
+    bridge.thread_open(request).await?;
     let host = bridge.session(owner.clone()).await;
     let bound = host.initialized.get().unwrap();
     let scope = forge_provider_api::InvocationScope::new(owner.clone(), "settled-test-turn");
-    let (sink, _control_stream) = events::channel(bound.binding.id.clone(), scope.clone());
+    let (sink, _control_stream) = crate::provider::events::channel(scope.clone());
     let endpoint = Arc::new(crate::tools::control_session::ControlSession::new(
         Vec::new(),
     ));
@@ -1324,7 +1632,7 @@ async fn foreground_cleanup_does_not_cancel_a_settled_invocation_observer() -> a
         Some(sink.clone()),
     )?;
     endpoint.begin(context.clone(), sink).await;
-    let (_event_sink, event_stream) = events::channel(bound.binding.id.clone(), scope.clone());
+    let (_event_sink, event_stream) = crate::provider::events::channel(scope.clone());
     let server = ControlServer::start(endpoint.clone()).await?;
     let endpoint_url = server.url.clone();
     let endpoint_lease = Arc::new(EndpointLease { _server: server });
@@ -1340,6 +1648,13 @@ async fn foreground_cleanup_does_not_cancel_a_settled_invocation_observer() -> a
         context,
         &[],
         crate::provider::host_invocation::HostInvocationResources {
+            observed_authority: Arc::new(ObservedPermissionAuthority::new(
+                bound.binding.id.clone(),
+                scope.clone(),
+                Arc::downgrade(&permissions),
+                Arc::downgrade(&host),
+                crate::provider::events::channel(scope.clone()).0,
+            )),
             provider_closed: bridge.closed.clone(),
             permissions: permissions.clone(),
             directories: None,
@@ -1431,11 +1746,11 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    bridge.session_open(request).await?;
+    bridge.thread_open(request).await?;
     let host = bridge.session(owner.clone()).await;
     let bound = host.initialized.get().unwrap();
     let scope = forge_provider_api::InvocationScope::new(owner.clone(), "settled-test-turn");
-    let (sink, _control_stream) = events::channel(bound.binding.id.clone(), scope.clone());
+    let (sink, _control_stream) = crate::provider::events::channel(scope.clone());
     let endpoint = Arc::new(crate::tools::control_session::ControlSession::new(
         crate::tools::ControlToolRegistry.definition_list(),
     ));
@@ -1455,7 +1770,7 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
         Some(sink.clone()),
     )?;
     endpoint.begin(context.clone(), sink).await;
-    let (_event_sink, event_stream) = events::channel(bound.binding.id.clone(), scope.clone());
+    let (_event_sink, event_stream) = crate::provider::events::channel(scope.clone());
     let server = ControlServer::start(endpoint.clone()).await?;
     let endpoint_lease = Arc::new(EndpointLease { _server: server });
     let relay = crate::provider::host_invocation::HostEventRelay::start(
@@ -1470,6 +1785,13 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
         context,
         &crate::tools::ControlToolRegistry.definition_list(),
         crate::provider::host_invocation::HostInvocationResources {
+            observed_authority: Arc::new(ObservedPermissionAuthority::new(
+                bound.binding.id.clone(),
+                scope.clone(),
+                Arc::downgrade(&permissions),
+                Arc::downgrade(&host),
+                crate::provider::events::channel(scope.clone()).0,
+            )),
             provider_closed: bridge.closed.clone(),
             permissions: permissions.clone(),
             directories: None,
@@ -1523,6 +1845,95 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     Ok(())
 }
 
+/// A host tool that fails before producing effects leaves host collection certain.
+///
+/// Cancelling a turn while `question_ask` waits makes the executor fail the call before it
+/// publishes anything. Collection must still succeed, because an uncertain collection fails the
+/// owner's observation and blocks every later prompt. The fixture fails the call through task
+/// admission, which rejects a plan tool while the session runs a goal.
+#[tokio::test]
+async fn host_call_failing_before_publication_keeps_collection_certain() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let request = provider_request(root.path());
+    let owner = request.owner()?;
+    bridge.thread_open(request).await?;
+    let host = bridge.session(owner.clone()).await;
+    let bound = host.initialized.get().unwrap();
+    let scope = forge_provider_api::InvocationScope::new(owner.clone(), "unpublished-call-turn");
+    let (sink, _control_stream) = crate::provider::events::channel(scope.clone());
+    let endpoint = Arc::new(crate::tools::control_session::ControlSession::new(
+        crate::tools::ControlToolRegistry.definition_list(),
+    ));
+    let mut context = crate::tools::ControlTurnContext::inactive(super::super::PromptMode::Plan);
+    let (_task_root, _task_store, task_controller) =
+        crate::task::SessionTaskController::test_goal();
+    context.bind_test_task_controller(task_controller);
+    let permissions = Arc::new(
+        crate::permissions::provider::ProviderPermissionContext::new(bridge.permissions.clone()),
+    );
+    permissions.configure(
+        owner.clone(),
+        crate::session::ApprovalMode::Ask,
+        root.path().to_string_lossy().into_owned(),
+        Some(sink.clone()),
+    )?;
+    endpoint.begin(context.clone(), sink).await;
+    let (_event_sink, event_stream) = crate::provider::events::channel(scope.clone());
+    let server = ControlServer::start(endpoint.clone()).await?;
+    let endpoint_lease = Arc::new(EndpointLease { _server: server });
+    let relay = crate::provider::host_invocation::HostEventRelay::start(
+        bound.binding.id.clone(),
+        event_stream,
+        host.sender.clone(),
+    );
+    let invocation = Arc::new(crate::provider::host_invocation::HostInvocation::new(
+        bound.binding.id.clone(),
+        scope.clone(),
+        &provider_request(root.path()),
+        context,
+        &crate::tools::ControlToolRegistry.definition_list(),
+        crate::provider::host_invocation::HostInvocationResources {
+            observed_authority: Arc::new(ObservedPermissionAuthority::new(
+                bound.binding.id.clone(),
+                scope.clone(),
+                Arc::downgrade(&permissions),
+                Arc::downgrade(&host),
+                crate::provider::events::channel(scope.clone()).0,
+            )),
+            provider_closed: bridge.closed.clone(),
+            permissions: permissions.clone(),
+            directories: None,
+            endpoint: endpoint.clone(),
+            endpoint_lease,
+            relay,
+            skills: None,
+        },
+    ));
+    let call = forge_provider_api::control::ToolCall {
+        id: forge_provider_api::control::ToolCallId::new("unpublished-plan-read")?,
+        name: "plan_file_read".into(),
+        arguments: serde_json::json!({}),
+    };
+    let failed =
+        forge_provider_api::control::ProviderTools::call(invocation.as_ref(), &scope, call).await;
+    assert!(
+        failed.is_err(),
+        "the fixture call must fail before publishing: {failed:?}"
+    );
+    host.invocations
+        .lock()
+        .await
+        .insert(scope.invocation_id.clone(), invocation.clone());
+    bridge.collect_host_effects(&scope).await.map_err(|error| {
+        anyhow::anyhow!("a call without effects made collection fail: {error:?}")
+    })?;
+    invocation.cancel();
+    let _ = bridge.shutdown().await;
+    Ok(())
+}
+
 /// A returned lifecycle result cannot advance before its event is reduced by the owner.
 #[tokio::test]
 async fn operation_watermark_waits_for_owner_consumption() -> anyhow::Result<()> {
@@ -1532,7 +1943,7 @@ async fn operation_watermark_waits_for_owner_consumption() -> anyhow::Result<()>
     let request = provider_request(root.path());
     let owner = request.owner()?;
     let mut events = bridge.session_events(owner.clone()).await?;
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     let host = bridge.session(owner.clone()).await;
     let bound = host.initialized.get().expect("the session is opened");
     let sink = native
@@ -1545,11 +1956,7 @@ async fn operation_watermark_waits_for_owner_consumption() -> anyhow::Result<()>
     let mut capabilities =
         forge_provider_api::CapabilityManifest::from_descriptor(native.descriptor());
     capabilities.effective_revision = 7;
-    sink.send_wait(ProviderEvent::CapabilitiesChanged {
-        scope: sink.scope().clone(),
-        capabilities,
-    })
-    .await?;
+    sink.capabilities_changed(capabilities).await?;
     let observation = loop {
         let observation = events
             .recv()
@@ -1581,6 +1988,24 @@ async fn operation_watermark_waits_for_owner_consumption() -> anyhow::Result<()>
             .effective_revision,
         7
     );
+    let mut stale = forge_provider_api::CapabilityManifest::from_descriptor(native.descriptor());
+    stale.effective_revision = 3;
+    sink.capabilities_changed(stale).await?;
+    let stale_observation = events
+        .recv()
+        .await?
+        .expect("stale capability event is retained");
+    let (binding, sequence) = stale_observation
+        .native
+        .expect("original native provenance is retained");
+    bridge.event_consumed(&binding, sequence).await?;
+    assert_eq!(
+        bridge
+            .capabilities(catalog_request(&request))
+            .await?
+            .effective_revision,
+        7
+    );
     drop(sink);
     bridge.shutdown().await?;
     Ok(())
@@ -1595,7 +2020,8 @@ async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()
     let request = provider_request(root.path());
     let owner = request.owner()?;
     let mut events = bridge.session_events(owner.clone()).await?;
-    bridge.session_open(request).await?;
+    bridge.thread_open(request).await?;
+    expect_negotiated_capabilities(&mut events);
     let host = bridge.session(owner.clone()).await;
     let binding = host
         .initialized
@@ -1604,10 +2030,7 @@ async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()
         .binding
         .id
         .clone();
-    assert!(matches!(
-        events.recv().await?.map(|event| event.event),
-        Some(ProviderEvent::CapabilitiesChanged { .. })
-    ));
+    assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
     native.close_native_stream(&binding);
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
@@ -1635,8 +2058,8 @@ async fn close_waits_for_published_prefix_without_fabricating_observation_loss()
     let request = provider_request(root.path());
     let owner = request.owner()?;
     let mut events = bridge.session_events(owner.clone()).await?;
-    bridge.session_open(request).await?;
-    assert!(events.recv().await?.is_some());
+    bridge.thread_open(request).await?;
+    expect_negotiated_capabilities(&mut events);
     let host = bridge.session(owner.clone()).await;
     let binding = host
         .initialized
@@ -1646,11 +2069,14 @@ async fn close_waits_for_published_prefix_without_fabricating_observation_loss()
         .id
         .clone();
     let sink = native.sinks.lock().unwrap().get(&binding).cloned().unwrap();
-    sink.send_wait(ProviderEvent::SessionIdentity {
-        scope: sink.scope().clone(),
-        provider_session_id: "final-history".to_owned().try_into()?,
-    })
-    .await?;
+    sink.activity_writer()
+        .send_wait(forge_provider_api::AdapterActivity::Thread {
+            thread_id: sink.scope().owner().thread_id(),
+            event: forge_provider_api::ThreadEvent::IdentityResolved(
+                "final-history".to_owned().try_into()?,
+            ),
+        })
+        .await?;
     let observed = events
         .recv()
         .await?
@@ -1686,11 +2112,11 @@ async fn rejected_open_allows_corrected_configuration_without_operation_conflict
     let mut request = provider_request(root.path());
     request.context_window = Some("unavailable".into());
     assert!(matches!(
-        bridge.session_open(request.clone()).await,
+        bridge.thread_open(request.clone()).await,
         Err(ProviderError::Unsupported(_))
     ));
     request.context_window = None;
-    bridge.session_open(request).await?;
+    bridge.thread_open(request).await?;
     {
         let attempts = native.open_attempts.lock().unwrap();
         assert_eq!(attempts.len(), 2);
@@ -1710,7 +2136,7 @@ async fn detached_open_observes_original_request_and_operation() -> anyhow::Resu
     let mut request = provider_request(root.path());
     let original = request.clone();
     let first_bridge = bridge.clone();
-    let first = tokio::spawn(async move { first_bridge.session_open(original).await });
+    let first = tokio::spawn(async move { first_bridge.thread_open(original).await });
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         native.open_started.notified(),
@@ -1720,7 +2146,7 @@ async fn detached_open_observes_original_request_and_operation() -> anyhow::Resu
     let _ = first.await;
     native.open_blocked.store(false, Ordering::Release);
     request.model = "changed-after-detach".into();
-    bridge.session_open(request).await?;
+    bridge.thread_open(request).await?;
     {
         let attempts = native.open_attempts.lock().unwrap();
         assert_eq!(attempts.len(), 2);
@@ -1740,7 +2166,7 @@ async fn closed_open_transaction_rejects_work_before_native_dispatch() -> anyhow
     let request = provider_request(root.path());
     let session = bridge.session(request.owner()?).await;
     session.open_operation.cancel();
-    assert!(matches!(bridge.session_open(request).await,
+    assert!(matches!(bridge.thread_open(request).await,
         Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed));
     assert!(native.open_attempts.lock().unwrap().is_empty());
     bridge.shutdown().await?;
@@ -1756,7 +2182,7 @@ async fn dropped_session_receiver_keeps_native_binding_owned_until_close() -> an
     let request = provider_request(root.path());
     let owner = request.owner()?;
     drop(bridge.session_events(owner.clone()).await?);
-    assert!(bridge.session_open(request).await.is_err());
+    assert!(bridge.thread_open(request).await.is_err());
     assert_eq!(native.sinks.lock().unwrap().len(), 1);
     bridge.session_close_owner(&owner).await?;
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
@@ -1773,7 +2199,7 @@ async fn collected_open_failure_releases_its_pending_transaction() -> anyhow::Re
     let native = BridgeFixtureProvider::new(false);
     *native.open_persistent_failure.lock().unwrap() = Some(
         ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Cancelled,
         )
         .at_phase(
@@ -1785,7 +2211,7 @@ async fn collected_open_failure_releases_its_pending_transaction() -> anyhow::Re
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    assert!(bridge.session_open(request).await.is_err());
+    assert!(bridge.thread_open(request).await.is_err());
     bridge.session_close_owner(&owner).await?;
     assert!(!bridge.sessions.lock().await.contains_key(&owner));
     bridge.shutdown().await?;
@@ -1799,7 +2225,7 @@ async fn close_retains_uncertain_open_until_collection_is_proven() -> anyhow::Re
     let native = BridgeFixtureProvider::new(false);
     *native.open_persistent_failure.lock().unwrap() = Some(
         ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Transport,
         )
         .at_phase(
@@ -1811,7 +2237,7 @@ async fn close_retains_uncertain_open_until_collection_is_proven() -> anyhow::Re
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    assert!(bridge.session_open(request).await.is_err());
+    assert!(bridge.thread_open(request).await.is_err());
     assert!(bridge.session_close_owner(&owner).await.is_err());
     assert!(
         bridge.sessions.lock().await.contains_key(&owner),
@@ -1833,7 +2259,7 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
     let request = provider_request(root.path());
     let opening = bridge.clone();
-    let worker = tokio::spawn(async move { opening.session_open(request).await });
+    let worker = tokio::spawn(async move { opening.thread_open(request).await });
     native.open_started.notified().await;
     tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
     let error = worker
@@ -1843,7 +2269,7 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
         matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Cancelled)
     );
     let error = bridge
-        .session_open(provider_request(root.path()))
+        .thread_open(provider_request(root.path()))
         .await
         .expect_err("closed admission must reject reopening");
     assert!(
@@ -1860,7 +2286,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
     let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     let querying = bridge.clone();
     let query =
         tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
@@ -1872,7 +2298,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
     .await?
     .unwrap_err();
     assert!(
-        matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionClose && failure.kind() == ProviderFailureKind::Runtime)
+        matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadClose && failure.kind() == ProviderFailureKind::Runtime)
     );
     let host = bridge
         .sessions
@@ -1921,7 +2347,7 @@ async fn host_collection_timeout_preserves_closed_native_binding_proof() -> anyh
     let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
     let request = provider_request(root.path());
     let owner = request.owner()?;
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     let querying = bridge.clone();
     let query =
         tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
@@ -1929,16 +2355,15 @@ async fn host_collection_timeout_preserves_closed_native_binding_proof() -> anyh
     let closing = bridge.session_close_owner(&owner);
     tokio::pin!(closing);
     assert!(futures_util::poll!(closing.as_mut()).is_pending());
-    tokio::time::advance(std::time::Duration::from_secs(16)).await;
-    let error = closing.await.unwrap_err();
-    assert!(matches!(error, ProviderError::Failure(failure)
-        if failure.kind() == ProviderFailureKind::Timeout
-        && failure.phase() == forge_provider_api::ProviderPhase::Collection
-        && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(16), closing.as_mut())
+            .await
+            .is_err()
+    );
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     native.terminal_release.notify_one();
     query.await??;
-    bridge.session_close_owner(&owner).await?;
+    closing.await?;
     assert_eq!(
         native.retire_calls.load(Ordering::Acquire),
         1,
@@ -1956,10 +2381,10 @@ async fn configuration_preserves_original_deadline_before_native_admission() -> 
     let bridge = bridge(root.path(), native.clone()).await?;
     let request = provider_request(root.path());
     let _events = bridge.session_events(request.owner()?).await?;
-    bridge.session_open(request.clone()).await?;
+    bridge.thread_open(request.clone()).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     bridge
-        .session_configure(
+        .thread_configure(
             request.clone(),
             &crate::settings::PortableSettings::default(),
             Some(deadline),
@@ -1971,7 +2396,7 @@ async fn configuration_preserves_original_deadline_before_native_admission() -> 
     );
     let expired = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
     let failure = bridge
-        .session_configure(
+        .thread_configure(
             request,
             &crate::settings::PortableSettings::default(),
             Some(expired),
@@ -1985,4 +2410,282 @@ async fn configuration_preserves_original_deadline_before_native_admission() -> 
     assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
     bridge.shutdown().await?;
     Ok(())
+}
+
+/// Invalid returned ownership is fenced without dropping the native resource needed by close.
+#[tokio::test]
+async fn foreign_opened_thread_is_rejected_and_remains_collectable() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    *native.open_thread_override.lock().unwrap() = Some(ThreadOwner::root("foreign").thread_id());
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let request = provider_request(root.path());
+    let owner = request.owner()?;
+    assert!(matches!(bridge.thread_open(request.clone()).await,
+        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
+    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
+    assert!(matches!(bridge.thread_open(request).await,
+        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
+    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
+    bridge.session_close_owner(&owner).await?;
+    assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+/// Preserve independent native-child policy and publication after the original parent is collected.
+#[tokio::test]
+async fn observed_child_policy_survives_parent_collection_and_retires_on_child_close()
+-> anyhow::Result<()> {
+    use crate::provider::test_support::ProviderTestExt as _;
+    use forge_provider_api::agent::{
+        AgentActiveState, AgentDelegation, AgentDescription, AgentEvent, AgentLifecycleEvent,
+        AgentOutcome,
+    };
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart};
+    use forge_provider_api::permissions::{
+        PermissionRequest, PermissionResponse, PermissionTarget,
+    };
+    use forge_provider_api::tool::{
+        InspectableArguments, ToolCompletion, ToolDescriptor, ToolOutcome, ToolSemantics,
+    };
+    use forge_provider_api::{AdapterActivity, AgentId, ItemId};
+    let phase = std::sync::Mutex::new("fixture setup");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let root = tempfile::tempdir()?;
+        let readable = root.path().join("child-readable.txt");
+        std::fs::write(&readable, "child resource")?;
+        let retained = Arc::new(std::sync::Mutex::new(None));
+        let capture = retained.clone();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            forge_providers::registry::descriptor(
+                &forge_providers::registry::nonselectable_id().unwrap(),
+            )?,
+            move |request, writer, start, _| {
+                let capture = capture.clone();
+                async move {
+                    start.observed(1).await?;
+                    let agent_id = AgentId::new("observed-child").unwrap();
+                    let child_owner = ThreadOwner::new(
+                        request.scope.owner.session_id().clone(),
+                        AgentId::new("independent-child-owner").unwrap(),
+                    )
+                    .unwrap();
+                    let scope = forge_provider_api::InvocationScope::new(
+                        child_owner.clone(),
+                        request.scope.exchange_id.clone(),
+                    );
+                    let address = forge_provider_api::TurnAddress {
+                        thread_id: child_owner.thread_id(),
+                        turn_id: scope.turn_id().unwrap(),
+                        scope,
+                    };
+                    let description = AgentDescription {
+                        parent_agent_id: Some(request.scope.owner.agent_id().clone()),
+                        delegation: Some(AgentDelegation {
+                            parent_thread_id: request.thread_id.clone(),
+                            parent_turn_id: request.turn_id.clone(),
+                            parent_item_id: None,
+                        }),
+                        thread_id: Some(address.thread_id.clone()),
+                        definition: None,
+                        nickname: Some("Independent child".into()),
+                        task: None,
+                    };
+                    writer
+                        .send_wait(AdapterActivity::Agent {
+                            agent_id: agent_id.clone(),
+                            event: AgentEvent::Lifecycle {
+                                event: AgentLifecycleEvent::Started {
+                                    agent: description.clone(),
+                                    state: AgentActiveState::Running,
+                                },
+                            },
+                        })
+                        .await?;
+                    let child_writer = writer.register_observed_turn(address.clone())?;
+                    *capture.lock().unwrap() = Some((
+                        request.permissions.clone(),
+                        request.provider_tools.clone(),
+                        request.scope.clone(),
+                        address,
+                        writer,
+                        child_writer,
+                        agent_id,
+                        description,
+                    ));
+                    Ok(crate::provider::test_support::native_result(
+                        &request,
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                    ))
+                }
+            },
+        );
+        let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let mut request = provider_request(root.path());
+        request.approval_mode = crate::session::ApprovalMode::Allow;
+        *phase.lock().unwrap() = "root collection";
+        fixture.session_prompt_and_collect(request).await?;
+        let (permissions, tools, parent, child, writer, child_writer, agent_id, description) =
+            retained
+                .lock()
+                .unwrap()
+                .take()
+                .expect("native fixture recorded its child");
+        assert_ne!(
+            fixture
+                .provider_handle()
+                .retained_session_id(&parent.owner)
+                .await
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("child-native-history")
+        );
+        *phase.lock().unwrap() = "first positive child activity after root collection";
+        child_writer
+            .send_wait(AdapterActivity::Thread {
+                thread_id: child.thread_id.clone(),
+                event: forge_provider_api::ThreadEvent::IdentityResolved(
+                    "child-native-history".try_into().unwrap(),
+                ),
+            })
+            .await?;
+        child_writer
+            .send_wait(AdapterActivity::Item {
+                thread_id: child.thread_id.clone(),
+                turn_id: child.turn_id.clone(),
+                item_id: ItemId::new("child-tool").unwrap(),
+                event: ItemEvent::Started(ItemStart::ToolCall(ToolDescriptor {
+                    name: "inspect".into(),
+                    title: "Inspect child resource".into(),
+                    semantics: ToolSemantics::Other,
+                    arguments: InspectableArguments::new(serde_json::Value::Null),
+                })),
+            })
+            .await?;
+        *phase.lock().unwrap() = "late child permission";
+        permissions.before_observed_child(&parent, &child).await?;
+        let call = forge_provider_api::control::ToolCall {
+            id: forge_provider_api::control::ToolCallId::new("child-workflow-call").unwrap(),
+            name: "goal_status".into(),
+            arguments: serde_json::json!({}),
+        };
+        let foreign_parent = forge_provider_api::InvocationScope::new(
+            parent.owner.clone(),
+            parent.exchange_id.clone(),
+        );
+        assert!(
+            tools
+                .call_observed_child(&foreign_parent, &child, call.clone())
+                .await
+                .is_err()
+        );
+        *phase.lock().unwrap() = "late child host callback";
+        let denied = tools
+            .call_observed_child(&parent, &child, call.clone())
+            .await;
+        assert!(match &denied {
+            Ok(message) => message.contains("does not authorize parent workflow"),
+            Err(_) => true,
+        });
+        let replay = tools
+            .call_observed_child(&parent, &child, call.clone())
+            .await;
+        assert_eq!(format!("{denied:?}"), format!("{replay:?}"));
+
+        let permission = permissions
+            .authorize_observed_child(
+                &parent,
+                &child,
+                PermissionRequest {
+                    id: "child-read".into(),
+                    provider: forge_providers::registry::nonselectable_id().unwrap(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Read {
+                        path: readable.to_string_lossy().into_owned(),
+                    }],
+                },
+            )
+            .await;
+        assert!(matches!(permission, PermissionResponse::Allow));
+        child_writer
+            .send_wait(AdapterActivity::Item {
+                thread_id: child.thread_id.clone(),
+                turn_id: child.turn_id.clone(),
+                item_id: ItemId::new("child-tool").unwrap(),
+                event: ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+                    outcome: ToolOutcome::Succeeded,
+                    descriptor: None,
+                    output: Some("child read completed".into()),
+                    changes: Default::default(),
+                })),
+            })
+            .await?;
+        let gate = crate::checkpoint::ToolGate::new();
+        let host = fixture
+            .provider_handle()
+            .sessions
+            .lock()
+            .await
+            .get(&parent.owner)
+            .cloned()
+            .expect("original parent binding is retained");
+        let child_context = host
+            .observed_contexts
+            .lock()
+            .unwrap()
+            .get(&child.turn_id)
+            .cloned()
+            .expect("first positive child activity retained its independent policy");
+        let mut child_controls =
+            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        child_controls.question_invocation = Some(child.scope.clone());
+        child_controls.checkpoint = Some(gate.clone());
+        child_context.bind_context(Some(&child_controls))?;
+        let callback = permissions.before_observed_child(&parent, &child);
+        tokio::pin!(callback);
+        assert!(futures_util::poll!(callback.as_mut()).is_pending());
+        writer
+            .send_wait(AdapterActivity::Agent {
+                agent_id,
+                event: AgentEvent::Lifecycle {
+                    event: AgentLifecycleEvent::Finished {
+                        agent: description,
+                        outcome: AgentOutcome::Completed,
+                    },
+                },
+            })
+            .await?;
+        *phase.lock().unwrap() = "native child retirement releases held original callback";
+        assert!(callback.await.is_err());
+        assert!(
+            !gate.ready(),
+            "terminal delivery must release the callback without checkpoint completion"
+        );
+
+        loop {
+            if permissions
+                .before_observed_child(&parent, &child)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tools
+                .call_observed_child(&parent, &child, call)
+                .await
+                .is_err()
+        );
+        *phase.lock().unwrap() = "fixture owner close";
+        fixture.close().await?;
+        *phase.lock().unwrap() = "provider shutdown";
+        fixture.provider_handle().shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{}: {error}", *phase.lock().unwrap()))?
 }

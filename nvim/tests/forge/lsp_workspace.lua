@@ -7,14 +7,21 @@ local rust_path, typescript_path = directory .. "/rust/main.rs", directory .. "/
 vim.fn.writefile({ "fn sample() {}" }, rust_path)
 vim.fn.writefile({ "function sample() {}" }, typescript_path)
 local original = { wait = startup.wait, clients = vim.lsp.get_clients, timer = vim.uv.new_timer }
-local clients, calls, cancelled, pending = {}, {}, {}, {}
+local clients, calls, answered, cancelled, pending = {}, {}, {}, {}, {}
 local hold, empty, malformed = false, false, false
-local held_name, fast_deadline, startup_calls
+local held_name, captured_deadline, startup_calls
+---Holds the semantic layer's ten-second workspace deadline callback while capture is enabled,
+---so the fixture fires the expiry directly instead of letting a timer elapse.
+---@type fun()?
+local deadline_expiry
 startup.wait = function(_, _, receive) startup_calls = (startup_calls or 0) + 1 receive() return function() end end
 vim.uv.new_timer = function()
   local timer = assert(original.timer())
   return {
-    start = function(_, delay, interval, callback) return timer:start(fast_deadline and delay == 10000 and 100 or delay, interval, callback) end,
+    start = function(_, delay, interval, callback)
+      if captured_deadline and delay == 10000 then deadline_expiry = callback return 0 end
+      return timer:start(delay, interval, callback)
+    end,
     stop = function() return timer:stop() end,
     close = function() return timer:close() end,
   }
@@ -29,6 +36,7 @@ local function make_client(identity, name, root, path, supported, failed)
   function client:request(method, _, receive)
     calls[name] = (calls[name] or 0) + 1
     local function respond()
+      answered[name] = (answered[name] or 0) + 1
       if failed then receive({ message = "fixture failure" }) return end
       local range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }
       if method == "workspace/diagnostic" then
@@ -96,12 +104,18 @@ local success, failure = xpcall(function()
   assert(not result and error:find("cancelled", 1, true))
   for _, respond in ipairs(pending) do respond() end
   assert(next(cancelled), "cancellation did not reach native requests")
-  hold, empty, held_name, fast_deadline = false, true, "typescript", true
+  hold, empty, held_name, captured_deadline = false, true, "typescript", true
   pending, startup_calls = {}, 0
+  local rust_answers = answered.rust or 0
   local done, reply, failure
   require("forge.lsp.query").request(directory, { operation = "diagnostics" }, function(_, receive) receive({}) end,
     function() error("empty diagnostics should not require structural analysis") end,
     function(value, error) done, reply, failure = true, value, error end)
+  -- Expire only after the responsive server answers, so the deadline marks just the held one failed.
+  assert(vim.wait(2000, function() return deadline_expiry ~= nil and (answered.rust or 0) > rust_answers end, 5),
+    "workspace deadline was not armed or the responsive server did not answer")
+  assert(not done, "workspace facade replied before its deadline")
+  deadline_expiry()
   assert(vim.wait(2000, function() return done end, 5), "workspace facade lost its timeout reply")
   assert(reply and not failure and #reply.coverage == 2 and reply.freshness == "unknown", failure or vim.inspect(reply))
   assert(startup_calls == 1, "workspace operation repeated its startup wait")

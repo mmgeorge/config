@@ -16,11 +16,14 @@ struct ReceiptState {
     failed: bool,
     failure: Option<ProviderError>,
     fail_acceptance: bool,
+    hold_acceptance: bool,
 }
 
 struct FixtureReceipt {
     id: SubmissionId,
     state: Mutex<ReceiptState>,
+    acceptance_started: tokio::sync::Notify,
+    acceptance_release: tokio::sync::Notify,
 }
 
 impl FixtureReceipt {
@@ -28,6 +31,8 @@ impl FixtureReceipt {
         Arc::new(Self {
             id: SubmissionId::try_from("fixture-submission".to_owned()).unwrap(),
             state: Mutex::new(ReceiptState::default()),
+            acceptance_started: Default::default(),
+            acceptance_release: Default::default(),
         })
     }
 }
@@ -54,10 +59,15 @@ impl InputReceipt for FixtureReceipt {
         self: Arc<Self>,
         _: Option<RecoveryToken>,
     ) -> Result<(), ProviderError> {
+        let held = self.state.lock().unwrap().hold_acceptance;
+        if held {
+            self.acceptance_started.notify_one();
+            self.acceptance_release.notified().await;
+        }
         let mut state = self.state.lock().unwrap();
         if state.fail_acceptance {
             return Err(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Runtime,
             )
             .into());
@@ -163,6 +173,11 @@ fn prompt_request(
         receipt.attempt_id().unwrap(),
     );
     forge_provider_api::session::PromptRequest {
+        thread_id: (scope).owner.thread_id(),
+        turn_id: (scope)
+            .turn_id()
+            .expect("admitted scope has a nonempty host turn identity"),
+
         scope,
         dispatch,
         mode: forge_provider_api::input::PromptMode::Chat,
@@ -196,6 +211,8 @@ fn receipt(id: &str) -> Arc<FixtureReceipt> {
     Arc::new(FixtureReceipt {
         id: SubmissionId::try_from(id.to_owned()).unwrap(),
         state: Mutex::new(ReceiptState::default()),
+        acceptance_started: Default::default(),
+        acceptance_release: Default::default(),
     })
 }
 
@@ -307,11 +324,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  if(request.method==='session/fork')result={sessionId:'fork-child'};
  if(request.method==='session/prompt'||request.method==='_session/steering'){
   const mode=fs.readFileSync(process.argv[2],'utf8');
-  if((mode==='held'||mode==='held_cancel')&&request.method==='session/prompt'){heldPrompt=request.id;return;}
+  if(mode.startsWith('observed:')||mode==='held'||mode==='held_cancel')write({method:'session/update',params:{sessionId:'fixture',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'answer'}}}});
+  if((mode==='held'||mode==='held_cancel'||mode==='held_no_start')&&request.method==='session/prompt'){heldPrompt=request.id;return;}
   if(mode==='remote_error'){write({id:request.id,error:{code:-32603,message:'private native error'}});return;}
   if(mode==='invalid_request'){write({id:request.id,error:{code:-32600,message:'private invalid request detail'}});return;}
   if(request.method==='_session/steering')result=mode==='promptRequired'?{outcome:'promptRequired',reason:'noRunningTurn'}:{outcome:mode};
-  else result=mode==='invalid'?{}:{stopReason:mode==='cancelled'?'cancelled':'end_turn'};
+  else result=mode==='invalid'?{}:{stopReason:mode.startsWith('observed:')?mode.slice(9):mode==='cancelled'?'cancelled':'end_turn'};
  }
  write({id:request.id,result});
 });
@@ -362,13 +380,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             )
             .await
             .map_err(|error| {
-                crate::error::acp(error, forge_provider_api::ProviderOperation::SessionOpen)
+                crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadOpen)
             })?;
         self.connection
             .request("session/new", json!({"cwd":".","mcpServers":[]}))
             .await
             .map_err(|error| {
-                crate::error::acp(error, forge_provider_api::ProviderOperation::SessionOpen)
+                crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadOpen)
             })?;
         Ok(())
     }
@@ -398,7 +416,7 @@ impl forge_provider_api::session::ProviderHostEffects for FailedHostEffects {
 async fn native_settlement_does_not_wait_for_host_effects() {
     use forge_provider_api::provider::Provider;
     use forge_provider_api::session::{ResourceSelection, SessionMode, SessionRequest};
-    use forge_provider_api::{ExecutionOwner, InvocationScope};
+    use forge_provider_api::{InvocationScope, ThreadOwner};
 
     let fixture = WireFixture::start("ok").await.unwrap();
     fixture.connection.shutdown().await.unwrap();
@@ -408,11 +426,12 @@ async fn native_settlement_does_not_wait_for_host_effects() {
         fixture._directory.path().join("runtime"),
     )
     .unwrap();
-    let owner = ExecutionOwner::root("session");
+    let owner = ThreadOwner::root("session");
     let binding = provider
-        .session_open(
+        .thread_open(
             operation_context(),
             SessionRequest {
+                thread_id: (owner.clone()).thread_id(),
                 owner: owner.clone(),
                 mode: SessionMode::Interactive,
                 workspace: fixture._directory.path().to_string_lossy().into_owned(),
@@ -447,17 +466,17 @@ async fn native_settlement_does_not_wait_for_host_effects() {
     request.host_effects = Arc::new(FailedHostEffects);
     let scope = request.scope.clone();
     provider
-        .input_submit(operation_context(), &binding.id, request)
+        .turn_start(operation_context(), &binding.id, request)
         .await
         .unwrap();
     assert!(receipt.state.lock().unwrap().accepted);
-    let settlement = next_settlement(&mut stream).await;
+    let settlement = next_completion(&mut stream).await;
     assert!(matches!(
-        settlement.result,
-        forge_provider_api::ExecutionResult::Completed { .. }
+        settlement.outcome,
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
     ));
     let repeated = provider
-        .cancel(
+        .turn_interrupt(
             operation_context(),
             &binding.id,
             forge_provider_api::CancelRequest { scope },
@@ -466,7 +485,7 @@ async fn native_settlement_does_not_wait_for_host_effects() {
         .unwrap();
     assert_eq!(settlement.watermark, repeated.watermark);
     provider
-        .session_close(operation_context(), &binding.id)
+        .thread_close(operation_context(), &binding.id)
         .await
         .unwrap();
 }
@@ -505,7 +524,7 @@ async fn prompt_dispatch_does_not_wait_for_terminal_acceptance() {
     let (dispatch, mut observer) = forge_provider_api::submission::DispatchReporter::channel(
         forge_provider_api::BindingId::new("binding").unwrap(),
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("session"),
+            forge_provider_api::ThreadOwner::root("session"),
             "invocation",
         ),
         receipt.id.clone(),
@@ -556,7 +575,7 @@ async fn idle_steering_rejection_proves_input_not_consumed() {
         )
         .await;
     assert!(
-        matches!(result, Err(ProviderError::PreparationFailed(cause)) if matches!(*cause, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::InputSteer && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged))
+        matches!(result, Err(ProviderError::PreparationFailed(cause)) if matches!(*cause, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::TurnSteer && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged))
     );
     {
         let state = receipt.state.lock().unwrap();
@@ -572,8 +591,8 @@ async fn malformed_native_outcomes_preserve_uncertainty_in_return_and_receipt() 
         FailureDisposition, ProviderFailureKind, ProviderOperation, ProviderPhase,
     };
     for (kind, operation) in [
-        (AcpSubmission::Prompt, ProviderOperation::InputSubmit),
-        (AcpSubmission::Steering, ProviderOperation::InputSteer),
+        (AcpSubmission::Prompt, ProviderOperation::TurnStart),
+        (AcpSubmission::Steering, ProviderOperation::TurnSteer),
     ] {
         let fixture = WireFixture::start("invalid").await.unwrap();
         fixture.ready().await.unwrap();
@@ -623,11 +642,58 @@ async fn accepted_receipt_failure_preserves_persistence_uncertainty() {
         )
         .await;
     assert!(
-        matches!(result, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::InputSubmit && failure.kind() == ProviderFailureKind::Runtime && failure.phase() == ProviderPhase::Persistence && failure.disposition() == FailureDisposition::Uncertain)
+        matches!(result, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::TurnStart && failure.kind() == ProviderFailureKind::Runtime && failure.phase() == ProviderPhase::Persistence && failure.disposition() == FailureDisposition::Uncertain)
     );
     assert!(
         matches!(receipt.state.lock().unwrap().failure.as_ref(), Some(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Runtime && failure.phase() == ProviderPhase::Persistence && failure.disposition() == FailureDisposition::Uncertain)
     );
+    let native = fixture
+        .connection
+        .prompt_end(&forge_provider_api::CoveredInput::new(
+            receipt.id().clone(),
+            receipt.attempt_id().unwrap(),
+        ))
+        .expect("native response survives receipt persistence failure");
+    assert_eq!(
+        native.outcome(),
+        super::PromptOutcome::Completed(forge_provider_api::turn::TurnCompletionReason::Normal)
+    );
+    fixture.connection.shutdown().await.unwrap();
+}
+
+/// Native end time and reason are retained before the late ACP v1 acceptance receipt commits.
+#[tokio::test]
+async fn native_prompt_end_is_retained_while_receipt_acceptance_is_pending() {
+    let fixture = WireFixture::start("ok").await.unwrap();
+    fixture.ready().await.unwrap();
+    let receipt = FixtureReceipt::new();
+    receipt.state.lock().unwrap().hold_acceptance = true;
+    let submitting = fixture.connection.submit(
+        AcpSubmission::Prompt,
+        json!({"sessionId":"fixture", "prompt":[]}),
+        Some(receipt.clone()),
+        None,
+        None,
+    );
+    tokio::pin!(submitting);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            _ = receipt.acceptance_started.notified() => {},
+            result = &mut submitting => panic!("submission completed before receipt collection: {result:?}"),
+        }
+    }).await.unwrap();
+    let input =
+        forge_provider_api::CoveredInput::new(receipt.id().clone(), receipt.attempt_id().unwrap());
+    let before = fixture
+        .connection
+        .prompt_end(&input)
+        .expect("native end is retained before acceptance commit");
+    assert!(!receipt.state.lock().unwrap().accepted);
+    receipt.acceptance_release.notify_one();
+    submitting.await.unwrap();
+    let after = fixture.connection.prompt_end(&input).unwrap();
+    assert_eq!(before.outcome(), after.outcome());
+    assert_eq!(before.completed_at_ms(), after.completed_at_ms());
     fixture.connection.shutdown().await.unwrap();
 }
 
@@ -664,7 +730,7 @@ async fn typed_json_rpc_rejection_maps_without_exposing_native_message() {
         .request("session/prompt", json!({"sessionId":"fixture","prompt":[]}))
         .await
         .unwrap_err();
-    let normalized = crate::error::acp(native, forge_provider_api::ProviderOperation::InputSubmit);
+    let normalized = crate::error::acp(native, forge_provider_api::ProviderOperation::TurnStart);
     assert!(
         matches!(normalized, ProviderError::Failure(ref failure) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
     );
@@ -702,10 +768,11 @@ async fn provider_fixture(
     )
     .unwrap();
     let opened = provider
-        .session_open(
+        .thread_open(
             operation_context(),
             forge_provider_api::SessionRequest {
-                owner: forge_provider_api::ExecutionOwner::root("fixture-owner"),
+                thread_id: (forge_provider_api::ThreadOwner::root("fixture-owner")).thread_id(),
+                owner: forge_provider_api::ThreadOwner::root("fixture-owner"),
                 mode: forge_provider_api::SessionMode::Interactive,
                 workspace: fixture._directory.path().to_string_lossy().into_owned(),
                 history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -730,21 +797,40 @@ async fn provider_fixture(
     (fixture, provider, opened)
 }
 
+/// Preserve the public completion and its exact publication boundary in native fixtures.
+struct ObservedCompletion {
+    binding_id: forge_provider_api::BindingId,
+    thread_id: forge_provider_api::ThreadId,
+    turn_id: forge_provider_api::TurnId,
+    outcome: forge_provider_api::turn::TurnOutcome,
+    watermark: forge_provider_api::EventSequence,
+}
+
 /// Observe automatic collection without issuing a public cleanup command.
-async fn next_settlement(
+async fn next_completion(
     stream: &mut forge_provider_api::ProviderEventStream,
-) -> forge_provider_api::InvocationSettlement {
+) -> ObservedCompletion {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let event = stream.recv().await.unwrap().unwrap();
-            if let forge_provider_api::ProviderEvent::Settled { settlement } = event.event {
-                assert_eq!(settlement.watermark, event.sequence);
-                return *settlement;
+            let envelope = stream.recv().await.unwrap().unwrap();
+            if let forge_provider_api::ProviderEvent::Turn {
+                thread_id,
+                turn_id,
+                event: forge_provider_api::TurnEvent::Completed(completed),
+            } = envelope.event
+            {
+                return ObservedCompletion {
+                    binding_id: envelope.binding_id,
+                    thread_id,
+                    turn_id,
+                    outcome: completed.result().outcome(),
+                    watermark: envelope.sequence,
+                };
             }
         }
     })
     .await
-    .expect("native worker must automatically settle")
+    .expect("native worker must automatically collect")
 }
 
 /// Invalid invocation authority must reject before any native input or receipt effect.
@@ -761,14 +847,14 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
         let mut request = prompt_request(
             &binding,
             forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("fixture-owner"),
+                forge_provider_api::ThreadOwner::root("fixture-owner"),
                 "invalid",
             ),
             receipt.clone(),
             forge_provider_api::PromptInput::Text("must not dispatch".into()),
         );
         match invalid {
-            0 => request.scope.owner = forge_provider_api::ExecutionOwner::root("different-owner"),
+            0 => request.scope.owner = forge_provider_api::ThreadOwner::root("different-owner"),
             1 => request.receipt = FixtureReceipt::new(),
             2 => {
                 request.attempt_id =
@@ -786,13 +872,13 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
             _ => unreachable!(),
         }
         assert!(
-            matches!(provider.input_submit(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::InputSubmit && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Unchanged)
+            matches!(provider.turn_start(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::TurnStart && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Unchanged)
         );
         assert!(!receipt.state.lock().unwrap().sending);
     }
     let idle = forge_provider_api::SteeringRequest {
         scope: forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "idle-steer",
         ),
         delivery: forge_provider_api::SteeringDelivery::Context,
@@ -801,7 +887,7 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
         task: None,
     };
     assert!(
-        matches!(provider.input_steer(operation_context(), &binding, idle.clone()).await, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::InputSteer && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Unchanged)
+        matches!(provider.turn_steer(operation_context(), &binding, idle.clone()).await, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::TurnSteer && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Unchanged)
     );
     let log = std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
     assert!(
@@ -809,7 +895,7 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
             .any(|line| line.contains("session/prompt") || line.contains("_session/steering"))
     );
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
     let request = prompt_request(
@@ -819,10 +905,10 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
         forge_provider_api::PromptInput::Text("closed".into()),
     );
     assert!(
-        matches!(provider.input_submit(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
+        matches!(provider.turn_start(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
     );
     assert!(
-        matches!(provider.input_steer(operation_context(), &binding, idle).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
+        matches!(provider.turn_steer(operation_context(), &binding, idle).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
     );
     provider.shutdown(operation_context()).await.unwrap();
 }
@@ -834,7 +920,7 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
     let (fixture, provider, opened) = provider_fixture("held_cancel").await;
     let binding = opened.binding.id;
     let mut events = opened.events;
-    let owner = forge_provider_api::ExecutionOwner::root("fixture-owner");
+    let owner = forge_provider_api::ThreadOwner::root("fixture-owner");
     let scope = forge_provider_api::InvocationScope::new(owner.clone(), "late-cancel");
     let request = prompt_request(
         &binding,
@@ -851,7 +937,7 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
     let submitted_binding = binding.clone();
     let submitted = tokio::spawn(async move {
         submitted_provider
-            .input_submit(submit_context, &submitted_binding, request)
+            .turn_start(submit_context, &submitted_binding, request)
             .await
     });
     let log_path = fixture._directory.path().join("mode.requests");
@@ -890,7 +976,7 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
         cancellation,
     )
     .unwrap();
-    let cancellation = provider.cancel(
+    let cancellation = provider.turn_interrupt(
         context.clone(),
         &binding,
         forge_provider_api::CancelRequest {
@@ -946,11 +1032,7 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
     );
     let observed = cancellation.await;
     let observed_summary = match &observed {
-        Ok(settlement) => match &settlement.result {
-            forge_provider_api::ExecutionResult::Completed { .. } => "completed".to_owned(),
-            forge_provider_api::ExecutionResult::Cancelled { .. } => "cancelled".to_owned(),
-            forge_provider_api::ExecutionResult::Failed { .. } => "failed".to_owned(),
-        },
+        Ok(_) => "collected".to_owned(),
         Err(error) => error.to_string(),
     };
     eprintln!(
@@ -980,23 +1062,24 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
         forge_provider_api::PromptInput::Text("must await collection".into()),
     );
     assert!(
-        matches!(provider.input_submit(operation_context(), &binding, blocked).await,
+        matches!(provider.turn_start(operation_context(), &binding, blocked).await,
         Err(ProviderError::Failure(failure))
             if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive)
     );
     tokio::time::resume();
     std::fs::write(fixture._directory.path().join("mode"), "release_cancel").unwrap();
     submitted.await.unwrap().unwrap();
-    let settled = next_settlement(&mut events).await;
-    assert_eq!(settled.scope, scope);
+    let settled = next_completion(&mut events).await;
+    assert_eq!(settled.thread_id, scope.owner.thread_id());
+    assert_eq!(settled.turn_id, scope.turn_id().unwrap());
     assert!(matches!(
-        settled.result,
-        forge_provider_api::ExecutionResult::Completed { .. }
+        settled.outcome,
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
     ));
     let replayed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match provider
-                .cancel(
+                .turn_interrupt(
                     context.clone(),
                     &binding,
                     forge_provider_api::CancelRequest {
@@ -1016,10 +1099,6 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
     .await
     .unwrap();
     assert_eq!(replayed.watermark, settled.watermark);
-    assert!(matches!(
-        replayed.result,
-        forge_provider_api::ExecutionResult::Completed { .. }
-    ));
     std::fs::write(fixture._directory.path().join("mode"), "ok").unwrap();
     let successor = prompt_request(
         &binding,
@@ -1028,15 +1107,103 @@ async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
         forge_provider_api::PromptInput::Text("same binding after late collection".into()),
     );
     provider
-        .input_submit(operation_context(), &binding, successor)
+        .turn_start(operation_context(), &binding, successor)
         .await
         .unwrap();
-    assert_eq!(next_settlement(&mut events).await.binding_id, binding);
+    assert_eq!(next_completion(&mut events).await.binding_id, binding);
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
     provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Root terminal publication retains the native stop condition and follows final content.
+#[tokio::test]
+async fn collected_root_completion_preserves_each_native_stop_reason_once() {
+    use forge_provider_api::{
+        provider::Provider,
+        turn::{TurnCompletionReason, TurnOutcome},
+    };
+    for (native, outcome) in [
+        (
+            "end_turn",
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Normal,
+            },
+        ),
+        (
+            "max_tokens",
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::TokenLimit,
+            },
+        ),
+        (
+            "max_turn_requests",
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::RequestLimit,
+            },
+        ),
+        (
+            "refusal",
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Refusal,
+            },
+        ),
+        ("cancelled", TurnOutcome::Interrupted),
+    ] {
+        let (_fixture, provider, opened) = provider_fixture(&format!("observed:{native}")).await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        let request = prompt_request(
+            &binding,
+            forge_provider_api::InvocationScope::new(
+                forge_provider_api::ThreadOwner::root("fixture-owner"),
+                native,
+            ),
+            receipt(native),
+            forge_provider_api::PromptInput::Text("respond".into()),
+        );
+        let scope = request.scope.clone();
+        provider
+            .turn_start(operation_context(), &binding, request)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut message_finished = false;
+            loop {
+                let event = events.recv().await.unwrap().unwrap();
+                match event.event {
+                    forge_provider_api::ProviderEvent::Item {
+                        event:
+                            forge_provider_api::ItemEvent::Completed(
+                                forge_provider_api::ItemCompletion::AgentMessage(_),
+                            ),
+                        ..
+                    } => message_finished = true,
+                    forge_provider_api::ProviderEvent::Turn {
+                        thread_id,
+                        turn_id,
+                        event: forge_provider_api::TurnEvent::Completed(completed),
+                    } => {
+                        let observed = completed.result().outcome();
+                        assert!(message_finished);
+                        assert_eq!(thread_id, scope.owner.thread_id());
+                        assert_eq!(turn_id, scope.turn_id().unwrap());
+                        assert_eq!(observed, outcome);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        provider
+            .thread_close(operation_context(), &binding)
+            .await
+            .unwrap();
+    }
 }
 
 /// A stale cancel must replay completed evidence while a successor continues running.
@@ -1046,7 +1213,7 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
     let (fixture, provider, opened) = provider_fixture("ok").await;
     let binding = opened.binding.id;
     let mut events = opened.events;
-    let owner = forge_provider_api::ExecutionOwner::root("fixture-owner");
+    let owner = forge_provider_api::ThreadOwner::root("fixture-owner");
     let first = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(owner.clone(), "first"),
@@ -1055,13 +1222,13 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
     );
     let first_scope = first.scope.clone();
     provider
-        .input_submit(operation_context(), &binding, first)
+        .turn_start(operation_context(), &binding, first)
         .await
         .unwrap();
-    let settled = next_settlement(&mut events).await;
+    let settled = next_completion(&mut events).await;
     assert!(matches!(
-        settled.result,
-        forge_provider_api::ExecutionResult::Completed { .. }
+        settled.outcome,
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
     ));
 
     std::fs::write(fixture._directory.path().join("mode"), "held").unwrap();
@@ -1076,7 +1243,7 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
     let submitted_binding = binding.clone();
     let submitted = tokio::spawn(async move {
         submitted_provider
-            .input_submit(operation_context(), &submitted_binding, second)
+            .turn_start(operation_context(), &submitted_binding, second)
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1106,7 +1273,7 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
         resources: Default::default(),
     };
     assert!(
-        matches!(provider.session_configure(operation_context(), &binding, configuration).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive)
+        matches!(provider.thread_configure(operation_context(), &binding, configuration).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive)
     );
     let overlapping = prompt_request(
         &binding,
@@ -1115,11 +1282,11 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
         forge_provider_api::PromptInput::Text("must not overlap".into()),
     );
     assert!(
-        matches!(provider.input_submit(operation_context(), &binding, overlapping).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+        matches!(provider.turn_start(operation_context(), &binding, overlapping).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
     );
     assert!(!submitted.is_finished());
     let repeated = provider
-        .cancel(
+        .turn_interrupt(
             operation_context(),
             &binding,
             forge_provider_api::CancelRequest { scope: first_scope },
@@ -1127,13 +1294,9 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
         .await
         .unwrap();
     assert_eq!(repeated.watermark, settled.watermark);
-    assert!(matches!(
-        repeated.result,
-        forge_provider_api::ExecutionResult::Completed { .. }
-    ));
     assert!(!submitted.is_finished());
     let cancelled = provider
-        .cancel(
+        .turn_interrupt(
             operation_context(),
             &binding,
             forge_provider_api::CancelRequest {
@@ -1142,14 +1305,15 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
         )
         .await
         .unwrap();
-    assert_eq!(cancelled.scope, second_scope);
+    assert_eq!(cancelled.turn_id, second_scope.turn_id().unwrap());
+    let cancelled_completion = next_completion(&mut events).await;
     assert!(matches!(
-        cancelled.result,
-        forge_provider_api::ExecutionResult::Cancelled { .. }
+        cancelled_completion.outcome,
+        forge_provider_api::turn::TurnOutcome::Interrupted
     ));
     submitted.await.unwrap().unwrap();
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1162,7 +1326,7 @@ async fn settled_configuration_preserves_binding_and_event_reader() {
     let binding = opened.binding.id;
     let mut events = opened.events;
     let configured = provider
-        .session_configure(
+        .thread_configure(
             operation_context(),
             &binding,
             forge_provider_api::SessionConfiguration {
@@ -1184,19 +1348,19 @@ async fn settled_configuration_preserves_binding_and_event_reader() {
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "after-config",
         ),
         receipt("configured"),
         forge_provider_api::PromptInput::Text("after config".into()),
     );
     provider
-        .input_submit(operation_context(), &binding, request)
+        .turn_start(operation_context(), &binding, request)
         .await
         .unwrap();
-    assert_eq!(next_settlement(&mut events).await.binding_id, binding);
+    assert_eq!(next_completion(&mut events).await.binding_id, binding);
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1208,7 +1372,7 @@ async fn task_model_and_reasoning_override_does_not_replace_session_defaults() {
     let (fixture, provider, opened) = provider_fixture("ok").await;
     let binding = opened.binding.id;
     let mut events = opened.events;
-    let owner = forge_provider_api::ExecutionOwner::root("fixture-owner");
+    let owner = forge_provider_api::ThreadOwner::root("fixture-owner");
     let mut task = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(owner.clone(), "task"),
@@ -1219,10 +1383,10 @@ async fn task_model_and_reasoning_override_does_not_replace_session_defaults() {
     task.configuration.model.reasoning =
         forge_provider_api::generation::ReasoningSelection::Level("high".into());
     provider
-        .input_submit(operation_context(), &binding, task)
+        .turn_start(operation_context(), &binding, task)
         .await
         .unwrap();
-    next_settlement(&mut events).await;
+    next_completion(&mut events).await;
     let ordinary = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(owner, "ordinary"),
@@ -1230,10 +1394,10 @@ async fn task_model_and_reasoning_override_does_not_replace_session_defaults() {
         forge_provider_api::PromptInput::Text("ordinary".into()),
     );
     provider
-        .input_submit(operation_context(), &binding, ordinary)
+        .turn_start(operation_context(), &binding, ordinary)
         .await
         .unwrap();
-    next_settlement(&mut events).await;
+    next_completion(&mut events).await;
     let requests = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
         .unwrap()
         .lines()
@@ -1252,7 +1416,7 @@ async fn task_model_and_reasoning_override_does_not_replace_session_defaults() {
         .collect::<Vec<_>>();
     assert_eq!(reasoning, vec!["high", "medium"]);
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1302,7 +1466,7 @@ async fn cancelled_before_dispatch_retraction_proves_only_the_exact_input_attemp
     let mut request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "cancel-before-send",
         ),
         receipt("cancel-before-send"),
@@ -1323,22 +1487,29 @@ async fn cancelled_before_dispatch_retraction_proves_only_the_exact_input_attemp
     let submitted_binding = binding.clone();
     let submitted = tokio::spawn(async move {
         submitted_provider
-            .input_submit(operation_context(), &submitted_binding, request)
+            .turn_start(operation_context(), &submitted_binding, request)
             .await
     });
     pending.started.notified().await;
-    provider
-        .cancel(
+    let interrupted = provider
+        .turn_interrupt(
             operation_context(),
             &binding,
             forge_provider_api::CancelRequest {
                 scope: retract.scope.clone(),
             },
         )
-        .await
-        .unwrap();
+        .await;
+    assert!(
+        matches!(interrupted, Err(ProviderError::PreparationFailed(cause))
+        if cause.is_clean_cancellation())
+    );
     assert!(submitted.await.unwrap().is_err());
-    next_settlement(&mut events).await;
+    while let Some(event) = events.try_next().unwrap() {
+        assert!(
+            !matches!(event.event, forge_provider_api::ProviderEvent::Turn { turn_id, .. } | forge_provider_api::ProviderEvent::Item { turn_id, .. } if turn_id == retract.scope.turn_id().unwrap())
+        );
+    }
     for _ in 0..2 {
         assert_eq!(
             provider
@@ -1348,6 +1519,7 @@ async fn cancelled_before_dispatch_retraction_proves_only_the_exact_input_attemp
             forge_provider_api::InputRetractOutcome::NeverConsumed
         );
     }
+    let successor_owner = retract.scope.owner.clone();
     let mut stale = retract;
     stale.attempt_id = forge_provider_api::DeliveryAttemptId::new("different-attempt").unwrap();
     assert_eq!(
@@ -1356,11 +1528,22 @@ async fn cancelled_before_dispatch_retraction_proves_only_the_exact_input_attemp
             .await
             .unwrap(),
         forge_provider_api::InputRetractOutcome::Unavailable(
-            forge_provider_api::InputRetractUnavailable::Unsupported
+            forge_provider_api::InputRetractUnavailable::NotCancelled
         )
     );
+    let successor = prompt_request(
+        &binding,
+        forge_provider_api::InvocationScope::new(successor_owner, "after-preparation-cancel"),
+        receipt("after-preparation-cancel"),
+        forge_provider_api::PromptInput::Text("reuse connection".into()),
+    );
     provider
-        .session_close(operation_context(), &binding)
+        .turn_start(operation_context(), &binding, successor)
+        .await
+        .unwrap();
+    next_completion(&mut events).await;
+    provider
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1368,7 +1551,8 @@ async fn cancelled_before_dispatch_retraction_proves_only_the_exact_input_attemp
 /// Build a durable resume with an independent host owner for history-exclusion regressions.
 fn resume_request(fixture: &WireFixture, owner: &str) -> forge_provider_api::SessionRequest {
     forge_provider_api::SessionRequest {
-        owner: forge_provider_api::ExecutionOwner::root(owner),
+        thread_id: (forge_provider_api::ThreadOwner::root(owner)).thread_id(),
+        owner: forge_provider_api::ThreadOwner::root(owner),
         mode: forge_provider_api::SessionMode::Interactive,
         workspace: fixture._directory.path().to_string_lossy().into_owned(),
         history: forge_provider_api::SessionHistory::Durable {
@@ -1403,7 +1587,7 @@ async fn base_instructions_survive_open_reload_and_resume() {
         request.history = forge_provider_api::SessionHistory::Durable { resume: None };
         request.system_instructions = "base-instructions".into();
         let opened = provider
-            .session_open(operation_context(), request.clone())
+            .thread_open(operation_context(), request.clone())
             .await
             .unwrap();
         let fork_capability = opened
@@ -1436,19 +1620,19 @@ async fn base_instructions_survive_open_reload_and_resume() {
                 headers: Default::default(),
             });
             provider
-                .input_submit(operation_context(), &opened.binding.id, prompt)
+                .turn_start(operation_context(), &opened.binding.id, prompt)
                 .await
                 .unwrap();
-            next_settlement(&mut events).await;
+            next_completion(&mut events).await;
         }
         if mode != "ok" {
             let forked = provider
-                .session_fork(
+                .thread_fork(
                     operation_context(),
                     forge_provider_api::SessionForkRequest {
                         source: forge_provider_api::ForkSource::Binding(opened.binding.id.clone()),
                         target: forge_provider_api::ForkTarget {
-                            owner: forge_provider_api::ExecutionOwner::root("fork-owner"),
+                            owner: forge_provider_api::ThreadOwner::root("fork-owner"),
                             workspace: request.workspace.clone(),
                             configuration: request.configuration.clone(),
                             system_instructions: "fork-only".into(),
@@ -1463,7 +1647,7 @@ async fn base_instructions_survive_open_reload_and_resume() {
             }
         }
         provider
-            .session_close(operation_context(), &opened.binding.id)
+            .thread_close(operation_context(), &opened.binding.id)
             .await
             .unwrap();
         request.history = forge_provider_api::SessionHistory::Durable {
@@ -1471,7 +1655,7 @@ async fn base_instructions_survive_open_reload_and_resume() {
         };
         request.system_instructions = "resume-base".into();
         let resumed = provider
-            .session_open(operation_context(), request.clone())
+            .thread_open(operation_context(), request.clone())
             .await
             .unwrap();
         let mut prompt = prompt_request(
@@ -1482,12 +1666,12 @@ async fn base_instructions_survive_open_reload_and_resume() {
         );
         prompt.instructions.clear();
         provider
-            .input_submit(operation_context(), &resumed.binding.id, prompt)
+            .turn_start(operation_context(), &resumed.binding.id, prompt)
             .await
             .unwrap();
-        next_settlement(&mut { resumed.events }).await;
+        next_completion(&mut { resumed.events }).await;
         provider
-            .session_close(operation_context(), &resumed.binding.id)
+            .thread_close(operation_context(), &resumed.binding.id)
             .await
             .unwrap();
         let requests = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
@@ -1577,7 +1761,7 @@ async fn claude_old_native_cli_rejects_before_history_or_profile_mutation() {
         if !resume {
             request.history = forge_provider_api::SessionHistory::Durable { resume: None };
         }
-        let result = provider.session_open(operation_context(), request).await;
+        let result = provider.thread_open(operation_context(), request).await;
         assert!(matches!(result, Err(ProviderError::RuntimeVersion(
             forge_provider_api::version::RuntimeVersionError::Unsupported { requirement, detected }
         )) if *requirement.minimum() == semver::Version::new(2, 1, 248)
@@ -1598,7 +1782,7 @@ async fn antigravity_native_schedule_filter_survives_endpoint_reload_and_resume(
     let mut request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "schedule-filter",
         ),
         receipt("schedule-filter"),
@@ -1609,23 +1793,23 @@ async fn antigravity_native_schedule_filter_survives_endpoint_reload_and_resume(
         headers: Default::default(),
     });
     provider
-        .input_submit(operation_context(), &binding, request)
+        .turn_start(operation_context(), &binding, request)
         .await
         .unwrap();
-    next_settlement(&mut events).await;
+    next_completion(&mut events).await;
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
     let resumed = provider
-        .session_open(
+        .thread_open(
             operation_context(),
             resume_request(&fixture, "resumed-owner"),
         )
         .await
         .unwrap();
     provider
-        .session_close(operation_context(), &resumed.binding.id)
+        .thread_close(operation_context(), &resumed.binding.id)
         .await
         .unwrap();
     provider.shutdown(operation_context()).await.unwrap();
@@ -1668,7 +1852,7 @@ async fn disabled_native_extensions_reject_fork_before_dispatch() {
     fixture.connection.shutdown().await.unwrap();
     let provider = fixture.claude_provider(fixture._directory.path().join("runtime"));
     let opened = provider
-        .session_open(
+        .thread_open(
             operation_context(),
             resume_request(&fixture, "source-owner"),
         )
@@ -1679,7 +1863,7 @@ async fn disabled_native_extensions_reject_fork_before_dispatch() {
         && entry.support == forge_provider_api::capability::Support::Unsupported));
     let request = resume_request(&fixture, "target-owner");
     let result = provider
-        .session_fork(
+        .thread_fork(
             operation_context(),
             forge_provider_api::SessionForkRequest {
                 source: forge_provider_api::ForkSource::Binding(opened.binding.id.clone()),
@@ -1692,7 +1876,10 @@ async fn disabled_native_extensions_reject_fork_before_dispatch() {
             },
         )
         .await;
-    assert!(matches!(result, Err(ProviderError::Unsupported(_))));
+    assert!(
+        matches!(result, Err(ProviderError::Unsupported(_))),
+        "unexpected unsupported fork disposition: {result:?}"
+    );
     let requests =
         std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
     assert!(
@@ -1701,7 +1888,7 @@ async fn disabled_native_extensions_reject_fork_before_dispatch() {
             .any(|request| request.contains("session/fork"))
     );
     provider
-        .session_close(operation_context(), &opened.binding.id)
+        .thread_close(operation_context(), &opened.binding.id)
         .await
         .unwrap();
     provider.shutdown(operation_context()).await.unwrap();
@@ -1713,19 +1900,19 @@ async fn concurrent_resumes_admit_only_one_history_owner() {
     use forge_provider_api::provider::Provider;
     let (fixture, provider, opened) = provider_fixture("ok").await;
     provider
-        .session_close(operation_context(), &opened.binding.id)
+        .thread_close(operation_context(), &opened.binding.id)
         .await
         .unwrap();
     let (left, right) = tokio::join!(
-        provider.session_open(operation_context(), resume_request(&fixture, "left-owner")),
-        provider.session_open(operation_context(), resume_request(&fixture, "right-owner"))
+        provider.thread_open(operation_context(), resume_request(&fixture, "left-owner")),
+        provider.thread_open(operation_context(), resume_request(&fixture, "right-owner"))
     );
     let (winner, rejected) = match (left, right) {
         (Ok(winner), Err(rejected)) | (Err(rejected), Ok(winner)) => (winner, rejected),
         _ => panic!("one exact durable history must admit only one writable owner"),
     };
     assert!(
-        matches!(rejected, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::SessionOpen && failure.kind() == forge_provider_api::ProviderFailureKind::HistoryConflict)
+        matches!(rejected, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::ThreadOpen && failure.kind() == forge_provider_api::ProviderFailureKind::HistoryConflict)
     );
     let requests =
         std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
@@ -1737,7 +1924,7 @@ async fn concurrent_resumes_admit_only_one_history_owner() {
         1
     );
     provider
-        .session_close(operation_context(), &winner.binding.id)
+        .thread_close(operation_context(), &winner.binding.id)
         .await
         .unwrap();
 }
@@ -1751,7 +1938,7 @@ async fn invalidated_binding_retains_history_exclusion_until_close_collection() 
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "failed-native",
         ),
         receipt("failed-native"),
@@ -1759,12 +1946,12 @@ async fn invalidated_binding_retains_history_exclusion_until_close_collection() 
     );
     assert!(
         provider
-            .input_submit(operation_context(), &binding, request)
+            .turn_start(operation_context(), &binding, request)
             .await
             .is_err()
     );
     assert!(
-        matches!(provider.session_open(operation_context(), resume_request(&fixture, "replacement-owner")).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::HistoryConflict)
+        matches!(provider.thread_open(operation_context(), resume_request(&fixture, "replacement-owner")).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::HistoryConflict)
     );
     let requests =
         std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
@@ -1775,20 +1962,20 @@ async fn invalidated_binding_retains_history_exclusion_until_close_collection() 
             .count(),
         0
     );
-    let _ = provider.session_close(operation_context(), &binding).await;
+    let _ = provider.thread_close(operation_context(), &binding).await;
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
     let resumed = provider
-        .session_open(
+        .thread_open(
             operation_context(),
             resume_request(&fixture, "replacement-owner"),
         )
         .await
         .unwrap();
     provider
-        .session_close(operation_context(), &resumed.binding.id)
+        .thread_close(operation_context(), &resumed.binding.id)
         .await
         .unwrap();
 }
@@ -1814,7 +2001,7 @@ async fn dropped_submit_awaiter_retains_native_work_until_explicit_cancel() {
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "dropped-awaiter",
         ),
         receipt("dropped-awaiter"),
@@ -1826,7 +2013,7 @@ async fn dropped_submit_awaiter_retains_native_work_until_explicit_cancel() {
     let submitted_binding = binding.clone();
     let awaiting = tokio::spawn(async move {
         submitted_provider
-            .input_submit(operation, &submitted_binding, request)
+            .turn_start(operation, &submitted_binding, request)
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1854,7 +2041,7 @@ async fn dropped_submit_awaiter_retains_native_work_until_explicit_cancel() {
             .any(|request| request.contains("session/cancel"))
     );
     provider
-        .cancel(
+        .turn_interrupt(
             operation_context(),
             &binding,
             forge_provider_api::CancelRequest { scope },
@@ -1862,11 +2049,11 @@ async fn dropped_submit_awaiter_retains_native_work_until_explicit_cancel() {
         .await
         .unwrap();
     assert!(matches!(
-        next_settlement(&mut events).await.result,
-        forge_provider_api::ExecutionResult::Cancelled { .. }
+        next_completion(&mut events).await.outcome,
+        forge_provider_api::turn::TurnOutcome::Interrupted
     ));
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1881,7 +2068,7 @@ async fn cancelled_submit_context_settles_and_replay_never_redispatches() {
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "cancelled-operation",
         ),
         receipt("cancelled-operation"),
@@ -1900,7 +2087,7 @@ async fn cancelled_submit_context_settles_and_replay_never_redispatches() {
     let submitted_request = request.clone();
     let awaiting = tokio::spawn(async move {
         submitted_provider
-            .input_submit(submitted_context, &submitted_binding, submitted_request)
+            .turn_start(submitted_context, &submitted_binding, submitted_request)
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1921,13 +2108,13 @@ async fn cancelled_submit_context_settles_and_replay_never_redispatches() {
     source.cancel();
     let _ = awaiting.await.unwrap();
     assert!(matches!(
-        next_settlement(&mut events).await.result,
-        forge_provider_api::ExecutionResult::Cancelled { .. }
+        next_completion(&mut events).await.outcome,
+        forge_provider_api::turn::TurnOutcome::Interrupted
     ));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if provider
-                .input_submit(context.clone(), &binding, request.clone())
+                .turn_start(context.clone(), &binding, request.clone())
                 .await
                 .is_ok()
             {
@@ -1948,7 +2135,7 @@ async fn cancelled_submit_context_settles_and_replay_never_redispatches() {
         1
     );
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -1981,7 +2168,7 @@ async fn cancelled_configuration_context_rejects_before_native_mutation() {
         resources: Default::default(),
     };
     assert!(
-        matches!(provider.session_configure(context, &binding, configuration).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Cancelled && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+        matches!(provider.thread_configure(context, &binding, configuration).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Cancelled && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
     );
     let requests =
         std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
@@ -1993,19 +2180,19 @@ async fn cancelled_configuration_context_rejects_before_native_mutation() {
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "after-cancelled-configure",
         ),
         receipt("after-cancelled-configure"),
         forge_provider_api::PromptInput::Text("still reusable".into()),
     );
     provider
-        .input_submit(operation_context(), &binding, request)
+        .turn_start(operation_context(), &binding, request)
         .await
         .unwrap();
-    next_settlement(&mut events).await;
+    next_completion(&mut events).await;
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -2020,7 +2207,7 @@ async fn endpoint_reload_error_after_native_apply_invalidates_binding() {
     let mut request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "endpoint-reload",
         ),
         receipt("endpoint-reload"),
@@ -2031,11 +2218,11 @@ async fn endpoint_reload_error_after_native_apply_invalidates_binding() {
         headers: BTreeMap::from([("authorization".into(), "new-secret".into())]),
     });
     let error = provider
-        .input_submit(operation_context(), &binding, request)
+        .turn_start(operation_context(), &binding, request)
         .await
         .unwrap_err();
     assert!(
-        matches!(error, ProviderError::PreparationFailed(cause) if matches!(*cause, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::InputSubmit && failure.phase() == forge_provider_api::ProviderPhase::Preparation && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated))
+        matches!(error, ProviderError::PreparationFailed(cause) if matches!(*cause, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::TurnStart && failure.phase() == forge_provider_api::ProviderPhase::Preparation && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated))
     );
     let applied: Value = serde_json::from_str(
         &std::fs::read_to_string(fixture._directory.path().join("mode.endpoint-applied")).unwrap(),
@@ -2046,14 +2233,14 @@ async fn endpoint_reload_error_after_native_apply_invalidates_binding() {
     let request = prompt_request(
         &binding,
         forge_provider_api::InvocationScope::new(
-            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            forge_provider_api::ThreadOwner::root("fixture-owner"),
             "endpoint-none",
         ),
         receipt("endpoint-none"),
         forge_provider_api::PromptInput::Text("stale URL must not be reused".into()),
     );
     assert!(
-        matches!(provider.input_submit(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::BindingInvalidated)
+        matches!(provider.turn_start(operation_context(), &binding, request).await, Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::BindingInvalidated)
     );
     let requests =
         std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
@@ -2064,9 +2251,9 @@ async fn endpoint_reload_error_after_native_apply_invalidates_binding() {
             .count(),
         0
     );
-    let _ = provider.session_close(operation_context(), &binding).await;
+    let _ = provider.thread_close(operation_context(), &binding).await;
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
 }
@@ -2085,7 +2272,7 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
     let mut initial = resume_request(&fixture, "preflight-owner");
     initial.history = forge_provider_api::SessionHistory::Durable { resume: None };
     let opened = provider
-        .session_open(operation_context(), initial.clone())
+        .thread_open(operation_context(), initial.clone())
         .await
         .unwrap();
     let binding = opened.binding.id.clone();
@@ -2124,17 +2311,17 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
         let mut replacement = initial.clone();
         replacement.configuration = configuration.clone();
         assert!(
-            matches!(provider.session_open(operation_context(), replacement).await,
+            matches!(provider.thread_open(operation_context(), replacement).await,
             Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
         );
         assert!(
-            matches!(provider.session_configure(operation_context(), &binding, configuration.clone()).await,
+            matches!(provider.thread_configure(operation_context(), &binding, configuration.clone()).await,
             Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
         );
         assert!(
-            matches!(provider.session_fork(operation_context(), forge_provider_api::SessionForkRequest {
+            matches!(provider.thread_fork(operation_context(), forge_provider_api::SessionForkRequest {
             source: forge_provider_api::ForkSource::Binding(binding.clone()),
-            target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("preflight-fork"),
+            target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("preflight-fork"),
                 workspace: initial.workspace.clone(), system_instructions: String::new(), configuration: configuration.clone() },
         }).await, Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
         );
@@ -2155,7 +2342,7 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
                 headers: Default::default(),
             });
             assert!(
-                matches!(provider.input_submit(operation_context(), &binding, prompt).await,
+                matches!(provider.turn_start(operation_context(), &binding, prompt).await,
                 Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
             );
         }
@@ -2177,13 +2364,80 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
         forge_provider_api::PromptInput::Text("still usable".into()),
     );
     provider
-        .input_submit(operation_context(), &binding, prompt)
+        .turn_start(operation_context(), &binding, prompt)
         .await
         .unwrap();
-    next_settlement(&mut events).await;
+    next_completion(&mut events).await;
     provider
-        .session_close(operation_context(), &binding)
+        .thread_close(operation_context(), &binding)
         .await
         .unwrap();
     provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A cancelled prompt accepted before native processing retains delivery without fabricating lifecycle.
+#[tokio::test]
+async fn accepted_prompt_cancelled_before_start_has_no_started_or_completed_turn() {
+    use forge_provider_api::{provider::Provider, *};
+    let (fixture, provider, opened) = provider_fixture("held_no_start").await;
+    let binding = opened.binding.id;
+    let mut events = opened.events;
+    let scope = InvocationScope::new(ThreadOwner::root("fixture-owner"), "no-start");
+    let accepted = receipt("no-start");
+    let request = prompt_request(
+        &binding,
+        scope.clone(),
+        accepted.clone(),
+        PromptInput::Text("cancel before work".into()),
+    );
+    let submitted_provider = provider.clone();
+    let submitted_binding = binding.clone();
+    let submitted = tokio::spawn(async move {
+        submitted_provider
+            .turn_start(operation_context(), &submitted_binding, request)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let log =
+                std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
+            if log.lines().any(|line| line.contains("session/prompt")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let interrupted = provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            CancelRequest {
+                scope: scope.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(interrupted.turn_id, scope.turn_id().unwrap());
+    assert!(matches!(
+        submitted.await.unwrap(),
+        Err(ProviderError::Cancelled)
+    ));
+    assert!(accepted.state.lock().unwrap().accepted);
+    while let Some(event) = events.try_next().unwrap() {
+        assert!(!matches!(
+            event.event,
+            ProviderEvent::Turn {
+                event: TurnEvent::Started(_) | TurnEvent::Completed(_),
+                ..
+            } | ProviderEvent::Provider {
+                event: ProviderConnectionEvent::Unavailable(_)
+            }
+        ));
+    }
+    provider
+        .thread_close(operation_context(), &binding)
+        .await
+        .unwrap();
 }

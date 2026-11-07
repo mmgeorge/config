@@ -2,6 +2,8 @@
 mod agent_admission;
 #[path = "tests/bootstrap.rs"]
 mod bootstrap;
+#[path = "tests/configuration_retry.rs"]
+mod configuration_retry;
 #[path = "tests/live_goal.rs"]
 mod live_goal;
 #[path = "tests/owner_cancel.rs"]
@@ -312,6 +314,43 @@ async fn shared_runtime_initialization_does_not_create_or_select_a_session() -> 
     Ok(())
 }
 
+/// Classify reads of a deleted session as terminal so clients stop polling it.
+#[tokio::test]
+async fn document_reads_for_a_missing_session_report_session_not_found() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    let response = service
+        .initialize_services(1, initialize(&fixture, "mock"))
+        .await?;
+    assert!(response.error().is_none(), "{:?}", response.error());
+    let error = service
+        .document(
+            Some("deleted-session".into()),
+            serde_json::from_value(
+                json!({"operation":"sync","document":"transcript","revision":0}),
+            )?,
+        )
+        .await
+        .expect_err("a missing session resolved a presentation controller");
+    assert_eq!(
+        crate::broker::request_failure_code(&error),
+        "session_not_found",
+        "{error:#}"
+    );
+    assert!(
+        service
+            .registry()
+            .await?
+            .controller_by_id
+            .read()
+            .await
+            .is_empty(),
+        "a missing session registered a controller"
+    );
+    service.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn plan_review_questions_fork_without_changing_the_main_timeline() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -533,10 +572,18 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
         &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
     )
     .expect("mock fixture descriptor");
-    let unsupported_native =
-        crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-            Ok(())
-        });
+    let unsupported_native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |request, _, start, _| async move {
+            start.observed(1).await?;
+            Ok(crate::provider::test_support::native_result(
+                &request,
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+            ))
+        },
+    );
     let unsupported =
         crate::provider::test_support::ProviderTestSession::from_native(unsupported_native)?;
     let error = generate_isolated_text(
@@ -578,7 +625,7 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
     .await
     .unwrap_err();
     let diagnostic = format!("{failure:#}");
-    assert!(diagnostic.contains("InputSubmit"));
+    assert!(diagnostic.contains("TurnStart"), "{diagnostic}");
     assert!(!diagnostic.contains("fixture generation failure"));
     assert!(shutdown.load(Ordering::Acquire));
     Ok(())
@@ -651,15 +698,15 @@ impl forge_provider_api::provider::Provider for TerminalInventoryProvider {
         self.inner.model_list(context, query).await
     }
 
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: forge_provider_api::OperationContext,
         request: forge_provider_api::SessionRequest,
     ) -> std::result::Result<forge_provider_api::OpenedSession, crate::provider::ProviderError>
     {
-        self.inner.session_open(context, request).await
+        self.inner.thread_open(context, request).await
     }
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &forge_provider_api::BindingId,
@@ -667,33 +714,33 @@ impl forge_provider_api::provider::Provider for TerminalInventoryProvider {
     ) -> std::result::Result<forge_provider_api::ConfiguredSession, crate::provider::ProviderError>
     {
         self.inner
-            .session_configure(context, binding, configuration)
+            .thread_configure(context, binding, configuration)
             .await
     }
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &forge_provider_api::BindingId,
     ) -> std::result::Result<(), crate::provider::ProviderError> {
-        self.inner.session_close(context, binding).await
+        self.inner.thread_close(context, binding).await
     }
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &forge_provider_api::BindingId,
         request: forge_provider_api::CancelRequest,
-    ) -> std::result::Result<forge_provider_api::InvocationSettlement, crate::provider::ProviderError>
+    ) -> std::result::Result<forge_provider_api::TurnInterruptResult, crate::provider::ProviderError>
     {
-        self.inner.cancel(context, binding, request).await
+        self.inner.turn_interrupt(context, binding, request).await
     }
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: forge_provider_api::OperationContext,
         binding: &forge_provider_api::BindingId,
         request: forge_provider_api::PromptRequest,
     ) -> std::result::Result<forge_provider_api::InputAcceptance, crate::provider::ProviderError>
     {
-        self.inner.input_submit(context, binding, request).await
+        self.inner.turn_start(context, binding, request).await
     }
     async fn inspect(
         &self,
@@ -765,6 +812,16 @@ async fn terminal_inventory_discards_configuration_races_but_reports_unrelated_e
     while !controller.provider_ready().await {
         tokio::task::yield_now().await;
     }
+    // Startup leaves the native conversation unopened, which has no shells to query.
+    let unopened = controller.background_terminals().await?;
+    assert!(unopened.supported && !unopened.starting && unopened.terminal.is_empty());
+    assert_eq!(provider.calls.load(Ordering::Acquire), 0);
+    // Open the binding the way first input does so the race below observes a live inventory.
+    let open = controller.broker.lock().await.provider_request(
+        crate::provider::ProviderInput::from_text(""),
+        crate::provider::PromptMode::Chat,
+    )?;
+    provider_fixture.provider_handle().thread_open(open).await?;
     let replacement = controller.provider_lane.clone().write_owned().await;
     assert!(controller.background_terminals().await?.starting);
     assert_eq!(provider.calls.load(Ordering::Acquire), 0);
@@ -786,6 +843,9 @@ async fn terminal_inventory_discards_configuration_races_but_reports_unrelated_e
         .to_string();
     assert!(error.to_lowercase().contains("transport"));
     assert!(!error.contains("connection closed"));
+    // Follow production shutdown: binding collection may wake the observation relay after the
+    // owner closes, which explicit stopping classifies as a completed owner lifetime.
+    controller.input_stopping.store(true, Ordering::Release);
     controller.finish_exchange_owner().await?;
     provider_fixture.provider_handle().shutdown().await?;
     controller.finish_session_events().await?;
@@ -810,7 +870,7 @@ fn generation_provider(
     )
     .expect("mock fixture descriptor");
     let calls = requests.clone();
-    let provider = crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, _| {
+    let provider = crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, start, _| {
         let calls = calls.clone();
         async move {
             let mut calls = calls.lock().await;
@@ -826,26 +886,18 @@ fn generation_provider(
             drop(calls);
             if fail {
                 return Err(forge_provider_api::ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::InputSubmit, forge_provider_api::ProviderFailureKind::Runtime),
+                    forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::TurnStart, forge_provider_api::ProviderFailureKind::Runtime),
                 ));
             }
-            let address = crate::provider::test_support::address(&request.scope, "temporary-thread", "temporary-turn");
-            sink.send_wait(crate::provider::ProviderEvent::Execution {
-                observation: forge_provider_api::ExecutionObservation::new(request.scope.clone(), forge_provider_api::ExecutionUpdate::Started { address: address.clone() })?,
-            }).await?;
-            for event in crate::provider::test_support::message(&address, "thought", Some(crate::provider::MessageRole::Thought), "private reasoning") {
-                sink.send_wait(event).await?;
+            let address = crate::provider::TurnAddress { scope: request.scope.clone(), thread_id: request.thread_id.clone(), turn_id: request.turn_id.clone() };
+            start.observed(1).await?;
+            for event in crate::provider::test_support::message(&address, "thought", Some(crate::provider::TestMessageContent::Reasoning(forge_provider_api::ReasoningKind::Full)), "private reasoning") {
+                sink.send_wait(crate::provider::test_support::activity(event)?).await?;
             }
-            for event in crate::provider::test_support::message(&address, "answer", Some(crate::provider::MessageRole::Response), "```text\nfix: preserve drafts\n\nKeep existing text.\n```") {
-                sink.send_wait(event).await?;
+            for event in crate::provider::test_support::message(&address, "answer", Some(crate::provider::TestMessageContent::Response), "```text\nfix: preserve drafts\n\nKeep existing text.\n```") {
+                sink.send_wait(crate::provider::test_support::activity(event)?).await?;
             }
-            sink.send_wait(crate::provider::ProviderEvent::Execution {
-                observation: forge_provider_api::ExecutionObservation::new(request.scope.clone(), forge_provider_api::ExecutionUpdate::Finished {
-                    address, covered_submissions: vec![request.submission_id.clone()], completed_at_ms: 1,
-                    result: forge_provider_api::ExecutionResult::Completed { completion: forge_provider_api::completion::ProviderCompletion::default().into() },
-                })?,
-            }).await?;
-            Ok(())
+            Ok(crate::provider::test_support::native_result(&request, forge_provider_api::turn::TurnOutcome::Completed { stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal }))
         }
     }).with_models(vec![serde_json::from_value(json!({"id":"selected-model","reasoning":["low","high"],"context_window":[],"vision":false,"is_default":true})).expect("normalized fixture model")]);
     provider.with_session_open(move |request| {
@@ -2206,7 +2258,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
         .to_owned();
     let registry = controller.broker.lock().await.execution_registry();
     let engine = registry
-        .owner(crate::provider::ExecutionOwner::root(&session_id))
+        .owner(crate::provider::ThreadOwner::root(&session_id))
         .await?;
     let submissions = controller.submission_store.clone();
     let prompt_session = session_id.clone();
@@ -2226,6 +2278,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -2240,13 +2293,25 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
             tokio::select! {
                 result = &mut execution => break result?,
                 observed = stream.recv(), if open => match observed? {
-                    Some(observed) => event.push(observed),
+                    Some(crate::provider::session_execution::OwnerObservation::Event(observed)) => event.push(observed),
+                    Some(crate::provider::session_execution::OwnerObservation::InputAcceptance { .. }) => anyhow::bail!("fixture has no steering acceptance"),
+                    Some(crate::provider::session_execution::OwnerObservation::HostFileChange { .. }) => anyhow::bail!("fixture has no host mutation callback"),
                     None => open = false,
                 },
             }
         };
         while let Some(observed) = stream.try_next()? {
-            event.push(observed);
+            match observed {
+                crate::provider::session_execution::OwnerObservation::Event(observed) => {
+                    event.push(observed)
+                }
+                crate::provider::session_execution::OwnerObservation::InputAcceptance {
+                    ..
+                } => anyhow::bail!("fixture has no steering acceptance"),
+                crate::provider::session_execution::OwnerObservation::HostFileChange { .. } => {
+                    anyhow::bail!("fixture has no host mutation callback")
+                }
+            }
         }
         Ok::<_, anyhow::Error>(crate::provider::ProviderOutput { event, completion })
     });
@@ -2285,11 +2350,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
     let completed = tokio::time::timeout(Duration::from_secs(2), prompt).await???;
     assert!(completed.event.iter().any(|event| matches!(
         event,
-        crate::provider::ProviderEvent::Message {
-            update: crate::provider::MessageUpdate::Started { text, .. },
-            ..
-        } if text == "Mock response: held prompt"
-    )));
+        crate::provider::HarnessEvent::Native { event: boxed_native_event, .. }  if matches!(boxed_native_event.as_ref(), crate::provider::ProviderEvent::Item { event: forge_provider_api::message::ItemEvent::Started(forge_provider_api::message::ItemStart::AgentMessage(message)), .. } if message.text == "Mock response: held prompt"))));
     drop(execution);
     drop(broker);
     service.shutdown(Duration::from_secs(1)).await?;
@@ -2882,10 +2943,18 @@ fn steering_provider(
         &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
     )
     .expect("mock fixture descriptor");
-    let provider =
-        crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-            Ok(())
-        });
+    let provider = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |request, _, start, _| async move {
+            start.observed(1).await?;
+            Ok(crate::provider::test_support::native_result(
+                &request,
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+            ))
+        },
+    );
     let steering_requests = requests.clone();
     provider.with_steering(move |request| {
         let requests = steering_requests.clone();
@@ -2907,7 +2976,7 @@ fn steering_provider(
                 .push(("cleanup".into(), String::new()));
             Err(forge_provider_api::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::Transport,
                 ),
             ))
@@ -2945,10 +3014,12 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         .await?;
     let agent_id = admitted["agent"]["id"].as_str().unwrap().to_owned();
     let task_id = admitted["task"]["id"].as_str().unwrap().to_owned();
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (session_id.clone()).into(),
-        agent_id: (agent_id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (session_id.clone()).into(),
+        forge_provider_api::AgentId::new(agent_id.clone())
+            .expect("registered agent identity is nonempty"),
+    )
+    .expect("registered session and agent identities are nonempty");
     let permission = controller.permission.clone();
     let (event_sink, mut events) =
         crate::provider::events::channel(crate::provider::InvocationScope {
@@ -2972,8 +3043,8 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
                 },
                 Some(crate::provider::TurnAddress {
                     scope: event_sink.invocation_scope()?.clone(),
-                    thread_id: "mock-session".into(),
-                    turn_id: "mock-turn".into(),
+                    thread_id: event_sink.invocation_scope()?.owner.thread_id(),
+                    turn_id: event_sink.invocation_scope()?.turn_id()?,
                 }),
                 Some(&event_sink),
             )
@@ -3001,13 +3072,14 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         }
     })
     .await??;
-    assert_eq!(requested_view["exchange_id"], task_id);
-    let approval_id = requested_view["id"].as_str().unwrap();
-    let answers: Vec<_> = requested_view["item_list"]
+    // The wire request carries the child's owner; the editor answers by request and target IDs.
+    assert_eq!(requested_view["execution_owner"]["agent_id"], agent_id);
+    let approval_id = requested_view["request_id"].as_str().unwrap();
+    let answers: Vec<_> = requested_view["targets"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| json!({"item_id":item["id"],"choice_id":"allow_once"}))
+        .map(|target| json!({"item_id":target["target_id"],"choice_id":"allow_once"}))
         .collect();
     assert!(
         route_control_request(
@@ -3031,19 +3103,26 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         .unwrap();
     assert!(matches!(
         &resolved,
-        crate::provider::ProviderEvent::Approval {
-            update: crate::provider::ApprovalUpdate::Resolved(_),
-            ..
-        }
+        crate::provider::session_execution::OwnerObservation::Event(
+            crate::provider::HarnessEvent::Host {
+                event: crate::provider::HostEvent::PermissionApproval {
+                    execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                    event: crate::provider::PermissionApprovalEvent::Resolved(_)
+                },
+                ..
+            }
+        )
     ));
     controller
         .agent_coordinator
         .sender()
         .send(crate::agent::AgentCommand::Event {
-            owner: crate::provider::ExecutionOwner {
-                session_id: (session_id.clone()).into(),
-                agent_id: (agent_id.clone()).into(),
-            },
+            owner: crate::provider::ThreadOwner::new(
+                (session_id.clone()).into(),
+                forge_provider_api::AgentId::new(agent_id.clone())
+                    .expect("registered agent identity is nonempty"),
+            )
+            .expect("registered session and agent identities are nonempty"),
             task_id: task_id.clone(),
             event: resolved.into(),
         })
@@ -3272,6 +3351,9 @@ async fn next_prompt_is_admitted_when_previous_completion_arrives() -> Result<()
     Ok(())
 }
 
+/// The scheduler only wakes the exchange owner at a deadline; the owner retries behind a busy
+/// broker and revalidates the schedule, so no deadline reserves execution admission and a
+/// superseded or cancelled wait dispatches nothing once the broker is released.
 #[tokio::test(start_paused = true)]
 async fn input_timeout_waits_without_admission_and_releases_stale_waits() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -3310,7 +3392,7 @@ async fn input_timeout_waits_without_admission_and_releases_stale_waits() -> Res
     assert_eq!(controller.coordinator.execution.available_permits(), 1);
     tokio::time::advance(Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
-    assert_eq!(controller.coordinator.execution.available_permits(), 0);
+    assert_eq!(controller.coordinator.execution.available_permits(), 1);
     controller
         .observer
         .input_schedule
@@ -3336,6 +3418,11 @@ async fn input_timeout_waits_without_admission_and_releases_stale_waits() -> Res
     tokio::task::yield_now().await;
     assert_eq!(controller.coordinator.execution.available_permits(), 1);
     drop(broker);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(controller.coordinator.execution.available_permits(), 1);
+    assert!(controller.observer.snapshot()?.exchange.is_empty());
     service.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
@@ -3918,7 +4005,7 @@ async fn task_state_controls_never_wait_for_provider_or_broker() -> Result<()> {
         assert!(
             controller
                 .exchange_owner
-                .command_status(crate::exchange::command::CommandId::new(&format!(
+                .command_status(crate::exchange::command::CommandId::new(format!(
                     "locked-{action}"
                 ))?)
                 .await?
@@ -4339,6 +4426,57 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
         .await?;
     let registry = service.registry().await?;
     let controller = registry.resolve(registry.initial_session_id()).await?;
+    controller.trace.configure_default(true)?;
+    let child_started = Arc::new(Notify::new());
+    let child_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().context("missing mock fixture")?,
+    )?;
+    let behavior = {
+        let child_started = child_started.clone();
+        let child_release = child_release.clone();
+        move |request: forge_provider_api::PromptRequest,
+              _: forge_provider_api::AdapterActivityWriter,
+              start: forge_provider_api::NativeTurnStart,
+              _: tokio::sync::watch::Receiver<bool>| {
+            let child_started = child_started.clone();
+            let child_release = child_release.clone();
+            async move {
+                start.observed(1).await?;
+                if request.scope.owner.is_root() {
+                    crate::provider::test_support::call_tool(&request, "question_ask", json!({
+                        "questions":[{"header":"Choice", "question":"Which active route?", "options":[], "allow_freeform":true}]
+                    })).await?;
+                } else {
+                    child_started.notify_one();
+                    crate::provider::test_support::wait_gate(&child_release).await?;
+                }
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            }
+        }
+    };
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor.clone(),
+        behavior.clone(),
+    );
+    let child_native =
+        crate::provider::test_support::EventFixtureProvider::new(descriptor, behavior);
+    let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let child_provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(child_native)?;
+    {
+        let mut broker = controller.broker.lock().await;
+        broker.set_provider_for_test(provider_fixture.provider_handle());
+        broker
+            .agent_provider_factory
+            .register(child_provider_fixture.provider_handle());
+    }
+    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
     let (sink, mut output) = forge_protocol::outbound::channel();
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_output = observed.clone();
@@ -4350,23 +4488,59 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
     controller.attach_session_events(&sink).await?;
-    let (scope, engine) = {
-        let mut broker = controller.broker.lock().await;
-        let result = broker
-            .dispatch(Request {
+    service
+        .dispatch(
+            Some(registry.initial_session_id().to_owned()),
+            Request {
                 id: 2,
                 method: "session.prompt.submit".into(),
                 params: json!({"text":"hello"}),
-            })
-            .await;
-        anyhow::ensure!(
-            result.response.error().is_none(),
-            "initial prompt failed: {:?}",
-            result.response.error()
-        );
-        broker.retained_idle_test_owner()?
+            },
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ready = {
+                let broker = controller.broker.lock().await;
+                let snapshot = broker.snapshot()?;
+                snapshot.exchange.last().is_some_and(|exchange| {
+                    exchange
+                        .turn
+                        .last()
+                        .is_some_and(|turn| turn.completed().is_some())
+                }) && !snapshot.questions.questions.is_empty()
+                    && controller.coordinator.execution.available_permits() > 0
+            };
+            if ready {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("root question and completion were not committed")??;
+    let (scope, engine) = {
+        let mut broker = controller.broker.lock().await;
+        let snapshot = broker.snapshot()?;
+        let exchange = snapshot
+            .exchange
+            .last()
+            .context("missing committed root exchange")?;
+        let scope = exchange
+            .turn
+            .last()
+            .context("missing committed root turn")?
+            .provider()
+            .scope
+            .clone();
+        let engine = broker
+            .execution_registry()
+            .owner(scope.owner.clone())
+            .await?;
+        (scope, engine)
     };
-    engine
+    let late_effect = engine
         .publish_idle_test_effect(
             scope.clone(),
             crate::provider::ProviderCompletion {
@@ -4383,47 +4557,142 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
                 ..Default::default()
             },
         )
+        .await;
+    assert!(
+        late_effect.is_err(),
+        "a retired root cannot acquire a new host effect"
+    );
+    assert!(
+        engine
+            .steer(
+                scope.clone(),
+                crate::provider::SteeringInput::AgentResult("continue".into())
+            )
+            .await
+            .is_err(),
+        "late child results cannot reopen the root turn"
+    );
+    {
+        let broker = controller.broker.lock().await;
+        let snapshot = broker.snapshot()?;
+        let exchange = snapshot
+            .exchange
+            .iter()
+            .find(|exchange| exchange.id == scope.exchange_id.as_str())
+            .context("original root exchange disappeared")?;
+        assert_eq!(exchange.turn.len(), 1);
+        assert_eq!(snapshot.questions.questions.len(), 1);
+        assert_eq!(
+            snapshot.questions.questions[0].exchange_id,
+            scope.exchange_id.as_str()
+        );
+        assert_eq!(
+            snapshot.questions.questions[0].content.question,
+            "Which active route?"
+        );
+        let published = observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["event"] == "question"
+                    && message["payload"]["exchange_id"] == scope.exchange_id.as_str()
+                    && message
+                        .pointer("/payload/elicitation/question_set/id")
+                        .and_then(Value::as_str)
+                        == Some("idle-question")
+            })
+            .count();
+        assert_eq!(
+            published, 0,
+            "a rejected late root effect cannot publish a question"
+        );
+    }
+    controller.attach_agents(&sink).await?;
+    let admitted = controller
+        .agent_coordinator
+        .sender()
+        .request(crate::agent::AgentRequest {
+            operation_id: "independent-idle-child".into(),
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+                profile: Some("worker".into()),
+                text: "Keep the independent child lifecycle".into(),
+            }),
+        })
         .await?;
-    engine
-        .steer(
-            scope.clone(),
-            crate::provider::SteeringInput::AgentResult("continue".into()),
-        )
-        .await?;
+    let child_task = admitted["task"]["id"]
+        .as_str()
+        .context("missing child task")?
+        .to_owned();
+    let child_agent = admitted["agent"]["id"]
+        .as_str()
+        .context("missing child agent")?
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), child_started.notified()).await?;
+    let store = SqliteStore::read_only(&controller.data_root)?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let broker = controller.broker.lock().await;
-            let committed = broker.retained_idle_test_question(&scope, "idle-question")?;
-            let published = observed
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|message| {
-                    message["event"] == "question"
-                        && message["payload"]["exchange_id"] == scope.exchange_id.as_str()
-                        && message
-                            .pointer("/payload/elicitation/question_set/id")
-                            .and_then(Value::as_str)
-                            == Some("idle-question")
-                })
-                .count();
-            anyhow::ensure!(published <= 1, "idle question was published more than once");
-            if committed && published == 1 {
-                broker.retained_idle_test_next_admission()?;
-                return Ok::<(), anyhow::Error>(());
+            if let Some(child) = store.load_exchange(&child_task)?
+                && let Some(turn) = child.turn.first()
+            {
+                assert_eq!(turn.provider().scope.owner.agent_id().as_str(), child_agent);
+                assert_ne!(turn.provider().scope, scope);
+                assert!(turn.completed().is_none());
+                break Ok::<(), anyhow::Error>(());
             }
-            drop(broker);
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .with_context(|| {
-        format!(
-            "idle question effect was not applied; observations: {:?}",
-            observed.lock().unwrap()
-        )
-    })??;
-    service.shutdown(Duration::from_secs(5)).await?;
+    .await??;
+    child_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if controller
+                .agent_coordinator
+                .task(&child_task)
+                .is_some_and(|task| task.completed_at_ms.is_some())
+            {
+                let child = store
+                    .load_exchange(&child_task)?
+                    .context("child exchange missing")?;
+                assert!(
+                    child
+                        .turn
+                        .first()
+                        .context("child turn missing")?
+                        .completed()
+                        .is_some()
+                );
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let snapshot = controller.broker.lock().await.snapshot()?;
+    let original = snapshot
+        .exchange
+        .iter()
+        .find(|exchange| exchange.id == scope.exchange_id.as_str())
+        .context("root exchange missing")?;
+    assert_eq!(
+        original.turn.len(),
+        1,
+        "independent child completion reopened the retired root"
+    );
+    assert_eq!(
+        snapshot.questions.questions.len(),
+        1,
+        "independent child cannot invent root question authority"
+    );
+    if let Err(error) = service.shutdown(Duration::from_secs(5)).await {
+        return Err(owner_fixture::retain_cleanup_failure(
+            fixture,
+            &controller,
+            error,
+        ));
+    }
     drop(sink);
     reader.await??;
     Ok(())
@@ -4988,7 +5257,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
         .into_iter()
         .find(|message| message.id == "queued")
         .unwrap();
-    assert_eq!(queued.reservation().as_deref(), Some("editor"));
+    assert_eq!(queued.reservation(), Some("editor"));
     controller.coordinator.submissions.apply(InputOperation {
         id: "commit".into(),
         control_revision: 0,

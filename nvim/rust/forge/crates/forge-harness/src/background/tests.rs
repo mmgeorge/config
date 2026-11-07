@@ -95,7 +95,7 @@ async fn commit_generation_replaces_incompatible_operation_storage() -> Result<(
         "incompatible history must be deleted rather than migrated"
     );
     let recorded: i64 = database.query_row(
-        "SELECT count(*) FROM owner_core_log WHERE session_id=?1 AND json_extract(record,'$.record')='operation_completed' AND json_extract(record,'$.operation.kind')='session_open'",
+        "SELECT count(*) FROM owner_core_log WHERE session_id=?1 AND json_extract(record,'$.record')='operation_completed' AND json_extract(record,'$.operation.kind')='thread_open'",
         [&generated.session_id], |row| row.get(0),
     )?;
     assert!(

@@ -28,7 +28,7 @@ local ok, failure = pcall(function()
     end
     error("exchange summary is missing")
   end
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps")
   local baseline = renderer.build({ { kind = "exchange", exchange = exchange } }, { expanded = {} })
   local reported = "--- a/lib.rs\n+++ b/lib.rs\n@@ -0,0 +1 @@\n+reported\n"
   local checkpoint = "--- a/generated.rs\n+++ b/generated.rs\n@@ -0,0 +1 @@\n+generated\n"
@@ -47,68 +47,68 @@ local ok, failure = pcall(function()
   end
   exchange.metrics.tool_duration_ms = 439
   exchange.metrics.reported_response_ms = 5561
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 439 ms │ 76.0k (90%) -> 4.2k · 755 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 439 ms │ 76.0k (90% cached) -> 4.2k · 755 tps")
   exchange.metrics.tool_duration_ms = 2500
   exchange.metrics.reported_response_ms = 3500
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 2.5 s │ 76.0k (90%) -> 4.2k · 1200 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 2.5 s │ 76.0k (90% cached) -> 4.2k · 1200 tps")
   exchange.metrics.tool_duration_ms = 3000
   exchange.metrics.reported_response_ms = 3000
   exchange.duration_ms = 6500
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps")
   exchange.duration_ms = 3500
-  assert_equals(summary(), "▸ Thought 3s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps")
+  assert_equals(summary(), "▸ Thought 3s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps")
   exchange.duration_ms = 3000
-  assert_equals(summary(), "▸ Thought 3s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps")
+  assert_equals(summary(), "▸ Thought 3s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps")
   exchange.duration_ms = 6000
   exchange.turn[1].usage.output = 4251
   exchange.metrics.reported_output_tokens = 4251
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.3k · 1417 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.3k · 1417 tps")
   exchange.turn[1].usage.output = 4200
   exchange.turn[2] = { id = "second", usage = { input = 4000, cached_input = 0, reasoning = 0, output = 100 }, tool = { order = {}, item = {} } }
   exchange.metrics.request_count = 2
   exchange.metrics.reported_output_tokens = 4300
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 80.0k (86%) -> 4.3k · 1433 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 80.0k (86% cached) -> 4.3k · 1433 tps")
   exchange.turn[2].usage.reasoning = vim.NIL
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 80.0k (86%) -> 4.3k · 1433 tps")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 80.0k (86% cached) -> 4.3k · 1433 tps")
   exchange.turn[2].usage = vim.NIL
   exchange.metrics.timing_complete = false
-  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools │ 76.0k (90%) -> 4.2k")
+  assert_equals(summary(), "▸ Thought 6s │ 0/1 tools │ 76.0k (90% cached) -> 4.2k")
   exchange.state = "running"
   exchange.completed_at_ms = vim.NIL
   exchange.execution_started_at_ms = 10000
   exchange.metrics.timing_complete = true
   exchange.metrics.blocked_started_ms = 6000
   exchange.metrics.tool_started_ms = 6000
-  assert_equals(summary({ now_ms = 12000 }), "▾ Working 8s │ 0/1 tools · 5 s │ 76.0k (90%) -> 4.2k · 1433 tps")
+  assert_equals(summary({ now_ms = 12000 }), "▾ Thinking 8s │ 0/1 tools · 5 s │ 76.0k (90% cached) -> 4.2k · 1433 tps")
   exchange.execution_started_at_ms = vim.NIL
   exchange.turn[#exchange.turn].state = { kind = "finished", outcome = "interrupted" }
-  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1433 tps")
+  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1433 tps")
   exchange.kind = "plan_draft"
   for _, now_ms in ipairs({ 90000, 900000 }) do
-    assert_equals(summary({ now_ms = now_ms }), "▾ Planning paused 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1433 tps")
+    assert_equals(summary({ now_ms = now_ms }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1433 tps")
   end
   exchange.execution_started_at_ms = 900000
-  assert_equals(summary({ now_ms = 902000 }), "▾ Planning 8s │ 0/1 tools · 5 s │ 76.0k (90%) -> 4.2k · 1433 tps")
+  assert_equals(summary({ now_ms = 902000 }), "▾ Thinking 8s │ 0/1 tools · 5 s │ 76.0k (90% cached) -> 4.2k · 1433 tps")
   exchange.kind, exchange.execution_started_at_ms = "chat", vim.NIL
   exchange.metrics.request_count = 0
-  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1433 tps")
+  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1433 tps")
   exchange.metrics = { timing_complete = true, request_count = 0 }
   exchange.turn = {}
-  assert_equals(summary(), "▾ Working 6s")
+  assert_equals(summary(), "▾ Thinking 6s")
   exchange.metrics.request_count = 1
-  assert_equals(summary(), "▾ Working 6s")
+  assert_equals(summary(), "▾ Thinking 6s")
   exchange.turn = { { id = "partial", usage = { input = 1000, output = 100 } } }
-  assert_equals(summary(), "▾ Working 6s │ 1.0k -> 100")
+  assert_equals(summary(), "▾ Thinking 6s │ 1.0k -> 100")
   exchange.turn[1].usage = { reasoning = 23 }
-  assert_equals(summary(), "▾ Working 6s")
+  assert_equals(summary(), "▾ Thinking 6s")
   exchange.turn[1].usage = { input = 1000, cached_input = 0, reasoning = 0, output = 0 }
   exchange.metrics.reported_output_tokens = 0
   exchange.metrics.reported_response_ms = 2000
-  assert_equals(summary(), "▾ Working 6s │ 1.0k (0%) -> 0")
+  assert_equals(summary(), "▾ Thinking 6s │ 1.0k (0% cached) -> 0")
   exchange.turn = {}
   exchange.metrics = { request_count = 0 }
   exchange.node_list = { { kind = "agent_reference", agent = { child_agent_id = "child" } } }
-  assert_equals(summary(), "▾ Working 6s")
+  assert_equals(summary(), "▾ Thinking 6s")
   exchange.kind, exchange.state = "plan_draft", "complete"
   exchange.duration_ms, exchange.completed_at_ms = 44000, 44000
   exchange.node_list = {}
@@ -121,7 +121,7 @@ local ok, failure = pcall(function()
     calls.item[id] = { id = id, status = index == 20 and "failed" or "completed", failed = index == 20 }
   end
   exchange.turn = { { id = "compact", usage = { input = 855100, output = 7906, reasoning = 906 }, tool = calls } }
-  assert_equals(summary(), "▸ Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps")
+  assert_equals(summary(), "▸ Thought 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps")
   calls.item["1"].status = "running"
   assert(summary():find("18/20 tools", 1, true), "running tools must not count as passed")
   calls.item["1"].status = "cancelled"
@@ -134,7 +134,7 @@ local ok, failure = pcall(function()
       first = { id = "first", status = "completed" }, second = { id = "second", status = "completed" },
     } },
   } }
-  assert_equals(summary(), "▸ Thought 31s │ 2/2 tools · 29 ms │ 77.0k (64%) -> 846 · 93 tps")
+  assert_equals(summary(), "▸ Thought 31s │ 2/2 tools · 29 ms │ 77.0k (64% cached) -> 846 · 93 tps")
   local first, second = exchange.turn[1].tool.item.first, exchange.turn[1].tool.item.second
   first.kind, second.kind = "file_change", "file_change"
   first.change = { file = { { path = "src\\main.rs" } } }

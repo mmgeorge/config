@@ -1,6 +1,7 @@
 use super::collect::ProviderTestExt as _;
 use anyhow::{Context, Result};
-use forge_harness::provider::{MessageUpdate, ProviderEvent, ProviderInput, ProviderRequest};
+use forge_harness::provider::{ProviderEvent, ProviderInput, ProviderRequest};
+use forge_provider_api::message::{ItemCompletion, ItemEvent};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     let first = create_provider(provider, &data, &request)?;
     let mut missing = request.clone();
     missing.provider_session_id = Some(uuid::Uuid::new_v4().to_string().try_into()?);
-    let unavailable = first.session_open(missing).await;
+    let unavailable = first.thread_open(missing).await;
     eprintln!("{provider}: missing history result {unavailable:?}");
     assert!(
         unavailable.is_err(),
@@ -50,10 +51,10 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         Some(forge_harness::provider::ProviderError::Failure(failure))
             if failure.kind() == forge_provider_api::ProviderFailureKind::SessionMissing
     ));
-    let prepared = first.session_open(request.clone()).await;
+    let prepared = first.thread_open(request.clone()).await;
     if let Ok(Some(thread)) = &prepared {
         assert_eq!(
-            first.session_open(request.clone()).await?.as_ref(),
+            first.thread_open(request.clone()).await?.as_ref(),
             Some(thread)
         );
     }
@@ -64,7 +65,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     request.provider_session_id = None;
     let second = create_provider(provider, &data, &request)?;
     let result: Result<forge_provider_api::ProviderSessionId> = async {
-        let prepared = second.session_open(request.clone()).await?.context("missing prepared thread")?;
+        let prepared = second.thread_open(request.clone()).await?.context("missing prepared thread")?;
         assert_ne!(prepared, thread);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
@@ -91,7 +92,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     request.provider_session_id = Some(result?);
     let third = create_provider(provider, &data, &request)?;
     let resumed: Result<()> = async {
-        let resumed = third.session_open(request.clone()).await?;
+        let resumed = third.thread_open(request.clone()).await?;
         assert_eq!(resumed, request.provider_session_id);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
@@ -108,11 +109,11 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
 }
 
 /// Verify the provider retained conversation context across each transition.
-fn assert_token(event: &[ProviderEvent]) {
+fn assert_token(event: &[forge_harness::provider::HarnessEvent]) {
     assert!(
-        event.iter().any(|event| matches!(event,
-            ProviderEvent::Message { update: MessageUpdate::Completed { text }, .. }
-                if text.contains("FORGE-RESUME-72931")
+        event.iter().filter_map(super::native_event).any(|event| matches!(event,
+            ProviderEvent::Item { event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), .. }
+                if completion.text.contains("FORGE-RESUME-72931")
         )),
         "provider did not retain the conversation token: {event:?}"
     );
@@ -179,27 +180,12 @@ async fn service_recovery(provider: &str) -> Result<()> {
         let renamed = output.recv().await?.context("rename response missing")?;
         let renamed: serde_json::Value = serde_json::from_slice(renamed.bytes())?;
         anyhow::ensure!(renamed.get("error").is_none(), "rename failed: {renamed}");
+        // Startup clears the unused missing history and defers the native open to the
+        // first input, so it neither recreates nor republishes a provider conversation.
         service.start_provider_session(&session.id, &sink).await?;
-        loop {
-            let frame = output
-                .recv()
-                .await?
-                .context("service event stream closed")?;
-            let event: serde_json::Value = serde_json::from_slice(frame.bytes())?;
-            anyhow::ensure!(
-                event["payload"]["kind"] != "error",
-                "startup failed: {event}"
-            );
-            if event["event"] == "session_configured" {
-                assert!(event["payload"]["session"]["provider_session_id"].is_string());
-                assert_ne!(event["payload"]["session"]["provider_session_id"], serde_json::json!(session.provider_session_id));
-                break;
-            }
-        }
         let store = forge_harness::storage::SqliteStore::open(&data)?;
         let initialized = store.load_session(&session.id)?.unwrap().provider_session_id;
-        assert!(initialized.is_some());
-        assert_ne!(initialized, session.provider_session_id);
+        assert!(initialized.is_none());
         assert!(store.list_exchange(&session.id)?.is_empty());
         assert_eq!(store.load_session(&session.id)?.unwrap().name, "Renamed without an exchange");
         Ok(())
@@ -211,7 +197,9 @@ async fn service_recovery(provider: &str) -> Result<()> {
     let reopened = reopened.snapshot()?.session;
     assert_eq!(reopened.name, "Renamed without an exchange");
     assert!(reopened.provider_session_id.is_none());
-    eprintln!("{provider}: production startup recovered the missing empty session");
+    eprintln!(
+        "{provider}: production startup cleared the missing empty session without a native open"
+    );
     Ok(())
 }
 

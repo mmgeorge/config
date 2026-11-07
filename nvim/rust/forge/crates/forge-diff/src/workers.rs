@@ -54,8 +54,27 @@ pub struct PoolShutdown {
 #[derive(Clone)]
 pub struct WorkBudget {
     input_bytes: usize,
-    deadline: Option<Instant>,
+    deadline: WorkDeadline,
     cancelled: Arc<AtomicBool>,
+}
+
+/// Selects how a budget decides deadline expiry at cooperative checkpoints.
+#[derive(Clone)]
+enum WorkDeadline {
+    Unbounded,
+    At(Instant),
+    /// Expires once its owner sets the flag, which lets tests expire work without the wall clock.
+    Signal(Arc<AtomicBool>),
+}
+
+impl WorkDeadline {
+    fn expired(&self) -> bool {
+        match self {
+            Self::Unbounded => false,
+            Self::At(deadline) => Instant::now() >= *deadline,
+            Self::Signal(expired) => expired.load(Ordering::Acquire),
+        }
+    }
 }
 
 /// Identifies one submission within its owning pool. Dropping a ticket does not cancel work.
@@ -117,7 +136,20 @@ impl WorkBudget {
     pub fn new(input_bytes: usize, deadline: Option<Instant>) -> Self {
         Self {
             input_bytes,
-            deadline,
+            deadline: deadline.map_or(WorkDeadline::Unbounded, WorkDeadline::At),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Test seam: creates a budget whose deadline expires once `expired` becomes true.
+    ///
+    /// Tests use it to expire work at an exact point in the pool lifecycle without waiting on the
+    /// wall clock. Production budgets use [`WorkBudget::new`].
+    #[doc(hidden)]
+    pub fn with_expiry_signal(input_bytes: usize, expired: Arc<AtomicBool>) -> Self {
+        Self {
+            input_bytes,
+            deadline: WorkDeadline::Signal(expired),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -126,10 +158,7 @@ impl WorkBudget {
     pub fn check(&self) -> Result<(), WorkStop> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(WorkStop::Cancelled)
-        } else if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        } else if self.deadline.expired() {
             Err(WorkStop::Deadline)
         } else {
             Ok(())

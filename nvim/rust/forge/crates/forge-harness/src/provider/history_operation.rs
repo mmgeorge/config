@@ -7,8 +7,8 @@ use std::{
 };
 
 use forge_provider_api::{
-    BindingId, Compaction, CompactionRequest, EventScope, ExecutionOwner, OperationId,
-    ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation, SessionForkRequest,
+    BindingId, Compaction, CompactionRequest, EventScope, OperationId, ProviderError,
+    ProviderFailure, ProviderFailureKind, ProviderOperation, SessionForkRequest, ThreadOwner,
 };
 use tokio::sync::OnceCell;
 
@@ -25,8 +25,8 @@ impl HistoryKind {
     /// Get the operation category whose identity this record owns.
     fn operation(self) -> ProviderOperation {
         match self {
-            Self::Fork => ProviderOperation::SessionFork,
-            Self::Compact => ProviderOperation::SessionCompact,
+            Self::Fork => ProviderOperation::ThreadFork,
+            Self::Compact => ProviderOperation::ThreadCompact,
         }
     }
 }
@@ -60,13 +60,13 @@ struct RetainedRequest<T> {
 /// Bind compaction to the exact reader whose watermark must settle, including after replacement.
 pub(super) struct CompactionTarget {
     host: Arc<HostSession>,
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     binding: BindingId,
 }
 
 impl CompactionTarget {
     /// Create a target while bridge admission still protects the binding and its reader.
-    pub(super) fn new(host: Arc<HostSession>, owner: ExecutionOwner, binding: BindingId) -> Self {
+    pub(super) fn new(host: Arc<HostSession>, owner: ThreadOwner, binding: BindingId) -> Self {
         Self {
             host,
             owner,
@@ -112,14 +112,14 @@ impl HistoryOperations {
         operation::observe(
             trace,
             core,
-            ProviderOperation::SessionFork,
+            ProviderOperation::ThreadFork,
             &context,
             EventScope::SessionOperation {
                 owner: request.target.owner.clone(),
                 operation_id: context.id().clone(),
             },
             None,
-            native.session_fork(context.clone(), request.clone()),
+            native.thread_fork(context.clone(), request.clone()),
         )
         .await
     }
@@ -156,11 +156,11 @@ impl HistoryOperations {
         let result = operation::observe(
             trace,
             core,
-            ProviderOperation::SessionCompact,
+            ProviderOperation::ThreadCompact,
             &context,
             prepared.request.scope.clone(),
             Some(prepared.target.binding.clone()),
-            native.session_compact(
+            native.thread_compact(
                 context.clone(),
                 &prepared.target.binding,
                 prepared.request.clone(),
@@ -172,7 +172,7 @@ impl HistoryOperations {
             biased;
             result = super::wait_for_watermark(&prepared.target.host, result.watermark) => result?,
             interruption = context.interrupted() => return Err(interruption.failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 forge_provider_api::ProviderPhase::Observation,
                 forge_provider_api::FailureDisposition::Uncertain,
             )),

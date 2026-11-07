@@ -11,7 +11,7 @@ local transcript_options = {
     fold_markers = true,
   conceal = { level = 3, cursor = "nvic" },
   columns = { signcolumn = "yes:1", statuscolumn = "%s" },
-  wrapping = { indent = true, options = "shift:0" },
+  wrapping = require("forge.views.harness.layout").transcript_wrapping,
 }
 
 function M.open(options, callback)
@@ -52,7 +52,8 @@ function M.open(options, callback)
   local function fail(message)
     if startup then startup.finish("failed", { error = tostring(message) }) end
     local previous = owner.failure
-    owner.failure = tostring(message) .. ". Reopen Harness to retry."
+    owner.failure = tostring(message) .. (owner.session_missing and ". The Harness session no longer exists."
+      or ". Reopen Harness to retry.")
     owner.pending, owner.syncing, owner.applying, owner.highlighting, owner.selecting = false, false, false, false, false
     owner.section_inflight = {}
     clear_loading()
@@ -149,10 +150,15 @@ function M.open(options, callback)
       local operation = current.params.operation
       local code = detail and detail.code
       local read = operation == "sync" or operation == "snapshot" or operation == "open"
-      local retryable = code == "not_admitted"
+      -- A deleted session never becomes readable again, so it ends the presentation instead of retrying.
+      if code == "session_not_found" and not cleanup_request(current.params) then
+        owner.session_missing = true
+        diagnostic.set(owner, "sync_failure", nil)
+      end
+      local retryable = not owner.session_missing and (code == "not_admitted"
         or (read and code ~= "invalid_state" and code ~= "invalid_request" and code ~= -32602)
         or ((not detail or code == "outcome_unknown")
-          and (operation == "staging" or operation == "node" or operation == "select_agent"))
+          and (operation == "staging" or operation == "node" or operation == "select_agent")))
       if failure and retryable and valid_request(current) then
         diagnostic.set(owner, "sync_failure", "Retrying transcript " .. operation .. ": " .. tostring(failure),
           { owner = identity, category = "presentation", severity = "info" })
@@ -279,6 +285,7 @@ function M.open(options, callback)
   owner.status_view = require("forge.views.harness.status_view").new({
     transcript = owner.transcript, transcript_window = options.transcript_window,
     composer_window = options.composer_window, alive = alive, notice = notice, recover = recovery,
+    refresh = function() if owner.ready and not owner.closed then owner.sync() end end,
   })
   owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
   owner.transcript.fold_loading = {}

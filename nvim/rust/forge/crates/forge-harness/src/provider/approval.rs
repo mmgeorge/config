@@ -11,9 +11,11 @@ use crate::permissions::matcher::{
 };
 use crate::permissions::shell;
 use crate::permissions::store::PermissionStore;
-use crate::provider::{ProviderEvent, ProviderEventSink};
+use crate::provider::events::{HarnessEventSink, HostEvent};
+use crate::provider::host_event::*;
 use crate::session::{ApprovalMode, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
+use forge_provider_api::SanitizedMessage;
 #[cfg(test)]
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -22,13 +24,49 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+/// Retain the original execution's publication, policy, and revocation authority while approval waits.
+struct ApprovalExecution<'scope> {
+    address: Option<crate::provider::TurnAddress>,
+    event_sink: Option<&'scope HarnessEventSink>,
+    directory_policy: Option<Arc<DirectoryPolicy>>,
+    authority: Option<Arc<ApprovalAuthority>>,
+    kind: ApprovalExecutionKind,
+}
+
 struct PendingApproval {
     token: Uuid,
     view: ApprovalRequestView,
+    presentation: PermissionApprovalRequest,
+    execution_kind: ApprovalExecutionKind,
     response: oneshot::Sender<ApprovalResolution>,
-    resolution_sink: Option<ProviderEventSink>,
+    resolution_sink: Option<HarnessEventSink>,
     directory_policy: Option<Arc<DirectoryPolicy>>,
     authority: Option<Arc<ApprovalAuthority>>,
+    /// Takes the same expiry branch as the deadline timer; see `expire_pending_for_owner`.
+    expiry_trigger: Arc<tokio::sync::Notify>,
+}
+
+/// Capture immutable directory and selected-skill authority for independently retained native children.
+#[derive(Clone)]
+pub(crate) struct PermissionInheritance {
+    directory: Option<Arc<DirectoryPolicy>>,
+    skills: Option<Arc<crate::skill::SkillAccess>>,
+}
+
+/// Revoke one child's inherited grants when its independent callback owner is retired.
+#[must_use = "dropping the lease revokes inherited child grants"]
+pub(crate) struct InheritedPermissionLease {
+    _directory: DirectoryExecution,
+    _skills: Option<crate::skill::SkillExecution>,
+}
+
+impl InheritedPermissionLease {
+    /// Get the selected-skill observer retained for this child's independent native items.
+    pub(crate) fn skill_observer(&self) -> Option<Arc<dyn crate::provider::events::EventObserver>> {
+        self._skills
+            .as_ref()
+            .map(crate::skill::SkillExecution::event_observer)
+    }
 }
 
 /// Serialize retirement with approval admission and persistent decisions for one native generation.
@@ -53,13 +91,34 @@ struct PendingRegistration<'registry> {
 }
 
 impl Drop for PendingRegistration<'_> {
+    /// Remove only this request generation and announce a disconnected requester.
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.registry.lock()
-            && pending
+        let pending = self.registry.lock().ok().and_then(|mut pending| {
+            if pending
                 .get(&self.id)
                 .is_some_and(|entry| entry.token == self.token)
+            {
+                pending.remove(&self.id)
+            } else {
+                None
+            }
+        });
+        if let Some(pending) = pending
+            && let Some(sink) = &pending.resolution_sink
+            && let Ok(cancelled_at_ms) = now_ms()
         {
-            pending.remove(&self.id);
+            let _ = sink.send(crate::provider::HarnessEvent::Host {
+                scope: sink.scope().clone(),
+                event: HostEvent::PermissionApproval {
+                    execution_kind: pending.execution_kind,
+                    event: PermissionApprovalEvent::Cancelled(PermissionApprovalCancellation {
+                        request_id: pending.presentation.request_id,
+                        scope: pending.presentation.scope,
+                        reason: ApprovalCancellationReason::RequesterGone,
+                        cancelled_at_ms,
+                    }),
+                },
+            });
         }
     }
 }
@@ -68,14 +127,75 @@ pub struct PermissionCoordinator {
     pending_map: Mutex<BTreeMap<String, PendingApproval>>,
     store: Arc<RwLock<PermissionStore>>,
     timeout_by_session: Mutex<BTreeMap<String, InputTimeout>>,
-    feedback_by_owner: Mutex<HashMap<crate::provider::ExecutionOwner, String>>,
-    feedback_watch:
-        Mutex<HashMap<crate::provider::ExecutionOwner, tokio::sync::watch::Sender<bool>>>,
-    skill_by_owner: Mutex<HashMap<crate::provider::ExecutionOwner, Arc<crate::skill::SkillAccess>>>,
+    feedback_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, String>>,
+    feedback_watch: Mutex<HashMap<crate::provider::ThreadOwner, tokio::sync::watch::Sender<bool>>>,
+    skill_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, Arc<crate::skill::SkillAccess>>>,
     directory_by_scope: Mutex<HashMap<crate::provider::InvocationScope, Arc<DirectoryPolicy>>>,
 }
 
 impl PermissionCoordinator {
+    /// Capture the original policy before parent foreground collection releases its leases.
+    pub(crate) fn capture_inheritance(
+        &self,
+        scope: &crate::provider::InvocationScope,
+    ) -> Result<PermissionInheritance> {
+        let directory = self
+            .directory_by_scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?
+            .get(scope)
+            .cloned();
+        let skills = self
+            .skill_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?
+            .get(&scope.owner)
+            .cloned();
+        Ok(PermissionInheritance { directory, skills })
+    }
+
+    /// Install only a proven child's captured policy under its original independent owner.
+    pub(crate) fn inherit(
+        self: &Arc<Self>,
+        scope: &crate::provider::InvocationScope,
+        captured: &PermissionInheritance,
+    ) -> Result<InheritedPermissionLease> {
+        let policy = captured
+            .directory
+            .clone()
+            .context("native child has no captured directory policy")?;
+        let mut directories = self
+            .directory_by_scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
+        let mut skills = self
+            .skill_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
+        anyhow::ensure!(
+            !directories.contains_key(scope) && !skills.contains_key(&scope.owner),
+            "native child policy already has an independent owner"
+        );
+        directories.insert(scope.clone(), policy.clone());
+        let skills = captured.skills.as_ref().map(|access| {
+            skills.insert(scope.owner.clone(), access.clone());
+            crate::skill::SkillExecution {
+                observer: Arc::new(Mutex::new(crate::skill::SkillObserver::new(access.clone()))),
+                access: access.clone(),
+                owner: scope.owner.clone(),
+                coordinator: self.clone(),
+            }
+        });
+        Ok(InheritedPermissionLease {
+            _directory: DirectoryExecution {
+                scope: scope.clone(),
+                policy,
+                coordinator: self.clone(),
+            },
+            _skills: skills,
+        })
+    }
+
     /// Report the captured write-off boundary for an active execution owner.
     pub(crate) fn writes_disabled(
         &self,
@@ -192,7 +312,7 @@ impl PermissionCoordinator {
     /// Revoke only the matching execution generation's temporary bundle grants.
     pub(crate) fn release_skills(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
         access: &Arc<crate::skill::SkillAccess>,
     ) {
         if let Ok(mut scope) = self.skill_by_owner.lock()
@@ -227,7 +347,7 @@ impl PermissionCoordinator {
     /// Consume one owner's automatic-rejection guidance at its next continuation boundary.
     pub fn take_timeout_feedback(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
     ) -> Result<Option<String>> {
         let feedback = self
             .feedback_by_owner
@@ -241,7 +361,7 @@ impl PermissionCoordinator {
     /// Subscribe to one owner's retained feedback without losing changes during registration.
     pub(crate) fn subscribe_timeout_feedback(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
     ) -> Result<tokio::sync::watch::Receiver<bool>> {
         let feedback = self
             .feedback_by_owner
@@ -258,7 +378,7 @@ impl PermissionCoordinator {
             .subscribe())
     }
 
-    fn publish_timeout_feedback(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+    fn publish_timeout_feedback(&self, owner: &crate::provider::ThreadOwner) -> Result<()> {
         let feedback = self
             .feedback_by_owner
             .lock()
@@ -282,8 +402,32 @@ impl PermissionCoordinator {
         Ok(())
     }
 
+    /// Expire every timed approval that one owner awaits, exactly as its elapsed deadline would.
+    ///
+    /// Only the mock provider's deterministic control surface calls this, so integration
+    /// fixtures can exercise automatic rejection without waiting on the real clock. Approvals
+    /// without a deadline are left pending, and the count of triggered approvals is returned.
+    pub(crate) fn expire_pending_for_owner(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+    ) -> Result<usize> {
+        let pending_map = self
+            .pending_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+        let mut expired_count = 0;
+        for pending in pending_map.values().filter(|pending| {
+            pending.view.deadline.is_some() && pending.view.execution_owner.as_ref() == Some(owner)
+        }) {
+            // A stored permit lets a trigger that precedes the waiter's poll still win.
+            pending.expiry_trigger.notify_one();
+            expired_count += 1;
+        }
+        Ok(expired_count)
+    }
+
     /// Check whether one owner needs a serialized continuation after denial.
-    pub fn has_timeout_feedback(&self, owner: &crate::provider::ExecutionOwner) -> Result<bool> {
+    pub fn has_timeout_feedback(&self, owner: &crate::provider::ThreadOwner) -> Result<bool> {
         Ok(self
             .feedback_by_owner
             .lock()
@@ -309,10 +453,17 @@ impl PermissionCoordinator {
         approval_mode: ApprovalMode,
         request: PermissionRequest,
         address: Option<crate::provider::TurnAddress>,
-        event_sink: Option<&ProviderEventSink>,
+        event_sink: Option<&HarnessEventSink>,
     ) -> Result<ApprovalResolution> {
-        self.authorize_scoped(approval_mode, request, address, event_sink, None)
-            .await
+        self.authorize_scoped(
+            approval_mode,
+            request,
+            address,
+            event_sink,
+            None,
+            ApprovalExecutionKind::Managed,
+        )
+        .await
     }
 
     /// Evaluate approval under a revocable native callback generation.
@@ -321,9 +472,12 @@ impl PermissionCoordinator {
         approval_mode: ApprovalMode,
         mut request: PermissionRequest,
         address: Option<crate::provider::TurnAddress>,
-        event_sink: Option<&ProviderEventSink>,
+        event_sink: Option<&HarnessEventSink>,
         authority: Option<Arc<ApprovalAuthority>>,
+        execution_kind: ApprovalExecutionKind,
     ) -> Result<ApprovalResolution> {
+        // Native callback correlation remains in the adapter; host approvals own independent identities.
+        request.id = Uuid::new_v4().to_string();
         if request.target_list.is_empty()
             || request
                 .target_list
@@ -367,16 +521,17 @@ impl PermissionCoordinator {
             Ok(evaluation) => evaluation,
             Err(error) => {
                 if let Some(sink) = event_sink {
-                    sink.send_wait(ProviderEvent::Diagnostic {
-                        scope: sink.scope().clone(),
-                        diagnostic: crate::provider::ProviderDiagnostic {
-                            kind: forge_provider_api::ProviderFailureKind::Authorization,
-                            message: forge_provider_api::SanitizedMessage::new(
-                                "Permission evaluation failed",
-                            )
-                            .expect("static diagnostic is nonempty"),
-                            fatal: false,
-                        },
+                    sink.send_host(HostEvent::Failure {
+                        failure: forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Authorization,
+                        ),
+                        // Evaluation errors originate in Harness policy code rather than
+                        // provider payloads, so the cause is safe and necessary to show.
+                        message: forge_provider_api::SanitizedMessage::new(format!(
+                            "Permission evaluation failed: {error:#}"
+                        ))
+                        .expect("diagnostic has a static prefix"),
                     })
                     .await?;
                 }
@@ -450,11 +605,55 @@ impl PermissionCoordinator {
             }
         }
         match evaluation.decision {
-            PermissionDecision::Allow => return Ok(ApprovalResolution::AllowOnce),
-            PermissionDecision::Deny => return Ok(ApprovalResolution::DenyPolicy),
+            PermissionDecision::Allow => {
+                Self::emit_automatic(
+                    event_sink,
+                    address.as_ref(),
+                    &request,
+                    ApprovalResolution::AllowOnce,
+                    ApprovalDecisionSource::SavedPolicy,
+                    execution_kind,
+                )
+                .await?;
+                return Ok(ApprovalResolution::AllowOnce);
+            }
+            PermissionDecision::Deny => {
+                Self::emit_automatic(
+                    event_sink,
+                    address.as_ref(),
+                    &request,
+                    ApprovalResolution::DenyPolicy,
+                    ApprovalDecisionSource::SavedPolicy,
+                    execution_kind,
+                )
+                .await?;
+                return Ok(ApprovalResolution::DenyPolicy);
+            }
             PermissionDecision::Ask => match approval_mode {
-                ApprovalMode::Deny => return Ok(ApprovalResolution::DenyMode),
-                ApprovalMode::Allow => return Ok(ApprovalResolution::AllowOnce),
+                ApprovalMode::Deny => {
+                    Self::emit_automatic(
+                        event_sink,
+                        address.as_ref(),
+                        &request,
+                        ApprovalResolution::DenyMode,
+                        ApprovalDecisionSource::ApprovalMode,
+                        execution_kind,
+                    )
+                    .await?;
+                    return Ok(ApprovalResolution::DenyMode);
+                }
+                ApprovalMode::Allow => {
+                    Self::emit_automatic(
+                        event_sink,
+                        address.as_ref(),
+                        &request,
+                        ApprovalResolution::AllowOnce,
+                        ApprovalDecisionSource::ApprovalMode,
+                        execution_kind,
+                    )
+                    .await?;
+                    return Ok(ApprovalResolution::AllowOnce);
+                }
                 ApprovalMode::Ask => {}
             },
         }
@@ -462,9 +661,6 @@ impl PermissionCoordinator {
             .as_ref()
             .map(|address| address.scope.owner.clone())
             .or_else(|| event_sink.map(|sink| sink.scope().owner().clone()));
-        if let Some(owner) = &execution_owner {
-            request.id = format!("{}:{}:{}", owner.session_id, owner.agent_id, request.id);
-        }
         let mut view = approval_view(&request, &evaluation);
         if let Some(policy) = &directory_policy {
             for (item, target) in view
@@ -548,8 +744,18 @@ impl PermissionCoordinator {
             }
         }
         view.execution_owner = execution_owner;
-        self.wait_for_approval(view, address, event_sink, directory_policy, authority)
-            .await
+        self.wait_for_approval(
+            view,
+            evaluation.pending_target_list,
+            ApprovalExecution {
+                address,
+                event_sink,
+                directory_policy,
+                authority,
+                kind: execution_kind,
+            },
+        )
+        .await
     }
 
     /// Reviews one exact proposal without creating reusable permission grants.
@@ -558,7 +764,7 @@ impl PermissionCoordinator {
         title: String,
         detail: String,
         scope: crate::provider::InvocationScope,
-        event_sink: &ProviderEventSink,
+        event_sink: &HarnessEventSink,
     ) -> Result<ApprovalResolution> {
         let view = ApprovalRequestView {
             id: Uuid::new_v4().to_string(),
@@ -599,18 +805,45 @@ impl PermissionCoordinator {
                 ],
             }],
         };
-        self.wait_for_approval(view, None, Some(event_sink), None, None)
-            .await
+        self.wait_for_approval(
+            view,
+            vec![PermissionTarget::HostTool {
+                name: "review_proposal".into(),
+            }],
+            ApprovalExecution {
+                address: None,
+                event_sink: Some(event_sink),
+                directory_policy: None,
+                authority: None,
+                kind: ApprovalExecutionKind::Managed,
+            },
+        )
+        .await
     }
 
+    /// Await a decision under the original execution's policy and revocation authority.
     async fn wait_for_approval(
         &self,
         mut view: ApprovalRequestView,
-        _address: Option<crate::provider::TurnAddress>,
-        event_sink: Option<&ProviderEventSink>,
-        directory_policy: Option<Arc<DirectoryPolicy>>,
-        authority: Option<Arc<ApprovalAuthority>>,
+        targets: Vec<PermissionTarget>,
+        execution: ApprovalExecution<'_>,
     ) -> Result<ApprovalResolution> {
+        let ApprovalExecution {
+            address,
+            event_sink,
+            directory_policy,
+            authority,
+            kind: execution_kind,
+        } = execution;
+        if let Some(sink) = event_sink {
+            view.exchange_id = sink
+                .scope()
+                .invocation()
+                .map(|scope| scope.exchange_id.to_string());
+        }
+        if let Some(address) = &address {
+            view.turn_id = Some(address.turn_id.clone());
+        }
         let id = view.id.clone();
         let timeout = self
             .timeout_by_session
@@ -619,7 +852,7 @@ impl PermissionCoordinator {
             .get(
                 view.execution_owner
                     .as_ref()
-                    .map(|owner| owner.session_id.as_str())
+                    .map(|owner| owner.session_id().as_str())
                     .unwrap_or_default(),
             )
             .copied()
@@ -630,9 +863,11 @@ impl PermissionCoordinator {
                 .as_millis(),
         )?;
         view.deadline = timeout.deadline(now_ms)?;
+        let presentation = permission_request(&view, targets, address.as_ref(), event_sink)?;
         let expires = tokio::time::Instant::now() + timeout.duration();
         let (sender, mut receiver) = oneshot::channel();
         let token = Uuid::new_v4();
+        let expiry_trigger = Arc::new(tokio::sync::Notify::new());
         {
             let generation = authority
                 .as_ref()
@@ -660,10 +895,13 @@ impl PermissionCoordinator {
                 PendingApproval {
                     token,
                     view: view.clone(),
+                    presentation: presentation.clone(),
+                    execution_kind,
                     response: sender,
                     resolution_sink: event_sink.cloned(),
                     directory_policy,
                     authority: authority.clone(),
+                    expiry_trigger: Arc::clone(&expiry_trigger),
                 },
             );
         }
@@ -674,9 +912,9 @@ impl PermissionCoordinator {
         };
         if let Some(event_sink) = event_sink {
             event_sink
-                .send_wait(ProviderEvent::Approval {
-                    scope: event_sink.invocation_scope()?.clone(),
-                    update: crate::provider::ApprovalUpdate::Requested(view.clone()),
+                .send_host(HostEvent::PermissionApproval {
+                    execution_kind,
+                    event: PermissionApprovalEvent::Requested(presentation),
                 })
                 .await?;
         }
@@ -684,7 +922,10 @@ impl PermissionCoordinator {
             if timeout.amount == 0 {
                 std::future::pending::<()>().await;
             }
-            tokio::time::sleep_until(expires).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(expires) => {}
+                () = expiry_trigger.notified() => {}
+            }
         };
         tokio::select! {
             result = &mut receiver => result.with_context(|| format!("approval request {id} was cancelled")),
@@ -706,7 +947,7 @@ impl PermissionCoordinator {
                     pending
                 };
                 if let Some(pending) = pending {
-                    Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
+                    Self::emit_resolution(event_sink, &pending, &[], &[], true).await?;
                     Ok(ApprovalResolution::TimedOut)
                 } else {
                     // A manual resolver already owns the terminal decision and its persistence.
@@ -716,51 +957,15 @@ impl PermissionCoordinator {
         }
     }
 
-    /// Attach canonical execution ownership before publishing or snapshotting an approval.
-    pub(crate) fn bind_owner(
-        &self,
-        id: &str,
-        exchange_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<Option<ApprovalRequestView>> {
-        let turn_id = turn_id.map(forge_provider_api::ProviderTurnId::from);
-        let mut pending = self
-            .pending_map
-            .lock()
-            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-        let Some(approval) = pending.get_mut(id) else {
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            approval
-                .view
-                .exchange_id
-                .as_deref()
-                .is_none_or(|owner| owner == exchange_id),
-            "approval cannot change its owning exchange"
-        );
-        approval.view.exchange_id = Some(exchange_id.to_owned());
-        anyhow::ensure!(
-            approval
-                .view
-                .turn_id
-                .as_ref()
-                .is_none_or(|owner| Some(owner) == turn_id.as_ref()),
-            "approval cannot change its owning turn"
-        );
-        approval.view.turn_id = turn_id;
-        Ok(Some(approval.view.clone()))
-    }
-
     /// Resolve a pending request and publish its terminal event on the requesting execution's stream.
     /// Use `event_sink` only when the request was registered without a stream.
     pub async fn resolve(
         &self,
         approval_id: &str,
         answer_list: &[ApprovalAnswer],
-        event_sink: Option<&ProviderEventSink>,
+        event_sink: Option<&HarnessEventSink>,
     ) -> Result<ApprovalRequestView> {
-        let (pending, resolution, directory_list, persisted) = {
+        let (pending, resolution, directory_list, selected, persisted) = {
             let (token, authority) = self
                 .pending_map
                 .lock()
@@ -781,7 +986,7 @@ impl PermissionCoordinator {
                 !generation.as_ref().is_some_and(|retired| **retired),
                 "provider approval generation is retired"
             );
-            let (pending, resolution, rule_list, directory_list) = {
+            let (pending, resolution, rule_list, directory_list, selected) = {
                 let mut pending_map = self
                     .pending_map
                     .lock()
@@ -818,6 +1023,7 @@ impl PermissionCoordinator {
                         answer.item_id
                     );
                 }
+                let mut selected = Vec::new();
                 let mut resolution = ApprovalResolution::AllowOnce;
                 let mut rule_map = BTreeMap::new();
                 let mut directory_list = Vec::new();
@@ -830,6 +1036,7 @@ impl PermissionCoordinator {
                         .iter()
                         .find(|choice| &choice.id == *choice_id)
                         .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+                    selected.push((item.id.clone(), choice.clone()));
                     if let Some(directory) = &choice.directory
                         && !directory_list.contains(directory)
                     {
@@ -885,7 +1092,7 @@ impl PermissionCoordinator {
                 if resolution != ApprovalResolution::AllowOnce {
                     directory_list.clear();
                 }
-                (pending, resolution, rule_list, directory_list)
+                (pending, resolution, rule_list, directory_list, selected)
             };
             let persisted = (|| -> Result<()> {
                 if !directory_list.is_empty() {
@@ -912,29 +1119,74 @@ impl PermissionCoordinator {
                 }
                 Ok(())
             })();
-            (pending, resolution, directory_list, persisted)
+            (pending, resolution, directory_list, selected, persisted)
         };
         let event_sink = pending.resolution_sink.as_ref().or(event_sink);
         if let Err(error) = persisted {
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
+            Self::emit_cancelled(
+                event_sink,
+                &pending,
+                ApprovalCancellationReason::PersistenceFailed(
+                    crate::provider::lifecycle_error::diagnostic(
+                        forge_provider_api::ProviderOperation::TurnStart,
+                        error.as_ref(),
+                    ),
+                ),
+            )
+            .await?;
             return Err(error);
         }
         // Queue the terminal event before the provider can resume and finish its turn.
         if !directory_list.is_empty()
             && let Some(sink) = event_sink
         {
-            sink.send_wait(ProviderEvent::DirectoryAccess {
-                scope: sink.invocation_scope()?.clone(),
-                grant: directory_list,
-            })
+            for grant in directory_list.iter().cloned() {
+                sink.send_host(HostEvent::DirectoryAccessGranted(DirectoryAccessGrant {
+                    request_id: pending.presentation.request_id.clone(),
+                    scope: pending.presentation.scope.clone(),
+                    grant,
+                    granted_at_ms: now_ms()?,
+                }))
+                .await?;
+            }
+        }
+        if resolution == ApprovalResolution::Cancel {
+            Self::emit_cancelled(
+                event_sink,
+                &pending,
+                ApprovalCancellationReason::UserCancelled,
+            )
             .await?;
+        } else {
+            Self::emit_resolution(event_sink, &pending, &selected, &directory_list, false).await?;
         }
-        Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
-        if pending.response.send(resolution).is_err() {
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
-            anyhow::bail!("provider no longer waits for approval {approval_id}");
-        }
+        // A committed decision stays committed even if the native requester disconnects.
+        pending
+            .response
+            .send(resolution)
+            .map_err(|_| anyhow::anyhow!("provider no longer waits for approval {approval_id}"))?;
         Ok(pending.view)
+    }
+
+    /// Project pending requests with their original host control owner and exact offered choices.
+    pub fn pending_presentations(&self) -> Result<Vec<ApprovalRequestPresentation>> {
+        self.pending_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?
+            .values()
+            .map(|pending| {
+                Ok(ApprovalRequestPresentation {
+                    request: pending.presentation.clone(),
+                    execution_kind: pending.execution_kind,
+                    execution_owner: pending
+                        .view
+                        .execution_owner
+                        .clone()
+                        .context("pending approval has no original owner")?,
+                    exchange_id: pending.view.exchange_id.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn pending_list(&self) -> Result<Vec<ApprovalRequestView>> {
@@ -947,7 +1199,7 @@ impl PermissionCoordinator {
             .collect())
     }
 
-    pub async fn cancel_all(&self, event_sink: Option<&ProviderEventSink>) -> Result<()> {
+    pub async fn cancel_all(&self, event_sink: Option<&HarnessEventSink>) -> Result<()> {
         self.feedback_by_owner
             .lock()
             .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
@@ -976,28 +1228,39 @@ impl PermissionCoordinator {
                 .into_values()
                 .collect::<Vec<_>>()
         };
-        Self::cancel_pending(pending_list, event_sink).await
+        Self::cancel_pending(
+            pending_list,
+            event_sink,
+            ApprovalCancellationReason::ThreadClosed,
+        )
+        .await
     }
 
     /// Cancel only approvals owned by the interrupted execution.
     pub async fn cancel_owner(
         &self,
-        owner: &crate::provider::ExecutionOwner,
-        event_sink: Option<&ProviderEventSink>,
+        owner: &crate::provider::ThreadOwner,
+        event_sink: Option<&HarnessEventSink>,
     ) -> Result<()> {
         let pending_list = self.take_owner_approvals(owner)?;
-        Self::cancel_pending(pending_list, event_sink).await
+        Self::cancel_pending(
+            pending_list,
+            event_sink,
+            ApprovalCancellationReason::TurnInterrupted,
+        )
+        .await
     }
 
     /// Publish cancellation on each request's own stream and release every waiter on failure.
     async fn cancel_pending(
         pending_list: Vec<PendingApproval>,
-        event_sink: Option<&ProviderEventSink>,
+        event_sink: Option<&HarnessEventSink>,
+        reason: ApprovalCancellationReason,
     ) -> Result<()> {
         let mut first_error = None;
         for pending in pending_list {
             let sink = pending.resolution_sink.as_ref().or(event_sink);
-            let result = Self::emit_lifecycle(sink, "approval_cancelled", &pending.view).await;
+            let result = Self::emit_cancelled(sink, &pending, reason.clone()).await;
             let _ = pending.response.send(ApprovalResolution::Cancel);
             if let Err(error) = result {
                 first_error.get_or_insert(error);
@@ -1012,7 +1275,7 @@ impl PermissionCoordinator {
     /// Begin cancellation synchronously after callback authority is checked.
     pub(crate) fn cancel_owner_immediate(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
     ) -> Result<()> {
         for pending in self.take_owner_approvals(owner)? {
             let _ = pending.response.send(ApprovalResolution::Cancel);
@@ -1022,7 +1285,7 @@ impl PermissionCoordinator {
 
     fn take_owner_approvals(
         &self,
-        owner: &crate::provider::ExecutionOwner,
+        owner: &crate::provider::ThreadOwner,
     ) -> Result<Vec<PendingApproval>> {
         self.take_timeout_feedback(owner)?;
         let pending_list = {
@@ -1043,23 +1306,133 @@ impl PermissionCoordinator {
         Ok(pending_list)
     }
 
-    async fn emit_lifecycle(
-        event_sink: Option<&ProviderEventSink>,
-        kind: &str,
-        view: &ApprovalRequestView,
+    /// Preserve automatic permission authority without inventing a pending user choice.
+    async fn emit_automatic(
+        sink: Option<&HarnessEventSink>,
+        address: Option<&crate::provider::TurnAddress>,
+        request: &PermissionRequest,
+        resolution: ApprovalResolution,
+        source: ApprovalDecisionSource,
+        execution_kind: ApprovalExecutionKind,
     ) -> Result<()> {
-        if let Some(event_sink) = event_sink {
-            let update = match kind {
-                "approval_resolved" => crate::provider::ApprovalUpdate::Resolved(view.clone()),
-                "approval_cancelled" => crate::provider::ApprovalUpdate::Cancelled(view.clone()),
-                _ => anyhow::bail!("unsupported approval lifecycle: {kind}"),
-            };
-            event_sink
-                .send_wait(ProviderEvent::Approval {
-                    scope: event_sink.invocation_scope()?.clone(),
-                    update,
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+        let scope = match address {
+            Some(address) => ApprovalScope::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+            },
+            None => ApprovalScope::Thread {
+                thread_id: sink.scope().owner().thread_id(),
+            },
+        };
+        let choice = ApprovalChoice {
+            id: "automatic".into(),
+            label: "Automatic permission decision".into(),
+            resolution,
+            rule_list: Vec::new(),
+            directory: None,
+        };
+        let targets = request
+            .target_list
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Ok(ResolvedPermissionTarget {
+                    target_id: ApprovalTargetId::new(index.to_string())?,
+                    decision: choice_decision(&choice)?,
+                    source,
+                    rules: Vec::new(),
+                    directory_grants: Vec::new(),
                 })
-                .await?;
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sink.send_host(HostEvent::PermissionApproval {
+            execution_kind,
+            event: PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
+                request_id: ApprovalRequestId::new(request.id.clone())?,
+                scope,
+                targets,
+                resolved_at_ms: now_ms()?,
+            }),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Publish committed per-target choices with their actual decision source.
+    async fn emit_resolution(
+        event_sink: Option<&HarnessEventSink>,
+        pending: &PendingApproval,
+        selected: &[(String, ApprovalChoice)],
+        committed_directory_grants: &[forge_provider_api::access::DirectoryGrant],
+        timed_out: bool,
+    ) -> Result<()> {
+        if let Some(sink) = event_sink {
+            let targets = if timed_out {
+                pending
+                    .presentation
+                    .targets
+                    .iter()
+                    .map(|target| ResolvedPermissionTarget {
+                        target_id: target.target_id.clone(),
+                        decision: super::host_event::PermissionDecision::TimedOut,
+                        source: ApprovalDecisionSource::Timeout,
+                        rules: Vec::new(),
+                        directory_grants: Vec::new(),
+                    })
+                    .collect()
+            } else {
+                selected
+                    .iter()
+                    .map(|(id, choice)| {
+                        Ok(ResolvedPermissionTarget {
+                            target_id: ApprovalTargetId::new(id.clone())?,
+                            decision: choice_decision(choice)?,
+                            source: ApprovalDecisionSource::User,
+                            rules: choice_rules(choice)?,
+                            directory_grants: choice
+                                .directory
+                                .iter()
+                                .filter(|grant| committed_directory_grants.contains(grant))
+                                .cloned()
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            sink.send_host(HostEvent::PermissionApproval {
+                execution_kind: pending.execution_kind,
+                event: PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
+                    request_id: pending.presentation.request_id.clone(),
+                    scope: pending.presentation.scope.clone(),
+                    targets,
+                    resolved_at_ms: now_ms()?,
+                }),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// End a request without fabricating a user denial.
+    async fn emit_cancelled(
+        event_sink: Option<&HarnessEventSink>,
+        pending: &PendingApproval,
+        reason: ApprovalCancellationReason,
+    ) -> Result<()> {
+        if let Some(sink) = event_sink {
+            sink.send_host(HostEvent::PermissionApproval {
+                execution_kind: pending.execution_kind,
+                event: PermissionApprovalEvent::Cancelled(PermissionApprovalCancellation {
+                    request_id: pending.presentation.request_id.clone(),
+                    scope: pending.presentation.scope.clone(),
+                    reason,
+                    cancelled_at_ms: now_ms()?,
+                }),
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1331,20 +1704,150 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
     })
 }
 
-pub use forge_provider_api::approval::{
+pub use super::approval_view::{
     ApprovalAnswer, ApprovalChoice, ApprovalCommand, ApprovalItem, ApprovalRequestView,
     ApprovalResolution,
 };
 
+/// Capture the immutable permission owner and independently identified target choices.
+fn permission_request(
+    view: &ApprovalRequestView,
+    targets: Vec<PermissionTarget>,
+    address: Option<&crate::provider::TurnAddress>,
+    sink: Option<&HarnessEventSink>,
+) -> Result<PermissionApprovalRequest> {
+    let scope = match address {
+        Some(address) => ApprovalScope::Turn {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+        },
+        None => ApprovalScope::Thread {
+            thread_id: view
+                .execution_owner
+                .as_ref()
+                .or_else(|| sink.map(|sink| sink.scope().owner()))
+                .context("approval has no original owner")?
+                .thread_id(),
+        },
+    };
+    anyhow::ensure!(
+        targets.len() == view.item_list.len(),
+        "approval targets do not match presentation items"
+    );
+    let targets = view
+        .item_list
+        .iter()
+        .zip(targets)
+        .map(|(item, target)| {
+            let choices = item
+                .choice_list
+                .iter()
+                .filter(|choice| choice.resolution != ApprovalResolution::Cancel)
+                .map(|choice| {
+                    Ok(PermissionApprovalChoice::new(
+                        choice.id.clone(),
+                        choice.label.clone(),
+                        choice_decision(choice)?,
+                        choice_rules(choice)?,
+                        choice.directory.iter().cloned().collect(),
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PermissionApprovalTarget {
+                target_id: ApprovalTargetId::new(item.id.clone())?,
+                target,
+                title: item.title.clone(),
+                detail: item.detail.clone(),
+                commands: item.command_list.clone(),
+                choices,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PermissionApprovalRequest {
+        request_id: ApprovalRequestId::new(view.id.clone())?,
+        scope,
+        reason: view
+            .reason
+            .as_ref()
+            .map(|reason| SanitizedMessage::new(reason.clone()))
+            .transpose()?,
+        targets,
+        deadline: view.deadline.clone(),
+    })
+}
+
+/// Translate callback dispositions without conflating timeout or cancellation.
+fn choice_decision(choice: &ApprovalChoice) -> Result<super::host_event::PermissionDecision> {
+    use super::host_event::PermissionDecision as Decision;
+    let scope = match choice.resolution {
+        ApprovalResolution::AllowOnce if choice.directory.is_some() => {
+            PermissionRuleScope::BroadRule
+        }
+        ApprovalResolution::AllowOnce
+        | ApprovalResolution::DenyOnce
+        | ApprovalResolution::DenyPolicy
+        | ApprovalResolution::DenyMode => PermissionRuleScope::Once,
+        ApprovalResolution::AllowExact | ApprovalResolution::DenyExact => {
+            PermissionRuleScope::ExactRule
+        }
+        ApprovalResolution::AllowBroad | ApprovalResolution::DenyBroad => {
+            PermissionRuleScope::BroadRule
+        }
+        ApprovalResolution::TimedOut => return Ok(Decision::TimedOut),
+        ApprovalResolution::Cancel => anyhow::bail!("cancellation is not a permission decision"),
+    };
+    Ok(match choice.resolution {
+        ApprovalResolution::AllowOnce
+        | ApprovalResolution::AllowExact
+        | ApprovalResolution::AllowBroad => Decision::Allow { scope },
+        ApprovalResolution::DenyOnce
+        | ApprovalResolution::DenyExact
+        | ApprovalResolution::DenyBroad
+        | ApprovalResolution::DenyPolicy
+        | ApprovalResolution::DenyMode => Decision::Deny {
+            scope,
+            reason: SanitizedMessage::new("Permission denied").expect("static denial is nonempty"),
+        },
+        ApprovalResolution::TimedOut | ApprovalResolution::Cancel => {
+            unreachable!("terminal dispositions returned before scope selection")
+        }
+    })
+}
+
+/// Preserve the established category and exact displayed saved pattern.
+fn choice_rules(choice: &ApprovalChoice) -> Result<Vec<ApprovalRulePattern>> {
+    choice
+        .rule_list
+        .iter()
+        .map(|(category, pattern)| {
+            Ok(ApprovalRulePattern {
+                category: ApprovalRuleCategory::from_saved_category(category)
+                    .context("unsupported permission rule category")?,
+                pattern: pattern.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Read a checked wall-clock timestamp for committed host notifications.
+fn now_ms() -> Result<i64> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
+}
+
 #[cfg(test)]
 mod test {
-    use crate::provider::{ApprovalUpdate, ExecutionOwner, InvocationScope, TurnAddress};
+    use crate::provider::session_execution::OwnerObservation;
+    use crate::provider::{HarnessEvent, InvocationScope, ThreadOwner, TurnAddress};
     use forge_provider_api::permissions::{PermissionRequest, PermissionTarget};
     use forge_shell::shell::CommandShell;
 
     fn scope() -> InvocationScope {
         InvocationScope {
-            owner: ExecutionOwner::root("approval"),
+            owner: ThreadOwner::root("approval"),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
@@ -1359,16 +1862,86 @@ mod test {
         }
     }
 
-    fn approval(event: ProviderEvent) -> ApprovalRequestView {
-        let ProviderEvent::Approval {
+    fn approval(event: OwnerObservation) -> ApprovalRequestView {
+        let OwnerObservation::Event(HarnessEvent::Host {
             scope,
-            update: ApprovalUpdate::Requested(view),
-        } = event
+            event:
+                HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Requested(request),
+                },
+        }) = event
         else {
             panic!("expected requested approval");
         };
-        assert_eq!(view.execution_owner.as_ref(), Some(&scope.owner));
-        view
+        let item_list = request
+            .targets
+            .iter()
+            .map(|target| ApprovalItem {
+                id: target.target_id.as_str().to_owned(),
+                title: target.title.clone(),
+                detail: target.detail.clone(),
+                command_list: target.commands.clone(),
+                choice_list: target
+                    .choices
+                    .iter()
+                    .map(|choice| ApprovalChoice {
+                        id: choice.choice_id().to_owned(),
+                        label: choice.label().to_owned(),
+                        resolution: match choice.decision() {
+                            super::super::PermissionDecision::Allow {
+                                scope: PermissionRuleScope::Once,
+                            } => ApprovalResolution::AllowOnce,
+                            super::super::PermissionDecision::Allow {
+                                scope: PermissionRuleScope::ExactRule,
+                            } => ApprovalResolution::AllowExact,
+                            super::super::PermissionDecision::Allow {
+                                scope: PermissionRuleScope::BroadRule,
+                            } => ApprovalResolution::AllowBroad,
+                            super::super::PermissionDecision::Deny {
+                                scope: PermissionRuleScope::Once,
+                                ..
+                            } => ApprovalResolution::DenyOnce,
+                            super::super::PermissionDecision::Deny {
+                                scope: PermissionRuleScope::ExactRule,
+                                ..
+                            } => ApprovalResolution::DenyExact,
+                            super::super::PermissionDecision::Deny {
+                                scope: PermissionRuleScope::BroadRule,
+                                ..
+                            } => ApprovalResolution::DenyBroad,
+                            super::super::PermissionDecision::TimedOut => {
+                                panic!("timeout was offered as a choice")
+                            }
+                        },
+                        rule_list: choice
+                            .rules()
+                            .iter()
+                            .map(|rule| {
+                                (
+                                    rule.category.saved_category().to_owned(),
+                                    rule.pattern.clone(),
+                                )
+                            })
+                            .collect(),
+                        directory: choice.directory_grants().first().cloned(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        ApprovalRequestView {
+            id: request.request_id.as_str().to_owned(),
+            execution_owner: Some(scope.owner().clone()),
+            exchange_id: scope
+                .invocation()
+                .map(|scope| scope.exchange_id.to_string()),
+            turn_id: None,
+            provider: None,
+            reason: request.reason.map(|reason| reason.to_string()),
+            item_list,
+            deadline: request.deadline,
+            resolution_source: ResolutionSource::User,
+        }
     }
 
     #[tokio::test]
@@ -1484,6 +2057,7 @@ mod test {
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -1492,8 +2066,8 @@ mod test {
                 owner: request.owner()?,
                 ..scope()
             },
-            thread_id: "native".into(),
-            turn_id: "turn".into(),
+            thread_id: forge_provider_api::ThreadId::new("native").unwrap(),
+            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
         });
         let directories = coordinator.directories(
             Some(&settings_root),
@@ -1638,14 +2212,24 @@ mod test {
         assert_eq!(global.readable_directory.len(), 1);
         assert_eq!(global.writable_directory.len(), 1);
         assert_eq!(waiter.await??, ApprovalResolution::AllowOnce);
-        let first = stream.recv().await.unwrap().unwrap();
-        assert!(matches!(first, ProviderEvent::DirectoryAccess { grant, .. } if !grant.is_empty()));
+        for _ in 0..2 {
+            assert!(matches!(
+                stream.recv().await.unwrap().unwrap(),
+                OwnerObservation::Event(HarnessEvent::Host {
+                    event: HostEvent::DirectoryAccessGranted(_),
+                    ..
+                })
+            ));
+        }
         assert!(matches!(
             stream.recv().await.unwrap().unwrap(),
-            ProviderEvent::Approval {
-                update: ApprovalUpdate::Resolved(_),
+            OwnerObservation::Event(HarnessEvent::Host {
+                event: HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Resolved(_)
+                },
                 ..
-            }
+            })
         ));
         assert_eq!(
             coordinator
@@ -1779,8 +2363,8 @@ mod test {
                 owner: request.owner()?,
                 ..scope()
             },
-            thread_id: "native".into(),
-            turn_id: "turn".into(),
+            thread_id: forge_provider_api::ThreadId::new("native").unwrap(),
+            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
         });
         let (sink, mut stream) =
             crate::provider::events::channel(address.as_ref().unwrap().scope.clone());
@@ -1792,7 +2376,7 @@ mod test {
         let event = stream.recv().await.unwrap().unwrap();
         assert!(matches!(
             event,
-            ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Authorization && diagnostic.message.as_str() == "Permission evaluation failed"
+            OwnerObservation::Event(HarnessEvent::Host { event: HostEvent::Failure { failure, message }, .. }) if failure.kind() == forge_provider_api::ProviderFailureKind::Authorization && message.as_str().starts_with("Permission evaluation failed: ") && message.as_str().contains("empty")
         ));
         Ok(())
     }
@@ -1823,6 +2407,7 @@ mod test {
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -1883,6 +2468,7 @@ mod test {
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -1891,8 +2477,8 @@ mod test {
                 owner: request.owner()?,
                 ..scope()
             },
-            thread_id: "provider".into(),
-            turn_id: "turn".into(),
+            thread_id: forge_provider_api::ThreadId::new("provider").unwrap(),
+            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
         });
         let skills = coordinator.skills(
             Some(directory.path()),
@@ -2116,8 +2702,8 @@ mod test {
                 let event = stream.try_recv().unwrap();
                 assert!(matches!(
                     event,
-                    ProviderEvent::Diagnostic { diagnostic, .. }
-                        if diagnostic.message.as_str().contains("shell_command_parse_error")
+                    OwnerObservation::Event(HarnessEvent::Host { event: HostEvent::Failure { failure, .. }, .. })
+                        if failure.kind() == forge_provider_api::ProviderFailureKind::Authorization
                 ));
                 assert!(stream.try_recv().is_err());
             }
@@ -2137,11 +2723,23 @@ mod test {
                     .unwrap(),
                 ApprovalResolution::AllowOnce
             );
+            assert!(matches!(
+                stream.try_recv().unwrap(),
+                OwnerObservation::Event(HarnessEvent::Host {
+                    event: HostEvent::PermissionApproval {
+                        event: PermissionApprovalEvent::Resolved(_),
+                        ..
+                    },
+                    ..
+                })
+            ));
         }
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
-    #[tokio::test]
+    /// The paused clock auto-advances to the original one-second deadline, while the virtual
+    /// three-second guard fails the test if reconfiguration had extended that deadline.
+    #[tokio::test(start_paused = true)]
     async fn input_timeout_rejects_once_without_rules_and_preserves_other_owners() {
         use super::*;
         let directory = tempfile::tempdir().unwrap();
@@ -2151,12 +2749,12 @@ mod test {
         ));
         let before = std::fs::read(directory.path().join("permissions.json")).unwrap();
         let coordinator = Arc::new(PermissionCoordinator::new(store));
-        let expired_owner = crate::provider::ExecutionOwner::root("expired");
+        let expired_owner = crate::provider::ThreadOwner::root("expired");
         let mut expired_feedback = coordinator
             .subscribe_timeout_feedback(&expired_owner)
             .unwrap();
         let waiting_feedback = coordinator
-            .subscribe_timeout_feedback(&crate::provider::ExecutionOwner::root("waiting"))
+            .subscribe_timeout_feedback(&crate::provider::ThreadOwner::root("waiting"))
             .unwrap();
         coordinator
             .configure_timeout(
@@ -2179,7 +2777,7 @@ mod test {
         let mut tasks = Vec::new();
         let mut streams = Vec::new();
         for session in ["expired", "waiting"] {
-            let owner = crate::provider::ExecutionOwner::root(session);
+            let owner = crate::provider::ThreadOwner::root(session);
             let coordinator = coordinator.clone();
             let (sink, stream) =
                 crate::provider::events::channel(InvocationScope { owner, ..scope() });
@@ -2199,8 +2797,8 @@ mod test {
                         },
                         Some(TurnAddress {
                             scope: sink.invocation_scope().unwrap().clone(),
-                            thread_id: session.into(),
-                            turn_id: "turn".into(),
+                            thread_id: forge_provider_api::ThreadId::new(session).unwrap(),
+                            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
                         }),
                         Some(&sink),
                     )
@@ -2215,7 +2813,7 @@ mod test {
         let original = pending
             .iter()
             .find(|view| {
-                view.execution_owner.as_ref().unwrap().session_id
+                *view.execution_owner.as_ref().unwrap().session_id()
                     == forge_provider_api::SessionId::from("expired")
             })
             .unwrap();
@@ -2249,10 +2847,7 @@ mod test {
             .unwrap();
         assert!(matches!(
             expired,
-            ProviderEvent::Approval {
-                update: ApprovalUpdate::Resolved(view),
-                ..
-            } if view.resolution_source == ResolutionSource::Timeout
+            OwnerObservation::Event(HarnessEvent::Host { event: HostEvent::PermissionApproval { execution_kind: _, event: PermissionApprovalEvent::Resolved(view) }, .. }) if view.targets.iter().all(|target| matches!(target.source, ApprovalDecisionSource::Timeout))
         ));
         assert!(expired_feedback.has_changed().unwrap());
         assert!(*expired_feedback.borrow_and_update());
@@ -2263,12 +2858,12 @@ mod test {
         assert!(pending[0].deadline.is_none());
         assert!(
             coordinator
-                .has_timeout_feedback(&crate::provider::ExecutionOwner::root("expired"))
+                .has_timeout_feedback(&crate::provider::ThreadOwner::root("expired"))
                 .unwrap()
         );
         assert!(
             !coordinator
-                .has_timeout_feedback(&crate::provider::ExecutionOwner::root("waiting"))
+                .has_timeout_feedback(&crate::provider::ThreadOwner::root("waiting"))
                 .unwrap()
         );
         assert_eq!(
@@ -2276,7 +2871,7 @@ mod test {
             before
         );
         coordinator
-            .cancel_owner(&crate::provider::ExecutionOwner::root("waiting"), None)
+            .cancel_owner(&crate::provider::ThreadOwner::root("waiting"), None)
             .await
             .unwrap();
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::Cancel);
@@ -2337,10 +2932,11 @@ mod test {
         let mut channels = Vec::new();
         for agent_id in ["first", "second"] {
             let coordinator = coordinator.clone();
-            let owner = crate::provider::ExecutionOwner {
-                session_id: "root".into(),
-                agent_id: agent_id.into(),
-            };
+            let owner = crate::provider::ThreadOwner::new(
+                "root".into(),
+                forge_provider_api::AgentId::new(agent_id).unwrap(),
+            )
+            .expect("registered session and agent identities are nonempty");
             let (sink, mut stream) =
                 crate::provider::events::channel(InvocationScope { owner, ..scope() });
             let waiting_sink = sink.clone();
@@ -2359,8 +2955,8 @@ mod test {
                         },
                         Some(TurnAddress {
                             scope: waiting_sink.invocation_scope().unwrap().clone(),
-                            thread_id: "thread".into(),
-                            turn_id: "turn".into(),
+                            thread_id: forge_provider_api::ThreadId::new("thread").unwrap(),
+                            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
                         }),
                         Some(&waiting_sink),
                     )
@@ -2373,35 +2969,40 @@ mod test {
         assert_eq!(coordinator.pending_list().unwrap().len(), 2);
         coordinator
             .cancel_owner(
-                &crate::provider::ExecutionOwner {
-                    session_id: "root".into(),
-                    agent_id: "first".into(),
-                },
+                &crate::provider::ThreadOwner::new(
+                    "root".into(),
+                    forge_provider_api::AgentId::new("first").unwrap(),
+                )
+                .expect("registered session and agent identities are nonempty"),
                 None,
             )
             .await
             .unwrap();
         assert!(matches!(
             channels[0].1.recv().await.unwrap().unwrap(),
-            ProviderEvent::Approval {
-                update: ApprovalUpdate::Cancelled(_),
+            OwnerObservation::Event(HarnessEvent::Host {
+                event: HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Cancelled(_)
+                },
                 ..
-            }
+            })
         ));
         assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(!waiter[0].is_finished());
         let pending = coordinator.pending_list().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            pending[0].execution_owner.as_ref().unwrap().agent_id,
-            forge_provider_api::AgentId::from("second")
+            *pending[0].execution_owner.as_ref().unwrap().agent_id(),
+            forge_provider_api::AgentId::new("second").unwrap()
         );
         coordinator
             .cancel_owner(
-                &crate::provider::ExecutionOwner {
-                    session_id: "root".into(),
-                    agent_id: "second".into(),
-                },
+                &crate::provider::ThreadOwner::new(
+                    "root".into(),
+                    forge_provider_api::AgentId::new("second").unwrap(),
+                )
+                .expect("registered session and agent identities are nonempty"),
                 None,
             )
             .await
@@ -2409,10 +3010,13 @@ mod test {
         assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(matches!(
             channels[1].1.recv().await.unwrap().unwrap(),
-            ProviderEvent::Approval {
-                update: ApprovalUpdate::Cancelled(_),
+            OwnerObservation::Event(HarnessEvent::Host {
+                event: HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Cancelled(_)
+                },
                 ..
-            }
+            })
         ));
     }
 
@@ -2657,9 +3261,14 @@ mod test {
     }
 
     #[tokio::test]
-    async fn allow_callback_does_not_publish_or_persist_an_approval() -> Result<()> {
+    async fn approval_mode_resolution_preserves_source_without_persisting_policy() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let coordinator = PermissionCoordinator::transient(directory.path())?;
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            CATEGORY_EDIT.into(),
+            ".".into(),
+            PermissionDecision::Ask,
+        )])?;
         let before = coordinator.store.read().unwrap().open().1;
         let (sink, mut stream) = crate::provider::events::channel(scope());
         let resolution = coordinator
@@ -2679,10 +3288,25 @@ mod test {
             .await?;
         assert_eq!(resolution, ApprovalResolution::AllowOnce);
         assert!(coordinator.pending_list()?.is_empty());
+        let OwnerObservation::Event(HarnessEvent::Host {
+            event:
+                HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Resolved(resolution),
+                },
+            ..
+        }) = stream
+            .recv()
+            .await?
+            .context("automatic resolution missing")?
+        else {
+            panic!("automatic permission did not report a committed resolution")
+        };
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), stream.recv())
-                .await
-                .is_err()
+            resolution
+                .targets
+                .iter()
+                .all(|target| matches!(target.source, ApprovalDecisionSource::ApprovalMode))
         );
         assert_eq!(coordinator.store.read().unwrap().open().1, before);
         Ok(())
@@ -2766,22 +3390,15 @@ mod test {
         });
         let event = event_stream.recv().await.unwrap().unwrap();
         let view = approval(event);
-        let owned = coordinator
-            .bind_owner(&view.id, "child-exchange", Some("child-turn"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
-        let snapshot = coordinator.pending_list().unwrap();
-        assert_eq!(snapshot[0].exchange_id, owned.exchange_id);
+        let owned = coordinator.pending_list().unwrap().remove(0);
         assert_eq!(
-            snapshot[0].turn_id,
-            Some(forge_provider_api::ProviderTurnId::from("child-turn"))
+            owned.exchange_id.as_deref(),
+            Some(scope().exchange_id.as_str())
         );
-        assert!(
-            coordinator
-                .bind_owner(&view.id, "other-exchange", Some("other-turn"))
-                .is_err()
-        );
+        assert!(owned.turn_id.is_none());
+        let snapshot = coordinator.pending_presentations().unwrap();
+        assert_eq!(snapshot[0].execution_owner, scope().owner);
+        assert_eq!(snapshot[0].request.request_id.as_str(), view.id);
         coordinator
             .resolve(
                 &view.id,
@@ -2799,15 +3416,22 @@ mod test {
             .expect("manual resolution must reach the requesting execution")
             .unwrap()
             .unwrap();
-        let ProviderEvent::Approval {
-            update: ApprovalUpdate::Resolved(resolved_view),
+        let OwnerObservation::Event(HarnessEvent::Host {
+            event:
+                HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Resolved(resolved_view),
+                },
             ..
-        } = resolved
+        }) = resolved
         else {
             panic!("expected resolved approval");
         };
-        assert_eq!(resolved_view.exchange_id, owned.exchange_id);
-        assert_eq!(resolved_view.turn_id, owned.turn_id);
+        assert!(matches!(
+            resolved_view.scope,
+            ApprovalScope::Thread { .. } | ApprovalScope::Turn { .. }
+        ));
+        assert_eq!(resolved_view.targets.len(), owned.item_list.len());
         let source = store.read().unwrap().open().1;
         assert!(source.contains("\"rg *\": \"allow\""));
     }
@@ -2889,10 +3513,13 @@ mod test {
         coordinator.cancel_all(None).await.unwrap();
         assert!(matches!(
             event_stream.recv().await.unwrap().unwrap(),
-            ProviderEvent::Approval {
-                update: ApprovalUpdate::Cancelled(_),
+            OwnerObservation::Event(HarnessEvent::Host {
+                event: HostEvent::PermissionApproval {
+                    execution_kind: _,
+                    event: PermissionApprovalEvent::Cancelled(_)
+                },
                 ..
-            }
+            })
         ));
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::Cancel);
         assert!(coordinator.pending_list().unwrap().is_empty());

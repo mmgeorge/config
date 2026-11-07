@@ -327,7 +327,7 @@ The two session identities have different roles:
 | Result `deleted` | Session ID string | The deleted local session. |
 | Result `provider_session_preserved` | Boolean, `true` on success | The provider's own conversation remains available. |
 
-Deletion closes an idle cached controller, releases its lease, and removes the local session and plan files. Active execution, control work, queued input, agents, or checks reject deletion. An unknown target or a conflicting lease also fails. No provider request or request-specific progress event occurs. The caller must discard a late response after its picker closes. After a lost connection, refresh the session list before deciding whether to retry because this method has no operation receipt.
+Deletion closes an idle cached controller, releases its lease, and removes the local session and plan files. Active execution, control work, queued input, agents, or checks reject deletion. An unknown target or a conflicting lease also fails. No provider request or request-specific progress event occurs. A deleted session's open views fail document reads with `session_not_found`, which the presentation treats as terminal: it stops retrying, clears the retry notice, and reports that the session no longer exists. The caller still closes those views: on success `session_picker.lua` calls `session_navigation.session_deleted`, even after its picker closes, and discards only the late list refresh. After a lost connection, refresh the session list before deciding whether to retry because this method has no operation receipt.
 
 For an existing caller `caller` and a distinct idle target `saved`, the complete wire exchange is:
 
@@ -339,7 +339,7 @@ For an existing caller `caller` and a distinct idle target `saved`, the complete
 {"id":42,"result":{"deleted":"saved","provider_session_preserved":true}}
 ```
 
-The [picker regression](../../../tests/forge/session_picker.lua) checks both identities, and the [built-host regression](../../../tests/forge/harness_host.lua) deletes an idle cached session while another session is running and rejects deletion of the caller itself.
+The [picker regression](../../../tests/forge/session_picker.lua) checks both identities, the [tab regression](../../../tests/forge/harness_session_picker_tabs.lua) checks that deletion closes another tab's view of the target, and the [built-host regression](../../../tests/forge/harness_host.lua) deletes an idle cached session while another session is running and rejects deletion of the caller itself.
 
 ## `session.document`
 
@@ -513,7 +513,7 @@ Apply Clear to the session task slot through the retained goal alias.
 
 ### Contract
 
-No action-specific fields. Supply optional `operation_id` for reliable recovery. This is the `action = "clear"` form of [session.command.apply](#sessioncommandapply), returning its transition receipt. It clears the selected live task through the task owner without deleting historical exchanges. It inherits canonical persistence, validation, and replay semantics and emits no request-progress stream.
+No action-specific fields. Supply optional `operation_id` for reliable recovery. This is the `action = "clear"` form of [session.command.apply](#sessioncommandapply), returning its transition receipt. It clears the selected live task through the task owner without deleting historical exchanges. Running work is collected like other task controls, and Clear closes the exchange that collection parked because no later admission will. It inherits canonical persistence, validation, and replay semantics and emits no request-progress stream.
 
 ## `session.goal.pause`
 
@@ -561,7 +561,7 @@ Install a Goal task through the shared command boundary.
 
 ### Contract
 
-Requires nonblank `text` (string); `objective` is accepted when text is absent. Optional `operation_id` is a stable mutation identity, and optional `display_text` controls presentation. This is the `action = "goal"` form of [session.command.apply](#sessioncommandapply) and inherits its receipt, persistence, event ordering, and recovery contract. It selects the session-level task and queues its start prompt. During active work it promotes the task without cancelling the provider turn. When idle it begins a new exchange through input delivery. It emits no request-progress stream.
+Requires nonblank `text` (string); `objective` is accepted when text is absent. Optional `operation_id` is a stable mutation identity, and optional `display_text` controls presentation. This is the `action = "goal"` form of [session.command.apply](#sessioncommandapply) and inherits its receipt, persistence, event ordering, and recovery contract. It selects the session-level task and queues its start prompt. During active work the owning command first collects that work, so the running provider turn ends as interrupted before the task commits, and the start prompt then begins a new exchange. When idle it begins a new exchange through input delivery. It emits no request-progress stream.
 
 ## `session.health.get`
 
@@ -1060,7 +1060,7 @@ No parameter fields. Returns an array of [McpDefinition](runtime-schemas.md#mcpd
 Control a test provider's response barrier.
 
 - **Context:** Explicit existing session/provider.
-- **Input:** A mock-response command such as hold, wait, release, or cancel, with its matching identity.
+- **Input:** A mock-response command such as hold, wait, release, cancel, script, or expire_approval, with its matching identity.
 - **Result and effects:** Returns the command-specific mock-control result.
 - **Boundary:** Only the mock provider supports this test interface.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service.rs).
@@ -1069,7 +1069,7 @@ Control a test provider's response barrier.
 
 ### Contract
 
-A live integration-control endpoint available only for the mock provider. `operation: "hold"` accepts optional prompt `mode` and `any_session` (false by default), then returns a new hold `id`. `wait` requires that ID and waits until a matching provider prompt arrives, returning `id`, provider `session_id`, `mode`, and full `prompt`. `release` requires an arrived hold; `cancel` can discard an armed or arrived hold. Both return `id`, `released`, and `cancelled`. IDs belong to the selected session even when matching allows any provider session. Unknown, released, cancelled, or unarrived holds fail according to the operation. These barriers affect test provider responses, not production providers.
+A live integration-control endpoint available only for the mock provider. `operation: "hold"` accepts optional prompt `mode` and `any_session` (false by default), then returns a new hold `id`. `wait` requires that ID and waits until a matching provider prompt arrives, returning `id`, provider `session_id`, `mode`, and full `prompt`. `release` requires an arrived hold; `cancel` can discard an armed or arrived hold. Both return `id`, `released`, and `cancelled`. IDs belong to the selected session even when matching allows any provider session. Unknown, released, cancelled, or unarrived holds fail according to the operation. These barriers affect test provider responses, not production providers. `expire_approval` takes no other field: the session's permission coordinator fires every timed approval the root session awaits through the same path its elapsed deadline takes, recording a `Timeout` resolution and retaining continuation feedback, and returns the triggered count as `expired`. It fails when no timed approval is pending, and it leaves approvals without a deadline untouched.
 
 ## `session.provider.model.list`
 

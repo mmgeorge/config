@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use harness::provider::session_execution::OwnerObservation;
 use harness::provider::{
-    ExecutionOwner, InvocationScope, ProviderCompletion, ProviderError, ProviderEvent,
-    ProviderEventSink, ProviderOutput, ProviderRequest,
+    HarnessEvent, HarnessEventSink, InvocationScope, ProviderCompletion, ProviderError,
+    ProviderOutput, ProviderRequest, ThreadOwner,
 };
 use tokio::sync::Mutex;
 
@@ -16,7 +17,7 @@ use tokio::sync::Mutex;
 pub struct ProviderTestSession {
     provider: Arc<harness::provider::Provider>,
     registry: Arc<harness::provider::session_execution::SessionExecutionRegistry>,
-    owners: Arc<Mutex<HashMap<ExecutionOwner, Arc<TestOwner>>>>,
+    owners: Arc<Mutex<HashMap<ThreadOwner, Arc<TestOwner>>>>,
     store: Arc<harness::provider::submission::SubmissionStore>,
     _directory: Arc<tempfile::TempDir>,
 }
@@ -29,7 +30,7 @@ struct TestOwner {
 
 #[derive(Default)]
 struct IdleObservations {
-    events: Vec<ProviderEvent>,
+    events: Vec<HarnessEvent>,
     failure: Option<forge_provider_api::lifecycle::ObservationFailure>,
 }
 
@@ -104,7 +105,7 @@ impl ProviderTestSession {
     /// Observe only work submitted through this fixture's registry; controllers retain their own registry.
     pub(crate) fn active_invocation_scope(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
     ) -> Result<Option<InvocationScope>, ProviderError> {
         match self.registry.existing_owner(owner)? {
             Some(engine) => engine.active_invocation_scope(),
@@ -123,18 +124,18 @@ impl ProviderTestSession {
     }
 
     /// Install session observation before native initialization can emit updates.
-    pub async fn session_open(
+    pub async fn thread_open(
         &self,
         request: ProviderRequest,
     ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
         self.owner(request.owner()?).await?;
-        Ok(self.provider.session_open(request).await?)
+        Ok(self.provider.thread_open(request).await?)
     }
 
     /// Steer through the same owner and reducer used for complete-result collection.
     pub async fn steer_current(
         &self,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         input: harness::provider::SteeringInput,
     ) -> Result<(), ProviderError> {
         self.owner(owner).await?.engine.steer_current(input).await
@@ -144,7 +145,7 @@ impl ProviderTestSession {
     pub async fn session_prompt_with_retry(
         &self,
         request: ProviderRequest,
-        sink: Option<ProviderEventSink>,
+        sink: Option<HarnessEventSink>,
         trace: &harness::trace::TraceStore,
         store: &Arc<harness::provider::submission::SubmissionStore>,
     ) -> Result<ProviderOutput, ProviderError> {
@@ -156,7 +157,7 @@ impl ProviderTestSession {
         if scope.owner != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ),
             ));
@@ -174,7 +175,7 @@ impl ProviderTestSession {
                 .await
                 .map_err(|error| {
                     harness::provider::lifecycle_error::classify(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         error,
                     )
                 })
@@ -184,13 +185,10 @@ impl ProviderTestSession {
         // The retry owner admits fresh invocations in this exchange. Preserve each exact
         // scope when mirroring host output; a native sink never acquires broader authority.
         let relay_sink =
-            |event: &ProviderEvent| -> Result<Option<ProviderEventSink>, ProviderError> {
+            |event: &OwnerObservation| -> Result<Option<HarnessEventSink>, ProviderError> {
                 let Some(sink) = &sink else {
                     return Ok(None);
                 };
-                if matches!(event, ProviderEvent::Execution { .. }) {
-                    return Ok(None);
-                }
                 let event_scope = event.scope();
                 if &event_scope == sink.scope() {
                     return Ok(Some(sink.clone()));
@@ -205,25 +203,25 @@ impl ProviderTestSession {
                 result = &mut completion => {
                     while let Ok(event) = stream.try_recv() {
                         if let Some(sink) = relay_sink(&event)? {
-                            sink.send_wait(event.clone()).await?;
+                            sink.send_observation(event.clone()).await?;
                         }
-                        observed.push(event);
+                        if let OwnerObservation::Event(event) = event { observed.push(event); }
                     }
                     return Ok(ProviderOutput { event: observed, completion: result? });
                 }
                 event = stream.recv(), if stream_open => {
                     let Some(event) = event? else { stream_open = false; continue; };
                     if let Some(sink) = relay_sink(&event)? {
-                        sink.send_wait(event.clone()).await?;
+                        sink.send_observation(event.clone()).await?;
                     }
-                    observed.push(event);
+                    if let OwnerObservation::Event(event) = event { observed.push(event); }
                 }
             }
         }
     }
 
     /// Replace a failed owner through the production recovery path before another test request.
-    pub async fn recover(&self, owner: ExecutionOwner) -> anyhow::Result<()> {
+    pub async fn recover(&self, owner: ThreadOwner) -> anyhow::Result<()> {
         self.registry.owner(owner.clone()).await?.close().await?;
         let inbox = self.registry.observer(owner.clone())?;
         // This fixture replaces inbox delivery with its separately joined stream.
@@ -269,7 +267,7 @@ impl ProviderTestSession {
     }
 
     /// Keep the engine and its idle observer alive independently of result waiters.
-    async fn owner(&self, owner: ExecutionOwner) -> Result<Arc<TestOwner>, ProviderError> {
+    async fn owner(&self, owner: ThreadOwner) -> Result<Arc<TestOwner>, ProviderError> {
         let mut owners = self.owners.lock().await;
         if let Some(existing) = owners.get(&owner) {
             if let Some(failure) = existing.idle.lock().await.failure.clone() {
@@ -302,7 +300,9 @@ impl ProviderTestSession {
                     }
                 };
                 let mut idle = retained.lock().await;
-                idle.events.push(event);
+                if let OwnerObservation::Event(event) = event {
+                    idle.events.push(event);
+                }
             }
         });
         let execution = Arc::new(TestOwner {
@@ -318,7 +318,7 @@ impl ProviderTestSession {
     async fn execute(
         &self,
         request: ProviderRequest,
-        sink: Option<ProviderEventSink>,
+        sink: Option<HarnessEventSink>,
     ) -> Result<ProviderOutput, ProviderError> {
         let owner = request.owner()?;
         let scope = match &sink {
@@ -328,7 +328,7 @@ impl ProviderTestSession {
         if scope.owner != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ),
             ));
@@ -356,10 +356,10 @@ impl ProviderTestSession {
             tokio::select! {
                 result = &mut completion => {
                     while let Ok(event) = stream.try_recv() {
-                        if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
-                            sink.send_wait(event.clone()).await?;
+                        if let Some(sink) = &sink {
+                            sink.send_observation(event.clone()).await?;
                         }
-                        observed.push(event);
+                        if let OwnerObservation::Event(event) = event { observed.push(event); }
                     }
                     let ready = result?;
                     match ready.ticket.commit().await {
@@ -380,10 +380,10 @@ impl ProviderTestSession {
                         stream_open = false;
                         continue;
                     };
-                    if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
-                        sink.send_wait(event.clone()).await?;
+                    if let Some(sink) = &sink {
+                        sink.send_observation(event.clone()).await?;
                     }
-                    observed.push(event);
+                    if let OwnerObservation::Event(event) = event { observed.push(event); }
                 }
             }
         }
@@ -412,7 +412,7 @@ pub trait ProviderTestExt {
     async fn session_prompt_and_wait(
         &self,
         request: ProviderRequest,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
     ) -> Result<ProviderCompletion, ProviderError>;
 }
 
@@ -427,7 +427,7 @@ impl ProviderTestExt for ProviderTestSession {
     async fn session_prompt_and_wait(
         &self,
         request: ProviderRequest,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
     ) -> Result<ProviderCompletion, ProviderError> {
         Ok(self.execute(request, Some(sink)).await?.completion)
     }
@@ -455,7 +455,7 @@ mod tests {
             workspace.path().into(),
         )?;
         let fixture = ProviderTestSession::from_dyn(provider.clone())?;
-        let owner = ExecutionOwner::root("collector");
+        let owner = ThreadOwner::root("collector");
         let request = ProviderRequest {
             dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(owner.clone()),
@@ -471,6 +471,7 @@ mod tests {
             approval_mode: harness::session::ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };

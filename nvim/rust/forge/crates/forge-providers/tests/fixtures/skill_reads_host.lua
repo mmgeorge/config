@@ -44,7 +44,7 @@ local function request(method, parameter)
     assert(vim.wait(90000, function()
       for _, approval in ipairs(state.approval or {}) do approvals[approval.id] = true end
       local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      return not state.busy and text:find("SKILL_READ_VERIFIED", 1, true)
+      return not require("forge.views.harness.activity").busy(state) and text:find("SKILL_READ_VERIFIED", 1, true)
     end, 10), "skill execution did not settle after durable submission")
   end
   return result

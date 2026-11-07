@@ -98,7 +98,9 @@ impl RollbackEffect {
                     let journal = GitCheckpoint::new(&preview.workspace)
                         .apply_preview(self.repositories, self.objects, preview, resume)
                         .await
-                        .map_err(|_| RollbackFailure::RecoveryRequired)?;
+                        .map_err(|error| RollbackFailure::RestoreIncomplete {
+                            cause: format!("{error:#}"),
+                        })?;
                     (None, Some(journal))
                 }
                 RollbackWork::Conversation => (None, None),

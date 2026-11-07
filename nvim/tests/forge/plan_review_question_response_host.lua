@@ -6,7 +6,8 @@ vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(30000)
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge-test-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors = {}
@@ -25,7 +26,10 @@ local controller = require("forge.views.harness.controller")
 local comments = require("forge.draft_comments")
 local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
 local review_view = require("forge.views.plan_review.native_controller")
-local answer = "This declaration defines the proposed interface"
+-- The unscripted mock answers a plan question by echoing its prompt. Response scripts bind to the
+-- root session, while each review question runs in its own fork, so the echo marks the answer.
+local answer = "Mock response: Answer this Plan Review question"
+local mock_requirement = "Preserve the requested behavior at its owning boundary."
 
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10), message)
@@ -78,6 +82,8 @@ local function begin_answer(scene, body)
   assert(scene.review.owner.saving, "question did not remain pending before release")
   assert(text(scene):find("Generating response", 1, true), "pending question omitted its progress row")
   local model = scene.expected_model or state.session.resolved_model or state.session.model
+  -- PlanReview presents an unresolved default model as a resolving state.
+  if model == "default" then model = "Resolving model" end
   local effort = scene.expected_effort or (state.session.effort ~= "" and state.session.effort or "Default")
   assert(text(scene):find("Generating response · " .. model .. " · Thinking: " .. effort, 1, true),
     "pending question omitted its captured model and thinking")
@@ -259,20 +265,24 @@ local cases = {
     assert_answer(scene, question)
   end },
   { name = "prose question stays on its requirement after reopening", run = function(scene)
-    focus_source(scene, "Preserve the registry ownership boundary.")
+    -- The unscripted mock planner records this requirement in the overview.
+    focus_source(scene, mock_requirement)
     local question = ask(scene, "Why must the registry retain this ownership boundary?")
     leave_question(scene, question.id)
     reopen(scene)
     assert_answer(scene, question)
     assert(row_containing(scene, question.source.body)
-        > row_containing(scene, "Preserve the registry ownership boundary."),
+        > row_containing(scene, mock_requirement),
       "question moved before the requirement it describes")
     reopen(scene)
     assert_answer(scene, question)
   end },
   { name = "prose comment preserves both selected range endpoints", run = function(scene)
     focus_source(scene, "Requirements")
-    press(scene, "V<Down>")
+    -- A blank row separates each section heading from its body, so extend the selection
+    -- through the requirement itself.
+    local heading_row = vim.api.nvim_win_get_cursor(scene.review.win)[1]
+    press(scene, "V" .. string.rep("<Down>", row_containing(scene, mock_requirement, heading_row) - heading_row))
     local comment = add_message(scene, "C", "Keep this requirement attached to its heading.")
     assert(comment.source.end_line > comment.source.start_line, "comment did not capture the selected range")
     press(scene, ":write<CR>")
@@ -281,7 +291,7 @@ local cases = {
     local retained = comments.capture(scene.review.buf)[1]
     assert(vim.deep_equal(retained.source, comment.source), "reopening changed the comment's source range")
     assert(row_containing(scene, comment.source.body)
-        > row_containing(scene, "Preserve the registry ownership boundary."),
+        > row_containing(scene, mock_requirement),
       "range comment moved before the end of its selected source")
   end },
   { name = "close during pending answer retains review then reopens", run = function(scene)
@@ -422,7 +432,7 @@ for _, case in ipairs(cases) do
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan build the feature" })
     controller.submit()
     await(function()
-      return not state.busy and state.active_plan and type(state.active_plan.review_digest) == "string"
+      return not require("forge.views.harness.activity").busy(state) and state.active_plan and type(state.active_plan.review_digest) == "string"
     end, "submitted mock plan did not arrive")
     scene.plan = state.active_plan
     scene.canonical = vim.fn.readfile(scene.plan.working_path, "b")

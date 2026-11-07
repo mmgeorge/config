@@ -10,6 +10,8 @@ vim.fn.writefile({ vim.json.encode({ checks = {
   ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "exit 7", label = "Verify", category = "test" } }
 } }) }, workspace .. "/.forge.json")
 local executable = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
+-- Resolve before the fixture changes into its workspace; the script path is relative to the launch directory.
+local check_storage = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/check_storage.lua")
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   return (kind == "data" or kind == "config") and data or original_stdpath(kind)
@@ -37,14 +39,14 @@ local success, failure = xpcall(function()
   require("forge").open_harness()
   await(function() return state.ready and state.session end, "Harness did not open")
   local configured
-  client.request({ method = "session.configure", params = { shell = "nushell" }, session_id = assert(require("forge.session").harness.session).id }, function(_, problem)
+  client.request({ method = "session.configure", params = { shell = "nushell", automatic_checks = true }, session_id = assert(require("forge.session").harness.session).id }, function(_, problem)
     assert(not problem, tostring(problem))
     configured = true
   end)
   await(function() return configured end, "shell configuration did not settle")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Inspect the fixture" })
   controller.submit()
-  local baseline = data .. "/forge/harness/" .. state.session.id .. "/checks/change-baseline.json"
+  local baseline = check_storage.path(data, state.session.id, "change-baseline.json")
   await(function() return vim.fn.filereadable(baseline) == 1 end, "baseline was not captured")
   vim.fn.writefile({ "after" }, workspace .. "/source.txt")
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
@@ -77,11 +79,17 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_win(state.transcript_win)
   vim.api.nvim_win_set_cursor(state.transcript_win, { summary_row + 1, 0 })
   assert(state.presentation.toggle_heading(state.transcript_win), "exchange activity did not expand")
+  -- Owned runs combine into the exchange's aggregate result heading, which counts each run as an attempt.
+  local aggregate_id = exchanges[1].id .. ":results:checks"
+  local aggregate_text
   await(function()
-    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    local _, count = text:gsub("Checks finished", "")
-    return count >= #catalog.history
-  end, "owned checks did not render inside the expanded exchange")
+    if not state.presentation.transcript.sequence.node[aggregate_id] then return false end
+    local _, aggregate_row = state.presentation.transcript.sequence:position(aggregate_id)
+    aggregate_text = aggregate_row and vim.api.nvim_buf_get_lines(state.transcript_buf, aggregate_row, aggregate_row + 1, false)[1]
+    return aggregate_text ~= nil
+  end, "owned checks did not render with the owning exchange")
+  assert(aggregate_text:find("Checks finished", 1, true)
+    and aggregate_text:find(("%d attempts"):format(#catalog.history), 1, true), aggregate_text)
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(not transcript:find("Check repair started", 1, true), transcript)
   assert(transcript:find("Checks finished", 1, true), "attached check results are missing")

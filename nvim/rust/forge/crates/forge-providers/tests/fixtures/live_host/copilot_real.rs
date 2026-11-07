@@ -72,7 +72,7 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         provider_session_id: None,
     };
     test_session
-        .session_open(super::prompt_request(&request))
+        .thread_open(super::prompt_request(&request))
         .await
         .unwrap();
     let server = tokio::time::timeout(

@@ -154,7 +154,7 @@ wait_exchange = function(previous_count, timeout, target_session)
     local latest = observed[#observed]
     if latest.state == "complete" or latest.state == "failed" then return true end
     snapshot = request("session.state.get", {}, target_session)
-    return snapshot.active_elicitation ~= nil and snapshot.active_elicitation ~= vim.NIL and not state.busy
+    return snapshot.active_elicitation ~= nil and snapshot.active_elicitation ~= vim.NIL and not require("forge.views.harness.activity").busy(state)
   end, 100), "execution did not settle after command admission: " .. vim.inspect({ exchange = observed, snapshot = snapshot, data_root = data }))
   assert(observed[#observed].state ~= "failed", vim.inspect(observed[#observed]))
   return observed[#observed]
@@ -520,7 +520,7 @@ local succeeded, failure = xpcall(function()
         return false
       end, 10), "active-settings prompt did not stream its start marker")
       assert(settled and not failure, "submit command did not acknowledge durable admission")
-      assert(state.busy, "active-settings execution completed before the configuration change")
+      assert(require("forge.views.harness.activity").busy(state), "active-settings execution completed before the configuration change")
       local operation_id = set_resource(resources[1], false, 90000)
       wait_exchange(#before_exchange, 90000)
       assert(not failure, tostring(failure))
@@ -620,7 +620,7 @@ local succeeded, failure = xpcall(function()
     end)
     assert(vim.wait(30000, function()
       local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      return admitted and text:find("CANCEL_READY", 1, true) and state.busy
+      return admitted and text:find("CANCEL_READY", 1, true) and require("forge.views.harness.activity").busy(state)
     end, 10), "cancellation fixture did not reach active generation")
     assert(not command_error, tostring(command_error))
     request("session.turn.cancel")
@@ -674,16 +674,16 @@ local succeeded, failure = xpcall(function()
   end
   if vim.g.forge_acp_test_queue then
     controller.activate_snapshot(request("session.state.get"))
-    assert(vim.wait(5000, function() return not state.busy and not state.configuring and not state.task_operation end, 10))
+    assert(vim.wait(5000, function() return not require("forge.views.harness.activity").busy(state) and not state.configuring and not state.task_operation end, 10))
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Reply with exactly QUEUE_FIRST_VERIFIED. Do not call tools." })
     controller.queue_submit()
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Reply with exactly QUEUE_SECOND_VERIFIED. Do not call tools." })
     controller.queue_submit()
     assert(vim.wait(90000, function()
       local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      return not state.busy and #state.queue == 0 and text:find("QUEUE_FIRST_VERIFIED", 1, true)
+      return not require("forge.views.harness.activity").busy(state) and #state.queue == 0 and text:find("QUEUE_FIRST_VERIFIED", 1, true)
         and text:find("QUEUE_SECOND_VERIFIED", 1, true)
-    end, 10), "provider prompt queue did not drain: " .. vim.inspect({ queue = state.queue, busy = state.busy,
+    end, 10), "provider prompt queue did not drain: " .. vim.inspect({ queue = state.queue, busy = require("forge.views.harness.activity").busy(state),
       task_operation = state.task_operation, execution_notice = state.execution_notice, active_elicitation = state.active_elicitation,
       state_sync_pending = state.state_sync_pending, configuring = state.configuring, connection_error = state.connection_error,
       status = state.status, queue_suspended = state.queue_suspended, host_error = state.host_error,

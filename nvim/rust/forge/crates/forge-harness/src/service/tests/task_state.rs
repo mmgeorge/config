@@ -48,7 +48,7 @@ async fn planning_configuration_restarts(setting: PlanningRestart) -> Result<()>
     let response = TestPromptScript {
         acceptance: Default::default(),
         steps: vec![TestPromptStep::Message {
-            role: forge_provider_api::MessageRole::Response,
+            content: forge_provider_api::TestMessageContent::Response,
             text: "I have not changed the plan yet.".into(),
         }],
         terminal: TestPromptTerminal::Completed,
@@ -265,7 +265,7 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts() ->
             .context("task alias did not collect work and settle its queued directive")??;
             let execution = controller.broker.lock().await.execution_registry();
             let active = execution
-                .existing_owner(&crate::provider::ExecutionOwner::root(&session_id))?
+                .existing_owner(&crate::provider::ThreadOwner::root(&session_id))?
                 .map(|engine| engine.active_invocation_snapshot())
                 .transpose()?
                 .flatten();
@@ -1428,6 +1428,98 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
     Ok(())
 }
 
+/// Clearing a task closes the exchange its collection parked, because no admission follows.
+#[tokio::test]
+async fn clearing_running_goal_closes_its_parked_exchange() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let mock_provider = controller.provider_handle();
+    let control = mock_provider.mock_response_control().unwrap();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let held = control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let request = Request {
+        id: 2,
+        method: "session.command.apply".into(),
+        params: json!({"operation_id":"held-goal","action":"goal","text":"Hold the goal entry"}),
+    };
+    service.prepare_task(Some(&session_id), &request).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.dispatch(Some(session_id.clone()), request, &sink),
+    )
+    .await??;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        control.dispatch(&session_id, MockResponseCommand::Wait { id: hold_id }),
+    )
+    .await??;
+    let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+    let entry = store
+        .latest_exchange(&session_id)?
+        .context("goal entry exchange missing")?;
+    assert_eq!(entry.state(), crate::exchange::ExchangeState::Running);
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 3,
+                method: "session.command.apply".into(),
+                params: json!({"operation_id":"clear-held-goal","action":"clear"}),
+            },
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while controller.coordinator.execution.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(controller.task_controller.current()?.is_none());
+    // Task controls park collected work for a later admission; clearing schedules none.
+    let settled = store
+        .load_exchange(&entry.id)?
+        .context("cleared goal exchange disappeared")?;
+    assert!(
+        settled.is_finished(),
+        "cleared goal left its exchange {:?}",
+        settled.state()
+    );
+    assert!(
+        store
+            .list_exchange(&session_id)?
+            .iter()
+            .all(|exchange| exchange.state() != crate::exchange::ExchangeState::Running)
+    );
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    tokio::time::timeout(Duration::from_secs(2), reader)
+        .await
+        .context("shutdown retained a session subscription sender")???;
+    Ok(())
+}
+
 /// Scoped tools may finish their work before native acknowledgment, without forging it.
 #[tokio::test]
 async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
@@ -1441,24 +1533,44 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
-    let observed_review = Arc::new(AtomicBool::new(false));
-    let refreshed_review = observed_review.clone();
+    // Plan notifications use the `refresh` route: the editor re-reads session state to open the
+    // review. Outbound delivery trails the committed publication stream, so a refresh can observe
+    // later work such as the scripted overview edit. The invariant is therefore revision-based:
+    // every refresh must expose at least the plan revision its notification announced, which a
+    // notification published before its commit cannot satisfy.
+    let delivered_plan_notification = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader_plan_notification = delivered_plan_notification.clone();
     let observer = controller.observer.clone();
     let reader = tokio::spawn(async move {
+        let mut stale_refresh = Vec::new();
         while let Some(frame) = output.recv().await? {
             let event: Value = serde_json::from_slice(frame.bytes())?;
             if event["event"] == "plan_created" || event["event"] == "plan_revision_created" {
-                // These notifications request a state refresh; they do not carry a session snapshot.
+                let notified_revision = event["payload"]["plan"]["model_revision"]
+                    .as_u64()
+                    .context("plan notification omitted its model revision")?;
                 let snapshot = observer.snapshot()?;
-                if snapshot.session.active_task.as_ref().is_some_and(|task| {
-                    matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
-                        if plan.artifact.state == crate::plan::PlanState::AwaitingReview)
-                }) {
-                    refreshed_review.store(true, Ordering::Release);
+                let refreshed_revision =
+                    snapshot
+                        .session
+                        .active_task
+                        .as_ref()
+                        .and_then(|task| match &task.workflow {
+                            crate::task::WorkflowSnapshot::Plan { plan } => {
+                                Some((plan.artifact.state, u64::from(plan.artifact.model_revision)))
+                            }
+                            _ => None,
+                        });
+                if refreshed_revision.is_none_or(|(_, revision)| revision < notified_revision) {
+                    stale_refresh.push(format!(
+                        "{} announced revision {notified_revision}; refresh saw {refreshed_revision:?}",
+                        event["event"]
+                    ));
                 }
+                reader_plan_notification.fetch_add(1, Ordering::AcqRel);
             }
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<Vec<String>, anyhow::Error>(stale_refresh)
     });
     controller.attach_input(&sink).await?;
     let selection = reviewed_execution_fixture_with_acceptance(
@@ -1590,14 +1702,24 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
             events[accepted],
         );
     }
+    // Shutdown does not drain committed publications to a live sink; they stay retained for the
+    // next attachment. Await delivery of both submissions' notifications so the refresh checks
+    // cover the initial review and the resubmitted revision.
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        while delivered_plan_notification.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(Duration::from_secs(2), reader).await???;
-    if !observed_review.load(Ordering::Acquire) {
+    let stale_refresh = tokio::time::timeout(Duration::from_secs(2), reader).await???;
+    if delivered.is_err() || !stale_refresh.is_empty() {
         let retained_fixture = fixture.keep();
         anyhow::bail!(
-            "plan notification refresh did not expose committed review state; fixture={}; trace={retained_trace}; native_receipt={native_receipt}",
+            "plan notification refresh did not expose its committed revision; fixture={}; trace={retained_trace}; native_receipt={native_receipt}; delivered={}; stale={stale_refresh:?}",
             retained_fixture.display(),
+            delivered_plan_notification.load(Ordering::Acquire),
         );
     }
     Ok(())
@@ -3190,5 +3312,34 @@ async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Res
         crate::exchange::journal::CommandState::Finished { .. }
     ));
     controller.finish_exchange_owner().await?;
+    Ok(())
+}
+
+/// Conversation-only undo reaches the owner through the same alias set at admission and dispatch.
+#[tokio::test]
+async fn task_admission_accepts_conversation_only_undo() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let session_id = service.registry().await?.initial_session_id().to_owned();
+    let undo = Request {
+        id: 2,
+        method: "session.command.apply".into(),
+        params: json!({"operation_id":"conversation-undo","action":"undo","rollback":{
+            "scope":"conversation","exchange_id":"exchange","latest_exchange_id":"exchange"}}),
+    };
+    service.prepare_task(Some(&session_id), &undo).await?;
+    let unknown = Request {
+        id: 3,
+        method: "session.command.apply".into(),
+        params: json!({"operation_id":"unknown","action":"unknown-action"}),
+    };
+    assert!(
+        service
+            .prepare_task(Some(&session_id), &unknown)
+            .await
+            .is_err()
+    );
     Ok(())
 }

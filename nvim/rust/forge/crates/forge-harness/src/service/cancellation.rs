@@ -80,6 +80,56 @@ mod tests {
         })
     }
 
+    /// Retract a prompt that a cancel overtook before any owner claimed it.
+    #[tokio::test]
+    async fn restoring_cancel_retracts_an_unclaimed_submission() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let controller = controller(fixture.path()).await?;
+        controller
+            .coordinator
+            .submissions
+            .apply(serde_json::from_value(serde_json::json!({
+                "id":"submit-unclaimed","action":{"kind":"submit","message":{
+                    "id":"unclaimed","text":"Write a long story","intent":"auto"}}
+            }))?)?;
+        let follow_up = controller
+            .coordinator
+            .submissions
+            .apply(serde_json::from_value(serde_json::json!({
+                "id":"queue-follow-up","action":{"kind":"submit","message":{
+                    "id":"follow-up","text":"Then summarize it","intent":"queue"}}
+            }))?);
+        follow_up?;
+        let (messages, _output) = forge_protocol::outbound::channel();
+        let mut request = command("cancel-unclaimed")?;
+        request.command = Command::CancelExchange(CancelExchangeRequest {
+            input: CancelledInputPolicy::RestoreIfUnconsumed,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            controller
+                .exchange_owner
+                .execute_identified(request, messages),
+        )
+        .await??;
+        let snapshot = controller.coordinator.submissions.snapshot()?;
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.id != "unclaimed"),
+            "the overtaken prompt stayed stranded in the suspended queue"
+        );
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.id == "follow-up"),
+            "a deliberately queued follow-up must survive the cancel"
+        );
+        Ok(())
+    }
+
     /// Keep FIFO intent and durable completion when the first caller drops its response future.
     #[tokio::test]
     async fn queued_cancel_survives_dropped_waiter_and_replays_one_result() -> Result<()> {

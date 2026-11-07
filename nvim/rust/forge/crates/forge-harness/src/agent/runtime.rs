@@ -4,9 +4,8 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use super::{AgentCommand, AgentCommandSender};
-use crate::provider::{
-    ExecutionOwner, Provider, ProviderCompletion, ProviderEvent, ProviderRequest,
-};
+use crate::provider::session_execution::OwnerObservation;
+use crate::provider::{HarnessEvent, Provider, ProviderCompletion, ProviderRequest, ThreadOwner};
 
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
@@ -47,7 +46,14 @@ impl AgentRuntime {
         let event_sink = event_sink.with_observer(watchdog.clone());
         let mut events = ChildObservation {
             stream: Some(event_stream),
+            owner: owner.clone(),
+            native_outcome: None,
         };
+        let physical_changes = self
+            .request
+            .control_context
+            .as_ref()
+            .map(|context| context.provider_completion.clone());
         let mut request = self.request.clone();
         let mut cancelled = *self.cancellation.borrow();
         let retry_admission =
@@ -70,18 +76,14 @@ impl AgentRuntime {
                     biased;
                     expired = watchdog.expired() => {
                         let expired = expired?.context("tool watchdog ended during child execution")?;
-                        self.publish(&owner, ProviderEvent::Tool {
-                            address: expired.address.clone(),
-                            update: crate::provider::ToolUpdate::Finished {
-                                outcome: crate::provider::ToolOutcome::Failed {
-                                    diagnostic: crate::provider::ToolDiagnostic {
-                                        kind: forge_provider_api::ProviderFailureKind::Timeout,
-                                        message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
-                                            .expect("static diagnostic is nonempty"),
-                                    },
-                                },
+                        self.publish(&owner, OwnerObservation::Event(HarnessEvent::Host {
+                            scope: expired.address.turn.scope.clone().into(),
+                            event: crate::provider::HostEvent::Failure {
+                                failure: forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::TurnStart,
+                                    forge_provider_api::ProviderFailureKind::Timeout),
+                                message: forge_provider_api::SanitizedMessage::new("Tool execution timed out").expect("static diagnostic is nonempty"),
                             },
-                        }).await?;
+                        })).await?;
                         retry_admission.close();
                         engine.close_admission();
                         let collected = collect_interrupted_attempt(
@@ -122,7 +124,7 @@ impl AgentRuntime {
                     }
                     event = events.next(), if events.is_open() => {
                         if let Some(event) = event? {
-                            watchdog.observe(&event)?;
+                            if let OwnerObservation::Event(event) = &event { watchdog.observe(event)?; }
                             self.publish(&owner, event).await?;
                         }
                     }
@@ -142,6 +144,12 @@ impl AgentRuntime {
                 if cancelled || result.is_err() {
                     break result;
                 }
+                events.drain(&self, &owner).await?;
+                if !events.native_outcome.is_some_and(
+                    forge_provider_api::turn::TurnOutcome::permits_automatic_continuation,
+                ) {
+                    break result;
+                }
                 let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else {
                     break result;
                 };
@@ -150,6 +158,7 @@ impl AgentRuntime {
                 {
                     request.provider_session_id = output.provider_session_id.clone();
                 }
+                events.native_outcome = None;
                 request.input = crate::provider::ProviderInput::from_text(feedback);
                 request.submission = None;
                 request.recovered_input.clear();
@@ -160,21 +169,6 @@ impl AgentRuntime {
         // Read identity already published by open or the ordered binding stream.
         let retained = self.provider.retained_session_id(&owner).await;
         if let Err(error) = events.drain(&self, &owner).await {
-            preserve_child_failure(&mut output, error);
-        }
-        if let Some(provider_thread_id) = &retained
-            && let Err(error) = self
-                .publish(
-                    &owner,
-                    ProviderEvent::Agent {
-                        scope: scope.clone(),
-                        update: crate::provider::AgentUpdate::ConversationResolved {
-                            thread_id: provider_thread_id.clone().into(),
-                        },
-                    },
-                )
-                .await
-        {
             preserve_child_failure(&mut output, error);
         }
         // Settle native work and publish its final observations before child completion.
@@ -223,14 +217,22 @@ impl AgentRuntime {
                 owner,
                 task_id: self.task_id.clone(),
                 output: Box::new(output),
+                host_file_changes: physical_changes
+                    .map_or_else(Vec::new, |slot| slot.collected_file_changes()),
                 cleanup_error,
             })
             .await
     }
 
-    async fn publish(&self, owner: &ExecutionOwner, event: ProviderEvent) -> Result<()> {
+    async fn publish(&self, owner: &ThreadOwner, event: OwnerObservation) -> Result<()> {
+        let event_scope = event.scope();
+        let native_child = matches!(
+            &event,
+            OwnerObservation::Event(HarnessEvent::Native { .. })
+                | OwnerObservation::HostFileChange { .. }
+        ) && event_scope.owner().session_id() == owner.session_id();
         anyhow::ensure!(
-            event.scope().owner() == owner,
+            event_scope.owner() == owner || native_child,
             "provider event crosses child execution ownership"
         );
         anyhow::ensure!(
@@ -282,22 +284,44 @@ fn preserve_child_failure(output: &mut Result<ProviderCompletion>, additional: a
 
 /// Preserve invocation ordering while draining observations owned by the same child session.
 struct ChildObservation {
-    stream: Option<crate::provider::events::ProviderEventStream>,
+    stream: Option<crate::provider::events::HarnessEventStream>,
+    owner: ThreadOwner,
+    native_outcome: Option<forge_provider_api::turn::TurnOutcome>,
 }
 
 impl ChildObservation {
+    /// Retain only this managed child's outcome for host continuation decisions.
+    fn observe_completion(&mut self, observation: &OwnerObservation) {
+        if let OwnerObservation::Event(HarnessEvent::Native {
+            scope,
+            event: boxed_native_event,
+            ..
+        }) = observation
+            && let forge_provider_api::ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Completed(completed),
+                ..
+            } = boxed_native_event.as_ref()
+            && scope.owner() == &self.owner
+        {
+            self.native_outcome = Some(completed.result().outcome());
+        }
+    }
+
     /// Identify whether the owner stream can still produce an observation.
     fn is_open(&self) -> bool {
         self.stream.is_some()
     }
 
     /// Receive foreground and retained events in the engine's delivery order.
-    async fn next(&mut self) -> Result<Option<ProviderEvent>> {
+    async fn next(&mut self) -> Result<Option<OwnerObservation>> {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(None);
         };
         match stream.recv().await {
-            Ok(Some(event)) => Ok(Some(event)),
+            Ok(Some(event)) => {
+                self.observe_completion(&event);
+                Ok(Some(event))
+            }
             Ok(None) => {
                 self.stream = None;
                 Ok(None)
@@ -313,7 +337,7 @@ impl ChildObservation {
     async fn forward_until<Operation: Future>(
         &mut self,
         runtime: &AgentRuntime,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         operation: Operation,
     ) -> (Operation::Output, Option<anyhow::Error>) {
         tokio::pin!(operation);
@@ -338,11 +362,12 @@ impl ChildObservation {
     }
 
     /// Publish every queued final observation after its producer has finished shutdown.
-    async fn drain(&mut self, runtime: &AgentRuntime, owner: &ExecutionOwner) -> Result<()> {
+    async fn drain(&mut self, runtime: &AgentRuntime, owner: &ThreadOwner) -> Result<()> {
         let mut failure = None;
         while let Some(stream) = self.stream.as_mut() {
             match stream.try_recv() {
                 Ok(event) => {
+                    self.observe_completion(&event);
                     if let Err(error) = runtime.publish(owner, event).await {
                         failure.get_or_insert(error);
                     }

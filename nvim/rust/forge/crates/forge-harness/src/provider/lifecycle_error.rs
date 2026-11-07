@@ -35,17 +35,17 @@ pub(crate) fn classify(operation: ProviderOperation, error: anyhow::Error) -> Pr
     classify_source(operation, error.as_ref())
 }
 
-/// Render only the normalized primary cause for a persisted diagnostic.
+/// Preserve the normalized primary failure without flattening its operation, phase, or disposition.
 pub(crate) fn diagnostic(
     operation: ProviderOperation,
     source: &(dyn std::error::Error + 'static),
-) -> forge_provider_api::ProviderDiagnostic {
-    fn category(error: &ProviderError) -> ProviderFailureKind {
-        match error {
-            ProviderError::Failure(failure) => failure.kind(),
-            ProviderError::Combined { primary, .. } => category(primary),
-            ProviderError::PreparationFailed(cause)
-            | ProviderError::PreparationCleanup { cause, .. } => category(cause),
+) -> ProviderFailure {
+    fn primary(operation: ProviderOperation, error: ProviderError) -> ProviderFailure {
+        let kind = match error {
+            ProviderError::Failure(failure) => return failure,
+            ProviderError::Combined { primary: cause, .. }
+            | ProviderError::PreparationFailed(cause)
+            | ProviderError::PreparationCleanup { cause, .. } => return primary(operation, *cause),
             ProviderError::Contract(_) => ProviderFailureKind::Protocol,
             ProviderError::Cleanup(_)
             | ProviderError::Observation(_)
@@ -56,15 +56,10 @@ pub(crate) fn diagnostic(
             | ProviderError::NotConsumed
             | ProviderError::Cancelled => ProviderFailureKind::Rejected,
             ProviderError::RuntimeVersion(_) => ProviderFailureKind::Initialization,
-        }
+        };
+        ProviderFailure::new(operation, kind)
     }
-    let normalized = classify_source(operation, source);
-    forge_provider_api::ProviderDiagnostic {
-        kind: category(&normalized),
-        message: forge_provider_api::SanitizedMessage::new(normalized.to_string())
-            .expect("normalized errors have nonempty display text"),
-        fatal: false,
-    }
+    primary(operation, classify_source(operation, source))
 }
 
 /// Convert only recognized typed causes; native text and source chains never cross this boundary.
@@ -81,7 +76,7 @@ pub(crate) fn classify_source(
             return ProviderError::Cancelled;
         }
         let kind = if cause.is::<forge_provider_api::access::AccessPolicyError>()
-            || cause.is::<forge_provider_api::deadline::InputTimeoutError>()
+            || cause.is::<crate::session::InputTimeoutError>()
         {
             Some(ProviderFailureKind::Rejected)
         } else if let Some(error) = cause.downcast_ref::<std::io::Error>() {
@@ -146,14 +141,14 @@ mod tests {
                     source: std::io::Error::new(std::io::ErrorKind::NotFound, "private-cause"),
                 },
             ),
-            Box::new(forge_provider_api::deadline::InputTimeoutError::TimestampRange),
+            Box::new(crate::session::InputTimeoutError::TimestampRange),
         ];
         for error in errors {
-            let normalized = classify_source(ProviderOperation::SessionConfigure, error.as_ref());
+            let normalized = classify_source(ProviderOperation::ThreadConfigure, error.as_ref());
             let ProviderError::Failure(failure) = &normalized else {
                 panic!("invalid configuration lost its normalized failure");
             };
-            assert_eq!(failure.operation(), ProviderOperation::SessionConfigure);
+            assert_eq!(failure.operation(), ProviderOperation::ThreadConfigure);
             assert_eq!(failure.kind(), ProviderFailureKind::Rejected);
             let rendered = format!("{normalized:?} {normalized}");
             assert!(!rendered.contains("private-directory"));
@@ -170,18 +165,18 @@ mod tests {
     fn lifecycle_boundary_preserves_identity_and_removes_native_sources() {
         assert!(matches!(
             classify(
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 forge_provider_api::error::TurnCancelled.into()
             ),
             ProviderError::Cancelled
         ));
         let uncertain = ProviderError::DeliveryUncertain;
         assert!(matches!(
-            classify(ProviderOperation::SessionOpen, uncertain.into()),
+            classify(ProviderOperation::ThreadOpen, uncertain.into()),
             ProviderError::DeliveryUncertain
         ));
         let error = classify(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             anyhow::Error::new(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "native fixture",
@@ -191,7 +186,7 @@ mod tests {
         let ProviderError::Failure(failure) = &error else {
             panic!("native failure lost its operation");
         };
-        assert_eq!(failure.operation(), ProviderOperation::SessionOpen);
+        assert_eq!(failure.operation(), ProviderOperation::ThreadOpen);
         assert_eq!(failure.kind(), ProviderFailureKind::Transport);
         assert!(!format!("{error:?} {error}").contains("native fixture"));
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);

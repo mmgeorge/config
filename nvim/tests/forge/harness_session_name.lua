@@ -16,12 +16,14 @@ end
 notifications.error = function(message) errors[#errors + 1] = message end
 controller.refresh_winbar = function() refreshes = refreshes + 1 end
 state.session = { id = "session", name = "Existing name", model = "selected", effort = "high" }
-state.busy = true
-state.pending_config = { model = "pending-model" }
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
+-- The host owns configuration and Lua keeps no unconfirmed selection, so name generation uses
+-- the session's applied model.
 controller.rename_session("")
-assert(requests[1].params.operation == "session_name" and requests[1].params.model == "pending-model")
+assert(requests[1].params.operation == "session_name" and requests[1].params.model == "selected",
+  vim.inspect(requests[1]))
 assert(state.rename_status == "Generating session name…")
-assert(state.session.name == "Existing name" and state.session.effort == "high" and state.busy)
+assert(state.session.name == "Existing name" and state.session.effort == "high" and require("forge.views.harness.activity").busy(state))
 requests[1].reply({ text = "Terminal status fixes" })
 assert(state.rename_status == "Generating session name…")
 assert(requests[2].method == "session.rename" and requests[2].params.expected_name == "Existing name")
@@ -60,7 +62,6 @@ assert(#requests == count and state.rename_status == nil)
 controller.rename_session("")
 local other_session = requests[#requests]
 state.session = { id = "other", name = "Other session", model = "default", resolved_model = "private-alias" }
-state.pending_config = nil
 other_session.reply({ text = "Wrong session" })
 assert(state.session.name == "Other session")
 controller.rename_session("Must fail visibly")

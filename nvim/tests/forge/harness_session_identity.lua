@@ -54,7 +54,7 @@ local succeeded, failure = xpcall(function()
   local transport = client._client
   local replied = false
   transport.ready, transport.runtime_ready = true, true
-  transport.provider_registry_generation = transport.generation
+  client._provider_registry_adopt_for_test(true)
   transport.process = { write = function(_, encoded)
     local request = vim.json.decode(encoded)
     assert(request.method == "session.resume" and request.session_id == durable_id)

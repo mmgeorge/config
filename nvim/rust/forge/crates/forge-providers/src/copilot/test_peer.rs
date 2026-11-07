@@ -8,9 +8,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 pub(super) struct SdkPeer {
     requests: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
+    writer: Arc<tokio::sync::Mutex<DuplexStream>>,
 }
 
 impl SdkPeer {
+    /// Deliver an actual SDK notification independently of its original parent request.
+    pub(super) async fn notify(&self, notification: Value) {
+        write_frame(&mut *self.writer.lock().await, &notification).await;
+    }
+
     /// Join peer exit and inspect the complete native request sequence.
     pub(super) async fn collected(self) -> Vec<Value> {
         self.task
@@ -40,7 +46,9 @@ pub(super) fn streams(
     mut handler: impl FnMut(&Value) -> Vec<Value> + Send + 'static,
 ) -> (DuplexStream, DuplexStream, SdkPeer) {
     let (client_writer, mut peer_reader) = tokio::io::duplex(64 * 1024);
-    let (mut peer_writer, client_reader) = tokio::io::duplex(64 * 1024);
+    let (peer_writer, client_reader) = tokio::io::duplex(64 * 1024);
+    let writer = Arc::new(tokio::sync::Mutex::new(peer_writer));
+    let peer_writer = writer.clone();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     let task = tokio::spawn(async move {
@@ -50,23 +58,33 @@ pub(super) fn streams(
                 .expect("fixture request lock is not poisoned")
                 .push(request.clone());
             for response in handler(&request) {
-                let body = serde_json::to_vec(&response).expect("fixture response serializes");
-                peer_writer
-                    .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-                    .await
-                    .expect("fixture peer writes header");
-                peer_writer
-                    .write_all(&body)
-                    .await
-                    .expect("fixture peer writes response");
-                peer_writer
-                    .flush()
-                    .await
-                    .expect("fixture peer flushes response");
+                write_frame(&mut *peer_writer.lock().await, &response).await;
             }
         }
     });
-    (client_reader, client_writer, SdkPeer { requests, task })
+    (
+        client_reader,
+        client_writer,
+        SdkPeer {
+            requests,
+            task,
+            writer,
+        },
+    )
+}
+
+/// Write one complete native frame atomically across scripted replies and delayed notifications.
+async fn write_frame(writer: &mut DuplexStream, value: &Value) {
+    let body = serde_json::to_vec(value).expect("fixture native value serializes");
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+        .await
+        .expect("fixture peer writes header");
+    writer
+        .write_all(&body)
+        .await
+        .expect("fixture peer writes value");
+    writer.flush().await.expect("fixture peer flushes value");
 }
 
 /// Preserve the real SDK request identity when acknowledging its native operation.

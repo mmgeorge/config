@@ -1,4 +1,5 @@
 pub mod approval;
+mod approval_view;
 mod catalog;
 pub(crate) use catalog::select_model_settings;
 pub use compaction::{
@@ -10,11 +11,16 @@ pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
 mod bridge;
 mod session_opening;
-pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt};
+pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt, NativeBindingStatus};
 mod completion;
 mod live_host_effect;
 pub(crate) use live_host_effect::{LiveHostCommit, LiveHostEffect, LiveHostEffectSender};
 pub mod events;
+pub use events::{HarnessEvent, HarnessEventSink, HarnessEventStream, NativeEventSource};
+mod host_event;
+pub use host_event::*;
+mod ownership;
+pub(crate) use ownership::ObservedAgentAssociation;
 mod execution;
 mod host_invocation;
 pub(crate) mod lifecycle_error;
@@ -35,8 +41,8 @@ pub use catalog::{
     ProviderInput, ResourceScope, SkillDefinition,
 };
 pub use execution::{
-    AgentId, EventScope, ExchangeId, ExecutionOwner, InvocationId, InvocationScope, MessageAddress,
-    ProviderTurnId, SessionId, TaskId, ToolAddress, ToolId, TurnAddress, TurnUpdate,
+    AgentId, EventScope, ExchangeId, InvocationId, InvocationScope, SessionId, TaskId, ThreadOwner,
+    ToolAddress, TurnAddress, TurnEvent,
 };
 pub use forge_provider_api::terminal;
 pub use forge_provider_api::usage;
@@ -49,19 +55,16 @@ mod contract;
 pub(crate) mod test_support;
 pub use contract::*;
 pub use forge_provider_api::message;
-pub use message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
+pub use forge_provider_api::testing::TestMessageContent;
+pub use message::MessageClassification;
 mod tool_status;
 pub(crate) mod tool_timeout;
-pub use tool_status::{
-    TextUpdate, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolStatus, ToolUpdate,
-};
+pub use tool_status::{TextUpdate, ToolDiagnostic, ToolOutcome, ToolStatus};
 mod capability;
 mod provider_trace;
 pub use capability::{CapabilityManifest, UnsupportedCapability};
 
-pub use forge_provider_api::execution::TurnSummary;
 pub use forge_provider_api::model::*;
-pub use forge_provider_api::tool::ToolActivityKind;
 
 pub use forge_provider_api::error::ProviderError;
 pub use forge_provider_api::event::*;

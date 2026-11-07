@@ -560,7 +560,7 @@ fn search_respects_workspace_read_boundary_and_explicit_denials() -> Result<()> 
 
 #[test]
 fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> Result<()> {
-    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolOutcome};
     let fixture = Fixture::new()?;
     let mut store = SqliteStore::open(fixture.root.path())?;
     let mut exchange = exchange(&fixture.scope.session, "exchange", "Initial question");
@@ -576,10 +576,10 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let event = crate::turn::test_support::message(
         &address,
         "progress",
-        Some(crate::provider::MessageRole::Commentary),
+        Some(forge_provider_api::AgentMessageRole::Commentary),
         "progress excluded",
     );
-    exchange.observe_turn(&event, 1)?;
+    exchange.observe_event(&event, 1)?;
     exchange.append_input(
         crate::exchange::InputIntent::Steering,
         "Follow-up question".into(),
@@ -588,30 +588,38 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let event = crate::turn::test_support::message(
         &address,
         "answer",
-        Some(crate::provider::MessageRole::Response),
+        Some(forge_provider_api::AgentMessageRole::Response),
         "Final answer",
     );
-    exchange.observe_turn(&event, 3)?;
+    exchange.observe_event(&event, 3)?;
     let output = format!("{}NEEDLE\0{}", "x".repeat(15998), "\u{96ea}".repeat(20000));
+    use forge_provider_api::{
+        InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion, ToolDescriptor,
+        ToolItemEvent,
+    };
     crate::turn::test_support::tool(
         &mut exchange,
         &address,
         "reused",
-        ToolInvocation {
+        ItemStart::ToolCall(ToolDescriptor {
             semantics: Default::default(),
-            kind: ToolActivityKind::ToolCall,
             name: "inspect".into(),
             title: "inspect".into(),
-            arguments: json!({}),
-        },
+            arguments: InspectableArguments::new(json!({})),
+        }),
         [
-            ToolUpdate::Started,
-            ToolUpdate::Output {
-                update: TextUpdate::Replace(output.clone()),
+            ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
             },
-            ToolUpdate::Finished {
+            ItemEvent::Tool {
+                event: ToolItemEvent::Output(TextUpdate::Replace(output.clone())),
+            },
+            ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
                 outcome: ToolOutcome::Succeeded,
-            },
+                descriptor: None,
+                output: None,
+                changes: Default::default(),
+            })),
         ],
         4,
     )?;
@@ -665,8 +673,10 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
     let mut raw = serde_json::to_value(&exchange)?;
     let mut duplicate = raw["turn"][0].clone();
     duplicate["id"] = json!("second-local-turn");
-    duplicate["provider"]["turn_id"] = json!("two");
-    raw["turn"].as_array_mut().unwrap().push(duplicate);
+    // A second native turn needs its own invocation, since turn identity derives from scope.
+    duplicate["provider"] =
+        serde_json::to_value(crate::turn::test_support::address(&exchange, "two"))?;
+    raw["turn"].as_array_mut().unwrap().push(duplicate.clone());
     let tools = raw["entry"]
         .as_array_mut()
         .unwrap()
@@ -676,6 +686,13 @@ fn conversation_order_tool_output_and_ambiguous_occurrences_are_preserved() -> R
         .unwrap();
     let mut duplicate_tools = tools[0].clone();
     duplicate_tools["turn_id"] = json!("second-local-turn");
+    for execution in duplicate_tools["store"]["execution"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        execution["address"] = duplicate["provider"].clone();
+    }
     tools.push(duplicate_tools);
     raw["node_list"].as_array_mut().unwrap().push(json!({
         "kind":"turn_content", "id":"second-local-turn:tool:reused",

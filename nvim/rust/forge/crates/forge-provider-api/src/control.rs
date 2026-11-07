@@ -83,11 +83,66 @@ pub trait ProviderTools: Send + Sync {
         scope: &crate::InvocationScope,
         call: ToolCall,
     ) -> Result<String, ProviderError>;
+
+    /// Execute for an independently registered native child using its original parent authority.
+    /// Hosts must explicitly support this boundary; root execution is never a fallback.
+    async fn call_observed_child(
+        &self,
+        _parent: &crate::InvocationScope,
+        _child: &crate::TurnAddress,
+        _call: ToolCall,
+    ) -> Result<String, ProviderError> {
+        Err(crate::ProviderFailure::new(
+            crate::ProviderOperation::TurnStart,
+            crate::ProviderFailureKind::Authorization,
+        )
+        .into())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unsupported observed-child execution must not reuse the root tool authority.
+    #[tokio::test]
+    async fn observed_child_tools_deny_by_default_without_calling_root() {
+        struct RootTools;
+        #[async_trait]
+        impl ProviderTools for RootTools {
+            async fn call(
+                &self,
+                _: &crate::InvocationScope,
+                _: ToolCall,
+            ) -> Result<String, ProviderError> {
+                panic!("observed child execution must never fall back to root execution")
+            }
+        }
+        let parent = crate::InvocationScope::new(crate::ThreadOwner::root("session"), "parent");
+        let child_scope = crate::InvocationScope::new(
+            crate::ThreadOwner::new("session".into(), crate::AgentId::new("child").unwrap())
+                .unwrap(),
+            "child-turn",
+        );
+        let child = crate::TurnAddress {
+            thread_id: child_scope.owner.thread_id(),
+            turn_id: child_scope.turn_id().unwrap(),
+            scope: child_scope,
+        };
+        let result = RootTools
+            .call_observed_child(
+                &parent,
+                &child,
+                ToolCall {
+                    id: ToolCallId::new("child-call").unwrap(),
+                    name: "host_tool".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Failure(error))
+            if error.kind() == crate::ProviderFailureKind::Authorization));
+    }
 
     /// Decoding durable call identity must enforce the same rule as native adapters.
     #[test]

@@ -94,6 +94,41 @@ fn snapshots_exclude_sockets_and_binary_contents() {
     assert!(!repository.path().join("new.txt").exists());
 }
 
+/// Git reports an untracked nested repository as one directory entry spelled with a trailing
+/// slash. Capture must accept that entry, leave the nested repository's contents outside the
+/// checkpoint, and keep capturing sibling changes; restore must never delete the nested repository.
+#[test]
+fn checkpoints_skip_untracked_nested_repositories() {
+    let repository = repository();
+    let root = repository.path();
+    let nested = root.join("fixtures").join("workspace");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    fs::write(nested.join("README.md"), "nested\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
+    assert!(before.file.is_empty(), "{:?}", before.file);
+
+    fs::write(root.join("sibling.txt"), "captured\n").unwrap();
+    fs::write(nested.join("README.md"), "nested edit\n").unwrap();
+    let after = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
+    assert_eq!(before.changed_paths(&after).unwrap(), vec!["sibling.txt"]);
+
+    checkpoint.restore(&objects, &after, &before).unwrap();
+    assert!(!root.join("sibling.txt").exists());
+    assert_eq!(
+        fs::read_to_string(nested.join("README.md")).unwrap(),
+        "nested edit\n"
+    );
+    assert!(nested.join(".git").is_dir());
+}
+
 #[test]
 fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     use super::super::restore::{RestoreJournal, RestorePreview};
@@ -1254,7 +1289,7 @@ fn corrupt_restore_object_is_rejected_before_any_worktree_deletion() {
         .find(|file| file.path == "tracked.txt")
         .unwrap()
         .object_id;
-    let object = crate::storage::state::directory(&data.path())
+    let object = crate::storage::state::directory(data.path())
         .join("objects/sha256")
         .join(&identity[..2])
         .join(&identity[2..]);
@@ -1715,7 +1750,7 @@ fn clean_checkpoint_keeps_git_baseline_without_duplicate_objects() {
     assert!(checkpoint.deleted.is_empty());
     assert!(checkpoint.tree.is_some());
     assert_eq!(
-        fs::read_dir(crate::storage::state::directory(&data.path()).join("objects/sha256"))
+        fs::read_dir(crate::storage::state::directory(data.path()).join("objects/sha256"))
             .unwrap()
             .count(),
         0

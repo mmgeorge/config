@@ -483,6 +483,15 @@ impl Drop for AcpTransportResources {
 pub struct AcpConnection {
     connection: ConnectionTo<UntypedRole>,
     resources: Arc<AcpTransportResources>,
+    prompt_ends: std::sync::Mutex<
+        std::collections::HashMap<
+            (
+                forge_provider_api::SubmissionId,
+                forge_provider_api::DeliveryAttemptId,
+            ),
+            super::response::NativePromptEnd,
+        >,
+    >,
 }
 
 impl AcpConnection {
@@ -624,7 +633,48 @@ impl AcpConnection {
         Ok(Self {
             connection,
             resources,
+            prompt_ends: Default::default(),
         })
+    }
+
+    /// Preserve native terminal evidence before receipt persistence can fail or wait.
+    pub(super) fn retain_prompt_end(
+        &self,
+        input: &forge_provider_api::CoveredInput,
+        end: super::response::NativePromptEnd,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        let mut ends = self
+            .prompt_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match ends.entry((input.submission_id().clone(), input.attempt_id().clone())) {
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().outcome() != end.outcome() =>
+            {
+                Err(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+                .into())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Ok(()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(end);
+                Ok(())
+            }
+        }
+    }
+
+    /// Get the original native terminal fact for one exact journaled delivery attempt.
+    pub(super) fn prompt_end(
+        &self,
+        input: &forge_provider_api::CoveredInput,
+    ) -> Option<super::response::NativePromptEnd> {
+        self.prompt_ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(input.submission_id().clone(), input.attempt_id().clone()))
+            .copied()
     }
 
     /// Retain the first normalized open failure independently of the connection facade.

@@ -7,12 +7,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
-use forge_provider_api::lifecycle::{ExecutionUpdate, ObservationFailure, SubmissionId};
+use forge_provider_api::lifecycle::{ObservationFailure, SubmissionId};
+use forge_provider_api::{ProviderConnectionEvent, ProviderEvent as NativeEvent, TurnEvent};
 
-use super::{DeliveryState, ExecutionReadiness, ExecutionState};
+use super::{
+    DeliveryState, ExecutionReadiness, ExecutionState, InputPresentation, OwnerObservation,
+};
 use crate::provider::{
-    ExecutionOwner, InvocationId, InvocationScope, Provider, ProviderCompletion, ProviderError,
-    ProviderEvent, ProviderEventSink, ProviderRequest,
+    HarnessEvent, HarnessEventSink, InvocationId, InvocationScope, Provider, ProviderCompletion,
+    ProviderError, ProviderRequest, ThreadOwner,
 };
 
 /// Preserve native and retained-work failures at the registry boundary.
@@ -50,23 +53,34 @@ impl From<ProviderError> for RegistryError {
 pub(crate) struct SessionExecutionRegistry {
     provider: Arc<Provider>,
     trace: Arc<crate::trace::TraceStore>,
-    owners: Mutex<HashMap<ExecutionOwner, Arc<OwnerExecution>>>,
+    owners: Mutex<HashMap<ThreadOwner, Arc<OwnerExecution>>>,
     gate: tokio::sync::RwLock<()>,
     closed: AtomicBool,
     cleanup: super::cleanup::CleanupLedger,
 }
 
-#[derive(Default)]
 struct OwnerExecution {
+    thread_id: forge_provider_api::ThreadId,
     engine: OnceCell<Arc<SessionExecution>>,
     observer: Arc<super::SessionObservationInbox>,
+}
+
+impl OwnerExecution {
+    /// Register a stable host thread before opening its provider binding.
+    fn new(owner: &ThreadOwner, observer: Arc<super::SessionObservationInbox>) -> Self {
+        Self {
+            thread_id: owner.thread_id(),
+            engine: OnceCell::new(),
+            observer,
+        }
+    }
 }
 
 impl SessionExecutionRegistry {
     /// Get an already installed owner without creating a binding or observer generation.
     pub(crate) fn existing_owner(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
     ) -> Result<Option<Arc<SessionExecution>>, ProviderError> {
         Ok(self
             .owners
@@ -94,17 +108,14 @@ impl SessionExecutionRegistry {
     /// Create replacement infrastructure while preserving the host's observer handle.
     pub(crate) fn with_observer(
         provider: Arc<Provider>,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         observer: Arc<super::SessionObservationInbox>,
         trace: Arc<crate::trace::TraceStore>,
     ) -> Self {
         let mut owners = HashMap::new();
         owners.insert(
-            owner,
-            Arc::new(OwnerExecution {
-                engine: OnceCell::new(),
-                observer,
-            }),
+            owner.clone(),
+            Arc::new(OwnerExecution::new(&owner, observer)),
         );
         Self {
             provider,
@@ -135,7 +146,7 @@ impl SessionExecutionRegistry {
         self.cleanup.collect().await
     }
 
-    fn slot(&self, owner: &ExecutionOwner) -> Result<Arc<OwnerExecution>, ProviderError> {
+    fn slot(&self, owner: &ThreadOwner) -> Result<Arc<OwnerExecution>, ProviderError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(protocol("execution registry is closed"));
         }
@@ -144,14 +155,19 @@ impl SessionExecutionRegistry {
             .lock()
             .map_err(|_| protocol("execution registry poisoned"))?
             .entry(owner.clone())
-            .or_default()
+            .or_insert_with(|| {
+                Arc::new(OwnerExecution::new(
+                    owner,
+                    Arc::new(super::SessionObservationInbox::default()),
+                ))
+            })
             .clone())
     }
 
     /// Get the owner queue without starting a provider or creating another observation stream.
     pub(crate) fn observer(
         &self,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
     ) -> Result<Arc<super::SessionObservationInbox>, ProviderError> {
         Ok(self.slot(&owner)?.observer.clone())
     }
@@ -159,27 +175,32 @@ impl SessionExecutionRegistry {
     /// Install intake once, before initialization can emit provider events.
     pub(crate) async fn owner(
         &self,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
     ) -> Result<Arc<SessionExecution>, ProviderError> {
         let _gate = self.gate.read().await;
         let slot = self.slot(&owner)?;
+        let thread_id = slot.thread_id.clone();
         slot.engine
             .get_or_try_init(|| async {
                 SessionExecution::open(
                     self.provider.clone(),
                     owner,
+                    thread_id,
                     slot.observer.clone(),
                     self.trace.clone(),
                 )
                 .await
-                .map(Arc::new)
+                .map(|engine| {
+                    debug_assert_eq!(engine.thread_id, slot.thread_id);
+                    Arc::new(engine)
+                })
             })
             .await
             .cloned()
     }
 
     /// Retire an existing owner without starting a new generation.
-    pub(crate) async fn fence(&self, owner: &ExecutionOwner) -> Result<(), ProviderError> {
+    pub(crate) async fn fence(&self, owner: &ThreadOwner) -> Result<(), ProviderError> {
         let _gate = self.gate.write().await;
         let slot = self
             .owners
@@ -200,7 +221,7 @@ impl SessionExecutionRegistry {
     /// Retire one binding through native cleanup without closing sibling owners.
     pub(crate) async fn retire(
         &self,
-        owner: &ExecutionOwner,
+        owner: &ThreadOwner,
         reason: OwnerCloseReason,
     ) -> Result<(), ProviderError> {
         let _gate = self.gate.write().await;
@@ -217,7 +238,9 @@ impl SessionExecutionRegistry {
             // Reader closure is not native collection evidence. Perform this
             // even if an earlier fence already joined the reader, and retain
             // the binding on any failure so a later close retries it.
-            self.provider.session_close_owner(owner).await?;
+            if let Some(binding) = self.provider.session_close_owner(owner).await? {
+                slot.observer.record_retired_binding(binding)?;
+            }
             if let Some(engine) = slot.engine.get() {
                 engine.close().await?;
             }
@@ -229,7 +252,7 @@ impl SessionExecutionRegistry {
     /// Replace one failed owner only after cleanup and consumption of its observation failure.
     pub(crate) async fn replace(
         &self,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
     ) -> Result<Arc<super::SessionObservationInbox>, RegistryError> {
         self.collect_cleanup()
             .await
@@ -255,15 +278,13 @@ impl SessionExecutionRegistry {
             SessionExecution::open(
                 self.provider.clone(),
                 owner.clone(),
+                old.thread_id.clone(),
                 observer.clone(),
                 self.trace.clone(),
             )
             .await?,
         );
-        let slot = Arc::new(OwnerExecution {
-            engine: OnceCell::new(),
-            observer: observer.clone(),
-        });
+        let slot = Arc::new(OwnerExecution::new(&owner, observer.clone()));
         slot.engine
             .set(engine)
             .map_err(|_| protocol("replacement execution owner was already initialized"))?;
@@ -327,16 +348,16 @@ impl SessionExecutionRegistry {
 
 /// Share an owner's event-driven execution without transferring its reader to a caller.
 pub(crate) struct SessionExecution {
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
+    thread_id: forge_provider_api::ThreadId,
     provider: Arc<Provider>,
     commands: mpsc::Sender<Command>,
     healthy: Arc<AtomicBool>,
     orderly_shutdown: Arc<AtomicBool>,
+    observer: Arc<super::SessionObservationInbox>,
     task: tokio::sync::Mutex<ExecutionTask>,
     activity: Arc<Mutex<Option<InvocationScope>>>,
     admitted: Arc<Mutex<std::collections::HashSet<InvocationScope>>>,
-    #[cfg(test)]
-    delivery_pressure: tokio::sync::watch::Receiver<bool>,
     #[cfg(test)]
     presentation_queue: mpsc::WeakSender<Delivery>,
 }
@@ -420,6 +441,8 @@ pub(crate) struct SettlementCell {
 /// Identify one host workflow mutation within an adapter publication.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum HostEffectKind {
+    /// An authenticated host callback committed file operations independently of native item reports.
+    FileChange,
     /// A semantic plan edit.
     PlanEdit,
     /// A declaration design edit.
@@ -1028,14 +1051,14 @@ enum Command {
         reply: oneshot::Sender<Result<(), ProviderError>>,
     },
     ObserveSession {
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
         reply: oneshot::Sender<Result<(), ProviderError>>,
     },
     Execute {
         request: Box<ProviderRequest>,
         scope: InvocationScope,
         submission: Option<SubmissionId>,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
         completion: Box<crate::tools::ControlTurnContext>,
         continuation: Option<(InvocationScope, u64, u64, u64)>,
         stale: Option<oneshot::Sender<ProviderRequest>>,
@@ -1059,11 +1082,11 @@ enum Command {
 enum Delivery {
     Inbox {
         inbox: Arc<super::SessionObservationInbox>,
-        event: ProviderEvent,
+        event: OwnerObservation,
     },
     Event {
-        sink: ProviderEventSink,
-        event: Box<ProviderEvent>,
+        sink: HarnessEventSink,
+        event: Box<OwnerObservation>,
         fallback: Option<SessionObserver>,
     },
     Complete {
@@ -1074,11 +1097,12 @@ enum Delivery {
 
 struct Invocation {
     scope: InvocationScope,
-    output: ProviderEventSink,
+    output: HarnessEventSink,
     reply: Option<oneshot::Sender<Result<NativeReady, ProviderError>>>,
     completion: crate::tools::ControlTurnContext,
-    terminal: Option<Result<forge_provider_api::lifecycle::ExecutionResult, ProviderError>>,
-    native_settlement: Option<forge_provider_api::InvocationSettlement>,
+    terminal: Option<Result<forge_provider_api::CompletedTurn, ProviderError>>,
+    native_metadata: forge_provider_api::completion::ProviderCompletion,
+    observed_output: bool,
     host_collection: HostCollection,
     publication_failure: Option<ProviderError>,
     pending_controls: usize,
@@ -1086,7 +1110,6 @@ struct Invocation {
     ticket_outstanding: bool,
     ticket_nonce: u64,
     abandoned: Arc<AtomicBool>,
-    idle_observation: bool,
 }
 
 /// Keep native settlement separate from host-owned callback and checkpoint collection.
@@ -1100,6 +1123,8 @@ enum HostCollection {
 struct SubmissionOutcome {
     scope: InvocationScope,
     submission: Option<SubmissionId>,
+    receipt: Option<Arc<crate::provider::submission::Submission>>,
+    not_started: Option<ProviderError>,
     control_reply: Option<oneshot::Sender<Result<(), ProviderError>>>,
     result: Result<(), ProviderError>,
 }
@@ -1173,16 +1198,18 @@ enum CancellationKind {
 #[derive(Clone)]
 enum SessionObserver {
     Inbox(Arc<super::SessionObservationInbox>),
-    Stream(Box<ProviderEventSink>),
+    Stream(Box<HarnessEventSink>),
 }
 
 impl SessionObserver {
     /// Preserve an invocation event when its result observer has been dropped.
-    async fn retain(&self, event: ProviderEvent) -> Result<(), ProviderError> {
+    async fn retain(&self, event: OwnerObservation) -> Result<(), ProviderError> {
         match self {
-            Self::Inbox(inbox) => inbox.push(event),
+            Self::Inbox(inbox) => inbox.push_observation(event),
             Self::Stream(sink) => {
-                sink.bind_scope(event.scope())?.send_wait(event).await?;
+                sink.bind_scope(event.scope())?
+                    .send_observation(event)
+                    .await?;
                 Ok(())
             }
         }
@@ -1198,13 +1225,13 @@ impl SessionObserver {
         }
     }
 
-    fn diagnostic(&self, event: ProviderEvent) {
+    fn diagnostic(&self, event: HarnessEvent) {
         match self {
             Self::Inbox(inbox) => {
                 let _ = inbox.push(event);
             }
             Self::Stream(sink) => {
-                if let Ok(scoped) = sink.bind_scope(event.scope()) {
+                if let Ok(scoped) = sink.bind_scope(event.scope().clone()) {
                     let _ = scoped.send(event);
                 }
             }
@@ -1223,7 +1250,7 @@ struct FailedWaiter {
 }
 
 struct Driver {
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     provider: Arc<Provider>,
     trace: Arc<crate::trace::TraceStore>,
     queue_loss_reported: AtomicBool,
@@ -1235,8 +1262,6 @@ struct Driver {
     deliveries: JoinSet<Result<(), ProviderError>>,
     delivery: Option<mpsc::Sender<Delivery>>,
     pending_delivery: VecDeque<Delivery>,
-    #[cfg(test)]
-    delivery_pressure: tokio::sync::watch::Sender<bool>,
     cleanup: JoinSet<forge_provider_api::error::ObservationCleanup>,
     failed_waiters: Vec<FailedWaiter>,
     commands: mpsc::Sender<Command>,
@@ -1289,7 +1314,7 @@ impl SessionExecution {
         {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::WrongInvocation,
                 ),
             ));
@@ -1304,7 +1329,7 @@ impl SessionExecution {
             })
             .map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
             })
@@ -1421,7 +1446,8 @@ impl SessionExecution {
             .map(|scope| scope.clone())
             .map_err(|_| protocol("activity snapshot poisoned"))
     }
-    /// Read the exact owner's published admission state while applying an exchange command.
+    /// Read the exact owner's published admission state in a lifecycle regression.
+    #[cfg(test)]
     pub(crate) fn invocation_active_snapshot(
         &self,
         scope: &InvocationScope,
@@ -1471,7 +1497,8 @@ impl SessionExecution {
 
     async fn open(
         provider: Arc<Provider>,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
+        thread_id: forge_provider_api::ThreadId,
         observer: Arc<super::SessionObservationInbox>,
         trace: Arc<crate::trace::TraceStore>,
     ) -> Result<Self, ProviderError> {
@@ -1482,8 +1509,6 @@ impl SessionExecution {
         let presentation_queue = delivery.downgrade();
         let mut deliveries = JoinSet::new();
         deliveries.spawn(deliver(output));
-        #[cfg(test)]
-        let (delivery_pressure, pressure_observer) = tokio::sync::watch::channel(false);
         let healthy = Arc::new(AtomicBool::new(true));
         let activity = Arc::new(Mutex::new(None));
         let admitted = Arc::new(Mutex::new(Default::default()));
@@ -1501,8 +1526,6 @@ impl SessionExecution {
             deliveries,
             delivery: Some(delivery),
             pending_delivery: VecDeque::new(),
-            #[cfg(test)]
-            delivery_pressure: delivery_pressure.clone(),
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands: commands.clone(),
@@ -1513,7 +1536,7 @@ impl SessionExecution {
             first_failure: None,
             cleanup_failure: None,
             retiring: None,
-            idle: SessionObserver::Inbox(observer),
+            idle: SessionObserver::Inbox(observer.clone()),
             activity: activity.clone(),
             admitted: admitted.clone(),
             attempts: HashMap::new(),
@@ -1539,8 +1562,6 @@ impl SessionExecution {
                                 let delivery = driver.pending_delivery.pop_front()
                                     .expect("capacity is requested only for retained delivery");
                                 permit.send(delivery);
-                                #[cfg(test)]
-                                driver.delivery_pressure.send_replace(!driver.pending_delivery.is_empty());
                             },
                             Err(_) => {
                                 for delivery in driver.pending_delivery.drain(..) {
@@ -1616,7 +1637,7 @@ impl SessionExecution {
                         match delivered {
                             Some(Ok((id, outcome))) => { driver.submission_finished(id); driver.acceptance(outcome); },
                             Some(Err(error)) if error.is_cancelled() => { driver.submission_finished(error.id()); },
-                            Some(Err(error)) => { driver.submission_finished(error.id()); driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)); },
+                            Some(Err(error)) => { driver.submission_finished(error.id()); driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::TurnStart, Arc::new(error)); },
                             None => {},
                         }
                     },
@@ -1624,8 +1645,8 @@ impl SessionExecution {
                         match result {
                             Some(Ok(Ok(()))) | None => {},
                             Some(Ok(Err(ProviderError::Observation(failure)))) => driver.fail_observation(failure),
-                            Some(Ok(Err(error))) => driver.fail_operation(ObservationFailure::Disconnected, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)),
-                            Some(Err(error)) => driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)),
+                            Some(Ok(Err(error))) => driver.fail_operation(ObservationFailure::Disconnected, forge_provider_api::error::ProviderOperation::TurnStart, Arc::new(error)),
+                            Some(Err(error)) => driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::TurnStart, Arc::new(error)),
                         }
                     },
                     result = driver.cleanup.join_next(), if !driver.cleanup.is_empty() => { driver.cleanup_finished(result); },
@@ -1681,27 +1702,30 @@ impl SessionExecution {
                                 driver.submission_finished(error.id());
                                 driver.fail_operation(
                                     ObservationFailure::LifecycleUnavailable,
-                                    forge_provider_api::error::ProviderOperation::InputSubmit,
+                                    forge_provider_api::error::ProviderOperation::TurnStart,
                                     Arc::new(error),
                                 );
                             }
                         }
                     }
+                    // Native collection resolves retained submission tasks before their owner can judge missing proof.
                     if driver.pending_delivery.is_empty()
-                        && (driver.state.active_scope().is_some()
-                            || !driver.submissions.is_empty()
-                            || driver
-                                .invocations
-                                .values()
-                                .any(|invocation| invocation.pending_controls != 0))
+                        && driver.submissions.is_empty()
+                        && driver.state.active_scope().is_some()
                     {
                         driver.fail_observation(ObservationFailure::LifecycleUnavailable);
                     }
                 }
-                if (driver.failed
-                    || driver.retiring.is_some() && driver.pending_delivery.is_empty())
-                    && driver.cleanup.is_empty()
-                {
+                let retirement_collected = driver.retiring.is_some()
+                    && driver.pending_delivery.is_empty()
+                    && driver.submissions.is_empty()
+                    && driver.invocations.values().all(|invocation| {
+                        invocation.pending_controls == 0
+                            && (!(matches!(invocation.terminal, Some(Ok(_)))
+                                || driver.state.not_started(&invocation.scope))
+                                || matches!(invocation.host_collection, HostCollection::Settled))
+                    });
+                if (driver.failed || retirement_collected) && driver.cleanup.is_empty() {
                     break;
                 }
             }
@@ -1719,7 +1743,7 @@ impl SessionExecution {
                         driver.submission_finished(error.id());
                         if !error.is_cancelled() {
                             driver.retain_collection_failure(
-                                forge_provider_api::error::ProviderOperation::InputSubmit,
+                                forge_provider_api::error::ProviderOperation::TurnStart,
                                 Arc::new(error),
                             );
                         }
@@ -1735,7 +1759,7 @@ impl SessionExecution {
                     if let Err(error) = delivery.send(retained).await {
                         error.0.fail(ObservationFailure::Disconnected);
                         driver.retain_collection_failure(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             Arc::new(ProviderError::Observation(ObservationFailure::Disconnected)),
                         );
                     }
@@ -1746,11 +1770,11 @@ impl SessionExecution {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => driver.retain_collection_failure(
-                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        forge_provider_api::error::ProviderOperation::TurnStart,
                         Arc::new(error),
                     ),
                     Err(error) => driver.retain_collection_failure(
-                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        forge_provider_api::error::ProviderOperation::TurnStart,
                         Arc::new(error),
                     ),
                 }
@@ -1772,16 +1796,16 @@ impl SessionExecution {
             Ok(())
         });
         Ok(Self {
+            thread_id,
             owner,
             provider,
             commands,
             healthy,
             orderly_shutdown,
+            observer,
             task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
             activity,
             admitted,
-            #[cfg(test)]
-            delivery_pressure: pressure_observer,
             #[cfg(test)]
             presentation_queue,
         })
@@ -1820,6 +1844,7 @@ impl SessionExecution {
                 self.provider.as_ref(),
                 &self.owner,
                 previous.observation().clone(),
+                Some(self.observer.as_ref()),
             )
             .await;
             if !report.collected() {
@@ -1840,7 +1865,7 @@ impl SessionExecution {
         let result = match result {
             Ok(result) => result,
             Err(error) => Err(crate::provider::lifecycle_error::classify_source(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 &error,
             )),
         };
@@ -1877,7 +1902,7 @@ impl SessionExecution {
     #[cfg(test)]
     pub(crate) async fn session_events(
         &self,
-    ) -> Result<crate::provider::events::ProviderEventStream, ProviderError> {
+    ) -> Result<crate::provider::events::HarnessEventStream, ProviderError> {
         Ok(self.session_observer().await?.1)
     }
 
@@ -1886,8 +1911,8 @@ impl SessionExecution {
         &self,
     ) -> Result<
         (
-            ProviderEventSink,
-            crate::provider::events::ProviderEventStream,
+            HarnessEventSink,
+            crate::provider::events::HarnessEventStream,
         ),
         ProviderError,
     > {
@@ -1977,7 +2002,7 @@ impl SessionExecution {
     pub(crate) async fn run_once(
         &self,
         request: ProviderRequest,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<ProviderCompletion, ProviderError> {
         let scope = sink.invocation_scope()?.clone();
@@ -1998,7 +2023,7 @@ impl SessionExecution {
     pub(crate) async fn run_until_ready(
         &self,
         request: ProviderRequest,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<NativeReady, ProviderError> {
         self.submit_until_ready(request, sink, store, None, None)
@@ -2009,8 +2034,8 @@ impl SessionExecution {
     pub(crate) async fn continue_attempt(
         &self,
         ticket: &SettlementTicket,
-        request: ProviderRequest,
-        sink: ProviderEventSink,
+        mut request: ProviderRequest,
+        sink: HarnessEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<ContinuationAttempt, ProviderError> {
         let supplied = sink.invocation_scope()?;
@@ -2025,6 +2050,8 @@ impl SessionExecution {
         let scope =
             InvocationScope::new(ticket.scope.owner.clone(), ticket.scope.exchange_id.clone());
         let sink = sink.successor_invocation_sink(&scope)?;
+        // A successor has a new receipt and scope; the predecessor's handoff cannot authorize it.
+        request.dispatch = super::super::DispatchTracker::default();
         let (stale, mut rejected) = oneshot::channel();
         let result = self
             .submit_until_ready(
@@ -2050,7 +2077,7 @@ impl SessionExecution {
     async fn submit_until_ready(
         &self,
         mut request: ProviderRequest,
-        sink: ProviderEventSink,
+        sink: HarnessEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
         continuation: Option<(InvocationScope, u64, u64, u64)>,
         stale: Option<oneshot::Sender<ProviderRequest>>,
@@ -2079,7 +2106,7 @@ impl SessionExecution {
             .control_context
             .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode));
         if continuation.is_none() {
-            context.begin_provider_execution();
+            context.begin_provider_execution()?;
         }
         let completion = context.clone();
         let (reply, response) = oneshot::channel();
@@ -2146,7 +2173,7 @@ impl Driver {
     ) -> Result<(), ProviderError> {
         let invalid = || {
             ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::WrongInvocation,
             ))
         };
@@ -2232,35 +2259,91 @@ impl Driver {
     /// Publish a read-only owner snapshot without transferring transition authority to readers.
     fn publish_activity(&self) {
         if let Ok(mut activity) = self.activity.lock() {
-            *activity = (!self.failed && self.retiring.is_none())
-                .then(|| {
-                    self.state
-                        .active_scope()
-                        .filter(|scope| {
-                            self.invocations
-                                .get(&scope.invocation_id)
-                                .is_some_and(|invocation| invocation.native_settlement.is_none())
-                        })
-                        .cloned()
-                })
-                .flatten();
+            *activity =
+                (!self.failed && self.retiring.is_none())
+                    .then(|| {
+                        self.state
+                            .active_scope()
+                            .filter(|scope| {
+                                self.invocations.get(&scope.invocation_id).is_some_and(
+                                    |invocation| !matches!(invocation.terminal, Some(Ok(_))),
+                                )
+                            })
+                            .cloned()
+                    })
+                    .flatten();
         }
     }
     /// Reduce a binding event before acknowledging its stream position to operation waiters.
-    async fn native_event(&mut self, envelope: crate::provider::bridge::HostEvent) {
-        let crate::provider::bridge::HostEvent { event, native } = envelope;
+    async fn native_event(&mut self, envelope: crate::provider::bridge::ProviderObservation) {
+        let crate::provider::bridge::ProviderObservation { event, native } = envelope;
+        let event = match event {
+            OwnerObservation::Event(event) => event,
+            OwnerObservation::HostFileChange {
+                binding_id,
+                scope,
+                change,
+            } => {
+                if native.is_some()
+                    || scope != change.scope
+                    || scope.owner.session_id() != self.owner.session_id()
+                    || !self
+                        .provider
+                        .observed_scope(&scope)
+                        .is_ok_and(|association| association.binding_id() == &binding_id)
+                {
+                    self.fail_observation(ObservationFailure::OwnershipConflict);
+                    return;
+                }
+                self.idle_observation(OwnerObservation::HostFileChange {
+                    binding_id,
+                    scope,
+                    change,
+                });
+                return;
+            }
+            OwnerObservation::InputAcceptance {
+                scope,
+                receipt,
+                presentation,
+            } => {
+                if native.is_some() || scope.owner != self.owner || !self.state.contains(&scope) {
+                    self.fail_observation(ObservationFailure::OwnershipConflict);
+                    return;
+                }
+                self.publish_acceptance(scope, receipt, presentation);
+                return;
+            }
+        };
         let category = event_category(&event);
-        let scope = event.scope();
+        let scope = event.scope().clone();
         if scope.owner() != &self.owner {
-            self.fail_observation(ObservationFailure::OwnershipConflict);
-            return;
+            let registered_host = matches!(&event, HarnessEvent::Host { .. })
+                && scope
+                    .invocation()
+                    .is_some_and(|scope| self.provider.observed_scope(scope).is_ok());
+            if scope.owner().session_id() != self.owner.session_id()
+                || native.is_none() && !registered_host
+            {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            }
         }
-        let identity_first =
-            matches!(&event, ProviderEvent::SessionIdentity { .. }) && native.is_some();
+        let identity_first = matches!(
+           &event,
+           HarnessEvent::Native {
+               event: boxed_native_event,
+               ..
+           }
+        if matches!(boxed_native_event.as_ref(), NativeEvent::Thread {
+                   event: forge_provider_api::ThreadEvent::IdentityResolved(_),
+                   ..
+               }))
+            && native.is_some();
         if identity_first
             && scope
                 .invocation()
-                .is_some_and(|scope| !self.state.contains(scope))
+                .is_some_and(|scope| scope.owner == self.owner && !self.state.contains(scope))
         {
             self.fail_observation(ObservationFailure::OwnershipConflict);
             return;
@@ -2272,10 +2355,24 @@ impl Driver {
             return;
         }
         if let Some((binding, sequence)) = &native {
+            let HarnessEvent::Native {
+                source,
+                event: provider_event,
+                ..
+            } = &event
+            else {
+                self.fail_observation(ObservationFailure::Protocol);
+                return;
+            };
+            if &source.binding_id != binding || source.sequence != *sequence {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            }
             let core = crate::exchange::core_log::CoreRecord::provider_event_metadata(
                 binding.clone(),
                 *sequence,
-                &event,
+                scope.clone(),
+                provider_event,
             );
             if let Err(error) = self.provider.record_core_event(&self.owner, &core) {
                 self.fail_observation_with_origin(
@@ -2301,7 +2398,7 @@ impl Driver {
                 );
                 return;
             } else {
-                self.trace.record(self.owner.session_id.as_str(), "provider.event.consumed", serde_json::json!({
+                self.trace.record(self.owner.session_id().as_str(), "provider.event.consumed", serde_json::json!({
                     "binding_id":binding, "sequence":sequence, "scope":scope, "category":category,
                 }));
             }
@@ -2313,140 +2410,48 @@ impl Driver {
         }
     }
 
-    /// Validate immutable lifecycle preconditions before durable consumption evidence or publication.
-    fn validate_native_event(&self, event: &ProviderEvent) -> Result<(), ObservationFailure> {
-        let scope = event.scope();
+    /// Validate lifecycle ownership before durable consumption or publication.
+    fn validate_native_event(&self, event: &HarnessEvent) -> Result<(), ObservationFailure> {
+        let HarnessEvent::Native { scope, event, .. } = event else {
+            return Ok(());
+        };
+        let event = event.as_ref();
         let Some(scope) = scope.invocation() else {
             return Ok(());
         };
+        if scope.owner != self.owner {
+            return Ok(());
+        }
         if !self.state.contains(scope) {
             return Err(ObservationFailure::OwnershipConflict);
         }
-        let invocation = self
-            .invocations
-            .get(&scope.invocation_id)
-            .filter(|invocation| &invocation.scope == scope);
-        if let ProviderEvent::Settled { settlement } = event {
-            let invocation = invocation
-                .or_else(|| {
-                    self.committed_invocations
-                        .get(&scope.invocation_id)
-                        .filter(|invocation| &invocation.scope == scope)
-                })
-                .ok_or(ObservationFailure::OwnershipConflict)?;
-            if invocation
-                .native_settlement
-                .as_ref()
-                .is_some_and(|previous| {
-                    previous.binding_id != settlement.binding_id
-                        || previous.result != settlement.result
-                })
-                || matches!(&invocation.terminal, Some(Ok(result)) if result != &settlement.result)
-            {
-                return Err(ObservationFailure::Protocol);
-            }
-        }
-        let ProviderEvent::Execution { observation } = event else {
+        let NativeEvent::Turn {
+            thread_id,
+            turn_id,
+            event,
+        } = event
+        else {
             return Ok(());
         };
-        if matches!(observation.update(), ExecutionUpdate::Started { .. })
-            && (invocation.is_none()
-                || invocation.is_some_and(|invocation| invocation.native_settlement.is_some()))
-        {
-            return Err(ObservationFailure::OwnershipConflict);
+        match event {
+            TurnEvent::Started(_) => self.state.validate_turn(scope, thread_id, turn_id, None),
+            TurnEvent::Completed(completed) => {
+                self.state
+                    .validate_turn(scope, thread_id, turn_id, Some(completed))
+            }
+            TurnEvent::Error { .. }
+            | TurnEvent::ModelResolved(_)
+            | TurnEvent::Usage(_)
+            | TurnEvent::ChecklistUpdated(_) => {
+                if &scope.owner.thread_id() != thread_id
+                    || scope.turn_id().ok().as_ref() != Some(turn_id)
+                {
+                    return Err(ObservationFailure::OwnershipConflict);
+                }
+                Ok(())
+            }
         }
-        if invocation.is_some_and(|invocation| invocation.revision.checked_add(1).is_none()) {
-            return Err(ObservationFailure::Protocol);
-        }
-        let state = self
-            .state
-            .invocations
-            .get(&scope.invocation_id)
-            .ok_or(ObservationFailure::OwnershipConflict)?;
-        match observation.update() {
-            ExecutionUpdate::Finished {
-                address,
-                covered_submissions,
-                result,
-                ..
-            }
-            | ExecutionUpdate::PublicationFailed {
-                address,
-                covered_submissions,
-                result,
-                ..
-            } => {
-                let previous = state
-                    .executions
-                    .get(&ExecutionState::key(address.clone()))
-                    .ok_or(ObservationFailure::Protocol)?;
-                if covered_submissions
-                    .iter()
-                    .any(|id| !state.submissions.contains_key(id))
-                {
-                    return Err(ObservationFailure::Protocol);
-                }
-                let publication = if let ExecutionUpdate::PublicationFailed { failure, .. } =
-                    observation.update()
-                {
-                    Some(*failure)
-                } else {
-                    None
-                };
-                let current_covered: std::collections::HashSet<_> =
-                    covered_submissions.iter().cloned().collect();
-                if let super::NativeExecution::Finished {
-                    result: prior,
-                    covered,
-                    publication_failure,
-                } = previous
-                    && (prior.as_ref() != result
-                        || covered != &current_covered
-                        || publication_failure != &publication)
-                {
-                    return Err(ObservationFailure::Protocol);
-                }
-            }
-            ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions,
-                result,
-                ..
-            }
-            | ExecutionUpdate::ResolutionPublicationFailed {
-                covered_submissions,
-                result,
-                ..
-            } => {
-                if covered_submissions
-                    .iter()
-                    .any(|id| !state.submissions.contains_key(id))
-                {
-                    return Err(ObservationFailure::Protocol);
-                }
-                let covered: std::collections::HashSet<_> =
-                    covered_submissions.iter().cloned().collect();
-                let publication =
-                    if let ExecutionUpdate::ResolutionPublicationFailed { failure, .. } =
-                        observation.update()
-                    {
-                        Some(*failure)
-                    } else {
-                        None
-                    };
-                for previous in &state.without_execution {
-                    if previous.covered == covered {
-                        if previous.result != *result || previous.publication_failure != publication
-                        {
-                            return Err(ObservationFailure::Protocol);
-                        }
-                    } else if !previous.covered.is_disjoint(&covered) {
-                        return Err(ObservationFailure::Protocol);
-                    }
-                }
-            }
-            ExecutionUpdate::Started { .. } | ExecutionUpdate::ObservationLost { .. } => {}
-        }
-        Ok(())
+        .map_err(|_| ObservationFailure::Protocol)
     }
     /// Preserve a failed owned task while keeping the first observation cause immutable.
     fn retain_collection_failure(
@@ -2502,9 +2507,21 @@ impl Driver {
         self.healthy.store(false, Ordering::Release);
         let provider = self.provider.clone();
         let owner = self.owner.clone();
+        let observer = match &self.idle {
+            SessionObserver::Inbox(inbox) => Some(inbox.clone()),
+            SessionObserver::Stream(_) => None,
+        };
         self.cleanup.spawn(async move {
             use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
-            let collection = provider.session_close_owner(&owner).await;
+            let collection = provider
+                .session_close_owner(&owner)
+                .await
+                .and_then(|binding| {
+                    if let (Some(observer), Some(binding)) = (&observer, binding) {
+                        observer.record_retired_binding(binding)?;
+                    }
+                    Ok(())
+                });
             let classify = |result: Result<(), ProviderError>| match result {
                 Ok(()) => None,
                 Err(error) => Some(CleanupFailure::Failed(Box::new(error))),
@@ -2543,7 +2560,8 @@ impl Driver {
                 let collected = |invocation: &Invocation| {
                     invocation.pending_controls == 0
                         && invocation.terminal.is_some()
-                        && invocation.native_settlement.is_some()
+                        && (matches!(invocation.terminal, Some(Ok(_)))
+                            || self.state.not_started(&invocation.scope))
                         && matches!(invocation.host_collection, HostCollection::Settled)
                 };
                 let prior = self
@@ -2574,14 +2592,14 @@ impl Driver {
                     || !current_fence
                     || !latest
                 {
-                    self.trace.record(self.owner.session_id.as_str(), "provider.replacement.rejected", serde_json::json!({
+                    self.trace.record(self.owner.session_id().as_str(), "provider.replacement.rejected", serde_json::json!({
                         "scope":scope, "fence_id":collection.fence_id, "owner_failed":self.failed,
                         "admitted":admitted, "previous_collected":previous_collected,
                         "current_fence":current_fence, "latest_reservation":latest,
                     }));
                     let _ = reply.send(Err(ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::SessionConfigure,
+                            forge_provider_api::ProviderOperation::ThreadConfigure,
                             forge_provider_api::ProviderFailureKind::WrongInvocation,
                         ),
                     )));
@@ -2590,7 +2608,7 @@ impl Driver {
                 if self.state.active_scope().is_some() || !all_collected {
                     let _ = reply.send(Err(ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::SessionConfigure,
+                            forge_provider_api::ProviderOperation::ThreadConfigure,
                             forge_provider_api::ProviderFailureKind::ExecutionActive,
                         ),
                     )));
@@ -2640,8 +2658,8 @@ impl Driver {
                 operation_id,
                 result,
             } => {
-                self.trace.record(self.owner.session_id.as_str(), "provider.operation.completed", serde_json::json!({
-                    "operation_id":operation_id, "operation":forge_provider_api::ProviderOperation::InputSubmit,
+                self.trace.record(self.owner.session_id().as_str(), "provider.operation.completed", serde_json::json!({
+                    "operation_id":operation_id, "operation":forge_provider_api::ProviderOperation::TurnStart,
                     "phase":forge_provider_api::ProviderPhase::Collection, "scope":scope, "success":result.is_ok(),
                 }));
                 let Some(invocation) =
@@ -2689,7 +2707,7 @@ impl Driver {
                     .or_else(|| self.committed_invocations.get(&scope.invocation_id))
                     .is_some_and(|invocation| {
                         invocation.scope == scope
-                            && invocation.native_settlement.is_some()
+                            && matches!(invocation.terminal, Some(Ok(_)))
                             && matches!(invocation.host_collection, HostCollection::Settled)
                     })
                 {
@@ -2797,6 +2815,22 @@ impl Driver {
                 result,
                 reply,
             } => {
+                if result.is_ok() && matches!(outcome, CancellationKind::Native) {
+                    match self.state.cancel_unstarted(&scope) {
+                        Ok(true) => {
+                            if let Some(invocation) = self.invocations.get_mut(&scope.invocation_id)
+                            {
+                                invocation.terminal = Some(Err(ProviderError::Cancelled));
+                            }
+                            self.begin_host_collection(&scope);
+                            self.settle(&scope.invocation_id);
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            self.fail_observation(ObservationFailure::OwnershipConflict);
+                        }
+                    }
+                }
                 if let CancellationKind::Prevented(prevented) = outcome
                     && result.is_ok()
                 {
@@ -2825,6 +2859,7 @@ impl Driver {
                     {
                         invocation.terminal = Some(Err(ProviderError::Cancelled));
                     }
+                    self.begin_host_collection(&scope);
                     self.settle(&scope.invocation_id);
                 }
                 reply.complete(result);
@@ -2838,7 +2873,6 @@ impl Driver {
                 let result = self
                     .invocations
                     .get(&scope.invocation_id)
-                    .or_else(|| self.committed_invocations.get(&scope.invocation_id))
                     .filter(|invocation| invocation.scope == scope)
                     .ok_or_else(|| protocol("test effect has no retained invocation"))
                     .and_then(|invocation| {
@@ -2879,7 +2913,7 @@ impl Driver {
                     || self
                         .invocations
                         .get(&scope.invocation_id)
-                        .is_none_or(|invocation| invocation.native_settlement.is_some())
+                        .is_none_or(|invocation| matches!(invocation.terminal, Some(Ok(_))))
                 {
                     let _ = reply.send(Err(not_admitted()));
                     return;
@@ -2909,7 +2943,13 @@ impl Driver {
                         .checked_add(1)
                         .ok_or_else(|| protocol("pending control count exhausted"))?;
                     if let Some(id) = &submission {
-                        self.state.admit(scope.clone(), id.clone())?;
+                        let attempt = input
+                            .submission()
+                            .ok_or_else(|| protocol("steering has no journal attempt"))?
+                            .record()
+                            .map_err(crate::provider::submission::journal_failure)?
+                            .attempt_id;
+                        self.state.admit(scope.clone(), id.clone(), attempt)?;
                     }
                     invocation.pending_controls = pending;
                     invocation.revision = revision;
@@ -2917,6 +2957,7 @@ impl Driver {
                     let reply = reply
                         .take()
                         .expect("control reply is present before dispatch");
+                    let receipt = input.submission();
                     self.submissions.spawn(async move {
                         let result = match dispatch_authority
                             .as_ref()
@@ -2925,13 +2966,13 @@ impl Driver {
                         {
                             Err(error) => Err(ProviderError::PreparationFailed(Box::new(
                                 crate::provider::lifecycle_error::classify(
-                                    forge_provider_api::ProviderOperation::InputSubmit,
+                                    forge_provider_api::ProviderOperation::TurnStart,
                                     error,
                                 ),
                             ))),
                             Ok(_) => {
                                 let result = provider
-                                    .input_steer(&scope.owner, scope.clone(), input)
+                                    .turn_steer(&scope.owner, scope.clone(), input)
                                     .await;
                                 if dispatch_authority
                                     .as_ref()
@@ -2947,6 +2988,8 @@ impl Driver {
                         SubmissionOutcome {
                             scope,
                             submission,
+                            receipt,
+                            not_started: None,
                             control_reply: Some(reply),
                             result,
                         }
@@ -2982,7 +3025,7 @@ impl Driver {
                 };
                 self.idle = SessionObserver::Stream(Box::new(sink));
                 for event in pending {
-                    self.idle_event(event);
+                    self.idle_observation(event);
                 }
                 if self.failed {
                     let _ = reply.send(Err(ProviderError::Observation(
@@ -3034,7 +3077,7 @@ impl Driver {
                         ProviderError::Cancelled
                     } else {
                         ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::WrongInvocation,
                         ))
                     };
@@ -3067,13 +3110,20 @@ impl Driver {
                 {
                     let _ = reply.send(Err(ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::WrongInvocation,
                         ),
                     )));
                     return;
                 }
                 let attempt_id = reservation.attempt_id;
+                let included_inputs = match receipt.included_inputs() {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                };
                 if matches!(
                     record.delivery,
                     crate::provider::submission::SubmissionState::Cancelled
@@ -3167,7 +3217,12 @@ impl Driver {
                         return;
                     }
                     if let Some(submission) = &submission
-                        && let Err(error) = self.state.admit(scope.clone(), submission.clone())
+                        && let Err(error) = self.state.admit_group(
+                            scope.clone(),
+                            submission.clone(),
+                            attempt_id.clone(),
+                            &included_inputs,
+                        )
                     {
                         let _ = reply.send(Err(protocol(&error.to_string())));
                         return;
@@ -3199,7 +3254,8 @@ impl Driver {
                             reply: Some(reply),
                             completion,
                             terminal: None,
-                            native_settlement: None,
+                            native_metadata: Default::default(),
+                            observed_output: false,
                             host_collection: HostCollection::Pending,
                             publication_failure: None,
                             pending_controls: 0,
@@ -3207,7 +3263,6 @@ impl Driver {
                             ticket_outstanding: false,
                             ticket_nonce: 0,
                             abandoned,
-                            idle_observation: false,
                         },
                     );
                 } else {
@@ -3218,7 +3273,12 @@ impl Driver {
                         return;
                     }
                     if let Some(submission) = &submission
-                        && let Err(error) = self.state.admit(scope.clone(), submission.clone())
+                        && let Err(error) = self.state.admit_group(
+                            scope.clone(),
+                            submission.clone(),
+                            attempt_id.clone(),
+                            &included_inputs,
+                        )
                     {
                         let _ = reply.send(Err(protocol(&error.to_string())));
                         return;
@@ -3231,7 +3291,8 @@ impl Driver {
                             reply: Some(reply),
                             completion,
                             terminal: None,
-                            native_settlement: None,
+                            native_metadata: Default::default(),
+                            observed_output: false,
                             host_collection: HostCollection::Pending,
                             publication_failure: None,
                             pending_controls: 0,
@@ -3239,7 +3300,6 @@ impl Driver {
                             ticket_outstanding: false,
                             ticket_nonce: 0,
                             abandoned,
-                            idle_observation: false,
                         },
                     );
                 }
@@ -3248,11 +3308,58 @@ impl Driver {
                 let attempt_submission = request.submission.clone();
                 let attempt_dispatch = request.dispatch.observer();
                 let (finished, finish_observer) = tokio::sync::watch::channel(false);
+                let receipt = attempt_submission.clone();
                 let task = self.submissions.spawn(async move {
-                    let result = provider.input_submit(request, scope.clone()).await;
+                    let mut result = provider.turn_start(request, scope.clone()).await;
+                    let accepted = receipt
+                        .as_ref()
+                        .map(|receipt| receipt.record())
+                        .transpose()
+                        .map(|record| {
+                            record.is_some_and(|record| {
+                                matches!(
+                                    record.delivery,
+                                    crate::provider::submission::SubmissionState::Accepted { .. }
+                                )
+                            })
+                        });
+                    // Preserve the original operation record while awaiting its retained native disposition.
+                    let not_started = if result.is_err() && matches!(accepted, Ok(true)) {
+                        match provider.wait_start_result(&scope).await {
+                            Ok(()) => {
+                                result = Ok(());
+                                None
+                            }
+                            Err(start_error) => match provider.not_started_error(&scope).await {
+                                Ok(Some(error)) => Some(error),
+                                Ok(None) => {
+                                    result = Err(ProviderError::Combined {
+                                        primary: Box::new(result.expect_err(
+                                            "failed operation retains its recorded error",
+                                        )),
+                                        secondary: vec![start_error],
+                                    });
+                                    None
+                                }
+                                Err(error) => {
+                                    result = Err(ProviderError::Combined {
+                                        primary: Box::new(result.expect_err(
+                                            "failed operation retains its recorded error",
+                                        )),
+                                        secondary: vec![start_error, error],
+                                    });
+                                    None
+                                }
+                            },
+                        }
+                    } else {
+                        None
+                    };
                     SubmissionOutcome {
                         scope,
                         submission,
+                        receipt,
+                        not_started,
                         control_reply: None,
                         result,
                     }
@@ -3368,12 +3475,61 @@ impl Driver {
 
     /// Reduce delivery independently, retaining a terminal candidate until all controls settle.
     fn acceptance(&mut self, outcome: SubmissionOutcome) {
+        // Reconcile the operation result against the retained journal receipt.
         let SubmissionOutcome {
             scope,
             submission,
+            receipt,
+            not_started,
             control_reply,
-            result,
+            mut result,
         } = outcome;
+        let receipt_state = match receipt
+            .as_ref()
+            .map(|receipt| receipt.record().map(|record| record.delivery))
+            .transpose()
+        {
+            Ok(state) => state,
+            Err(error) => {
+                self.fail_observation_with_origin(
+                    ObservationFailure::LifecycleUnavailable,
+                    FailureOrigin::Error(crate::provider::submission::journal_failure(error)),
+                );
+                return;
+            }
+        };
+        let accepted = matches!(
+            receipt_state,
+            Some(crate::provider::submission::SubmissionState::Accepted { .. })
+        );
+        let delivery = match &result {
+            Ok(()) => DeliveryState::Accepted,
+            Err(_) if accepted => DeliveryState::Accepted,
+            Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_)) => {
+                DeliveryState::NotConsumed
+            }
+            Err(ProviderError::Cancelled)
+                if matches!(
+                    receipt_state,
+                    Some(
+                        crate::provider::submission::SubmissionState::Prepared
+                            | crate::provider::submission::SubmissionState::Cancelled
+                    )
+                ) =>
+            {
+                DeliveryState::NotConsumed
+            }
+            Err(_) => DeliveryState::Uncertain,
+        };
+        let collected_without_start = not_started.is_some();
+        if let Some(error) = not_started {
+            if control_reply.is_some() || !matches!(self.state.cancel_unstarted(&scope), Ok(true)) {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            }
+            result = Err(error);
+        }
+        // Commit delivery without replacing an independently observed native outcome.
         let Some(invocation) = self.invocations.get_mut(&scope.invocation_id) else {
             if control_reply.is_some()
                 && let Some(invocation) = self.committed_invocations.get_mut(&scope.invocation_id)
@@ -3384,13 +3540,6 @@ impl Driver {
                 };
                 invocation.pending_controls = pending;
             }
-            let delivery = match &result {
-                Ok(()) => DeliveryState::Accepted,
-                Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_)) => {
-                    DeliveryState::NotConsumed
-                }
-                Err(_) => DeliveryState::Uncertain,
-            };
             if let Some(submission) = submission
                 && let Err(error) = self.state.delivery(&scope, &submission, delivery)
             {
@@ -3408,214 +3557,207 @@ impl Driver {
         if is_control {
             invocation.pending_controls -= 1;
         }
-        let delivery = match &result {
-            Ok(()) => DeliveryState::Accepted,
-            Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_)) => {
-                DeliveryState::NotConsumed
-            }
-            Err(_) => DeliveryState::Uncertain,
-        };
         if let Some(submission) = submission
             && let Err(error) = self.state.delivery(&scope, &submission, delivery)
         {
             invocation.terminal = Some(Err(protocol(&error.to_string())));
         }
         if let Some(reply) = control_reply {
-            if result.is_err() && delivery != DeliveryState::NotConsumed {
+            if delivery == DeliveryState::Uncertain {
                 invocation.terminal = Some(Err(ProviderError::DeliveryUncertain));
             }
             let _ = reply.send(result);
-        } else if let Err(error) = result {
+        } else if let Err(error) = result
+            && (!accepted || collected_without_start)
+        {
             invocation.terminal = Some(Err(error));
+        }
+        // Recheck every delivery and collection barrier before releasing the host waiter.
+        if collected_without_start {
+            self.begin_host_collection(&scope);
         }
         self.settle(&scope.invocation_id);
     }
 
-    fn event(&mut self, event: ProviderEvent) {
-        if event.scope().owner() != &self.owner {
-            self.fail_all("foreign owner in provider stream");
+    /// Apply the runner's sole completion and retain all content under its original owner.
+    fn event(&mut self, event: HarnessEvent) {
+        // Validate original ownership before changing root lifecycle state.
+        let event_scope = event.scope().clone();
+        if event_scope.owner() != &self.owner {
+            let registered_host = matches!(&event, HarnessEvent::Host { .. })
+                && event_scope
+                    .invocation()
+                    .is_some_and(|scope| self.provider.observed_scope(scope).is_ok());
+            if (matches!(event, HarnessEvent::Native { .. }) || registered_host)
+                && event_scope.owner().session_id() == self.owner.session_id()
+            {
+                self.idle_event(event);
+            } else {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+            }
             return;
         }
-        if let ProviderEvent::SettlementFailed { scope, failure } = &event {
-            if !self.state.contains(scope) {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
-                return;
-            }
+        if let HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &event
+            && let NativeEvent::Provider {
+                event: ProviderConnectionEvent::Unavailable(unavailable),
+            } = boxed_native_event.as_ref()
+        {
+            self.idle_event(event.clone());
+            self.state
+                .unavailable(ObservationFailure::LifecycleUnavailable);
             self.fail_observation_with_origin(
                 ObservationFailure::LifecycleUnavailable,
-                FailureOrigin::Error(ProviderError::Failure(*failure)),
+                FailureOrigin::Error(ProviderError::Failure(unavailable.failure)),
             );
             return;
         }
-        let Some(scope) = event.scope().invocation().cloned() else {
+        let Some(scope) = event_scope.invocation().cloned() else {
             self.idle_event(event);
             return;
         };
-        if let ProviderEvent::Settled { settlement } = &event {
-            let Some(invocation) = self
-                .invocations
-                .get_mut(&scope.invocation_id)
-                .filter(|invocation| invocation.scope == scope)
-            else {
-                if self
-                    .committed_invocations
-                    .contains_key(&scope.invocation_id)
-                {
-                    return;
-                }
-                self.fail_observation(ObservationFailure::OwnershipConflict);
-                return;
-            };
-            if invocation
-                .native_settlement
-                .as_ref()
-                .is_some_and(|previous| {
-                    previous.binding_id != settlement.binding_id
-                        || previous.result != settlement.result
-                })
-            {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
-                return;
-            }
-            if let Some(Ok(terminal)) = &invocation.terminal
-                && terminal != &settlement.result
-            {
-                self.fail_observation(ObservationFailure::Protocol);
-                return;
-            }
-            invocation.native_settlement = Some(settlement.as_ref().clone());
-            if matches!(invocation.host_collection, HostCollection::Pending) {
-                invocation.host_collection = HostCollection::Collecting;
-                let operation_id =
-                    forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string())
-                        .expect("generated host collection identity is nonempty");
-                self.trace.record(self.owner.session_id.as_str(), "provider.operation.started", serde_json::json!({
-                    "operation_id":operation_id, "operation":forge_provider_api::ProviderOperation::InputSubmit,
-                    "phase":forge_provider_api::ProviderPhase::Collection, "scope":scope,
-                }));
-                let provider = self.provider.clone();
-                let commands = self.commands.clone();
-                self.deliveries.spawn(async move {
-                    let result = provider.collect_host_effects(&scope).await;
-                    let _ = commands
-                        .send(Command::HostEffectsCollected {
-                            scope,
-                            operation_id,
-                            result,
-                        })
-                        .await;
-                    Ok(())
-                });
-            }
-            return;
-        }
-        if !self.invocations.contains_key(&scope.invocation_id)
-            && matches!(&event, ProviderEvent::Execution { observation } if matches!(observation.update(), ExecutionUpdate::Started { .. }))
-            && let Some(invocation) = self.committed_invocations.remove(&scope.invocation_id)
-        {
-            self.idle_event(event);
-            self.invocations
-                .insert(invocation.scope.invocation_id.clone(), invocation);
+        if !self.state.contains(&scope) {
             self.fail_observation(ObservationFailure::OwnershipConflict);
             return;
         }
+        let native_turn = match &event {
+            HarnessEvent::Native { event, .. } => match event.as_ref() {
+                NativeEvent::Turn {
+                    thread_id,
+                    turn_id,
+                    event,
+                } => Some((thread_id, turn_id, event)),
+                NativeEvent::Provider { .. }
+                | NativeEvent::Thread { .. }
+                | NativeEvent::Item { .. }
+                | NativeEvent::Agent { .. } => None,
+            },
+            HarnessEvent::Host { .. } => None,
+        };
         if !self.invocations.contains_key(&scope.invocation_id) {
-            if let ProviderEvent::Execution { observation } = &event {
-                if !self.state.contains(&scope) {
-                    self.fail_all("unregistered execution in provider stream");
-                    return;
-                }
-                if matches!(observation.update(), ExecutionUpdate::Started { .. }) {
-                    self.fail_all("late execution has no retained host settlement authority");
-                    return;
-                }
-                if matches!(observation.update(), ExecutionUpdate::Started { .. })
-                    && !self.invocations.is_empty()
-                {
-                    self.fail_all("late execution conflicts with another admitted exchange");
-                    return;
-                }
-                if self.state.observe(observation.clone()).is_err() {
-                    self.fail_all("conflicting late execution observation");
-                    return;
-                }
-                if let ExecutionUpdate::ObservationLost { failure, .. } = observation.update() {
-                    let failure = failure.clone();
-                    self.idle_event(event);
-                    self.fail_observation(failure);
+            if let Some((thread_id, turn_id, turn)) = native_turn {
+                let result = match turn {
+                    TurnEvent::Started(_) => {
+                        Err(forge_provider_api::lifecycle::LifecycleError::TerminalConflict)
+                    }
+                    TurnEvent::Completed(completed) => {
+                        self.state
+                            .completed(&scope, thread_id, turn_id, completed.clone())
+                    }
+                    TurnEvent::Error { .. }
+                    | TurnEvent::ModelResolved(_)
+                    | TurnEvent::Usage(_)
+                    | TurnEvent::ChecklistUpdated(_) => Ok(()),
+                };
+                if result.is_err() {
+                    self.fail_observation(ObservationFailure::OwnershipConflict);
                     return;
                 }
             }
             self.idle_event(event);
             return;
+        }
+        // Apply only the runner-owned root lifecycle to this invocation.
+        if let Some((thread_id, turn_id, turn)) = native_turn {
+            let result = match turn {
+                TurnEvent::Started(_) => self.state.started(&scope, thread_id, turn_id),
+                TurnEvent::Completed(completed) => {
+                    self.state
+                        .completed(&scope, thread_id, turn_id, completed.clone())
+                }
+                TurnEvent::Error { .. }
+                | TurnEvent::ModelResolved(_)
+                | TurnEvent::Usage(_)
+                | TurnEvent::ChecklistUpdated(_) => Ok(()),
+            };
+            if result.is_err() {
+                self.fail_observation(ObservationFailure::Protocol);
+                return;
+            }
         }
         let invocation = self
             .invocations
             .get_mut(&scope.invocation_id)
-            .expect("active invocation was checked");
-        if let ProviderEvent::Execution { observation } = &event {
-            if matches!(observation.update(), ExecutionUpdate::Started { .. })
-                && invocation.native_settlement.is_some()
-            {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
-                return;
-            }
-            let Some(revision) = invocation.revision.checked_add(1) else {
-                self.fail_all("settlement revision exhausted");
-                return;
-            };
-            invocation.revision = revision;
-            if let Err(error) = self.state.observe(observation.clone()) {
-                invocation.terminal = Some(Err(protocol(&error.to_string())));
-            } else {
-                invocation.terminal = match observation.update() {
-                    ExecutionUpdate::Started { .. } => {
-                        invocation.native_settlement = None;
-                        invocation.host_collection = HostCollection::Pending;
-                        None
+            .expect("admitted invocation remains owned by driver");
+        let mut begin_collection = false;
+        if let Some((_, _, turn)) = native_turn {
+            match turn {
+                TurnEvent::Started(_) => {
+                    invocation.host_collection = HostCollection::Pending;
+                }
+                TurnEvent::Completed(completed) => {
+                    if matches!(&invocation.terminal, Some(Ok(previous)) if previous == completed) {
+                        return;
                     }
-                    ExecutionUpdate::Finished { result, .. }
-                    | ExecutionUpdate::ResolvedWithoutExecution { result, .. } => {
-                        Some(Ok(result.clone()))
+                    let Some(revision) = invocation.revision.checked_add(1) else {
+                        self.fail_all("settlement revision exhausted");
+                        return;
+                    };
+                    invocation.revision = revision;
+                    invocation.terminal = Some(Ok(completed.clone()));
+                    if matches!(invocation.host_collection, HostCollection::Pending) {
+                        invocation.host_collection = HostCollection::Collecting;
+                        begin_collection = true;
                     }
-                    ExecutionUpdate::PublicationFailed {
-                        failure, result, ..
-                    }
-                    | ExecutionUpdate::ResolutionPublicationFailed {
-                        failure, result, ..
-                    } => {
-                        let kind = match failure {
-                            forge_provider_api::HostEffectFailure::Rejected
-                            | forge_provider_api::HostEffectFailure::Retired => {
-                                forge_provider_api::ProviderFailureKind::Rejected
-                            }
-                            forge_provider_api::HostEffectFailure::Uncertain => {
-                                forge_provider_api::ProviderFailureKind::Persistence
-                            }
-                        };
-                        invocation.publication_failure = Some(ProviderError::Failure(
-                            forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::InputSubmit,
-                                kind,
-                            ),
-                        ));
-                        Some(Ok(result.clone()))
-                    }
-                    ExecutionUpdate::ObservationLost { failure, .. } => {
-                        Some(Err(ProviderError::Observation(failure.clone())))
-                    }
-                };
+                }
+                TurnEvent::ModelResolved(model) => {
+                    invocation.native_metadata.runtime.model = Some(model.model_id.to_string());
+                }
+                TurnEvent::Error { .. } | TurnEvent::Usage(_) | TurnEvent::ChecklistUpdated(_) => {}
             }
         }
-        if invocation.idle_observation {
-            self.idle_event(event);
-            self.settle(&scope.invocation_id);
-            return;
+        // Accumulate retry-sensitive evidence while forwarding complete payloads to canonical reducers.
+        if let HarnessEvent::Native { event, .. } = &event {
+            match event.as_ref() {
+                NativeEvent::Item { event, .. } => {
+                    use forge_provider_api::message::{ItemEvent, ItemStart};
+                    invocation.observed_output |= has_model_output(event);
+                    match event {
+                        ItemEvent::Started(
+                            ItemStart::CommandExecution(_)
+                            | ItemStart::FileChange(_)
+                            | ItemStart::ToolCall(_),
+                        ) => invocation.native_metadata.evidence.tool_called = true,
+                        ItemEvent::Started(
+                            ItemStart::UserMessage(_)
+                            | ItemStart::AgentMessage(_)
+                            | ItemStart::Reasoning(_),
+                        )
+                        | ItemEvent::Message { .. }
+                        | ItemEvent::Completed(_) => {}
+                        ItemEvent::Tool {
+                            event: forge_provider_api::tool::ToolItemEvent::Changes(changes),
+                        } => {
+                            invocation.native_metadata.evidence.workspace_changed |=
+                                !changes.file.is_empty();
+                        }
+                        ItemEvent::Tool { .. } => {}
+                    }
+                }
+                NativeEvent::Thread {
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(identity),
+                    ..
+                } => invocation.native_metadata.provider_session_id = Some(identity.clone()),
+                NativeEvent::Thread {
+                    event: forge_provider_api::ThreadEvent::ContextUsage(usage),
+                    ..
+                } => invocation.native_metadata.metrics.context_usage = Some(usage.clone()),
+                NativeEvent::Provider { .. }
+                | NativeEvent::Thread { .. }
+                | NativeEvent::Turn { .. }
+                | NativeEvent::Agent { .. } => {}
+            }
         }
         let output = invocation.output.clone();
+        // Collect host callbacks before allowing the settlement ticket to escape.
+        if begin_collection {
+            self.spawn_host_collection(&scope);
+        }
         if !self.enqueue(Delivery::Event {
             sink: output,
-            event: Box::new(event),
+            event: Box::new(OwnerObservation::Event(event)),
             fallback: Some(self.idle.clone()),
         }) {
             self.fail_observation(ObservationFailure::Disconnected);
@@ -3624,16 +3766,132 @@ impl Driver {
         self.settle(&scope.invocation_id);
     }
 
+    /// Start host collection once for a proven native end or collected no-start operation.
+    fn begin_host_collection(&mut self, scope: &InvocationScope) {
+        let Some(invocation) = self.invocations.get_mut(&scope.invocation_id) else {
+            return;
+        };
+        if !matches!(invocation.host_collection, HostCollection::Pending) {
+            return;
+        }
+        invocation.host_collection = HostCollection::Collecting;
+        self.spawn_host_collection(scope);
+    }
+
+    /// Retain callback endpoint and relay collection in the existing delivery worker set.
+    fn spawn_host_collection(&mut self, scope: &InvocationScope) {
+        let operation_id = forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string())
+            .expect("generated collection identity is nonempty");
+        let provider = self.provider.clone();
+        let commands = self.commands.clone();
+        let scope = scope.clone();
+        self.deliveries.spawn(async move {
+            let result = provider.collect_host_effects(&scope).await;
+            let _ = commands
+                .send(Command::HostEffectsCollected {
+                    scope,
+                    operation_id,
+                    result,
+                })
+                .await;
+            Ok(())
+        });
+    }
+
+    /// Deliver acceptance to the same original owner as its input's provider operation.
+    fn publish_acceptance(
+        &mut self,
+        scope: InvocationScope,
+        receipt: Arc<crate::provider::submission::Submission>,
+        presentation: InputPresentation,
+    ) {
+        let record = match receipt.record() {
+            Ok(record) => record,
+            Err(error) => {
+                self.fail_observation_with_origin(
+                    ObservationFailure::LifecycleUnavailable,
+                    FailureOrigin::Error(crate::provider::submission::journal_failure(error)),
+                );
+                return;
+            }
+        };
+        if !matches!(
+            record.delivery,
+            crate::provider::submission::SubmissionState::Accepted { .. }
+        ) || record.request.owner().ok().as_ref() != Some(&scope.owner)
+            || self
+                .state
+                .validate_acceptance(&scope, receipt.receipt_id(), &record.attempt_id)
+                .is_err()
+        {
+            self.fail_observation(ObservationFailure::OwnershipConflict);
+            return;
+        }
+        let observation = OwnerObservation::InputAcceptance {
+            scope: scope.clone(),
+            receipt,
+            presentation,
+        };
+        if let Some(invocation) = self.invocations.get(&scope.invocation_id) {
+            let sink = invocation.output.clone();
+            if !self.enqueue(Delivery::Event {
+                sink,
+                event: Box::new(observation),
+                fallback: Some(self.idle.clone()),
+            }) {
+                self.fail_observation(ObservationFailure::Disconnected);
+            }
+            return;
+        }
+        self.idle_observation(observation);
+    }
+
     /// Retain initialization and late output under the owner-wide observer.
-    fn idle_event(&mut self, event: ProviderEvent) {
+    fn idle_event(&mut self, event: HarnessEvent) {
+        self.idle_observation(OwnerObservation::Event(event));
+    }
+
+    /// Preserve acceptance and activity ordering when foreground delivery has retired.
+    fn idle_observation(&mut self, observation: OwnerObservation) {
         match self.idle.clone() {
             SessionObserver::Inbox(inbox) => {
-                if !self.enqueue(Delivery::Inbox { inbox, event }) {
+                if !self.enqueue(Delivery::Inbox {
+                    inbox,
+                    event: observation,
+                }) {
                     self.fail_observation(ObservationFailure::Disconnected);
                 }
             }
             SessionObserver::Stream(idle) => {
-                let sink = match idle.bind_scope(event.scope()) {
+                let scope = observation.scope();
+                let bound = if scope.owner() == &self.owner {
+                    idle.bind_scope(scope)
+                } else {
+                    match &observation {
+                        OwnerObservation::Event(HarnessEvent::Native { .. }) => {
+                            idle.registered_native_sink(&scope)
+                        }
+                        OwnerObservation::Event(HarnessEvent::Host { .. })
+                        | OwnerObservation::HostFileChange { .. } => match scope
+                            .invocation()
+                            .ok_or_else(|| {
+                                protocol("host child observation has no original invocation")
+                            })
+                            .and_then(|scope| self.provider.observed_scope(scope))
+                        {
+                            Ok(association) => idle.registered_observed_sink(&association),
+                            Err(_) => {
+                                self.fail_observation(ObservationFailure::OwnershipConflict);
+                                return;
+                            }
+                        },
+                        OwnerObservation::InputAcceptance { .. } => {
+                            self.fail_observation(ObservationFailure::OwnershipConflict);
+                            return;
+                        }
+                    }
+                };
+                let sink = match bound {
                     Ok(sink) => sink,
                     Err(error) => {
                         self.fail_all(&error.to_string());
@@ -3642,7 +3900,7 @@ impl Driver {
                 };
                 if !self.enqueue(Delivery::Event {
                     sink,
-                    event: Box::new(event),
+                    event: Box::new(observation),
                     fallback: None,
                 }) {
                     self.fail_observation(ObservationFailure::Disconnected);
@@ -3674,8 +3932,6 @@ impl Driver {
         };
         if self.pending_delivery.len() < forge_protocol::MAX_PENDING_FRAMES {
             self.pending_delivery.push_back(delivery);
-            #[cfg(test)]
-            self.delivery_pressure.send_replace(true);
             return true;
         }
         if !self.queue_loss_reported.swap(true, Ordering::AcqRel) {
@@ -3683,12 +3939,12 @@ impl Driver {
                 Delivery::Inbox { event, .. } => (
                     "engine_idle",
                     Some(event.scope()),
-                    serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
+                    event.encoded_event_bytes(),
                 ),
                 Delivery::Event { event, .. } => (
                     "engine_foreground",
                     Some(event.scope()),
-                    serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
+                    event.encoded_event_bytes(),
                 ),
                 Delivery::Complete { result, .. } => (
                     "engine_completion",
@@ -3700,7 +3956,7 @@ impl Driver {
                     None,
                 ),
             };
-            self.trace.record(self.owner.session_id.as_str(), "provider.observation_queue_lost", serde_json::json!({
+            self.trace.record(self.owner.session_id().as_str(), "provider.observation_queue_lost", serde_json::json!({
                 "provider":self.provider.descriptor().kind, "stage":stage,
                 "queued":self.pending_delivery.len(), "capacity":forge_protocol::MAX_PENDING_FRAMES,
                 "queued_bytes":null, "event_bytes":event_bytes, "source_scope":source_scope, "owner":self.owner,
@@ -3749,20 +4005,22 @@ impl Driver {
             self.fail_observation_with_origin(failure, origin);
             return;
         }
-        if matches!(invocation.terminal, Some(Ok(_)))
-            && (invocation.native_settlement.is_none()
-                || !matches!(invocation.host_collection, HostCollection::Settled))
+        let not_started = self.state.not_started(&invocation.scope);
+        if (matches!(invocation.terminal, Some(Ok(_))) || not_started)
+            && !matches!(invocation.host_collection, HostCollection::Settled)
         {
             return;
         }
-        if self.invocations.get(id).is_some_and(|invocation| {
-            matches!(
-                &invocation.terminal,
-                Some(Err(ProviderError::PreparationFailed(_)
-                    | ProviderError::NotConsumed
-                    | ProviderError::Cancelled))
-            )
-        }) {
+        if !not_started
+            && self.invocations.get(id).is_some_and(|invocation| {
+                matches!(
+                    &invocation.terminal,
+                    Some(Err(ProviderError::PreparationFailed(_)
+                        | ProviderError::NotConsumed
+                        | ProviderError::Cancelled))
+                )
+            })
+        {
             let mut invocation = self
                 .invocations
                 .remove(id)
@@ -3786,16 +4044,44 @@ impl Driver {
         let Some(reply) = invocation.reply.take() else {
             return;
         };
-        let Some(Ok(terminal)) = invocation.terminal.as_ref() else {
-            let _ = reply.send(Err(protocol("invalid terminal observation")));
-            self.fail_all("invalid terminal observation");
-            return;
-        };
+        let terminal = invocation
+            .terminal
+            .as_ref()
+            .expect("settlement requires a retained terminal disposition");
+        let preview =
+            match terminal {
+                Ok(completed) => invocation.completion.preview_provider_execution(
+                    completed.result(),
+                    &invocation.native_metadata,
+                    &forge_provider_api::TurnAddress {
+                        scope: invocation.scope.clone(),
+                        thread_id: invocation.scope.owner.thread_id(),
+                        turn_id: invocation
+                            .scope
+                            .turn_id()
+                            .expect("admitted turn has a host identity"),
+                    },
+                ),
+                Err(error) if not_started => invocation
+                    .completion
+                    .provider_completion
+                    .preview()
+                    .map(|preview| crate::tools::ProviderExecutionPreview {
+                        revision: preview.revision,
+                        outcome: Err(error.clone()),
+                        batches: preview.batches,
+                    }),
+                Err(error) => {
+                    let _ = reply.send(Err(error.clone()));
+                    self.fail_all("invalid terminal observation");
+                    return;
+                }
+            };
         let crate::tools::ProviderExecutionPreview {
             revision: effects_revision,
             mut outcome,
             batches,
-        } = match invocation.completion.preview_provider_execution(terminal) {
+        } = match preview {
             Ok(preview) => preview,
             Err(error) => {
                 let message = error.to_string();
@@ -3804,6 +4090,16 @@ impl Driver {
                 return;
             }
         };
+        if invocation.observed_output
+            && matches!(outcome, Err(ProviderError::Retryable(_)))
+            && let forge_provider_api::turn::TurnOutcome::Failed { error, .. } = terminal
+                .as_ref()
+                .expect("retryable native outcome has a completed turn")
+                .result()
+                .outcome()
+        {
+            outcome = Err(ProviderError::Failure(error));
+        }
         if let Some(failure) = &invocation.publication_failure {
             outcome = Err(failure.clone());
         }
@@ -3856,7 +4152,7 @@ impl Driver {
                     None,
                     Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
                         crate::provider::lifecycle_error::classify_source(
-                            forge_provider_api::error::ProviderOperation::SessionClose,
+                            forge_provider_api::error::ProviderOperation::ThreadClose,
                             &error,
                         ),
                     ))),
@@ -3893,17 +4189,23 @@ impl Driver {
                 }
             }
             self.cleanup_failure = Some(report.clone());
-            self.idle.diagnostic(ProviderEvent::Diagnostic {
+            self.idle.diagnostic(HarnessEvent::Host {
                 scope: crate::provider::EventScope::Binding {
                     owner: self.owner.clone(),
                 },
-                diagnostic: crate::provider::ProviderDiagnostic {
-                    kind: forge_provider_api::ProviderFailureKind::Runtime,
+                event: crate::provider::HostEvent::Failure {
+                    failure: forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::ThreadClose,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Collection,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    ),
                     message: forge_provider_api::SanitizedMessage::new(
                         "Provider observation cleanup failed",
                     )
                     .expect("static diagnostic is nonempty"),
-                    fatal: true,
                 },
             });
         }
@@ -3945,8 +4247,18 @@ impl Driver {
             FailureOrigin::Observation => None,
             FailureOrigin::Error(error) => Some(error.clone()),
         };
+        let observer = match &self.idle {
+            SessionObserver::Inbox(inbox) => Some(inbox.clone()),
+            SessionObserver::Stream(_) => None,
+        };
         self.cleanup.spawn(async move {
-            let report = collect_failed_execution(provider.as_ref(), &owner, observation).await;
+            let report = collect_failed_execution(
+                provider.as_ref(),
+                &owner,
+                observation,
+                observer.as_deref(),
+            )
+            .await;
             match cleanup_origin {
                 Some(origin) => report.with_origin(origin),
                 None => report,
@@ -3971,20 +4283,10 @@ impl Driver {
                 )
             })
             .collect();
-        for (scope, output, reply) in waiters {
-            if let Ok(observation) = forge_provider_api::lifecycle::ExecutionObservation::new(
-                scope,
-                ExecutionUpdate::ObservationLost {
-                    failure: failure.clone(),
-                    completion: None,
-                },
-            ) {
-                self.enqueue(Delivery::Event {
-                    sink: output,
-                    event: Box::new(ProviderEvent::Execution { observation }),
-                    fallback: Some(self.idle.clone()),
-                });
-            }
+        for (_scope, output, reply) in waiters {
+            output.fail(crate::provider::events::EventDeliveryError::Observation(
+                failure.clone(),
+            ));
             if let Some(reply) = reply {
                 let original = match &origin {
                     FailureOrigin::Observation => None,
@@ -3999,12 +4301,21 @@ impl Driver {
 /// Retry cleanup without admitting new work or replaying the failed invocation.
 async fn collect_failed_execution(
     provider: &Provider,
-    owner: &ExecutionOwner,
+    owner: &ThreadOwner,
     failure: ObservationFailure,
+    observer: Option<&super::SessionObservationInbox>,
 ) -> forge_provider_api::error::ObservationCleanup {
     use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
 
-    let collection = provider.session_close_owner(owner).await;
+    let collection = provider
+        .session_close_owner(owner)
+        .await
+        .and_then(|binding| {
+            if let (Some(observer), Some(binding)) = (observer, binding) {
+                observer.record_retired_binding(binding)?;
+            }
+            Ok(())
+        });
     let classify = |result: Result<(), ProviderError>| match result {
         Ok(()) => None,
         Err(error) => Some(CleanupFailure::Failed(Box::new(error))),
@@ -4032,7 +4343,7 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
     while let Some(delivery) = pending.recv().await {
         let result = match delivery {
             Delivery::Inbox { inbox, event } => {
-                let result = inbox.push(event);
+                let result = inbox.push_observation(event);
                 if let Err(ProviderError::Observation(failure)) = &result {
                     inbox.fail(failure.clone());
                 }
@@ -4045,14 +4356,17 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
             } => {
                 let event = *event;
                 match fallback {
-                    Some(observer) => match sink.send_wait(event.clone()).await {
+                    Some(observer) => match sink.send_observation(event.clone()).await {
                         Ok(()) => Ok(()),
                         Err(crate::provider::events::EventDeliveryError::Closed) => {
                             observer.retain(event).await
                         }
                         Err(error) => Err(error.into()),
                     },
-                    None => sink.send_wait(event).await.map_err(ProviderError::from),
+                    None => sink
+                        .send_observation(event)
+                        .await
+                        .map_err(ProviderError::from),
                 }
             }
             Delivery::Complete { reply, result } => {
@@ -4075,35 +4389,62 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
     Ok(())
 }
 
-/// Classify observation logs without recording prompt text, tool payloads, or native details.
-fn event_category(event: &ProviderEvent) -> &'static str {
+/// Detect native assistant content that makes automatic replay unsafe.
+fn has_model_output(event: &forge_provider_api::message::ItemEvent) -> bool {
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart, MessageItemEvent};
     match event {
-        ProviderEvent::Settled { .. } => "settled",
-        ProviderEvent::SettlementFailed { .. } => "settlement_failed",
-        ProviderEvent::CapabilitiesChanged { .. } => "capabilities_changed",
-        ProviderEvent::SessionIdentity { .. } => "session_identity",
-        ProviderEvent::Terminals { .. } => "terminals",
-        ProviderEvent::Execution { .. } => "execution",
-        ProviderEvent::Message { .. } => "message",
-        ProviderEvent::Tool { .. } => "tool",
-        ProviderEvent::Turn { .. } => "turn",
-        ProviderEvent::Usage { .. } => "usage",
-        ProviderEvent::Runtime { .. } => "runtime",
-        ProviderEvent::Compaction { .. } => "compaction",
-        ProviderEvent::Agent { .. } => "agent",
-        ProviderEvent::Checklist { .. } => "checklist",
-        ProviderEvent::Approval { .. } => "approval",
-        ProviderEvent::DirectoryAccess { .. } => "directory_access",
-        ProviderEvent::InputAccepted { .. } => "input_accepted",
-        ProviderEvent::Retry { .. } => "retry",
-        ProviderEvent::Diagnostic { .. } => "diagnostic",
-        ProviderEvent::ParentBoundary { .. } => "parent_boundary",
+        ItemEvent::Started(ItemStart::AgentMessage(message)) => !message.text.is_empty(),
+        ItemEvent::Started(ItemStart::Reasoning(reasoning)) => !reasoning.text.is_empty(),
+        ItemEvent::Message {
+            event: MessageItemEvent::Delta(text),
+        } => !text.is_empty(),
+        ItemEvent::Completed(
+            ItemCompletion::AgentMessage(message) | ItemCompletion::Reasoning(message),
+        ) => !message.text.is_empty(),
+        ItemEvent::Started(
+            ItemStart::UserMessage(_)
+            | ItemStart::CommandExecution(_)
+            | ItemStart::FileChange(_)
+            | ItemStart::ToolCall(_),
+        )
+        | ItemEvent::Message {
+            event: MessageItemEvent::Classified(_),
+        }
+        | ItemEvent::Tool { .. }
+        | ItemEvent::Completed(
+            ItemCompletion::UserMessage(_)
+            | ItemCompletion::CommandExecution(_)
+            | ItemCompletion::FileChange(_)
+            | ItemCompletion::ToolCall(_),
+        ) => false,
+    }
+}
+
+/// Classify observation logs without recording prompt text, tool payloads, or native details.
+fn event_category(event: &HarnessEvent) -> &'static str {
+    match event {
+        HarnessEvent::Native { event, .. } => match event.as_ref() {
+            NativeEvent::Provider { .. } => "provider",
+            NativeEvent::Thread { .. } => "thread",
+            NativeEvent::Turn { .. } => "turn",
+            NativeEvent::Item { .. } => "item",
+            NativeEvent::Agent { .. } => "agent",
+        },
+        HarnessEvent::Host { event, .. } => match event {
+            crate::provider::HostEvent::PermissionApproval { .. } => "approval",
+            crate::provider::HostEvent::DirectoryAccessGranted(_) => "directory_access",
+            crate::provider::HostEvent::RetryUpdated { .. } => "retry",
+            crate::provider::HostEvent::ChildWait { .. } => "child_wait",
+            crate::provider::HostEvent::SkillRead { .. } => "skill_read",
+            crate::provider::HostEvent::CapabilitiesNegotiated { .. } => "capabilities",
+            crate::provider::HostEvent::Failure { .. } => "host_failure",
+        },
     }
 }
 
 fn protocol(_message: &str) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::InputSubmit,
+        forge_provider_api::ProviderOperation::TurnStart,
         forge_provider_api::ProviderFailureKind::Protocol,
     ))
 }
@@ -4111,7 +4452,7 @@ fn protocol(_message: &str) -> ProviderError {
 fn not_admitted() -> ProviderError {
     ProviderError::PreparationFailed(Box::new(ProviderError::Failure(
         forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::InputSteer,
+            forge_provider_api::ProviderOperation::TurnSteer,
             forge_provider_api::ProviderFailureKind::Rejected,
         ),
     )))
@@ -4131,7 +4472,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(directory.path())?);
         let database =
-            rusqlite::Connection::open(crate::storage::state::database(&directory.path()))?;
+            rusqlite::Connection::open(crate::storage::state::database(directory.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         database.execute_batch("CREATE TRIGGER reject_consumption BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='provider_event_consumed' BEGIN SELECT RAISE(ABORT,'fixture consumption evidence failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
@@ -4145,7 +4486,7 @@ mod tests {
             trace.clone(),
             directory.path().into(),
         )?;
-        let owner = ExecutionOwner::root("session");
+        let owner = ThreadOwner::root("session");
         let (delivery, mut pending) = mpsc::channel(8);
         let (commands, _receive) = mpsc::channel(1);
         let mut driver = Driver {
@@ -4160,7 +4501,6 @@ mod tests {
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
             pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -4183,15 +4523,25 @@ mod tests {
             submission_exits: Default::default(),
         };
         driver
-            .native_event(crate::provider::bridge::HostEvent {
-                event: ProviderEvent::Diagnostic {
-                    scope: forge_provider_api::EventScope::Binding { owner },
-                    diagnostic: forge_provider_api::ProviderDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new("not published")?,
-                        fatal: false,
+            .native_event(crate::provider::bridge::ProviderObservation {
+                event: OwnerObservation::Event(HarnessEvent::Native {
+                    source: crate::provider::events::NativeEventSource {
+                        binding_id: forge_provider_api::BindingId::new("binding")?,
+                        sequence: forge_provider_api::EventSequence::new(1),
                     },
-                },
+                    scope: forge_provider_api::EventScope::Binding {
+                        owner: owner.clone(),
+                    },
+                    event: Box::new(NativeEvent::Thread {
+                        thread_id: owner.thread_id(),
+                        event: forge_provider_api::ThreadEvent::Error {
+                            error: forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::ThreadOpen,
+                                forge_provider_api::ProviderFailureKind::Unknown,
+                            ),
+                        },
+                    }),
+                }),
                 native: Some((
                     forge_provider_api::BindingId::new("binding")?,
                     forge_provider_api::EventSequence::new(1),
@@ -4213,14 +4563,13 @@ mod tests {
     use crate::provider::mock_response::MockResponseCommand;
     use crate::provider::{PromptMode, ProviderInput, ProviderLaunch};
     use anyhow::Context;
-    use forge_provider_api::lifecycle::ExecutionObservation;
 
     /// Dropping a cancellable checkout restores the sole ticket to its host owner.
     #[test]
     fn settlement_checkout_restores_ticket_on_drop() -> anyhow::Result<()> {
         let cell = Arc::new(SettlementCell::default());
         let (commands, _receive) = mpsc::channel(1);
-        let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "exchange");
         {
             let mut checkout = cell.checkout()?;
             assert!(cell.checkout().is_err());
@@ -4416,15 +4765,16 @@ mod tests {
         let task = tokio::spawn(async move { Err(ProviderError::Cleanup(report)) });
         let (commands, _receive) = mpsc::channel(1);
         let engine = SessionExecution {
-            owner: ExecutionOwner::root("failed-close"),
+            thread_id: forge_provider_api::ThreadId::new("test-thread").unwrap(),
+            owner: ThreadOwner::root("failed-close"),
             provider,
             commands,
             healthy: Arc::new(AtomicBool::new(true)),
             orderly_shutdown: Arc::new(AtomicBool::new(false)),
+            observer: Arc::default(),
             task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
             activity: Default::default(),
             admitted: Default::default(),
-            delivery_pressure: tokio::sync::watch::channel(false).1,
             presentation_queue: mpsc::channel(1).0.downgrade(),
         };
         let Err(ProviderError::Cleanup(actual)) = engine.close().await else {
@@ -4456,7 +4806,7 @@ mod tests {
         )?;
         let store =
             crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let owner = ExecutionOwner::root("host-ticket");
+        let owner = ThreadOwner::root("host-ticket");
         let registry = SessionExecutionRegistry::new(provider.clone(), trace.clone());
         let engine = registry.owner(owner.clone()).await?;
         let mut request = ProviderRequest {
@@ -4474,6 +4824,7 @@ mod tests {
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -4619,7 +4970,7 @@ mod tests {
             trace.clone(),
             directory.path().into(),
         )?;
-        let owner = ExecutionOwner::root("collected-prevention");
+        let owner = ThreadOwner::root("collected-prevention");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let (commands, _receive) = mpsc::channel(1);
         let collection = ExchangeCollection {
@@ -4639,7 +4990,6 @@ mod tests {
             deliveries: JoinSet::new(),
             delivery: None,
             pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -4696,204 +5046,215 @@ mod tests {
         Ok(())
     }
 
-    /// A native terminal cannot release the owner before provider settlement and host-effect commit.
+    /// Native completion and collected no-start both wait for host collection and effect commit.
     #[tokio::test]
     async fn native_terminal_waits_for_settlement_and_host_effect_commit() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = crate::provider::build(
-            ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: Vec::new(),
-            },
-            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
-            trace.clone(),
-            directory.path().into(),
-        )?;
-        let owner = ExecutionOwner::root("idle-host-effects");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let submission = SubmissionId::try_from("original".to_owned())?;
-        let first = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "first".into(),
-        };
-        let completed = forge_provider_api::lifecycle::ExecutionResult::Completed {
-            completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-        };
-        let mut state = ExecutionState::new(owner.clone());
-        state.admit(scope.clone(), submission.clone())?;
-        state.delivery(&scope, &submission, DeliveryState::Accepted)?;
-        state.observe(ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Started {
-                address: first.clone(),
-            },
-        )?)?;
-        state.observe(ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::Finished {
-                address: first,
-                covered_submissions: vec![submission],
-                completed_at_ms: 1,
-                result: completed.clone(),
-            },
-        )?)?;
-        let context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
-        let slot = context.provider_completion.clone();
-        let (sink, _events) = crate::provider::events::channel(scope.clone());
-        let (reply, response) = oneshot::channel();
-        let mut committed = HashMap::new();
-        committed.insert(
-            scope.invocation_id.clone(),
-            Invocation {
+        for not_started in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+            let provider: Arc<Provider> = crate::provider::build(
+                ProviderLaunch {
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
+                    command: Vec::new(),
+                },
+                crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+                trace.clone(),
+                directory.path().into(),
+            )?;
+            let owner = ThreadOwner::root("idle-host-effects");
+            let scope = InvocationScope::new(owner.clone(), "exchange");
+            let submission = SubmissionId::try_from("original".to_owned())?;
+            let first = crate::provider::TurnAddress {
                 scope: scope.clone(),
-                output: sink,
-                reply: Some(reply),
-                completion: context,
-                terminal: Some(Ok(completed.clone())),
-                native_settlement: None,
-                host_collection: HostCollection::Pending,
-                publication_failure: None,
-                pending_controls: 0,
-                revision: 1,
-                ticket_outstanding: false,
-                ticket_nonce: 1,
-                abandoned: Arc::new(AtomicBool::new(false)),
-                idle_observation: false,
-            },
-        );
-        let (delivery, mut deliveries) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let (commands, _receive) = mpsc::channel(1);
-        let mut driver = Driver {
-            trace: Arc::new(crate::trace::TraceStore::open(directory.path())?),
-            queue_loss_reported: AtomicBool::new(false),
-            owner,
-            provider,
-            state,
-            invocations: committed,
-            committed_invocations: HashMap::new(),
-            submissions: JoinSet::new(),
-            deliveries: JoinSet::new(),
-            delivery: Some(delivery),
-            pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
-            cleanup: JoinSet::new(),
-            failed_waiters: Vec::new(),
-            commands,
-            next_ticket_nonce: 1,
-            committed_tickets: HashMap::new(),
-            failed: false,
-            healthy: Arc::new(AtomicBool::new(true)),
-            first_failure: None,
-            cleanup_failure: None,
-            retiring: None,
-            idle: SessionObserver::Inbox(Arc::default()),
-            activity: Default::default(),
-            admitted: Default::default(),
-            attempts: HashMap::new(),
-            cancelled_admissions: Default::default(),
-            cancelled_exchanges: Default::default(),
-            prevented_invocations: Default::default(),
-            reservations: Default::default(),
-            latest_reservations: Default::default(),
-            submission_exits: Default::default(),
-        };
-        driver.settle(&scope.invocation_id);
-        assert!(
-            deliveries.try_recv().is_err(),
-            "terminal bypassed provider settlement"
-        );
-        slot.publish(ProviderCompletion {
-            plan_question: Some(crate::plan::PlanQuestionSet {
-                id: "idle-question".into(),
-                questions: Vec::new(),
-            }),
-            ..Default::default()
-        })?;
-        driver.event(ProviderEvent::Settled {
-            settlement: Box::new(forge_provider_api::InvocationSettlement {
-                binding_id: forge_provider_api::BindingId::new("binding")?,
-                scope: scope.clone(),
-                result: completed,
-                watermark: forge_provider_api::EventSequence::new(2),
-            }),
-        });
-        assert!(
-            deliveries.try_recv().is_err(),
-            "native settlement bypassed host-owned collection"
-        );
-        driver.command(Command::HostEffectsCollected {
-            scope: scope.clone(),
-            operation_id: forge_provider_api::OperationId::new("fixture-collection")?,
-            result: Ok(()),
-        });
-        while let Some(delivery) = deliveries.recv().await {
-            if let Delivery::Complete { reply, result } = delivery {
-                reply.send(*result).ok();
-                break;
+                thread_id: owner.thread_id(),
+                turn_id: scope.turn_id()?,
+            };
+            let attempt = forge_provider_api::DeliveryAttemptId::new("attempt")?;
+            let completed = if not_started {
+                None
+            } else {
+                Some(crate::provider::test_support::completed_turn(
+                    scope.clone(),
+                    forge_provider_api::TurnResult::new(
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        1,
+                        None,
+                        vec![forge_provider_api::CoveredInput::new(
+                            submission.clone(),
+                            attempt.clone(),
+                        )],
+                        vec![],
+                        None,
+                    )?,
+                )?)
+            };
+            let mut state = ExecutionState::new(owner.clone());
+            state.admit(scope.clone(), submission.clone(), attempt)?;
+            state.delivery(&scope, &submission, DeliveryState::Accepted)?;
+            if let Some(completed) = &completed {
+                state.started(&scope, &first.thread_id, &first.turn_id)?;
+                state.completed(&scope, &first.thread_id, &first.turn_id, completed.clone())?;
+            } else {
+                assert!(state.cancel_unstarted(&scope)?);
             }
-        }
-        let ready = response.await??;
-        assert_eq!(
-            ready.batches[0]
-                .completion
-                .plan_question
-                .as_ref()
-                .unwrap()
-                .id,
-            "idle-question"
-        );
-        assert!(slot.preview()?.completion.is_some());
-        let (reply, committed) = oneshot::channel();
-        driver.command(Command::CommitSettlement {
-            scope: scope.clone(),
-            revision: ready.ticket.revision,
-            effects_revision: ready.ticket.effects_revision,
-            nonce: ready.ticket.nonce,
-            reply,
-        });
-        committed.await??;
-        assert!(slot.preview()?.completion.is_none());
-        assert!(
+            let context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
+            let slot = context.provider_completion.clone();
+            let (sink, _events) = crate::provider::events::channel(scope.clone());
+            let (reply, response) = oneshot::channel();
+            let mut committed = HashMap::new();
+            committed.insert(
+                scope.invocation_id.clone(),
+                Invocation {
+                    scope: scope.clone(),
+                    output: sink,
+                    reply: Some(reply),
+                    completion: context,
+                    terminal: Some(completed.ok_or(ProviderError::Cancelled)),
+                    native_metadata: Default::default(),
+                    observed_output: false,
+                    host_collection: HostCollection::Pending,
+                    publication_failure: None,
+                    pending_controls: 0,
+                    revision: 1,
+                    ticket_outstanding: false,
+                    ticket_nonce: 1,
+                    abandoned: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            let (delivery, mut deliveries) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+            let (commands, _receive) = mpsc::channel(1);
+            let mut driver = Driver {
+                trace: Arc::new(crate::trace::TraceStore::open(directory.path())?),
+                queue_loss_reported: AtomicBool::new(false),
+                owner,
+                provider,
+                state,
+                invocations: committed,
+                committed_invocations: HashMap::new(),
+                submissions: JoinSet::new(),
+                deliveries: JoinSet::new(),
+                delivery: Some(delivery),
+                pending_delivery: VecDeque::new(),
+                cleanup: JoinSet::new(),
+                failed_waiters: Vec::new(),
+                commands,
+                next_ticket_nonce: 1,
+                committed_tickets: HashMap::new(),
+                failed: false,
+                healthy: Arc::new(AtomicBool::new(true)),
+                first_failure: None,
+                cleanup_failure: None,
+                retiring: None,
+                idle: SessionObserver::Inbox(Arc::default()),
+                activity: Default::default(),
+                admitted: Default::default(),
+                attempts: HashMap::new(),
+                cancelled_admissions: Default::default(),
+                cancelled_exchanges: Default::default(),
+                prevented_invocations: Default::default(),
+                reservations: Default::default(),
+                latest_reservations: Default::default(),
+                submission_exits: Default::default(),
+            };
+            driver.settle(&scope.invocation_id);
+            assert!(
+                deliveries.try_recv().is_err(),
+                "terminal bypassed provider settlement"
+            );
+            slot.publish(ProviderCompletion {
+                plan_question: Some(crate::plan::PlanQuestionSet {
+                    id: "idle-question".into(),
+                    questions: Vec::new(),
+                }),
+                ..Default::default()
+            })?;
             driver
-                .committed_invocations
-                .contains_key(&scope.invocation_id)
-        );
-        let (_task_root, mut task_store, controller) =
-            crate::task::SessionTaskController::test_goal();
-        let task = controller.current()?.context("task fixture missing")?;
-        let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
-        context.bind_test_task_controller(controller.clone());
-        let authority =
-            crate::tools::TaskAuthority::capture(&context).context("callback authority missing")?;
-        controller.change(
-            &mut task_store,
-            Some(&task.revision),
-            crate::task::TaskChange::Clear,
-            3,
-        )?;
-        let (reply, response) = oneshot::channel();
-        driver.command(Command::SteerCurrent {
-            input: crate::provider::SteeringInput::AgentResult("stale child message".into()),
-            submission: None,
-            authority: Some(authority),
-            reply,
-        });
-        let response = response.await?;
-        let Err(ProviderError::PreparationFailed(cause)) = response else {
-            panic!("collected owner admitted stale child control: {response:?}");
-        };
-        assert!(matches!(cause.as_ref(), ProviderError::Failure(failure)
-            if failure.operation() == forge_provider_api::ProviderOperation::InputSteer
+                .invocations
+                .get_mut(&scope.invocation_id)
+                .unwrap()
+                .host_collection = HostCollection::Collecting;
+            assert!(
+                deliveries.try_recv().is_err(),
+                "native settlement bypassed host-owned collection"
+            );
+            driver.command(Command::HostEffectsCollected {
+                scope: scope.clone(),
+                operation_id: forge_provider_api::OperationId::new("fixture-collection")?,
+                result: Ok(()),
+            });
+            while let Some(delivery) = deliveries.recv().await {
+                if let Delivery::Complete { reply, result } = delivery {
+                    reply.send(*result).ok();
+                    break;
+                }
+            }
+            let ready = response.await??;
+            assert_eq!(
+                matches!(ready.outcome, Err(ProviderError::Cancelled)),
+                not_started
+            );
+            assert_eq!(
+                ready.batches[0]
+                    .completion
+                    .plan_question
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                "idle-question"
+            );
+            assert!(slot.preview()?.completion.is_some());
+            let (reply, committed) = oneshot::channel();
+            driver.command(Command::CommitSettlement {
+                scope: scope.clone(),
+                revision: ready.ticket.revision,
+                effects_revision: ready.ticket.effects_revision,
+                nonce: ready.ticket.nonce,
+                reply,
+            });
+            committed.await??;
+            assert!(slot.preview()?.completion.is_none());
+            assert!(
+                driver
+                    .committed_invocations
+                    .contains_key(&scope.invocation_id)
+            );
+            let (_task_root, mut task_store, controller) =
+                crate::task::SessionTaskController::test_goal();
+            let task = controller.current()?.context("task fixture missing")?;
+            let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
+            context.bind_test_task_controller(controller.clone());
+            let authority = crate::tools::TaskAuthority::capture(&context)
+                .context("callback authority missing")?;
+            controller.change(
+                &mut task_store,
+                Some(&task.revision),
+                crate::task::TaskChange::Clear,
+                3,
+            )?;
+            let (reply, response) = oneshot::channel();
+            driver.command(Command::SteerCurrent {
+                input: crate::provider::SteeringInput::AgentResult("stale child message".into()),
+                submission: None,
+                authority: Some(authority),
+                reply,
+            });
+            let response = response.await?;
+            let Err(ProviderError::PreparationFailed(cause)) = response else {
+                panic!("collected owner admitted stale child control: {response:?}");
+            };
+            assert!(matches!(cause.as_ref(), ProviderError::Failure(failure)
+            if failure.operation() == forge_provider_api::ProviderOperation::TurnSteer
                 && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
                 && failure.phase() == forge_provider_api::ProviderPhase::Admission
                 && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged));
-        assert!(
-            driver.submissions.is_empty(),
-            "revoked callback dispatched native work"
-        );
+            assert!(
+                driver.submissions.is_empty(),
+                "revoked callback dispatched native work"
+            );
+        }
         Ok(())
     }
 
@@ -4912,11 +5273,15 @@ mod tests {
             Arc::new(crate::trace::TraceStore::open(directory.path())?),
             directory.path().into(),
         )?;
-        let owner = ExecutionOwner::root("preparation-failure");
+        let owner = ThreadOwner::root("preparation-failure");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
         let mut state = ExecutionState::new(owner.clone());
-        state.admit(scope.clone(), submission.clone())?;
+        state.admit(
+            scope.clone(),
+            submission.clone(),
+            forge_provider_api::DeliveryAttemptId::new("attempt")?,
+        )?;
         let (sink, _events) = crate::provider::events::channel(scope.clone());
         let (reply, response) = oneshot::channel();
         let mut invocations = HashMap::new();
@@ -4928,7 +5293,8 @@ mod tests {
                 reply: Some(reply),
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
-                native_settlement: None,
+                native_metadata: Default::default(),
+                observed_output: false,
                 host_collection: HostCollection::Pending,
                 publication_failure: None,
                 pending_controls: 0,
@@ -4936,7 +5302,6 @@ mod tests {
                 ticket_outstanding: false,
                 ticket_nonce: 0,
                 abandoned: Arc::new(AtomicBool::new(false)),
-                idle_observation: false,
             },
         );
         let (delivery, mut pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -4953,7 +5318,6 @@ mod tests {
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
             pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -4978,10 +5342,12 @@ mod tests {
         driver.acceptance(SubmissionOutcome {
             scope: scope.clone(),
             submission: Some(submission),
+            receipt: None,
+            not_started: None,
             control_reply: None,
             result: Err(ProviderError::PreparationFailed(Box::new(
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::SessionOpen,
+                    forge_provider_api::ProviderOperation::ThreadOpen,
                     forge_provider_api::ProviderFailureKind::Initialization,
                 )),
             ))),
@@ -5002,6 +5368,7 @@ mod tests {
         driver.state.admit(
             InvocationScope::new(scope.owner.clone(), "next-explicit-request"),
             SubmissionId::try_from("next-input".to_owned())?,
+            forge_provider_api::DeliveryAttemptId::new("next-attempt")?,
         )?;
         Ok(())
     }
@@ -5021,11 +5388,15 @@ mod tests {
             trace.clone(),
             directory.path().into(),
         )?;
-        let owner = ExecutionOwner::root("uncertain-cleanup");
+        let owner = ThreadOwner::root("uncertain-cleanup");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
         let mut state = ExecutionState::new(owner.clone());
-        state.admit(scope.clone(), submission.clone())?;
+        state.admit(
+            scope.clone(),
+            submission.clone(),
+            forge_provider_api::DeliveryAttemptId::new("attempt")?,
+        )?;
         state.delivery(&scope, &submission, DeliveryState::Uncertain)?;
         let (sink, _events) = crate::provider::events::channel(scope.clone());
         let (reply, mut response) = oneshot::channel();
@@ -5037,13 +5408,21 @@ mod tests {
                 output: sink,
                 reply: Some(reply),
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
-                terminal: Some(Ok(
-                    forge_provider_api::lifecycle::ExecutionResult::Completed {
-                        completion: forge_provider_api::completion::ProviderCompletion::default()
-                            .into(),
-                    },
-                )),
-                native_settlement: None,
+                terminal: Some(Ok(crate::provider::test_support::completed_turn(
+                    scope.clone(),
+                    forge_provider_api::TurnResult::new(
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        1,
+                        None,
+                        vec![],
+                        vec![],
+                        None,
+                    )?,
+                )?)),
+                native_metadata: Default::default(),
+                observed_output: false,
                 host_collection: HostCollection::Pending,
                 publication_failure: None,
                 pending_controls: 0,
@@ -5051,7 +5430,6 @@ mod tests {
                 ticket_outstanding: false,
                 ticket_nonce: 0,
                 abandoned: Arc::new(AtomicBool::new(false)),
-                idle_observation: false,
             },
         );
         let (delivery, _pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -5068,7 +5446,6 @@ mod tests {
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
             pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -5125,11 +5502,15 @@ mod tests {
             trace.clone(),
             directory.path().into(),
         )?;
-        let owner = ExecutionOwner::root("uncertain-cleanup");
+        let owner = ThreadOwner::root("uncertain-cleanup");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
         let mut state = ExecutionState::new(owner.clone());
-        state.admit(scope.clone(), submission.clone())?;
+        state.admit(
+            scope.clone(),
+            submission.clone(),
+            forge_provider_api::DeliveryAttemptId::new("attempt")?,
+        )?;
         let (sink, _events) = crate::provider::events::channel(scope.clone());
         let (reply, mut response) = oneshot::channel();
         let mut invocations = HashMap::new();
@@ -5142,14 +5523,14 @@ mod tests {
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
                 pending_controls: 0,
-                native_settlement: None,
+                native_metadata: Default::default(),
+                observed_output: false,
                 host_collection: HostCollection::Pending,
                 publication_failure: None,
                 revision: 0,
                 ticket_outstanding: false,
                 ticket_nonce: 0,
                 abandoned: Arc::new(AtomicBool::new(false)),
-                idle_observation: false,
             },
         );
         let (delivery, _pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -5166,7 +5547,6 @@ mod tests {
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
             pending_delivery: VecDeque::new(),
-            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -5188,14 +5568,7 @@ mod tests {
             latest_reservations: Default::default(),
             submission_exits: Default::default(),
         };
-        let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::ObservationLost {
-                failure: ObservationFailure::DeliveryUncertain,
-                completion: None,
-            },
-        )?;
-        driver.event(ProviderEvent::Execution { observation });
+        driver.fail_observation(ObservationFailure::DeliveryUncertain);
         assert!(matches!(
             response.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -5245,13 +5618,13 @@ mod tests {
         )?;
         let store =
             crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let owner = ExecutionOwner::root("failed-foreground-close");
+        let owner = ThreadOwner::root("failed-foreground-close");
         let registry = SessionExecutionRegistry::new(provider.clone(), trace);
         let engine = registry.owner(owner.clone()).await?;
         let control = provider.mock_response_control().unwrap();
         let hold = control
             .dispatch(
-                owner.session_id.as_str(),
+                owner.session_id().as_str(),
                 MockResponseCommand::Hold {
                     mode: Some(PromptMode::Chat),
                     any_session: false,
@@ -5261,7 +5634,7 @@ mod tests {
         let request = ProviderRequest {
             dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(owner.clone()),
-            harness_session_id: owner.session_id.to_string(),
+            harness_session_id: owner.session_id().to_string(),
             workspace: directory.path().to_string_lossy().into_owned(),
             input: ProviderInput::from_text("Wait until cancelled"),
             mode: PromptMode::Chat,
@@ -5273,6 +5646,7 @@ mod tests {
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -5284,7 +5658,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             control.dispatch(
-                owner.session_id.as_str(),
+                owner.session_id().as_str(),
                 MockResponseCommand::Wait {
                     id: hold["id"].as_str().unwrap().into(),
                 },
@@ -5326,7 +5700,7 @@ mod tests {
         )?;
         let store =
             crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let owner = ExecutionOwner::root("engine-fixture");
+        let owner = ThreadOwner::root("engine-fixture");
         let registry = SessionExecutionRegistry::new(provider.clone(), trace.clone());
         let engine = registry.owner(owner.clone()).await?;
         assert!(Arc::ptr_eq(&engine, &registry.owner(owner.clone()).await?));
@@ -5348,6 +5722,7 @@ mod tests {
                 approval_mode: crate::session::ApprovalMode::Ask,
                 provider_session_id: None,
                 submission: None,
+                acknowledged_child_reports: Vec::new(),
                 recovered_input: Vec::new(),
                 control_context: None,
             };
@@ -5446,7 +5821,7 @@ mod tests {
             matches!(rejected,
             Err(ProviderError::PreparationFailed(error))
             if matches!(error.as_ref(), ProviderError::Failure(failure)
-                if failure.operation() == forge_provider_api::ProviderOperation::InputSteer
+                if failure.operation() == forge_provider_api::ProviderOperation::TurnSteer
                     && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)),
             "retired native invocation accepted new input"
         );
@@ -5459,12 +5834,7 @@ mod tests {
         );
         registry.close().await.context("close fixture registry")?;
         registry.close().await.context("close fixture registry")?;
-        assert!(
-            registry
-                .owner(ExecutionOwner::root("closed"))
-                .await
-                .is_err()
-        );
+        assert!(registry.owner(ThreadOwner::root("closed")).await.is_err());
         provider
             .shutdown()
             .await

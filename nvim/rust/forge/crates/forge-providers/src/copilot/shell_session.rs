@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalSnapshot};
 use forge_provider_api::{
-    ExecutionOwner, ProviderError, ProviderEventSink, ProviderFailureKind, ProviderOperation,
+    ProviderError, ProviderEventSink, ProviderFailureKind, ProviderOperation, ThreadOwner,
 };
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
@@ -152,7 +152,7 @@ impl NativeCallbackRouter for HelperCallbacks {
             .upgrade()
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 )
             })?
@@ -178,7 +178,7 @@ impl NativeCallbackRouter for HelperCallbacks {
             .upgrade()
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 )
             })?
@@ -192,7 +192,7 @@ impl NativeCallbackRouter for HelperCallbacks {
             .upgrade()
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 )
             })?
@@ -201,13 +201,17 @@ impl NativeCallbackRouter for HelperCallbacks {
     }
 
     /// Forward observed identities without extending the router's idle lifetime.
-    async fn bind_native_call(&self, call_id: &str, scope: &forge_provider_api::InvocationScope) {
-        if let Some(target) = self.target.upgrade() {
-            target.bind_native_call(call_id, scope).await;
+    async fn bind_native_call(
+        &self,
+        call_id: &str,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        match self.target.upgrade() {
+            Some(target) => target.bind_native_call(call_id, scope).await,
+            None => Err(ProviderError::Cancelled),
         }
     }
 
-    /// Release native call ownership only while the router still exists.
     async fn release_native_call(&self, call_id: &str) {
         if let Some(target) = self.target.upgrade() {
             target.release_native_call(call_id).await;
@@ -248,7 +252,7 @@ impl ShellSession {
     /// Create a dormant owner before the model session can expose shell tools.
     pub(super) fn new(
         callbacks: Weak<dyn NativeCallbackRouter>,
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         sink: ProviderEventSink,
     ) -> Self {
         let (interruption, _) = watch::channel(0);
@@ -290,7 +294,7 @@ impl ShellSession {
         let mut state = self.state.lock().await;
         if matches!(state.admission, Admission::Closed) {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -299,7 +303,7 @@ impl ShellSession {
             state.helper_id = Some(id);
         } else if state.helper_id.as_ref() != Some(&id) {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -346,7 +350,7 @@ impl ShellSession {
         };
         let shell = tokio::time::timeout_at(startup.deadline, startup.result)
             .await
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Timeout))??;
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Timeout))??;
         shell.admitted.clone()?;
         let snapshot = shell.inventory.borrow().clone();
         Ok(snapshot)
@@ -413,10 +417,7 @@ impl ShellSession {
         let task = tokio::spawn(async move { owner.close_owned().await });
         let cleanup = async move {
             task.await.map_err(|_| {
-                failure(
-                    ProviderOperation::SessionClose,
-                    ProviderFailureKind::Runtime,
-                )
+                failure(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime)
             })?
         }
         .boxed()
@@ -480,7 +481,7 @@ impl ShellSession {
                                 .is_err()
                             {
                                 task_failures.push(failure(
-                                    ProviderOperation::SessionClose,
+                                    ProviderOperation::ThreadClose,
                                     ProviderFailureKind::Runtime,
                                 ));
                             }
@@ -499,7 +500,7 @@ impl ShellSession {
                     Ok(_) => {
                         failures.extend(task_failures);
                         failures.push(failure(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::ResourceConflict,
                         ));
                     }
@@ -512,13 +513,13 @@ impl ShellSession {
         }
         if matches!(cleanup.reader, CollectionPhase::Pending) {
             let mut reader = shell.reader.lock().await;
-            if let Some(reader) = reader.as_mut() {
-                if reader.await.is_err() {
-                    failures.push(failure(
-                        ProviderOperation::SessionClose,
-                        ProviderFailureKind::Runtime,
-                    ));
-                }
+            if let Some(reader) = reader.as_mut()
+                && reader.await.is_err()
+            {
+                failures.push(failure(
+                    ProviderOperation::ThreadClose,
+                    ProviderFailureKind::Runtime,
+                ));
             }
             reader.take();
             cleanup.reader = CollectionPhase::Complete;
@@ -571,7 +572,7 @@ impl ShellSession {
                 match shell.session.disconnect().await {
                     Ok(()) => cleanup.disconnect = CollectionPhase::Complete,
                     Err(_) => failures.push(failure(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Transport,
                     )),
                 }
@@ -603,7 +604,7 @@ impl ShellSession {
             }
         } else if failures.is_empty() {
             failures.push(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -636,7 +637,7 @@ impl ShellSession {
         if matches!(*state, HistoryCleanup::Pending) {
             let factory = self.cleanup_factory.get().ok_or_else(|| {
                 failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Transport,
                 )
             })?;
@@ -683,7 +684,7 @@ impl ShellSession {
             let mut state = self.state.lock().await;
             if matches!(state.admission, Admission::Closed) {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
@@ -718,7 +719,7 @@ impl ShellSession {
             let abort = task.abort_handle();
             let call = async move {
                 task.await.map_err(|_| {
-                    failure(ProviderOperation::InputSubmit, ProviderFailureKind::Runtime)
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime)
                 })?
             }
             .boxed()
@@ -745,7 +746,7 @@ impl ShellSession {
     ) -> Result<NativeToolResult, ProviderError> {
         let callbacks = self.callbacks.upgrade().ok_or_else(|| {
             failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             )
         })?;
@@ -763,10 +764,7 @@ impl ShellSession {
                     .and_then(Value::as_f64)
                     .unwrap_or(30.0);
                 wait = Duration::try_from_secs_f64(seconds).map_err(|_| {
-                    failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Rejected,
-                    )
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
                 })?;
             }
             // Initial waiting is owned by this invocation, never by the native
@@ -788,7 +786,7 @@ impl ShellSession {
                 let mut handles = self.handles.lock().await;
                 if handles.contains_key(&id) {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::OperationConflict,
                     ));
                 }
@@ -806,7 +804,7 @@ impl ShellSession {
         } else if let Some(id) = arguments.get("shellId").and_then(Value::as_str) {
             let id = TerminalId::new(id)?;
             let target = self
-                .target(&shell, &id, ProviderOperation::InputSubmit)
+                .target(&shell, &id, ProviderOperation::TurnStart)
                 .await?;
             if tool.is_read() {
                 let delay = arguments
@@ -814,10 +812,7 @@ impl ShellSession {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
                 let delay = Duration::try_from_secs_f64(delay).map_err(|_| {
-                    failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Rejected,
-                    )
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
                 })?;
                 if target.output_epoch == target.read_epoch && !delay.is_zero() {
                     let mut activity = shell.activity.subscribe();
@@ -917,7 +912,7 @@ impl ShellSession {
             let mut state = self.state.lock().await;
             if matches!(state.admission, Admission::Closed) {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
@@ -926,7 +921,7 @@ impl ShellSession {
             } else {
                 let preparation = state.preparation.clone().ok_or_else(|| {
                     failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         ProviderFailureKind::Initialization,
                     )
                 })?;
@@ -945,7 +940,7 @@ impl ShellSession {
                 });
                 let result = async move {
                     task.await.map_err(|_| {
-                        failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime)
+                        failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime)
                     })?
                 }
                 .boxed()
@@ -963,11 +958,11 @@ impl ShellSession {
         };
         let shell = tokio::time::timeout_at(startup.deadline, startup.result)
             .await
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Timeout))??;
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Timeout))??;
         shell.admitted.clone()?;
         if matches!(self.state.lock().await.admission, Admission::Closed) {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -986,7 +981,7 @@ impl ShellSession {
             .lock()
             .await
             .get(id)
-            .filter(|target| &target.session == shell.session.id())
+            .filter(|target| target.session == shell.session.id())
             .cloned()
             .ok_or_else(|| failure(operation, ProviderFailureKind::Rejected))
     }
@@ -1005,7 +1000,7 @@ impl ShellSession {
             let state = self.state.lock().await;
             if matches!(state.admission, Admission::Closed) {
                 return Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::BindingClosed,
                 ));
             }
@@ -1015,8 +1010,8 @@ impl ShellSession {
         }
         let result = async {
             let value = shell.client.inner.call("session.tools.execute", Some(json!({"sessionId":shell.session.id(),"name":name,"arguments":arguments,"toolCallId":call_id}))).await
-                .map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Transport))?;
-            serde_json::from_value(value).map_err(|_| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Protocol))
+                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))?;
+            serde_json::from_value(value).map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
         }.await;
         if let Some(launch) = launch {
             launch.send_replace(if result.is_ok() {
@@ -1099,7 +1094,7 @@ async fn open(
 ) -> Result<Arc<PausedShell>, ProviderError> {
     if callbacks.upgrade().is_none() {
         return Err(failure(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::BindingClosed,
         ));
     }
@@ -1115,7 +1110,7 @@ async fn open(
         )
     {
         return Err(failure(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Transport,
         ));
     }
@@ -1170,7 +1165,7 @@ async fn open(
             .await
             .map_err(|_| {
                 failure(
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     ProviderFailureKind::Initialization,
                 )
             })?,
@@ -1184,12 +1179,7 @@ async fn open(
         )
         .await
         .map(|_| ())
-        .map_err(|_| {
-            failure(
-                ProviderOperation::SessionOpen,
-                ProviderFailureKind::Protocol,
-            )
-        });
+        .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol));
     let mut subscription = session.subscribe();
     let (shutdown, mut stopped) = watch::channel(false);
     let (inventory, _) = watch::channel(TerminalSnapshot {
@@ -1271,13 +1261,13 @@ async fn open(
 async fn native_tasks(shell: &PausedShell) -> Result<Vec<BackgroundTerminal>, ProviderError> {
     let tasks = shell.session.rpc().tasks().list().await.map_err(|_| {
         failure(
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             ProviderFailureKind::Transport,
         )
     })?;
     let tasks = serde_json::to_value(tasks).map_err(|_| {
         failure(
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             ProviderFailureKind::Protocol,
         )
     })?;
@@ -1285,7 +1275,7 @@ async fn native_tasks(shell: &PausedShell) -> Result<Vec<BackgroundTerminal>, Pr
         .map(|snapshot| snapshot.terminal)
         .map_err(|_| {
             failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::Protocol,
             )
         })
@@ -1306,7 +1296,7 @@ async fn collect_native_tasks(shell: &PausedShell) -> Result<(), ProviderError> 
             .is_err()
         {
             failures.push(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::Runtime,
             ));
         }
@@ -1326,7 +1316,7 @@ async fn collect_native_tasks(shell: &PausedShell) -> Result<(), ProviderError> 
         };
     }
     failures.push(failure(
-        ProviderOperation::SessionClose,
+        ProviderOperation::ThreadClose,
         ProviderFailureKind::ResourceConflict,
     ));
     let primary = failures.remove(0);
@@ -1358,7 +1348,7 @@ async fn delete_native_history(
             Ok(())
         }
         Err(_) => Err(failure(
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
             ProviderFailureKind::Transport,
         )),
     }

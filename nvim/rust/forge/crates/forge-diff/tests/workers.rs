@@ -269,15 +269,19 @@ async fn a_deadline_that_expires_after_reservation_drops_input_without_execution
         workers: 1,
         jobs: 1,
     });
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let expired = Arc::new(AtomicBool::new(false));
     let permit = pool
-        .reserve(WorkPriority::Visible, WorkBudget::new(8, Some(deadline)))
+        .reserve(
+            WorkPriority::Visible,
+            WorkBudget::with_expiry_signal(8, Arc::clone(&expired)),
+        )
         .unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
     let ran = Arc::new(AtomicBool::new(false));
     let executed = Arc::clone(&ran);
     let owner = InputOwner(Arc::clone(&dropped));
-    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    // Expire between reservation and worker start, the window a wall-clock deadline would cross.
+    expired.store(true, Ordering::Release);
     permit.submit(move |_| {
         executed.store(true, Ordering::Release);
         drop(owner);

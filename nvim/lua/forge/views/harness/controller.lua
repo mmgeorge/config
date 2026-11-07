@@ -190,23 +190,6 @@ local function set_composer_text(buf, text, attachments)
   attachment.restore(buf, attachments)
 end
 
-local function restore_retracted_prompt(text, attachments)
-  local state = harness_state()
-  if state.queue_edit or composer_text(state.composer_buf) ~= "" then
-    input_state.submit(state, text, attachments or {}, "queue")
-    notifications.warn("The retracted prompt was queued because the composer already contains a newer draft", "ForgeHarness")
-    render_status_hint(state)
-    return
-  end
-  set_composer_text(state.composer_buf, text, attachments)
-  layout.resize_composer(state.composer_buf, state.composer_win)
-  vim.schedule(function()
-    if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-      vim.api.nvim_set_current_win(state.composer_win)
-    end
-  end)
-end
-
 ---@return { text: string, group: string }[]
 local function status_text()
   local state = harness_state()
@@ -222,14 +205,14 @@ local function status_text()
   local yolo = abbreviation == "rxwx" and approval == "allow"
     and (active_session.access or {}).sandbox == false
   local configured_model = active_session.model or config.options.harness.model
-  local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
+  local confirmed_model = type(active_session.resolved_model) == "string" and active_session.resolved_model or nil
+  local model = confirmed_model or (configured_model .. " (unconfirmed)")
   local effort = selected_setting(state, "effort")
   local selected_model = selected_setting(state, "model")
-  if selected_model ~= configured_model then model = selected_model end
+  if selected_model ~= configured_model then model = selected_model .. " (requested)" end
   local tier = selected_setting(state, "service_tier")
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
-  local model_pending = false
-  local model_text = ("%s %s%s"):format(model, effort, model_pending and "*" or "")
+  local model_text = ("%s %s"):format(model, effort)
   local segment_list = {}
   local function append_status(text, group)
     if not text or text == "" then return end
@@ -266,7 +249,7 @@ function M.refresh_winbar()
   local state = harness_state()
   if not state.command_set then return end
   local active_session = not state.initial_snapshot_pending and state.session or nil
-  tabline.set_session_name(state.timeline_tab, active_session and active_session.name)
+  tabline.refresh()
   local right_status = context_status.segment(active_session and active_session.context_usage) or {}
   local artifact_count = active_session and #(state.artifact or {}) or 0
   if artifact_count > 0 then
@@ -401,7 +384,7 @@ end
 
 local function remove_approval(state, approval_id)
   for index, approval in ipairs(state.approval or {}) do
-    if approval.id == approval_id then
+    if approval.request_id == approval_id then
       table.remove(state.approval, index)
       return true
     end
@@ -412,12 +395,12 @@ end
 ---@param state table
 local function reconcile_approval_presentation(state)
   if state.dismissed_approval_id and not vim.iter(state.approval or {}):any(function(approval)
-    return approval.id == state.dismissed_approval_id
+    return approval.request_id == state.dismissed_approval_id
   end) then state.dismissed_approval_id = nil end
   local presented_id = state.presented_approval_id
   if not presented_id then return end
   local still_pending = vim.iter(state.approval or {}):any(function(approval)
-    return approval.id == presented_id
+    return approval.request_id == presented_id
   end)
   if still_pending then return end
   require("forge.views.harness.approval").close()
@@ -529,6 +512,10 @@ local function on_event(event, payload)
     end
     return
   end
+  -- Rollback discards the provider context that produced the retained usage figure.
+  -- Snapshot adoption keeps prior usage whenever a snapshot omits it, so the stale
+  -- figure must be dropped here or it would outlive the rollback.
+  if event == "interaction_rolled_back" and state.session then state.session.context_usage = nil end
   local changes_session = event ~= "provider_event" and event ~= "input_changed"
     and event ~= "activity_changed" and event ~= "command_completed"
   if event == "provider_event" then
@@ -600,7 +587,7 @@ local function on_event(event, payload)
     elseif payload.kind == "approval_requested" then
       local request = payload.data or payload
       state.approval = state.approval or {}
-      if not vim.iter(state.approval):any(function(approval) return approval.id == request.id end) then
+      if not vim.iter(state.approval):any(function(approval) return approval.request_id == request.request_id end) then
         state.approval[#state.approval + 1] = request
       end
       M.refresh_winbar()
@@ -608,7 +595,7 @@ local function on_event(event, payload)
       vim.schedule(M.present_approval)
     elseif payload.kind == "approval_resolved" or payload.kind == "approval_cancelled" then
       local request = payload.data or payload
-      remove_approval(state, request.id)
+      remove_approval(state, request.request_id)
       reconcile_approval_presentation(state)
       M.refresh_winbar()
       render_status_hint(state)
@@ -620,7 +607,7 @@ local function on_event(event, payload)
       local runtime = payload.data or {}
       if not state.session or runtime.session_id ~= state.session.id then return end
       state.session.provider_label = runtime.provider
-      state.session.resolved_model = runtime.model
+      state.session.resolved_model = type(runtime.model) == "string" and runtime.model or nil
       M.refresh_winbar()
     elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
@@ -628,7 +615,11 @@ local function on_event(event, payload)
     elseif payload.kind == "timeline_node_updated" then
       M.refresh_winbar()
     elseif payload.kind == "error" then
-      if type(payload.text) == "string" then notifications.warn(payload.text, "ForgeHarness") end
+      if type(payload.text) == "string" then
+        local severity = (payload.data or {}).severity
+        if severity == "error" then notifications.error(payload.text, "ForgeHarness")
+        else notifications.warn(payload.text, "ForgeHarness") end
+      end
     else
       error("Unhandled Harness provider event: " .. tostring(payload.kind))
     end
@@ -713,10 +704,10 @@ function M.present_approval(reopen)
   local state = harness_state()
   local request = state.approval and state.approval[1]
   if state.approval_open or not request then return end
-  if not reopen and state.dismissed_approval_id == request.id then return end
+  if not reopen and state.dismissed_approval_id == request.request_id then return end
   state.dismissed_approval_id = nil
   state.approval_open = true
-  state.presented_approval_id = request.id
+  state.presented_approval_id = request.request_id
   local owner = type(request.execution_owner) == "table" and request.execution_owner or nil
   local child_id = owner and owner.agent_id ~= (state.session.primary_agent_id or (state.session.id .. ":agent:primary"))
     and owner.agent_id or nil
@@ -754,8 +745,8 @@ function M.present_approval(reopen)
       state.approval_open = false
       state.presented_approval_id = nil
       state.dismissed_approval_id = vim.iter(state.approval or {}):any(function(approval)
-        return approval.id == request.id
-      end) and request.id or nil
+        return approval.request_id == request.request_id
+      end) and request.request_id or nil
       M.refresh_winbar()
     end,
   })
@@ -2084,7 +2075,7 @@ function M.select_provider()
   end
   local current = state.session and state.session.provider or config.options.harness.provider
   local option_list = {}
-  for provider, provider_config in pairs(config.options.harness.providers) do
+  for provider, provider_config in pairs(client.provider_map()) do
     if provider_config.selectable ~= false then
       option_list[#option_list + 1] = {
         id = provider,
@@ -2100,7 +2091,7 @@ function M.select_provider()
       if provider == current or not current_source() then return end
       local function destination_picker()
         if not current_source() then return end
-        open_choice_picker(state, "Select Chat", config.options.harness.providers[provider].label, {
+        open_choice_picker(state, "Select Chat", client.provider_map()[provider].label, {
           { id = "new", label = "New chat", value = "new" },
           { id = "resume", label = "Resume session…", value = "resume" },
         }, function(destination)
@@ -2139,7 +2130,12 @@ end
 ---@param method? string
 function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
-  if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
+  -- Task requests flatten unknown fields into metadata, which resume and plan-review capture
+  -- reject, so only a submission that actually selected attachments carries the field.
+  if submitted_text then
+    local selected = attachment.capture(state.composer_buf).attachments
+    if #selected > 0 then action.attachments = selected end
+  end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
   task_control.transition(state, action, M.render, function(failure)
@@ -2221,6 +2217,10 @@ function M.activate_snapshot(result, options)
   state.initial_snapshot_pending = nil
   if previous_session ~= state.session.id then state.queue, state.queue_edit = {}, nil end
   M.render()
+  -- A previous host may have stopped mid-offer, leaving its outbox blocked behind an
+  -- uncertain publication. Only the `session.state.get` reconciliation clears that
+  -- block, so every attach reconciles instead of waiting for an event that cannot arrive.
+  synchronize_state()
   M.resolve_runtime_model()
   if not options or options.present_questions ~= false then
     if state.active_elicitation and state.active_elicitation.elicitation then

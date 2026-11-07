@@ -174,6 +174,7 @@ pub fn prepare_provider_fork(
                 .map(TryInto::try_into)
                 .transpose()?,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         },

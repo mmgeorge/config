@@ -64,7 +64,7 @@ local success, failure = xpcall(function()
   assert(vim.wait(3000, function() return harness.provider_switch_available() end, 10))
   local function switch_provider(provider, destination)
     assert(vim.wait(10000, harness.provider_switch_available, 10), 'provider controls did not become available: '
-      .. vim.inspect({ busy = session.harness.busy, configuring = session.harness.configuring,
+      .. vim.inspect({ busy = require("forge.views.harness.activity").busy(session.harness), configuring = session.harness.configuring,
         switching = session.harness.switching_provider, syncing = session.harness.state_sync_pending,
         operation = session.harness.task_operation, status = session.harness.status,
         queue = session.harness.queue, steering = session.harness.pending_steer,

@@ -107,7 +107,7 @@ impl ShellTool {
     ) -> Result<(), forge_provider_api::ProviderError> {
         let invalid = || {
             forge_provider_api::ProviderError::from(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         };

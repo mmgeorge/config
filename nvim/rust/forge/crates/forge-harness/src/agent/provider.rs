@@ -232,7 +232,7 @@ impl AgentProviderFactory {
             .as_ref()
             .context("child has no resolved provider selection")?;
         ensure!(
-            work.owner().session_id
+            *work.owner().session_id()
                 == forge_provider_api::SessionId::from(root.harness_session_id.as_str())
                 && !work.owner().is_root(),
             "child request crosses root ownership"
@@ -266,6 +266,7 @@ impl AgentProviderFactory {
                 .map(TryInto::try_into)
                 .transpose()?,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         })

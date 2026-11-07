@@ -13,7 +13,6 @@ use std::time::Duration;
 /// Permanent command-result failure releases observers without dropping native cleanup ownership.
 #[tokio::test]
 async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() -> Result<()> {
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -26,28 +25,10 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
     .unwrap();
     let native = crate::provider::test_support::EventFixtureProvider::new(descriptor, {
         let invoked = invoked.clone();
-        move |request, sink, mut cancelled| {
+        move |request, _sink, start, mut cancelled| {
             let invoked = invoked.clone();
             async move {
-                let address = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id: "cleanup-thread".into(),
-                    turn_id: "cleanup-turn".into(),
-                };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
+                start.observed(1).await?;
                 invoked.notify_one();
                 while !*cancelled.borrow_and_update() {
                     cancelled
@@ -55,31 +36,10 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
                         .await
                         .map_err(|_| crate::provider::ProviderError::Cancelled)?;
                 }
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: crate::provider::TurnUpdate::Finished {
-                        outcome: forge_provider_api::turn::TurnOutcome::Cancelled,
-                        completed_at_ms: 2,
-                    },
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Finished {
-                            address,
-                            covered_submissions: vec![request.submission_id.clone()],
-                            completed_at_ms: 2,
-                            result: ExecutionResult::Cancelled {
-                                completion:
-                                    forge_provider_api::completion::ProviderCompletion::default()
-                                        .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Interrupted,
+                ))
             }
         }
     });
@@ -101,6 +61,10 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
             }
         }
     });
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"mock-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
@@ -273,10 +237,18 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
         &forge_providers::registry::nonselectable_id().unwrap(),
     )
     .unwrap();
-    let native =
-        crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-            Ok(())
-        });
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |request, _, start, _| async move {
+            start.observed(1).await?;
+            Ok(crate::provider::test_support::native_result(
+                &request,
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+            ))
+        },
+    );
     native.with_session_close({
         let cleanup_calls = cleanup_calls.clone();
         let closing_bindings = closing_bindings.clone();
@@ -295,6 +267,10 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
             }
         }
     });
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"mock-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
@@ -313,17 +289,17 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
     })
     .await
     .context("retirement fixture provider did not become ready")?;
-    // This fixture needs no native initialization request. Open its real root
-    // binding explicitly so retirement exercises cleanup rather than an empty slot.
-    let registry = controller.broker.lock().await.execution_registry();
-    registry
-        .owner(crate::provider::ExecutionOwner::root(
-            controller.observer.session_id(),
-        ))
-        .await?;
+    // Startup leaves the native conversation unopened. Open the root binding the
+    // way first input does so retirement exercises cleanup rather than an empty slot.
+    let open = controller.broker.lock().await.provider_request(
+        crate::provider::ProviderInput::from_text(""),
+        crate::provider::PromptMode::Chat,
+    )?;
+    provider_fixture.provider_handle().thread_open(open).await?;
     assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
     let original_provider = controller.provider_handle();
     let original_inbox = controller.observer.session_events();
+    controller.input_stopping.store(true, Ordering::Release);
     controller.exchange_owner.close().await;
     let trace = controller
         .trace

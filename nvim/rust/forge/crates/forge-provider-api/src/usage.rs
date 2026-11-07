@@ -66,22 +66,6 @@ impl TokenUsage {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Identifies one usage report independently of text and tool lifecycle replay.
-pub struct UsageUpdate {
-    /// Distinguishes model calls from context-only accounting adjustments.
-    #[serde(default)]
-    pub context_adjustment: bool,
-    /// Provider call identity or cumulative snapshot identity.
-    pub id: String,
-    /// Usage reported for the last completed model call.
-    pub usage: TokenUsage,
-    /// Native thread totals used to recover increments and deduplicate refreshes.
-    pub cumulative: Option<TokenUsage>,
-    /// Native total, retained separately from the token category breakdown.
-    pub cumulative_total: Option<u64>,
-}
-
 #[cfg(test)]
 mod test {
     use super::*;

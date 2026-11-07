@@ -4,8 +4,8 @@ use super::super::{
     ProviderLaunch, SessionUpdate, TurnCancelled,
 };
 use super::test_support::{
-    admit_child_fixture, check_fixture, child_address, child_event, child_tool, completed_message,
-    planning_question_broker, repository, settle_managed_children,
+    admit_child_fixture, check_fixture, child_address, child_completed, child_event, child_tool,
+    completed_message, planning_question_broker, repository, settle_managed_children,
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -282,17 +282,29 @@ fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let admission = admit_child_fixture(&mut broker, "terminal-status")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: broker.session.id.clone().into(),
-        agent_id: admission.agent.id.clone().into(),
-    };
-    let status = |owner| ProviderEvent::Terminals {
-        scope: forge_provider_api::EventScope::Binding { owner },
-        snapshot: forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: Vec::new(),
-        },
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
+    let status = |target: crate::provider::ThreadOwner| {
+        crate::provider::session_execution::OwnerObservation::Event(
+            crate::provider::test_support::native_event(
+                forge_provider_api::EventScope::Binding {
+                    owner: target.clone(),
+                },
+                ProviderEvent::Thread {
+                    thread_id: target.thread_id(),
+                    event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
+                        forge_provider_api::terminal::TerminalSnapshot {
+                            supported: true,
+                            starting: false,
+                            terminal: Vec::new(),
+                        },
+                    )),
+                },
+            ),
+        )
     };
     let before = broker
         .agent_coordinator
@@ -316,7 +328,7 @@ fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result
             .state,
         before
     );
-    let foreign = crate::provider::ExecutionOwner::root("foreign");
+    let foreign = crate::provider::ThreadOwner::root("foreign");
     assert!(
         broker
             .apply_managed_agent_observation(
@@ -327,19 +339,26 @@ fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result
             )
             .is_err()
     );
-    let diagnostic = ProviderEvent::Diagnostic {
-        scope: forge_provider_api::EventScope::Binding {
-            owner: owner.clone(),
-        },
-        diagnostic: crate::provider::ProviderDiagnostic {
-            kind: forge_provider_api::ProviderFailureKind::Runtime,
-            message: forge_provider_api::diagnostic::SanitizedMessage::new(
-                "Background terminal inventory is unavailable.",
-            )
-            .unwrap(),
-            fatal: false,
-        },
-    };
+    let diagnostic = crate::provider::session_execution::OwnerObservation::Event(
+        crate::provider::test_support::native_event(
+            forge_provider_api::EventScope::Binding {
+                owner: owner.clone(),
+            },
+            ProviderEvent::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TerminalList,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Unchanged,
+                    ),
+                )),
+            },
+        ),
+    );
     assert!(matches!(
         broker.apply_managed_agent_observation(
             owner,
@@ -382,11 +401,12 @@ fn admitted_request_fixture(
 }
 
 fn child_message(
+    address: &crate::provider::TurnAddress,
     id: impl Into<String>,
-    role: crate::provider::MessageRole,
+    role: crate::provider::TestMessageContent,
     text: impl Into<String>,
 ) -> Vec<ProviderEvent> {
-    completed_message(&child_address(), id, role, text)
+    completed_message(address, id, role, text)
 }
 
 async fn query_child(
@@ -414,22 +434,29 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let admission = admit_child_fixture(&mut broker, "inspection")?;
     let sibling = admit_child_fixture(&mut broker, "sibling-inspection")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     broker
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+            child_event(
+                &child_address(&(owner.clone()), &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
             &mut Vec::new(),
         )
         .await?;
     for ordinal in 0..6 {
         let thought = child_message(
+            &child_address(&(owner.clone()), &admission.task.id),
             format!("thought-{ordinal}"),
-            crate::provider::MessageRole::Commentary,
+            crate::provider::TestMessageContent::Commentary,
             if ordinal == 5 {
                 "思".repeat(4001)
             } else {
@@ -441,7 +468,11 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
             .await?;
     }
     let source = format!("{}\0tail", "output-é😀".repeat(9000));
-    let mut update = child_tool(source.clone(), crate::provider::ToolStatus::Running);
+    let mut update = child_tool(
+        &child_address(&(owner.clone()), &admission.task.id),
+        source.clone(),
+        crate::provider::ToolStatus::Running,
+    );
     broker
         .observe_child_fixture(
             owner.clone(),
@@ -468,25 +499,32 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     assert!(tool.get("output").is_none());
     assert!(!activity.to_string().contains("output-é"));
     let call_ref = tool["call_ref"].as_str().unwrap().to_owned();
-    let sibling_owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (sibling.agent.id.clone()).into(),
-    };
+    let sibling_owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(sibling.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     broker
         .observe_child_fixture(
             sibling_owner.clone(),
             &sibling.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+            child_event(
+                &child_address(&(sibling_owner.clone()), &sibling.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
             &mut Vec::new(),
         )
         .await?;
     let sibling_tool = child_tool(
+        &child_address(&(sibling_owner), &sibling.task.id),
         "SIBLING OUTPUT".into(),
         crate::provider::ToolStatus::Running,
     );
     broker
         .observe_child_fixture(
-            sibling_owner,
+            sibling_owner.clone(),
             &sibling.task.id,
             sibling_tool,
             &mut Vec::new(),
@@ -544,13 +582,19 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     .await?;
     assert_eq!(tail["output"], "\0tail");
     assert!(tail["next_offset"].is_null());
-    update = vec![ProviderEvent::Tool {
-        address: crate::provider::ToolAddress {
-            turn: child_address(),
-            tool_id: "same-provider-call".into(),
-        },
-        update: crate::provider::ToolUpdate::Output {
-            update: crate::provider::TextUpdate::Append("APPENDED".into()),
+    let child_turn = child_address(&owner, &admission.task.id);
+    update = vec![ProviderEvent::Item {
+        item_id: forge_provider_api::ItemId::new(format!(
+            "{}:same-provider-call",
+            child_turn.turn_id.as_str()
+        ))
+        .unwrap(),
+        thread_id: child_turn.thread_id,
+        turn_id: child_turn.turn_id,
+        event: forge_provider_api::ItemEvent::Tool {
+            event: forge_provider_api::ToolItemEvent::Output(crate::provider::TextUpdate::Append(
+                "APPENDED".into(),
+            )),
         },
     }];
     broker
@@ -663,9 +707,12 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         .load_exchange(&admission.task.parent_exchange_id)?
         .unwrap();
     parent.append_agent_task(&followup.task)?;
-    broker
-        .store
-        .admit_agent_task(&followup.agent, &followup.task, &parent)?;
+    broker.store.admit_agent_task(
+        &followup.agent,
+        &followup.task,
+        &parent,
+        followup.continuation_authorization(),
+    )?;
     followup.commit()?;
     let active = query_child(
         &mut broker,
@@ -681,6 +728,7 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     );
 
     update = child_tool(
+        &child_address(&(owner.clone()), &admission.task.id),
         "failure details".into(),
         crate::provider::ToolStatus::Failed,
     );
@@ -693,8 +741,9 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         )
         .await?;
     let final_message = child_message(
+        &child_address(&(owner.clone()), &admission.task.id),
         "final",
-        crate::provider::MessageRole::Response,
+        crate::provider::TestMessageContent::Response,
         "FINAL ANSWER MUST NOT ENTER ACTIVITY",
     );
     broker
@@ -723,6 +772,7 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
             owner.clone(),
             admission.task.id.clone(),
             Err(anyhow::anyhow!("failed")),
+            Vec::new(),
             None,
             &mut Vec::new(),
         )
@@ -744,7 +794,10 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         session_id: "other-session".into(),
         agent_id: admission.agent.id.clone(),
         exchange_id: admission.task.id.clone(),
-        turn_id: "child-turn".into(),
+        turn_id: child_address(&owner, &admission.task.id)
+            .turn_id
+            .as_str()
+            .to_owned(),
         tool_id: "same-provider-call".into(),
     };
     let forged = format!("agent-tool:{}", hex::encode(serde_json::to_vec(&foreign)?));
@@ -821,15 +874,17 @@ async fn child_execution_blocks_automatic_verification_without_mutating_the_goal
     assert!(execution.check_runs.is_empty());
     assert_eq!(execution.state, PlanExecutionState::Active);
     assert!(broker.task_controller.current()?.is_some());
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     broker
         .complete_managed_agent(
             owner,
             admission.task.id,
             Err(anyhow::anyhow!("stopped")),
+            Vec::new(),
             None,
             &mut Vec::new(),
         )
@@ -852,15 +907,21 @@ async fn child_summary_preserves_running_exchange_when_followup_is_queued() -> R
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let admission = admit_child_fixture(&mut broker, "queued-followup")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     broker
         .observe_child_fixture(
-            owner,
+            owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+            child_event(
+                &child_address(&(owner), &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
             &mut Vec::new(),
         )
         .await?;
@@ -884,15 +945,21 @@ async fn child_summary_preserves_running_exchange_when_followup_is_queued() -> R
         .load_exchange(&admission.task.parent_exchange_id)?
         .unwrap();
     parent.append_agent_task(&queued.task)?;
-    broker
-        .store
-        .admit_agent_task(&queued.agent, &queued.task, &parent)?;
+    broker.store.admit_agent_task(
+        &queued.agent,
+        &queued.task,
+        &parent,
+        queued.continuation_authorization(),
+    )?;
     queued.commit()?;
     let snapshot = broker.snapshot()?;
     let summary = &snapshot.agent.summary[&admission.agent.id];
     assert_eq!(summary["state"], "running");
     assert_eq!(summary["latest_exchange_id"], admission.task.id);
-    assert_eq!(summary["target"]["turn_id"], "child-turn");
+    assert_eq!(
+        summary["target"]["turn_id"],
+        json!(child_address(&owner, &admission.task.id).turn_id)
+    );
     assert_eq!(summary["exchange_count"], 2);
     Ok(())
 }
@@ -910,15 +977,21 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
     let mut waiters = Vec::new();
     let mut event = Vec::new();
     for admission in [&first, &sibling] {
-        let owner = crate::provider::ExecutionOwner {
-            session_id: (broker.session.id.clone()).into(),
-            agent_id: (admission.agent.id.clone()).into(),
-        };
+        let owner = crate::provider::ThreadOwner::new(
+            (broker.session.id.clone()).into(),
+            forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
         broker
             .observe_child_fixture(
                 owner.clone(),
                 &admission.task.id,
-                child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+                child_event(
+                    &child_address(&(owner.clone()), &admission.task.id),
+                    crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                        started_at_ms: 0,
+                    }),
+                ),
                 &mut event,
             )
             .await?;
@@ -944,9 +1017,9 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                         }],
                     },
                     Some(crate::provider::TurnAddress {
+                        thread_id: (scope).owner.thread_id(),
+                        turn_id: (scope).turn_id().unwrap(),
                         scope,
-                        thread_id: "durable-child-conversation".into(),
-                        turn_id: "child-turn".into(),
                     }),
                     Some(&sink),
                 )
@@ -956,12 +1029,13 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
             .await??
             .context("approval event missing")?;
         approval_streams.push(stream);
-        let owner = crate::provider::ExecutionOwner {
-            session_id: (broker.session.id.clone()).into(),
-            agent_id: (admission.agent.id.clone()).into(),
-        };
+        let owner = crate::provider::ThreadOwner::new(
+            (broker.session.id.clone()).into(),
+            forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
         broker
-            .observe_child_fixture(owner, &admission.task.id, requested, &mut event)
+            .observe_child_fixture(owner.clone(), &admission.task.id, requested, &mut event)
             .await?;
         let activity = query_child(
             &mut broker,
@@ -976,7 +1050,8 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
             event
                 .iter()
                 .any(|event| event.payload["kind"] == "approval_requested"
-                    && event.payload["data"]["exchange_id"] == admission.task.id
+                    && event.payload["data"]["scope"]["Turn"]["turn_id"]
+                        == child_address(&owner, &admission.task.id).turn_id.as_str()
                     && event.payload["data"]["execution_owner"]["agent_id"] == admission.agent.id)
         );
     }
@@ -1013,15 +1088,17 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
             .any(|event| event.payload["kind"] == "approval_cancelled"
                 && event.payload["data"]["execution_owner"]["agent_id"] == first.agent.id)
     );
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (sibling.agent.id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(sibling.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     broker
         .complete_managed_agent(
             owner,
             sibling.task.id.clone(),
             Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -1047,16 +1124,22 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let admission = admit_child_fixture(&mut broker, "retained")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     let mut event = Vec::new();
     broker
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+            child_event(
+                &child_address(&(owner.clone()), &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
             &mut event,
         )
         .await?;
@@ -1077,6 +1160,19 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
             .contains("child execution")
     );
     broker
+        .observe_child_fixture(
+            owner.clone(),
+            &admission.task.id,
+            ProviderEvent::Thread {
+                thread_id: owner.thread_id(),
+                event: forge_provider_api::ThreadEvent::IdentityResolved(
+                    "durable-child-conversation".to_owned().try_into()?,
+                ),
+            },
+            &mut event,
+        )
+        .await?;
+    broker
         .interrupt_managed_agent(&admission.agent.id, &mut event)
         .await?;
     broker
@@ -1084,6 +1180,7 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
             owner,
             admission.task.id.clone(),
             Err(anyhow::anyhow!("interrupted")),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -1211,9 +1308,12 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             100,
         )?;
         parent.append_agent_task(&admitted.task)?;
-        broker
-            .store
-            .admit_agent_task(&admitted.agent, &admitted.task, &parent)?;
+        broker.store.admit_agent_task(
+            &admitted.agent,
+            &admitted.task,
+            &parent,
+            admitted.continuation_authorization(),
+        )?;
         let admitted = match admitted.commit()? {
             crate::agent::AgentCommit::Admitted(work)
             | crate::agent::AgentCommit::Existing(work) => work,
@@ -1222,26 +1322,32 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         admission.push(admitted);
     }
     let mut event = Vec::new();
-    let mut update = vec![child_event(crate::provider::TurnUpdate::Started {
-        started_at_ms: 0,
-    })];
     for admitted in &admission {
-        let owner = crate::provider::ExecutionOwner {
-            session_id: (broker.session.id.clone()).into(),
-            agent_id: (admitted.agent.id.clone()).into(),
-        };
+        let owner = crate::provider::ThreadOwner::new(
+            (broker.session.id.clone()).into(),
+            forge_provider_api::agent::AgentId::new(admitted.agent.id.clone()).unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
+        let update = child_event(
+            &child_address(&owner, &admitted.task.id),
+            crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: 0,
+            }),
+        );
         broker
-            .observe_child_fixture(owner, &admitted.task.id, update.clone(), &mut event)
+            .observe_child_fixture(owner.clone(), &admitted.task.id, update, &mut event)
             .await?;
     }
     let first = &admission[0];
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (first.agent.id.clone()).into(),
-    };
-    update = child_message(
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(first.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
+    let mut update = child_message(
+        &child_address(&(owner.clone()), &first.task.id),
         "thought",
-        crate::provider::MessageRole::Commentary,
+        crate::provider::TestMessageContent::Commentary,
         "First child thought",
     );
     broker
@@ -1270,15 +1376,17 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             .is_empty()
     );
     let mut foreign = update.clone();
-    if let ProviderEvent::Message { address, .. } = &mut foreign[0] {
-        address.turn.scope.owner = crate::provider::ExecutionOwner {
-            session_id: broker.session.id.clone().into(),
-            agent_id: admission[1].agent.id.clone().into(),
-        };
+    if let ProviderEvent::Item { thread_id, .. } = &mut foreign[0] {
+        *thread_id = crate::provider::ThreadOwner::new(
+            broker.session.id.clone().into(),
+            forge_provider_api::agent::AgentId::new(admission[1].agent.id.clone())?,
+        )
+        .unwrap()
+        .thread_id();
     }
     assert!(
         broker
-            .observe_managed_agent(owner.clone(), &first.task.id, foreign.remove(0), &mut event)
+            .observe_child_fixture(owner.clone(), &first.task.id, foreign.remove(0), &mut event)
             .await
             .is_err()
     );
@@ -1310,8 +1418,9 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         "Retain after rejected steering"
     );
     update = child_message(
+        &child_address(&(owner.clone()), &first.task.id),
         "final",
-        crate::provider::MessageRole::Response,
+        crate::provider::TestMessageContent::Response,
         "Child final response",
     );
     broker
@@ -1322,6 +1431,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             owner.clone(),
             first.task.id.clone(),
             Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -1351,23 +1461,30 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
         101,
     )?;
     parent.append_agent_task(&next.task)?;
-    broker
-        .store
-        .admit_agent_task(&next.agent, &next.task, &parent)?;
+    broker.store.admit_agent_task(
+        &next.agent,
+        &next.task,
+        &parent,
+        next.continuation_authorization(),
+    )?;
     let next = match next.commit()? {
         crate::agent::AgentCommit::Admitted(work) | crate::agent::AgentCommit::Existing(work) => {
             work
         }
     };
-    update = vec![child_event(crate::provider::TurnUpdate::Started {
-        started_at_ms: 0,
-    })];
+    update = vec![child_event(
+        &child_address(&(owner.clone()), &next.task.id),
+        crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+            started_at_ms: 0,
+        }),
+    )];
     broker
         .observe_child_fixture(owner.clone(), &next.task.id, update.clone(), &mut event)
         .await?;
     update = child_message(
+        &child_address(&(owner.clone()), &next.task.id),
         "next-thought",
-        crate::provider::MessageRole::Commentary,
+        crate::provider::TestMessageContent::Commentary,
         "New task thought",
     );
     broker
@@ -1379,8 +1496,9 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     );
     let saved_next = serde_json::to_value(broker.store.load_exchange(&next.task.id)?)?;
     update = child_message(
+        &child_address(&(owner.clone()), &first.task.id),
         "late-old-task",
-        crate::provider::MessageRole::Commentary,
+        crate::provider::TestMessageContent::Commentary,
         "LATE OLD TASK",
     );
     broker
@@ -1391,6 +1509,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             owner,
             first.task.id.clone(),
             Err(anyhow::anyhow!("duplicate failure")),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -1438,11 +1557,13 @@ impl RoutingProvider {
         let captured = self.request.clone();
         let handler = crate::provider::test_support::EventFixtureProvider::new(
             descriptor.clone(),
-            move |request, sink, _cancelled| {
+            move |request, sink, start, _cancelled| {
                 let turns = turns.clone();
                 let captured = captured.clone();
-                let descriptor = descriptor.clone();
+
                 async move {
+                    start.observed(0).await?;
+
                     captured.lock().unwrap().push(request.clone());
                     let ordinal = turns.fetch_add(1, Ordering::AcqRel);
                     let root = request.scope.owner.is_root();
@@ -1463,7 +1584,7 @@ impl RoutingProvider {
                             if !text.contains("CHILD_RESULT") {
                                 return Err(crate::provider::ProviderError::Failure(
                                     forge_provider_api::ProviderFailure::new(
-                                        forge_provider_api::ProviderOperation::InputSubmit,
+                                        forge_provider_api::ProviderOperation::TurnStart,
                                         forge_provider_api::ProviderFailureKind::Protocol,
                                     ),
                                 ));
@@ -1474,7 +1595,7 @@ impl RoutingProvider {
                         if !text.ends_with("CHILD_RESULT") {
                             return Err(crate::provider::ProviderError::Failure(
                                 forge_provider_api::ProviderFailure::new(
-                                    forge_provider_api::ProviderOperation::InputSubmit,
+                                    forge_provider_api::ProviderOperation::TurnStart,
                                     forge_provider_api::ProviderFailureKind::Protocol,
                                 ),
                             ));
@@ -1483,74 +1604,50 @@ impl RoutingProvider {
                     };
                     let scope = request.scope.clone();
                     let address = crate::provider::TurnAddress {
+                        thread_id: (scope.clone()).owner.thread_id(),
+                        turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
-                        thread_id: if root {
+                    };
+
+                    for event in completed_message(
+                        &address,
+                        "routing-response",
+                        crate::provider::TestMessageContent::Response,
+                        response,
+                    ) {
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
+                    }
+                    if let Some(history) = Some(
+                        if root {
                             "root-history"
                         } else {
                             "child-history"
                         }
-                        .into(),
-                        turn_id: format!("routing-{ordinal}").into(),
-                    };
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                    })
-                    .await?;
-                    for event in completed_message(
-                        &address,
-                        "routing-response",
-                        crate::provider::MessageRole::Response,
-                        response,
+                        .to_owned()
+                        .try_into()
+                        .expect("fixture ID is valid"),
                     ) {
-                        sink.send_wait(event).await?;
+                        sink.send_wait(forge_provider_api::AdapterActivity::Thread {
+                            thread_id: request.thread_id.clone(),
+                            event: forge_provider_api::ThreadEvent::IdentityResolved(history),
+                        })
+                        .await?;
                     }
-                    let completion = forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some(
-                            if root {
-                                "root-history"
-                            } else {
-                                "child-history"
-                            }
-                            .to_owned()
-                            .try_into()
-                            .expect("fixture ID is valid"),
-                        ),
-                        capability: descriptor.capability.clone(),
-                        ..Default::default()
+                    let native_outcome = crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     };
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                            completed_at_ms: 2,
-                        },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope,
-                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 2,
-                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                    completion: completion.into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                    let native_completed_at_ms = 2;
+
+                    Ok(forge_provider_api::TurnResult::new(
+                        native_outcome,
+                        native_completed_at_ms,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"))
                 }
             },
         );
@@ -1579,7 +1676,7 @@ impl RoutingProvider {
             if reject_steering {
                 Err(crate::provider::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Rejected,
                     ),
                 ))
@@ -1815,13 +1912,15 @@ impl ResultReceivingProvider {
         let input = self.input.clone();
         let provider = crate::provider::test_support::EventFixtureProvider::new(
             descriptor,
-            move |request, sink, _cancelled| {
+            move |request, sink, start, _cancelled| {
                 let turn = turn.clone();
                 let incoming = incoming.clone();
                 let receipt = receipt.clone();
                 let message = message.clone();
                 let input = input.clone();
                 async move {
+                    start.observed(0).await?;
+
                     turn.fetch_add(1, Ordering::AcqRel);
                     let text = match &request.input {
                         forge_provider_api::PromptInput::Text(text) => text.clone(),
@@ -1853,60 +1952,46 @@ impl ResultReceivingProvider {
                     }
                     let scope = request.scope.clone();
                     let address = crate::provider::TurnAddress {
+                        thread_id: (scope.clone()).owner.thread_id(),
+                        turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
-                        thread_id: "result-parent-history".into(),
-                        turn_id: "result-parent-turn".into(),
                     };
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
+
                     for event in completed_message(
                         &address,
                         "synthesized-response",
-                        crate::provider::MessageRole::Response,
+                        crate::provider::TestMessageContent::Response,
                         "SYNTHESIZED_RESULT",
                     ) {
-                        sink.send_wait(event).await?;
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
                     }
-                    let completion = forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some(
-                            "result-parent-history"
-                                .to_owned()
-                                .try_into()
-                                .expect("fixture ID is valid"),
-                        ),
-                        capability: crate::provider::test_support::fixture_capability(),
-                        ..Default::default()
+                    if let Some(history) = Some(
+                        "result-parent-history"
+                            .to_owned()
+                            .try_into()
+                            .expect("fixture ID is valid"),
+                    ) {
+                        sink.send_wait(forge_provider_api::AdapterActivity::Thread {
+                            thread_id: request.thread_id.clone(),
+                            event: forge_provider_api::ThreadEvent::IdentityResolved(history),
+                        })
+                        .await?;
+                    }
+                    let native_outcome = crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     };
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                            completed_at_ms: 1,
-                        },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope,
-                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 1,
-                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                    completion: completion.into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                    let native_completed_at_ms = 1;
+
+                    Ok(forge_provider_api::TurnResult::new(
+                        native_outcome,
+                        native_completed_at_ms,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"))
                 }
             },
         );
@@ -2011,31 +2096,41 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
         crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
     broker.provider = fixture.provider_handle();
     let admission = admit_child_fixture(&mut broker, "idle-result")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id.clone()).into(),
-    };
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     let mut event = Vec::new();
     broker
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 0 }),
+            child_event(
+                &child_address(&(owner.clone()), &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
             &mut event,
         )
         .await?;
     let response = child_message(
+        &child_address(&(owner.clone()), &admission.task.id),
         "result",
-        crate::provider::MessageRole::Response,
+        crate::provider::TestMessageContent::Response,
         "RETAINED_CHILD_REPORT",
     );
     broker
         .observe_child_fixture(owner.clone(), &admission.task.id, response, &mut event)
         .await?;
-    let finished = child_event(crate::provider::TurnUpdate::Finished {
-        outcome: crate::turn::TurnOutcome::Completed,
-        completed_at_ms: 100,
-    });
+    let finished = child_completed(
+        &child_address(&(owner.clone()), &admission.task.id),
+        crate::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+        },
+        100,
+    );
     broker
         .observe_child_fixture(owner.clone(), &admission.task.id, finished, &mut event)
         .await?;
@@ -2044,6 +2139,7 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
             owner.clone(),
             admission.task.id.clone(),
             Ok(Default::default()),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -2053,6 +2149,7 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
             owner,
             admission.task.id.clone(),
             Err(anyhow::anyhow!("duplicate")),
+            Vec::new(),
             None,
             &mut event,
         )
@@ -2111,10 +2208,12 @@ impl SuspendedParentProvider {
         let state = self.clone();
         crate::provider::test_support::EventFixtureProvider::new(
             descriptor.clone(),
-            move |request, sink, mut cancelled| {
+            move |request, sink, start, mut cancelled| {
                 let state = state.clone();
-                let descriptor = descriptor.clone();
+
                 async move {
+                    start.observed(0).await?;
+
                     let text = match &request.input {
                         forge_provider_api::PromptInput::Text(text) => text.clone(),
                         _ => String::new(),
@@ -2151,74 +2250,36 @@ impl SuspendedParentProvider {
                         format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
                     };
                     let scope = request.scope.clone();
-                    let root = scope.owner.is_root();
+
                     let address = crate::provider::TurnAddress {
+                        thread_id: (scope.clone()).owner.thread_id(),
+                        turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
-                        thread_id: if root {
-                            "suspended-history"
-                        } else {
-                            "child-history"
-                        }
-                        .into(),
-                        turn_id: format!("suspended-{}", state.root_turn.load(Ordering::Acquire))
-                            .into(),
                     };
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope.clone(),
-                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                    })
-                    .await?;
+
                     for event in completed_message(
                         &address,
                         "suspended-response",
-                        crate::provider::MessageRole::Response,
+                        crate::provider::TestMessageContent::Response,
                         response,
                     ) {
-                        sink.send_wait(event).await?;
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
                     }
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
-                            completed_at_ms: 2,
-                        },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                            scope,
-                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 2,
-                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                    completion:
-                                        forge_provider_api::completion::ProviderCompletion {
-                                            provider_session_id: Some(
-                                                "suspended-history"
-                                                    .to_owned()
-                                                    .try_into()
-                                                    .expect("fixture ID is valid"),
-                                            ),
-                                            capability: descriptor.capability.clone(),
-                                            ..Default::default()
-                                        }
-                                        .into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
+                    let native_outcome = forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    };
+                    let native_completed_at_ms = 2;
+
+                    Ok(forge_provider_api::TurnResult::new(
+                        native_outcome,
+                        native_completed_at_ms,
+                        None,
+                        request.input_coverage(),
+                        Vec::new(),
+                        None,
+                    )
+                    .expect("fixture native coverage is valid"))
                 }
             },
         )

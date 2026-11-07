@@ -9,7 +9,8 @@ local build = require("forge.builder").binary_path()
 assert(vim.fn.executable(build) == 1, "build the selected Forge host before this integration test")
 assert(vim.fn.mkdir(data_directory, "p") == 1)
 local executable = data_directory .. "/" .. executable_name
-assert(vim.uv.fs_copyfile(build, executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   if kind == "data" then return data_directory end

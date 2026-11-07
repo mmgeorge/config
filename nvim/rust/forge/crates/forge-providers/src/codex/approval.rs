@@ -1,8 +1,9 @@
 use crate::permission_input::{normalize_permission_payload, provider_path, provider_shell};
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::access::DirectoryOperation;
-use forge_provider_api::approval::ApprovalResolution;
-use forge_provider_api::permissions::{CommandAnalysisError, PermissionRequest, PermissionTarget};
+use forge_provider_api::permissions::{
+    CommandAnalysisError, PermissionRequest, PermissionResponse, PermissionTarget,
+};
 use forge_shell::shell::{CommandAnalysisFailure, CommandShell};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -251,16 +252,16 @@ pub fn permission_from_provider(
     })
 }
 
-pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value {
-    let allow = matches!(
-        resolution,
-        ApprovalResolution::AllowOnce
-            | ApprovalResolution::AllowExact
-            | ApprovalResolution::AllowBroad
-    );
+/// Encode the normalized host decision in the reply shape of the original Codex request.
+///
+/// Harness has already applied saved rules, grants, and deadlines; the adapter sees only whether
+/// the request was allowed, denied, or cancelled.
+pub fn codex_response(message: &Value, response: &PermissionResponse) -> Value {
+    let allow = matches!(response, PermissionResponse::Allow);
+    let cancelled = matches!(response, PermissionResponse::Cancelled);
     if message.get("method").and_then(Value::as_str) == Some("mcpServer/elicitation/request") {
         return json!({
-            "action": if allow { "accept" } else if resolution == ApprovalResolution::Cancel { "cancel" } else { "decline" },
+            "action": if allow { "accept" } else if cancelled { "cancel" } else { "decline" },
             "content": if allow { json!({}) } else { Value::Null },
         });
     }
@@ -271,10 +272,10 @@ pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value 
             json!({ "permissions": {}, "scope": "turn" })
         };
     }
-    json!({ "decision": match resolution {
-        ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => "accept",
-        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad | ApprovalResolution::DenyPolicy | ApprovalResolution::DenyMode | ApprovalResolution::TimedOut => "decline",
-        ApprovalResolution::Cancel => "cancel",
+    json!({ "decision": match response {
+        PermissionResponse::Allow => "accept",
+        PermissionResponse::Deny { .. } => "decline",
+        PermissionResponse::Cancelled => "cancel",
     }})
 }
 
@@ -612,17 +613,17 @@ mod tests {
     fn native_approval_resolution_encodes_protocol_specific_replies() {
         let command = json!({"method":"item/commandExecution/requestApproval"});
         assert_eq!(
-            codex_response(&command, ApprovalResolution::TimedOut)["decision"],
+            codex_response(&command, &PermissionResponse::Deny { reason: None })["decision"],
             "decline"
         );
         let permissions = json!({"method":"item/permissions/requestApproval","params":{"permissions":{"write":true}}});
         assert_eq!(
-            codex_response(&permissions, ApprovalResolution::AllowOnce)["permissions"]["write"],
+            codex_response(&permissions, &PermissionResponse::Allow)["permissions"]["write"],
             true
         );
         let elicitation = json!({"method":"mcpServer/elicitation/request"});
         assert_eq!(
-            codex_response(&elicitation, ApprovalResolution::Cancel)["action"],
+            codex_response(&elicitation, &PermissionResponse::Cancelled)["action"],
             "cancel"
         );
     }

@@ -181,6 +181,11 @@ fn summarize_check_leaves(leaves: &[CheckLeaf<'_>]) -> String {
         result.0 = state;
         result.1 += 1;
     }
+    // Pending and skipped commands produce no leaves; a run with none executed no check,
+    // and a vacuous `0/0 passed` reads as success.
+    if latest.is_empty() {
+        return "No automatic checks ran".into();
+    }
     let attempts = latest
         .values()
         .map(|(_, attempts)| *attempts)
@@ -409,19 +414,20 @@ impl TimelineRenderer<'_> {
                 ""
             }
         );
-        let heading = crate::turn::ToolCall {
-            command_shell: None,
-            id: call_id.to_string(),
-            kind: "check".into(),
-            title: title.clone(),
-            started_at_ms: elapsed.map(|_| 0),
-            completed_at_ms: elapsed.map(|value| value.min(i64::MAX as u64) as i64),
-            checklist_item_id: None,
-            output: Default::default(),
-            status: String::new(),
-            failed,
-            change: Default::default(),
-        };
+        let heading = crate::turn::ToolCall::projection(
+            call_id.to_string(),
+            "check".into(),
+            title.clone(),
+            if failed {
+                crate::turn::ToolState::Failed
+            } else if elapsed.is_some() {
+                crate::turn::ToolState::Completed
+            } else {
+                crate::turn::ToolState::Running
+            },
+            elapsed.map(|_| 0),
+            elapsed.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        );
         let mut output = if let Some(result) = leaf.result {
             let details = format!("Command: {}\n{}", result.command, result.output);
             let raw = ToolOutputView::file(raw_id, check.output.clone(), check.output_bytes);
@@ -430,7 +436,7 @@ impl TimelineRenderer<'_> {
         } else {
             ToolOutputView::file(call_id, check.output.clone(), check.output_bytes)
         };
-        output.heading(&heading);
+        output.heading(&heading, crate::turn::ToolInstant::wall(self.now_ms));
         output.group = leaf.group.clone();
         let expanded = self.expansion.get(&format!("{call_id}:tool")).copied() == Some(true);
         let limit = self
@@ -538,6 +544,28 @@ mod tests {
         Ok(())
     }
 
+    /// A run whose commands were all ineligible reports that no automatic check ran
+    /// instead of a vacuous `0/0 passed` count.
+    #[test]
+    fn run_without_eligible_commands_reports_no_automatic_checks() -> Result<()> {
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":1,"completed_at_ms":2,"state":"passed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"run:0","command":"python -m unittest","state":"skipped",
+                "started_at_ms":1,"completed_at_ms":null,"exit_code":null,"error":null,"stdout":"",
+                "stderr":"","output":"","output_bytes":0,"preview":"",
+                "context":{"definition_id":"unit","name":"unit-tests","area":".","reason":"manual",
+                    "matched_files":[],"category":"test","directory":".","selection":{"kind":"all"},
+                    "resolved":null,"depends_on":[],"receipt":"unused"}
+            }]
+        }))?;
+        assert_eq!(check_summary(&run), "No automatic checks ran");
+        Ok(())
+    }
+
     #[test]
     fn categories_preserve_file_groups_repeated_runs_and_original_outcomes() -> Result<()> {
         let mut commands = Vec::new();
@@ -572,6 +600,7 @@ mod tests {
                 run: (run.clone()).into(),
             },
             &WidthProfile::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             false,
             &HashMap::new(),
             &HashMap::new(),
@@ -694,6 +723,7 @@ mod tests {
                 run: (failed_run).into(),
             },
             &WidthProfile::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             false,
             &HashMap::new(),
             &HashMap::new(),

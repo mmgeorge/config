@@ -275,7 +275,13 @@ mod tests {
             }
         }
 
-        async fn bind_native_call(&self, _: &str, _: &forge_provider_api::InvocationScope) {}
+        async fn bind_native_call(
+            &self,
+            _: &str,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), forge_provider_api::ProviderError> {
+            Ok(())
+        }
 
         async fn release_native_call(&self, _: &str) {}
     }

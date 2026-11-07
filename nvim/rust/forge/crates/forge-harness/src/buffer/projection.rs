@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
@@ -231,19 +230,20 @@ impl ProjectionSource<'_> {
     }
 }
 
+/// Places projection-test time after every fixture timestamp, as the system clock does.
+#[cfg(test)]
+pub(crate) const FIXTURE_NOW_MS: i64 = 1_800_000_000_000;
+
+/// Project one entry, rendering elapsed labels against the caller's presentation time.
 pub fn project<'source>(
     entry: impl Into<ProjectionSource<'source>>,
     width: &WidthProfile,
+    now_ms: i64,
     leading_separator: bool,
     expansion: &HashMap<String, bool>,
     tool_limit: &HashMap<String, usize>,
     display: &mut crate::buffer::identity::DisplayRegistry,
 ) -> Result<ProjectedEntry> {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().min(i64::MAX as u128) as i64
-        });
     project_at_with_separator(
         entry.into(),
         width,
@@ -255,10 +255,47 @@ pub fn project<'source>(
     )
 }
 
+/// Identify the provider turn that produced a content part, so a turn restarted after
+/// an interruption (for example by a mid-turn access or thinking change) can be
+/// separated from the partial output it replaces.
+fn part_turn_id<'source>(
+    interaction: &'source Exchange,
+    content: &crate::exchange::ExchangeContentView<'source>,
+    part: &crate::exchange::EntryPart<'source>,
+) -> Option<&'source str> {
+    match part {
+        crate::exchange::EntryPart::Event(nodes) => nodes.iter().find_map(|node| match node {
+            ExchangeNode::TurnContent { turn_id, .. } => Some(turn_id.as_str()),
+            _ => None,
+        }),
+        crate::exchange::EntryPart::Commentary(index) => {
+            let commentary = content.commentary.get(*index)?;
+            commentary
+                .message
+                .and_then(|message| {
+                    interaction
+                        .turn
+                        .iter()
+                        .find(|turn| turn.messages().iter().any(|item| item.id() == message.id()))
+                        .map(|turn| turn.id())
+                })
+                .or_else(|| {
+                    commentary
+                        .tools
+                        .call
+                        .iter()
+                        .chain(&commentary.writes.call)
+                        .map(|call| call.turn.id())
+                        .next()
+                })
+        }
+    }
+}
+
 fn tool_group_label<'tool>(
     calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
     lifecycle: NodeLifecycle,
-    now_ms: i64,
+    now: crate::turn::ToolInstant,
 ) -> String {
     let mut count = 0;
     let mut failed = 0;
@@ -267,7 +304,7 @@ fn tool_group_label<'tool>(
         count += 1;
         failed += usize::from(tool.failed);
         elapsed = elapsed
-            .zip(tool.elapsed_ms(now_ms))
+            .zip(tool.elapsed_ms(now))
             .map(|(total, duration)| total.saturating_add(duration));
     }
     let mut label = format!(
@@ -294,6 +331,7 @@ fn tool_group_label<'tool>(
 pub(super) fn timing_blocks(
     entry: &TimelineEntry,
     width: &WidthProfile,
+    now_ms: i64,
     document: &forge_buffer::document::BufferDocument,
     expanded: &HashMap<String, bool>,
     tools: &HashMap<super::identity::DisplayId, ToolOutputView>,
@@ -367,13 +405,22 @@ pub(super) fn timing_blocks(
                     exchanges(agent, result, headings);
                 }
             }
+            TimelineEntry::ObservedAgent {
+                agent, children, ..
+            } => {
+                if agent.availability() == crate::agent::ObservedAgentAvailability::Available {
+                    result.extend(agent.exchanges());
+                }
+                for child in children {
+                    exchanges(child, result, headings);
+                }
+            }
             _ => {}
         }
     }
     if matches!(entry, TimelineEntry::Status { .. }) {
         return Ok(Vec::new());
     }
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     if matches!(entry, TimelineEntry::Checks { .. }) {
         return Ok(Vec::new());
     }
@@ -451,7 +498,11 @@ pub(super) fn timing_blocks(
             for tool in exchange.tools_for_turn(turn.id()) {
                 let Some(call_id) = display.tool(
                     &entry.id(),
-                    &crate::turn::ToolAddress::new(turn.id(), &tool.id),
+                    &crate::turn::ToolAddress {
+                        turn: turn.provider().clone(),
+                        item_id: forge_provider_api::ItemId::new(tool.id.clone())
+                            .expect("retained tool has a validated item identity"),
+                    },
                 ) else {
                     continue;
                 };
@@ -478,7 +529,7 @@ pub(super) fn timing_blocks(
                                 previous,
                                 crate::buffer::transcript::ToolHeading {
                                     kind: &tool.kind,
-                                    elapsed_ms: tool.elapsed_ms(now_ms),
+                                    elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
                                     failed: tool.failed,
                                     title: &tool.title,
                                     expanded: false,
@@ -502,7 +553,11 @@ pub(super) fn timing_blocks(
             for (turn, tool) in &calls {
                 let Some(call_id) = display.tool(
                     &entry.id(),
-                    &crate::turn::ToolAddress::new(turn.id(), &tool.id),
+                    &crate::turn::ToolAddress {
+                        turn: turn.provider().clone(),
+                        item_id: forge_provider_api::ItemId::new(tool.id.clone())
+                            .expect("retained tool has a validated item identity"),
+                    },
                 ) else {
                     continue;
                 };
@@ -525,7 +580,7 @@ pub(super) fn timing_blocks(
                     previous,
                     crate::buffer::transcript::ToolHeading {
                         kind: &tool.kind,
-                        elapsed_ms: tool.elapsed_ms(now_ms),
+                        elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
                         failed: tool.failed,
                         title: &tool.title,
                         expanded: expanded.get(&format!("{call_id}:tool")) == Some(&true),
@@ -555,7 +610,11 @@ pub(super) fn timing_blocks(
                 .max(1);
             let mut block = TranscriptRenderer::new(&profile)?.literal(
                 previous.id.clone(),
-                &tool_group_label(calls.iter().map(|(_, tool)| *tool), lifecycle, now_ms),
+                &tool_group_label(
+                    calls.iter().map(|(_, tool)| *tool),
+                    lifecycle,
+                    exchange.tool_instant(now_ms),
+                ),
                 2,
             )?;
             block.metadata = previous.metadata.clone();
@@ -601,24 +660,29 @@ pub(super) fn message_block(
         expansion: &HashMap::new(),
         tool_limit: &HashMap::new(),
     };
-    let mut block = renderer.markdown_block(
-        &previous.id.0,
-        message.text(),
-        if message.delivery() == crate::turn::MessageDelivery::Final {
-            if previous
-                .metadata
-                .layout
-                .as_ref()
-                .is_some_and(|layout| layout.marker.is_none())
-            {
-                MarkdownRole::Message
+    let mut block = if message.kind() == crate::turn::MessageKind::User {
+        TranscriptRenderer::new(&renderer.content_width())?
+            .prompt(previous.id.clone(), message.text())?
+    } else {
+        renderer.markdown_block(
+            &previous.id.0,
+            message.text(),
+            if message.delivery() == crate::turn::MessageDelivery::Final {
+                if previous
+                    .metadata
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.marker.is_none())
+                {
+                    MarkdownRole::Message
+                } else {
+                    MarkdownRole::Response
+                }
             } else {
-                MarkdownRole::Response
-            }
-        } else {
-            MarkdownRole::Commentary
-        },
-    )?;
+                MarkdownRole::Commentary
+            },
+        )?
+    };
     block.metadata.layout = previous.metadata.layout.clone();
     if let Some(layout) = &mut block.metadata.layout {
         layout.source_indent = 0;
@@ -818,6 +882,14 @@ impl TimelineRenderer<'_> {
                 {
                     self.declaration_comparison(id, execution)?;
                 }
+            }
+            TimelineEntry::ObservedAgent {
+                id,
+                agent,
+                children,
+                ..
+            } => {
+                self.observed_agent(id, agent, children, depth)?;
             }
             TimelineEntry::AgentLifecycle {
                 id,
@@ -1027,6 +1099,107 @@ impl TimelineRenderer<'_> {
                 self.plan_resolution(resolution, deviation, audit.as_ref())?;
             }
         }
+        Ok(())
+    }
+
+    /// Freeze unavailable native-child display clocks without inventing a native completion.
+    fn observed_agent(
+        &mut self,
+        id: &str,
+        agent: &crate::agent::ObservedAgent,
+        children: &[TimelineEntry],
+        depth: usize,
+    ) -> Result<()> {
+        let original_now = self.now_ms;
+        if agent.availability() == crate::agent::ObservedAgentAvailability::Unavailable {
+            self.now_ms = agent.observation_boundary_ms();
+        }
+        let rendered = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            self.observed_agent_content(id, agent, children, depth)
+        });
+        self.now_ms = original_now;
+        rendered
+    }
+
+    /// Present native child history without managed-agent action or task controls.
+    fn observed_agent_content(
+        &mut self,
+        id: &str,
+        agent: &crate::agent::ObservedAgent,
+        children: &[TimelineEntry],
+        depth: usize,
+    ) -> Result<()> {
+        use crate::agent::ObservedAgentState;
+        use forge_provider_api::agent::{AgentActiveState, AgentOutcome};
+        let description = agent.description();
+        let label = description
+            .nickname
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| {
+                description
+                    .definition
+                    .as_deref()
+                    .filter(|label| !label.trim().is_empty())
+            })
+            .unwrap_or("child");
+        let state = match agent.state() {
+            ObservedAgentState::NotObserved => "observed",
+            ObservedAgentState::Active(AgentActiveState::Starting) => "starting",
+            ObservedAgentState::Active(AgentActiveState::Running) => "running",
+            ObservedAgentState::Active(AgentActiveState::Waiting) => "waiting",
+            ObservedAgentState::Finished(AgentOutcome::Completed) => "completed",
+            ObservedAgentState::Finished(AgentOutcome::Failed(_)) => "failed",
+            ObservedAgentState::Finished(AgentOutcome::Interrupted) => "interrupted",
+            ObservedAgentState::Finished(AgentOutcome::Closed) => "closed",
+        };
+        let unavailable =
+            agent.availability() == crate::agent::ObservedAgentAvailability::Unavailable;
+        self.literal(
+            id,
+            &format!(
+                "Native agent {label} · {}",
+                if unavailable {
+                    "observation unavailable"
+                } else {
+                    state
+                }
+            ),
+            None,
+        )?;
+        let section = self.begin_section(2);
+        if unavailable {
+            self.literal(
+                &format!("{id}:last-state"),
+                &format!("Last native state: {state}"),
+                None,
+            )?;
+        }
+        if let Some(task) = description
+            .task
+            .as_deref()
+            .filter(|task| !task.trim().is_empty())
+        {
+            self.markdown(&format!("{id}:task"), task, MarkdownRole::Detail)?;
+        }
+        if let ObservedAgentState::Finished(AgentOutcome::Failed(failure)) = agent.state() {
+            self.literal(&format!("{id}:failure"), &failure.to_string(), None)?;
+        }
+        let no_managed_agents = HashMap::new();
+        self.host_file_change_records(agent.pending_file_changes())?;
+        for exchange in agent.exchanges() {
+            self.interaction(exchange, &no_managed_agents, depth + 1)?;
+        }
+        for child in children {
+            self.entry(child, depth + 1)?;
+        }
+        let finished = unavailable || matches!(agent.state(), ObservedAgentState::Finished(_));
+        let node = self.finish_section(section, id, finished);
+        node.lifecycle = if finished {
+            NodeLifecycle::Settled
+        } else {
+            NodeLifecycle::Live
+        };
         Ok(())
     }
 
@@ -1271,7 +1444,11 @@ impl TimelineRenderer<'_> {
             )?;
             self.prompt.push(prompt.id.clone());
             self.push(prompt)?;
-        } else if !interaction.prompt.is_empty() {
+        } else if !matches!(
+            interaction.origin,
+            crate::exchange::ExchangeOrigin::NativeAgent
+        ) && !interaction.prompt.is_empty()
+        {
             let prompt = TranscriptRenderer::new(&self.content_width())?.prompt(
                 BlockId(format!("{}:prompt", interaction.id)),
                 &interaction.prompt,
@@ -1328,6 +1505,8 @@ impl TimelineRenderer<'_> {
                 NodeLifecycle::Live
             };
         }
+        self.provider_checklist(interaction)?;
+        self.host_file_changes(interaction)?;
         self.interaction_results(interaction)?;
         self.content(
             interaction,
@@ -1369,6 +1548,41 @@ impl TimelineRenderer<'_> {
             drop(margin);
             self.offset_layout(start, indent / 2);
             continuation = remaining;
+        }
+        for turn in &interaction.turn {
+            for (index, error) in turn.errors().iter().enumerate() {
+                self.literal(
+                    &format!("{}:turn:{}:error:{index}", interaction.id, turn.id()),
+                    &format!("Provider turn error: {error}"),
+                    None,
+                )?;
+            }
+            if let crate::turn::TurnState::Finished {
+                outcome:
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: reason,
+                    },
+            } = turn.state()
+            {
+                use forge_provider_api::turn::TurnCompletionReason;
+                let notice = match reason {
+                    TurnCompletionReason::Normal => None,
+                    TurnCompletionReason::Refusal => Some("The provider refused to continue."),
+                    TurnCompletionReason::TokenLimit => {
+                        Some("The provider stopped because it reached its token limit.")
+                    }
+                    TurnCompletionReason::RequestLimit => Some(
+                        "The provider stopped because this turn reached its model-request limit.",
+                    ),
+                };
+                if let Some(notice) = notice {
+                    self.literal(
+                        &format!("{}:turn:{}:stop-reason", interaction.id, turn.id()),
+                        notice,
+                        None,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -1425,7 +1639,7 @@ impl TimelineRenderer<'_> {
 
     fn verification_result(
         &mut self,
-        exchange_id: &str,
+        _exchange_id: &str,
         id: &str,
         result: &crate::exchange::VerificationResult,
     ) -> Result<()> {
@@ -1560,14 +1774,10 @@ impl TimelineRenderer<'_> {
                     MarkdownRole::Detail,
                 )?;
                 for (evidence_index, evidence) in check.evidence.iter().enumerate() {
-                    let source_id = result
+                    let action = result
                         .verification_tools
                         .get(evidence)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{exchange_id}:{evidence}"));
-                    let action = self
-                        .display
-                        .legacy_tool(&source_id)
+                        .and_then(|source| self.display.source_tool(source))
                         .map(|call_id| TranscriptAction::Tool { call_id });
                     self.literal(
                         &format!("{check_id}:evidence:{evidence_index}"),
@@ -1690,7 +1900,25 @@ impl TimelineRenderer<'_> {
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
     ) -> Result<()> {
+        let mut previous_turn: Option<&str> = None;
         for part in &content.part {
+            if let Some(turn_id) = part_turn_id(interaction, &content, part) {
+                if let Some(previous) = previous_turn
+                    && previous != turn_id
+                    && interaction.turn.iter().any(|turn| {
+                        turn.id() == previous
+                            && matches!(
+                                turn.state(),
+                                crate::turn::TurnState::Finished {
+                                    outcome: crate::turn::TurnOutcome::Interrupted
+                                }
+                            )
+                    })
+                {
+                    self.literal(&format!("{turn_id}:resumed"), "◇ Resumed", None)?;
+                }
+                previous_turn = Some(turn_id);
+            }
             match part {
                 crate::exchange::EntryPart::Event(nodes) => {
                     if let [
@@ -1709,15 +1937,19 @@ impl TimelineRenderer<'_> {
                                 turn.messages().iter().find(|message| message.id() == id)
                             })
                             .context("response references a missing provider message")?;
-                        self.markdown(
-                            nodes[0].id(),
-                            message.text(),
-                            if message.role().is_none() {
-                                MarkdownRole::Message
-                            } else {
-                                response_role
-                            },
-                        )?;
+                        if message.kind() == crate::turn::MessageKind::User {
+                            self.native_user_message(nodes[0].id(), message.text())?;
+                        } else {
+                            self.markdown(
+                                nodes[0].id(),
+                                message.text(),
+                                if message.role().is_none() {
+                                    MarkdownRole::Message
+                                } else {
+                                    response_role
+                                },
+                            )?;
+                        }
                     } else {
                         self.content_nodes(interaction, agents, depth, nodes, questions)?;
                     }
@@ -1791,7 +2023,7 @@ impl TimelineRenderer<'_> {
         let label = tool_group_label(
             group.call.iter().map(|call| call.tool),
             lifecycle,
-            self.now_ms,
+            exchange.tool_instant(self.now_ms),
         );
         self.literal(&group_id, &label, None)?;
         for (index, call) in group.call.iter().enumerate() {
@@ -1880,7 +2112,19 @@ impl TimelineRenderer<'_> {
                         .find(|turn| turn.id() == turn_id)
                         .and_then(|turn| turn.messages().iter().find(|message| message.id() == id))
                         .context("response references a missing provider message")?;
-                    self.markdown(node.id(), message.text(), MarkdownRole::Response)?;
+                    if message.kind() == crate::turn::MessageKind::User {
+                        self.native_user_message(node.id(), message.text())?;
+                    } else {
+                        self.markdown(
+                            node.id(),
+                            message.text(),
+                            if message.role().is_none() {
+                                MarkdownRole::Message
+                            } else {
+                                MarkdownRole::Response
+                            },
+                        )?;
+                    }
                 }
                 ExchangeNode::TurnContent { .. } => {
                     anyhow::bail!("tool content requires a commentary owner")
@@ -2192,16 +2436,13 @@ impl TimelineRenderer<'_> {
         if let Some(instructions) = &compaction.result.custom_instructions {
             details.push(format!("Focus instructions: {instructions}"));
         }
-        if let Some(diagnostic) = &compaction.result.diagnostic {
+        if let Some(diagnostic) = &compaction.result.error {
             let label = if compaction.state == CompactionState::Failed {
                 "Failure"
             } else {
                 "Explanation"
             };
-            details.push(format!(
-                "{label}: {} ({:?})",
-                diagnostic.message, diagnostic.kind
-            ));
+            details.push(format!("{label}: {} ({:?})", diagnostic, diagnostic.kind()));
         }
         if let Some(count) = compaction.result.tokens_removed {
             details.push(format!("Tokens removed: {count}"));
@@ -2491,6 +2732,87 @@ impl TimelineRenderer<'_> {
         }
     }
 
+    /// Render committed host mutations independently of provider-native final snapshots.
+    fn host_file_changes(&mut self, exchange: &Exchange) -> Result<()> {
+        self.host_file_change_records(&exchange.host_file_changes)
+    }
+
+    /// Show the retained provider checklist as reported progress, never as Harness lifecycle.
+    ///
+    /// The exchange owns the canonical tracker snapshot, so a refresh rebuilds the same block
+    /// identities from it. Superseded entries stay in the snapshot and appear only as a count,
+    /// and a missing or empty checklist adds no section rather than implying finished work.
+    fn provider_checklist(&mut self, exchange: &Exchange) -> Result<()> {
+        use crate::provider::ChecklistStatus;
+        let Some(checklist) = &exchange.checklist else {
+            return Ok(());
+        };
+        if checklist.current.is_empty() {
+            return Ok(());
+        }
+        let identity = format!("{}:provider-checklist", exchange.id);
+        let completed = checklist
+            .current
+            .iter()
+            .filter(|item| item.status == ChecklistStatus::Completed)
+            .count();
+        let mut heading = format!(
+            "Provider-reported checklist · {completed}/{} completed",
+            checklist.current.len()
+        );
+        if let Some(name) = checklist.name.as_deref().map(str::trim)
+            && !name.is_empty()
+        {
+            heading = format!("{heading} · {name}");
+        }
+        if !checklist.superseded.is_empty() {
+            heading = format!("{heading} · {} superseded", checklist.superseded.len());
+        }
+        self.literal(&identity, &heading, None)?;
+        let section = self.begin_section(2);
+        for item in &checklist.current {
+            let marker = match item.status {
+                ChecklistStatus::Pending => "[ ]",
+                ChecklistStatus::InProgress => "[>]",
+                ChecklistStatus::Completed => "[x]",
+                ChecklistStatus::Superseded => "[-]",
+            };
+            let suffix = match item.status {
+                ChecklistStatus::InProgress => " · in progress",
+                ChecklistStatus::Superseded => " · superseded",
+                ChecklistStatus::Pending | ChecklistStatus::Completed => "",
+            };
+            self.literal(
+                &format!("{identity}:{}", item.id),
+                &format!("{marker} {}{suffix}", item.title.trim()),
+                None,
+            )?;
+        }
+        self.finish_section(section, &identity, exchange.is_finished());
+        Ok(())
+    }
+
+    /// Keep each committed host callback's diff stable before and after native transcript admission.
+    fn host_file_change_records(
+        &mut self,
+        effects: &[crate::tools::lsp::HostFileChange],
+    ) -> Result<()> {
+        for effect in effects {
+            let Some(diff) = crate::exchange::ProviderDiffBuilder::build_changes(&effect.changes)
+            else {
+                continue;
+            };
+            let call = serde_json::to_vec(&(&effect.scope, &effect.call_id))?;
+            let identity = format!(
+                "{}:host-file-changes:{}",
+                effect.scope.exchange_id,
+                crate::plan::digest(&call)
+            );
+            self.diff(&identity, "Host file changes", &diff, "", None, None)?;
+        }
+        Ok(())
+    }
+
     fn workspace_comparison(
         &mut self,
         identity: &str,
@@ -2691,9 +3013,14 @@ impl TimelineRenderer<'_> {
     ) -> Result<(super::identity::DisplayId, bool)> {
         let interaction = call.turn.id();
         let tool = call.tool;
-        let display = self
-            .display
-            .tool(crate::turn::ToolAddress::new(interaction, &tool.id), scope);
+        let display = self.display.tool(
+            crate::turn::ToolAddress {
+                turn: call.turn.provider().clone(),
+                item_id: forge_provider_api::ItemId::new(tool.id.clone())
+                    .expect("retained tool has a validated item identity"),
+            },
+            scope,
+        );
         let call_id = display;
         let mut output = if let Some((root, object)) = exchange.output_store.as_ref().zip(
             exchange
@@ -2709,7 +3036,7 @@ impl TimelineRenderer<'_> {
         } else {
             ToolOutputView::new(call_id, &tool.output)
         };
-        output.heading(tool);
+        output.heading(tool, exchange.tool_instant(self.now_ms));
         output.group = group.to_owned();
         output.live_preview = preview;
         let id = format!("{call_id}:tool");
@@ -2726,7 +3053,7 @@ impl TimelineRenderer<'_> {
             crate::buffer::transcript::ToolHeading {
                 shell: tool.command_shell.as_deref(),
                 kind: &tool.kind,
-                elapsed_ms: tool.elapsed_ms(self.now_ms),
+                elapsed_ms: tool.elapsed_ms(exchange.tool_instant(self.now_ms)),
                 failed: tool.failed,
                 title: &label,
                 expanded,
@@ -2813,6 +3140,14 @@ impl TimelineRenderer<'_> {
 
     fn markdown(&mut self, id: &str, text: &str, role: MarkdownRole) -> Result<()> {
         let block = self.markdown_block(id, text, role)?;
+        self.push(block)
+    }
+
+    /// Render positive native user content with the same sender treatment as submitted prompts.
+    fn native_user_message(&mut self, id: &str, text: &str) -> Result<()> {
+        let block =
+            TranscriptRenderer::new(&self.content_width())?.prompt(BlockId(id.into()), text)?;
+        self.prompt.push(block.id.clone());
         self.push(block)
     }
 
@@ -3213,8 +3548,10 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
     let mut tokens = Vec::new();
     let input = usage.input.map(|input| {
         let mut label = token_display(input);
+        // Input sums every request in the exchange, so a bare percentage beside it reads
+        // as context fill; name it as the cached share of that input.
         if let Some(percent) = usage.cached_percent() {
-            label.push_str(&format!(" ({percent}%)"));
+            label.push_str(&format!(" ({percent}% cached)"));
         }
         label
     });
@@ -3262,7 +3599,7 @@ mod tests {
     fn compaction_context_usage_survives_event_order_and_reload() -> anyhow::Result<()> {
         use super::*;
         use crate::provider::{Compaction, CompactionResult, CompactionState};
-        for usage_before_completion in [false, true] {
+        for metrics_on_completion in [false, true] {
             let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
                 "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
                 "prompt":"Work", "state":"running", "created_at_ms":0,
@@ -3280,15 +3617,25 @@ mod tests {
                     ..Default::default()
                 },
             };
-            exchange.observe_compaction(running.clone(), 1_000);
-            assert!(!exchange.observe_compaction_usage("different-provider", 900_000));
-            if usage_before_completion {
-                assert!(!exchange.observe_compaction_usage("provider", 125_000));
-            }
+            let apply = |exchange: &mut Exchange, compaction: Compaction, now| {
+                let event =
+                    forge_provider_api::ThreadEvent::CompactionUpdated(Box::new(compaction));
+                let forge_provider_api::ThreadEvent::CompactionUpdated(compaction) = event else {
+                    unreachable!("fixture carries positively identified compaction metadata")
+                };
+                exchange.observe_compaction(*compaction, now);
+            };
+            apply(&mut exchange, running.clone(), 1_000);
+            let mut unrelated = running.clone();
+            unrelated.thread_id = "different-provider".into();
+            unrelated.state = CompactionState::Completed;
+            unrelated.result.context_tokens_after = Some(900_000);
+            apply(&mut exchange, unrelated, 2_000);
             let mut completed = running.clone();
             completed.state = CompactionState::Completed;
             completed.result = CompactionResult::default();
-            exchange.observe_compaction(completed, 16_000);
+            completed.result.context_tokens_after = metrics_on_completion.then_some(32_000);
+            apply(&mut exchange, completed.clone(), 16_000);
             let waiting = project_at(
                 &TimelineEntry::Exchange {
                     id: "exchange".into(),
@@ -3301,17 +3648,20 @@ mod tests {
                 &WidthProfile::default(),
                 16_000,
             )?;
-            assert!(
-                !waiting
-                    .entry
-                    .block
-                    .iter()
-                    .flat_map(|block| block.text.wire_rows())
-                    .any(|row| row.contains("→"))
-            );
-            assert!(exchange.observe_compaction_usage("provider", 32_000));
-            assert!(!exchange.observe_compaction_usage("provider", 64_000));
-            exchange.observe_compaction(running, 20_000);
+            let original_header = waiting
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .find(|row| row.contains("120.0k"))
+                .unwrap_or_default();
+            assert_eq!(original_header.contains("→ 32.0k"), metrics_on_completion);
+            completed.result.context_tokens_after = Some(32_000);
+            apply(&mut exchange, completed.clone(), 17_000);
+            apply(&mut exchange, completed.clone(), 18_000);
+            completed.result.context_tokens_after = Some(64_000);
+            apply(&mut exchange, completed, 19_000);
+            apply(&mut exchange, running, 20_000);
             let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
             let projected = project_at(
                 &TimelineEntry::Exchange {
@@ -3383,14 +3733,16 @@ mod tests {
                             started_at_ms: Some(1),
                             completed_at_ms: Some(2),
                             result: CompactionResult {
-                                diagnostic: Some(forge_provider_api::ProviderDiagnostic {
-                                    kind: forge_provider_api::ProviderFailureKind::Runtime,
-                                    message: forge_provider_api::SanitizedMessage::new(
-                                        "Runtime closed",
+                                error: Some(
+                                    forge_provider_api::ProviderFailure::new(
+                                        forge_provider_api::ProviderOperation::ThreadCompact,
+                                        forge_provider_api::ProviderFailureKind::Runtime,
                                     )
-                                    .unwrap(),
-                                    fatal: false,
-                                }),
+                                    .at_phase(
+                                        forge_provider_api::ProviderPhase::Observation,
+                                        forge_provider_api::FailureDisposition::Uncertain,
+                                    ),
+                                ),
                                 ..Default::default()
                             },
                         })
@@ -3666,6 +4018,18 @@ mod tests {
     fn verification_groups_keep_checks_and_declaration_diffs_separate() -> anyhow::Result<()> {
         use super::*;
         use serde_json::json;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "earlier-exchange",
+        );
+        let evidence_address = crate::turn::ToolAddress {
+            turn: crate::provider::TurnAddress {
+                thread_id: scope.owner.thread_id(),
+                turn_id: scope.turn_id().unwrap(),
+                scope,
+            },
+            item_id: forge_provider_api::ItemId::new("test-tool").unwrap(),
+        };
         let exchange: Exchange = serde_json::from_value(json!({
             "id":"verify", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
@@ -3676,7 +4040,7 @@ mod tests {
                     {"category":"automated","label":"cargo check","outcome":"failed","summary":"Expected FontSize","evidence":[]},
                     {"category":"manual","label":"Initial display","outcome":"blocked","summary":"Compilation failed","evidence":[]}
                 ]},
-                "verification_tools":{"test-tool":"earlier-exchange:test-tool"},
+                "verification_tools":{"test-tool":evidence_address},
                 "declaration_findings":["src/lib.rs: function update: changed"],
                 "declaration_changes":[{"path":"src/lib.rs","name":"function update",
                     "finding":"src/lib.rs: function update: changed",
@@ -3685,10 +4049,9 @@ mod tests {
         }))?;
         let exchange: Exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
         let mut display = crate::buffer::identity::DisplayRegistry::default();
-        let evidence_id = display.project("earlier-exchange".into()).tool(
-            crate::turn::ToolAddress::new("earlier-exchange", "test-tool"),
-            None,
-        );
+        let evidence_id = display
+            .project("earlier-exchange".into())
+            .tool(evidence_address, None);
         let projection = project_at_with_separator(
             ProjectionSource::Entry(&TimelineEntry::Exchange {
                 id: "verify".into(),
@@ -3885,6 +4248,7 @@ mod tests {
         let refreshed = super::timing_blocks(
             &entry,
             &width,
+            crate::buffer::projection::FIXTURE_NOW_MS,
             &document,
             &Default::default(),
             &projected.tool,
@@ -4032,10 +4396,7 @@ mod tests {
     #[test]
     fn outer_responses_keep_order_across_answered_questions_and_continued_turns() {
         use crate::exchange::{ExchangeNode, InputIntent, QuestionInput};
-        use crate::provider::{
-            ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-            TurnUpdate,
-        };
+        use crate::provider::{TextUpdate, ToolOutcome};
 
         for planning_question in [None, Some(false), Some(true)] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4050,25 +4411,25 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 "inspection",
-                Some(crate::provider::MessageRole::Commentary),
+                Some(forge_provider_api::AgentMessageRole::Commentary),
                 "Inspecting the repository",
             );
-            exchange.observe_turn(&event, 1).unwrap();
+            exchange.observe_event(&event, 1).unwrap();
             let event = crate::turn::test_support::message(
                 &address,
                 "response",
-                Some(crate::provider::MessageRole::Response),
+                Some(forge_provider_api::AgentMessageRole::Response),
                 "The repository contains only .git. Three choices are pending.",
             );
-            exchange.observe_turn(&event, 2).unwrap();
-            let event = ProviderEvent::Turn {
-                address: address.clone(),
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 3,
+            exchange.observe_event(&event, 2).unwrap();
+            let event = crate::turn::test_support::completed_event(
+                &(address.clone()),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            };
-            exchange.observe_turn(&event, 3).unwrap();
+                3,
+            );
+            exchange.observe_event(&event, 3).unwrap();
 
             if let Some(planning) = planning_question {
                 let question: crate::plan::PlanQuestionSet = serde_json::from_value(json!({
@@ -4120,10 +4481,10 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 "continuation",
-                Some(crate::provider::MessageRole::Commentary),
+                Some(forge_provider_api::AgentMessageRole::Commentary),
                 "The design will use a 2D arena survival loop.",
             );
-            exchange.observe_turn(&event, 6).unwrap();
+            exchange.observe_event(&event, 6).unwrap();
 
             let render = |exchange: &Exchange| {
                 project_at(
@@ -4163,21 +4524,33 @@ mod tests {
                     &mut exchange,
                     &address,
                     &format!("lookup-{tool_count}"),
-                    ToolInvocation {
-                        semantics: Default::default(),
-                        kind: ToolActivityKind::Command,
-                        name: "lookup".into(),
-                        title: format!("lookup_{tool_count}"),
-                        arguments: json!({}),
-                    },
+                    forge_provider_api::ItemStart::CommandExecution(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            name: "lookup".into(),
+                            title: format!("lookup_{tool_count}"),
+                            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                        },
+                    ),
                     [
-                        ToolUpdate::Started,
-                        ToolUpdate::Output {
-                            update: TextUpdate::Replace("found".into()),
+                        forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::ExecutionStarted,
                         },
-                        ToolUpdate::Finished {
-                            outcome: ToolOutcome::Succeeded,
+                        forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Replace(
+                                "found".into(),
+                            )),
                         },
+                        forge_provider_api::ItemEvent::Completed(
+                            forge_provider_api::ItemCompletion::CommandExecution(
+                                forge_provider_api::ToolCompletion {
+                                    outcome: ToolOutcome::Succeeded,
+                                    descriptor: None,
+                                    output: None,
+                                    changes: Default::default(),
+                                },
+                            ),
+                        ),
                     ],
                     6 + tool_count,
                 )
@@ -4256,18 +4629,18 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 "response",
-                Some(crate::provider::MessageRole::Response),
+                Some(forge_provider_api::AgentMessageRole::Response),
                 "The design is ready for review.",
             );
-            exchange.observe_turn(&event, 10).unwrap();
-            let event = ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: 11,
+            exchange.observe_event(&event, 10).unwrap();
+            let event = crate::turn::test_support::completed_event(
+                &(address),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            };
-            exchange.observe_turn(&event, 11).unwrap();
+                11,
+            );
+            exchange.observe_event(&event, 11).unwrap();
             exchange
                 .finish(crate::exchange::ExchangeOutcome::Complete, 11)
                 .unwrap();
@@ -4377,7 +4750,7 @@ mod tests {
     #[test]
     fn question_branches_keep_targets_responses_and_folds_across_reload() {
         use crate::exchange::{ExchangeNode, InputIntent, QuestionInput};
-        use crate::provider::{ProviderEvent, TurnUpdate};
+
         use forge_buffer::block::BufferBlock;
         for planning in [false, true] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4442,18 +4815,18 @@ mod tests {
                 let event = crate::turn::test_support::message(
                     &address,
                     "response",
-                    Some(crate::provider::MessageRole::Response),
+                    Some(forge_provider_api::AgentMessageRole::Response),
                     reply,
                 );
-                exchange.observe_turn(&event, index as i64).unwrap();
-                let event = ProviderEvent::Turn {
-                    address,
-                    update: TurnUpdate::Finished {
-                        outcome: crate::turn::TurnOutcome::Completed,
-                        completed_at_ms: index as i64,
+                exchange.observe_event(&event, index as i64).unwrap();
+                let event = crate::turn::test_support::completed_event(
+                    &(address),
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     },
-                };
-                exchange.observe_turn(&event, index as i64).unwrap();
+                    index as i64,
+                );
+                exchange.observe_event(&event, index as i64).unwrap();
             }
             let selected = crate::plan::PlanQuestionAnswer {
                 source: crate::session::ResolutionSource::User,
@@ -4581,10 +4954,7 @@ mod tests {
     #[test]
     fn question_clarification_preserves_turn_delivery_and_history() {
         use crate::exchange::ExchangeNode;
-        use crate::provider::{
-            ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-            TurnUpdate,
-        };
+        use crate::provider::{TextUpdate, ToolOutcome};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"question-flow", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Plan out a new one", "kind":"chat", "state":"running",
@@ -4597,10 +4967,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "scope",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "The scope determines the implementation.",
         );
-        exchange.observe_turn(&event, 1).unwrap();
+        exchange.observe_event(&event, 1).unwrap();
         for (id, status) in [
             ("failed-question", "failed"),
             ("accepted-question", "completed"),
@@ -4609,53 +4979,63 @@ mod tests {
                 &mut exchange,
                 &address,
                 id,
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "question_ask".into(),
-                    title: "question_ask".into(),
-                    arguments: json!({}),
-                },
+                forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "question_ask".into(),
+                        title: "question_ask".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    },
+                ),
                 [
-                    ToolUpdate::Started,
-                    ToolUpdate::Output {
-                        update: TextUpdate::Replace(
+                    forge_provider_api::ItemEvent::Tool {
+                        event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                    },
+                    forge_provider_api::ItemEvent::Tool {
+                        event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Replace(
                             if status == "failed" {
                                 "Invalid options"
                             } else {
                                 "Question set accepted"
                             }
                             .into(),
-                        ),
+                        )),
                     },
-                    ToolUpdate::Finished {
-                        outcome: if status == "failed" {
-                            ToolOutcome::Failed {
-                                diagnostic: crate::provider::ToolDiagnostic {
-                                    kind: forge_provider_api::ProviderFailureKind::Unknown,
-                                    message: forge_provider_api::SanitizedMessage::new(
-                                        "Invalid options",
-                                    )
-                                    .expect("fixture diagnostic is nonempty"),
+                    forge_provider_api::ItemEvent::Completed(
+                        forge_provider_api::ItemCompletion::CommandExecution(
+                            forge_provider_api::ToolCompletion {
+                                outcome: if status == "failed" {
+                                    ToolOutcome::Failed {
+                                        diagnostic: crate::provider::ToolDiagnostic {
+                                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                                            message: forge_provider_api::SanitizedMessage::new(
+                                                "Invalid options",
+                                            )
+                                            .expect("fixture diagnostic is nonempty"),
+                                        },
+                                    }
+                                } else {
+                                    ToolOutcome::Succeeded
                                 },
-                            }
-                        } else {
-                            ToolOutcome::Succeeded
-                        },
-                    },
+                                descriptor: None,
+                                output: None,
+                                changes: Default::default(),
+                            },
+                        ),
+                    ),
                 ],
                 2,
             )
             .unwrap();
         }
-        let event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 3,
+        let event = crate::turn::test_support::completed_event(
+            &(address.clone()),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 3).unwrap();
+            3,
+        );
+        exchange.observe_event(&event, 3).unwrap();
         let question = crate::plan::PlanQuestionSet {
             id: "scope-set".into(),
             questions: vec![crate::plan::PlanQuestion {
@@ -4712,18 +5092,18 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "response",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "I mean a Rust CLI or a redesigned TypeScript demo.",
         );
-        exchange.observe_turn(&event, 5).unwrap();
-        let event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 6,
+        exchange.observe_event(&event, 5).unwrap();
+        let event = crate::turn::test_support::completed_event(
+            &(address.clone()),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 6).unwrap();
+            6,
+        );
+        exchange.observe_event(&event, 6).unwrap();
         exchange.pause(6);
         let restored: Exchange =
             serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
@@ -4902,18 +5282,18 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "continuation",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "Proceeding with Rust",
         );
-        exchange.observe_turn(&event, 8).unwrap();
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 9,
+        exchange.observe_event(&event, 8).unwrap();
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 9).unwrap();
+            9,
+        );
+        exchange.observe_event(&event, 9).unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Complete, 9)
             .unwrap();
@@ -4949,10 +5329,7 @@ mod tests {
 
     #[test]
     fn commentary_closes_groups_and_unsuccessful_writes_remain_nested() -> anyhow::Result<()> {
-        use crate::provider::{
-            ProviderChangeKind, ProviderChangeSet, ProviderEvent, ProviderFileChange,
-            ToolActivityKind, ToolInvocation, TurnUpdate,
-        };
+        use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         for boundary in ["commentary", "failed", "cancelled", "denied", "interrupted"] {
             let repeated_id = format!("{boundary}:output:{}:hidden", "identity".repeat(40));
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -4965,17 +5342,36 @@ mod tests {
             exchange.start_turn(address.clone(), 0)?;
             for (ordinal, name) in ["first", boundary, "last"].into_iter().enumerate() {
                 if name == "commentary" {
-                    exchange.observe_turn(
+                    exchange.observe_event(
                         &crate::turn::test_support::message(
                             &address,
                             "message",
-                            Some(crate::provider::MessageRole::Commentary),
+                            Some(forge_provider_api::AgentMessageRole::Commentary),
                             "Continue after this message",
                         ),
                         ordinal as i64 + 1,
                     )?;
                 } else {
+                    let fixture_start = (if name == "command" {
+                        forge_provider_api::ItemStart::CommandExecution
+                            as fn(
+                                forge_provider_api::ToolDescriptor,
+                            ) -> forge_provider_api::ItemStart
+                    } else {
+                        forge_provider_api::ItemStart::FileChange
+                            as fn(
+                                forge_provider_api::ToolDescriptor,
+                            ) -> forge_provider_api::ItemStart
+                    })(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            title: name.into(),
+                            name: name.into(),
+                            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                        },
+                    );
                     let update = crate::turn::test_support::tool_updates(
+                        &fixture_start,
                         crate::provider::ToolStatus::parse(if ordinal == 1 && name != "command" {
                             name
                         } else {
@@ -4996,17 +5392,7 @@ mod tests {
                         &mut exchange,
                         &address,
                         if ordinal == 1 { &repeated_id } else { name },
-                        ToolInvocation {
-                            semantics: Default::default(),
-                            title: name.into(),
-                            name: name.into(),
-                            arguments: json!({}),
-                            kind: if name == "command" {
-                                ToolActivityKind::Command
-                            } else {
-                                ToolActivityKind::FileChange
-                            },
-                        },
+                        fixture_start.clone(),
                         update,
                         ordinal as i64 + 1,
                     )?;
@@ -5016,32 +5402,36 @@ mod tests {
             let _store = crate::storage::SqliteStore::open(directory.path())?;
             let mut stored = exchange.clone();
             if boundary != "commentary" {
-                let event = ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: TurnUpdate::Finished {
-                        outcome: crate::turn::TurnOutcome::Completed,
-                        completed_at_ms: 4,
+                let event = crate::turn::test_support::completed_event(
+                    &(address.clone()),
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     },
-                };
-                stored.observe_turn(&event, 4)?;
+                    4,
+                );
+                stored.observe_event(&event, 4)?;
                 let address = crate::turn::test_support::address(&stored, "next-turn");
                 stored.start_turn(address.clone(), 5)?;
+
+                let fixture_start =
+                    forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: boundary.into(),
+                        name: boundary.into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    });
+                let fixture_updates = crate::turn::test_support::tool_updates(
+                    &fixture_start,
+                    crate::provider::ToolStatus::parse(boundary).unwrap(),
+                    Some(format!("second turn {boundary} details")),
+                    ProviderChangeSet::default(),
+                );
                 crate::turn::test_support::tool(
                     &mut stored,
                     &address,
                     &repeated_id,
-                    ToolInvocation {
-                        semantics: Default::default(),
-                        title: boundary.into(),
-                        name: boundary.into(),
-                        arguments: json!({}),
-                        kind: ToolActivityKind::FileChange,
-                    },
-                    crate::turn::test_support::tool_updates(
-                        crate::provider::ToolStatus::parse(boundary).unwrap(),
-                        Some(format!("second turn {boundary} details")),
-                        ProviderChangeSet::default(),
-                    ),
+                    fixture_start.clone(),
+                    fixture_updates,
                     6,
                 )?;
             }
@@ -5143,10 +5533,7 @@ mod tests {
     #[test]
     fn alternating_tools_and_writes_restore_activity_without_exchange_summaries()
     -> anyhow::Result<()> {
-        use crate::provider::{
-            ProviderChangeKind, ProviderChangeSet, ProviderEvent, ProviderFileChange,
-            ToolActivityKind, ToolInvocation, TurnUpdate,
-        };
+        use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"edits", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Implement", "kind":"plan_execution", "state":"running", "created_at_ms":0,
@@ -5156,67 +5543,91 @@ mod tests {
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 0)?;
         for (index, (id, kind, status, diff)) in [
-            ("inspect", ToolActivityKind::Command, "completed", ""),
+            (
+                "inspect",
+                (forge_provider_api::ItemStart::CommandExecution
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
+                "completed",
+                "",
+            ),
             (
                 "add",
-                ToolActivityKind::FileChange,
+                (forge_provider_api::ItemStart::FileChange
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
                 "completed",
                 "@@ -0,0 +1 @@\n+first",
             ),
-            ("read", ToolActivityKind::Command, "completed", ""),
+            (
+                "read",
+                (forge_provider_api::ItemStart::CommandExecution
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
+                "completed",
+                "",
+            ),
             (
                 "edit",
-                ToolActivityKind::FileChange,
+                (forge_provider_api::ItemStart::FileChange
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
                 "completed",
                 "@@ -1 +1 @@\n-first\n+second",
             ),
             (
                 "rejected",
-                ToolActivityKind::FileChange,
+                (forge_provider_api::ItemStart::FileChange
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
                 "failed",
                 "@@ -1 +1 @@\n-second\n+wrong",
             ),
-            ("check", ToolActivityKind::Command, "completed", ""),
+            (
+                "check",
+                (forge_provider_api::ItemStart::CommandExecution
+                    as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart),
+                "completed",
+                "",
+            ),
         ]
         .into_iter()
         .enumerate()
         {
-            let file_change = kind == ToolActivityKind::FileChange;
+            let file_change = !diff.is_empty();
+
+            let fixture_start = (kind)(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: id.into(),
+                title: if file_change {
+                    "file changes".into()
+                } else {
+                    id.into()
+                },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+            let fixture_updates = crate::turn::test_support::tool_updates(
+                &fixture_start,
+                crate::provider::ToolStatus::Running,
+                None,
+                ProviderChangeSet {
+                    file: if file_change {
+                        vec![ProviderFileChange {
+                            path: "src/lib.rs".into(),
+                            move_path: None,
+                            kind: if id == "add" {
+                                ProviderChangeKind::Add
+                            } else {
+                                ProviderChangeKind::Update
+                            },
+                            diff: diff.into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
             crate::turn::test_support::tool(
                 &mut exchange,
                 &address,
                 id,
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind,
-                    name: id.into(),
-                    title: if file_change {
-                        "file changes".into()
-                    } else {
-                        id.into()
-                    },
-                    arguments: json!({}),
-                },
-                crate::turn::test_support::tool_updates(
-                    crate::provider::ToolStatus::Running,
-                    None,
-                    ProviderChangeSet {
-                        file: if file_change {
-                            vec![ProviderFileChange {
-                                path: "src/lib.rs".into(),
-                                move_path: None,
-                                kind: if id == "add" {
-                                    ProviderChangeKind::Add
-                                } else {
-                                    ProviderChangeKind::Update
-                                },
-                                diff: diff.into(),
-                            }]
-                        } else {
-                            Vec::new()
-                        },
-                    },
-                ),
+                fixture_start.clone(),
+                fixture_updates,
                 index as i64 * 10 + 1,
             )?;
             if file_change {
@@ -5242,30 +5653,25 @@ mod tests {
                 }));
             }
             for update in crate::turn::test_support::tool_updates(
+                &fixture_start,
                 crate::provider::ToolStatus::parse(status).unwrap(),
                 None,
                 Default::default(),
             ) {
-                exchange.observe_turn(
-                    &ProviderEvent::Tool {
-                        address: crate::provider::ToolAddress {
-                            turn: address.clone(),
-                            tool_id: id.into(),
-                        },
-                        update,
-                    },
+                exchange.observe_event(
+                    &crate::turn::test_support::item_event(&(address.clone()), id, update),
                     index as i64 * 10 + 2,
                 )?;
             }
         }
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 70,
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 70)?;
+            70,
+        );
+        exchange.observe_event(&event, 70)?;
         exchange.finish(crate::exchange::ExchangeOutcome::Complete, 70)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         let projected = project_at(
@@ -5382,9 +5788,7 @@ mod tests {
 
     #[test]
     fn tool_groups_align_mixed_durations_as_running_timers_change() {
-        use crate::provider::{
-            ProviderEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-        };
+        use crate::provider::ToolOutcome;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"aligned", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Inspect", "kind":"chat", "state":"running", "created_at_ms":0,
@@ -5403,34 +5807,51 @@ mod tests {
                 &mut exchange,
                 &address,
                 &format!("tool-{index}"),
-                ToolInvocation {
+                (if index % 2 == 0 {
+                    forge_provider_api::ItemStart::CommandExecution
+                        as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart
+                } else {
+                    forge_provider_api::ItemStart::ToolCall
+                        as fn(forge_provider_api::ToolDescriptor) -> forge_provider_api::ItemStart
+                })(forge_provider_api::ToolDescriptor {
                     semantics: Default::default(),
-                    kind: if index % 2 == 0 {
-                        ToolActivityKind::Command
-                    } else {
-                        ToolActivityKind::ToolCall
-                    },
                     title: format!("inspect_{index}"),
                     name: "inspect".into(),
-                    arguments: json!({}),
-                },
-                [ToolUpdate::Started],
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                }),
+                [forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                }],
                 clock,
             )
             .unwrap();
             if let Some(duration) = duration {
                 clock += duration;
                 exchange
-                    .observe_turn(
-                        &ProviderEvent::Tool {
-                            address: crate::provider::ToolAddress {
-                                turn: address.clone(),
-                                tool_id: format!("tool-{index}").into(),
-                            },
-                            update: ToolUpdate::Finished {
-                                outcome: ToolOutcome::Succeeded,
-                            },
-                        },
+                    .observe_event(
+                        &crate::turn::test_support::item_event(
+                            &(address.clone()),
+                            format!("tool-{index}"),
+                            forge_provider_api::ItemEvent::Completed(if index % 2 == 0 {
+                                forge_provider_api::ItemCompletion::CommandExecution(
+                                    forge_provider_api::ToolCompletion {
+                                        outcome: ToolOutcome::Succeeded,
+                                        descriptor: None,
+                                        output: None,
+                                        changes: Default::default(),
+                                    },
+                                )
+                            } else {
+                                forge_provider_api::ItemCompletion::ToolCall(
+                                    forge_provider_api::ToolCompletion {
+                                        outcome: ToolOutcome::Succeeded,
+                                        descriptor: None,
+                                        output: None,
+                                        changes: Default::default(),
+                                    },
+                                )
+                            }),
+                        ),
                         clock,
                     )
                     .unwrap();
@@ -5500,6 +5921,7 @@ mod tests {
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
+                crate::buffer::projection::FIXTURE_NOW_MS,
                 &document,
                 &Default::default(),
                 &projected.tool,
@@ -5563,36 +5985,144 @@ mod tests {
 
     #[test]
     fn tool_group_totals_sum_parallel_calls_and_require_complete_timing() {
-        let mut first: crate::turn::ToolCall = serde_json::from_value(json!({
-            "id":"first", "kind":"command", "title":"first", "output":"",
-            "status":"completed", "failed":false, "started_at_ms":0, "completed_at_ms":1050
-        }))
-        .unwrap();
-        let mut second = first.clone();
-        second.id = "second".into();
-        second.completed_at_ms = None;
-        second.status = "running".into();
+        use crate::turn::{ToolCall, ToolState};
+        let tool = |id: &str, state, started_at_ms, completed_at_ms| {
+            ToolCall::projection(
+                id.into(),
+                "command".into(),
+                id.into(),
+                state,
+                started_at_ms,
+                completed_at_ms,
+            )
+        };
+        let first = tool("first", ToolState::Completed, Some(0), Some(1050));
+        let second = tool("second", ToolState::Running, Some(0), None);
         assert_eq!(
-            super::tool_group_label([&first, &second], NodeLifecycle::Live, 1500),
+            super::tool_group_label(
+                [&first, &second],
+                NodeLifecycle::Live,
+                crate::turn::ToolInstant::wall(1500)
+            ),
             "▸ Running 2 tools · 2.6s"
         );
-        second.completed_at_ms = Some(2000);
-        second.status = "failed".into();
-        second.failed = true;
+        let second = tool("second", ToolState::Failed, Some(0), Some(2000));
         assert_eq!(
-            super::tool_group_label([&first, &second], NodeLifecycle::Settled, 90_000),
+            super::tool_group_label(
+                [&first, &second],
+                NodeLifecycle::Settled,
+                crate::turn::ToolInstant::wall(90_000)
+            ),
             "▸ Ran 2 tools (1 failed) · 3.1s"
         );
-        first.started_at_ms = None;
+        let first = tool("first", ToolState::Completed, None, Some(1050));
         assert_eq!(
-            super::tool_group_label([&first, &second], NodeLifecycle::Settled, 90_000),
+            super::tool_group_label(
+                [&first, &second],
+                NodeLifecycle::Settled,
+                crate::turn::ToolInstant::wall(90_000)
+            ),
             "▸ Ran 2 tools (1 failed)"
         );
     }
 
     #[test]
+    fn provider_checklist_renders_current_entries_as_reported_progress() -> anyhow::Result<()> {
+        let item = |id: &str, title: &str, status: &str, ordinal: usize| {
+            json!({"id": id, "provider_id": null, "title": title, "priority": null,
+                "status": status, "provider_ordinal": ordinal, "attributed": false})
+        };
+        let exchange = |checklist: serde_json::Value| -> anyhow::Result<Exchange> {
+            Ok(serde_json::from_value(json!({
+                "id":"checklist", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Implement the change", "kind":"chat", "state":"running",
+                "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[],
+                "checklist": checklist
+            }))?)
+        };
+        let rows = |exchange: &Exchange| -> anyhow::Result<(Vec<String>, Vec<String>)> {
+            let projected = project_at(
+                &TimelineEntry::Exchange {
+                    id: exchange.id.clone(),
+                    created_at_ms: 0,
+                    exchange: exchange.clone().into(),
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                0,
+            )?;
+            Ok((
+                projected
+                    .entry
+                    .block
+                    .iter()
+                    .map(|block| block.id.0.clone())
+                    .collect(),
+                projected
+                    .entry
+                    .block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        };
+        let reported = exchange(json!({
+            "scope_id":"turn-1", "name":"Refactor", "revision":3, "complete":false,
+            "current":[
+                item("checklist:1", "Read the owner", "completed", 0),
+                item("checklist:2", "Move the types", "in_progress", 1),
+                item("checklist:3", "Update callers", "in_progress", 2),
+                item("checklist:5", "Document it", "pending", 3)
+            ],
+            "superseded":[item("checklist:4", "Old step", "superseded", 9)]
+        }))?;
+        let (ids, text) = rows(&reported)?;
+        let text = text.join("\n");
+        assert!(
+            text.contains("Provider-reported checklist · 1/4 completed · Refactor · 1 superseded"),
+            "{text}"
+        );
+        for row in [
+            "[x] Read the owner",
+            "[>] Move the types · in progress",
+            "[>] Update callers · in progress",
+            "[ ] Document it",
+        ] {
+            assert!(text.contains(row), "missing {row:?} in {text}");
+        }
+        assert!(
+            !text.contains("Old step"),
+            "superseded history stays out of the list"
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.starts_with("checklist:provider-checklist"))
+                .count(),
+            5,
+            "{ids:?}"
+        );
+
+        // Reopening the same snapshot rebuilds identical identities without provider input.
+        let reopened: Exchange = serde_json::from_value(serde_json::to_value(&reported)?)?;
+        assert_eq!(rows(&reopened)?.0, ids);
+
+        for absent in [
+            json!(null),
+            json!({"scope_id":"turn-1", "name":null, "revision":1,
+            "complete":true, "current":[], "superseded":[]}),
+        ] {
+            let (_, text) = rows(&exchange(absent)?)?;
+            assert!(
+                !text.iter().any(|row| row.contains("checklist")),
+                "{text:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn adjacent_tools_share_one_group_across_turns_and_hidden_reasoning() -> anyhow::Result<()> {
-        use crate::provider::{ProviderEvent, ToolActivityKind, ToolInvocation, TurnUpdate};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"cross-turn", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Inspect the repository", "kind":"chat", "state":"running",
@@ -5618,34 +6148,39 @@ mod tests {
             let address = crate::turn::test_support::address(&exchange, &format!("turn-{ordinal}"));
             exchange.start_turn(address.clone(), ordinal * 10)?;
             for kind in ["reasoning", "reasoning_summary"] {
-                let event = crate::turn::test_support::message(
+                let event = crate::turn::test_support::reasoning(
                     &address,
                     format!("{kind}-{ordinal}"),
-                    Some(if kind == "reasoning" {
-                        crate::provider::MessageRole::Thought
+                    if kind == "reasoning" {
+                        forge_provider_api::ReasoningKind::Full
                     } else {
-                        crate::provider::MessageRole::ThoughtSummary
-                    }),
+                        forge_provider_api::ReasoningKind::Summary
+                    },
                     "Thoughts must not become commentary",
                 );
-                exchange.observe_turn(&event, ordinal * 10 + 1)?;
+                exchange.observe_event(&event, ordinal * 10 + 1)?;
             }
+
+            let fixture_start = forge_provider_api::ItemStart::CommandExecution(
+                forge_provider_api::ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "inspect".into(),
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    title: format!("Inspect file {ordinal}"),
+                },
+            );
+            let fixture_updates = crate::turn::test_support::tool_updates(
+                &fixture_start,
+                crate::provider::ToolStatus::Running,
+                Some(format!("output-{ordinal}\n")),
+                Default::default(),
+            );
             crate::turn::test_support::tool(
                 &mut exchange,
                 &address,
                 "shared-call",
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                    title: format!("Inspect file {ordinal}"),
-                },
-                crate::turn::test_support::tool_updates(
-                    crate::provider::ToolStatus::Running,
-                    Some(format!("output-{ordinal}\n")),
-                    Default::default(),
-                ),
+                fixture_start.clone(),
+                fixture_updates,
                 ordinal * 10 + 2,
             )?;
             let projected = render(&exchange)?;
@@ -5679,10 +6214,10 @@ mod tests {
                         .display
                         .tool(
                             &projected.entry.id,
-                            &crate::turn::ToolAddress::new(
-                                exchange.turn[owner as usize - 1].id(),
-                                "shared-call"
-                            )
+                            &crate::turn::ToolAddress {
+                                turn: exchange.turn[owner as usize - 1].provider().clone(),
+                                item_id: forge_provider_api::ItemId::new("shared-call").unwrap(),
+                            }
                         )
                         .is_some_and(|id| projected.tool.contains_key(&id)),
                     "grouping replaced a tool's provider-turn identity"
@@ -5702,6 +6237,7 @@ mod tests {
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
+                crate::buffer::projection::FIXTURE_NOW_MS,
                 &document,
                 &Default::default(),
                 &projected.tool,
@@ -5721,6 +6257,7 @@ mod tests {
             );
             assert_eq!(refreshed_group.metadata.node, groups[0].metadata.node);
             for update in crate::turn::test_support::tool_updates(
+                &fixture_start,
                 if ordinal == 2 {
                     crate::provider::ToolStatus::Failed
                 } else {
@@ -5729,14 +6266,12 @@ mod tests {
                 None,
                 Default::default(),
             ) {
-                exchange.observe_turn(
-                    &ProviderEvent::Tool {
-                        address: crate::provider::ToolAddress {
-                            turn: address.clone(),
-                            tool_id: "shared-call".into(),
-                        },
+                exchange.observe_event(
+                    &crate::turn::test_support::item_event(
+                        &(address.clone()),
+                        "shared-call",
                         update,
-                    },
+                    ),
                     ordinal * 10 + 3,
                 )?;
             }
@@ -5759,14 +6294,14 @@ mod tests {
                 group.metadata.node.as_ref().unwrap().lifecycle,
                 NodeLifecycle::Live
             );
-            let event = ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                    completed_at_ms: ordinal * 10 + 4,
+            let event = crate::turn::test_support::completed_event(
+                &(address),
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
-            };
-            exchange.observe_turn(&event, ordinal * 10 + 4)?;
+                ordinal * 10 + 4,
+            );
+            exchange.observe_event(&event, ordinal * 10 + 4)?;
             let completed_turn = render(&exchange)?;
             let group = completed_turn
                 .entry
@@ -5801,26 +6336,30 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "commentary",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Now inspect the final file",
         );
-        exchange.observe_turn(&event, 41)?;
+        exchange.observe_event(&event, 41)?;
+
+        let fixture_start =
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "inspect".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                title: "Inspect final file".into(),
+            });
+        let fixture_updates = crate::turn::test_support::tool_updates(
+            &fixture_start,
+            crate::provider::ToolStatus::Succeeded,
+            Some("final-output\n".into()),
+            Default::default(),
+        );
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             "shared-call",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::Command,
-                name: "inspect".into(),
-                arguments: json!({}),
-                title: "Inspect final file".into(),
-            },
-            crate::turn::test_support::tool_updates(
-                crate::provider::ToolStatus::Succeeded,
-                Some("final-output\n".into()),
-                Default::default(),
-            ),
+            fixture_start.clone(),
+            fixture_updates,
             42,
         )?;
         let projected = render(&exchange)?;
@@ -5848,14 +6387,14 @@ mod tests {
                 .unwrap()
                 .starts_with("▸ Running 1 tool")
         );
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 43,
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 43)?;
+            43,
+        );
+        exchange.observe_event(&event, 43)?;
         for outcome in [
             crate::exchange::ExchangeOutcome::Complete,
             crate::exchange::ExchangeOutcome::Cancelled,
@@ -5884,7 +6423,6 @@ mod tests {
 
     #[test]
     fn sequential_tools_keep_group_open_and_only_latest_preview_expanded() {
-        use crate::provider::{ProviderEvent, ToolActivityKind, ToolInvocation, TurnUpdate};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"sequence", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Inspect the repository", "kind":"chat", "state":"running",
@@ -5911,22 +6449,26 @@ mod tests {
         };
         for count in 1..=4 {
             for status in ["in_progress", "completed"] {
+                let fixture_start = forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                        title: format!("Inspect repository file {count}"),
+                    },
+                );
+                let fixture_updates = crate::turn::test_support::tool_updates(
+                    &fixture_start,
+                    crate::provider::ToolStatus::parse(status).unwrap(),
+                    Some(format!("first-{count}\nmiddle\nlast-{count}\n")),
+                    Default::default(),
+                );
                 crate::turn::test_support::tool(
                     &mut exchange,
                     &address,
                     &format!("call-{count}"),
-                    ToolInvocation {
-                        semantics: Default::default(),
-                        kind: ToolActivityKind::Command,
-                        name: "inspect".into(),
-                        arguments: json!({}),
-                        title: format!("Inspect repository file {count}"),
-                    },
-                    crate::turn::test_support::tool_updates(
-                        crate::provider::ToolStatus::parse(status).unwrap(),
-                        Some(format!("first-{count}\nmiddle\nlast-{count}\n")),
-                        Default::default(),
-                    ),
+                    fixture_start.clone(),
+                    fixture_updates,
                     count,
                 )
                 .unwrap();
@@ -5987,14 +6529,14 @@ mod tests {
             }
         }
         let mut finished = exchange.clone();
-        let event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 11,
+        let event = crate::turn::test_support::completed_event(
+            &(address.clone()),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        finished.observe_turn(&event, 11).unwrap();
+            11,
+        );
+        finished.observe_event(&event, 11).unwrap();
         assert!(
             !render(&finished)
                 .entry
@@ -6010,10 +6552,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "inspection",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Repository inspection complete",
         );
-        exchange.observe_turn(&event, 11).unwrap();
+        exchange.observe_event(&event, 11).unwrap();
         assert!(
             render(&exchange)
                 .entry
@@ -6026,6 +6568,111 @@ mod tests {
                 .closed,
             "following commentary must close the group"
         );
+    }
+
+    #[test]
+    fn later_turn_results_follow_the_earlier_response_in_source_order() {
+        let artifact = |id: &str, path: &str, created_at_ms: i64| {
+            crate::exchange::ExchangeNode::ArtifactChange {
+                change: crate::exchange::ArtifactChange {
+                    revision_request: false,
+                    id: id.into(),
+                    declaration: None,
+                    path: path.into(),
+                    created_at_ms,
+                    diff_text: format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"),
+                },
+            }
+        };
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"revision", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        exchange.resume(0).unwrap();
+        let address = crate::turn::test_support::address(&exchange, "first");
+        exchange.start_turn(address.clone(), 0).unwrap();
+        exchange.node_list.push(artifact("early", "early.md", 1));
+        let event = crate::turn::test_support::message(
+            &address,
+            "first-response",
+            Some(forge_provider_api::AgentMessageRole::Response),
+            "First revision is ready.",
+        );
+        exchange.observe_event(&event, 2).unwrap();
+        let event = crate::turn::test_support::completed_event(
+            &address,
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            3,
+        );
+        exchange.observe_event(&event, 3).unwrap();
+        let address = crate::turn::test_support::address(&exchange, "second");
+        exchange.start_turn(address.clone(), 4).unwrap();
+        let event = crate::turn::test_support::message(
+            &address,
+            "second-commentary",
+            Some(forge_provider_api::AgentMessageRole::Commentary),
+            "Applying the requested changes.",
+        );
+        exchange.observe_event(&event, 4).unwrap();
+        exchange.node_list.push(artifact("late", "late.md", 4));
+        let lifecycle = serde_json::from_value(json!({
+            "id":"event-2", "session_id":"session", "plan_id":"plan",
+            "title":"Second plan", "kind":"revision_created",
+            "model_revision":2, "user_revision":0, "created_at_ms":4
+        }))
+        .unwrap();
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::PlanEvent {
+                event: Box::new(crate::plan::ExchangePlanEvent {
+                    id: "event-2".into(),
+                    node_count: exchange.node_list.len(),
+                    content: crate::plan::PlanEventContent::Lifecycle {
+                        title: "Second plan".into(),
+                        lifecycle,
+                    },
+                }),
+            });
+        let event = crate::turn::test_support::message(
+            &address,
+            "second-response",
+            Some(forge_provider_api::AgentMessageRole::Response),
+            "Second revision is ready.",
+        );
+        exchange.observe_event(&event, 6).unwrap();
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            10,
+        )
+        .unwrap();
+        let rows = projected
+            .entry
+            .block
+            .iter()
+            .map(|block| block.text.wire_rows().join("\n"))
+            .collect::<Vec<_>>();
+        let position = |needle: &str| {
+            rows.iter()
+                .position(|text| text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {rows:#?}"))
+        };
+        let early = position("early.md");
+        let first = position("First revision is ready.");
+        let late = position("late.md");
+        let second = position("Second revision is ready.");
+        assert!(early < first, "{rows:#?}");
+        assert!(first < late, "{rows:#?}");
+        assert!(late < second, "{rows:#?}");
     }
 
     #[test]
@@ -6122,18 +6769,18 @@ mod tests {
         let response = crate::turn::test_support::message(
             &address,
             "response",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "Submitted the revised design.",
         );
-        exchange.observe_turn(&response, 1).unwrap();
-        let response = crate::provider::ProviderEvent::Turn {
-            address,
-            update: crate::provider::TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 2,
+        exchange.observe_event(&response, 1).unwrap();
+        let response = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&response, 2).unwrap();
+            2,
+        );
+        exchange.observe_event(&response, 2).unwrap();
         exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
             change: crate::exchange::ArtifactChange {
                         revision_request: false,
@@ -6260,7 +6907,7 @@ mod tests {
     #[test]
     fn child_preview_nests_live_activity_and_completed_task_history() {
         use crate::exchange::ExchangeState;
-        use crate::provider::{ToolActivityKind, ToolInvocation, ToolStatus};
+        use crate::provider::ToolStatus;
         let mut nested: Exchange = serde_json::from_value(json!({
             "id":"nested", "session_id":"session", "agent_id":"nested-agent", "ordinal":1,
             "prompt":"Inspect nested work", "kind":"chat", "state":"running", "created_at_ms":0,
@@ -6273,40 +6920,44 @@ mod tests {
         let update = crate::turn::test_support::message(
             &address,
             "earlier",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Earlier child thought",
         );
-        nested.observe_turn(&update, 1).unwrap();
+        nested.observe_event(&update, 1).unwrap();
         let update = crate::turn::test_support::message(
             &address,
             "latest",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Latest child thought",
         );
-        nested.observe_turn(&update, 2).unwrap();
+        nested.observe_event(&update, 2).unwrap();
         let update = crate::turn::test_support::message(
             &address,
             "response",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "Child final response",
         );
-        nested.observe_turn(&update, 3).unwrap();
+        nested.observe_event(&update, 3).unwrap();
+
+        let fixture_start =
+            forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "child".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                title: "Child tool".into(),
+            });
+        let fixture_updates = crate::turn::test_support::tool_updates(
+            &fixture_start,
+            ToolStatus::Succeeded,
+            Some("Child tool result".into()),
+            Default::default(),
+        );
         crate::turn::test_support::tool(
             &mut nested,
             &address,
             "call",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::ToolCall,
-                name: "child".into(),
-                arguments: json!({}),
-                title: "Child tool".into(),
-            },
-            crate::turn::test_support::tool_updates(
-                ToolStatus::Succeeded,
-                Some("Child tool result".into()),
-                Default::default(),
-            ),
+            fixture_start.clone(),
+            fixture_updates,
             3,
         )
         .unwrap();
@@ -6316,31 +6967,35 @@ mod tests {
         parent.node_list.clear();
         let address = crate::turn::test_support::address(&parent, "root-turn");
         parent.start_turn(address.clone(), 0).unwrap();
+
+        let fixture_start =
+            forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "agent_spawn".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                title: "agent_spawn(task_name=Nested)".into(),
+            });
+        let fixture_updates = crate::turn::test_support::tool_updates(
+            &fixture_start,
+            ToolStatus::Succeeded,
+            Some("SPAWN_PAYLOAD".into()),
+            Default::default(),
+        );
         crate::turn::test_support::tool(
             &mut parent,
             &address,
             "spawn-call",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::ToolCall,
-                name: "agent_spawn".into(),
-                arguments: json!({}),
-                title: "agent_spawn(task_name=Nested)".into(),
-            },
-            crate::turn::test_support::tool_updates(
-                ToolStatus::Succeeded,
-                Some("SPAWN_PAYLOAD".into()),
-                Default::default(),
-            ),
+            fixture_start.clone(),
+            fixture_updates,
             1,
         )
         .unwrap();
         parent
-            .observe_turn(
+            .observe_event(
                 &crate::turn::test_support::message(
                     &address,
                     "parent-response",
-                    Some(crate::provider::MessageRole::Response),
+                    Some(forge_provider_api::AgentMessageRole::Response),
                     "Parent final response",
                 ),
                 2,
@@ -6478,6 +7133,7 @@ mod tests {
         let refreshed = super::timing_blocks(
             &entry,
             &WidthProfile::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             &document,
             &Default::default(),
             &projected.tool,
@@ -6631,6 +7287,7 @@ mod tests {
                 let refreshed = super::timing_blocks(
                     &selected_entry,
                     &WidthProfile::default(),
+                    crate::buffer::projection::FIXTURE_NOW_MS,
                     &document,
                     &Default::default(),
                     &selected.tool,
@@ -6653,22 +7310,25 @@ mod tests {
         }
         let mut failed_entry = entry.clone();
         if let TimelineEntry::Exchange { exchange, .. } = &mut failed_entry {
+            let fixture_start =
+                forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "agent_spawn".into(),
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    title: "agent_spawn(task_name=Nested)".into(),
+                });
+            let fixture_updates = crate::turn::test_support::tool_updates(
+                &fixture_start,
+                ToolStatus::Failed,
+                None,
+                Default::default(),
+            );
             crate::turn::test_support::tool(
                 exchange,
                 &address,
                 "failed-spawn-call",
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::ToolCall,
-                    name: "agent_spawn".into(),
-                    arguments: json!({}),
-                    title: "agent_spawn(task_name=Nested)".into(),
-                },
-                crate::turn::test_support::tool_updates(
-                    ToolStatus::Failed,
-                    None,
-                    Default::default(),
-                ),
+                fixture_start.clone(),
+                fixture_updates,
                 2,
             )
             .unwrap();
@@ -6835,7 +7495,6 @@ mod tests {
 
     #[test]
     fn native_turn_content_renders_in_exchange_order_without_segment_content() {
-        use crate::provider::{ProviderEvent, ToolActivityKind, ToolInvocation, TurnUpdate};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"native", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Do the work",
             "kind":"chat", "state":"running", "created_at_ms":0,
@@ -6848,33 +7507,37 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "ownership",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Inspecting ownership",
         );
-        exchange.observe_turn(&event, 1).unwrap();
+        exchange.observe_event(&event, 1).unwrap();
+
+        let fixture_start =
+            forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                title: "inspect".into(),
+                name: "inspect".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+        let fixture_updates = crate::turn::test_support::tool_updates(
+            &fixture_start,
+            crate::provider::ToolStatus::Succeeded,
+            Some("result".into()),
+            crate::provider::ProviderChangeSet {
+                file: vec![crate::provider::ProviderFileChange {
+                    path: "owned.rs".into(),
+                    move_path: None,
+                    kind: crate::provider::ProviderChangeKind::Add,
+                    diff: "@@ -0,0 +1 @@\n+owned\n".into(),
+                }],
+            },
+        );
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             "call",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::FileChange,
-                title: "inspect".into(),
-                name: "inspect".into(),
-                arguments: json!({}),
-            },
-            crate::turn::test_support::tool_updates(
-                crate::provider::ToolStatus::Succeeded,
-                Some("result".into()),
-                crate::provider::ProviderChangeSet {
-                    file: vec![crate::provider::ProviderFileChange {
-                        path: "owned.rs".into(),
-                        move_path: None,
-                        kind: crate::provider::ProviderChangeKind::Add,
-                        diff: "@@ -0,0 +1 @@\n+owned\n".into(),
-                    }],
-                },
-            ),
+            fixture_start.clone(),
+            fixture_updates,
             2,
         )
         .unwrap();
@@ -6888,10 +7551,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "response",
-            Some(crate::provider::MessageRole::Response),
+            Some(forge_provider_api::AgentMessageRole::Response),
             "Finished the work",
         );
-        exchange.observe_turn(&event, 4).unwrap();
+        exchange.observe_event(&event, 4).unwrap();
         exchange
             .node_list
             .push(crate::exchange::ExchangeNode::SkillRead {
@@ -6904,22 +7567,26 @@ mod tests {
                     tool_id: "read-skill".into(),
                 },
             });
+
+        let fixture_start =
+            forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                title: "file changes".into(),
+                name: "edit".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+        let fixture_updates = crate::turn::test_support::tool_updates(
+            &fixture_start,
+            crate::provider::ToolStatus::Interrupted,
+            None,
+            Default::default(),
+        );
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             "interrupted-edit",
-            ToolInvocation {
-                semantics: Default::default(),
-                kind: ToolActivityKind::FileChange,
-                title: "file changes".into(),
-                name: "edit".into(),
-                arguments: json!({}),
-            },
-            crate::turn::test_support::tool_updates(
-                crate::provider::ToolStatus::Interrupted,
-                None,
-                Default::default(),
-            ),
+            fixture_start.clone(),
+            fixture_updates,
             4,
         )
         .unwrap();
@@ -6972,14 +7639,14 @@ mod tests {
             2,
             "streaming final response must not inherit activity indentation"
         );
-        let event = ProviderEvent::Turn {
-            address,
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 5,
+        let event = crate::turn::test_support::completed_event(
+            &(address),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 5).unwrap();
+            5,
+        );
+        exchange.observe_event(&event, 5).unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Complete, 5)
             .unwrap();
@@ -7748,9 +8415,7 @@ mod tests {
 
     #[test]
     fn thought_activity_preserves_text_ownership_and_streamed_fold() -> anyhow::Result<()> {
-        use crate::provider::{
-            TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
-        };
+        use crate::provider::{TextUpdate, ToolOutcome};
 
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"thought-layout", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -7764,34 +8429,47 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "initial",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             text,
         );
-        exchange.observe_turn(&event, 1)?;
+        exchange.observe_event(&event, 1)?;
         let thought_id = exchange.node_list.last().unwrap().id().to_owned();
         for index in 0..3 {
+            let fixture_start = forge_provider_api::ItemStart::CommandExecution(
+                forge_provider_api::ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "checks_run".into(),
+                    title: format!("checks_run exact test {index}"),
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                },
+            );
             let mut update = vec![
-                ToolUpdate::Started,
-                ToolUpdate::Output {
-                    update: TextUpdate::Replace("retained test output".into()),
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                },
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Replace(
+                        "retained test output".into(),
+                    )),
                 },
             ];
             if index != 2 {
-                update.push(ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                });
+                update.push(forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ));
             }
             crate::turn::test_support::tool(
                 &mut exchange,
                 &address,
                 &format!("exact-{index}"),
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "checks_run".into(),
-                    title: format!("checks_run exact test {index}"),
-                    arguments: json!({}),
-                },
+                fixture_start.clone(),
                 update,
                 index + 2,
             )?;
@@ -7876,10 +8554,7 @@ mod tests {
     #[test]
     fn interaction_results_render_created_then_deleted_files_without_preview_errors()
     -> anyhow::Result<()> {
-        use crate::provider::{
-            ProviderChangeKind, ProviderChangeSet, ProviderFileChange, ToolActivityKind,
-            ToolInvocation,
-        };
+        use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         for persistent in [false, true] {
             let mut exchange: Exchange = serde_json::from_value(json!({
                 "id":"transient", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -7901,10 +8576,10 @@ mod tests {
                 let event = crate::turn::test_support::message(
                     &address,
                     format!("step-{index}"),
-                    Some(crate::provider::MessageRole::Commentary),
+                    Some(forge_provider_api::AgentMessageRole::Commentary),
                     format!("Step {index}"),
                 );
-                exchange.observe_turn(&event, index as i64 * 10 + 1)?;
+                exchange.observe_event(&event, index as i64 * 10 + 1)?;
                 let mut file = vec![ProviderFileChange {
                     path: "temporary.lua".into(),
                     move_path: None,
@@ -7919,32 +8594,37 @@ mod tests {
                         diff: "@@ -1 +1 @@\n-before\n+after".into(),
                     });
                 }
+
+                let fixture_start =
+                    forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "file changes".into(),
+                        name: "edit".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    });
+                let fixture_updates = crate::turn::test_support::tool_updates(
+                    &fixture_start,
+                    crate::provider::ToolStatus::Succeeded,
+                    None,
+                    ProviderChangeSet { file },
+                );
                 crate::turn::test_support::tool(
                     &mut exchange,
                     &address,
                     &format!("write-{index}"),
-                    ToolInvocation {
-                        semantics: Default::default(),
-                        kind: ToolActivityKind::FileChange,
-                        title: "file changes".into(),
-                        name: "edit".into(),
-                        arguments: json!({}),
-                    },
-                    crate::turn::test_support::tool_updates(
-                        crate::provider::ToolStatus::Succeeded,
-                        None,
-                        ProviderChangeSet { file },
-                    ),
+                    fixture_start.clone(),
+                    fixture_updates,
                     index as i64 * 10 + 2,
                 )?;
             }
             for complete in [false, true] {
                 if complete {
-                    exchange
-                        .turn
-                        .last_mut()
-                        .unwrap()
-                        .finish(crate::turn::TurnOutcome::Completed, 49)?;
+                    exchange.turn.last_mut().unwrap().finish(
+                        crate::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        49,
+                    )?;
                     exchange.finish(crate::exchange::ExchangeOutcome::Complete, 50)?;
                     exchange.checkpoint_before = Some("before".into());
                     exchange.checkpoint_after = Some("after".into());
@@ -8010,10 +8690,7 @@ mod tests {
     fn interaction_results_combine_checks_and_files_above_their_thought_details()
     -> anyhow::Result<()> {
         use crate::exchange::ExchangeNode;
-        use crate::provider::{
-            ProviderChangeKind, ProviderChangeSet, ProviderFileChange, ToolActivityKind,
-            ToolInvocation,
-        };
+        use crate::provider::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"combined", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Implement and check", "state":"running", "created_at_ms":0,
@@ -8027,43 +8704,47 @@ mod tests {
             let event = crate::turn::test_support::message(
                 &address,
                 format!("thought-{index}"),
-                Some(crate::provider::MessageRole::Commentary),
+                Some(forge_provider_api::AgentMessageRole::Commentary),
                 format!("Thought {index}"),
             );
-            exchange.observe_turn(&event, index * 10 + 1)?;
+            exchange.observe_event(&event, index * 10 + 1)?;
             thought_ids.push(exchange.node_list.last().unwrap().id().to_owned());
+
+            let fixture_start =
+                forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                    semantics: Default::default(),
+                    title: "file changes".into(),
+                    name: "edit".into(),
+                    arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                });
+            let fixture_updates = crate::turn::test_support::tool_updates(
+                &fixture_start,
+                crate::provider::ToolStatus::Succeeded,
+                None,
+                ProviderChangeSet {
+                    file: vec![ProviderFileChange {
+                        path: "result.txt".into(),
+                        move_path: None,
+                        kind: if index == 0 {
+                            ProviderChangeKind::Add
+                        } else {
+                            ProviderChangeKind::Update
+                        },
+                        diff: if index == 0 {
+                            "@@ -0,0 +1 @@\n+first"
+                        } else {
+                            "@@ -1 +1 @@\n-first\n+second"
+                        }
+                        .into(),
+                    }],
+                },
+            );
             crate::turn::test_support::tool(
                 &mut exchange,
                 &address,
                 &format!("write-{index}"),
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::FileChange,
-                    title: "file changes".into(),
-                    name: "edit".into(),
-                    arguments: json!({}),
-                },
-                crate::turn::test_support::tool_updates(
-                    crate::provider::ToolStatus::Succeeded,
-                    None,
-                    ProviderChangeSet {
-                        file: vec![ProviderFileChange {
-                            path: "result.txt".into(),
-                            move_path: None,
-                            kind: if index == 0 {
-                                ProviderChangeKind::Add
-                            } else {
-                                ProviderChangeKind::Update
-                            },
-                            diff: if index == 0 {
-                                "@@ -0,0 +1 @@\n+first"
-                            } else {
-                                "@@ -1 +1 @@\n-first\n+second"
-                            }
-                            .into(),
-                        }],
-                    },
-                ),
+                fixture_start.clone(),
+                fixture_updates,
                 index * 10 + 2,
             )?;
             let run: crate::checks::CheckRun = serde_json::from_value(json!({
@@ -8173,26 +8854,132 @@ mod tests {
         Ok(())
     }
 
+    /// A turn-scoped error remains visible once while its native work continues.
+    #[test]
+    fn turn_error_notices_survive_reload_without_completing_work() -> anyhow::Result<()> {
+        let mut turn = crate::turn::Turn::new(
+            "turn".into(),
+            crate::provider::test_support::address(&crate::provider::InvocationScope::new(
+                crate::provider::ThreadOwner::root("session"),
+                "work",
+            )),
+            0,
+        );
+        let error = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::RateLimited,
+        );
+        assert!(turn.record_error(error));
+        assert!(!turn.record_error(error));
+        assert_eq!(turn.state(), crate::turn::TurnState::Running);
+        let exchange: Exchange = serde_json::from_value(json!({
+            "id":"work", "session_id":"session", "agent_id":"session:agent:primary", "ordinal":1,
+            "prompt":"Answer", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":true, "turn":[turn], "node_list":[]
+        }))?;
+        let entry = TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.into(),
+            agent_by_id: HashMap::new(),
+        };
+        let loaded = serde_json::from_str(&serde_json::to_string(&entry)?)?;
+        for source in [&entry, &loaded, &loaded] {
+            let projected = project_at(source, &WidthProfile::default(), 20)?;
+            let notices = projected
+                .entry
+                .block
+                .iter()
+                .filter(|block| block.id.0 == "work:turn:turn:error:0")
+                .collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1);
+            assert!(
+                notices[0]
+                    .text
+                    .wire_rows()
+                    .join("")
+                    .contains("Provider turn error:")
+            );
+        }
+        Ok(())
+    }
+
+    /// Empty native stops retain exactly one visible notice after history reload and reprojection.
+    #[test]
+    fn native_stop_notices_survive_reload_without_duplication() -> anyhow::Result<()> {
+        use forge_provider_api::turn::TurnCompletionReason;
+        for (reason, notice) in [
+            (
+                TurnCompletionReason::Refusal,
+                "The provider refused to continue.",
+            ),
+            (
+                TurnCompletionReason::TokenLimit,
+                "The provider stopped because it reached its token limit.",
+            ),
+            (
+                TurnCompletionReason::RequestLimit,
+                "The provider stopped because this turn reached its model-request limit.",
+            ),
+        ] {
+            let mut turn = crate::turn::Turn::new(
+                "turn".into(),
+                crate::provider::test_support::address(&crate::provider::InvocationScope::new(
+                    crate::provider::ThreadOwner::root("session"),
+                    "work",
+                )),
+                0,
+            );
+            turn.finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: reason,
+                },
+                20,
+            )?;
+            let exchange: Exchange = serde_json::from_value(json!({
+                "id":"work", "session_id":"session", "agent_id":"session:agent:primary", "ordinal":1,
+                "prompt":"Answer", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":true, "turn":[turn], "node_list":[]
+            }))?;
+            let entry = TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            };
+            let reloaded = serde_json::from_str(&serde_json::to_string(&entry)?)?;
+            for source in [&entry, &reloaded, &reloaded] {
+                let projected = project_at(source, &WidthProfile::default(), 20)?;
+                let notices = projected
+                    .entry
+                    .block
+                    .iter()
+                    .filter(|block| block.id.0 == "work:turn:turn:stop-reason")
+                    .collect::<Vec<_>>();
+                assert_eq!(notices.len(), 1);
+                assert!(notices[0].text.wire_rows().join("").contains(notice));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn owned_check_results_keep_exchange_ownership_before_the_final_response() -> anyhow::Result<()>
     {
-        use crate::provider::{ExecutionOwner, InvocationScope, TurnAddress};
+        use crate::provider::{InvocationScope, ThreadOwner};
         use crate::turn::{MessageDelivery, MessageKind, Turn, TurnOutcome};
 
         let mut turn = Turn::new(
             "turn".into(),
-            TurnAddress {
-                scope: InvocationScope {
-                    owner: ExecutionOwner {
-                        session_id: "session".into(),
-                        agent_id: "primary".into(),
-                    },
-                    exchange_id: "work".into(),
-                    invocation_id: "invocation".into(),
-                },
-                thread_id: "thread".into(),
-                turn_id: "turn".into(),
-            },
+            crate::provider::test_support::address(&InvocationScope {
+                owner: ThreadOwner::new(
+                    "session".into(),
+                    forge_provider_api::agent::AgentId::new("primary").unwrap(),
+                )
+                .expect("registered session and agent identities are nonempty"),
+                exchange_id: "work".into(),
+                invocation_id: "invocation".into(),
+            }),
             0,
         );
         turn.record_provider_text(
@@ -8202,7 +8989,12 @@ mod tests {
             MessageDelivery::Final,
             false,
         )?;
-        turn.finish(TurnOutcome::Completed, 20)?;
+        turn.finish(
+            TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            20,
+        )?;
         let exchange: Exchange = serde_json::from_value(json!({
             "id":"work", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Check the change", "state":"running", "created_at_ms":0,
@@ -8399,6 +9191,7 @@ mod tests {
         let refreshed = super::timing_blocks(
             &entry,
             &profile,
+            crate::buffer::projection::FIXTURE_NOW_MS,
             &document,
             &Default::default(),
             &projected.tool,
@@ -8441,6 +9234,7 @@ mod tests {
             super::timing_blocks(
                 &finished,
                 &profile,
+                crate::buffer::projection::FIXTURE_NOW_MS,
                 &document,
                 &Default::default(),
                 &projected.tool,
@@ -8576,35 +9370,32 @@ mod tests {
     #[test]
     fn activity_header_retains_tool_totals_and_distinct_files_during_refresh_and_reload()
     -> anyhow::Result<()> {
-        let mut exchange: Exchange = serde_json::from_value(json!({
-            "id":"summary", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
-            "execution_started_at_ms":1000,"attributed_matches_checkpoint":false,"node_list":[]
-        }))?;
-        let address = crate::turn::test_support::address(&exchange, "turn");
-        exchange.start_turn(address.clone(), 1000)?;
-        let mut failures = Vec::new();
-        for (id, status, failed, path) in [
-            ("first", "completed", false, "src\\main.rs"),
-            ("repeat", "completed", false, "src/main.rs"),
-            ("other", "completed", false, "src/other.rs"),
-            ("error", "failed", false, "failed.rs"),
-            ("reported", "completed", true, "also-failed.rs"),
-            ("pending", "running", false, "pending.rs"),
-        ] {
-            failures.push((id, failed));
-            crate::turn::test_support::tool(
-                &mut exchange,
-                &address,
-                id,
-                crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::FileChange,
-                    name: "edit".into(),
-                    title: "Edit".into(),
-                    arguments: json!({}),
-                },
-                crate::turn::test_support::tool_updates(
+        // Build each observed state through the reducer; typed tool lifecycles reject forged flags.
+        let build = |pending_status: &str| -> anyhow::Result<Exchange> {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"summary", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
+                "execution_started_at_ms":1000,"attributed_matches_checkpoint":false,"node_list":[]
+            }))?;
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 1000)?;
+            for (id, status, path) in [
+                ("first", "completed", "src\\main.rs"),
+                ("repeat", "completed", "src/main.rs"),
+                ("other", "completed", "src/other.rs"),
+                ("error", "failed", "failed.rs"),
+                ("reported", "failed", "also-failed.rs"),
+                ("pending", pending_status, "pending.rs"),
+            ] {
+                let fixture_start =
+                    forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "edit".into(),
+                        title: "Edit".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    });
+                let fixture_updates = crate::turn::test_support::tool_updates(
+                    &fixture_start,
                     crate::provider::ToolStatus::parse(status)?,
                     None,
                     crate::provider::ProviderChangeSet {
@@ -8615,23 +9406,25 @@ mod tests {
                             diff: String::new(),
                         }],
                     },
-                ),
-                1000,
-            )?;
-        }
-        let mut source = serde_json::to_value(&exchange)?;
-        for (id, failed) in failures {
-            crate::turn::test_support::tool_value_mut(&mut source, id)["failed"] = json!(failed);
-        }
-        let exchange: Exchange = serde_json::from_value(source.clone())?;
+                );
+                crate::turn::test_support::tool(
+                    &mut exchange,
+                    &address,
+                    id,
+                    fixture_start.clone(),
+                    fixture_updates,
+                    1000,
+                )?;
+            }
+            Ok(exchange)
+        };
+        let exchange = build("running")?;
         let live = super::exchange_activity_summary(&exchange, 2000);
         assert!(live.contains("3/6 tools"));
         assert!(live.ends_with("│ 2 files changed"));
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         assert_eq!(super::exchange_activity_summary(&restored, 2000), live);
-        crate::turn::test_support::tool_value_mut(&mut source, "pending")["status"] =
-            json!("completed");
-        let exchange: Exchange = serde_json::from_value(source)?;
+        let exchange = build("completed")?;
         let entry = TimelineEntry::Exchange {
             id: exchange.id.clone(),
 
@@ -8649,6 +9442,7 @@ mod tests {
         let refreshed = super::timing_blocks(
             &entry,
             &width,
+            crate::buffer::projection::FIXTURE_NOW_MS,
             &document,
             &HashMap::new(),
             &projected.tool,
@@ -8666,102 +9460,147 @@ mod tests {
 
     #[test]
     fn compact_header_reports_successful_tools_and_inclusive_output_tokens() {
-        let mut exchange: Exchange = serde_json::from_value(json!({
-            "id":"header","session_id":"session","agent_id":"primary","ordinal":1,
-            "kind":"plan_draft","state":"running","prompt":"Plan","created_at_ms":0,
-            "attributed_matches_checkpoint":true,"node_list":[]
-        }))
-        .unwrap();
-        exchange.resume(0).unwrap();
-        let address = crate::turn::test_support::address(&exchange, "turn");
-        exchange.start_turn(address.clone(), 0).unwrap();
-        for index in 1..=20 {
-            crate::turn::test_support::tool(
-                &mut exchange,
-                &address,
-                &index.to_string(),
-                crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::ToolCall,
-                    name: "inspect".into(),
-                    title: "inspect".into(),
-                    arguments: json!({}),
-                },
-                crate::turn::test_support::tool_updates(
-                    if index == 20 {
-                        crate::provider::ToolStatus::Failed
-                    } else {
-                        crate::provider::ToolStatus::Succeeded
-                    },
+        use crate::provider::ToolStatus;
+        use crate::provider::usage::TokenUsage;
+        // Every measurement enters through provider events; restoring metrics recomputes the
+        // derived totals, so only the stored tool duration is patched after serialization.
+        let build = |kind: &str,
+                     statuses: &[ToolStatus],
+                     usage: TokenUsage,
+                     reported_ms: u64,
+                     finished_ms: i64,
+                     tool_duration_ms: u64| {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"header","session_id":"session","agent_id":"primary","ordinal":1,
+                "kind":kind,"state":"running","prompt":"Plan","created_at_ms":0,
+                "attributed_matches_checkpoint":true,"node_list":[]
+            }))
+            .unwrap();
+            exchange.resume(0).unwrap();
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 0).unwrap();
+            for (index, status) in statuses.iter().enumerate() {
+                let fixture_start =
+                    forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "inspect".into(),
+                        title: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    });
+                let fixture_updates = crate::turn::test_support::tool_updates(
+                    &fixture_start,
+                    *status,
                     None,
                     Default::default(),
-                ),
-                200,
-            )
-            .unwrap();
-        }
-        exchange.turn[0].record_usage(crate::provider::usage::TokenUsage {
+                );
+                crate::turn::test_support::tool(
+                    &mut exchange,
+                    &address,
+                    &(index + 1).to_string(),
+                    fixture_start.clone(),
+                    fixture_updates,
+                    200,
+                )
+                .unwrap();
+            }
+            exchange
+                .observe_event(
+                    &crate::turn::test_support::usage_event(
+                        &address,
+                        forge_provider_api::TurnUsageReport::accounting(
+                            forge_provider_api::UsageReportId::new("fixture-usage").unwrap(),
+                            1,
+                            Some(usage),
+                            Some(reported_ms),
+                        )
+                        .unwrap(),
+                    ),
+                    1,
+                )
+                .unwrap();
+            exchange.turn[0]
+                .finish(
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    finished_ms,
+                )
+                .unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeOutcome::Complete, finished_ms)
+                .unwrap();
+            let mut value = serde_json::to_value(&exchange).unwrap();
+            value["metrics"]["timing_complete"] = json!(true);
+            value["metrics"]["tool_duration_ms"] = json!(tool_duration_ms);
+            serde_json::from_value::<Exchange>(value).unwrap()
+        };
+        let planning_usage = TokenUsage {
             input: Some(855100),
             output: Some(7906),
             reasoning: Some(906),
             cached_input: None,
-        });
-        exchange.turn[0]
-            .finish(crate::turn::TurnOutcome::Completed, 44000)
-            .unwrap();
-        exchange
-            .finish(crate::exchange::ExchangeOutcome::Complete, 44000)
-            .unwrap();
-        let mut value = serde_json::to_value(&exchange).unwrap();
-        value["metrics"] = json!({"timing_complete":true,"tool_duration_ms":4000,
-            "reported_output_tokens":7906,"reported_response_ms":40132});
-        let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
+        };
+        let mut statuses = vec![ToolStatus::Succeeded; 19];
+        statuses.push(ToolStatus::Failed);
+        let exchange = build(
+            "plan_draft",
+            &statuses,
+            planning_usage.clone(),
+            40132,
+            44000,
+            4000,
+        );
         assert_eq!(
             super::exchange_activity_summary(&exchange, 44000),
             "● Thought 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
         );
-        for status in ["running", "cancelled", "interrupted"] {
-            crate::turn::test_support::tool_value_mut(&mut value, "1")["status"] = json!(status);
-            let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
-            assert!(super::exchange_activity_summary(&exchange, 44000).contains("18/20 tools"));
+        for status in [
+            ToolStatus::Running,
+            ToolStatus::Cancelled,
+            ToolStatus::Interrupted,
+        ] {
+            statuses[0] = status;
+            let exchange = build(
+                "plan_draft",
+                &statuses,
+                planning_usage.clone(),
+                40132,
+                44000,
+                4000,
+            );
+            assert!(
+                super::exchange_activity_summary(&exchange, 44000).contains("18/20 tools"),
+                "{status:?}"
+            );
         }
-        value["kind"] = json!("chat");
-        value["duration_ms"] = json!(31000);
-        value["metrics"] = json!({"timing_complete":true,"tool_duration_ms":29,
-            "reported_output_tokens":846,"reported_response_ms":9097});
-        value["turn"][0]["usage"] = json!({"input":77000,"cached_input":49280,"output":846});
-        let store = &mut value["entry"][0]["commentary"]["tool"][0]["store"];
-        store["order"] = json!(["1", "2"]);
-        for key in ["item", "execution"] {
-            store[key]
-                .as_object_mut()
-                .unwrap()
-                .retain(|id, _| id == "1" || id == "2");
-        }
-        for id in ["1", "2"] {
-            store["item"][id]["status"] = json!("completed");
-            store["item"][id]["failed"] = json!(false);
-            store["item"][id]["started_at_ms"] = json!(0);
-            store["item"][id]["completed_at_ms"] = json!(29);
-        }
-        let exchange: Exchange = serde_json::from_value(value).unwrap();
+        let exchange = build(
+            "chat",
+            &[ToolStatus::Succeeded, ToolStatus::Succeeded],
+            TokenUsage {
+                input: Some(77000),
+                output: Some(846),
+                reasoning: None,
+                cached_input: Some(49280),
+            },
+            9097,
+            31000,
+            29,
+        );
         assert_eq!(
             super::exchange_activity_summary(&exchange, 44000),
-            "● Thought 31s │ 2/2 tools · 29 ms │ 77.0k (64%) -> 846 · 93 tps"
+            "● Thought 31s │ 2/2 tools · 29 ms │ 77.0k (64% cached) -> 846 · 93 tps"
         );
         let child = crate::agent::Agent::pending("session", "Child", "Inspect", 0);
         assert!(
             super::agent_summary(&child, Some(&exchange), 44000)
-                .ends_with("│ 2/2 tools · 29 ms │ 77.0k (64%) -> 846 · 93 tps")
+                .ends_with("│ 2/2 tools · 29 ms │ 77.0k (64% cached) -> 846 · 93 tps")
         );
     }
 
     #[test]
     fn compact_summary_counts_native_usage_and_total_time_including_tools() {
-        use crate::provider::usage::{TokenUsage, UsageUpdate};
-        use crate::provider::{
-            ProviderEvent, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
-        };
+        use crate::provider::usage::TokenUsage;
+        use crate::provider::{ProviderEvent, ToolOutcome};
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
@@ -8775,25 +9614,24 @@ mod tests {
             &mut exchange,
             &address,
             "tool",
-            ToolInvocation {
+            forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::ToolCall,
                 name: "test".into(),
                 title: "cargo test".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             [],
             2000,
         )
         .unwrap();
-        let mut event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address.clone(),
-                tool_id: "tool".into(),
+        let mut event = crate::turn::test_support::item_event(
+            &(address.clone()),
+            "tool",
+            forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::ExecutionStarted,
             },
-            update: ToolUpdate::Started,
-        };
-        exchange.observe_turn(&event, 2000).unwrap();
+        );
+        exchange.observe_event(&event, 2000).unwrap();
         for (now_ms, duration, aggregate) in [
             (2439, "0.4s", "439 ms"),
             (2500, "0.5s", "500 ms"),
@@ -8834,18 +9672,28 @@ mod tests {
             super::exchange_activity_summary(&permission_wait, 902_000),
             "● Thinking 5s │ 0/1 tools · 4.5 s"
         );
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Failed {
-                    diagnostic: crate::provider::ToolDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new("test failed")
-                            .expect("fixture diagnostic is nonempty"),
+        if let crate::provider::events::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item { event: update, .. } = boxed_native_event.as_mut()
+        {
+            *update = forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::ToolCall(forge_provider_api::ToolCompletion {
+                    outcome: ToolOutcome::Failed {
+                        diagnostic: crate::provider::ToolDiagnostic {
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::SanitizedMessage::new("test failed")
+                                .expect("fixture diagnostic is nonempty"),
+                        },
                     },
-                },
-            };
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                }),
+            );
         }
-        exchange.observe_turn(&event, 5000).unwrap();
+        exchange.observe_event(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {
             id: exchange.id.clone(),
 
@@ -8862,42 +9710,48 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("•    3s cargo test"))
         }));
-        event = ProviderEvent::Turn {
-            address: address.clone(),
-            update: TurnUpdate::Finished {
-                outcome: crate::turn::TurnOutcome::Completed,
-                completed_at_ms: 7000,
+        event = crate::turn::test_support::completed_event(
+            &(address.clone()),
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             },
-        };
-        exchange.observe_turn(&event, 7000).unwrap();
+            7000,
+        );
+        exchange.observe_event(&event, 7000).unwrap();
         exchange
             .finish(crate::exchange::ExchangeOutcome::Complete, 7000)
             .unwrap();
-        event = ProviderEvent::Usage {
-            address,
-            update: UsageUpdate {
-                context_adjustment: false,
-                id: "call".into(),
-                usage: TokenUsage {
+        event = crate::turn::test_support::usage_event(
+            &(address),
+            forge_provider_api::TurnUsageReport::call(
+                forge_provider_api::UsageReportId::new("call").unwrap(),
+                Some(forge_provider_api::ModelCallId::new("call").unwrap()),
+                3000,
+                Some(TokenUsage {
                     input: Some(76000),
                     cached_input: Some(68400),
                     reasoning: Some(3000),
                     output: Some(4200),
-                },
-                cumulative: None,
-                cumulative_total: None,
-            },
-        };
-        exchange.observe_turn(&event, 8000).unwrap();
-        exchange.observe_turn(&event, 9000).unwrap();
+                }),
+                Some(3000),
+            )
+            .unwrap(),
+        );
+        exchange.observe_event(&event, 8000).unwrap();
+        exchange.observe_event(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps"
+            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps"
         );
-        if let ProviderEvent::Usage { address, .. } = &mut event {
-            address.thread_id = "unowned-child".into();
+        if let crate::provider::events::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Turn { thread_id, .. } = boxed_native_event.as_mut()
+        {
+            *thread_id = forge_provider_api::ThreadId::new("unowned-child").unwrap();
         }
-        assert!(!exchange.observe_turn(&event, 90_000).unwrap());
+        assert!(!exchange.observe_event(&event, 90_000).unwrap());
         assert_eq!(exchange.usage().input, Some(76000));
         for duration_ms in [6500, 3500, 3000] {
             exchange.clock = crate::exchange::ExchangeClock::fixture(
@@ -8907,7 +9761,7 @@ mod tests {
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
                 format!(
-                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps",
+                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90% cached) -> 4.2k · 1400 tps",
                     duration_ms / 1000
                 )
             );
@@ -8915,13 +9769,12 @@ mod tests {
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k"
+            "● Thought 3s │ 0/1 tools │ 76.0k (90% cached) -> 4.2k"
         );
     }
 
     #[test]
     fn active_usage_updates_header_without_waiting_for_exchange_completion() {
-        use crate::provider::ProviderEvent;
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"live", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Work",
             "kind":"chat", "state":"running", "created_at_ms":1000,
@@ -8931,41 +9784,56 @@ mod tests {
         exchange.resume(1000).unwrap();
         let address = crate::turn::test_support::address(&exchange, "turn");
         exchange.start_turn(address.clone(), 1000).unwrap();
-        let mut event = ProviderEvent::Usage {
-            address,
-            update: crate::provider::usage::UsageUpdate {
-                context_adjustment: false,
-                id: "first".into(),
-                usage: crate::provider::usage::TokenUsage {
+        let mut event = crate::turn::test_support::usage_event(
+            &(address),
+            forge_provider_api::TurnUsageReport::call(
+                forge_provider_api::UsageReportId::new("first").unwrap(),
+                Some(forge_provider_api::ModelCallId::new("first").unwrap()),
+                3000,
+                Some(crate::provider::usage::TokenUsage {
                     input: Some(1000),
                     cached_input: Some(900),
                     reasoning: Some(40),
                     output: Some(100),
-                },
-                cumulative: None,
-                cumulative_total: None,
-            },
-        };
-        exchange.observe_turn(&event, 3000).unwrap();
+                }),
+                Some(2000),
+            )
+            .unwrap(),
+        );
+        exchange.observe_event(&event, 3000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 4000),
-            "● Thinking 3s │ 1.0k (90%) -> 100 · 50 tps"
+            "● Thinking 3s │ 1.0k (90% cached) -> 100 · 50 tps"
         );
-        exchange.observe_turn(&event, 6000).unwrap();
+        exchange.observe_event(&event, 6000).unwrap();
         assert!(super::exchange_activity_summary(&exchange, 6000).contains("50 tps"));
-        if let ProviderEvent::Usage { update, .. } = &mut event {
-            update.id = "second".into();
+        if let crate::provider::events::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let forge_provider_api::ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Usage(report),
+                ..
+            } = boxed_native_event.as_mut()
+        {
+            *report = forge_provider_api::TurnUsageReport::call(
+                forge_provider_api::UsageReportId::new("second").unwrap(),
+                Some(forge_provider_api::ModelCallId::new("second").unwrap()),
+                6000,
+                report.usage().clone(),
+                Some(3000),
+            )
+            .unwrap();
         }
-        exchange.observe_turn(&event, 6000).unwrap();
+        exchange.observe_event(&event, 6000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 9000),
-            "● Thinking 8s │ 2.0k (90%) -> 200 · 40 tps"
+            "● Thinking 8s │ 2.0k (90% cached) -> 200 · 40 tps"
         );
     }
 
     #[test]
     fn summary_omits_missing_usage_and_preserves_reported_zeroes() {
-        use crate::provider::ProviderEvent;
         let mut original: Exchange = serde_json::from_value(json!({
             "id":"partial", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
@@ -8987,31 +9855,37 @@ mod tests {
             ),
             (
                 json!({"input":1000,"cached_input":876}),
-                "● Thinking 3s │ in 1.0k (88%)",
+                "● Thinking 3s │ in 1.0k (88% cached)",
             ),
             (json!({"input":0,"cached_input":0}), "● Thinking 3s │ in 0"),
-            (
-                json!({"input":1000,"cached_input":1001}),
-                "● Thinking 3s │ in 1.0k",
-            ),
+            (json!({"input":1000,"cached_input":1001}), "● Thinking 3s"),
             (json!({"reasoning":23}), "● Thinking 3s"),
             (
                 json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
-                "● Thinking 3s │ 1.0k (0%) -> 0",
+                "● Thinking 3s │ 1.0k (0% cached) -> 0",
             ),
         ] {
             let mut exchange = original.clone();
-            let event = ProviderEvent::Usage {
-                address: address.clone(),
-                update: crate::provider::usage::UsageUpdate {
-                    context_adjustment: false,
-                    id: "first".into(),
-                    usage: serde_json::from_value(usage).unwrap(),
-                    cumulative: None,
-                    cumulative_total: None,
-                },
+            let report = forge_provider_api::TurnUsageReport::call(
+                forge_provider_api::UsageReportId::new("first").unwrap(),
+                Some(forge_provider_api::ModelCallId::new("first").unwrap()),
+                3000,
+                Some(serde_json::from_value(usage).unwrap()),
+                Some(2000),
+            );
+            let report = match report {
+                Ok(report) => report,
+                Err(error) => {
+                    assert_eq!(
+                        error,
+                        forge_provider_api::UsageReportError::InvalidTokenBreakdown
+                    );
+                    assert_eq!(super::exchange_activity_summary(&exchange, 4000), expected);
+                    continue;
+                }
             };
-            exchange.observe_turn(&event, 3000).unwrap();
+            let event = crate::turn::test_support::usage_event(&address, report);
+            exchange.observe_event(&event, 3000).unwrap();
             assert_eq!(super::exchange_activity_summary(&exchange, 4000), expected);
         }
     }
@@ -9031,9 +9905,26 @@ mod tests {
             "● Thinking 3s"
         );
         interaction.pause(5500);
+        let address = crate::turn::test_support::address(&interaction, "turn");
+        interaction.start_turn(address.clone(), 1000).unwrap();
+        // Usage enters through the exchange ledger, which owns the header's token totals.
         interaction
-            .start_turn(
-                crate::turn::test_support::address(&interaction, "turn"),
+            .observe_event(
+                &crate::turn::test_support::usage_event(
+                    &address,
+                    forge_provider_api::TurnUsageReport::accounting(
+                        forge_provider_api::UsageReportId::new("fixture-usage").unwrap(),
+                        1,
+                        Some(crate::provider::usage::TokenUsage {
+                            input: Some(1000),
+                            cached_input: Some(900),
+                            reasoning: Some(200),
+                            output: Some(280),
+                        }),
+                        None,
+                    )
+                    .unwrap(),
+                ),
                 1000,
             )
             .unwrap();
@@ -9041,29 +9932,24 @@ mod tests {
             .turn
             .last_mut()
             .unwrap()
-            .record_usage(crate::provider::usage::TokenUsage {
-                input: Some(1000),
-                cached_input: Some(900),
-                reasoning: Some(200),
-                output: Some(280),
-            });
-        interaction
-            .turn
-            .last_mut()
-            .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 5500)
+            .finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                5500,
+            )
             .unwrap();
         interaction.set_awaiting_input(true);
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Waiting for your answer 4s │ 1.0k (90%) -> 280"
+            "● Waiting for your answer 4s │ 1.0k (90% cached) -> 280"
         );
         interaction
             .finish(crate::exchange::ExchangeOutcome::Complete, 5500)
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Thought 4s │ 1.0k (90%) -> 280"
+            "● Thought 4s │ 1.0k (90% cached) -> 280"
         );
     }
     #[test]
@@ -9143,5 +10029,310 @@ mod tests {
             .join("\n");
         assert!(text.contains("Report content is unavailable"));
         assert!(text.contains("Implementation differences"));
+    }
+    /// Preserve a positive native user item with explicit sender styling through history reload.
+    #[test]
+    fn native_user_item_retains_its_sender_and_original_identity() -> anyhow::Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"native-user", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Submitted prompt", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let event = crate::turn::test_support::item_event(
+            &address,
+            "native-user-item",
+            forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                forge_provider_api::UserMessageStart {
+                    text: "Observed native user text".into(),
+                    submission_id: None,
+                },
+            )),
+        );
+        exchange.observe_event(&event, 1)?;
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        let message = &restored.turn[0].messages()[0];
+        assert_eq!(message.kind(), crate::turn::MessageKind::User);
+        assert_eq!(message.provider_id().as_str(), "native-user-item");
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: restored.id.clone(),
+                created_at_ms: 0,
+                exchange: restored.into(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            2,
+        )?;
+        let native = projected
+            .entry
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .join("\n")
+                    .contains("Observed native user text")
+            })
+            .expect("native user text must remain visible");
+        assert!(
+            native
+                .metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "ForgeHarnessPrompt")
+        );
+        Ok(())
+    }
+    /// A native user item echoing a Forge submission must not repeat the admitted prompt row.
+    #[test]
+    fn native_echo_of_a_submission_renders_one_prompt_row() -> anyhow::Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"echo", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"What is this repo?", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        for event in [
+            forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                forge_provider_api::UserMessageStart {
+                    text: "What is this repo?".into(),
+                    submission_id: Some(forge_provider_api::SubmissionId::try_from(
+                        "submission".to_owned(),
+                    )?),
+                },
+            )),
+            forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::UserMessage(
+                    forge_provider_api::MessageCompletion {
+                        text: "What is this repo?".into(),
+                        outcome: forge_provider_api::MessageOutcome::Completed,
+                    },
+                ),
+            ),
+        ] {
+            exchange.observe_event(
+                &crate::turn::test_support::item_event(&address, "native-echo", event),
+                1,
+            )?;
+        }
+        assert_eq!(exchange.turn[0].messages().len(), 1);
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            2,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("What is this repo?").count(), 1, "{text}");
+        Ok(())
+    }
+
+    /// A turn restarted after an interruption is separated from the partial answer it replaces.
+    #[test]
+    fn interrupted_turn_and_its_resumption_render_a_boundary() -> anyhow::Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"resume", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Explain ownership", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let interrupted = crate::turn::test_support::address(&exchange, "interrupted");
+        exchange.start_turn(interrupted.clone(), 0)?;
+        exchange.observe_event(
+            &crate::turn::test_support::message(&interrupted, "partial", None, "PARTIAL_ANSWER"),
+            1,
+        )?;
+        exchange.turn[0].finish(forge_provider_api::turn::TurnOutcome::Interrupted, 2)?;
+        let resumed = crate::turn::test_support::address(&exchange, "resumed");
+        exchange.start_turn(resumed.clone(), 3)?;
+        exchange.observe_event(
+            &crate::turn::test_support::message(&resumed, "restart", None, "RESTARTED_ANSWER"),
+            4,
+        )?;
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            5,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let partial = text.find("PARTIAL_ANSWER").expect(&text);
+        let boundary = text.find("◇ Resumed").expect(&text);
+        let restarted = text.find("RESTARTED_ANSWER").expect(&text);
+        assert!(partial < boundary && boundary < restarted, "{text}");
+        assert_eq!(text.matches("◇ Resumed").count(), 1, "{text}");
+        Ok(())
+    }
+    /// Native child history remains visible without managed actions or a fabricated user submission.
+    #[test]
+    fn observed_native_history_is_read_only_and_unavailable_is_explicit() -> anyhow::Result<()> {
+        use crate::provider::{InvocationScope, ThreadOwner, TurnAddress};
+        use forge_provider_api::agent::{
+            AgentActiveState, AgentDelegation, AgentDescription, AgentEvent, AgentId,
+            AgentLifecycleEvent,
+        };
+        let root = InvocationScope {
+            owner: ThreadOwner::root("session"),
+            exchange_id: "root".into(),
+            invocation_id: "root-turn".into(),
+        };
+        let owner = ThreadOwner::new(
+            root.owner.session_id().clone(),
+            AgentId::new("execution-owner")?,
+        )?;
+        let scope = InvocationScope {
+            owner,
+            exchange_id: root.exchange_id.clone(),
+            invocation_id: "child-turn".into(),
+        };
+        let address = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id()?,
+            scope,
+        };
+        let public = AgentId::new("public-child")?;
+        let description = AgentDescription {
+            parent_agent_id: Some(root.owner.agent_id().clone()),
+            delegation: Some(AgentDelegation {
+                parent_thread_id: root.owner.thread_id(),
+                parent_turn_id: root.turn_id()?,
+                parent_item_id: None,
+            }),
+            thread_id: Some(address.thread_id.clone()),
+            definition: None,
+            nickname: Some("Inspect".into()),
+            task: None,
+        };
+        let proof = crate::provider::test_support::observed_agent_fixture(
+            forge_provider_api::BindingId::new("binding")?,
+            root,
+            vec![(public.clone(), description.clone(), Some(address.clone()))],
+            public,
+            Some(address.turn_id.clone()),
+        )?;
+        let source = |sequence| crate::provider::events::NativeEventSource {
+            binding_id: proof.binding_id().clone(),
+            sequence: forge_provider_api::EventSequence::new(sequence),
+        };
+        let mut child = crate::agent::ObservedAgent::registered(&proof, 1)?;
+        child.observe_agent(
+            &proof,
+            &source(1),
+            &AgentEvent::Lifecycle {
+                event: AgentLifecycleEvent::Started {
+                    agent: description,
+                    state: AgentActiveState::Running,
+                },
+            },
+            1,
+        )?;
+        let native_scope = crate::provider::EventScope::from(address.scope.clone());
+        child.observe_event(
+            &proof,
+            &source(2),
+            &native_scope,
+            &forge_provider_api::ProviderEvent::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event: forge_provider_api::TurnEvent::Started(
+                    forge_provider_api::turn::TurnStarted { started_at_ms: 2 },
+                ),
+            },
+            2,
+        )?;
+        child.observe_event(
+            &proof,
+            &source(3),
+            &native_scope,
+            &forge_provider_api::ProviderEvent::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: forge_provider_api::ItemId::new("history-user")?,
+                event: forge_provider_api::ItemEvent::Started(
+                    forge_provider_api::ItemStart::UserMessage(
+                        forge_provider_api::UserMessageStart {
+                            text: "Positive native child history".into(),
+                            submission_id: None,
+                        },
+                    ),
+                ),
+            },
+            3,
+        )?;
+        child.mark_unavailable();
+        let id = child.storage_id();
+        let entries =
+            crate::timeline::TimelineProjector::with_observed_agents(vec![], vec![child])?;
+        let projected = project_at(&entries[0], &WidthProfile::default(), 90_000)?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Native agent Inspect · observation unavailable"));
+        assert!(text.contains("Last native state: running"));
+        assert!(text.contains("Positive native child history"));
+        assert!(
+            !projected
+                .action
+                .values()
+                .any(|action| matches!(action, super::TranscriptAction::Agent { .. }))
+        );
+        assert_eq!(
+            projected
+                .entry
+                .block
+                .iter()
+                .filter(|block| block
+                    .metadata
+                    .decoration
+                    .iter()
+                    .any(|decoration| decoration.capture == "ForgeHarnessPrompt"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            projected
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == id)
+                .unwrap()
+                .metadata
+                .node
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            NodeLifecycle::Settled
+        );
+        Ok(())
     }
 }

@@ -21,12 +21,12 @@ fn live_host_failure(error: &anyhow::Error) -> ProviderError {
     use forge_provider_api::error::{ProviderFailure, ProviderFailureKind, ProviderOperation};
     if error.is::<LiveHostRejection>() {
         ProviderError::Failure(ProviderFailure::new(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
         ))
     } else if error.is::<rusqlite::Error>() {
         ProviderError::Failure(
-            ProviderFailure::new(ProviderOperation::InputSubmit, ProviderFailureKind::Runtime)
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Runtime)
                 .at_phase(
                     forge_provider_api::ProviderPhase::Persistence,
                     forge_provider_api::FailureDisposition::Uncertain,
@@ -34,7 +34,7 @@ fn live_host_failure(error: &anyhow::Error) -> ProviderError {
         )
     } else {
         crate::provider::lifecycle_error::classify_source(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             error.as_ref(),
         )
     }
@@ -79,6 +79,59 @@ impl HarnessBroker {
             self.trace.record(&self.session.id, "host_effect.lifecycle", json!({"scope":request.scope,"call_id":request.call_id,"batch_revision":request.batch.revision,"stage":"rejected","outcome":"retired"}));
             request.reject(ProviderError::Cancelled);
             return Ok(ForegroundAction::Wait);
+        }
+        if !request.batch.completion.host_file_changes.is_empty() {
+            let committed = (|| -> Result<_> {
+                anyhow::ensure!(transaction.live_host.is_none(), LiveHostRejection::Busy);
+                anyhow::ensure!(
+                    request.batch.completion.host_file_changes.len() == 1,
+                    LiveHostRejection::MultipleMutations
+                );
+                let change = &request.batch.completion.host_file_changes[0];
+                anyhow::ensure!(
+                    change.scope == request.scope && change.call_id == request.call_id,
+                    "live file effect crosses original callback ownership"
+                );
+                let id = crate::provider::session_execution::HostEffectId {
+                    batch_revision: request.batch.revision,
+                    kind: crate::provider::session_execution::HostEffectKind::FileChange,
+                    ordinal: 0,
+                };
+                self.commit_host_file_change(
+                    &mut transaction.state.interaction,
+                    change,
+                    id,
+                    Some(&transaction.settlement),
+                )?;
+                let patch = self.reconcile_timeline()?;
+                Ok((id, patch))
+            })();
+            let (id, patch) = match committed {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = request.reply.send(Err(live_host_failure(&error)));
+                    return Err(error);
+                }
+            };
+            transaction.live_host = Some(LiveHostState {
+                scope: request.scope,
+                call_id: request.call_id,
+                batch_revision: request.batch.revision,
+                reply: Some(request.reply),
+                committed: true,
+                plan: None,
+                permit: None,
+                entry: None,
+                id,
+            });
+            let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
+            return Ok(ForegroundAction::Effect(
+                ForegroundJob::PlanTerminalPublication {
+                    delivery,
+                    cell: transaction.settlement.clone(),
+                    id,
+                },
+            ));
         }
         if request.batch.completion.goal_control.is_some() {
             self.trace.record(&self.session.id, "host_effect.lifecycle", json!({"scope":request.scope,"call_id":request.call_id,"batch_revision":request.batch.revision,"stage":"admitted","outcome":"goal"}));

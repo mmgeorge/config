@@ -1,5 +1,7 @@
 local M = {}
-local directory=vim.fs.dirname(debug.getinfo(1,"S").source:sub(2))
+-- Resolve against the load-time working directory: a relative runtimepath entry yields a relative
+-- source path, and a later working-directory change would otherwise redirect every wordlist.
+local directory=vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1,"S").source:sub(2),":p"))
 local cache={}
 local pending_add={}
 local publishing={}

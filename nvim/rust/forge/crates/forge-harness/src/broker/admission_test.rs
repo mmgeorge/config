@@ -257,7 +257,7 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
         broker.store.save_exchange(&previous)?;
         if completed {
             let connection =
-                rusqlite::Connection::open(crate::storage::state::database(&data.path()))?;
+                rusqlite::Connection::open(crate::storage::state::database(data.path()))?;
             connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.node_list','invalid transcript') WHERE id=?1", [&previous.id])?;
         }
         let (next, new_runtime, events) = broker
@@ -346,7 +346,11 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
                 result?;
             }
             "fail" => {
-                assert!(format!("{:#}", result.unwrap_err()).contains("fixture preparation failed"))
+                let error = result.unwrap_err();
+                assert!(error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<forge_provider_api::ProviderFailure>(),
+                    Some(failure) if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime
+                )), "preparation lost its typed failure: {error:#}");
             }
             "cancel" => assert!(result.unwrap_err().is::<TurnCancelled>()),
             _ => unreachable!(),
@@ -372,7 +376,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
 }
 
 #[tokio::test]
-async fn input_readiness_matches_pending_question_without_loading_history() -> Result<()> {
+async fn optional_question_preserves_input_readiness_without_loading_history() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), true);
@@ -391,8 +395,10 @@ async fn input_readiness_matches_pending_question_without_loading_history() -> R
     );
     let snapshot = broker.snapshot()?;
     let ready = broker.observer().input_readiness()?;
-    assert!(snapshot.active_elicitation.is_some());
-    assert!(ready.has_elicitation);
+    assert_eq!(snapshot.questions.questions.len(), 1);
+    assert!(snapshot.questions.questions[0].pending());
+    assert!(snapshot.active_elicitation.is_none());
+    assert!(!ready.has_elicitation);
     assert_eq!(
         broker
             .observer()

@@ -2,13 +2,17 @@ use super::collect::ProviderTestExt as _;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::plan::PlanPrompt;
 use forge_harness::provider::{
-    AgentUpdate, InvocationScope, MessageAddress, MessageClassification, MessageRole,
-    MessageUpdate, PromptMode, ProviderCatalogRequest, ProviderEvent, ProviderForkRequest,
-    ProviderInput, ProviderLaunch, ProviderRequest, ToolActivityKind, ToolOutcome, ToolUpdate,
-    TurnUpdate,
+    InvocationScope, MessageClassification, PromptMode, ProviderCatalogRequest, ProviderEvent,
+    ProviderForkRequest, ProviderInput, ProviderLaunch, ProviderRequest, ToolOutcome, TurnEvent,
 };
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
+use forge_provider_api::{
+    ItemId,
+    agent::{AgentEvent, AgentLifecycleEvent},
+    message::{AgentMessageRole, ItemCompletion, ItemEvent, ItemStart, MessageItemEvent},
+    tool::ToolItemEvent,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -39,37 +43,48 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> ProviderRequest {
         approval_mode: ApprovalMode::Ask,
         provider_session_id: None,
         submission: None,
+        acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
     }
 }
 
+/// Observe only typed assistant prose while preserving an unknown native classification.
 fn observe_assistant_text(
-    event: &ProviderEvent,
-    classification: &mut HashMap<MessageAddress, MessageClassification>,
+    event: &forge_harness::provider::HarnessEvent,
+    classification: &mut HashMap<ItemId, MessageClassification>,
 ) -> bool {
-    let ProviderEvent::Message { address, update } = event else {
+    let Some(ProviderEvent::Item { item_id, event, .. }) = super::native_event(event) else {
         return false;
     };
-    match update {
-        MessageUpdate::Started {
-            classification: value,
-            ..
+    let text = match event {
+        ItemEvent::Started(ItemStart::AgentMessage(start)) => {
+            classification.insert(item_id.clone(), start.classification);
+            Some(start.text.as_str())
+        }
+        ItemEvent::Message {
+            event: MessageItemEvent::Classified(value),
         } => {
-            classification.insert(address.clone(), *value);
+            classification.insert(item_id.clone(), *value);
+            None
         }
-        MessageUpdate::Classified { role } => {
-            classification.insert(address.clone(), MessageClassification::Known(*role));
+        ItemEvent::Message {
+            event: MessageItemEvent::Delta(text),
+        } => Some(text.as_str()),
+        ItemEvent::Completed(ItemCompletion::AgentMessage(completion)) => {
+            Some(completion.text.as_str())
         }
-        _ => {}
-    }
+        ItemEvent::Started(_) | ItemEvent::Tool { .. } | ItemEvent::Completed(_) => None,
+    };
     matches!(
-        classification.get(address),
+        classification.get(item_id),
         Some(
             MessageClassification::Unclassified
-                | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+                | MessageClassification::Known(
+                    AgentMessageRole::Commentary | AgentMessageRole::Response
+                )
         )
-    ) && update.text().is_some_and(|text| !text.trim().is_empty())
+    ) && text.is_some_and(|text| !text.trim().is_empty())
 }
 
 #[tokio::test]
@@ -147,7 +162,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     assert!(skill_list.iter().all(|skill| skill.path.is_some()));
 
     provider
-        .session_open(super::prompt_request(&catalog_request))
+        .thread_open(super::prompt_request(&catalog_request))
         .await
         .unwrap();
     let new_session_catalog_request = catalog_request;
@@ -181,7 +196,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     );
     let fork = provider
         .as_provider()
-        .session_fork(ProviderForkRequest {
+        .thread_fork(ProviderForkRequest {
             source: request(repository.path(), PromptMode::Chat, ""),
             target_harness_session_id: "prepared-fork-session".into(),
             checkpoint_id: None,
@@ -253,6 +268,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                 }
                 event = answer_event_stream.recv() => {
                     let event = event.expect("event delivery failed").expect("Codex closed the event stream before completion");
+                    let Some(event) = super::event_observation(event) else { continue; };
                     if observe_assistant_text(&event, &mut answer_classification) {
                         answer_events.push(event);
                         break;
@@ -271,7 +287,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                 output = &mut answer_future => break output.unwrap(),
                 event = answer_event_stream.recv(), if stream_open => {
                     if let Some(event) = event.expect("event delivery failed") {
-                        answer_events.push(event);
+                        if let Some(event) = super::event_observation(event) { answer_events.push(event); }
                     } else {
                         stream_open = false;
                     }
@@ -285,7 +301,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .try_next()
         .expect("final event delivery failed")
     {
-        answer_events.push(event);
+        if let Some(event) = super::event_observation(event) {
+            answer_events.push(event);
+        }
     }
     answer_classification.clear();
     assert!(
@@ -303,9 +321,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     );
     assert!(
         answer_events
-            .iter()
-            .any(|event| matches!(event, ProviderEvent::Usage { update, .. }
-            if update.usage.output.is_some_and(|output| output > 0))),
+            .iter().filter_map(super::native_event)
+            .any(|event| matches!(event, ProviderEvent::Turn { event: TurnEvent::Usage(update), .. }
+            if update.usage().as_ref().and_then(|usage| usage.output).is_some_and(|output| output > 0))),
         "Codex should report final turn token usage"
     );
     let model_list = provider
@@ -338,7 +356,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         tokio::time::sleep(Duration::from_millis(50)).await;
         provider
             .steer_current(
-                forge_harness::provider::ExecutionOwner::root("harness-session"),
+                forge_harness::provider::ThreadOwner::root("harness-session"),
                 "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
                     .into(),
             )
@@ -378,7 +396,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
                 output = &mut execution => break output.unwrap(),
                 event = event_stream.recv(), if stream_open => {
                     if let Some(event) = event.expect("execution event delivery failed") {
-                        streamed_event_list.push(event);
+                        if let Some(event) = super::event_observation(event) { streamed_event_list.push(event); }
                     } else {
                         stream_open = false;
                     }
@@ -389,36 +407,47 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             .try_next()
             .expect("final execution event delivery failed")
         {
-            streamed_event_list.push(event);
+            if let Some(event) = super::event_observation(event) { streamed_event_list.push(event); }
         }
         (executed, streamed_event_list)
     })
     .await
     .expect("Codex execution prompt timed out after provider-side completion");
     assert!(!streamed_event_list.is_empty());
-    let mut tool_kind = HashMap::new();
+    let mut file_changes = std::collections::HashSet::new();
     let mut tool_change = HashMap::new();
     let mut tool_outcome = HashMap::new();
-    for event in &streamed_event_list {
-        if let ProviderEvent::Tool { address, update } = event {
-            match update {
-                ToolUpdate::Requested { invocation } => {
-                    tool_kind.insert(address.clone(), invocation.kind);
+    for event in streamed_event_list.iter().filter_map(super::native_event) {
+        if let ProviderEvent::Item { item_id, event, .. } = event {
+            match event {
+                ItemEvent::Started(ItemStart::FileChange(_)) => {
+                    file_changes.insert(item_id.clone());
                 }
-                ToolUpdate::Changes { changes } => {
-                    tool_change.insert(address.clone(), changes);
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Changes(changes),
+                } => {
+                    tool_change.insert(item_id.clone(), changes);
                 }
-                ToolUpdate::Finished { outcome } => {
-                    tool_outcome.insert(address.clone(), outcome);
+                ItemEvent::Completed(
+                    ItemCompletion::CommandExecution(completion)
+                    | ItemCompletion::FileChange(completion)
+                    | ItemCompletion::ToolCall(completion),
+                ) => {
+                    tool_outcome.insert(item_id.clone(), &completion.outcome);
+                    if !completion.changes.is_empty() {
+                        tool_change.insert(item_id.clone(), &completion.changes);
+                    }
                 }
-                _ => {}
+                ItemEvent::Started(_)
+                | ItemEvent::Message { .. }
+                | ItemEvent::Tool { .. }
+                | ItemEvent::Completed(_) => {}
             }
         }
     }
     assert!(
-        tool_kind.iter().any(|(address, kind)| {
-            *kind == ToolActivityKind::FileChange
-                && matches!(tool_outcome.get(address), Some(ToolOutcome::Succeeded))
+        file_changes.iter().any(|address| {
+            matches!(tool_outcome.get(address), Some(ToolOutcome::Succeeded))
                 && tool_change.get(address).is_some_and(|changes| {
                     changes.file.iter().any(|change| {
                         change.path.replace('\\', "/") == "harness-integration.txt"
@@ -440,7 +469,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     execute.provider_session_id = executed.native.provider_session_id;
     let forked = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.as_provider().session_fork(ProviderForkRequest {
+        provider.as_provider().thread_fork(ProviderForkRequest {
             source: execute,
             target_harness_session_id: "forked-harness-session".into(),
             checkpoint_id: None,
@@ -478,23 +507,27 @@ async fn streams_structured_child_agent_lifecycle() {
     .await
     .expect("Codex subagent turn exceeded 90 seconds")
     .unwrap();
+    let native_events = output
+        .event
+        .iter()
+        .filter_map(super::native_event)
+        .collect::<Vec<_>>();
     assert!(
-        output.event.iter().any(|event| matches!(
+        native_events.iter().any(|event| matches!(
             event,
             ProviderEvent::Agent {
-                update: AgentUpdate::Lifecycle { .. },
+                event: AgentEvent::Lifecycle { .. },
                 ..
             }
         )),
         "Codex did not emit a structured child lifecycle event: {:#?}",
         output.event
     );
-    let lifecycle_list = output
-        .event
+    let lifecycle_list = native_events
         .iter()
         .filter_map(|event| match event {
             ProviderEvent::Agent {
-                update: AgentUpdate::Lifecycle { event },
+                event: AgentEvent::Lifecycle { event },
                 ..
             } => Some(event),
             _ => None,
@@ -503,10 +536,12 @@ async fn streams_structured_child_agent_lifecycle() {
     let child_thread_list = lifecycle_list
         .iter()
         .filter_map(|lifecycle| {
-            lifecycle
-                .conversation_id
-                .as_ref()
-                .map(forge_provider_api::ProviderSessionId::as_str)
+            let agent = match lifecycle {
+                AgentLifecycleEvent::Started { agent, .. }
+                | AgentLifecycleEvent::Updated { agent, .. }
+                | AgentLifecycleEvent::Finished { agent, .. } => agent,
+            };
+            agent.thread_id.as_ref()
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
@@ -515,51 +550,56 @@ async fn streams_structured_child_agent_lifecycle() {
         "one requested child must not manufacture extra provider identities: {lifecycle_list:#?}"
     );
     let child_thread_id = child_thread_list.into_iter().next().unwrap();
-    let child_completion_index = output
-        .event
+    let child_completion_index = native_events
         .iter()
         .position(|event| {
             matches!(event, ProviderEvent::Turn {
-            address, update: TurnUpdate::Finished { .. },
-        } if address.thread_id == child_thread_id)
+            thread_id, event: TurnEvent::Completed(_), ..
+        } if thread_id == child_thread_id)
         })
         .expect("the explorer must emit a terminal turn event for its provider identity");
-    let parent_thread_id = output
-        .completion
-        .provider_session_id
-        .as_ref()
-        .map(|id| id.as_str())
-        .expect("the parent turn must preserve its provider thread identity");
+    assert!(
+        output.completion.provider_session_id.is_some(),
+        "parent durable identity is absent"
+    );
+    let parent_thread_id = native_events
+        .iter()
+        .find_map(|event| match event {
+            ProviderEvent::Turn {
+                thread_id,
+                event: TurnEvent::Started(_),
+                ..
+            } if thread_id != child_thread_id => Some(thread_id),
+            _ => None,
+        })
+        .expect("parent host conversation identity is absent");
     let mut message_classification = HashMap::new();
     for event in &output.event {
         observe_assistant_text(event, &mut message_classification);
     }
-    let parent_response_index = output
-        .event
-        .iter()
+    let parent_response_index = native_events.iter()
         .enumerate()
         .skip(child_completion_index + 1)
         .find_map(|(index, event)| {
-            matches!(event, ProviderEvent::Message {
-                address, update: MessageUpdate::Completed { text },
-            } if address.turn.thread_id == parent_thread_id
-                && message_classification.get(address).is_some_and(|classification| matches!(
+            matches!(event, ProviderEvent::Item {
+                thread_id, item_id, event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), ..
+            } if thread_id == parent_thread_id
+                && message_classification.get(item_id).is_some_and(|classification| matches!(
                     classification, MessageClassification::Unclassified
-                        | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+                        | MessageClassification::Known(AgentMessageRole::Commentary | AgentMessageRole::Response)
                 ))
-                && text.contains("Child lifecycle"))
+                && completion.text.contains("Child lifecycle"))
             .then_some(index)
         })
         .expect("the parent must synthesize the child result after the child completes");
-    let parent_completion_index = output
-        .event
+    let parent_completion_index = native_events
         .iter()
         .enumerate()
         .skip(parent_response_index + 1)
         .find_map(|(index, event)| {
             matches!(event, ProviderEvent::Turn {
-                address, update: TurnUpdate::Finished { .. },
-            } if address.thread_id == parent_thread_id)
+                thread_id, event: TurnEvent::Completed(_), ..
+            } if thread_id == parent_thread_id)
             .then_some(index)
         })
         .expect("the parent turn must complete after reporting the child result");

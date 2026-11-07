@@ -152,6 +152,10 @@ pub(crate) enum RollbackFailure {
     PreparationFailed,
     #[error("restoration did not complete; inspect retained recovery status")]
     RecoveryRequired,
+    /// Retains the restore worker's cause, which is otherwise invisible because a
+    /// failed apply leaves only the journal state behind.
+    #[error("restoration did not complete ({cause}); inspect retained recovery status")]
+    RestoreIncomplete { cause: String },
 }
 impl RollbackFailure {
     /// Get a stable transport failure code.
@@ -161,7 +165,7 @@ impl RollbackFailure {
             Self::JournalMissing => "restore_journal_missing",
             Self::AuthorityUnavailable => "rollback_authority_unavailable",
             Self::PreparationFailed => "rollback_preparation_failed",
-            Self::RecoveryRequired => "restore_recovery_required",
+            Self::RecoveryRequired | Self::RestoreIncomplete { .. } => "restore_recovery_required",
         }
     }
 }

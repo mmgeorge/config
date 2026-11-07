@@ -208,6 +208,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
                 approval_mode: crate::session::ApprovalMode::Ask,
                 provider_session_id: None,
                 submission: None,
+                acknowledged_child_reports: Vec::new(),
                 recovered_input: Vec::new(),
                 control_context: None,
             };
@@ -270,7 +271,7 @@ fn queue_commit_failure_does_not_publish_candidate_state() -> Result<()> {
     let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
     queue.apply(queued_operation("first"))?;
     let before = serde_json::to_value(queue.snapshot()?)?;
-    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
     database.execute_batch("CREATE TRIGGER reject_queue_write BEFORE UPDATE ON input_session BEGIN SELECT RAISE(ABORT, 'fixture disk failure'); END;")?;
     assert!(queue.apply(queued_operation("second")).is_err());
     assert_eq!(serde_json::to_value(queue.snapshot()?)?, before);
@@ -311,7 +312,7 @@ fn queue_reopen_rejects_corrupt_snapshot() -> Result<()> {
     let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
     queue.apply(queued_operation("message"))?;
     drop(queue);
-    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
     database.execute("UPDATE input_session SET payload='{}'", [])?;
     assert!(SessionInputQueue::open(root.path(), "session", &submissions).is_err());
     Ok(())
@@ -391,6 +392,7 @@ fn reconciled_retry_commits_one_revision_and_preserves_receipt_identity() -> Res
         approval_mode: crate::session::ApprovalMode::Ask,
         provider_session_id: None,
         submission: None,
+        acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
     };

@@ -57,7 +57,13 @@ impl NativeCallbackRouter for Callbacks {
     }
 
     /// Leave invocation registration to the test's fixed outer call identity.
-    async fn bind_native_call(&self, _: &str, _: &forge_provider_api::InvocationScope) {}
+    async fn bind_native_call(
+        &self,
+        _: &str,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
 
     /// Leave invocation retirement to the test's fixed outer call identity.
     async fn release_native_call(&self, _: &str) {}
@@ -242,7 +248,7 @@ impl Fixture {
             release_permission: watch::channel(false).0,
         });
         let router: Arc<dyn NativeCallbackRouter> = callbacks.clone();
-        let owner = ExecutionOwner::root("shell-fixture");
+        let owner = ThreadOwner::root("shell-fixture");
         let (sink, events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("shell-fixture").unwrap(),
             forge_provider_api::EventScope::Binding {

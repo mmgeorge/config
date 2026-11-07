@@ -4,42 +4,6 @@ use forge_provider_api::trace::ProviderTrace;
 use github_copilot_sdk::SessionEvent;
 use github_copilot_sdk::subscription::RecvErrorKind;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Identify the bounded native handoff that first could not retain an observation.
-pub(crate) enum IntakeQueueStage {
-    Subscription,
-    Unbound,
-    Attachment,
-    Foreground,
-    Release,
-}
-
-/// Retain diagnostic ownership independently of foreground decoder locks.
-#[derive(Clone)]
-pub(crate) struct QueueDiagnostics {
-    reported: Arc<AtomicBool>,
-}
-
-impl QueueDiagnostics {
-    /// Record one bounded first-loss witness without entering an ordinary observation queue.
-    pub(crate) fn lost(
-        &self,
-        _stage: IntakeQueueStage,
-        _queued: usize,
-        _capacity: usize,
-        _scope: Option<&forge_provider_api::InvocationScope>,
-        _event: Option<&SessionEvent>,
-    ) {
-        self.reported.store(true, Ordering::Release);
-    }
-
-    /// Retain the SDK's public skipped-event count without inventing its private ring capacity.
-    fn subscription_lagged(&self, skipped: u64) {
-        let _ = skipped;
-        self.reported.store(true, Ordering::Release);
-    }
-}
 
 /// Distinguish pending initialization from its established native outcome.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -59,13 +23,53 @@ pub(crate) enum StartupOutcome {
     Failed,
 }
 
+/// Retain first receipt times independently of delayed decoding and send acknowledgements.
+#[derive(Clone, Default)]
+pub(crate) struct ObservationTimes {
+    times: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+}
+impl ObservationTimes {
+    /// Freeze the first SDK receipt time for this native event identity.
+    fn record(&self, event: &SessionEvent) {
+        self.times
+            .lock()
+            .expect("native observation clock is not poisoned")
+            .entry(event.id.clone())
+            .or_insert_with(super::decode::timestamp_ms);
+    }
+    /// Get the original native receipt time without charging later queue or decoder waits.
+    pub(crate) fn observed_at(&self, event: &SessionEvent) -> i64 {
+        self.record(event);
+        self.times
+            .lock()
+            .expect("native observation clock is not poisoned")[&event.id]
+    }
+}
+
+/// Preserve native order without imposing an adapter-local event-count limit.
+enum NativeReceiver {
+    Live(tokio::sync::mpsc::UnboundedReceiver<SessionEvent>),
+    #[cfg(test)]
+    Fixture(tokio::sync::mpsc::Receiver<SessionEvent>),
+}
+impl NativeReceiver {
+    /// Drain the retained native queue before observing its producer's failure.
+    async fn recv(&mut self) -> Option<SessionEvent> {
+        match self {
+            Self::Live(receiver) => receiver.recv().await,
+            #[cfg(test)]
+            Self::Fixture(receiver) => receiver.recv().await,
+        }
+    }
+}
+
 /// Drains SDK notifications without owning the session or blocking on presentation.
 pub struct SessionEventStream {
-    receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
+    receiver: NativeReceiver,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     session_id: String,
     startup: Option<tokio::sync::watch::Sender<StartupState>>,
-    diagnostics: QueueDiagnostics,
+    observation_times: ObservationTimes,
 }
 
 impl SessionEventStream {
@@ -97,13 +101,11 @@ impl SessionEventStream {
         initial: StartupState,
         generation: super::client_generation::ClientGeneration,
     ) -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (startup, mut startup_state) = tokio::sync::watch::channel(initial);
         let stream_session_id = session_id.clone();
-        let diagnostics = QueueDiagnostics {
-            reported: Arc::new(AtomicBool::new(false)),
-        };
-        let queue_diagnostics = diagnostics.clone();
+        let observation_times = ObservationTimes::default();
+        let observations = observation_times.clone();
         let task = tokio::spawn(async move {
             let result: std::result::Result<(), ObservationFailure> = async {
                 loop {
@@ -123,8 +125,7 @@ impl SessionEventStream {
                                 }
                             }
                             let failure = match error.kind() {
-                                RecvErrorKind::Lagged(lagged) => {
-                                    queue_diagnostics.subscription_lagged(lagged.skipped());
+                                RecvErrorKind::Lagged(_) => {
                                     forge_provider_api::lifecycle::ObservationFailure::Overflow
                                 }
                                 RecvErrorKind::Closed => {
@@ -135,21 +136,9 @@ impl SessionEventStream {
                             return Err(failure);
                         }
                     };
-                    if accepts(&event) {
-                        match sender.try_send(event) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                                queue_diagnostics.lost(
-                                    IntakeQueueStage::Subscription,
-                                    sender.max_capacity(),
-                                    sender.max_capacity(),
-                                    None,
-                                    Some(&event),
-                                );
-                                return Err(ObservationFailure::Overflow);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                        }
+                    observations.record(&event);
+                    if accepts(&event) && sender.send(event).is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -160,11 +149,11 @@ impl SessionEventStream {
             })
         });
         Self {
-            receiver,
+            receiver: NativeReceiver::Live(receiver),
             task: Some(task),
             session_id: stream_session_id,
             startup: (initial == StartupState::Pending).then_some(startup),
-            diagnostics,
+            observation_times,
         }
     }
 
@@ -174,19 +163,17 @@ impl SessionEventStream {
         task: tokio::task::JoinHandle<Result<()>>,
     ) -> Self {
         Self {
-            receiver,
+            receiver: NativeReceiver::Fixture(receiver),
             task: Some(task),
             session_id: "fixture".into(),
             startup: None,
-            diagnostics: QueueDiagnostics {
-                reported: Arc::new(AtomicBool::new(false)),
-            },
+            observation_times: ObservationTimes::default(),
         }
     }
 
-    /// Share first-loss diagnostics with handoffs below this subscription reader.
-    pub(crate) fn queue_diagnostics(&self) -> QueueDiagnostics {
-        self.diagnostics.clone()
+    /// Share immutable native receipt times with retained foreground and background decoders.
+    pub(crate) fn observation_times(&self) -> ObservationTimes {
+        self.observation_times.clone()
     }
 
     /// Resolve whether closure during session initialization was expected.
@@ -224,6 +211,7 @@ impl SessionEventStream {
     /// Receive retained notifications in SDK order without doing work on the intake task.
     pub async fn recv(&mut self) -> Result<SessionEvent> {
         if let Some(event) = self.receiver.recv().await {
+            self.observation_times.record(&event);
             return Ok(event);
         }
         let result = self

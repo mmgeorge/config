@@ -57,8 +57,7 @@ impl HarnessBroker {
             self.session.context_window = None;
         }
         self.session.model = selected.model.context("Ask model is unresolved")?;
-        self.session.resolved_model =
-            (self.session.model != "default").then(|| self.session.model.clone());
+        self.session.resolved_model = None;
         self.session.effort = selected.effort.unwrap_or_else(|| "default".into());
         self.session.service_tier = selected.service_tier.unwrap_or_default();
         self.session.access.write_access = crate::session::WriteScope::Off;

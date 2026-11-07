@@ -1,253 +1,223 @@
-use crate::approval;
-use crate::checklist::ProviderChecklistUpdate;
-use crate::compaction::Compaction;
-use crate::context::ContextUsage;
-use crate::message::MessageUpdate;
-use crate::tool::{TextUpdate, ToolUpdate};
+//! Typed observations from one ordered native provider connection.
 use crate::*;
 use serde::{Deserialize, Serialize};
 
-/// Bind every normalized observation to the live session generation that produced it.
+/// Bind a normalized observation to its original connection and stream position.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BoundProviderEvent {
-    /// Identify the exact live provider binding; retired bindings cannot update replacements.
-    pub binding_id: crate::session::BindingId,
-    /// Identify the final normalized event position represented by this envelope.
-    pub sequence: crate::EventSequence,
-    /// Carry the provider-neutral observation.
+    pub binding_id: BindingId,
+    pub sequence: EventSequence,
     pub event: ProviderEvent,
 }
 
+/// Carry notifications whose ownership is resolved by the binding registry.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderEvent {
-    /// Prove all native foreground resources have been collected for one invocation.
-    Settled {
-        settlement: Box<crate::InvocationSettlement>,
+    Provider {
+        event: ProviderConnectionEvent,
     },
-    /// Publish scoped collection failure while the adapter retains unfinished resource ownership.
-    SettlementFailed {
-        scope: InvocationScope,
-        failure: crate::ProviderFailure,
-    },
-    /// Publish effective support on the same ordered stream used for dependent admissions.
-    CapabilitiesChanged {
-        scope: EventScope,
-        capabilities: crate::capability::CapabilityManifest,
-    },
-    /// Publish a late-resolved durable history identity independently of display-only runtime text.
-    SessionIdentity {
-        scope: EventScope,
-        provider_session_id: crate::ProviderSessionId,
-    },
-    /// Publish the complete adapter-normalized inventory when native terminal state changes.
-    Terminals {
-        scope: EventScope,
-        snapshot: crate::terminal::TerminalSnapshot,
-    },
-    /// Carry validated execution lifecycle evidence independently of RPC completion.
-    Execution {
-        observation: crate::lifecycle::ExecutionObservation,
-    },
-    Message {
-        address: MessageAddress,
-        update: MessageUpdate,
-    },
-    Tool {
-        address: ToolAddress,
-        update: ToolUpdate,
+    Thread {
+        thread_id: ThreadId,
+        event: ThreadEvent,
     },
     Turn {
-        address: TurnAddress,
-        update: TurnUpdate,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        event: TurnEvent,
     },
-    Usage {
-        address: TurnAddress,
-        update: usage::UsageUpdate,
-    },
-    Runtime {
-        scope: InvocationScope,
-        update: RuntimeUpdate,
-    },
-    Compaction {
-        scope: EventScope,
-        update: Box<Compaction>,
+    Item {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+        event: crate::message::ItemEvent,
     },
     Agent {
-        scope: InvocationScope,
-        update: AgentUpdate,
-    },
-    Checklist {
-        address: TurnAddress,
-        update: ProviderChecklistUpdate,
-    },
-    Approval {
-        scope: InvocationScope,
-        update: ApprovalUpdate,
-    },
-    DirectoryAccess {
-        scope: InvocationScope,
-        grant: Vec<crate::access::DirectoryGrant>,
-    },
-    InputAccepted {
-        scope: InvocationScope,
-        acknowledgement: InputAcknowledgement,
-    },
-    Retry {
-        scope: InvocationScope,
-        update: Option<retry::ProviderRetry>,
-    },
-    Diagnostic {
-        scope: EventScope,
-        diagnostic: ProviderDiagnostic,
-    },
-    ParentBoundary {
-        scope: InvocationScope,
-        update: ParentBoundaryUpdate,
+        agent_id: AgentId,
+        event: crate::agent::AgentEvent,
     },
 }
 
+/// Report effective connection support and availability.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ProviderConnectionEvent {
+    CapabilitiesChanged(crate::capability::CapabilityManifest),
+    Warning(ProviderWarning),
+    Unavailable(ProviderUnavailable),
+}
+
+/// Observe thread metadata independently of response-cycle completion.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ThreadEvent {
+    Error { error: ProviderFailure },
+    IdentityResolved(ProviderSessionId),
+    ContextUsage(crate::context::ContextUsage),
+    TerminalsUpdated(Result<crate::terminal::TerminalSnapshot, ProviderFailure>),
+    CompactionUpdated(Box<crate::compaction::Compaction>),
+}
+
+/// Permit native activity without completion or host-policy publication authority.
+#[derive(Clone, Debug)]
+pub enum AdapterActivity {
+    Thread {
+        thread_id: ThreadId,
+        event: ThreadEvent,
+    },
+    Turn {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        event: TurnMetadataEvent,
+    },
+    Item {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+        event: crate::message::ItemEvent,
+    },
+    Agent {
+        agent_id: AgentId,
+        event: crate::agent::AgentEvent,
+    },
+    Warning(ProviderWarning),
+}
+
+/// Permit turn metadata while reserving start and completion for the retained runner.
+#[derive(Clone, Debug)]
+pub enum TurnMetadataEvent {
+    Error { error: ProviderFailure },
+    ModelResolved(crate::model::ResolvedModel),
+    Usage(TurnUsageReport),
+    ChecklistUpdated(ProviderChecklistUpdate),
+}
+
+impl From<AdapterActivity> for ProviderEvent {
+    /// Normalize the closed activity vocabulary without creating lifecycle authority.
+    fn from(activity: AdapterActivity) -> Self {
+        match activity {
+            AdapterActivity::Thread { thread_id, event } => Self::Thread { thread_id, event },
+            AdapterActivity::Turn {
+                thread_id,
+                turn_id,
+                event,
+            } => Self::Turn {
+                thread_id,
+                turn_id,
+                event: match event {
+                    TurnMetadataEvent::Error { error } => TurnEvent::Error { error },
+                    TurnMetadataEvent::ModelResolved(model) => TurnEvent::ModelResolved(model),
+                    TurnMetadataEvent::Usage(usage) => TurnEvent::Usage(usage),
+                    TurnMetadataEvent::ChecklistUpdated(checklist) => {
+                        TurnEvent::ChecklistUpdated(checklist)
+                    }
+                },
+            },
+            AdapterActivity::Item {
+                thread_id,
+                turn_id,
+                item_id,
+                event,
+            } => Self::Item {
+                thread_id,
+                turn_id,
+                item_id,
+                event,
+            },
+            AdapterActivity::Agent { agent_id, event } => Self::Agent { agent_id, event },
+            AdapterActivity::Warning(warning) => Self::Provider {
+                event: ProviderConnectionEvent::Warning(warning),
+            },
+        }
+    }
+}
+
+/// Identify the exact object affected by a recoverable warning.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RuntimeUpdate {
-    Resolved { runtime: ProviderRuntime },
-    ContextUsage { usage: ContextUsage },
-    Progress { received_bytes: u64 },
-    ForegroundIdle,
+pub enum WarningScope {
+    Provider,
+    Thread {
+        thread_id: ThreadId,
+    },
+    Turn {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
+    Item {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    },
+    Agent {
+        agent_id: AgentId,
+    },
+    Operation {
+        operation_id: OperationId,
+    },
 }
 
+/// Classify recoverable native limitations without implying turn failure.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentUpdate {
-    Lifecycle {
-        event: crate::agent::AgentLifecycleEvent,
-    },
-    ConversationResolved {
-        thread_id: String,
-    },
+pub enum ProviderWarningKind {
+    /// Preserve a message whose native phase cannot be mapped to a known display role.
+    UnsupportedMessageClassification,
+    /// Some optional tool description is missing, but required execution evidence remains valid.
+    IncompleteToolMetadata,
+    /// Some reported diff metadata is unavailable without implying that no file changed.
+    IncompleteFileChangeMetadata,
+    /// Optional compaction summary or metrics are missing while its known state remains visible.
+    IncompleteCompactionMetadata,
+    /// Report a classified native notice that does not itself establish turn failure.
+    NativeNotice { category: ProviderFailureKind },
+    /// A native notification outside the adapter's mapping was observed and not applied.
+    UnsupportedNativeEvent,
 }
 
+/// Explain a nonfatal limitation at its original scope.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
-pub enum ApprovalUpdate {
-    Requested(approval::ApprovalRequestView),
-    Resolved(approval::ApprovalRequestView),
-    Cancelled(approval::ApprovalRequestView),
+pub struct ProviderWarning {
+    pub scope: WarningScope,
+    pub kind: ProviderWarningKind,
+    pub message: SanitizedMessage,
 }
 
+/// Fence an unusable connection without manufacturing a completed turn.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InputAcknowledgement {
-    Steering {
-        input_id: Option<String>,
-        text: String,
-    },
-    TaskStarted {
-        input_id: Option<String>,
-        start: crate::input::TaskStart,
-        prompt: String,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderDiagnostic {
-    /// Carry only a normalized failure category.
-    pub kind: crate::error::ProviderFailureKind,
-    /// Preserve user-actionable text after native details have been removed.
-    pub message: crate::diagnostic::SanitizedMessage,
-    pub fatal: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ParentBoundaryUpdate {
-    WaitStarted { agent_count: usize },
-    WaitUpdated { agent_count: usize },
-    WaitFinished,
+pub struct ProviderUnavailable {
+    pub failure: ProviderFailure,
+    pub message: SanitizedMessage,
 }
 
 impl ProviderEvent {
-    pub fn scope(&self) -> EventScope {
-        match self {
-            Self::Settled { settlement } => settlement.scope.clone().into(),
-            Self::SettlementFailed { scope, .. } => scope.clone().into(),
-            Self::CapabilitiesChanged { scope, .. }
-            | Self::SessionIdentity { scope, .. }
-            | Self::Terminals { scope, .. } => scope.clone(),
-            Self::Execution { observation } => observation.scope().clone().into(),
-            Self::Message { address, .. } => address.turn.scope.clone().into(),
-            Self::Tool { address, .. } => address.turn.scope.clone().into(),
-            Self::Turn { address, .. }
-            | Self::Usage { address, .. }
-            | Self::Checklist { address, .. } => address.scope.clone().into(),
-            Self::Compaction { scope, .. } | Self::Diagnostic { scope, .. } => scope.clone(),
-            Self::Runtime { scope, .. }
-            | Self::Agent { scope, .. }
-            | Self::Approval { scope, .. }
-            | Self::DirectoryAccess { scope, .. }
-            | Self::InputAccepted { scope, .. }
-            | Self::Retry { scope, .. }
-            | Self::ParentBoundary { scope, .. } => scope.clone().into(),
-        }
-    }
-
-    pub fn turn_address(&self) -> Option<&TurnAddress> {
-        match self {
-            Self::Message { address, .. } => Some(&address.turn),
-            Self::Tool { address, .. } => Some(&address.turn),
-            Self::Turn { address, .. }
-            | Self::Usage { address, .. }
-            | Self::Checklist { address, .. } => Some(address),
-            _ => None,
-        }
-    }
-
-    pub fn message_delta(&self) -> Option<&str> {
-        match self {
-            Self::Message {
-                update: MessageUpdate::Delta { text },
-                ..
-            } => Some(text),
-            _ => None,
-        }
-    }
-
-    pub fn tool_output_delta(&self) -> Option<&str> {
-        match self {
-            Self::Tool {
-                update:
-                    ToolUpdate::Output {
-                        update: TextUpdate::Append(text),
-                    },
-                ..
-            } => Some(text),
-            _ => None,
-        }
-    }
-
+    /// Get a native timestamp when this observation carries one.
     pub fn observed_at_ms(&self, fallback: i64) -> i64 {
         match self {
             Self::Turn {
-                update: TurnUpdate::Started { started_at_ms },
+                event: TurnEvent::Started(started),
                 ..
-            } => *started_at_ms,
+            } => started.started_at_ms,
             Self::Turn {
-                update:
-                    TurnUpdate::CallFinished { completed_at_ms }
-                    | TurnUpdate::Finished {
-                        completed_at_ms, ..
-                    },
+                event: TurnEvent::Completed(completed),
                 ..
-            } => *completed_at_ms,
-            _ => fallback,
+            } => completed.result().completed_at_ms(),
+            Self::Turn {
+                event: TurnEvent::Usage(usage),
+                ..
+            } => *usage.observed_at_ms(),
+            Self::Provider { .. }
+            | Self::Thread { .. }
+            | Self::Turn { .. }
+            | Self::Item { .. }
+            | Self::Agent { .. } => fallback,
         }
     }
 }
 
-/// Represent the provider display label and resolved model shown by Harness.
+/// Represent the provider label and configured default displayed by the host.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderRuntime {
-    /// Display text only; use ProviderDescriptor.kind for machine identity.
     pub provider: String,
     pub model: Option<String>,
 }

@@ -11,6 +11,9 @@ local function reject(value)
 end
 
 local ok, failure = xpcall(function()
+  decode({ session_id = "session", event = "provider_event", payload = { kind = "approval_requested", data = {request_id = "approval", execution_kind = "managed"} } })
+  reject({ session_id = "session", event = "provider_event", payload = { kind = "approval_requested", data = {id = "obsolete"} } })
+
   for _, frame in ipairs({ protocol.encode_request(1, "host.shutdown"), protocol.encode_request(1, "host.shutdown", {}) }) do
     assert(frame:find('"params":{}', 1, true), "empty request parameters must encode as an object")
   end

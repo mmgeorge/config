@@ -93,6 +93,14 @@ impl TaskAuthority {
             .map(|permit| permit.or_else(|| self.permit.clone()))
     }
 
+    /// Capture the last owner-confirmed permit without following later parent advancement.
+    pub(crate) fn snapshot(&self) -> Result<Self> {
+        let mut snapshot = self.clone();
+        snapshot.permit = self.current_permit()?;
+        snapshot.progress = None;
+        Ok(snapshot)
+    }
+
     /// Adopt only a revision explicitly returned by this invocation's live owner commit.
     pub(crate) fn advance(&self, next: TaskPermit) -> Result<()> {
         let progress = self
@@ -176,14 +184,14 @@ impl TaskAuthority {
         // authority layer's own legacy validation failures cross its adapter.
         self.commit(|| Ok(commit())).map_err(|source| {
             crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 source,
             )
         })?
     }
 
-    /// Validate under the shared task gate and perform only a short synchronous commit.
-    pub(crate) fn commit<T>(&self, commit: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// Run a short synchronous section while the admitting task generation and permit remain current.
+    fn with_task_gate<T>(&self, section: impl FnOnce() -> Result<T>) -> Result<T> {
         let controller = self
             .controller
             .as_ref()
@@ -197,7 +205,21 @@ impl TaskAuthority {
             .map(|progress| progress.permit())
             .transpose()?
             .or_else(|| self.permit.clone());
-        controller.with_callback_authority(generation, permit.as_ref(), || {
+        controller.with_callback_authority(generation, permit.as_ref(), section)
+    }
+
+    /// Fence a new permission request by its task alone.
+    ///
+    /// The request is evaluated against the current permission policy, so a rule saved earlier
+    /// in the turn, such as an exact denial of another command, must not reject it. The captured
+    /// permission epoch still fences commits that relied on the earlier policy.
+    pub(crate) fn validate_task_for_new_request(&self) -> Result<()> {
+        self.with_task_gate(|| Ok(()))
+    }
+
+    /// Validate under the shared task gate and perform only a short synchronous commit.
+    pub(crate) fn commit<T>(&self, commit: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_task_gate(|| {
             if self.permission_required && self.permission_snapshot.is_none() {
                 anyhow::bail!("permission authority was not captured");
             }
@@ -227,6 +249,90 @@ impl TaskAuthority {
 mod test {
     use super::*;
     use crate::task::{Task, TaskChange};
+
+    /// Share the persisted baseline receipt across parent collection while retaining the child's original task fence.
+    #[tokio::test]
+    async fn child_checkpoint_survives_parent_collection_but_task_revocation_denies_mutation()
+    -> Result<()> {
+        let (directory, mut store, controller) = SessionTaskController::test_goal();
+        let parent_scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "exchange",
+        );
+        let child_scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::new(
+                "session".into(),
+                forge_provider_api::AgentId::new("native-child-owner")?,
+            )?,
+            "exchange",
+        );
+        let child_address = forge_provider_api::TurnAddress {
+            thread_id: child_scope.owner.thread_id(),
+            turn_id: child_scope.turn_id()?,
+            scope: child_scope.clone(),
+        };
+        let public_agent = forge_provider_api::AgentId::new("native-child")?;
+        let proof = crate::provider::test_support::observed_agent_fixture(
+            forge_provider_api::BindingId::new("binding")?,
+            parent_scope.clone(),
+            vec![(
+                public_agent.clone(),
+                forge_provider_api::agent::AgentDescription {
+                    parent_agent_id: Some(parent_scope.owner.agent_id().clone()),
+                    delegation: Some(forge_provider_api::agent::AgentDelegation {
+                        parent_thread_id: parent_scope.owner.thread_id(),
+                        parent_turn_id: parent_scope.turn_id()?,
+                        parent_item_id: None,
+                    }),
+                    thread_id: Some(child_address.thread_id.clone()),
+                    definition: None,
+                    nickname: None,
+                    task: None,
+                },
+                Some(child_address.clone()),
+            )],
+            public_agent,
+            Some(child_address.turn_id),
+        )?;
+        let checkpoint = crate::checkpoint::ToolGate::new();
+        checkpoint.complete(Ok(()));
+        let mut parent =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        parent.bind_test_task_controller(controller.clone());
+        parent.question_invocation = Some(parent_scope);
+        parent.checkpoint = Some(checkpoint.clone());
+        let (sink, _events) = crate::provider::events::channel(child_scope);
+        let child = parent.fork_observed(&proof, sink)?;
+        assert!(!Arc::ptr_eq(
+            &parent.provider_completion,
+            &child.provider_completion
+        ));
+        let authority = TaskAuthority::capture(&child).context("child task authority missing")?;
+        crate::tools::ControlToolExecutor::new(parent)
+            .finish()
+            .await;
+        checkpoint.complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
+        child.checkpoint.as_ref().unwrap().wait().await?;
+        let path = directory.path().join("child-write");
+        authority.commit(|| {
+            std::fs::write(&path, "committed child change")?;
+            Ok(())
+        })?;
+        let task = controller
+            .current()?
+            .context("task disappeared before revocation")?;
+        controller.change(&mut store, Some(&task.revision), TaskChange::Clear, 3)?;
+        assert!(
+            authority
+                .commit(|| {
+                    std::fs::write(&path, "revoked write")?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path)?, "committed child change");
+        Ok(())
+    }
 
     /// Only an owner-confirmed revision within the original observation fence reaches sibling callbacks.
     #[test]
@@ -260,7 +366,26 @@ mod test {
             context.current_task_permit()?.unwrap().revision(),
             &advanced.revision
         );
-        controller.change(&mut store, Some(&advanced.revision), TaskChange::Pause, 3)?;
+        let child = tools.snapshot()?;
+        controller.update(&mut store, &advanced.permit(), 3, |task| {
+            let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow else {
+                unreachable!()
+            };
+            goal.objective.push_str(" with later parent detail");
+            Ok(())
+        })?;
+        let latest = controller.current()?.unwrap();
+        tools.advance(latest.permit())?;
+        permissions.validate_scope()?;
+        assert_eq!(
+            child.current_permit()?.unwrap().revision(),
+            &advanced.revision
+        );
+        assert!(
+            child.validate_scope().is_err(),
+            "child policy followed later parent advancement"
+        );
+        controller.change(&mut store, Some(&latest.revision), TaskChange::Pause, 4)?;
         let paused = controller.current()?.unwrap();
         assert!(
             tools.advance(paused.permit()).is_err(),
@@ -314,7 +439,7 @@ mod test {
         };
         assert_eq!(
             failure.operation(),
-            forge_provider_api::error::ProviderOperation::InputSubmit
+            forge_provider_api::error::ProviderOperation::TurnStart
         );
         Ok(())
     }
@@ -480,7 +605,7 @@ mod test {
         ));
         let (sink, mut stream) =
             crate::provider::events::channel(crate::provider::InvocationScope::new(
-                crate::provider::ExecutionOwner::root("approval"),
+                crate::provider::ThreadOwner::root("approval"),
                 "exchange",
             ));
         let waiting_coordinator = coordinator.clone();
@@ -504,18 +629,24 @@ mod test {
                 .await
         });
         let event = stream.recv().await?.context("approval event missing")?;
-        let crate::provider::ProviderEvent::Approval {
-            update: crate::provider::ApprovalUpdate::Requested(view),
-            ..
-        } = event
+        let crate::provider::session_execution::OwnerObservation::Event(
+            crate::provider::HarnessEvent::Host {
+                event:
+                    crate::provider::HostEvent::PermissionApproval {
+                        execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                        event: crate::provider::PermissionApprovalEvent::Requested(view),
+                    },
+                ..
+            },
+        ) = event
         else {
             anyhow::bail!("expected approval request")
         };
         coordinator
             .resolve(
-                &view.id,
+                view.request_id.as_str(),
                 &[crate::provider::approval::ApprovalAnswer {
-                    item_id: view.item_list[0].id.clone(),
+                    item_id: view.targets[0].target_id.as_str().to_owned(),
                     choice_id: "allow_broad".into(),
                 }],
                 None,
@@ -545,6 +676,40 @@ mod test {
         )])?;
         let error = executor.execute(invocation()).await.unwrap_err();
         assert!(error.to_string().contains("permission authority changed"));
+        Ok(())
+    }
+
+    /// A saved denial fences commits under the captured policy but not new permission requests.
+    ///
+    /// Saving "always deny" for one command during a turn must not reject the turn's later,
+    /// unrelated permission requests, which the coordinator evaluates against the current policy.
+    #[test]
+    fn saved_denial_admits_new_permission_requests_but_fences_captured_commits() -> Result<()> {
+        use crate::permissions::document::PermissionDecision;
+        let (root, _store, controller) = SessionTaskController::test_goal();
+        let permissions = Arc::new(std::sync::RwLock::new(
+            crate::permissions::store::PermissionStore::load(
+                root.path().join("permissions.json"),
+                root.path(),
+            )?,
+        ));
+        let captured = {
+            let store = permissions.read().unwrap();
+            PermissionAuthoritySnapshot::capture(permissions.clone(), &store)
+        };
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller);
+        context.permission_snapshot = Some(captured);
+        context.permission_required = true;
+        let authority = TaskAuthority::capture(&context).unwrap();
+        permissions.write().unwrap().set_rule_list(&[(
+            "bash".into(),
+            "whoami".into(),
+            PermissionDecision::Deny,
+        )])?;
+        assert!(authority.validate_scope().is_err());
+        authority.validate_task_for_new_request()?;
         Ok(())
     }
 

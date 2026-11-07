@@ -237,6 +237,57 @@ pub struct IsolationMode {
     pub description: String,
 }
 
+/// Identify a model within the owning provider's catalog.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ModelId(String);
+
+impl ModelId {
+    /// Create an opaque model identity from observed native evidence.
+    pub fn new(value: impl Into<String>) -> Result<Self, crate::identity::IdentityError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(crate::identity::IdentityError);
+        }
+        Ok(Self(value))
+    }
+
+    /// Get the native model identifier for display or transport.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ModelId {
+    type Error = crate::identity::IdentityError;
+    /// Validate a serialized model identity.
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ModelId> for String {
+    /// Encode the model identity without inventing an alias.
+    fn from(value: ModelId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    /// Render the observed model identifier at a presentation boundary.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+/// Record a model positively confirmed for the addressed turn.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolvedModel {
+    /// Identify the actual native model, independently of requested defaults.
+    pub model_id: ModelId,
+    /// Preserve when native evidence confirmed this model.
+    pub observed_at_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

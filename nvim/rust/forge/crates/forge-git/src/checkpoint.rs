@@ -54,7 +54,7 @@ pub struct CheckpointSignature {
     index: Option<(u64, std::time::SystemTime)>,
     observation: Vec<crate::snapshot::WorktreeStamp>,
     paths: Vec<crate::snapshot::PathRecord>,
-    names: Vec<u8>,
+    listed: Vec<crate::RepositoryPath>,
     attributes: Vec<crate::snapshot::WorktreeStamp>,
     config: Vec<u8>,
     checkout: BTreeMap<String, [gix::attrs::State; 6]>,
@@ -136,21 +136,23 @@ pub fn signature(
         String::from_utf8_lossy(&names.stderr)
     );
     let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash())?;
+    let listed = names
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(crate::snapshot::directory_entry_path)
+        .collect::<Result<Vec<_>>>()?;
     let mut observation = Vec::with_capacity(paths.len());
     for path in &paths {
         check()?;
         observation.push(crate::snapshot::read_worktree_stamp(root, &path.path)?);
     }
     let mut attributes = Vec::new();
-    for name in names
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|name| *name == b".gitattributes" || name.ends_with(b"/.gitattributes"))
+    for name in listed
+        .iter()
+        .filter(|name| name.raw() == b".gitattributes" || name.raw().ends_with(b"/.gitattributes"))
     {
-        attributes.push(crate::snapshot::read_worktree_stamp(
-            root,
-            &crate::RepositoryPath::new(name.to_vec())?,
-        )?);
+        attributes.push(crate::snapshot::read_worktree_stamp(root, name)?);
     }
     let mut config = Vec::new();
     repository.config_snapshot().write_to(&mut config)?;
@@ -159,12 +161,7 @@ pub fn signature(
     config.extend(crate::content::conversion::read_info(&identity, check)?.unwrap_or_default());
     let checkout = checkout_attributes(
         root,
-        &names
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(path_key)
-            .collect(),
+        &listed.iter().map(|path| path_key(path.raw())).collect(),
         check,
     )?;
     let refreshed = gix::index::File::at_or_default(
@@ -183,7 +180,7 @@ pub fn signature(
         index,
         observation,
         paths,
-        names: names.stdout,
+        listed,
         attributes,
         config,
         checkout,
@@ -211,19 +208,12 @@ pub fn inventory(
         .keys()
         .chain(candidate.iter())
         .cloned()
-        .chain(
-            signature
-                .names
-                .split(|byte| *byte == 0)
-                .filter(|path| !path.is_empty())
-                .map(path_key),
-        )
+        .chain(signature.listed.iter().map(|path| path_key(path.raw())))
         .collect::<BTreeSet<_>>();
     let listed = signature
-        .names
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(path_key)
+        .listed
+        .iter()
+        .map(|path| path_key(path.raw()))
         .collect::<BTreeSet<_>>();
     let missing = paths.difference(&listed).cloned().collect::<BTreeSet<_>>();
     let additional = if missing.is_empty() {
@@ -652,7 +642,9 @@ pub fn path_bytes(key: &str) -> Result<Vec<u8>> {
     ensure!(encoded.len() % 2 == 0, "invalid encoded checkpoint path");
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
         .collect()
 }

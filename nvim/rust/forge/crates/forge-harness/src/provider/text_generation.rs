@@ -29,7 +29,7 @@ impl forge_provider_api::TextValidator for TextGeneration {
     ) -> std::result::Result<String, forge_provider_api::ProviderError> {
         TextGeneration::validate(*self, text).map_err(|_| {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         })
@@ -273,16 +273,17 @@ mod tests {
 
     #[test]
     fn history_keeps_visible_message_order_and_excludes_reasoning_and_reverted_work() {
+        let scope = crate::provider::InvocationScope {
+            owner: crate::provider::ThreadOwner::root("session"),
+            exchange_id: "exchange".into(),
+            invocation_id: "invocation".into(),
+        };
         let mut turn = crate::turn::Turn::new(
             "turn".into(),
             crate::provider::TurnAddress {
-                scope: crate::provider::InvocationScope {
-                    owner: crate::provider::ExecutionOwner::root("session"),
-                    exchange_id: "exchange".into(),
-                    invocation_id: "invocation".into(),
-                },
-                thread_id: "thread".into(),
-                turn_id: "provider-turn".into(),
+                thread_id: scope.owner.thread_id(),
+                turn_id: scope.turn_id().unwrap(),
+                scope,
             },
             1,
         );

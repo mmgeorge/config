@@ -196,18 +196,10 @@ impl HarnessBroker {
                 .task_controller
                 .current()?
                 .context("planning task disappeared")?;
-            let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else {
-                anyhow::bail!("planning continuation lost its task")
-            };
-            let document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan.artifact.id)?;
-            admission.planning = Some(foreground_dispatch::PlanningContext {
-                plan_id: plan.artifact.id.clone(),
-                permit: task.permit(),
-                before_version: document.version,
-                discussion: plan.artifact.state == PlanState::AwaitingReview,
-            });
+            admission.planning = Some(
+                self.planning_context(&task, mode)?
+                    .context("planning continuation lost its task")?,
+            );
         }
         let request = self.refresh_owned_continuation_request(
             previous,
@@ -266,21 +258,14 @@ impl HarnessBroker {
         let id = admission.request.id;
         let (response, events) = match result {
             Ok((value, events)) => (Response::success(id, value)?, events),
-            Err(error) => {
-                let code = if error.is::<RequestNotAdmitted>() {
-                    "not_admitted"
-                } else if error.is::<TurnCancelled>() {
-                    "turn_cancelled"
-                } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
-                    "tool_timeout"
-                } else {
-                    "request_failed"
-                };
-                (
-                    Response::failure(id, code, crate::storage::error_message(&error)),
-                    Vec::new(),
-                )
-            }
+            Err(error) => (
+                Response::failure(
+                    id,
+                    super::request_failure_code(&error),
+                    crate::storage::error_message(&error),
+                ),
+                Vec::new(),
+            ),
         };
         let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Effects(vec![
             submission_update,
@@ -315,12 +300,18 @@ impl HarnessBroker {
         else {
             anyhow::bail!("native completion has no running owner");
         };
+        if let Some(receipt) = &transaction.request.submission {
+            self.acknowledge_user_child_reports(&transaction.state.scope, receipt)?;
+        }
         if let Some(timeout) = transaction.native.watchdog.timeout()? {
             return self.handle_foreground_timeout(transaction, timeout);
         }
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
             ForegroundOutcome::NativeReady(Err(error)) if error.is_clean_cancellation() => {
+                if Self::cancellation_restores_prompt(transaction) {
+                    return self.settle_collected_cancellation(dispatch);
+                }
                 let submission = admission.take_submission()?;
                 let events = std::mem::take(&mut admission.events);
                 transaction.finalization =
@@ -381,7 +372,8 @@ impl HarnessBroker {
         }
         transaction.attached_results.clear();
         self.store.save_exchange(&transaction.state.interaction)?;
-        let decision = question_override.is_some()
+        let decision = self.requires_explicit_continuation(&transaction.state.interaction)?
+            || question_override.is_some()
             || output.plan_question.is_some()
             || output.question_withdrawal.is_some()
             || output.plan_submit.is_some()
@@ -422,16 +414,8 @@ impl HarnessBroker {
                     .is_some_and(|wait| wait.exchange_id == transaction.state.interaction.id)
             {
                 transaction.pending_native_ready = Some(Ok(output));
-                let interaction = &mut transaction.state.interaction;
-                interaction.observe_blocker("agent_wait".into(), false, self.clock.now_ms());
-                self.active_wait_projection = None;
-                if let Some(runtime) = transaction.state.runtime.as_mut() {
-                    runtime.active_wait = None;
-                }
-                self.store.save_exchange(interaction)?;
-                let patch = self.reconcile_live_interaction(Some(interaction), None)?;
-                let delivery =
-                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
+                let delivery = self
+                    .publish_child_wait(transaction, crate::provider::ChildWaitEvent::Finished)?;
                 return Ok(ForegroundAction::Effect(ForegroundJob::Publication(
                     delivery,
                 )));
@@ -490,29 +474,19 @@ impl HarnessBroker {
             }
             if unresolved {
                 transaction.pending_native_ready = Some(Ok(output));
-                let now_ms = self.clock.now_ms();
-                let interaction = &mut transaction.state.interaction;
+                let agent_count = self.agent_coordinator.active_count();
                 let prior = self
                     .active_wait_projection
                     .as_ref()
-                    .filter(|wait| wait.exchange_id == interaction.id);
-                if prior.is_some() {
-                    return Ok(ForegroundAction::Wait);
-                }
-                let started_at_ms = prior.map_or(now_ms, |wait| wait.started_at_ms);
-                interaction.observe_blocker("agent_wait".into(), true, now_ms);
-                self.active_wait_projection = Some(ActiveWait {
-                    exchange_id: interaction.id.clone(),
-                    started_at_ms,
-                    agent_count: self.agent_coordinator.active_count(),
-                });
-                if let Some(runtime) = transaction.state.runtime.as_mut() {
-                    runtime.active_wait = self.active_wait_projection.clone();
-                }
-                self.store.save_exchange(interaction)?;
-                let patch = self.reconcile_live_interaction(Some(interaction), None)?;
-                let delivery =
-                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
+                    .filter(|wait| wait.exchange_id == transaction.state.interaction.id);
+                let event = match prior {
+                    Some(wait) if wait.agent_count == agent_count => {
+                        return Ok(ForegroundAction::Wait);
+                    }
+                    Some(_) => crate::provider::ChildWaitEvent::Updated { agent_count },
+                    None => crate::provider::ChildWaitEvent::Started { agent_count },
+                };
+                let delivery = self.publish_child_wait(transaction, event)?;
                 return Ok(ForegroundAction::Effect(ForegroundJob::Publication(
                     delivery,
                 )));

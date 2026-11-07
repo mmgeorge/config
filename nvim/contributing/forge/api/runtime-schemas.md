@@ -1058,14 +1058,14 @@ pub struct McpDefinition {
 
 ## ApprovalRequestView
 
-Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
+Source: [approval_view.rs](../../../rust/forge/crates/forge-harness/src/provider/approval_view.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApprovalRequestView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_owner: Option<crate::provider::ExecutionOwner>,
+    pub execution_owner: Option<crate::provider::ThreadOwner>,
     pub exchange_id: Option<String>,
     pub turn_id: Option<String>,
     pub provider: String,
@@ -1082,7 +1082,7 @@ pub struct ApprovalRequestView {
 
 ## ApprovalAnswer
 
-Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
+Source: [approval_view.rs](../../../rust/forge/crates/forge-harness/src/provider/approval_view.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1095,7 +1095,7 @@ pub struct ApprovalAnswer {
 
 ## ApprovalChoice
 
-Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
+Source: [approval_view.rs](../../../rust/forge/crates/forge-harness/src/provider/approval_view.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1112,7 +1112,7 @@ pub struct ApprovalChoice {
 
 ## ApprovalItem
 
-Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
+Source: [approval_view.rs](../../../rust/forge/crates/forge-harness/src/provider/approval_view.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1129,7 +1129,7 @@ pub struct ApprovalItem {
 
 ## ApprovalResolution
 
-Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
+Source: [approval_view.rs](../../../rust/forge/crates/forge-harness/src/provider/approval_view.rs).
 
 ```rust
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

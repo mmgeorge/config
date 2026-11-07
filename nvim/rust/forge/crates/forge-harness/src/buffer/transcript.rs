@@ -73,7 +73,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         let rows = if expanded {
             let source = output.inline_chunk(chunk)?;
             let mut rows = if chunk == 0 {
-                output.header().map_or(Ok(Vec::new()), |header| {
+                output.header().map_or(Ok(Vec::new()), |(header, _)| {
                     tool_source_rows(self.profile, &header.kind, &header.title)
                 })?
             } else {
@@ -1221,24 +1221,19 @@ mod test {
             ),
             ("nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
         ] {
-            let heading = crate::turn::ToolCall {
-                command_shell: None,
-                id: "shell".into(),
-                kind: "command".into(),
-                title: source.into(),
-                output: Default::default(),
-                started_at_ms: Some(0),
-                completed_at_ms: Some(100),
-                checklist_item_id: None,
-                status: "completed".into(),
-                failed: false,
-                change: Default::default(),
-            };
+            let heading = crate::turn::ToolCall::projection(
+                "shell".into(),
+                "command".into(),
+                source.into(),
+                crate::turn::ToolState::Completed,
+                Some(0),
+                Some(100),
+            );
             let mut output = ToolOutputView::new(
                 crate::buffer::identity::DisplayId::test(),
                 "matching content\n",
             );
-            output.heading(&heading);
+            output.heading(&heading, crate::turn::ToolInstant::wall(100));
             let header = renderer.tool_header(
                 BlockId("shell".into()),
                 TargetId("shell".into()),
@@ -1261,7 +1256,7 @@ mod test {
             let rendered = body.text.wire_rows().join("\n");
             assert!(rendered.contains(&format!("Command: {source}")));
             assert!(rendered.contains("matching content"));
-            assert_eq!(output.header().unwrap().title, source);
+            assert_eq!(output.header().unwrap().0.title, source);
             header.validate()?;
             body.validate()?;
         }
@@ -1307,16 +1302,17 @@ mod test {
                 "fixture_command({})",
                 serde_json::json!({"command":command})
             );
-            let invocation = crate::provider::ToolInvocation {
+            let invocation = forge_provider_api::ToolDescriptor {
                 semantics: forge_provider_api::tool::ToolSemantics::Command {
                     text: command.into(),
                     shell: shell.map(str::to_owned),
                     directory: None,
                 },
-                kind: crate::provider::ToolActivityKind::Command,
                 name: "fixture_command".into(),
                 title: command.into(),
-                arguments: serde_json::json!({"command":command}),
+                arguments: forge_provider_api::InspectableArguments::new(
+                    serde_json::json!({"command":command}),
+                ),
             };
             let shell = match &invocation.semantics {
                 forge_provider_api::tool::ToolSemantics::Command { shell, .. } => shell.as_deref(),
@@ -1404,22 +1400,17 @@ mod test {
         let renderer = TranscriptRenderer::new(&profile)?;
         let source =
             r#"fixture.inspect({"path":"src/deeply/nested/module.rs","offset":123,"limit":456})"#;
-        let call = crate::turn::ToolCall {
-            command_shell: None,
-            id: "call".into(),
-            kind: "tool_call".into(),
-            title: source.into(),
-            output: Default::default(),
-            started_at_ms: Some(0),
-            completed_at_ms: Some(100),
-            checklist_item_id: None,
-            status: "completed".into(),
-            failed: false,
-            change: Default::default(),
-        };
+        let call = crate::turn::ToolCall::projection(
+            "call".into(),
+            "tool_call".into(),
+            source.into(),
+            crate::turn::ToolState::Completed,
+            Some(0),
+            Some(100),
+        );
         let mut output =
             ToolOutputView::new(crate::buffer::identity::DisplayId::test(), "tool result\n");
-        output.heading(&call);
+        output.heading(&call, crate::turn::ToolInstant::wall(100));
         let header = renderer.tool_header(
             BlockId("call".into()),
             TargetId("call".into()),

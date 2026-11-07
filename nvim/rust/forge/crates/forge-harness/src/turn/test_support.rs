@@ -1,120 +1,218 @@
 use super::*;
 use crate::{
     exchange::{Exchange, ExchangeNode},
-    provider::{
-        ExecutionOwner, InvocationScope, MessageAddress, MessageClassification, MessageId,
-        MessageRole, MessageUpdate, ProviderEvent, ToolInvocation, ToolUpdate, TurnAddress,
-    },
+    provider::{InvocationScope, ProviderEvent, ThreadOwner, TurnAddress},
 };
 use anyhow::Result;
+use forge_provider_api::{
+    AgentMessageRole, AgentMessageStart, ItemCompletion, ItemEvent, ItemId, ItemStart,
+    MessageClassification, ToolCompletion, ToolItemEvent,
+};
 use serde::{Deserialize, Serialize};
 
+/// Create a fixture address with distinct checked normalized identities.
 pub(crate) fn address(exchange: &Exchange, turn_id: &str) -> TurnAddress {
+    let scope = InvocationScope {
+        owner: ThreadOwner::new(
+            exchange.session_id.clone().into(),
+            forge_provider_api::agent::AgentId::new(exchange.agent_id.clone()).unwrap(),
+        )
+        .expect("fixture owner is registered"),
+        exchange_id: exchange.id.clone().into(),
+        invocation_id: format!("{}:invocation:{turn_id}", exchange.id).into(),
+    };
     TurnAddress {
-        scope: InvocationScope {
-            owner: ExecutionOwner {
-                session_id: exchange.session_id.clone().into(),
-                agent_id: exchange.agent_id.clone().into(),
-            },
-            exchange_id: exchange.id.clone().into(),
-            invocation_id: format!("{}:invocation:{turn_id}", exchange.id).into(),
-        },
-        thread_id: "thread".into(),
-        turn_id: turn_id.into(),
+        thread_id: scope.owner.thread_id(),
+        turn_id: scope.turn_id().unwrap(),
+        scope,
     }
 }
 
+/// Collect one real retained terminal fixture and preserve its original host scope.
+pub(crate) fn completed_event(
+    address: &TurnAddress,
+    outcome: TurnOutcome,
+    completed_at_ms: i64,
+) -> crate::provider::events::HarnessEvent {
+    let result =
+        forge_provider_api::TurnResult::new(outcome, completed_at_ms, None, vec![], vec![], None)
+            .unwrap();
+    let completed =
+        crate::provider::test_support::completed_turn(address.scope.clone(), result).unwrap();
+    crate::provider::test_support::native_event(
+        crate::provider::EventScope::Invocation {
+            invocation: address.scope.clone(),
+        },
+        ProviderEvent::Turn {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            event: forge_provider_api::TurnEvent::Completed(completed),
+        },
+    )
+}
+
+/// Preserve original ownership for a native item fixture.
+pub(crate) fn item_event(
+    address: &TurnAddress,
+    id: impl Into<String>,
+    event: ItemEvent,
+) -> crate::provider::events::HarnessEvent {
+    crate::provider::test_support::native_event(
+        crate::provider::EventScope::Invocation {
+            invocation: address.scope.clone(),
+        },
+        ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: ItemId::new(id).unwrap(),
+            event,
+        },
+    )
+}
+
+/// Preserve identified native accounting under its original invocation scope.
+pub(crate) fn usage_event(
+    address: &TurnAddress,
+    report: forge_provider_api::TurnUsageReport,
+) -> crate::provider::events::HarnessEvent {
+    crate::provider::test_support::native_event(
+        crate::provider::EventScope::Invocation {
+            invocation: address.scope.clone(),
+        },
+        ProviderEvent::Turn {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            event: forge_provider_api::TurnEvent::Usage(report),
+        },
+    )
+}
+/// Start an explicitly identified native reasoning representation.
+pub(crate) fn reasoning(
+    address: &TurnAddress,
+    id: impl Into<String>,
+    kind: forge_provider_api::ReasoningKind,
+    text: impl Into<String>,
+) -> crate::provider::events::HarnessEvent {
+    item_event(
+        address,
+        id,
+        ItemEvent::Started(ItemStart::Reasoning(forge_provider_api::ReasoningStart {
+            text: text.into(),
+            kind,
+        })),
+    )
+}
+/// Admit a real typed assistant item under its original turn.
 pub(crate) fn message(
     turn: &TurnAddress,
     id: impl Into<String>,
-    role: Option<MessageRole>,
+    role: Option<AgentMessageRole>,
     text: impl Into<String>,
-) -> ProviderEvent {
-    ProviderEvent::Message {
-        address: MessageAddress {
-            turn: turn.clone(),
-            message_id: MessageId::Native(id.into()),
+) -> crate::provider::events::HarnessEvent {
+    crate::provider::test_support::native_event(
+        crate::provider::EventScope::Invocation {
+            invocation: turn.scope.clone(),
         },
-        update: MessageUpdate::Started {
-            classification: role.map_or(
-                MessageClassification::Unclassified,
-                MessageClassification::Known,
-            ),
-            text: text.into(),
+        ProviderEvent::Item {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            item_id: ItemId::new(id).unwrap(),
+            event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                text: text.into(),
+                classification: role.map_or(
+                    MessageClassification::Unclassified,
+                    MessageClassification::Known,
+                ),
+            })),
         },
-    }
+    )
 }
 
+/// Observe an admitted typed tool item followed by its ordered activity.
 pub(crate) fn tool(
     exchange: &mut Exchange,
     turn: &TurnAddress,
     id: &str,
-    invocation: ToolInvocation,
-    update: impl IntoIterator<Item = ToolUpdate>,
+    start: ItemStart,
+    events: impl IntoIterator<Item = ItemEvent>,
     now_ms: i64,
 ) -> Result<()> {
-    let address = crate::provider::ToolAddress {
-        turn: turn.clone(),
-        tool_id: id.into(),
-    };
-    exchange.observe_turn(
-        &ProviderEvent::Tool {
-            address: address.clone(),
-            update: ToolUpdate::Requested { invocation },
-        },
-        now_ms,
-    )?;
-    for update in update {
-        exchange.observe_turn(
-            &ProviderEvent::Tool {
-                address: address.clone(),
-                update,
-            },
+    let item_id = ItemId::new(id)?;
+    for event in std::iter::once(ItemEvent::Started(start)).chain(events) {
+        exchange.observe_event(
+            &crate::provider::test_support::native_event(
+                crate::provider::EventScope::Invocation {
+                    invocation: turn.scope.clone(),
+                },
+                ProviderEvent::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id: item_id.clone(),
+                    event,
+                },
+            ),
             now_ms,
         )?;
     }
     Ok(())
 }
 
+/// Create typed fixture activity with a completion matching the admitted item family.
 pub(crate) fn tool_updates(
+    start: &ItemStart,
     status: crate::provider::ToolStatus,
     output: Option<String>,
     changes: crate::provider::ProviderChangeSet,
-) -> Vec<ToolUpdate> {
-    use crate::provider::{TextUpdate, ToolOutcome, ToolStatus};
-    let mut update = Vec::new();
+) -> Vec<ItemEvent> {
+    use crate::provider::{ToolOutcome, ToolStatus};
+    let mut events = Vec::new();
     if status == ToolStatus::Running {
-        update.push(ToolUpdate::Started);
+        events.push(ItemEvent::Tool {
+            event: ToolItemEvent::ExecutionStarted,
+        });
     }
     if let Some(output) = output {
-        update.push(ToolUpdate::Output {
-            update: TextUpdate::Replace(output),
+        events.push(ItemEvent::Tool {
+            event: ToolItemEvent::Output(forge_provider_api::TextUpdate::Replace(output)),
         });
     }
     if !changes.is_empty() {
-        update.push(ToolUpdate::Changes { changes });
+        events.push(ItemEvent::Tool {
+            event: ToolItemEvent::Changes(changes),
+        });
     }
     let outcome = match status {
-        ToolStatus::Running => None,
-        ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
-        ToolStatus::Failed => Some(ToolOutcome::Failed {
+        ToolStatus::Running => return events,
+        ToolStatus::Succeeded => ToolOutcome::Succeeded,
+        ToolStatus::Failed => ToolOutcome::Failed {
             diagnostic: crate::provider::ToolDiagnostic {
                 kind: forge_provider_api::ProviderFailureKind::Unknown,
-                message: forge_provider_api::SanitizedMessage::new("tool execution failed")
-                    .expect("host diagnostic is nonempty"),
+                message: forge_provider_api::SanitizedMessage::new("Tool execution failed")
+                    .unwrap(),
             },
-        }),
-        ToolStatus::Denied => Some(ToolOutcome::Denied {
-            reason: forge_provider_api::diagnostic::SanitizedMessage::new("tool execution denied")
-                .expect("static denial is nonempty"),
-        }),
-        ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
-        ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
+        },
+        ToolStatus::Denied => ToolOutcome::Denied {
+            reason: forge_provider_api::SanitizedMessage::new("Tool execution denied").unwrap(),
+        },
+        ToolStatus::Cancelled => ToolOutcome::Cancelled,
+        ToolStatus::Interrupted => ToolOutcome::Interrupted,
     };
-    if let Some(outcome) = outcome {
-        update.push(ToolUpdate::Finished { outcome });
-    }
-    update
+    let completion = ToolCompletion {
+        outcome,
+        descriptor: None,
+        output: None,
+        changes: Default::default(),
+    };
+    let completion = match start {
+        ItemStart::CommandExecution(_) => ItemCompletion::CommandExecution(completion),
+        ItemStart::FileChange(_) => ItemCompletion::FileChange(completion),
+        ItemStart::ToolCall(_) => ItemCompletion::ToolCall(completion),
+        ItemStart::UserMessage(_) | ItemStart::AgentMessage(_) | ItemStart::Reasoning(_) => {
+            panic!("tool fixture requires a tool item start")
+        }
+    };
+    events.push(ItemEvent::Completed(completion));
+    events
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,12 +223,14 @@ pub(crate) struct TestTurn {
 impl TestTurn {
     pub(crate) fn new(id: String, address: TurnAddress, now_ms: i64) -> Self {
         let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
-            "id":address.scope.exchange_id, "session_id":address.scope.owner.session_id,
-            "agent_id":address.scope.owner.agent_id, "ordinal":1,
+            "id":address.scope.exchange_id, "session_id":address.scope.owner.session_id(),
+            "agent_id":address.scope.owner.agent_id(), "ordinal":1,
             "prompt":"Work", "state":"running", "created_at_ms":now_ms,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))
         .unwrap();
+        // Production exchanges start their active clock at admission; tool timers read it.
+        exchange.clock.resume(now_ms);
         exchange.turn.push(Turn::new(id, address, now_ms));
         Self { exchange }
     }
@@ -162,39 +262,25 @@ impl TestTurn {
         self.exchange.tools().map(|(_, tool)| tool)
     }
 
-    pub(crate) fn record_tool(&mut self, id: &str, update: ToolUpdate, now_ms: i64) -> Result<()> {
-        let address = crate::provider::ToolAddress {
-            turn: self.exchange.turn[0].provider().clone(),
-            tool_id: id.into(),
-        };
-        self.exchange.turn[0].admit_tool(id)?;
-        self.synchronize()?;
-        let turn_id = self.exchange.turn[0].id().to_owned();
-        if !matches!(update, ToolUpdate::Requested { .. })
-            && !self
-                .exchange
-                .tools_for_turn(&turn_id)
-                .any(|tool| tool.id == id)
-        {
-            self.exchange.record_tool_event(
-                &turn_id,
-                &address,
-                &ToolUpdate::Requested {
-                    invocation: ToolInvocation {
-                        semantics: Default::default(),
-                        kind: crate::provider::ToolActivityKind::ToolCall,
-                        name: id.into(),
-                        title: id.into(),
-                        arguments: serde_json::json!({}),
-                    },
+    /// Apply a native item fixture through the same reducer as production observations.
+    pub(crate) fn record_tool(&mut self, id: &str, event: &ItemEvent, now_ms: i64) -> Result<()> {
+        let address = self.exchange.turn[0].provider().clone();
+        self.exchange.observe_event(
+            &crate::provider::test_support::native_event(
+                crate::provider::EventScope::Invocation {
+                    invocation: address.scope.clone(),
                 },
-                now_ms,
-            )?;
-        }
-        self.exchange
-            .record_tool_event(&turn_id, &address, &update, now_ms)
+                ProviderEvent::Item {
+                    thread_id: address.thread_id,
+                    turn_id: address.turn_id,
+                    item_id: ItemId::new(id)?,
+                    event: event.clone(),
+                },
+            ),
+            now_ms,
+        )?;
+        Ok(())
     }
-
     pub(crate) fn record_text(&mut self, kind: MessageKind, text: &str) -> Result<()> {
         self.exchange.turn[0].record_text(kind, text)?;
         self.synchronize()

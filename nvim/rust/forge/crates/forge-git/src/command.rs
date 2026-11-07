@@ -47,6 +47,30 @@ pub fn read_command(
     progress_command(command, limits, None, None, check)
 }
 
+/// Test seam: collects like [`read_command`] but expires the deadline when `deadline_expired`
+/// returns true instead of when `limits.timeout` elapses.
+///
+/// Tests use it to fire expiry at an exact point in the child's lifecycle without waiting on the
+/// wall clock. Expiry follows the production deadline path, including group termination and reaping.
+#[doc(hidden)]
+pub fn read_command_with_expiry(
+    command: &mut Command,
+    limits: CommandLimits,
+    mut deadline_expired: impl FnMut() -> bool,
+    check: impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    collect_command(
+        command,
+        limits,
+        None,
+        None,
+        false,
+        None,
+        |_| deadline_expired(),
+        check,
+    )
+}
+
 /// Collect two independent reads concurrently, retaining admission until both children exit.
 pub fn read_command_pair(
     first: Command,
@@ -63,9 +87,29 @@ pub fn read_command_pair(
     command_runtime()?.block_on(async {
         let mut first_check = || (check.borrow_mut())();
         let mut second_check = || (check.borrow_mut())();
+        let mut first_deadline_expired = timeout_elapsed(limits);
+        let mut second_deadline_expired = timeout_elapsed(limits);
         let (first, second) = tokio::join!(
-            collect_async(first, limits, None, None, false, None, &mut first_check),
-            collect_async(second, limits, None, None, false, None, &mut second_check),
+            collect_async(
+                first,
+                limits,
+                None,
+                None,
+                false,
+                None,
+                &mut first_deadline_expired,
+                &mut first_check,
+            ),
+            collect_async(
+                second,
+                limits,
+                None,
+                None,
+                false,
+                None,
+                &mut second_deadline_expired,
+                &mut second_check,
+            ),
         );
         Ok((first?, second?))
     })
@@ -89,7 +133,16 @@ pub fn progress_command(
     progress: Option<&CommandProgressSink>,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
-    collect_command(command, limits, input, progress, false, None, check)
+    collect_command(
+        command,
+        limits,
+        input,
+        progress,
+        false,
+        None,
+        timeout_elapsed(limits),
+        check,
+    )
 }
 
 /// Retains a bounded diagnostic tail while draining both streams to completion.
@@ -100,7 +153,16 @@ pub fn diagnostic_command(
     progress: Option<&CommandProgressSink>,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
-    collect_command(command, limits, input, progress, true, None, check)
+    collect_command(
+        command,
+        limits,
+        input,
+        progress,
+        true,
+        None,
+        timeout_elapsed(limits),
+        check,
+    )
 }
 
 /// Drains stdout directly to an owned file while retaining bounded stderr and process deadlines.
@@ -110,7 +172,21 @@ pub fn file_command(
     limits: CommandLimits,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
-    collect_command(command, limits, None, None, false, Some(destination), check)
+    collect_command(
+        command,
+        limits,
+        None,
+        None,
+        false,
+        Some(destination),
+        timeout_elapsed(limits),
+        check,
+    )
+}
+
+/// Expires the command deadline once the elapsed collection time reaches `limits.timeout`.
+fn timeout_elapsed(limits: CommandLimits) -> impl FnMut(Duration) -> bool {
+    move |elapsed| elapsed >= limits.timeout
 }
 
 fn collect_command(
@@ -120,6 +196,7 @@ fn collect_command(
     progress: Option<&CommandProgressSink>,
     diagnostic: bool,
     destination: Option<std::fs::File>,
+    mut deadline_expired: impl FnMut(Duration) -> bool,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
     ensure!(
@@ -138,6 +215,7 @@ fn collect_command(
             progress,
             diagnostic,
             destination,
+            &mut deadline_expired,
             &mut check,
         )
         .await
@@ -171,6 +249,7 @@ async fn collect_async(
     progress: Option<CommandProgressSink>,
     diagnostic: bool,
     destination: Option<std::fs::File>,
+    deadline_expired: &mut impl FnMut(Duration) -> bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Output> {
     let started = Instant::now();
@@ -235,7 +314,7 @@ async fn collect_async(
         if let Err(error) = check() {
             break Some(error);
         }
-        if started.elapsed() >= limits.timeout {
+        if deadline_expired(started.elapsed()) {
             break Some(anyhow::anyhow!(
                 "command exceeded {:?} deadline",
                 limits.timeout

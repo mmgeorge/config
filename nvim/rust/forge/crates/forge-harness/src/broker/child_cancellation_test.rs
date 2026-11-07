@@ -1,6 +1,7 @@
 use super::super::{AgentState, ExchangeState, TurnCancelled};
 use super::test_support::{
-    admit_child_fixture, child_event, child_tool, planning_question_broker, repository,
+    admit_child_fixture, child_address, child_completed, child_event, child_tool,
+    planning_question_broker, repository,
 };
 use anyhow::{Context, Result};
 
@@ -39,7 +40,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
     assert!(
         !*broker
             .agent_coordinator
-            .cancellation(owner.agent_id.as_str(), &admission.task.id)?
+            .cancellation(owner.agent_id().as_str(), &admission.task.id)?
             .borrow()
     );
     let mut event = Vec::new();
@@ -47,7 +48,12 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Started { started_at_ms: 1 }),
+            child_event(
+                &child_address(&(owner.clone()), &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 1,
+                }),
+            ),
             &mut event,
         )
         .await?;
@@ -55,7 +61,11 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_tool("policy denied".into(), crate::provider::ToolStatus::Denied),
+            child_tool(
+                &child_address(&(owner.clone()), &admission.task.id),
+                "policy denied".into(),
+                crate::provider::ToolStatus::Denied,
+            ),
             &mut event,
         )
         .await?;
@@ -68,7 +78,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         ChildCompletionFailure::ProviderFailed => (
             Err(anyhow::Error::new(crate::provider::ProviderError::from(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Unknown,
                 ),
             ))),
@@ -82,19 +92,30 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         ),
     };
     let turn_outcome = match failure {
-        ChildCompletionFailure::ProviderFailed => crate::turn::TurnOutcome::Failed,
+        ChildCompletionFailure::ProviderFailed => crate::turn::TurnOutcome::Failed {
+            error: forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Unknown,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+        },
         ChildCompletionFailure::ProviderCancelled | ChildCompletionFailure::CleanupFailed => {
-            crate::turn::TurnOutcome::Cancelled
+            crate::turn::TurnOutcome::Interrupted
         }
     };
     broker
         .observe_child_fixture(
             owner.clone(),
             &admission.task.id,
-            child_event(crate::provider::TurnUpdate::Finished {
-                outcome: turn_outcome,
-                completed_at_ms: 2,
-            }),
+            child_completed(
+                &child_address(&(owner.clone()), &admission.task.id),
+                turn_outcome,
+                2,
+            ),
             &mut event,
         )
         .await?;
@@ -103,6 +124,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             owner.clone(),
             admission.task.id.clone(),
             output,
+            Vec::new(),
             cleanup_error.clone(),
             &mut event,
         )
@@ -128,7 +150,9 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         crate::turn::ToolState::Denied
     );
     assert_eq!(exchange.finalization_error, cleanup_error);
-    let agent = broker.agent_coordinator.resolve(owner.agent_id.as_str())?;
+    let agent = broker
+        .agent_coordinator
+        .resolve(owner.agent_id().as_str())?;
     match failure {
         ChildCompletionFailure::CleanupFailed => {
             assert_eq!(agent.state, AgentState::Closing);
@@ -136,7 +160,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             assert!(
                 broker
                     .agent_coordinator
-                    .cleanup_task(owner.agent_id.as_str())
+                    .cleanup_task(owner.agent_id().as_str())
                     .is_some()
             );
         }
@@ -145,7 +169,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             assert!(
                 broker
                     .agent_coordinator
-                    .cleanup_task(owner.agent_id.as_str())
+                    .cleanup_task(owner.agent_id().as_str())
                     .is_none()
             );
         }

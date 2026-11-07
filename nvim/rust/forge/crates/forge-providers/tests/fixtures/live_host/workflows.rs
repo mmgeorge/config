@@ -3,11 +3,11 @@ use anyhow::{Context, Result, ensure};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::provider::{
     InvocationScope, Provider, ProviderError, ProviderEvent, ProviderInput, ProviderRequest,
-    ToolUpdate,
 };
 use forge_harness::session::{ApprovalMode, SessionStore};
 use forge_harness::trace::TraceStore;
 use forge_protocol::message::Request;
+use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -749,7 +749,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
     let provider_name = provider;
     let provider = create_provider(provider, &initialize, &request)?;
     let result: Result<()> = async {
-        request.provider_session_id = provider.session_open(request.clone()).await?;
+        request.provider_session_id = provider.thread_open(request.clone()).await?;
         let scope = InvocationScope::new(request.owner()?, "cancel-tool");
         let (sink, mut stream) = forge_harness::provider::events::channel(scope.clone());
         let execution = provider.session_prompt_and_wait(request.clone(), sink);
@@ -759,9 +759,10 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
             tokio::select! {
                 output = &mut execution => anyhow::bail!("provider completed before active-tool cancellation: {output:?}; observed events: {observed:#?}"),
                 event = stream.recv() => {
-                    let event = event?.context("event stream ended before command started")?;
-                    if let ProviderEvent::Tool { update: ToolUpdate::Requested { invocation }, .. } = &event {
-                        eprintln!("{provider_name}: requested tool {} ({:?})", invocation.name, invocation.kind);
+                    let observation = event?.context("event stream ended before command started")?;
+                    let Some(event) = super::event_observation(observation) else { continue; };
+                    if let Some(ProviderEvent::Item { event: ItemEvent::Started(ItemStart::CommandExecution(descriptor) | ItemStart::FileChange(descriptor) | ItemStart::ToolCall(descriptor)), .. }) = super::native_event(&event) {
+                        eprintln!("{provider_name}: requested tool {}", descriptor.name);
                     }
                     observed.push(event);
                 }
@@ -775,7 +776,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         }
         let command_started_at = tokio::time::Instant::now();
         let cancellation = async {
-            tokio::join!(provider.as_provider().cancel_invocation(scope), &mut execution)
+            tokio::join!(provider.as_provider().cancel_invocation(scope.clone()), &mut execution)
         };
         tokio::pin!(cancellation);
         let mut stream_open = true;
@@ -784,7 +785,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
                 settled = &mut cancellation => break settled,
                 event = stream.recv(), if stream_open => {
                     if let Some(event) = event? {
-                        observed.push(event);
+                        if let Some(event) = super::event_observation(event) { observed.push(event); }
                     } else {
                         stream_open = false;
                     }
@@ -792,17 +793,16 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
             }
         };
         let settlement = cancelled?;
-        ensure!(matches!(settlement.result, forge_provider_api::ExecutionResult::Cancelled { .. }), "interruption did not collect the exact invocation");
+        ensure!(settlement.turn_id == scope.turn_id()?, "interruption did not collect the exact invocation");
         while let Some(event) = stream.try_next()? {
-            observed.push(event);
+            if let Some(event) = super::event_observation(event) { observed.push(event); }
         }
         std::fs::write(fixture.join("cancelled-events.json"), serde_json::to_vec_pretty(&observed)?)?;
         match completed {
             Err(ProviderError::Cancelled) => {}
-            Ok(_) => ensure!(observed.iter().any(|event| matches!(event,
-                ProviderEvent::Turn { update: forge_harness::provider::TurnUpdate::Finished {
-                    outcome: forge_harness::turn::TurnOutcome::Cancelled | forge_harness::turn::TurnOutcome::Interrupted, ..
-                }, .. }
+            Ok(_) => ensure!(observed.iter().filter_map(super::native_event).any(|event| matches!(event,
+                ProviderEvent::Turn { event: forge_harness::provider::TurnEvent::Completed(completed), .. }
+                if matches!(completed.result().outcome(), forge_harness::turn::TurnOutcome::Interrupted)
             )), "cancelled command omitted interrupted-turn evidence: {observed:#?}"),
             Err(failure) => return Err(failure.into()),
         }
@@ -812,7 +812,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         request.provider_session_id = provider.as_provider().retained_session_id(&request.owner()?).await;
         request.input = ProviderInput::from_text("The previous command was intentionally cancelled. Use a tool to read input.txt, then reply with its exact token. Do not run another sleep.");
         let retried = provider.session_prompt_and_collect(request).await?;
-        ensure!(retried.event.iter().any(|event| matches!(event, ProviderEvent::Tool { update: ToolUpdate::Finished { .. }, .. })), "retry did not execute a tool");
+        ensure!(retried.event.iter().filter_map(super::native_event).any(|event| matches!(event, ProviderEvent::Item { event: ItemEvent::Completed(ItemCompletion::CommandExecution(_) | ItemCompletion::FileChange(_) | ItemCompletion::ToolCall(_)), .. })), "retry did not execute a tool");
         ensure!(serde_json::to_string(&retried.event)?.contains("WORKFLOW-72931"), "retry lost workspace access");
         eprintln!("{provider_name}: active command cancellation, drained execution, and successful tool retry passed");
         Ok(())

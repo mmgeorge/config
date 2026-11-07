@@ -5,7 +5,10 @@ assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
 vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+-- Resolve support paths before the fixture changes into its workspace.
+local fixture_directory = vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(fixture_directory .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 local errors = {}
@@ -24,7 +27,10 @@ local function await(predicate, message)
   assert(vim.wait(30000, function() return #errors > 0 or predicate() end, 10), message)
   assert(#errors == 0, table.concat(errors, "\n"))
 end
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua.
+  if method == "session.state.get" then return state_snapshot.get() end
   local result, failure, done
   client.request({ method = method, params = params, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error) result, failure, done = value, error, true end)
   await(function() return done end, method .. " did not settle")
@@ -38,17 +44,18 @@ local success, failure = xpcall(function()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   assert(state.session.approval_mode == "ask", "new sessions must start in Ask")
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "allow" } })
-  await(function() return state.session.approval_mode == "allow" and not state.busy end, "Approve mode did not apply")
+  await(function() return state.session.approval_mode == "allow" and not require("forge.views.harness.activity").busy(state) end, "Approve mode did not apply")
   local session_id = state.session.id
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })
   controller.submit()
-  await(function() return not state.busy and state.active_plan and state.active_plan.state == "awaiting_review" end, "Plan did not arrive")
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.active_plan and state.active_plan.state == "awaiting_review" end, "Plan did not arrive")
   assert(state.session.active_task.auto_accept_plan == false, "New Plan tasks must require review")
   assert(state.session.approval_mode == "allow", "entering Plan changed the active permission mode")
   local task_id = state.session.active_task.id
   local plan = state.active_plan
   request("session.plan.accept", { plan_id = plan.id, digest = plan.review_digest })
-  await(function() return not state.busy and state.session.active_task
+  dofile(fixture_directory .. "/support/plan_acceptance.lua").answer_execution_approval(session_id, "allow")
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.session.active_task
     and state.session.active_task.execution.record.state == "stalled" end, "Mock implementation did not stop at its continuation guard")
   local snapshot = request("session.state.get", {})
   assert(snapshot.session.id == session_id and snapshot.session.active_task.id == task_id,

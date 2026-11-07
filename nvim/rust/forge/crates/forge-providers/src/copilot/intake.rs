@@ -1,12 +1,12 @@
 //! Keep Copilot observation and decoding alive across foreground result waiters.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use forge_provider_api::completion::ProviderCompletion;
-use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionUpdate, ObservationFailure};
+use forge_provider_api::lifecycle::ObservationFailure;
 use forge_provider_api::{
-    ProviderError, ProviderEvent, ProviderEventSink, ProviderFailureKind, ProviderOperation,
+    AdapterActivityWriter, ProviderError, ProviderFailureKind, ProviderOperation,
 };
 use github_copilot_sdk::SessionEvent;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -14,24 +14,27 @@ use tokio::task::JoinHandle;
 
 use super::client_generation::ClientGeneration;
 use super::event_decoder::CopilotEventDecoder;
-use super::event_stream::{IntakeQueueStage, QueueDiagnostics, SessionEventStream};
+use super::event_stream::{ObservationTimes, SessionEventStream};
 
 /// Retain decoder identity and output after the prompt's host result has returned.
 pub(crate) struct TurnContext {
     pub(crate) decoder: CopilotEventDecoder,
     pub(crate) output: ProviderCompletion,
-    pub(crate) sink: ProviderEventSink,
+    pub(crate) sink: AdapterActivityWriter,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct DeliveryGeneration(uuid::Uuid);
 
 enum Command {
+    Bind {
+        writer: Box<AdapterActivityWriter>,
+        reply: oneshot::Sender<Result<(), ProviderError>>,
+    },
     Attach {
         generation: DeliveryGeneration,
         context: Arc<Mutex<TurnContext>>,
-        scope: forge_provider_api::InvocationScope,
-        reply: oneshot::Sender<Result<mpsc::Receiver<SessionEvent>, ProviderError>>,
+        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<SessionEvent>, ProviderError>>,
     },
     Release {
         generation: DeliveryGeneration,
@@ -46,8 +49,7 @@ enum IntakeState {
     Active {
         generation: DeliveryGeneration,
         context: Arc<Mutex<TurnContext>>,
-        sender: mpsc::Sender<SessionEvent>,
-        scope: forge_provider_api::InvocationScope,
+        sender: mpsc::UnboundedSender<SessionEvent>,
     },
     Retained(Arc<Mutex<TurnContext>>),
 }
@@ -59,37 +61,37 @@ enum TurnReceiveState {
 
 /// Own the session reader independently of each temporary foreground subscriber.
 pub(crate) struct SessionIntake {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::UnboundedSender<Command>,
     failure: watch::Receiver<Option<ObservationFailure>>,
     client: ClientGeneration,
     task: Mutex<Option<JoinHandle<()>>>,
-    diagnostics: QueueDiagnostics,
+    observation_times: ObservationTimes,
 }
 
 /// Release a foreground observer while retaining its decoder for late native events.
 pub(crate) struct TurnReceiver {
-    receiver: mpsc::Receiver<SessionEvent>,
-    commands: mpsc::Sender<Command>,
+    receiver: mpsc::UnboundedReceiver<SessionEvent>,
+    commands: mpsc::UnboundedSender<Command>,
     generation: DeliveryGeneration,
     failure: watch::Receiver<Option<ObservationFailure>>,
-    client: ClientGeneration,
     state: TurnReceiveState,
-    scope: forge_provider_api::InvocationScope,
-    diagnostics: QueueDiagnostics,
+    observation_times: ObservationTimes,
 }
 
 impl SessionIntake {
     pub(crate) fn new(mut stream: SessionEventStream, client: ClientGeneration) -> Self {
-        let (commands, mut receive) = mpsc::channel(16);
+        let (commands, mut receive) = mpsc::unbounded_channel();
         let failure = client.failures();
         let mut failures = failure.clone();
         let native = client.clone();
-        let diagnostics = stream.queue_diagnostics();
-        let queue_diagnostics = diagnostics.clone();
+        let observation_times = stream.observation_times();
+        let observations = observation_times.clone();
         let task = tokio::spawn(async move {
             let mut state = IntakeState::Unbound(VecDeque::new());
             let mut retired: Vec<Arc<Mutex<TurnContext>>> = Vec::new();
             let mut closing = None;
+            let mut binding_writer: Option<AdapterActivityWriter> = None;
+            let mut session_errors = HashMap::new();
             let result: Result<(), ProviderError> = async {
                 loop {
                     if let Some(failure) = failures.borrow().clone() { return Err(ProviderError::Observation(failure)); }
@@ -99,22 +101,34 @@ impl SessionIntake {
                             if let Some(failure) = failures.borrow().clone() { return Err(ProviderError::Observation(failure)); }
                         },
                         command = receive.recv() => match command {
-                            Some(Command::Attach { generation, context, scope, reply }) => {
+                            Some(Command::Bind { writer, reply }) => {
+                                if let IntakeState::Unbound(pending) = &mut state {
+                                    let mut retained = VecDeque::new();
+                                    while let Some(event) = pending.pop_front() {
+                                        if event.event_type == "session.error" && event.agent_id.is_none() {
+                                            publish_session_error(&writer, &mut session_errors, &event).await?;
+                                        } else { retained.push_back(event); }
+                                    }
+                                    *pending = retained;
+                                }
+                                binding_writer = Some(*writer);
+                                let _ = reply.send(Ok(()));
+                            },
+                            Some(Command::Attach { generation, context, reply }) => {
                                 if matches!(state, IntakeState::Active { .. }) {
-                                    let _ = reply.send(Err(native_failure(forge_provider_api::ProviderOperation::InputSubmit, forge_provider_api::ProviderFailureKind::Rejected)));
+                                    let _ = reply.send(Err(native_failure(forge_provider_api::ProviderOperation::TurnStart, forge_provider_api::ProviderFailureKind::Rejected)));
                                     continue;
                                 }
-                                let (sender, receiver) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+                                let (sender, receiver) = mpsc::unbounded_channel();
                                 if let IntakeState::Retained(previous) = &state && !Arc::ptr_eq(previous, &context) {
                                     retired.push(previous.clone());
                                 }
                                 if let IntakeState::Unbound(pending) = &mut state {
-                                    for event in pending.drain(..) { sender.try_send(event).map_err(|error| {
-                                        queue_diagnostics.lost(IntakeQueueStage::Attachment, sender.max_capacity() - sender.capacity(), sender.max_capacity(), Some(&scope), Some(&error.into_inner()));
-                                        ProviderError::Observation(ObservationFailure::Overflow)
-                                    })?; }
+                                    for event in pending.drain(..) {
+                                        sender.send(event).map_err(|_| ProviderError::Observation(ObservationFailure::Disconnected))?;
+                                    }
                                 }
-                                state = IntakeState::Active { generation, context, sender, scope };
+                                state = IntakeState::Active { generation, context, sender };
                                 let _ = reply.send(Ok(receiver));
                             },
                             Some(Command::Release { generation }) => {
@@ -126,7 +140,12 @@ impl SessionIntake {
                             None => return Ok(()),
                         },
                         event = stream.recv() => {
-                            let event = event.map_err(|error| error.downcast::<ProviderError>().unwrap_or_else(|_| native_failure(ProviderOperation::SessionClose, ProviderFailureKind::Transport)))?;
+                            let event = event.map_err(|error| error.downcast::<ProviderError>().unwrap_or_else(|_| native_failure(ProviderOperation::ThreadClose, ProviderFailureKind::Transport)))?;
+                            if event.event_type == "session.error" && event.agent_id.is_none()
+                                && let Some(writer) = &binding_writer {
+                                publish_session_error(writer, &mut session_errors, &event).await?;
+                                continue;
+                            }
                             let mut original = None;
                             for retained in &retired {
                                 if retained.lock().await.decoder.owns_event(&event) {
@@ -137,32 +156,21 @@ impl SessionIntake {
                                 }
                             }
                             if let Some(original) = original {
-                                decode_retained(&original, event).await?;
+                                decode_retained(&original, event, &observations).await?;
                                 continue;
                             }
                             match &mut state {
                                 IntakeState::Unbound(pending) => {
-                                    if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
-                                        queue_diagnostics.lost(IntakeQueueStage::Unbound, pending.len(), forge_protocol::MAX_PENDING_FRAMES, None, Some(&event));
-                                        return Err(ProviderError::Observation(ObservationFailure::Overflow));
-                                    }
                                     pending.push_back(event);
                                 },
-                                IntakeState::Active { sender, context, scope, .. } => {
-                                    match sender.try_send(event) {
-                                        Ok(()) => {},
-                                        Err(mpsc::error::TrySendError::Full(event)) => {
-                                            queue_diagnostics.lost(IntakeQueueStage::Foreground, sender.max_capacity(), sender.max_capacity(), Some(scope), Some(&event));
-                                            return Err(ProviderError::Observation(ObservationFailure::Overflow));
-                                        },
-                                        Err(mpsc::error::TrySendError::Closed(event)) => {
-                                            let retained = context.clone();
-                                            decode_retained(&retained, event).await?;
-                                            state = IntakeState::Retained(retained);
-                                        },
+                                IntakeState::Active { sender, context, .. } => {
+                                    if let Err(error) = sender.send(event) {
+                                        let retained = context.clone();
+                                        decode_retained(&retained, error.0, &observations).await?;
+                                        state = IntakeState::Retained(retained);
                                     }
                                 },
-                                IntakeState::Retained(context) => decode_retained(context, event).await?,
+                                IntakeState::Retained(context) => decode_retained(context, event, &observations).await?,
                             }
                         },
                     }
@@ -170,10 +178,20 @@ impl SessionIntake {
             }.await;
             let result = result.and(stream.close().await.map_err(|_| {
                 native_failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Transport,
                 )
             }));
+            let current = match state {
+                IntakeState::Active {
+                    context, sender, ..
+                } => {
+                    drop(sender);
+                    Some(context)
+                }
+                IntakeState::Retained(context) => Some(context),
+                IntakeState::Unbound(_) => None,
+            };
             if let Err(error) = result {
                 let reason = match error {
                     ProviderError::Observation(reason) => reason,
@@ -183,35 +201,17 @@ impl SessionIntake {
                 let reason = native
                     .failure()
                     .expect("generation failure is sticky after publication");
-                let context = match state {
-                    IntakeState::Active {
-                        context, sender, ..
-                    } => {
-                        // The foreground owns the decoder lock while receiving.
-                        // Release its sender before waiting for that lock.
-                        drop(sender);
-                        Some(context)
-                    }
-                    IntakeState::Retained(context) => Some(context),
-                    IntakeState::Unbound(_) => None,
-                };
-                if let Some(context) = context {
-                    let context = context.lock().await;
-                    if let Ok(scope) = context.sink.invocation_scope()
-                        && let Ok(observation) = ExecutionObservation::new(
-                            scope.clone(),
-                            ExecutionUpdate::ObservationLost {
-                                failure: reason,
-                                completion: Some(context.output.clone().into()),
-                            },
-                        )
-                    {
-                        let _ = context
-                            .sink
-                            .send_wait(ProviderEvent::Execution { observation })
-                            .await;
-                    }
+                if let Some(context) = &current {
+                    context.lock().await.sink.fail(
+                        forge_provider_api::events::EventDeliveryError::Observation(reason),
+                    );
                 }
+            }
+            if let Some(context) = current {
+                context.lock().await.decoder.close_children().await;
+            }
+            for context in retired {
+                context.lock().await.decoder.close_children().await;
             }
             if let Some(reply) = closing {
                 let _ = reply.send(());
@@ -222,8 +222,20 @@ impl SessionIntake {
             failure,
             client,
             task: Mutex::new(Some(task)),
-            diagnostics,
+            observation_times,
         }
+    }
+
+    /// Publish thread errors immediately even before the first prompt creates a decoder.
+    pub(crate) async fn bind(&self, writer: AdapterActivityWriter) -> Result<(), ProviderError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Bind {
+                writer: Box::new(writer),
+                reply,
+            })
+            .map_err(|_| self.closed())?;
+        response.await.map_err(|_| self.closed())?
     }
 
     pub(crate) async fn attach(
@@ -234,16 +246,14 @@ impl SessionIntake {
             return Err(ProviderError::Observation(failure));
         }
         let generation = DeliveryGeneration(uuid::Uuid::new_v4());
-        let scope = context.lock().await.sink.invocation_scope()?.clone();
+        context.lock().await.sink.invocation_scope()?;
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Attach {
                 generation,
                 context,
-                scope: scope.clone(),
                 reply,
             })
-            .await
             .map_err(|_| self.closed())?;
         let receiver = response.await.map_err(|_| self.closed())??;
         Ok(TurnReceiver {
@@ -251,10 +261,8 @@ impl SessionIntake {
             commands: self.commands.clone(),
             generation,
             failure: self.failure.clone(),
-            client: self.client.clone(),
             state: TurnReceiveState::Live,
-            scope,
-            diagnostics: self.diagnostics.clone(),
+            observation_times: self.observation_times.clone(),
         })
     }
 
@@ -264,12 +272,12 @@ impl SessionIntake {
             return Ok(());
         };
         let (reply, response) = oneshot::channel();
-        if self.commands.send(Command::Close { reply }).await.is_ok() {
+        if self.commands.send(Command::Close { reply }).is_ok() {
             let _ = response.await;
         }
         pending.await.map_err(|_error| {
             super::error::native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Protocol,
             )
         })?;
@@ -301,6 +309,11 @@ impl Drop for SessionIntake {
 }
 
 impl TurnReceiver {
+    /// Get first SDK receipt time for an event held behind native send acknowledgement.
+    pub(crate) fn observed_at(&self, event: &SessionEvent) -> i64 {
+        self.observation_times.observed_at(event)
+    }
+
     /// Preserve sticky observation loss during an auxiliary history read.
     pub(crate) fn ensure_healthy(&self) -> Result<(), ProviderError> {
         match self.failure.borrow().clone() {
@@ -347,30 +360,16 @@ impl TurnReceiver {
 
 impl Drop for TurnReceiver {
     fn drop(&mut self) {
-        if self
-            .commands
-            .try_send(Command::Release {
-                generation: self.generation,
-            })
-            .is_err()
-        {
-            if self.client.failure().is_none() {
-                self.diagnostics.lost(
-                    IntakeQueueStage::Release,
-                    self.commands.max_capacity() - self.commands.capacity(),
-                    self.commands.max_capacity(),
-                    Some(&self.scope),
-                    None,
-                );
-            }
-            self.client.fail(ObservationFailure::Overflow);
-        }
+        let _ = self.commands.send(Command::Release {
+            generation: self.generation,
+        });
     }
 }
 
 async fn decode_retained(
     context: &Arc<Mutex<TurnContext>>,
     event: SessionEvent,
+    observations: &ObservationTimes,
 ) -> Result<(), ProviderError> {
     let mut context = context.lock().await;
     let TurnContext {
@@ -389,7 +388,34 @@ async fn decode_retained(
             ObservationFailure::UnexpectedExecution,
         ));
     }
-    decoder.decode(&event, output, sink).await?;
+    decoder
+        .decode_at(&event, observations.observed_at(&event), output, sink)
+        .await?;
+    Ok(())
+}
+
+/// Deduplicate session errors without assigning them to whichever turn is currently visible.
+async fn publish_session_error(
+    writer: &AdapterActivityWriter,
+    observed: &mut HashMap<String, serde_json::Value>,
+    event: &SessionEvent,
+) -> Result<(), ProviderError> {
+    if let Some(previous) = observed.get(&event.id) {
+        if previous != &event.data {
+            return Err(ProviderError::Observation(ObservationFailure::Protocol));
+        }
+        return Ok(());
+    }
+    if event.id.trim().is_empty() {
+        return Err(ProviderError::Observation(ObservationFailure::Protocol));
+    }
+    writer
+        .send_wait(super::error::session_error(
+            writer.scope().owner().thread_id(),
+            &event.data,
+        ))
+        .await?;
+    observed.insert(event.id.clone(), event.data.clone());
     Ok(())
 }
 
@@ -403,503 +429,212 @@ fn native_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::{ExecutionOwner, InvocationScope, MessageUpdate};
+    use forge_provider_api::{
+        BindingId, InvocationScope, ItemCompletion, ItemEvent, ProviderEvent, ThreadOwner,
+    };
     use github_copilot_sdk::Client;
     use serde_json::json;
 
-    fn event(id: &str, kind: &str, data: serde_json::Value) -> SessionEvent {
+    /// Construct native envelopes without contacting a billable provider.
+    fn event(id: &str, kind: &str, contents: serde_json::Value) -> SessionEvent {
         serde_json::from_value(
-            json!({"id":id,"type":kind,"timestamp":"2026-11-01T00:00:00Z","data":data}),
+            json!({"id":id,"type":kind,"timestamp":"2026-11-05T00:00:00Z","data":contents}),
         )
         .unwrap()
     }
 
-    async fn fixture() -> (
-        SessionIntake,
-        mpsc::Sender<SessionEvent>,
-        Arc<Mutex<TurnContext>>,
-        forge_provider_api::ProviderEventStream,
-    ) {
-        let (sender, receiver) = mpsc::channel(32);
-        let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let (intake, context, observed) =
-            fixture_stream(SessionEventStream::fixture(receiver, task)).await;
-        (intake, sender, context, observed)
-    }
-
-    /// Bind a supplied native stream to the same retained decoder used by live prompts.
-    async fn fixture_stream(
-        stream: SessionEventStream,
+    /// Create an independent retained decoder on the same host binding.
+    async fn context(
+        label: &str,
     ) -> (
-        SessionIntake,
         Arc<Mutex<TurnContext>>,
         forge_provider_api::ProviderEventStream,
     ) {
-        let (read, _read_peer) = tokio::io::duplex(4096);
-        let (write, _write_peer) = tokio::io::duplex(4096);
-        let client = Client::from_streams(read, write, std::env::temp_dir()).unwrap();
-        fixture_stream_on(stream, ClientGeneration::new(client)).await
-    }
-
-    /// Bind another session reader to the same actual SDK client generation.
-    async fn fixture_stream_on(
-        stream: SessionEventStream,
-        generation: ClientGeneration,
-    ) -> (
-        SessionIntake,
-        Arc<Mutex<TurnContext>>,
-        forge_provider_api::ProviderEventStream,
-    ) {
-        let intake = SessionIntake::new(stream, generation);
-        let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
-        let binding = forge_provider_api::BindingId::new("intake-fixture").unwrap();
-        let (sink, mut observed) = forge_provider_api::events::channel(binding, scope.clone());
+        let scope = InvocationScope::new(ThreadOwner::root("session"), label);
+        let (sink, stream) =
+            forge_provider_api::events::channel(BindingId::new("intake").unwrap(), scope.clone());
+        let sink = sink.activity_writer();
         let mut decoder = CopilotEventDecoder::new(scope, ".".into());
         let mut output = ProviderCompletion {
-            provider_session_id: Some("native".to_owned().try_into().unwrap()),
-            ..Default::default()
-        };
-        decoder
-            .decode(
-                &event("start", "assistant.turn_start", json!({"turnId":"first"})),
-                &mut output,
-                &sink,
-            )
-            .await
-            .unwrap();
-        while observed.try_next().unwrap().is_some() {}
-        let context = Arc::new(Mutex::new(TurnContext {
-            decoder,
-            output,
-            sink,
-        }));
-        (intake, context, observed)
-    }
-
-    /// Native loss wakes a prompt holding the decoder without discarding its buffered prefix.
-    #[tokio::test]
-    async fn active_context_failure_drains_prefix_without_waiting_for_decoder_lock()
-    -> anyhow::Result<()> {
-        let (sender, receiver) = mpsc::channel(2);
-        let (fail, failed) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            failed.await?;
-            Err(ProviderError::Observation(ObservationFailure::Disconnected).into())
-        });
-        let (intake, context, mut observed) =
-            fixture_stream(SessionEventStream::fixture(receiver, task)).await;
-        let mut turn = intake.attach(context.clone()).await?;
-        let mut active = context.lock().await;
-        sender
-            .send(event(
-                "answer",
-                "assistant.message",
-                json!({
-                    "messageId":"answer", "phase":"final_answer", "content":"accepted before loss"
-                }),
-            ))
-            .await?;
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while turn.receiver.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        fail.send(())
-            .map_err(|_| anyhow::anyhow!("native fixture failure waiter closed"))?;
-        drop(sender);
-        let mut failure = intake.failure.clone();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            failure.wait_for(Option::is_some),
-        )
-        .await??;
-
-        let prefix = tokio::time::timeout(std::time::Duration::from_secs(1), turn.recv()).await??;
-        assert_eq!(prefix.id, "answer");
-        let TurnContext {
-            decoder,
-            output,
-            sink,
-        } = &mut *active;
-        decoder.decode(&prefix, output, sink).await?;
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), turn.recv())
-            .await?
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ProviderError::Observation(ObservationFailure::Disconnected)
-        ));
-        assert!(
-            !intake.task.lock().await.as_ref().unwrap().is_finished(),
-            "fixture must retain its decoder lock until foreground loss is delivered"
-        );
-        drop(active);
-        drop(turn);
-
-        let mut prefix_preserved = false;
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                match observed.recv().await? {
-                    Some(event)
-                        if matches!(&event.event, ProviderEvent::Message {
-                        update: MessageUpdate::Completed { text },
-                        ..
-                    } if text == "accepted before loss") =>
-                    {
-                        prefix_preserved = true
-                    }
-                    Some(event)
-                        if matches!(&event.event, ProviderEvent::Execution { observation }
-                        if matches!(
-                            observation.update(),
-                            ExecutionUpdate::ObservationLost {
-                                failure: ObservationFailure::Disconnected,
-                                ..
-                            }
-                        )) =>
-                    {
-                        break;
-                    }
-                    Some(_) => {}
-                    None => anyhow::bail!("native loss was not published"),
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        assert!(
-            prefix_preserved,
-            "accepted native output disappeared before observation loss"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(1), intake.close()).await??;
-        assert!(
-            matches!(
-                *intake.failure.borrow(),
-                Some(ObservationFailure::Disconnected)
-            ),
-            "receiver disposal replaced the original native failure"
-        );
-        Ok(())
-    }
-
-    /// Retain a full bounded startup or foreground burst while the prompt stops receiving.
-    #[tokio::test]
-    async fn bursts_at_capacity_survive_before_attach_and_while_foreground_is_paused() {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            for attached in [false, true] {
-                let (intake, sender, context, _observed) = fixture().await;
-                let mut receiver = if attached {
-                    Some(intake.attach(context.clone()).await.unwrap())
-                } else {
-                    None
-                };
-                let event_count = forge_protocol::MAX_PENDING_FRAMES;
-                for sequence in 0..event_count {
-                    sender
-                        .send(event(
-                            &format!("burst-{sequence}"),
-                            "assistant.message_delta",
-                            json!({"messageId":"answer","deltaContent":sequence.to_string()}),
-                        ))
-                        .await
-                        .unwrap();
-                }
-                while sender.capacity() != sender.max_capacity() {
-                    tokio::task::yield_now().await;
-                }
-                assert!(intake.failure.borrow().is_none());
-                let receiver = match receiver.as_mut() {
-                    Some(receiver) => receiver,
-                    None => receiver.insert(intake.attach(context).await.unwrap()),
-                };
-                for sequence in 0..event_count {
-                    assert_eq!(
-                        receiver.recv().await.unwrap().id,
-                        format!("burst-{sequence}")
-                    );
-                }
-                intake.close().await.unwrap();
-                assert!(!intake.client_stopped());
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    /// Report explicit loss instead of retaining an unbounded paused-reader backlog.
-    #[tokio::test]
-    async fn paused_bursts_over_capacity_publish_sticky_overflow() {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            for attached in [false, true] {
-                let (intake, sender, context, _observed) = fixture().await;
-                let receiver = if attached {
-                    Some(intake.attach(context).await.unwrap())
-                } else {
-                    None
-                };
-                for sequence in 0..=forge_protocol::MAX_PENDING_FRAMES {
-                    sender
-                        .send(event(
-                            &format!("overflow-{sequence}"),
-                            "session.usage_info",
-                            json!({}),
-                        ))
-                        .await
-                        .unwrap();
-                }
-                let mut failure = intake.failure.clone();
-                failure.wait_for(Option::is_some).await.unwrap();
-                assert!(matches!(
-                    *failure.borrow(),
-                    Some(ObservationFailure::Overflow)
-                ));
-                assert!(intake.client_stopped());
-                drop(receiver);
-                intake.close().await.unwrap();
-                assert!(matches!(
-                    *failure.borrow(),
-                    Some(ObservationFailure::Overflow)
-                ));
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    /// Close the receiver before failure publication waits for the prompt's decoder lock.
-    #[tokio::test]
-    async fn observation_loss_releases_locked_prompt_before_publishing_failure() {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let (intake, sender, context, mut observed) = fixture().await;
-            let mut receiver = intake.attach(context.clone()).await.unwrap();
-            let active = context.lock().await;
-            for sequence in 0..forge_protocol::MAX_PENDING_FRAMES {
-                sender.send(event(&format!("prefix-{sequence}"), "session.usage_info", json!({}))).await.unwrap();
-            }
-            while receiver.receiver.len() != forge_protocol::MAX_PENDING_FRAMES {
-                tokio::task::yield_now().await;
-            }
-            intake.client.fail(ObservationFailure::Disconnected);
-            for sequence in 0..forge_protocol::MAX_PENDING_FRAMES {
-                assert_eq!(receiver.recv().await.unwrap().id, format!("prefix-{sequence}"));
-            }
-            assert!(matches!(receiver.recv().await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
-            assert!(intake.client_stopped());
-            drop(active);
-            assert!(matches!(observed.recv().await.unwrap(), Some(event) if matches!(&event.event, ProviderEvent::Execution { observation }
-                if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: ObservationFailure::Disconnected, .. }))));
-            intake.close().await.unwrap();
-            assert!(matches!(intake.attach(context).await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
-        }).await.unwrap();
-    }
-
-    /// A known old message keeps its original sink after another invocation attaches.
-    #[tokio::test]
-    async fn retired_message_never_enters_new_invocation() {
-        let (intake, sender, old, mut observed) = fixture().await;
-        {
-            let mut old = old.lock().await;
-            let TurnContext {
-                decoder,
-                output,
-                sink,
-            } = &mut *old;
-            decoder
-                .decode(
-                    &event(
-                        "old-start",
-                        "assistant.message_start",
-                        json!({
-                            "messageId":"old-message", "phase":"final_answer", "content":"first"
-                        }),
-                    ),
-                    output,
-                    sink,
-                )
-                .await
-                .unwrap();
-        }
-        while observed.try_next().unwrap().is_some() {}
-        drop(intake.attach(old).await.unwrap());
-        let scope = InvocationScope::new(ExecutionOwner::root("session"), "next");
-        let binding = forge_provider_api::BindingId::new("next-intake-fixture").unwrap();
-        let (sink, _next_events) = forge_provider_api::events::channel(binding, scope.clone());
-        let mut decoder = CopilotEventDecoder::new(scope, ".".into());
-        let mut output = ProviderCompletion {
-            provider_session_id: Some("native".to_owned().try_into().unwrap()),
+            provider_session_id: Some("native".try_into().unwrap()),
             ..Default::default()
         };
         decoder
             .decode(
                 &event(
-                    "next-start",
+                    &format!("start-{label}"),
                     "assistant.turn_start",
-                    json!({"turnId":"next"}),
+                    json!({"turnId":"0"}),
                 ),
                 &mut output,
                 &sink,
             )
             .await
             .unwrap();
-        let next = Arc::new(Mutex::new(TurnContext {
-            decoder,
-            output,
-            sink,
-        }));
-        let mut receiver = intake.attach(next).await.unwrap();
-        sender
-            .send(event(
-                "old-delta",
-                "assistant.message_delta",
-                json!({
-                    "messageId":"old-message", "deltaContent":" last"
-                }),
-            ))
-            .await
-            .unwrap();
-        let late = tokio::time::timeout(std::time::Duration::from_secs(1), observed.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            late.event
-                .scope()
-                .invocation()
-                .unwrap()
-                .exchange_id
-                .as_str(),
-            "exchange"
-        );
-        assert!(futures_util::poll!(std::pin::pin!(receiver.recv())).is_pending());
-        drop(receiver);
-        intake.close().await.unwrap();
+        (
+            Arc::new(Mutex::new(TurnContext {
+                decoder,
+                output,
+                sink,
+            })),
+            stream,
+        )
     }
 
-    /// A result observer can leave without discarding subsequent output from its native turn.
+    /// Create a session reader whose producer remains owned until explicit close.
+    async fn fixture() -> (SessionIntake, mpsc::Sender<SessionEvent>) {
+        let (read, _read_peer) = tokio::io::duplex(4096);
+        let (write, _write_peer) = tokio::io::duplex(4096);
+        let client = Client::from_streams(read, write, std::env::temp_dir()).unwrap();
+        let (sender, receiver) = mpsc::channel(32);
+        let producer = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        (
+            SessionIntake::new(
+                SessionEventStream::fixture(receiver, producer),
+                ClientGeneration::new(client),
+            ),
+            sender,
+        )
+    }
+
+    /// Native session errors remain visible before any foreground turn has been admitted.
     #[tokio::test]
-    async fn retained_context_observes_output_after_foreground_receiver_drops() {
-        let (intake, sender, context, mut observed) = fixture().await;
-        drop(intake.attach(context).await.unwrap());
-        sender
-            .send(event(
-                "answer",
-                "assistant.message",
-                json!({"messageId":"answer","phase":"final_answer","content":"late answer"}),
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(event) = observed.recv().await.unwrap()
-                    && let ProviderEvent::Message {
-                        update: MessageUpdate::Completed { text },
-                        ..
-                    } = event.event
-                    && text == "late answer"
-                {
-                    break;
+    async fn unbound_session_error_publishes_without_starting_a_turn() -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (intake, sender) = fixture().await;
+            let owner = ThreadOwner::root("idle-error");
+            let (sink, mut events) = forge_provider_api::events::channel(BindingId::new("idle-error")?, forge_provider_api::EventScope::Binding { owner: owner.clone() });
+            sender.send(event("idle-error", "session.error", json!({"errorType":"query","statusCode":503,"message":"private-native-failure"}))).await?;
+            intake.bind(sink.activity_writer()).await?;
+            let observed = events.recv().await?.unwrap().event;
+            assert!(matches!(&observed, ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::Error { .. } } if thread_id == &owner.thread_id()));
+            assert!(!serde_json::to_string(&observed)?.contains("private-native-failure"));
+            assert!(events.try_next()?.is_none());
+            assert!(intake.failure.borrow().is_none());
+            intake.close().await?;
+            Ok::<(), anyhow::Error>(())
+        }).await?
+    }
+
+    /// A delayed foreground consumer retains every native event beyond the old arbitrary limit.
+    #[tokio::test]
+    async fn paused_bursts_over_capacity_retain_native_order() -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for attached in [false, true] {
+                let (intake, sender) = fixture().await;
+                let (context, _events) = context("burst").await;
+                let mut receiver = if attached {
+                    Some(intake.attach(context.clone()).await?)
+                } else {
+                    None
+                };
+                let count = forge_protocol::MAX_PENDING_FRAMES + 37;
+                for ordinal in 0..count {
+                    sender
+                        .send(event(
+                            &ordinal.to_string(),
+                            "assistant.streaming_delta",
+                            json!({}),
+                        ))
+                        .await?;
                 }
+                if receiver.is_none() {
+                    receiver = Some(intake.attach(context).await?);
+                }
+                let receiver = receiver.as_mut().unwrap();
+                for ordinal in 0..count {
+                    assert_eq!(receiver.recv().await?.id, ordinal.to_string());
+                }
+                assert!(intake.failure.borrow().is_none());
+                intake.close().await?;
             }
+            Ok::<(), anyhow::Error>(())
         })
-        .await
-        .unwrap();
-        intake.close().await.unwrap();
-        intake.client.fail(ObservationFailure::Disconnected);
+        .await?
     }
 
-    /// Uncorrelated native work does not borrow a settled invocation's authority.
+    /// Native loss wakes a foreground owner holding the decoder and retains its queued prefix.
     #[tokio::test]
-    async fn unsolicited_idle_turn_fails_observation() {
-        for native_id in ["first", "second"] {
-            let (intake, sender, context, mut observed) = fixture().await;
-            drop(intake.attach(context).await.unwrap());
+    async fn active_context_failure_drains_prefix_without_waiting_for_decoder_lock()
+    -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (intake, sender) = fixture().await;
+            let (context, mut observed) = context("loss").await;
+            let mut receiver = intake.attach(context.clone()).await?;
+            let mut owned = context.lock().await;
+            sender.send(event("answer", "assistant.message", json!({"messageId":"answer","phase":"final_answer","content":"prefix"}))).await?;
+            while receiver.receiver.is_empty() { tokio::task::yield_now().await; }
+            intake.client.fail(ObservationFailure::Disconnected);
+            let prefix = receiver.recv().await?;
+            let TurnContext { decoder, output, sink } = &mut *owned;
+            decoder.decode(&prefix, output, sink).await?;
+            assert!(matches!(receiver.recv().await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
+            assert!(!intake.task.lock().await.as_ref().unwrap().is_finished());
+            drop(owned);
+            drop(receiver);
+            let mut preserved = false;
+            while let Ok(Some(event)) = observed.try_next() {
+                preserved |= matches!(event.event, ProviderEvent::Item { event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), .. } if completion.text == "prefix");
+            }
+            // The stream may be fenced before a consumer drains it; native output remains in the retained decoder.
+            assert!(preserved || context.lock().await.decoder.owns_event(&prefix));
+            intake.close().await?;
+            Ok::<(), anyhow::Error>(())
+        }).await?
+    }
+
+    /// Late output retains its original item after a successor foreground attaches.
+    #[tokio::test]
+    async fn late_output_after_reattachment_keeps_original_turn() -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (intake, sender) = fixture().await;
+            let (first, mut first_events) = context("first").await;
+            let mut initial = intake.attach(first.clone()).await?;
+            sender.send(event("message", "assistant.message_start", json!({"messageId":"original"}))).await?;
+            let admitted = initial.recv().await?;
+            { let mut context = first.lock().await; let TurnContext { decoder, output, sink } = &mut *context; decoder.decode(&admitted, output, sink).await?; }
+            let original = first.lock().await.decoder.root_address().unwrap();
+            drop(initial);
+            let (second, _second_events) = context("second").await;
+            let mut next = intake.attach(second).await?;
+            sender.send(event("late", "assistant.message", json!({"messageId":"original","content":"late original","phase":"final_answer"}))).await?;
+            let mut found = false;
+            while !found {
+                if let Some(bound) = first_events.recv().await?
+                    && let ProviderEvent::Item { thread_id, turn_id, event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), .. } = bound.event {
+                        assert_eq!(thread_id, original.thread_id); assert_eq!(turn_id, original.turn_id); assert_eq!(completion.text, "late original"); found = true;
+                    }
+            }
+            assert!(next.receiver.try_recv().is_err());
+            intake.close().await?;
+            Ok::<(), anyhow::Error>(())
+        }).await?
+    }
+
+    /// A retained reader rejects new foreground work instead of reopening its retired turn.
+    #[tokio::test]
+    async fn retained_turn_rejects_unowned_native_start() -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (intake, sender) = fixture().await;
+            let (context, _events) = context("retired").await;
+            let receiver = intake.attach(context).await?;
+            drop(receiver);
             sender
                 .send(event(
-                    "unowned-start",
+                    "foreign-start",
                     "assistant.turn_start",
-                    json!({"turnId":native_id}),
+                    json!({"turnId":"0"}),
                 ))
-                .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    let event = observed.recv().await.unwrap().unwrap();
-                    assert!(
-                        !matches!(event.event, ProviderEvent::Turn { .. }),
-                        "unadmitted work reached the host before ownership validation"
-                    );
-                    if let ProviderEvent::Execution { observation } = event.event
-                        && matches!(
-                            observation.update(),
-                            ExecutionUpdate::ObservationLost {
-                                failure: ObservationFailure::UnexpectedExecution,
-                                ..
-                            }
-                        )
-                    {
-                        break;
-                    }
-                }
-            })
-            .await
-            .unwrap();
+                .await?;
+            let mut failures = intake.failure.clone();
+            failures.wait_for(Option::is_some).await?;
             assert!(matches!(
-                *intake.failure.borrow(),
+                *failures.borrow(),
                 Some(ObservationFailure::UnexpectedExecution)
             ));
-            intake.close().await.unwrap();
-        }
-    }
-
-    /// One failed reader wakes all active sessions sharing its native client, even under decoder locks.
-    #[tokio::test]
-    async fn shared_client_failure_wakes_all_session_readers_and_collects_them() {
-        let (first_sender, first_receiver) = mpsc::channel(32);
-        let first_task = tokio::spawn(async {
-            Err(ProviderError::Observation(ObservationFailure::Disconnected).into())
-        });
-        let (first, first_context, _first_observed) =
-            fixture_stream(SessionEventStream::fixture(first_receiver, first_task)).await;
-        let (second_sender, second_receiver) = mpsc::channel(32);
-        let second_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let (second, second_context, _second_observed) = fixture_stream_on(
-            SessionEventStream::fixture(second_receiver, second_task),
-            first.client.clone(),
-        )
-        .await;
-        let mut first_receiver = first.attach(first_context.clone()).await.unwrap();
-        let mut second_receiver = second.attach(second_context.clone()).await.unwrap();
-        let first_guard = first_context.lock().await;
-        let second_guard = second_context.lock().await;
-        drop(first_sender);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            assert!(matches!(
-                first_receiver.recv().await,
-                Err(ProviderError::Observation(ObservationFailure::Disconnected))
-            ));
-            assert!(matches!(
-                second_receiver.recv().await,
-                Err(ProviderError::Observation(ObservationFailure::Disconnected))
-            ));
+            intake.close().await?;
+            Ok::<(), anyhow::Error>(())
         })
-        .await
-        .expect("shared native failure waited for a decoder lock or unrelated sender drop");
-        drop(first_guard);
-        drop(second_guard);
-        drop(first_receiver);
-        drop(second_receiver);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            first.close().await.unwrap();
-            second.close().await.unwrap();
-        })
-        .await
-        .expect("failed generation left intake tasks uncollected");
-        assert!(first.task.lock().await.is_none() && second.task.lock().await.is_none());
-        assert!(
-            second_sender.is_closed(),
-            "collected generation retained an open native stream"
-        );
+        .await?
     }
 }

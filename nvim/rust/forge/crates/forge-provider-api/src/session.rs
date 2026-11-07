@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ExecutionOwner, InvocationScope, ProviderSessionId, SubmissionId};
+use crate::{InvocationScope, ProviderSessionId, SubmissionId, ThreadOwner};
 
 /// Identify one adapter-issued live binding generation independently of durable history.
 /// Each open, including resume, allocates a fresh ID. Retired IDs never authorize work on
@@ -133,7 +133,7 @@ pub enum ForkSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkTarget {
     /// Independent host owner reserved for the staged target history.
-    pub owner: ExecutionOwner,
+    pub owner: ThreadOwner,
     /// Workspace resolving the target's admitted resources.
     pub workspace: String,
     /// Complete resolved defaults for the target; never a patch to the source.
@@ -149,8 +149,10 @@ pub struct ForkTarget {
 /// inherited resources, or instructions before allocating native isolated work.
 #[derive(Clone)]
 pub struct SessionRequest {
+    /// Identify the host conversation before any native history is opened.
+    pub thread_id: crate::ThreadId,
     /// Own the live conversation and its callbacks.
-    pub owner: ExecutionOwner,
+    pub owner: ThreadOwner,
     /// Distinguish persistent interactive, Background, and delegated conversations.
     pub mode: SessionMode,
     /// Select the workspace used to resolve admitted resources.
@@ -172,6 +174,18 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
+    /// Reject a host thread identity that belongs to another registered owner.
+    pub fn validate_thread_owner(&self) -> Result<(), crate::ProviderError> {
+        if self.thread_id != self.owner.thread_id() {
+            return Err(crate::ProviderFailure::new(
+                crate::ProviderOperation::ThreadOpen,
+                crate::ProviderFailureKind::WrongInvocation,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Snapshot complete replay identity without retaining callback or resource ownership.
     pub fn identity(&self) -> crate::SessionRequestIdentity {
         self.into()
@@ -252,6 +266,8 @@ pub struct InvocationConfiguration {
 /// Retain one definitely-undelivered input without flattening its selected skill or question action.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredInput {
+    /// Original logical input and delivery attempt accepted with this grouped prompt.
+    pub covered_input: crate::CoveredInput,
     /// Earlier host input backed by positive proof that its prior attempt was not consumed.
     pub input: crate::input::PromptInput,
     /// Files admitted with that exact earlier input.
@@ -468,6 +484,10 @@ impl std::fmt::Debug for McpTransport {
 /// callback/resource copies when their native scope is collected, keeping only weak replay identity.
 #[derive(Clone)]
 pub struct PromptRequest {
+    /// Address the registered host thread before native dispatch.
+    pub thread_id: crate::ThreadId,
+    /// Address this host response cycle before a native turn exists.
+    pub turn_id: crate::TurnId,
     /// Identify the admitted execution scope.
     pub scope: InvocationScope,
     /// Preserve the user-visible execution mode for this invocation.
@@ -514,6 +534,32 @@ pub struct PromptRequest {
 }
 
 impl PromptRequest {
+    /// Get every original journal attempt accepted by this grouped native input.
+    pub fn input_coverage(&self) -> Vec<crate::CoveredInput> {
+        self.recovered_inputs
+            .iter()
+            .map(|input| input.covered_input.clone())
+            .chain(std::iter::once(crate::CoveredInput::new(
+                self.submission_id.clone(),
+                self.attempt_id.clone(),
+            )))
+            .collect()
+    }
+
+    /// Reject normalized turn identities that do not belong to the admitted host scope.
+    pub fn validate_turn_identity(&self) -> Result<(), crate::ProviderError> {
+        if self.thread_id != self.scope.owner.thread_id()
+            || self.scope.turn_id().as_ref() != Ok(&self.turn_id)
+        {
+            return Err(crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::WrongInvocation,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Snapshot complete replay identity without retaining callback or resource ownership.
     pub fn identity(&self) -> crate::PromptRequestIdentity {
         self.into()
@@ -523,7 +569,9 @@ impl PromptRequest {
 impl PartialEq for PromptRequest {
     /// Compare every immutable input value, attempt, dispatch channel, and callback authority.
     fn eq(&self, other: &Self) -> bool {
-        self.scope == other.scope
+        self.thread_id == other.thread_id
+            && self.turn_id == other.turn_id
+            && self.scope == other.scope
             && self.mode == other.mode
             && self.configuration == other.configuration
             && self.task == other.task
@@ -551,6 +599,8 @@ impl Eq for PromptRequest {}
 /// binding-scoped SessionIdentity observation before host persistence relies on that identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionBinding {
+    /// Retain the host conversation identity independently of native history resolution.
+    pub thread_id: crate::ThreadId,
     /// Identify this exact live reader and callback generation.
     pub id: BindingId,
     /// Identify persisted conversation history, when available.

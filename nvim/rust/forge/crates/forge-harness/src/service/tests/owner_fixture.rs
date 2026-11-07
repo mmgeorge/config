@@ -19,6 +19,8 @@ pub(super) struct OwnerTransitionFixture {
     pub(super) sink: MessageSender,
     pub(super) reader: tokio::task::JoinHandle<Result<()>>,
     pub(super) original: String,
+    /// Identifies the mock hold that keeps the original root invocation running.
+    pub(super) root_hold_id: String,
 }
 
 /// Start one held root invocation without using retired restart or cancellation flags.
@@ -79,7 +81,7 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
         .id;
     let execution_registry = controller.broker.lock().await.execution_registry();
     let engine = execution_registry
-        .owner(crate::provider::ExecutionOwner::root(&session))
+        .owner(crate::provider::ThreadOwner::root(&session))
         .await?;
     Ok(OwnerTransitionFixture {
         root,
@@ -91,6 +93,7 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
         sink,
         reader,
         original,
+        root_hold_id: hold["id"].as_str().unwrap().into(),
     })
 }
 

@@ -17,6 +17,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::observed_agent::recover_observed_agents(&transaction, session_id)?;
         let session_event = {
             let mut statement = transaction
                 .prepare("SELECT payload FROM session_event_record WHERE session_id=?1")?;
@@ -30,14 +31,16 @@ impl SqliteStore {
                 && compaction.state == crate::provider::CompactionState::Running
             {
                 compaction.state = crate::provider::CompactionState::Unconfirmed;
-                compaction.result.diagnostic = Some(forge_provider_api::ProviderDiagnostic {
-                    kind: forge_provider_api::ProviderFailureKind::Transport,
-                    message: forge_provider_api::SanitizedMessage::new(
-                        "Runtime stopped before compaction completion was confirmed",
+                compaction.result.error = Some(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::ThreadCompact,
+                        forge_provider_api::ProviderFailureKind::Transport,
                     )
-                    .expect("static diagnostic is nonempty"),
-                    fatal: false,
-                });
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    ),
+                );
                 transaction.execute(
                     "UPDATE session_event_record SET payload=?2 WHERE id=?1",
                     params![event.id, serde_json::to_string(&event)?],
@@ -97,8 +100,18 @@ impl SqliteStore {
             }
             if exchange.state() == ExchangeState::Finalizing {
                 let outcome = match exchange.finalization_outcome() {
-                    Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Cancelled,
-                    Some(crate::exchange::ExchangeOutcome::Failed) => TurnOutcome::Failed,
+                    Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Interrupted,
+                    Some(crate::exchange::ExchangeOutcome::Failed) => TurnOutcome::Failed {
+                        error: forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Unknown,
+                        )
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Observation,
+                            forge_provider_api::FailureDisposition::Uncertain,
+                        ),
+                        retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+                    },
                     _ => TurnOutcome::Interrupted,
                 };
                 for turn in &mut exchange.turn {
@@ -130,6 +143,7 @@ impl SqliteStore {
         };
         for payload in agent {
             let mut agent: crate::agent::Agent = serde_json::from_str(&payload)?;
+            super::agent_policy::validate(&transaction, &agent)?;
             let mut changed = false;
             if agent.state.is_open() && !agent.is_primary() {
                 agent.state = AgentState::Closed;
@@ -220,8 +234,12 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolOutcome};
     use crate::session::SessionStore;
+    use forge_provider_api::{
+        InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion, ToolDescriptor,
+        ToolItemEvent,
+    };
     use serde_json::json;
 
     #[derive(Clone, Copy, Debug)]
@@ -242,39 +260,56 @@ mod tests {
         for id in ["pending", "settled", "foreground"] {
             turn.record_tool(
                 id,
-                ToolUpdate::Requested {
-                    invocation: ToolInvocation {
-                        semantics: Default::default(),
-                        kind: ToolActivityKind::Command,
-                        name: "exec".into(),
-                        title: id.into(),
-                        arguments: json!({"owner":agent_id}),
-                    },
+                &ItemEvent::Started(ItemStart::CommandExecution(ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "exec".into(),
+                    title: id.into(),
+                    arguments: InspectableArguments::new(json!({"owner":agent_id})),
+                })),
+                11,
+            )?;
+            turn.record_tool(
+                id,
+                &ItemEvent::Tool {
+                    event: ToolItemEvent::ExecutionStarted,
                 },
                 11,
             )?;
-            turn.record_tool(id, ToolUpdate::Started, 11)?;
             turn.record_tool(
                 id,
-                ToolUpdate::Output {
-                    update: TextUpdate::Append(format!("{id}-output\n")),
+                &ItemEvent::Tool {
+                    event: ToolItemEvent::Output(TextUpdate::Append(format!("{id}-output\n"))),
                 },
                 12,
             )?;
             if id != "foreground" {
-                turn.record_tool(id, ToolUpdate::Backgrounded, 12)?;
+                turn.record_tool(
+                    id,
+                    &ItemEvent::Tool {
+                        event: ToolItemEvent::Backgrounded,
+                    },
+                    12,
+                )?;
             }
             if id == "settled" {
                 turn.record_tool(
                     id,
-                    ToolUpdate::Finished {
+                    &ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
                         outcome: ToolOutcome::Succeeded,
-                    },
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    })),
                     20,
                 )?;
             }
         }
-        turn.finish(TurnOutcome::Completed, 30)?;
+        turn.finish(
+            TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            30,
+        )?;
         let mut exchange = turn.into_exchange();
         exchange.finish(crate::exchange::ExchangeOutcome::Complete, 30)?;
         let mut stored = serde_json::to_value(exchange)?;
@@ -345,7 +380,10 @@ mod tests {
                     .1;
                 assert_eq!(pending.state(), crate::turn::ToolState::Interrupted);
                 assert_eq!(pending.completed_at_ms, Some(30));
-                assert_eq!(pending.elapsed_ms(90_000), Some(19));
+                assert_eq!(
+                    pending.elapsed_ms(crate::turn::ToolInstant::wall(90_000)),
+                    Some(19)
+                );
                 assert_eq!(pending.output, "pending-output\n");
                 let settled = recovered
                     .tools()

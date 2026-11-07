@@ -104,7 +104,7 @@ mod tests {
             (
                 codex(
                     CodexConnectionError::Closed("native-secret-code-payload".into()),
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                 ),
                 ProviderFailureKind::Transport,
             ),
@@ -115,7 +115,7 @@ mod tests {
                         failure: None,
                         source: Box::new(std::io::Error::other("native-secret-code-payload")),
                     },
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                 ),
                 ProviderFailureKind::Unknown,
             ),
@@ -126,7 +126,7 @@ mod tests {
                         failure: Some(AcpRemoteFailure::AuthenticationRequired),
                         source: Box::new(std::io::Error::other("native auth detail")),
                     },
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                 ),
                 ProviderFailureKind::Authentication,
             ),
@@ -137,14 +137,14 @@ mod tests {
                         failure: Some(AcpRemoteFailure::Rejected),
                         source: Box::new(std::io::Error::other("native rejection detail")),
                     },
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                 ),
                 ProviderFailureKind::Rejected,
             ),
         ];
         for (error, expected) in failures {
             assert!(
-                matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected && failure.operation() == ProviderOperation::InputSubmit)
+                matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected && failure.operation() == ProviderOperation::TurnStart)
             );
             let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
             while let Some(cause) = source {
@@ -159,7 +159,7 @@ mod tests {
                 method: "session/prompt".into(),
                 failure: Some(AcpRemoteFailure::RequestCancelled),
                 source: Box::new(std::io::Error::other("native cancellation detail")),
-            }, ProviderOperation::InputSubmit),
+            }, ProviderOperation::TurnStart),
             ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Uncertain
         ));
     }
@@ -174,14 +174,14 @@ mod tests {
                 process: Some(std::io::Error::other("native-secret-process-stop")),
                 reader: Some(reader),
             },
-            ProviderOperation::SessionClose,
+            ProviderOperation::ThreadClose,
         );
         let ProviderError::Combined { primary, secondary } = &error else {
             panic!("independent cleanup failures were collapsed")
         };
         assert_eq!(secondary.len(), 1);
         assert!(matches!(primary.as_ref(), ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::SessionClose && failure.phase() == forge_provider_api::ProviderPhase::Collection
+            if failure.operation() == ProviderOperation::ThreadClose && failure.phase() == forge_provider_api::ProviderPhase::Collection
                 && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
         assert!(matches!(&secondary[0], ProviderError::Failure(failure)
             if failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Closed));

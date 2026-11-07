@@ -86,7 +86,7 @@ impl ValidatedModelSelection {
             session.context_usage = None;
         }
         session.model = self.model.clone();
-        session.resolved_model = (self.model != "default").then(|| self.model.clone());
+        session.resolved_model = None;
         session.effort = self.effort.clone();
         session.context_window = None;
         session.service_tier = self.service_tier;
@@ -248,5 +248,27 @@ mod tests {
             ),
             Err(ModelSelectionError::ModelUnavailable)
         ));
+    }
+    #[test]
+    fn selecting_model_configuration_does_not_confirm_native_execution() {
+        let mut session: HarnessSession = serde_json::from_value(serde_json::json!({
+            "id":"session","primary_agent_id":"session:agent:primary","name":"Session","workspace":"workspace","provider":"mock",
+            "provider_fork_state":{"state":"ready"},"model":"default","effort":"default","approval_mode":"ask","created_at_ms":0,"updated_at_ms":0,
+            "resolved_model":"previous-actual"
+        })).unwrap();
+        let selected = ValidatedModelSelection::executor(
+            &PlanExecutor {
+                enabled: true,
+                model: Some("executor".into()),
+                effort: Some("high".into()),
+            },
+            ServiceTier::Standard,
+            &capability(),
+            &catalog(),
+        )
+        .unwrap();
+        selected.apply(&mut session);
+        assert_eq!(session.model, "executor");
+        assert!(session.resolved_model.is_none());
     }
 }

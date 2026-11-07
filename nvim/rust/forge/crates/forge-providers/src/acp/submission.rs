@@ -25,8 +25,8 @@ impl AcpSubmission {
     /// Get the semantic operation for every receipt and native response belonging to this send.
     fn operation(self) -> ProviderOperation {
         match self {
-            Self::Prompt => ProviderOperation::InputSubmit,
-            Self::Steering => ProviderOperation::InputSteer,
+            Self::Prompt => ProviderOperation::TurnStart,
+            Self::Steering => ProviderOperation::TurnSteer,
         }
     }
 
@@ -52,7 +52,7 @@ impl AcpConnection {
             Some("injected") => Ok(SteeringAcceptance::Injected),
             Some("startedNewTurn") => Ok(SteeringAcceptance::UnobservableExecution),
             _ => Err(ProviderFailure::new(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::Protocol,
             )
             .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
@@ -98,10 +98,23 @@ impl AcpConnection {
                 .map_err(|error| crate::error::acp(error, operation))?;
             if kind == AcpSubmission::Prompt {
                 // ACP v1 acknowledges a prompt only after the native turn has ended.
-                super::prompt_outcome(&response).map_err(|_| {
+                let native_end = super::response::NativePromptEnd::parse(
+                    &response,
+                    super::children::timestamp(),
+                )
+                .map_err(|_| {
                     ProviderFailure::new(operation, ProviderFailureKind::Protocol)
                         .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
                 })?;
+                if let Some(receipt) = &receipt {
+                    self.retain_prompt_end(
+                        &forge_provider_api::CoveredInput::new(
+                            receipt.id().clone(),
+                            receipt.attempt_id()?,
+                        ),
+                        native_end,
+                    )?;
+                }
             } else {
                 match response["outcome"].as_str() {
                     Some("injected" | "startedNewTurn") => {}

@@ -211,7 +211,8 @@ impl SettingsSnapshot {
         if let Some(model) = self.provider.get("model").and_then(Value::as_str) {
             ensure!(!model.trim().is_empty(), "saved model cannot be empty");
             session.model = model.to_owned();
-            session.resolved_model = (model != "default").then(|| model.to_owned());
+            // Saved configuration does not confirm the model used by a native turn.
+            session.resolved_model = None;
         }
         if let Some(effort) = self.provider.get("effort").and_then(Value::as_str) {
             ensure!(!effort.trim().is_empty(), "saved effort cannot be empty");
@@ -1871,5 +1872,21 @@ mod test {
         assert_eq!(application.generation, 1);
         assert_eq!(application.desired_revision, 3);
         assert_eq!(application.state, "failed");
+    }
+    #[test]
+    fn saved_provider_default_is_configuration_without_native_confirmation() {
+        let mut session: crate::session::HarnessSession = serde_json::from_value(serde_json::json!({
+            "id":"session","primary_agent_id":"session:agent:primary","name":"Session","workspace":"workspace","provider":"mock",
+            "provider_fork_state":{"state":"ready"},"model":"default","effort":"default","approval_mode":"ask","created_at_ms":0,"updated_at_ms":0
+        })).unwrap();
+        let snapshot = SettingsSnapshot {
+            revision: 1,
+            desired: PortableSettings::default(),
+            provider: serde_json::json!({"model":"saved-model","effort":"high"}),
+        };
+        snapshot.apply_provider_defaults(&mut session).unwrap();
+        assert_eq!(session.model, "saved-model");
+        assert_eq!(session.effort, "high");
+        assert!(session.resolved_model.is_none());
     }
 }

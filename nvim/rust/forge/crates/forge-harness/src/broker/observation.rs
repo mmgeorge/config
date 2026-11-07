@@ -144,9 +144,8 @@ impl BrokerObserver {
             "cannot delete the active session"
         );
         let mut store = SqliteStore::open(&self.data_root)?;
-        let session = store
-            .load_session(&session_id)?
-            .context("session not found")?;
+        let session =
+            super::SessionNotFound::require(store.load_session(&session_id)?, &session_id)?;
         store.delete_session_with(&session_id, || self.plan_file.delete_session(&session.id))?;
         Ok((
             json!({ "deleted": session_id, "provider_session_preserved": true }),
@@ -508,6 +507,10 @@ impl BrokerObserver {
             )?,
             &self.plan_file,
         )?;
+        timeline = TimelineProjector::with_observed_agents(
+            timeline,
+            store.list_observed_agents(&source_session.id)?,
+        )?;
         timeline.push(TimelineEntry::Status {
             checks,
             agent_count: self.agent_coordinator.active_count(),
@@ -518,7 +521,7 @@ impl BrokerObserver {
         });
         let approval = self
             .permission_coordinator
-            .pending_list()?
+            .pending_presentations()?
             .into_iter()
             .filter(|approval| {
                 interaction
@@ -579,6 +582,7 @@ impl BrokerObserver {
                 exchange: agent_exchange_list,
             },
             approval,
+            observed_agents: store.list_observed_agents(&source_session.id)?,
         })
     }
 
@@ -693,9 +697,8 @@ impl BrokerObserver {
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let store = SqliteStore::read_only(&self.data_root)?;
         let session_id = required_text(&params, "session_id")?;
-        let preview_session = store
-            .load_session(&session_id)?
-            .context("session not found")?;
+        let preview_session =
+            super::SessionNotFound::require(store.load_session(&session_id)?, &session_id)?;
         let interaction = store.list_exchange_metadata(&session_id)?;
         let plan_list = store.list_plan(&session_id)?;
         let agent_run_list = store
@@ -729,7 +732,7 @@ impl BrokerObserver {
         )?;
         let timeline = store.with_fork_history(&session_id, timeline, &self.plan_file)?;
         let preview = SessionPreview {
-            lines: preview_lines(&timeline)?,
+            lines: preview_lines(&timeline, Clock::now_ms(&SystemClock))?,
             session: preview_session,
             exchange: interaction,
             timeline,
@@ -977,14 +980,29 @@ mod tests {
     use super::*;
 
     /// Ordered negotiation must change pending task admission without accepting stale revisions.
-    #[test]
-    fn negotiated_task_steering_updates_readiness_and_rejects_stale_snapshots() -> Result<()> {
+    #[tokio::test]
+    async fn negotiated_task_steering_updates_readiness_and_rejects_stale_snapshots() -> Result<()>
+    {
         use forge_provider_api::capability::{CapabilityId, CapabilityManifest, Support};
         let root = tempfile::tempdir()?;
         let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
             "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"capability-owner",
             "provider":{"kind":"mock","command":[]},
         }))?)?;
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            broker.provider.descriptor().clone(),
+            |_, _, _, _| async { panic!("capability fixture never dispatches a prompt") },
+        );
+        let fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(native.clone())?;
+        broker.set_provider_for_test(fixture.provider_handle());
+        let owner = crate::provider::ThreadOwner::root(&broker.session.id);
+        let mut stream = broker.provider.session_events(owner.clone()).await?;
+        broker
+            .provider
+            .thread_open(broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?)
+            .await?;
+        crate::provider::test_support::expect_negotiated_capabilities(&mut stream).await?;
         let mut task = crate::task::Task::goal(
             "Continue through negotiated steering".into(),
             Default::default(),
@@ -1007,30 +1025,175 @@ mod tests {
             .context("capability manifest omits steering")?
             .support = Support::Supported;
         let initial = manifest.clone();
-        let scope = forge_provider_api::EventScope::Binding {
-            owner: crate::provider::ExecutionOwner::root(&broker.session.id),
-        };
-        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
-            scope: scope.clone(),
-            capabilities: manifest.clone(),
-        })?;
-        assert!(broker.observer.input_readiness()?.native_steer);
-        manifest.effective_revision = 2;
-        manifest.task_steering = vec![crate::task::TaskKind::Plan];
-        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
-            scope: scope.clone(),
-            capabilities: manifest,
-        })?;
-        assert!(!broker.observer.input_readiness()?.native_steer);
-        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
-            scope,
-            capabilities: initial,
-        })?;
-        assert!(!broker.observer.input_readiness()?.native_steer);
+        for (reported, expected) in [
+            (manifest.clone(), true),
+            (
+                {
+                    manifest.effective_revision = 2;
+                    manifest.task_steering = vec![crate::task::TaskKind::Plan];
+                    manifest
+                },
+                false,
+            ),
+            (initial, false),
+        ] {
+            native.publish_capabilities(&owner, reported).await?;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv())
+                .await??
+                .context("capability stream ended")?;
+            if let Some((binding, sequence)) = &event.native {
+                broker.provider.event_consumed(binding, *sequence).await?;
+            }
+            broker.observe_session_event(event.event)?;
+            assert_eq!(broker.observer.input_readiness()?.native_steer, expected);
+        }
         assert_eq!(
             broker.latest_manifest.as_ref().unwrap().effective_revision,
             2
         );
+        Ok(())
+    }
+    /// First late native confirmation updates only the latest root cycle of the still-current binding.
+    #[tokio::test]
+    async fn late_first_model_confirmation_respects_latest_root_turn_and_binding() -> Result<()> {
+        use crate::provider::test_support::ProviderTestExt;
+        #[derive(Clone, Copy)]
+        enum Boundary {
+            Current,
+            SuccessorTurn,
+            SuccessorExchange,
+            RetiredBinding,
+        }
+        for boundary in [
+            Boundary::Current,
+            Boundary::SuccessorTurn,
+            Boundary::SuccessorExchange,
+            Boundary::RetiredBinding,
+        ] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            let mut exchange =
+                Exchange::agent_admission(&broker.session.id, 1, "Original".into(), 1);
+            let address = crate::turn::test_support::address(&exchange, "original");
+            let native = crate::provider::test_support::EventFixtureProvider::new(
+                broker.provider.descriptor().clone(),
+                |request, writer, start, _| async move {
+                    start.observed(1).await?;
+                    writer
+                        .send_wait(forge_provider_api::AdapterActivity::Turn {
+                            thread_id: request.thread_id.clone(),
+                            turn_id: request.turn_id.clone(),
+                            event: forge_provider_api::TurnMetadataEvent::ModelResolved(
+                                forge_provider_api::ResolvedModel {
+                                    model_id: forge_provider_api::ModelId::new("native-original")
+                                        .unwrap(),
+                                    observed_at_ms: 2,
+                                },
+                            ),
+                        })
+                        .await?;
+                    Ok(forge_provider_api::TurnResult::new(
+                        forge_provider_api::turn::TurnOutcome::Completed {
+                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                        },
+                        3,
+                        None,
+                        request.input_coverage(),
+                        vec![],
+                        None,
+                    )
+                    .expect("fixture preserves runner-provided input coverage"))
+                },
+            );
+            let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+            broker.set_provider_for_test(fixture.provider_handle());
+            let (sink, mut stream) = crate::provider::events::channel(address.scope.clone());
+            fixture
+                .session_prompt_and_wait(
+                    broker
+                        .provider_request(ProviderInput::from_text("Original"), PromptMode::Chat)?,
+                    sink,
+                )
+                .await?;
+            let mut late = None;
+            while let Some(observation) = stream.try_next()? {
+                if let crate::provider::session_execution::OwnerObservation::Event(event) =
+                    observation
+                {
+                    if matches!(
+                       &event,
+                       HarnessEvent::Native {
+                           event: boxed_native_event,
+                           ..
+                       }
+                    if matches!(boxed_native_event.as_ref(), ProviderEvent::Turn {
+                               event: forge_provider_api::TurnEvent::ModelResolved(_),
+                               ..
+                           }))
+                    {
+                        late = Some(event);
+                    } else {
+                        exchange.observe_event(&event, 3)?;
+                    }
+                }
+            }
+            assert!(exchange.turn.last().unwrap().resolved_model().is_none());
+            let successor = matches!(
+                boundary,
+                Boundary::SuccessorTurn | Boundary::SuccessorExchange
+            );
+            if matches!(boundary, Boundary::SuccessorTurn) {
+                let next = crate::turn::test_support::address(&exchange, "successor");
+                exchange.start_turn(next, 4)?;
+            }
+            broker.store.save_exchange(&exchange)?;
+            if matches!(boundary, Boundary::SuccessorExchange) {
+                let mut next =
+                    Exchange::agent_admission(&broker.session.id, 2, "Successor".into(), 4);
+                let address = crate::turn::test_support::address(&next, "successor");
+                next.start_turn(address, 4)?;
+                broker.store.save_exchange(&next)?;
+            }
+            broker.session.resolved_model = successor.then(|| "successor-confirmed".into());
+            if matches!(boundary, Boundary::RetiredBinding) {
+                tokio::time::timeout(std::time::Duration::from_secs(3), fixture.close()).await??;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    broker.provider.session_close_owner(&address.scope.owner),
+                )
+                .await??;
+            }
+            let updates = broker.observe_session_event(
+                crate::provider::session_execution::OwnerObservation::Event(
+                    late.context("fixture omitted actual model metadata")?,
+                ),
+            )?;
+            let expected = match boundary {
+                Boundary::Current => Some("native-original"),
+                Boundary::SuccessorTurn | Boundary::SuccessorExchange => {
+                    Some("successor-confirmed")
+                }
+                Boundary::RetiredBinding => None,
+            };
+            assert_eq!(broker.session.resolved_model.as_deref(), expected);
+            let original = broker.store.load_exchange(&exchange.id)?.unwrap();
+            assert_eq!(
+                original.turn[0]
+                    .resolved_model()
+                    .map(|model| model.model_id.as_str()),
+                Some("native-original")
+            );
+            assert_eq!(
+                updates
+                    .iter()
+                    .any(|event| event.payload.get("kind").and_then(Value::as_str)
+                        == Some("runtime_resolved")),
+                matches!(boundary, Boundary::Current)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(3), fixture.close()).await??;
+        }
         Ok(())
     }
 }

@@ -101,7 +101,7 @@ mod tests {
             });
             let session = client.create_session(github_copilot_sdk::SessionConfig::default().with_session_id(github_copilot_sdk::SessionId::new("post-dispatch"))).await.unwrap();
             let turn = super::super::turn::CopilotTurnEvent::default();
-            let scope = forge_provider_api::InvocationScope::new(forge_provider_api::ExecutionOwner::root("post-dispatch"), "invocation");
+            let scope = forge_provider_api::InvocationScope::new(forge_provider_api::ThreadOwner::root("post-dispatch"), "invocation");
             let (sink, _events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("binding").unwrap(), scope.clone());
             let guard = turn.activate(Some(sink.clone()), None).unwrap();
             turn.steer_native(None, None, |authority| async {
@@ -112,9 +112,9 @@ mod tests {
                 provider_session_id: Some("post-dispatch".to_owned().try_into().unwrap()), ..Default::default()
             };
             let malformed = serde_json::from_value(json!({"id":"malformed", "type":"assistant.message_delta", "timestamp":"2026-11-04T00:00:00Z", "data":{"deltaContent":"no message identity"}})).unwrap();
-            let error = decoder.decode(&malformed, &mut output, &sink).await.unwrap_err();
+            let error = decoder.decode(&malformed, &mut output, &sink.activity_writer()).await.unwrap_err();
             assert!(matches!(error, forge_provider_api::ProviderError::Failure(failure)
-                if failure.operation() == forge_provider_api::ProviderOperation::InputSubmit
+                if failure.operation() == forge_provider_api::ProviderOperation::TurnStart
                 && failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
                 && failure.phase() == forge_provider_api::ProviderPhase::Observation
                 && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain));
@@ -164,7 +164,7 @@ mod tests {
             let turn = super::super::turn::CopilotTurnEvent::default();
             let guard = turn.activate(None, None).unwrap();
             let scope = forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("handoff"),
+                forge_provider_api::ThreadOwner::root("handoff"),
                 "invocation",
             );
             let submission = forge_provider_api::SubmissionId::try_from("submission").unwrap();

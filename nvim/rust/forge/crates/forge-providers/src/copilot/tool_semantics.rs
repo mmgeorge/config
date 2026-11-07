@@ -1,8 +1,26 @@
-use forge_provider_api::tool::{ToolActivityKind, ToolInvocation, ToolSemantics};
+use forge_provider_api::tool::ToolSemantics;
 use serde_json::Value;
 
+/// Classify native parser input before choosing its canonical item start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeToolKind {
+    Command,
+    FileChange,
+    ToolCall,
+}
+
+/// Retain native argument normalization privately inside the Copilot parser.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct NativeToolDescription {
+    pub(super) name: String,
+    pub(super) title: String,
+    pub(super) semantics: ToolSemantics,
+    pub(super) arguments: Value,
+    pub(super) kind: NativeToolKind,
+}
+
 /// Decode this integration's argument encodings before publishing operation semantics.
-pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
+pub fn normalize_invocation(mut invocation: NativeToolDescription) -> NativeToolDescription {
     if let Some(encoded) = invocation.arguments.as_str()
         && let Ok(decoded) = serde_json::from_str(encoded)
     {
@@ -25,11 +43,10 @@ pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
         .next()
         .unwrap_or(&invocation.name)
         .to_ascii_lowercase();
-    let command = string(&["command", "cmd", "commandLine", "CommandLine"]).or_else(|| {
-        (invocation.kind == ToolActivityKind::Command).then(|| invocation.title.clone())
-    });
+    let command = string(&["command", "cmd", "commandLine", "CommandLine"])
+        .or_else(|| (invocation.kind == NativeToolKind::Command).then(|| invocation.title.clone()));
     if let Some(text) = command.filter(|_| {
-        invocation.kind == ToolActivityKind::Command
+        invocation.kind == NativeToolKind::Command
             || matches!(
                 name.as_str(),
                 "bash" | "powershell" | "shell" | "exec_command" | "run_shell_command"
@@ -39,7 +56,7 @@ pub fn normalize_invocation(mut invocation: ToolInvocation) -> ToolInvocation {
             "bash" | "powershell" => Some(name.clone()),
             _ => None,
         });
-        invocation.kind = ToolActivityKind::Command;
+        invocation.kind = NativeToolKind::Command;
         invocation.title = text.clone();
         invocation.semantics = ToolSemantics::Command {
             text,

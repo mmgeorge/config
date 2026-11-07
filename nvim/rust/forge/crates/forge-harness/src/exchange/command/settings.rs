@@ -198,10 +198,10 @@ pub(crate) enum SettingsPatchError {
     CompactionThreshold,
     /// Approval timers must fit the platform timer range.
     #[error("invalid approval timeout: {0}")]
-    ApprovalTimeout(#[source] forge_provider_api::deadline::InputTimeoutError),
+    ApprovalTimeout(#[source] crate::session::InputTimeoutError),
     /// Tool execution must have a nonzero deadline.
     #[error("invalid tool timeout: {0}")]
-    ToolTimeout(#[source] forge_provider_api::deadline::InputTimeoutError),
+    ToolTimeout(#[source] crate::session::InputTimeoutError),
 }
 
 macro_rules! catalog_selection {

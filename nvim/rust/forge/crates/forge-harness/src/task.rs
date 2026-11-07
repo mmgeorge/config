@@ -19,7 +19,9 @@ pub use active::{
 };
 pub(crate) use active::{TaskReceiptInput, TaskReceiptPermit, TaskSnapshot};
 pub(crate) use controller::TaskChange;
-pub(crate) use controller::{OwnerTaskCommit, SessionTaskController};
+pub(crate) use controller::{
+    OwnerTaskCommit, SessionTaskController, latest_turn_completed_normally,
+};
 pub(crate) use event::TaskEvent;
 pub(crate) use state::TaskNextAction;
 pub use state::{

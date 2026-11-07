@@ -1,6 +1,10 @@
 use super::{SqliteStore, test::session};
 use crate::session::SessionStore;
 use anyhow::Result;
+use forge_provider_api::{
+    InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion, ToolDescriptor,
+    ToolItemEvent,
+};
 use rusqlite::TransactionBehavior;
 
 /// Render a normalized provider failure once even when orchestration adds error context.
@@ -11,14 +15,14 @@ fn provider_failure_display_does_not_repeat_its_source_chain() {
     };
     let failure =
         ProviderError::PreparationFailed(Box::new(ProviderError::Failure(ProviderFailure::new(
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
             ProviderFailureKind::Persistence,
         ))));
     let expected = failure.to_string();
     let error = anyhow::Error::new(failure).context("commit generation failed");
     let displayed = super::error_message(&error);
     assert_eq!(displayed, expected);
-    assert_eq!(displayed.matches("SessionOpen").count(), 1);
+    assert_eq!(displayed.matches("ThreadOpen").count(), 1);
     assert_eq!(displayed.matches("Persistence").count(), 1);
 }
 
@@ -26,7 +30,7 @@ fn provider_failure_display_does_not_repeat_its_source_chain() {
 #[test]
 fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
     use crate::exchange::core_log::{CoreEventLog, CoreOperation, CoreRecord};
-    use forge_provider_api::{EventScope, ExecutionOwner, OperationId, ProviderOperation};
+    use forge_provider_api::{EventScope, OperationId, ProviderOperation, ThreadOwner};
 
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
@@ -55,10 +59,10 @@ fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
     let record = CoreRecord::OperationStarted {
         operation: CoreOperation::Provider {
             id: OperationId::new("first-provider-open")?,
-            kind: ProviderOperation::SessionOpen,
+            kind: ProviderOperation::ThreadOpen,
             binding: None,
             scope: EventScope::Binding {
-                owner: ExecutionOwner::root("current-session"),
+                owner: ThreadOwner::root("current-session"),
             },
             invocation: None,
         },
@@ -302,7 +306,7 @@ fn partial_deletion_recovers_without_blocking_unrelated_writes() -> Result<()> {
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("deleted", "workspace"))?;
     store.save_session(&session("survivor", "workspace"))?;
-    let plans = crate::storage::state::directory(&root.path()).join("plans/deleted");
+    let plans = crate::storage::state::directory(root.path()).join("plans/deleted");
     std::fs::create_dir_all(&plans)?;
     std::fs::write(plans.join("first"), "first")?;
     std::fs::write(plans.join("second"), "second")?;
@@ -365,7 +369,7 @@ fn sqlite_contention_produces_an_actionable_error() -> Result<()> {
 
 #[test]
 fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
-    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolOutcome};
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;
@@ -381,21 +385,25 @@ fn stored_output_is_deferred_and_remains_complete_when_opened() -> Result<()> {
         &mut exchange,
         &address,
         "call",
-        ToolInvocation {
+        ItemStart::CommandExecution(ToolDescriptor {
             semantics: Default::default(),
-            kind: ToolActivityKind::Command,
             name: "read".into(),
             title: "read".into(),
-            arguments: serde_json::json!({}),
-        },
+            arguments: InspectableArguments::new(serde_json::json!({})),
+        }),
         [
-            ToolUpdate::Started,
-            ToolUpdate::Output {
-                update: TextUpdate::Replace(source.clone()),
+            ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
             },
-            ToolUpdate::Finished {
+            ItemEvent::Tool {
+                event: ToolItemEvent::Output(TextUpdate::Replace(source.clone())),
+            },
+            ItemEvent::Completed(ItemCompletion::CommandExecution(ToolCompletion {
                 outcome: ToolOutcome::Succeeded,
-            },
+                descriptor: None,
+                output: None,
+                changes: Default::default(),
+            })),
         ],
         2,
     )?;

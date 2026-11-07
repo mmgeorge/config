@@ -131,7 +131,7 @@ impl ExchangeTransition {
         session: &str,
     ) -> Result<(), TransitionFailure> {
         self.target_capture = TargetCapture::Admission;
-        let owner = crate::provider::ExecutionOwner::root(session);
+        let owner = crate::provider::ThreadOwner::root(session);
         let engine = broker
             .execution_registry()
             .existing_owner(&owner)
@@ -491,8 +491,7 @@ impl ExchangeTransition {
                 let native = matches!(
                     foreground,
                     ForegroundStatus::Active(_) | ForegroundStatus::Local
-                ) || matches!(view.execution, crate::broker::ControlExecution::Native)
-                    || self.invocation.is_some()
+                ) || self.invocation.is_some()
                     || check.is_some();
                 if native {
                     self.foreground_signals.push_back(
@@ -1356,7 +1355,7 @@ async fn collect_resources(
     };
     let _generation = generation;
     let session = services.observer.session_id();
-    let owner = crate::provider::ExecutionOwner::root(session);
+    let owner = crate::provider::ThreadOwner::root(session);
     let approvals = services
         .permissions
         .cancel_owner(&owner, None)
@@ -1415,7 +1414,7 @@ async fn collect_resources(
 /// Normalize an existing host-effect error at the generic collection boundary.
 fn collection_failure(error: anyhow::Error) -> ProviderError {
     let error = crate::provider::lifecycle_error::classify(
-        forge_provider_api::ProviderOperation::Cancel,
+        forge_provider_api::ProviderOperation::TurnInterrupt,
         error,
     );
     if let ProviderError::Failure(failure) = error {

@@ -56,27 +56,21 @@ pub struct CopilotMessageStore {
 }
 
 impl CopilotMessageStore {
-    pub fn has_text(&self) -> bool {
-        self.message
-            .values()
-            .any(|message| !message.text.is_empty())
+    pub fn has_unfinished_text(&self, thread: Option<&str>) -> bool {
+        self.message.iter().any(|((owner, _), message)| {
+            thread == Some(owner.as_str()) && message.published && !message.completed
+        })
     }
 
-    pub fn has_unfinished_text(&self) -> bool {
-        self.message
-            .values()
-            .any(|message| message.published && !message.completed)
-    }
-
-    pub fn interrupt_open(&mut self) -> Vec<(String, String)> {
+    pub fn interrupt_open(&mut self, thread: Option<&str>) -> Vec<((String, String), String)> {
         self.message
             .iter_mut()
             .filter_map(|(key, message)| {
-                if !message.published || message.completed {
+                if thread != Some(key.0.as_str()) || !message.published || message.completed {
                     return None;
                 }
                 message.completed = true;
-                Some(key.clone())
+                Some((key.clone(), message.text.clone()))
             })
             .collect()
     }

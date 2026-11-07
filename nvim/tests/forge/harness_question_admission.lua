@@ -12,7 +12,8 @@ controller.attach_transcript = function() end
 require("forge.views.harness.agent_picker").refresh = function() end
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 require("forge.views.harness.prompt_history").record = function() end
-question.open = function(_, callbacks) picker = callbacks end
+local picker_open_count = 0
+question.open = function(_, callbacks) picker, picker_open_count = callbacks, picker_open_count + 1 end
 state.session = { id = "question-input", provider = "mock", model = "mock", approval_mode = "ask" }
 state.queue = {}
 state.active_elicitation = { owner = "interaction", exchange_id = "exchange",
@@ -31,15 +32,20 @@ end
 input.attach(state, function() end)
 controller.present_plan_question(true)
 picker.ask({ question_id = "choice", text = "First clarification" })
-assert(not state.busy and #state.queue == 0 and state.pending_submit[1].text == "First clarification")
+assert(not require("forge.views.harness.activity").busy(state) and #state.queue == 0 and state.pending_submit[1].text == "First clarification")
+-- An in-flight clarification keeps the question picker closed; the retained callbacks still
+-- model a second clarification racing the first acknowledgement.
 controller.present_plan_question(true)
+assert(picker_open_count == 1, "question picker reopened while a clarification was unacknowledged")
 picker.ask({ question_id = "choice", text = "Second clarification" })
-assert(#state.pending_submit == 1 and #state.pending_steer == 1 and #transport.requests == 1)
+-- Each clarification is its own host input submission; both stay editor drafts until admitted.
+assert(#state.pending_submit == 2 and #state.pending_steer == 0 and #transport.requests == 2)
+assert(state.pending_submit[2].text == "Second clarification")
 transport.complete(transport.requests[1])
 assert(state.question_draft.text == "Second clarification", "older acknowledgement cleared the current draft")
 transport.flush()
 assert(not state.question_draft and not state.execution_notice)
-assert(#state.queue == 0 and #state.pending_submit == 1 and #state.pending_steer == 1 and #errors == 0)
-assert(state.pending_submit[1].intent == "auto" and state.pending_steer[1].intent == "auto")
+assert(#state.queue == 2 and #state.pending_submit == 0 and #state.pending_steer == 0 and #errors == 0)
+assert(state.queue[1].intent == "auto" and state.queue[2].intent == "auto")
 print("harness_question_admission: passed")
 vim.cmd("qa!")

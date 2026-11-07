@@ -162,6 +162,15 @@ impl PathRecord {
     }
 }
 
+/// Names an untracked or ignored entry as Git lists it in status and `ls-files --others`.
+///
+/// Git reports a directory it treats as one unit with a trailing slash: an untracked nested
+/// repository it does not descend into, or a directory collapsed by the untracked or ignored
+/// mode. The record names the directory itself, matching the gix status reader.
+pub fn directory_entry_path(raw: &[u8]) -> Result<RepositoryPath> {
+    RepositoryPath::new(raw.strip_suffix(b"/").unwrap_or(raw).to_vec())
+}
+
 /// Parses NUL-delimited status metadata without decoding repository path bytes as text.
 ///
 /// Reject malformed or truncated records without restricting complete inventory size.
@@ -187,7 +196,7 @@ pub fn parse_porcelain_v2(input: &[u8], hash: gix::hash::Kind) -> Result<Vec<Pat
         if matches!(kind, b'?' | b'!') {
             ensure!(seen.insert(&entry[2..]), "duplicate status path");
             record.push(PathRecord {
-                path: RepositoryPath::new(entry[2..].to_vec())?,
+                path: directory_entry_path(&entry[2..])?,
                 staged: ChangeKind::Unchanged,
                 unstaged: ChangeKind::Unchanged,
                 worktree_mode: None,

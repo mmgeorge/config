@@ -290,10 +290,10 @@ impl MessageSender {
 
     fn admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
         let result = self.try_admit(message, control, terminal);
-        if let Err(error) = &result {
-            if error.kind() != io::ErrorKind::WouldBlock {
-                self.record_failure(error);
-            }
+        if let Err(error) = &result
+            && error.kind() != io::ErrorKind::WouldBlock
+        {
+            self.record_failure(error);
         }
         result
     }

@@ -4,8 +4,7 @@ use forge_provider_api::retained_operation::{IdentityRegistry, Interruption, Sto
 use forge_provider_api::{
     capability::{CapabilityManifest, ProviderFeature, UnsupportedCapability},
     catalog::{McpDefinition, McpQuery, QueryContext, WorkspaceContext},
-    completion::ProviderCompletion,
-    events::{self, EventObserver, ProviderEventSink},
+    events::{self, ProviderEventSink},
     provider::Provider,
     *,
 };
@@ -22,9 +21,10 @@ use tokio::sync::{Mutex, watch};
 
 type PromptHandler = dyn Fn(
         PromptRequest,
-        ProviderEventSink,
+        AdapterActivityWriter,
+        NativeTurnStart,
         watch::Receiver<bool>,
-    ) -> BoxFuture<'static, Result<(), ProviderError>>
+    ) -> BoxFuture<'static, Result<TurnResult, ProviderError>>
     + Send
     + Sync;
 type SteeringHandler =
@@ -41,7 +41,7 @@ type OpenHandler =
 type ConfigureHandler = dyn Fn(BindingId, SessionConfiguration) -> BoxFuture<'static, Result<(), ProviderError>>
     + Send
     + Sync;
-type IdentityHandler = dyn Fn(ExecutionOwner) -> BoxFuture<'static, Result<Option<ProviderSessionId>, ProviderError>>
+type IdentityHandler = dyn Fn(ThreadOwner) -> BoxFuture<'static, Result<Option<ProviderSessionId>, ProviderError>>
     + Send
     + Sync;
 type CleanupHandler =
@@ -57,7 +57,7 @@ struct FixtureOperations {
     fork: Store<SessionForkRequest, ProviderForkResult>,
     compact: Store<(BindingId, provider::CompactionRequest), operations::CompactionResult>,
     close: Store<BindingId, ()>,
-    cancel: Store<(BindingId, CancelRequest), InvocationSettlement>,
+    cancel: Store<(BindingId, CancelRequest), TurnInterruptResult>,
     submit: Store<(BindingId, PromptRequestIdentity), InputAcceptance>,
     steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
     reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
@@ -162,7 +162,7 @@ impl FixtureOperations {
 
 struct FixtureSession {
     binding: SessionBinding,
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     sink: ProviderEventSink,
     admission: Mutex<()>,
     configuration: Mutex<SessionConfiguration>,
@@ -189,34 +189,121 @@ struct FixtureInvocation {
     submission_id: SubmissionId,
     attempt_id: DeliveryAttemptId,
     cancelled: watch::Sender<bool>,
-    settlement: watch::Sender<Option<Result<InvocationSettlement, ProviderError>>>,
+    settlement: watch::Sender<Option<Result<CompletedTurn, ProviderError>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cleanup_request: Mutex<bool>,
     collected: AtomicBool,
+    started: Arc<AtomicBool>,
 }
 
-struct TerminalCapture {
-    result: std::sync::Mutex<Option<ExecutionResult>>,
-}
-
-impl EventObserver for TerminalCapture {
-    /// Retain native terminal evidence independently of the host consuming the event.
-    fn before_delivery(&self, event: &ProviderEvent) -> Result<(), events::EventDeliveryError> {
-        if let ProviderEvent::Execution { observation } = event {
-            match observation.update() {
-                ExecutionUpdate::Finished { result, .. }
-                | ExecutionUpdate::PublicationFailed { result, .. }
-                | ExecutionUpdate::ResolvedWithoutExecution { result, .. }
-                | ExecutionUpdate::ResolutionPublicationFailed { result, .. } => {
-                    *self
-                        .result
-                        .lock()
-                        .expect("fixture terminal capture lock is not poisoned") =
-                        Some(result.clone());
-                }
-                ExecutionUpdate::Started { .. } | ExecutionUpdate::ObservationLost { .. } => {}
+struct FixtureStartObserver(Arc<AtomicBool>);
+impl forge_provider_api::events::EventObserver for FixtureStartObserver {
+    /// Retain positive native start so pre-start cancellation never invalidates a reusable fixture.
+    fn before_delivery(
+        &self,
+        event: &forge_provider_api::ProviderEvent,
+    ) -> Result<(), forge_provider_api::events::EventDeliveryError> {
+        if matches!(
+            event,
+            forge_provider_api::ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Started(_),
+                ..
             }
+        ) {
+            self.0.store(true, Ordering::Release);
         }
+        Ok(())
+    }
+}
+
+struct FixtureDriver {
+    request: PromptRequest,
+    session: Arc<FixtureSession>,
+    invocation: Arc<FixtureInvocation>,
+    handler: Arc<PromptHandler>,
+    pre_dispatch: Option<Arc<PreDispatchHandler>>,
+    admission: Option<Arc<AdmissionHandler>>,
+    cleanup: Option<Arc<CleanupHandler>>,
+    identity: Option<Arc<IdentityHandler>>,
+    context: OperationContext,
+    accepted: std::sync::Mutex<
+        Option<tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>>,
+    >,
+}
+#[async_trait::async_trait]
+impl forge_providers::testing::NativeTurnDriver for FixtureDriver {
+    /// Apply exact journal admission before the fixture's actual native observations.
+    async fn run(&self, start: NativeTurnStart) -> Result<TurnResult, ProviderError> {
+        let request = self.request.clone();
+        let mut cancelled = self.invocation.cancelled.subscribe();
+        let result = async {
+            if *cancelled.borrow() || self.session.closed.load(Ordering::Acquire) {
+                return Err(ProviderError::NotConsumed);
+            }
+            if let Some(hook) = &self.pre_dispatch {
+                tokio::select! {
+                    result = hook(request.clone()) => result.map_err(|cause| ProviderError::PreparationFailed(Box::new(cause)))?,
+                    changed = cancelled.changed() => { let _ = changed; return Err(ProviderError::NotConsumed); }
+                    reason = self.context.interrupted() => return Err(reason.failure(ProviderOperation::TurnStart, ProviderPhase::Preparation, FailureDisposition::Unchanged)),
+                }
+            }
+            if *cancelled.borrow() || self.session.closed.load(Ordering::Acquire) { return Err(ProviderError::NotConsumed); }
+            self.context.check_admission(ProviderOperation::TurnStart)?;
+            let token = RecoveryToken::new(format!("fixture-sending:{}:{}", request.submission_id.as_str(), request.attempt_id.as_str()).into_bytes()).expect("fixture sending evidence is nonempty");
+            request.receipt.clone().record_sending(Some(token)).await?;
+            if *cancelled.borrow() || self.session.closed.load(Ordering::Acquire) {
+                request.receipt.clone().record_rejected(ProviderError::NotConsumed).await?;
+                return Err(ProviderError::NotConsumed);
+            }
+            request.dispatch.confirm();
+            let receipt = match self.admission.as_ref().map_or(Ok(None), |hook| hook(&request)) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if matches!(error, ProviderError::DeliveryUncertain) { request.receipt.clone().record_failure(error.clone()).await?; }
+                    else { request.receipt.clone().record_rejected(error.clone()).await?; }
+                    return Err(error);
+                }
+            };
+            request.receipt.clone().record_accepted(receipt).await?;
+            if let Some(accepted) = self.accepted.lock().expect("fixture acceptance lock is not poisoned").take() { let _ = accepted.send(Ok(InputAcceptance { submission_id: request.submission_id.clone() })); }
+            let writer = self.session.sink.activity_writer().invocation_writer(&request.scope)?;
+            (self.handler)(request, writer, start, cancelled).await
+        }.await;
+        if let Some(accepted) = self
+            .accepted
+            .lock()
+            .expect("fixture acceptance lock is not poisoned")
+            .take()
+        {
+            let _ = accepted.send(Err(result.clone().err().unwrap_or_else(|| {
+                fixture_error(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+            })));
+        }
+        result
+    }
+    /// Notify the original native callback without replacing its terminal classification.
+    async fn interrupt(&self) -> Result<(), ProviderError> {
+        self.invocation.cancelled.send_replace(true);
+        Ok(())
+    }
+    /// Collect original native resources before the real runner publishes completion.
+    async fn collect(&self) -> Result<(), ProviderError> {
+        if let Some(hook) = &self.cleanup {
+            hook(self.session.binding.id.clone()).await?;
+        }
+        if let Some(hook) = &self.identity
+            && let Some(provider_session_id) = hook(self.session.owner.clone()).await?
+        {
+            self.session
+                .sink
+                .activity_writer()
+                .send_wait(AdapterActivity::Thread {
+                    thread_id: self.session.owner.thread_id(),
+                    event: ThreadEvent::IdentityResolved(provider_session_id),
+                })
+                .await?;
+        }
+        self.invocation.collected.store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -233,16 +320,17 @@ pub struct EventFixtureProvider {
     admission: std::sync::RwLock<Option<Arc<AdmissionHandler>>>,
     reconcile: std::sync::RwLock<Option<Arc<ReconcileHandler>>>,
     pre_dispatch: std::sync::RwLock<Option<Arc<PreDispatchHandler>>>,
-    session_open: std::sync::RwLock<Option<Arc<OpenHandler>>>,
-    session_configure: std::sync::RwLock<Option<Arc<ConfigureHandler>>>,
+    thread_open: std::sync::RwLock<Option<Arc<OpenHandler>>>,
+    thread_configure: std::sync::RwLock<Option<Arc<ConfigureHandler>>>,
+    configure_guard: std::sync::RwLock<Option<Arc<ConfigureHandler>>>,
     session_identity: std::sync::RwLock<Option<Arc<IdentityHandler>>>,
     cleanup: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     cleanup_request: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     shutdown: std::sync::RwLock<Option<Arc<ShutdownHandler>>>,
-    session_close: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
+    thread_close: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     mcp: std::sync::RwLock<Option<Arc<McpHandler>>>,
     sessions: Mutex<HashMap<BindingId, Arc<FixtureSession>>>,
-    owners: Mutex<HashMap<ExecutionOwner, BindingId>>,
+    owners: Mutex<HashMap<ThreadOwner, BindingId>>,
     closed_bindings: Mutex<HashSet<BindingId>>,
     closed: AtomicBool,
 }
@@ -251,32 +339,33 @@ impl EventFixtureProvider {
     /// Create a fixture whose ordinary input handler supplies native observations.
     pub fn new<F, Fut>(descriptor: ProviderDescriptor, handler: F) -> Arc<Self>
     where
-        F: Fn(PromptRequest, ProviderEventSink, watch::Receiver<bool>) -> Fut
+        F: Fn(PromptRequest, AdapterActivityWriter, NativeTurnStart, watch::Receiver<bool>) -> Fut
             + Send
             + Sync
             + 'static,
-        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
+        Fut: Future<Output = Result<TurnResult, ProviderError>> + Send + 'static,
     {
         Arc::new_cyclic(|myself| Self {
             myself: myself.clone(),
             operations: Default::default(),
             opened_operations: Default::default(),
             descriptor,
-            handler: Arc::new(move |request, sink, cancelled| {
-                Box::pin(handler(request, sink, cancelled))
+            handler: Arc::new(move |request, sink, start, cancelled| {
+                Box::pin(handler(request, sink, start, cancelled))
             }),
             steering: Default::default(),
             models: Default::default(),
             admission: Default::default(),
             reconcile: Default::default(),
             pre_dispatch: Default::default(),
-            session_open: Default::default(),
-            session_configure: Default::default(),
+            thread_open: Default::default(),
+            thread_configure: Default::default(),
+            configure_guard: Default::default(),
             session_identity: Default::default(),
             cleanup: Default::default(),
             cleanup_request: Default::default(),
             shutdown: Default::default(),
-            session_close: Default::default(),
+            thread_close: Default::default(),
             mcp: Default::default(),
             sessions: Default::default(),
             owners: Default::default(),
@@ -301,10 +390,26 @@ impl EventFixtureProvider {
         Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
     {
         *self
-            .session_open
+            .thread_open
             .write()
             .expect("fixture open hook lock is not poisoned") =
             Some(Arc::new(move |request| Box::pin(handler(request))));
+        self.clone()
+    }
+
+    /// Reject a native configuration admission before changing its applied fixture state.
+    pub fn with_session_configure_guard<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
+    where
+        F: Fn(BindingId, SessionConfiguration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
+    {
+        *self
+            .configure_guard
+            .write()
+            .expect("fixture configure guard lock is not poisoned") =
+            Some(Arc::new(move |binding, configuration| {
+                Box::pin(handler(binding, configuration))
+            }));
         self.clone()
     }
 
@@ -315,7 +420,7 @@ impl EventFixtureProvider {
         Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
     {
         *self
-            .session_configure
+            .thread_configure
             .write()
             .expect("fixture configure hook lock is not poisoned") =
             Some(Arc::new(move |binding, configuration| {
@@ -394,7 +499,7 @@ impl EventFixtureProvider {
     /// Publish late durable identity through normalized binding observations during collection.
     pub fn with_session_identity<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
     where
-        F: Fn(ExecutionOwner) -> Fut + Send + Sync + 'static,
+        F: Fn(ThreadOwner) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Option<ProviderSessionId>, ProviderError>> + Send + 'static,
     {
         *self
@@ -454,7 +559,7 @@ impl EventFixtureProvider {
         Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
     {
         *self
-            .session_close
+            .thread_close
             .write()
             .expect("fixture close hook lock is not poisoned") =
             Some(Arc::new(move |binding| Box::pin(handler(binding))));
@@ -475,8 +580,8 @@ impl EventFixtureProvider {
     /// Clone a binding-scoped sink for capability, identity, and background observations.
     pub async fn event_sink(
         &self,
-        owner: &ExecutionOwner,
-    ) -> Result<ProviderEventSink, ProviderError> {
+        owner: &ThreadOwner,
+    ) -> Result<AdapterActivityWriter, ProviderError> {
         let binding = self
             .owners
             .lock()
@@ -485,25 +590,51 @@ impl EventFixtureProvider {
             .cloned()
             .ok_or_else(|| {
                 fixture_error(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::SessionMissing,
                 )
             })?;
         Ok(self
-            .session(&binding, ProviderOperation::InputSubmit)
+            .session(&binding, ProviderOperation::TurnStart)
             .await?
             .sink
-            .clone())
+            .activity_writer())
+    }
+
+    /// Publish capabilities through the actual owning fixture connection runtime.
+    pub async fn publish_capabilities(
+        &self,
+        owner: &ThreadOwner,
+        capabilities: CapabilityManifest,
+    ) -> Result<(), ProviderError> {
+        let binding = self
+            .owners
+            .lock()
+            .await
+            .get(owner)
+            .cloned()
+            .ok_or_else(|| {
+                fixture_error(
+                    ProviderOperation::ThreadOpen,
+                    ProviderFailureKind::SessionMissing,
+                )
+            })?;
+        self.session(&binding, ProviderOperation::ThreadOpen)
+            .await?
+            .sink
+            .capabilities_changed(capabilities)
+            .await
+            .map_err(Into::into)
     }
 
     /// Bind the original retained stream to an exact invocation for event injection.
     pub async fn invocation_sink(
         &self,
         scope: &InvocationScope,
-    ) -> Result<ProviderEventSink, ProviderError> {
+    ) -> Result<AdapterActivityWriter, ProviderError> {
         self.event_sink(&scope.owner)
             .await?
-            .invocation_sink(scope)
+            .invocation_writer(scope)
             .map_err(Into::into)
     }
 
@@ -547,7 +678,7 @@ impl EventFixtureProvider {
 
 impl FixtureInvocation {
     /// Wait for retained collection evidence independently of any stream consumer.
-    async fn wait(&self) -> Result<InvocationSettlement, ProviderError> {
+    async fn wait(&self) -> Result<CompletedTurn, ProviderError> {
         let mut receiver = self.settlement.subscribe();
         loop {
             if let Some(result) = receiver.borrow_and_update().clone() {
@@ -555,7 +686,7 @@ impl FixtureInvocation {
             }
             if receiver.changed().await.is_err() {
                 return Err(fixture_error(
-                    ProviderOperation::Cancel,
+                    ProviderOperation::TurnInterrupt,
                     ProviderFailureKind::Runtime,
                 ));
             }
@@ -569,22 +700,22 @@ impl EventFixtureProvider {
         context: OperationContext,
         request: SessionRequest,
     ) -> Result<OpenedSession, ProviderError> {
-        context.check_admission(ProviderOperation::SessionOpen)?;
+        context.check_admission(ProviderOperation::ThreadOpen)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         let hook = self
-            .session_open
+            .thread_open
             .read()
             .expect("fixture open hook lock is not poisoned")
             .clone();
         if let Some(hook) = hook {
             tokio::select! {
                 result = hook(request.clone()) => result?,
-                reason = context.interrupted() => return Err(reason.failure(ProviderOperation::SessionOpen, ProviderPhase::Preparation, FailureDisposition::Unchanged)),
+                reason = context.interrupted() => return Err(reason.failure(ProviderOperation::ThreadOpen, ProviderPhase::Preparation, FailureDisposition::Unchanged)),
             }
         }
         if matches!(request.history, SessionHistory::IsolatedText(_))
@@ -594,21 +725,21 @@ impl EventFixtureProvider {
                 || !request.configuration.resources.mcp.is_empty())
         {
             return Err(fixture_error(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Policy,
             ));
         }
         let mut owners = self.owners.lock().await;
-        context.check_admission(ProviderOperation::SessionOpen)?;
+        context.check_admission(ProviderOperation::ThreadOpen)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if owners.contains_key(&request.owner) {
             return Err(fixture_error(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
@@ -621,6 +752,7 @@ impl EventFixtureProvider {
                 .expect("UUID history identity is nonempty")
         });
         let binding = SessionBinding {
+            thread_id: request.thread_id.clone(),
             id: id.clone(),
             provider_session_id: Some(history),
         };
@@ -643,10 +775,10 @@ impl EventFixtureProvider {
         });
         let mut sessions = self.sessions.lock().await;
         let mut opened = self.opened_operations.lock().await;
-        context.check_admission(ProviderOperation::SessionOpen)?;
+        context.check_admission(ProviderOperation::ThreadOpen)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -666,33 +798,42 @@ impl EventFixtureProvider {
         binding: &BindingId,
         configuration: SessionConfiguration,
     ) -> Result<ConfiguredSession, ProviderError> {
-        context.check_admission(ProviderOperation::SessionConfigure)?;
+        context.check_admission(ProviderOperation::ThreadConfigure)?;
         let session = self
-            .session(binding, ProviderOperation::SessionConfigure)
+            .session(binding, ProviderOperation::ThreadConfigure)
             .await?;
         let _admission = session.admission.lock().await;
         if session.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if session.invalidated.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
         if session.state.lock().await.active.is_some() {
             return Err(fixture_error(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
-        context.check_admission(ProviderOperation::SessionConfigure)?;
+        context.check_admission(ProviderOperation::ThreadConfigure)?;
+        let guard = self
+            .configure_guard
+            .read()
+            .expect("fixture configure guard lock is not poisoned")
+            .clone();
+        if let Some(guard) = guard {
+            guard(binding.clone(), configuration.clone()).await?;
+        }
+        context.check_admission(ProviderOperation::ThreadConfigure)?;
         *session.configuration.lock().await = configuration.clone();
         let hook = self
-            .session_configure
+            .thread_configure
             .read()
             .expect("fixture configure hook lock is not poisoned")
             .clone();
@@ -715,7 +856,7 @@ impl EventFixtureProvider {
             return Ok(());
         }
         let session = self
-            .session(binding, ProviderOperation::SessionClose)
+            .session(binding, ProviderOperation::ThreadClose)
             .await?;
         // Revoke authority before waiting for either admission or native cleanup.
         session.closed.store(true, Ordering::Release);
@@ -747,10 +888,7 @@ impl EventFixtureProvider {
                 && task.await.is_err()
             {
                 failure.get_or_insert_with(|| {
-                    fixture_error(
-                        ProviderOperation::SessionClose,
-                        ProviderFailureKind::Runtime,
-                    )
+                    fixture_error(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime)
                 });
             }
             if !invocation.collected.load(Ordering::Acquire) {
@@ -777,7 +915,7 @@ impl EventFixtureProvider {
         }
         // Release the binding only when every retained collection phase has completed.
         let close = self
-            .session_close
+            .thread_close
             .read()
             .expect("fixture close hook lock is not poisoned")
             .clone();
@@ -795,11 +933,13 @@ impl EventFixtureProvider {
 
     async fn cancel_inner(
         &self,
-        _context: OperationContext,
+        context: OperationContext,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
-        let session = self.session(binding, ProviderOperation::Cancel).await?;
+    ) -> Result<TurnInterruptResult, ProviderError> {
+        let session = self
+            .session(binding, ProviderOperation::TurnInterrupt)
+            .await?;
         let invocation = session
             .state
             .lock()
@@ -810,14 +950,32 @@ impl EventFixtureProvider {
             .filter(|invocation| invocation.scope == request.scope)
             .ok_or_else(|| {
                 fixture_error(
-                    ProviderOperation::Cancel,
+                    ProviderOperation::TurnInterrupt,
                     ProviderFailureKind::WrongInvocation,
                 )
             })?;
         if invocation.settlement.borrow().is_none() {
             self.request_collection(&session, &invocation).await?;
         }
-        invocation.wait().await
+        match invocation.wait().await {
+            Ok(_) | Err(ProviderError::NotConsumed) => {}
+            Err(ProviderError::Cancelled)
+                if !invocation.started.load(Ordering::Acquire)
+                    && invocation.collected.load(Ordering::Acquire) => {}
+            Err(_) if invocation.collected.load(Ordering::Acquire) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(TurnInterruptResult {
+            operation_id: context.id().clone(),
+            thread_id: request.scope.owner.thread_id(),
+            turn_id: request.scope.turn_id().map_err(|_| {
+                fixture_error(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?,
+            watermark: session.sink.watermark(),
+        })
     }
 
     async fn submit_inner(
@@ -826,22 +984,20 @@ impl EventFixtureProvider {
         binding: &BindingId,
         request: PromptRequest,
     ) -> Result<InputAcceptance, ProviderError> {
-        context.check_admission(ProviderOperation::InputSubmit)?;
+        context.check_admission(ProviderOperation::TurnStart)?;
         // Reserve the exact invocation before any cancellable preparation or transport work.
-        let session = self
-            .session(binding, ProviderOperation::InputSubmit)
-            .await?;
+        let session = self.session(binding, ProviderOperation::TurnStart).await?;
         let _admission = session.admission.lock().await;
-        context.check_admission(ProviderOperation::InputSubmit)?;
+        context.check_admission(ProviderOperation::TurnStart)?;
         if self.closed.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if session.invalidated.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
@@ -856,17 +1012,17 @@ impl EventFixtureProvider {
             )
         {
             return Err(fixture_error(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         if session.state.lock().await.active.is_some() {
             return Err(fixture_error(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
-        let (cancelled, cancel_receiver) = watch::channel(false);
+        let (cancelled, _cancel_receiver) = watch::channel(false);
         let invocation = Arc::new(FixtureInvocation {
             scope: request.scope.clone(),
             submission_id: request.submission_id.clone(),
@@ -876,243 +1032,105 @@ impl EventFixtureProvider {
             task: Mutex::new(None),
             cleanup_request: Mutex::new(false),
             collected: AtomicBool::new(false),
+            started: Arc::new(AtomicBool::new(false)),
         });
         {
             let mut state = session.state.lock().await;
             if state.invocations.contains_key(&request.scope.invocation_id) {
                 return Err(fixture_error(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::WrongInvocation,
                 ));
             }
-            context.check_admission(ProviderOperation::InputSubmit)?;
+            context.check_admission(ProviderOperation::TurnStart)?;
             state.history_boundary = None;
             state.active = Some(request.scope.invocation_id.clone());
             state
                 .invocations
                 .insert(request.scope.invocation_id.clone(), invocation.clone());
         }
-        let pre_dispatch = self
-            .pre_dispatch
-            .read()
-            .expect("fixture pre-dispatch lock is not poisoned")
-            .clone();
-        let admission = self
-            .admission
-            .read()
-            .expect("fixture admission lock is not poisoned")
-            .clone();
-        let cleanup = self
-            .cleanup
-            .read()
-            .expect("fixture cleanup lock is not poisoned")
-            .clone();
-        let identity = self
-            .session_identity
-            .read()
-            .expect("fixture identity lock is not poisoned")
-            .clone();
-        let handler = self.handler.clone();
-        let task_session = session.clone();
-        let task_invocation = invocation.clone();
         let acceptance = InputAcceptance {
             submission_id: request.submission_id.clone(),
         };
         let (accepted, acceptance_receiver) = tokio::sync::oneshot::channel();
-        let dispatched = Arc::new(AtomicBool::new(false));
-        let worker_dispatched = dispatched.clone();
-        let worker_context = context.clone();
-        // Retain a supervisor which joins the native worker before publishing collection evidence.
-        let task = tokio::spawn(async move {
-            let capture = Arc::new(TerminalCapture {
-                result: std::sync::Mutex::new(None),
-            });
-            let sink = task_session
+        let driver = Arc::new(FixtureDriver {
+            request: request.clone(),
+            session: session.clone(),
+            invocation: invocation.clone(),
+            handler: self.handler.clone(),
+            pre_dispatch: self
+                .pre_dispatch
+                .read()
+                .expect("fixture hook lock is not poisoned")
+                .clone(),
+            admission: self
+                .admission
+                .read()
+                .expect("fixture hook lock is not poisoned")
+                .clone(),
+            cleanup: self
+                .cleanup
+                .read()
+                .expect("fixture hook lock is not poisoned")
+                .clone(),
+            identity: self
+                .session_identity
+                .read()
+                .expect("fixture hook lock is not poisoned")
+                .clone(),
+            context: context.clone(),
+            accepted: std::sync::Mutex::new(Some(accepted)),
+        });
+        let runner = Arc::new(forge_providers::testing::RetainedTurn::spawn(
+            driver,
+            session
                 .sink
-                .invocation_sink(&request.scope)
-                .expect("fixture request owner was validated")
-                .with_observer(capture.clone());
-            let worker_request = request.clone();
-            let worker_sink = sink.clone();
-            let worker_session = task_session.clone();
-            let worker = tokio::spawn(async move {
-                let request = worker_request;
-                let mut cancel_receiver = cancel_receiver;
-                let sink = worker_sink;
-                let task_session = worker_session;
-                let mut accepted = Some(accepted);
-                let execution = async {
-                if let Some(hook) = pre_dispatch {
-                    tokio::select! {
-                        result = hook(request.clone()) => result.map_err(|cause| ProviderError::PreparationFailed(Box::new(cause)))?,
-                        changed = cancel_receiver.changed() => { let _ = changed; return Err(ProviderError::NotConsumed); }
-                        reason = worker_context.interrupted() => return Err(reason.failure(ProviderOperation::InputSubmit, ProviderPhase::Preparation, FailureDisposition::Unchanged)),
+                .clone()
+                .with_observer(Arc::new(FixtureStartObserver(invocation.started.clone()))),
+            TurnAddress {
+                scope: request.scope.clone(),
+                thread_id: request.thread_id.clone(),
+                turn_id: request.turn_id.clone(),
+            },
+        )?);
+        let worker_runner = runner.clone();
+        let task_session = session.clone();
+        let task_invocation = invocation.clone();
+        let task = tokio::spawn(async move {
+            let result = worker_runner.join().await;
+            let unconsumed = !task_invocation.started.load(Ordering::Acquire)
+                && task_invocation.collected.load(Ordering::Acquire)
+                && match &result {
+                    Err(
+                        ProviderError::NotConsumed
+                        | ProviderError::Cancelled
+                        | ProviderError::PreparationFailed(_),
+                    ) => true,
+                    Err(ProviderError::Failure(failure)) => {
+                        failure.disposition() == FailureDisposition::Unchanged
                     }
-                }
-                if *cancel_receiver.borrow() || task_session.closed.load(Ordering::Acquire) { return Err(ProviderError::NotConsumed); }
-                worker_context.check_admission(ProviderOperation::InputSubmit)?;
-                let token = RecoveryToken::new(format!("fixture-sending:{}:{}", request.submission_id.as_str(), request.attempt_id.as_str()).into_bytes()).expect("fixture sending evidence is nonempty");
-                request.receipt.clone().record_sending(Some(token)).await?;
-                let dispatch_admission = if *cancel_receiver.borrow() || task_session.closed.load(Ordering::Acquire) {
-                    Err(ProviderError::NotConsumed)
-                } else { worker_context.check_admission(ProviderOperation::InputSubmit) };
-                if let Err(error) = dispatch_admission {
-                    request.receipt.clone().record_rejected(error.clone()).await?;
-                    return Err(error);
-                }
-                worker_dispatched.store(true, Ordering::Release);
-                request.dispatch.confirm();
-                let receipt = match admission.map_or(Ok(None), |hook| hook(&request)) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        if matches!(error, ProviderError::DeliveryUncertain) {
-                            let recorded = request.receipt.clone().record_failure(error.clone()).await;
-                            let observation = ExecutionObservation::new(request.scope.clone(), ExecutionUpdate::ObservationLost {
-                                failure: ObservationFailure::DeliveryUncertain,
-                                completion: Some(ProviderCompletion { provider_session_id: task_session.binding.provider_session_id.clone(), ..Default::default() }.into()),
-                            }).expect("fixture uncertain delivery retains the exact invocation scope");
-                            let observed = sink.send_wait(ProviderEvent::Execution { observation }).await.map_err(ProviderError::from);
-                            let secondary: Vec<_> = [recorded.err(), observed.err()].into_iter().flatten().collect();
-                            if !secondary.is_empty() { return Err(ProviderError::Combined { primary: Box::new(error), secondary }); }
-                        }
-                        else {
-                            request.receipt.clone().record_rejected(error.clone()).await?;
-                            let result = ExecutionResult::Failed {
-                                completion: ProviderCompletion { provider_session_id: task_session.binding.provider_session_id.clone(), ..Default::default() }.into(),
-                                failure: ExecutionFailure::Rejected,
-                            };
-                            let observation = ExecutionObservation::new(request.scope.clone(), ExecutionUpdate::ResolvedWithoutExecution { covered_submissions: Vec::new(), completed_at_ms: crate::provider::retry::now_ms(), result })
-                                .expect("fixture explicit rejection has no mixed ownership");
-                            sink.send_wait(ProviderEvent::Execution { observation }).await?;
-                        }
-                        return Err(error);
-                    }
+                    Ok(_)
+                    | Err(
+                        ProviderError::RuntimeVersion(_)
+                        | ProviderError::Unsupported(_)
+                        | ProviderError::Delivery(_)
+                        | ProviderError::Contract(_)
+                        | ProviderError::Observation(_)
+                        | ProviderError::Cleanup(_)
+                        | ProviderError::DeliveryUncertain
+                        | ProviderError::Retryable(_)
+                        | ProviderError::Combined { .. }
+                        | ProviderError::PreparationCleanup { .. },
+                    ) => false,
                 };
-                request.receipt.clone().record_accepted(receipt).await?;
-                if let Some(accepted) = accepted.take() { let _ = accepted.send(Ok(InputAcceptance { submission_id: request.submission_id.clone() })); }
-                handler(request.clone(), sink.clone(), cancel_receiver).await
-            }.await;
-                if let Some(accepted) = accepted.take() {
-                    let _ = accepted.send(Err(execution.clone().err().unwrap_or_else(|| {
-                        fixture_error(
-                            ProviderOperation::InputSubmit,
-                            ProviderFailureKind::Protocol,
-                        )
-                    })));
-                }
-                execution
-            });
-            let execution = match worker.await {
-                Ok(execution) => execution,
-                Err(_) => Err(fixture_error(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Runtime,
-                )),
-            };
-            let execution = if !dispatched.load(Ordering::Acquire) && execution.is_err() {
-                let result = ExecutionResult::Failed {
-                    completion: ProviderCompletion {
-                        provider_session_id: task_session.binding.provider_session_id.clone(),
-                        ..Default::default()
-                    }
-                    .into(),
-                    failure: ExecutionFailure::Rejected,
-                };
-                let observation = ExecutionObservation::new(
-                    request.scope.clone(),
-                    ExecutionUpdate::ResolvedWithoutExecution {
-                        covered_submissions: Vec::new(),
-                        completed_at_ms: crate::provider::retry::now_ms(),
-                        result,
-                    },
-                )
-                .expect("fixture pre-dispatch rejection has no mixed ownership");
-                sink.send_wait(ProviderEvent::Execution { observation })
-                    .await
-                    .map_err(Into::into)
-            } else {
-                execution
-            };
-            // Collect native resources independently of host-owned exchange jobs.
-            let collection = async {
-                if let Some(hook) = cleanup {
-                    hook(task_session.binding.id.clone()).await?;
-                }
-                if let Some(hook) = identity
-                    && let Some(provider_session_id) = hook(task_session.owner.clone()).await?
-                {
-                    sink.send_wait(ProviderEvent::SessionIdentity {
-                        scope: request.scope.clone().into(),
-                        provider_session_id,
-                    })
-                    .await?;
-                }
-                Ok::<(), ProviderError>(())
-            }
-            .await;
-            if collection.is_ok() {
-                task_invocation.collected.store(true, Ordering::Release);
-            }
-            let terminal = capture
-                .result
-                .lock()
-                .expect("fixture terminal lock is not poisoned")
-                .clone();
-            let result = match (execution, collection, terminal) {
-                (_, Ok(()), Some(result)) => Ok(InvocationSettlement {
-                    binding_id: task_session.binding.id.clone(),
-                    scope: request.scope.clone(),
-                    result,
-                    watermark: sink.watermark(),
-                }),
-                (Ok(()), Ok(()), None) => Err(ProviderError::Observation(
-                    ObservationFailure::LifecycleUnavailable,
-                )),
-                (Err(primary), Ok(()), None) | (Ok(()), Err(primary), _) => Err(primary),
-                (Err(primary), Err(secondary), _) => Err(ProviderError::Combined {
-                    primary: Box::new(primary),
-                    secondary: vec![secondary],
-                }),
-            };
-            // Publish the exact collection result once, then release the execution slot.
-            let result = match result {
-                Ok(settlement) => sink.send_settlement(settlement).await.map_err(Into::into),
-                Err(error) => {
-                    task_session.invalidated.store(true, Ordering::Release);
-                    let failure = match &error {
-                        ProviderError::Failure(failure) => *failure,
-                        _ => ProviderFailure::new(
-                            ProviderOperation::Cancel,
-                            ProviderFailureKind::Runtime,
-                        )
-                        .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated),
-                    };
-                    let _ = sink
-                        .send_wait(ProviderEvent::SettlementFailed {
-                            scope: request.scope.clone(),
-                            failure,
-                        })
-                        .await;
-                    Err(error)
-                }
-            };
-            if result.is_ok() {
+            if result.is_ok() || unconsumed {
                 let mut state = task_session.state.lock().await;
                 if state.active.as_ref() == Some(&request.scope.invocation_id) {
                     state.active = None;
                 }
-                if let Ok(settlement) = &result {
-                    let completion = match &settlement.result {
-                        ExecutionResult::Completed { completion }
-                        | ExecutionResult::Cancelled { completion }
-                        | ExecutionResult::Failed { completion, .. } => {
-                            ProviderCompletion::from(completion.clone())
-                        }
-                    };
-                    state.history_boundary = completion
-                        .provider_checkpoint_id
-                        .and_then(|boundary| CheckpointId::new(boundary).ok())
-                        .map(|boundary| {
+                if let Ok(completed) = &result {
+                    state.history_boundary =
+                        completed.result().checkpoint_id().cloned().map(|boundary| {
                             (
                                 request.scope.clone(),
                                 request.submission_id.clone(),
@@ -1121,19 +1139,25 @@ impl EventFixtureProvider {
                             )
                         });
                 }
+            } else {
+                task_session.invalidated.store(true, Ordering::Release);
             }
             task_invocation.settlement.send_replace(Some(result));
         });
         *invocation.task.lock().await = Some(task);
         drop(_admission);
-        match acceptance_receiver.await {
-            Ok(result) => result,
-            Err(_) => Err(fixture_error(
-                ProviderOperation::InputSubmit,
+        // A native panic may bypass acceptance publication; retain its actual result instead of
+        // leaving the submission operation waiting on a sender owned by the completed driver.
+        tokio::select! {
+            biased;
+            accepted = acceptance_receiver => accepted.unwrap_or_else(|_| Err(fixture_error(
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Runtime,
-            )),
-        }
-        .map(|_| acceptance)
+            ))),
+            completed = runner.join() => completed.map(|_| acceptance.clone()),
+        }?;
+        runner.started().await?;
+        Ok(acceptance)
     }
 
     async fn steer_inner(
@@ -1142,21 +1166,21 @@ impl EventFixtureProvider {
         binding: &BindingId,
         request: SteeringRequest,
     ) -> Result<SteeringAcceptance, ProviderError> {
-        context.check_admission(ProviderOperation::InputSteer)?;
+        context.check_admission(ProviderOperation::TurnSteer)?;
         if !self.descriptor.capability.native_steer {
             return Err(UnsupportedCapability(ProviderFeature::NativeSteer).into());
         }
-        let session = self.session(binding, ProviderOperation::InputSteer).await?;
+        let session = self.session(binding, ProviderOperation::TurnSteer).await?;
         let _admission = session.admission.lock().await;
         if session.closed.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if session.invalidated.load(Ordering::Acquire) {
             return Err(fixture_error(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
@@ -1173,7 +1197,7 @@ impl EventFixtureProvider {
             .filter(|invocation| invocation.scope == request.scope)
             .ok_or_else(|| {
                 fixture_error(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::WrongInvocation,
                 )
             })?;
@@ -1203,7 +1227,7 @@ impl EventFixtureProvider {
             tokio::select! {
                 result = hook(request) => result,
                 reason = context.interrupted() => Err(reason.failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderPhase::Observation,
                     FailureDisposition::Uncertain,
                 )),
@@ -1216,7 +1240,7 @@ impl EventFixtureProvider {
                 &error,
                 ProviderError::NotConsumed | ProviderError::PreparationFailed(_)
             ) || matches!(&error, ProviderError::Failure(failure)
-                if failure.operation() == ProviderOperation::InputSteer
+                if failure.operation() == ProviderOperation::TurnSteer
                     && matches!(failure.phase(), ProviderPhase::Admission | ProviderPhase::Preparation)
                     && failure.disposition() == FailureDisposition::Unchanged);
             if let Some(receipt) = &receipt {
@@ -1309,17 +1333,17 @@ impl EventFixtureProvider {
             ));
         };
         let settlement = invocation.settlement.borrow().clone();
-        let Some(Ok(InvocationSettlement {
-            result: ExecutionResult::Cancelled { completion },
-            ..
-        })) = settlement
-        else {
+        let Some(Ok(completed)) = settlement else {
             return Ok(InputRetractOutcome::Unavailable(
                 InputRetractUnavailable::NotCancelled,
             ));
         };
-        let completion = ProviderCompletion::from(completion);
-        if completion.provider_checkpoint_id.as_deref() != Some(request.boundary.as_str())
+        if completed.result().outcome() != turn::TurnOutcome::Interrupted {
+            return Ok(InputRetractOutcome::Unavailable(
+                InputRetractUnavailable::NotCancelled,
+            ));
+        }
+        if completed.result().checkpoint_id() != Some(&request.boundary)
             || state.history_boundary.as_ref()
                 != Some(&(
                     request.scope.clone(),
@@ -1425,7 +1449,7 @@ impl EventFixtureProvider {
 
 #[async_trait::async_trait]
 impl Provider for EventFixtureProvider {
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: OperationContext,
         request: SessionRequest,
@@ -1442,13 +1466,13 @@ impl Provider for EventFixtureProvider {
             .open
             .take(
                 context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 request.identity(),
                 async move { owner.open_inner(work_context, work_request).await },
                 move |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionOpen,
+                            ProviderOperation::ThreadOpen,
                             ProviderPhase::Preparation,
                             FailureDisposition::Uncertain,
                         ),
@@ -1472,7 +1496,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1489,7 +1513,7 @@ impl Provider for EventFixtureProvider {
             .configure
             .observe(
                 context,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 payload,
                 async move {
                     owner
@@ -1499,7 +1523,7 @@ impl Provider for EventFixtureProvider {
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionConfigure,
+                            ProviderOperation::ThreadConfigure,
                             ProviderPhase::Preparation,
                             FailureDisposition::Uncertain,
                         ),
@@ -1510,7 +1534,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: OperationContext,
         request: SessionForkRequest,
@@ -1519,13 +1543,13 @@ impl Provider for EventFixtureProvider {
             .fork
             .observe(
                 context,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 request,
                 async { Err(UnsupportedCapability(ProviderFeature::NativeFork).into()) },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionFork,
+                            ProviderOperation::ThreadFork,
                             ProviderPhase::Admission,
                             FailureDisposition::Unchanged,
                         ),
@@ -1536,7 +1560,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1547,13 +1571,13 @@ impl Provider for EventFixtureProvider {
             .compact
             .observe(
                 context,
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 (binding.clone(), request),
                 async { Err(UnsupportedCapability(ProviderFeature::NativeCompact).into()) },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionCompact,
+                            ProviderOperation::ThreadCompact,
                             ProviderPhase::Admission,
                             FailureDisposition::Unchanged,
                         ),
@@ -1564,7 +1588,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1580,13 +1604,13 @@ impl Provider for EventFixtureProvider {
             .close
             .observe(
                 context,
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 payload,
                 async move { owner.close_inner(work_context, &binding).await },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderPhase::Close,
                             FailureDisposition::Invalidated,
                         ),
@@ -1597,12 +1621,12 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError> {
+    ) -> Result<TurnInterruptResult, ProviderError> {
         let owner = self
             .myself
             .upgrade()
@@ -1614,13 +1638,13 @@ impl Provider for EventFixtureProvider {
             .cancel
             .observe(
                 context,
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 payload,
                 async move { owner.cancel_inner(work_context, &binding, request).await },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::Cancel,
+                            ProviderOperation::TurnInterrupt,
                             ProviderPhase::Collection,
                             FailureDisposition::Uncertain,
                         ),
@@ -1631,7 +1655,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1652,19 +1676,19 @@ impl Provider for EventFixtureProvider {
             .submit
             .observe(
                 context,
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 payload,
                 async move { owner.submit_inner(work_context, &binding, request).await },
                 move |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::InputSubmit,
+                            ProviderOperation::TurnStart,
                             ProviderPhase::Observation,
                             FailureDisposition::Uncertain,
                         ),
                         async move {
                             let session = cleanup_owner
-                                .session(&cleanup_binding, ProviderOperation::InputSubmit)
+                                .session(&cleanup_binding, ProviderOperation::TurnStart)
                                 .await?;
                             let admitted = session
                                 .state
@@ -1693,7 +1717,7 @@ impl Provider for EventFixtureProvider {
             .await
     }
 
-    async fn input_steer(
+    async fn turn_steer(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -1710,13 +1734,13 @@ impl Provider for EventFixtureProvider {
             .steer
             .observe(
                 context,
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 payload,
                 async move { owner.steer_inner(work_context, &binding, request).await },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::InputSteer,
+                            ProviderOperation::TurnSteer,
                             ProviderPhase::Observation,
                             FailureDisposition::Uncertain,
                         ),
@@ -2036,7 +2060,7 @@ pub async fn call_tool(
 ) -> Result<serde_json::Value, ProviderError> {
     if !request.tools.iter().any(|tool| tool.name == name) {
         return Err(fixture_error(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             ProviderFailureKind::Authorization,
         ));
     }
@@ -2052,12 +2076,7 @@ pub async fn call_tool(
             },
         )
         .await?;
-    serde_json::from_str(&output).map_err(|_| {
-        fixture_error(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
-        )
-    })
+    Ok(serde_json::from_str(&output).unwrap_or_else(|_| serde_json::Value::String(output)))
 }
 
 #[cfg(test)]
@@ -2095,14 +2114,22 @@ mod tests {
                 label: "Close fixture".into(),
                 capability: ProviderCapability::default(),
             },
-            |_request, _sink, _cancelled| async { Ok(()) },
+            |request, _sink, start, _cancelled| async move {
+                start.observed(1).await?;
+                Ok(super::super::native_result(
+                    &request,
+                    turn::TurnOutcome::Completed {
+                        stop_reason: turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            },
         )
         .with_session_close(move |_binding| {
             let attempt = observed_closes.fetch_add(1, Ordering::AcqRel);
             async move {
                 if attempt == 0 {
                     return Err(fixture_error(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Transport,
                     ));
                 }
@@ -2110,10 +2137,11 @@ mod tests {
             }
         });
         let mut opened = provider
-            .session_open(
+            .thread_open(
                 operation("open-before-repair"),
                 SessionRequest {
-                    owner: ExecutionOwner::root("close-owner"),
+                    thread_id: (ThreadOwner::root("close-owner")).thread_id(),
+                    owner: ThreadOwner::root("close-owner"),
                     mode: SessionMode::Interactive,
                     workspace: ".".into(),
                     history: SessionHistory::Durable { resume: None },
@@ -2134,7 +2162,7 @@ mod tests {
         let binding = opened.binding.id.clone();
         let original = operation("original-close-failure");
         let error = provider
-            .session_close(original.clone(), &binding)
+            .thread_close(original.clone(), &binding)
             .await
             .unwrap_err();
         assert!(
@@ -2145,22 +2173,19 @@ mod tests {
             "failed release discarded native ownership"
         );
         provider
-            .session_close(operation("fresh-close-repair"), &binding)
+            .thread_close(operation("fresh-close-repair"), &binding)
             .await?;
         assert!(!provider.sessions.lock().await.contains_key(&binding));
         assert!(
             opened.events.recv().await?.is_none(),
             "repaired binding retained its stream producer"
         );
-        let original_error = provider
-            .session_close(original, &binding)
-            .await
-            .unwrap_err();
+        let original_error = provider.thread_close(original, &binding).await.unwrap_err();
         assert!(
             matches!(original_error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Transport)
         );
         provider
-            .session_close(operation("already-closed-proof"), &binding)
+            .thread_close(operation("already-closed-proof"), &binding)
             .await?;
         assert_eq!(
             close_count.load(Ordering::Acquire),

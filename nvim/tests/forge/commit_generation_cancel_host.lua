@@ -5,7 +5,8 @@ local fixture, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(fixture, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 local builder = require("forge.builder")
 local binary = data .. "/forge-cancellation-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(builder.binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 builder.ensure = function(callback) callback({ ok = true, path = binary }) return function() end end
 client._host_set_launcher_for_test(vim.system)
 local original_stdpath = vim.fn.stdpath

@@ -394,10 +394,8 @@ impl MarkdownRenderer {
                             state.capture.push("@markup.link.label");
                         }
                         Tag::Table(_) | Tag::TableHead | Tag::TableRow => state.break_row(false)?,
-                        Tag::TableCell => {
-                            if !state.row.last().unwrap().is_empty() {
-                                state.append(" │ ", false)?;
-                            }
+                        Tag::TableCell if !state.row.last().unwrap().is_empty() => {
+                            state.append(" │ ", false)?;
                         }
                         _ => {}
                     }

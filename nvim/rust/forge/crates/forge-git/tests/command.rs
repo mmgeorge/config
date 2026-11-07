@@ -2,7 +2,9 @@ use std::io::Write;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use forge_git::command::{CommandLimits, read_command, read_command_pair};
+use forge_git::command::{
+    CommandLimits, read_command, read_command_pair, read_command_with_expiry,
+};
 
 fn fixture(name: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -95,17 +97,16 @@ fn complete_stdout_and_stderr_cross_former_stream_caps_without_truncation() {
 
 #[test]
 fn deadline_terminates_and_reaps_a_sleeping_child() {
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let ready = fixture_dir.path().join("sleeping-child.ready");
+    let mut command = fixture("command_child_wait");
+    command.env("FORGE_TEST_READY", &ready);
     let started = Instant::now();
-    let error = read_command(
-        &mut fixture("command_child_wait"),
-        CommandLimits {
-            timeout: Duration::from_millis(100),
-            ..limits()
-        },
-        || Ok(()),
-    )
-    .unwrap_err();
+    // The deadline expires once the child confirms it is sleeping, not after a wall-clock delay.
+    let error =
+        read_command_with_expiry(&mut command, limits(), || ready.exists(), || Ok(())).unwrap_err();
     assert!(error.to_string().contains("deadline"));
+    // Returning before the child's 10-second sleep ends proves termination and reaping.
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
@@ -130,13 +131,15 @@ fn cancellation_terminates_a_descendant_holding_inherited_pipes() {
     let ready = marker.with_extension("ready");
     let mut command = fixture("command_child_descendant");
     command.env("FORGE_TEST_MARKER", &marker);
+    // The descendant writes `ready` itself, so cancellation fires while it holds the pipes.
     let error = read_command(&mut command, limits(), || {
         anyhow::ensure!(!ready.exists(), "cancel descendant tree");
         Ok(())
     })
     .unwrap_err();
     assert!(error.to_string().contains("cancel descendant tree"));
-    std::thread::sleep(Duration::from_millis(1100));
+    // Collection returns only after every holder of the output pipes closes them, so the
+    // descendant has exited and the marker state is final without waiting past its sleep.
     assert!(!marker.exists(), "descendant survived command cancellation");
 }
 
@@ -144,19 +147,15 @@ fn cancellation_terminates_a_descendant_holding_inherited_pipes() {
 fn deadline_terminates_descendants_after_the_direct_child_exits() {
     let fixture_dir = tempfile::tempdir().unwrap();
     let marker = fixture_dir.path().join("exited-parent-marker");
+    let ready = marker.with_extension("ready");
     let mut command = fixture("command_child_descendant_exits");
     command.env("FORGE_TEST_MARKER", &marker);
-    let error = read_command(
-        &mut command,
-        CommandLimits {
-            timeout: Duration::from_millis(300),
-            ..limits()
-        },
-        || Ok(()),
-    )
-    .unwrap_err();
+    // The orphan writes `ready` only after its parent exits, so expiry follows the parent's exit.
+    let error =
+        read_command_with_expiry(&mut command, limits(), || ready.exists(), || Ok(())).unwrap_err();
     assert!(error.to_string().contains("deadline"));
-    std::thread::sleep(Duration::from_millis(1100));
+    // Collection returns only after every holder of the output pipes closes them, so the orphan
+    // has exited and the marker state is final without waiting past the orphan's sleep.
     assert!(
         !marker.exists(),
         "descendant survived after its parent exited"
@@ -166,14 +165,71 @@ fn deadline_terminates_descendants_after_the_direct_child_exits() {
 #[cfg(windows)]
 #[test]
 fn job_object_terminates_descendants_after_owner_abort() {
+    use std::io::Read;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    use windows::core::PCWSTR;
+
     let fixture_dir = tempfile::tempdir().unwrap();
     let marker = fixture_dir.path().join("owner-abort-marker");
-    let output = fixture("command_owner_abort")
+    // The orphan's output pipes belong to the aborted owner, so the test serves its own pipe that
+    // the descendant holds open until it exits.
+    let liveness_pipe = format!(r"\\.\pipe\forge-git-owner-abort-{}", std::process::id());
+    let wide_pipe_name: Vec<u16> = liveness_pipe.encode_utf16().chain([0]).collect();
+    // SAFETY: the name is NUL-terminated and outlives the call. Passing no security attributes
+    // keeps the server handle out of the owner fixture's inherited handles.
+    let server = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(wide_pipe_name.as_ptr()),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            0,
+            0,
+            0,
+            None,
+        )
+    };
+    assert_ne!(server, INVALID_HANDLE_VALUE, "create liveness pipe");
+    // SAFETY: CreateNamedPipeW returned a valid handle that nothing else owns.
+    let server = unsafe { OwnedHandle::from_raw_handle(server.0) };
+    let mut owner = fixture("command_owner_abort");
+    owner
         .env("FORGE_TEST_MARKER", &marker)
-        .output()
+        .env("FORGE_TEST_LIVENESS_PIPE", &liveness_pipe)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut owner = owner.spawn().unwrap();
+    let owner_exit = std::thread::spawn({
+        let liveness_pipe = liveness_pipe.clone();
+        move || {
+            let status = owner.wait().unwrap();
+            // Unblock the connection wait when the owner exits before its descendant connects.
+            // A connected descendant keeps the single pipe instance busy, so this open then fails.
+            let _ = std::fs::OpenOptions::new().write(true).open(&liveness_pipe);
+            status
+        }
+    });
+    // SAFETY: `server` keeps the pipe handle open for the duration of the call.
+    match unsafe { ConnectNamedPipe(HANDLE(server.as_raw_handle()), None) } {
+        Ok(()) => {}
+        Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => {}
+        Err(error) => panic!("connect liveness pipe: {error}"),
+    }
+    let mut handshake = Vec::new();
+    // Reading ends only when the client handle closes, which the descendant defers until exit.
+    std::fs::File::from(server)
+        .read_to_end(&mut handshake)
         .unwrap();
-    assert!(!output.status.success());
-    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!owner_exit.join().unwrap().success());
+    assert_eq!(
+        handshake, b"ready",
+        "descendant never held the liveness pipe"
+    );
     assert!(!marker.exists(), "descendant survived owner abort");
 }
 
@@ -184,7 +240,6 @@ fn command_child_descendant() {
     let mut descendant = fixture("command_descendant_marker");
     descendant.env("FORGE_TEST_MARKER", &marker);
     let mut descendant = descendant.spawn().unwrap();
-    std::fs::write(marker.with_extension("ready"), b"ready").unwrap();
     std::thread::sleep(Duration::from_secs(10));
     descendant.wait().unwrap();
 }
@@ -194,8 +249,11 @@ fn command_child_descendant() {
 fn command_child_descendant_exits() {
     let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
     let mut descendant = fixture("command_descendant_marker");
-    descendant.env("FORGE_TEST_MARKER", &marker);
-    descendant.spawn().unwrap();
+    descendant
+        .env("FORGE_TEST_MARKER", &marker)
+        .stdin(std::process::Stdio::piped());
+    // The leaked stdin writer closes only when this process exits.
+    std::mem::forget(descendant.spawn().unwrap());
     // This fixture exits while its child retains the output pipes, exercising orphan collection.
     std::process::exit(0);
 }
@@ -203,8 +261,21 @@ fn command_child_descendant_exits() {
 #[test]
 #[ignore = "subprocess fixture invoked by command ownership tests"]
 fn command_descendant_marker() {
-    std::thread::sleep(Duration::from_millis(750));
+    // Stdin reaches end of file once its writer closes: immediately for inherited null input, or
+    // when a parent holding a piped writer exits, so readiness then implies the parent is gone.
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
     let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
+    // Held until exit, so the owning test observes this process's termination as pipe closure.
+    let _liveness = std::env::var_os("FORGE_TEST_LIVENESS_PIPE").map(|liveness_pipe| {
+        let mut client = std::fs::OpenOptions::new()
+            .write(true)
+            .open(liveness_pipe)
+            .unwrap();
+        client.write_all(b"ready").unwrap();
+        client
+    });
+    std::fs::write(marker.with_extension("ready"), b"ready").unwrap();
+    std::thread::sleep(Duration::from_secs(10));
     std::fs::write(marker, b"survived").unwrap();
 }
 
@@ -296,6 +367,9 @@ fn command_child_stderr() {
 #[test]
 #[ignore = "subprocess fixture invoked by command ownership tests"]
 fn command_child_wait() {
+    if let Some(ready) = std::env::var_os("FORGE_TEST_READY") {
+        std::fs::write(ready, b"ready").unwrap();
+    }
     std::thread::sleep(Duration::from_secs(10));
 }
 

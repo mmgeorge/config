@@ -701,14 +701,10 @@ fn handshake_response(envelope: RoutedRequestEnvelope) -> Result<Response> {
 }
 
 fn request_failure_response(request_id: u64, error: &anyhow::Error) -> Response {
-    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
-        "not_admitted"
-    } else if error.is::<forge_harness::broker::TurnCancelled>() {
-        "turn_cancelled"
-    } else if error.is::<forge_harness::buffer::TranscriptProjectionFailure>() {
+    let code = if error.is::<forge_harness::buffer::TranscriptProjectionFailure>() {
         "invalid_state"
     } else {
-        "request_failed"
+        forge_harness::broker::request_failure_code(error)
     };
     Response::failure(
         request_id,
@@ -812,6 +808,22 @@ mod tests {
                 .unwrap()
                 .code,
             "not_admitted"
+        );
+    }
+
+    /// Report a missing session distinctly so clients stop retrying reads of a deleted session.
+    #[test]
+    fn missing_session_is_session_not_found_through_context() {
+        let error = anyhow::Error::new(forge_harness::broker::SessionNotFound {
+            session_id: "deleted".into(),
+        })
+        .context("resume Harness session");
+        let response = request_failure_response(43, &error);
+        let failure = response.error().unwrap();
+        assert_eq!(failure.code, "session_not_found");
+        assert_eq!(
+            failure.message,
+            "resume Harness session: session not found: deleted"
         );
     }
 

@@ -16,6 +16,8 @@ pub struct ControlTurnContext {
     pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
     /// Commit live callback effects before acknowledging the native tool call.
     pub(crate) live_host_effects: Option<crate::provider::LiveHostEffectSender>,
+    /// Retain registered native-child physical facts on its binding-owned observation channel.
+    pub(crate) observed_file_changes: Option<crate::provider::HarnessEventSink>,
     pub(crate) question_exchange_id: Option<String>,
     /// Authenticated provider invocation bound by the host control endpoint.
     pub(crate) question_invocation: Option<crate::provider::InvocationScope>,
@@ -73,6 +75,68 @@ pub(crate) struct ProviderExecutionPreview {
 }
 
 impl ControlTurnContext {
+    /// Fork independent native-child tool ownership after exact original registration and sink validation.
+    pub(crate) fn fork_observed(
+        &self,
+        association: &crate::provider::ObservedAgentAssociation,
+        sink: crate::provider::HarnessEventSink,
+    ) -> std::result::Result<Self, crate::provider::ProviderError> {
+        let rejected = || {
+            crate::provider::ProviderError::Observation(
+                forge_provider_api::ObservationFailure::OwnershipConflict,
+            )
+        };
+        let scope = association.turn().cloned().ok_or_else(rejected)?;
+        if self.question_invocation.as_ref() != Some(association.parent())
+            || sink.scope().invocation() != Some(&scope)
+        {
+            return Err(rejected());
+        }
+        let mut context = self.clone();
+        context.provider_completion = Arc::default();
+        context.lsp = self
+            .lsp
+            .as_ref()
+            .map(|lsp| lsp.fork_observed(&scope))
+            .transpose()
+            .map_err(|error| {
+                crate::provider::lifecycle_error::classify_source(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    error.as_ref(),
+                )
+            })?;
+        context.repository = self
+            .repository
+            .as_ref()
+            .map(|repository| repository.fork_observed(&scope))
+            .transpose()
+            .map_err(|error| {
+                crate::provider::lifecycle_error::classify_source(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    error.as_ref(),
+                )
+            })?;
+        context.question_invocation = Some(scope.clone());
+        context.question_exchange_id = Some(scope.exchange_id.to_string());
+        context.live_host_effects = None;
+        context.observed_file_changes = Some(sink);
+        context.submission_cancelled = None;
+        context.task_permit = self.current_task_permit().map_err(|error| {
+            crate::provider::lifecycle_error::classify_source(
+                forge_provider_api::ProviderOperation::TurnStart,
+                error.as_ref(),
+            )
+        })?;
+        context.task_authority_progress = None;
+        context.task_start = None;
+        context.agent = None;
+        context.questions = None;
+        context.question_events = None;
+        context.checks = None;
+        context.execution = None;
+        Ok(context)
+    }
+
     /// Install one shared revision handle before permission and tool contexts are cloned.
     pub(crate) fn bind_task_authority_progress(&mut self) {
         if self.task_authority_progress.is_none() {
@@ -102,36 +166,29 @@ impl ControlTurnContext {
         self.task_controller = Some(controller);
     }
     /// Start a new provider observation while retaining this invocation's host authority.
-    pub fn begin_provider_execution(&mut self) {
-        self.provider_completion = Arc::default();
+    pub fn begin_provider_execution(
+        &mut self,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        self.provider_completion.begin_attempt()
     }
 
-    /// Merge terminal native evidence with host effects retained by the invocation.
-    pub fn complete_provider_execution(
-        &self,
-        result: &forge_provider_api::lifecycle::ExecutionResult,
-    ) -> std::result::Result<ProviderCompletion, crate::provider::ProviderError> {
-        let (effects, host_outcome) = self.provider_completion.take_with_outcome()?;
-        Self::merge_provider_execution(host_outcome.as_ref().unwrap_or(result), effects)
-    }
-
-    /// Preview the exact retained host effects without consuming them.
+    /// Preview the retained host effects without changing the native turn outcome.
     pub(crate) fn preview_provider_execution(
         &self,
-        result: &forge_provider_api::lifecycle::ExecutionResult,
+        result: &forge_provider_api::TurnResult,
+        native: &forge_provider_api::completion::ProviderCompletion,
+        address: &forge_provider_api::TurnAddress,
     ) -> std::result::Result<ProviderExecutionPreview, crate::provider::ProviderError> {
         let preview = self.provider_completion.preview()?;
+        let outcome = Self::merge_provider_execution(result, native, address, preview.completion);
         Ok(ProviderExecutionPreview {
             revision: preview.revision,
-            outcome: Self::merge_provider_execution(
-                preview.host_outcome.as_ref().unwrap_or(result),
-                preview.completion,
-            ),
+            outcome,
             batches: preview.batches,
         })
     }
 
-    /// Consume effects only if the host's reviewed revision is still current.
+    /// Consume effects only when the reviewed host revision remains current.
     pub(crate) fn commit_provider_execution(
         &self,
         revision: u64,
@@ -139,48 +196,55 @@ impl ControlTurnContext {
         self.provider_completion.take_revision(revision)
     }
 
-    /// Combine native terminal evidence with the supplied host effects.
+    /// Preserve native failure and explicit retry permission independently of host effects.
     fn merge_provider_execution(
-        result: &forge_provider_api::lifecycle::ExecutionResult,
+        result: &forge_provider_api::TurnResult,
+        native: &forge_provider_api::completion::ProviderCompletion,
+        address: &forge_provider_api::TurnAddress,
         effects: Option<ProviderCompletion>,
     ) -> std::result::Result<ProviderCompletion, crate::provider::ProviderError> {
         use crate::provider::ProviderError;
-        use forge_provider_api::lifecycle::{ExecutionFailure, ExecutionResult};
-        match result {
-            ExecutionResult::Completed { completion } => {
+        use forge_provider_api::turn::{RetryDecision, TurnOutcome};
+        match result.outcome() {
+            TurnOutcome::Completed { .. } => {
                 let mut output = effects.unwrap_or_default();
-                output.merge_native(completion.clone().into());
+                output.merge_native(native.clone());
+                output.native.provider_checkpoint_id =
+                    result.checkpoint_id().map(|id| id.as_str().to_owned());
                 Ok(output)
             }
-            ExecutionResult::Cancelled { .. } => Err(ProviderError::Cancelled),
-            ExecutionResult::Failed { failure, .. } => match failure {
-                ExecutionFailure::Rejected => Err(ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
-                        forge_provider_api::ProviderFailureKind::Rejected,
-                    ),
-                )),
-                ExecutionFailure::Terminal { kind } => Err(ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::InputSubmit,
-                        *kind,
-                    ),
-                )),
-                ExecutionFailure::Retryable {
-                    address,
-                    category,
-                    retry_after,
-                } => Err(ProviderError::Retryable(Box::new(
-                    forge_provider_api::retry::RetryableFailure {
-                        address: address.clone(),
-                        category: *category,
-                        retry_after: *retry_after,
-                    },
-                ))),
-            },
+            TurnOutcome::Interrupted => Err(ProviderError::Cancelled),
+            TurnOutcome::Failed {
+                error,
+                retry: RetryDecision::NotAllowed,
+            } => Err(ProviderError::Failure(error)),
+            TurnOutcome::Failed {
+                error,
+                retry: RetryDecision::Allowed { .. },
+            } => {
+                let mut retained = effects.unwrap_or_default();
+                retained.merge_native(native.clone());
+                if !crate::provider::retry::replay_safe(&retained) {
+                    return Err(ProviderError::Failure(error));
+                }
+                let category =
+                    if error.kind() == forge_provider_api::ProviderFailureKind::RateLimited {
+                        forge_provider_api::retry::RetryCategory::RateLimited
+                    } else if error.kind() == forge_provider_api::ProviderFailureKind::Transport {
+                        forge_provider_api::retry::RetryCategory::TemporaryTransport
+                    } else {
+                        forge_provider_api::retry::RetryCategory::TemporaryCapacity
+                    };
+                Err(ProviderError::Retryable(Box::new(
+                    forge_provider_api::retry::RetryableFailure::new(
+                        address.clone(),
+                        result,
+                        category,
+                    )?,
+                )))
+            }
         }
     }
-
     /// Build an inert context for provider calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
@@ -188,6 +252,7 @@ impl ControlTurnContext {
             questions: None,
             question_events: None,
             live_host_effects: None,
+            observed_file_changes: None,
             question_exchange_id: None,
             question_invocation: None,
             question_discussion: false,
@@ -221,6 +286,7 @@ impl ControlTurnContext {
 
 /// Owns provider-visible control validation for one bounded provider turn.
 pub struct ControlToolRuntime {
+    pub(super) lsp_mutations: Arc<super::lsp::MutationWork>,
     pub(super) context: ControlTurnContext,
     pub(super) plan_document: Option<PlanDocument>,
     pub(super) terminal: bool,
@@ -239,6 +305,7 @@ impl ControlToolRuntime {
     /// Build a runtime from the broker snapshot captured at turn start.
     pub fn new(context: ControlTurnContext) -> Self {
         Self {
+            lsp_mutations: Arc::default(),
             plan_document: context.plan_document.clone(),
             context,
             terminal: false,
@@ -250,6 +317,14 @@ impl ControlToolRuntime {
     /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
         self.ensure_submission_active()?;
+        if self.context.observed_file_changes.is_some()
+            && !(super::lsp::is_tool(&invocation.name)
+                || super::repository::is_tool(&invocation.name))
+        {
+            return Err(crate::tools::ToolError::Rejected(
+                "Native child context does not authorize parent workflow controls.".into(),
+            ));
+        }
         self.context.task_permit = self.context.current_task_permit()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
@@ -453,37 +528,149 @@ mod test {
     #[test]
     fn rejected_execution_preserves_provider_error_kind() {
         let context = ControlTurnContext::inactive(PromptMode::Chat);
-        let result = forge_provider_api::lifecycle::ExecutionResult::Failed {
-            completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-            failure: forge_provider_api::lifecycle::ExecutionFailure::Rejected,
+        let error = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::Rejected,
+        );
+        let result = forge_provider_api::TurnResult::new(
+            forge_provider_api::turn::TurnOutcome::Failed {
+                error,
+                retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+            },
+            1,
+            None,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("fixture"),
+            "exchange",
+        );
+        let address = forge_provider_api::TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
         };
-        assert!(matches!(context.complete_provider_execution(&result),
-            Err(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected));
+        assert!(
+            matches!(context.preview_provider_execution(&result, &Default::default(), &address).unwrap().outcome,
+            Err(crate::provider::ProviderError::Failure(failure)) if failure == error)
+        );
     }
 
-    /// A host rejection remains distinct from the native turn's successful terminal evidence.
+    /// Host rejection must not rewrite the retained native completion.
     #[test]
     fn host_rejection_does_not_rewrite_native_completion() {
-        use forge_provider_api::lifecycle::{ExecutionFailure, ExecutionResult};
         let context = ControlTurnContext::inactive(PromptMode::Chat);
-        let native = ExecutionResult::Completed {
-            completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-        };
+        let native = forge_provider_api::TurnResult::new(
+            forge_provider_api::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            1,
+            None,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
         context
             .provider_completion
-            .publish_host_outcome(ExecutionResult::Failed {
-                completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                failure: ExecutionFailure::Rejected,
+            .publish(ProviderCompletion {
+                control_error: Some("actual host control error".into()),
+                ..Default::default()
             })
             .unwrap();
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("fixture"),
+            "exchange",
+        );
+        let address = forge_provider_api::TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
         let ProviderExecutionPreview {
             revision, outcome, ..
-        } = context.preview_provider_execution(&native).unwrap();
-        assert!(
-            matches!(outcome, Err(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
+        } = context
+            .preview_provider_execution(&native, &Default::default(), &address)
+            .unwrap();
+        assert_eq!(
+            outcome.unwrap().control_error.as_deref(),
+            Some("actual host control error")
         );
-        assert!(matches!(native, ExecutionResult::Completed { .. }));
+        assert!(matches!(
+            native.outcome(),
+            forge_provider_api::turn::TurnOutcome::Completed { .. }
+        ));
         assert!(context.commit_provider_execution(revision).unwrap());
+    }
+
+    /// Explicit retry permission still cannot replay a completed native or host effect.
+    #[test]
+    fn retry_requires_explicit_permission_and_safe_completed_effects() {
+        use forge_provider_api::turn::{RetryDecision, TurnOutcome};
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("retry"),
+            "exchange",
+        );
+        let address = forge_provider_api::TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
+        let failure = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::TurnStart,
+            forge_provider_api::ProviderFailureKind::RateLimited,
+        );
+        for (retry, native_tool, host_edit, allowed) in [
+            (RetryDecision::NotAllowed, false, false, false),
+            (
+                RetryDecision::Allowed { retry_after: None },
+                false,
+                false,
+                true,
+            ),
+            (
+                RetryDecision::Allowed { retry_after: None },
+                true,
+                false,
+                false,
+            ),
+            (
+                RetryDecision::Allowed { retry_after: None },
+                false,
+                true,
+                false,
+            ),
+        ] {
+            let result = forge_provider_api::TurnResult::new(
+                TurnOutcome::Failed {
+                    error: failure,
+                    retry,
+                },
+                1,
+                None,
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+            let mut native = forge_provider_api::completion::ProviderCompletion::default();
+            native.evidence.tool_called = native_tool;
+            let mut effects = ProviderCompletion::default();
+            effects.evidence.workspace_changed = host_edit;
+            let outcome = ControlTurnContext::merge_provider_execution(
+                &result,
+                &native,
+                &address,
+                Some(effects),
+            );
+            assert_eq!(
+                matches!(outcome, Err(crate::provider::ProviderError::Retryable(_))),
+                allowed
+            );
+        }
     }
 
     /// Fence a queued control callback before it can inspect or mutate host state.
@@ -911,6 +1098,7 @@ mod test {
             questions: None,
             question_events: None,
             live_host_effects: None,
+            observed_file_changes: None,
             question_exchange_id: None,
             question_invocation: None,
             question_discussion: false,

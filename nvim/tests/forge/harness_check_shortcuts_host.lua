@@ -5,7 +5,8 @@ local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -27,6 +28,11 @@ end
 local function rows()
   return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
 end
+-- Live check progress belongs to the status split; completed results stay in the transcript.
+local function status_rows()
+  local status = state.presentation and state.presentation.status_view
+  return table.concat(status and status.content and status.content.lines or {}, "\n")
+end
 local function press(key)
   vim.api.nvim_set_current_win(state.composer_win)
   local mapping = vim.fn.maparg(key, "n", false, true)
@@ -36,13 +42,14 @@ end
 local function start_check()
   local run_id = check_tool.start(request, { check = { "slow" } }).run_id
   assert(vim.wait(5000, function()
-    return state.checks_running and state.active_check_run == run_id and rows():find("Shortcut check is running", 1, true)
-  end, 10), "check did not become active")
+    return state.checks_running and state.active_check_run == run_id and status_rows():find("Shortcut check is running", 1, true)
+  end, 10), "check did not become active: " .. vim.inspect({ run_id = run_id, checks_running = state.checks_running,
+    active_check_run = state.active_check_run, errors = errors, status = status_rows(), transcript = rows() }))
   return run_id
 end
 local function settled()
-  return not state.checks_running and not state.task_operation and not state.busy
-    and #(state.input and state.input.pending or {}) == 0
+  return not state.checks_running and not state.cleanup_operation_id and not require("forge.views.harness.activity").busy(state)
+    and #(state.input and state.input.drafts or {}) == 0
     and #state.queue == 0 and #state.pending_steer == 0 and #(state.pending_submit or {}) == 0
 end
 local function compose(text)
@@ -62,7 +69,7 @@ local succeeded, failure = xpcall(function()
   compose("")
   press("<C-c>")
   assert(vim.wait(3000, function() return not state.checks_running end, 10),
-    "Ctrl-C did not stop the check: " .. vim.inspect({ operation = state.task_operation, notice = state.execution_notice }))
+    "Ctrl-C did not stop the check: " .. vim.inspect({ operation = state.cleanup_operation_id, notice = state.execution_notice }))
   assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
   assert(vim.wait(3000, settled, 10), "Ctrl-C did not settle its pause")
   for _, pause_first in ipairs({ false, true }) do
@@ -70,7 +77,8 @@ local succeeded, failure = xpcall(function()
     if pause_first then
       compose("")
       press("<C-c>")
-      assert(state.task_operation, "Ctrl-C did not start a pause")
+      -- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
+      assert(state.cleanup_operation_id, "Ctrl-C did not start a pause")
     end
     local text = pause_first and "Replacement during pause" or "Replacement during check"
     compose(text)
@@ -78,8 +86,8 @@ local succeeded, failure = xpcall(function()
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "",
       "Ctrl-S did not capture the replacement")
     assert(vim.wait(5000, function() return settled() and rows():find(text, 1, true) end, 10),
-      "Ctrl-S did not complete its replacement: " .. vim.inspect({ operation = state.task_operation,
-        pending = state.input.pending, notice = state.execution_notice, busy = state.busy,
+      "Ctrl-S did not complete its replacement: " .. vim.inspect({ operation = state.cleanup_operation_id,
+        drafts = state.input.drafts, notice = state.execution_notice, busy = require("forge.views.harness.activity").busy(state),
         pause_first = pause_first, input = request("session.input.get"), queue = state.queue,
         steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
         transcript = rows() }))

@@ -71,7 +71,7 @@ local function format_exchange_usage(interaction, metrics)
   local sections = {}
   local input = totals.input and format_token_count(totals.input)
   if input and totals.input > 0 and totals.cached_input and totals.cached_input <= totals.input then
-    input = input .. (" (%d%%)"):format(math.floor(totals.cached_input * 100 / totals.input + 0.5))
+    input = input .. (" (%d%% cached)"):format(math.floor(totals.cached_input * 100 / totals.input + 0.5))
   end
   if totals.input and totals.output then
     sections[#sections + 1] = input .. " -> " .. format_token_count(totals.output)

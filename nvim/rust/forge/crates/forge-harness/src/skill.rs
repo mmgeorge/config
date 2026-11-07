@@ -1,7 +1,7 @@
 use crate::permissions::command::{CommandInvocation, normalize_command_in};
 use crate::permissions::matcher::PermissionTarget;
 use crate::permissions::shell::CommandShell;
-use crate::provider::{ExecutionOwner, ProviderEvent, ProviderEventSink};
+use crate::provider::{ProviderEvent, ThreadOwner};
 use crate::settings::SkillResource;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -122,14 +122,11 @@ impl SkillAccess {
             .collect()
     }
 
-    fn reads(&self, event: &ProviderEvent) -> Vec<SkillRead> {
-        let ProviderEvent::Tool {
-            address,
-            update: crate::provider::ToolUpdate::Requested { invocation },
-        } = event
-        else {
-            return Vec::new();
-        };
+    fn reads(
+        &self,
+        item_id: &forge_provider_api::ItemId,
+        invocation: &forge_provider_api::tool::ToolDescriptor,
+    ) -> Vec<SkillRead> {
         let (path, directory) = match &invocation.semantics {
             forge_provider_api::tool::ToolSemantics::Command {
                 text,
@@ -161,7 +158,7 @@ impl SkillAccess {
                     resource_id: skill.resource.id.clone(),
                     name: skill.resource.name.clone(),
                     path: skill.source.display().to_string(),
-                    tool_id: address.tool_id.to_string(),
+                    tool_id: item_id.to_string(),
                 })
             })
             .collect()
@@ -171,7 +168,14 @@ impl SkillAccess {
 /// Reconciles sparse tool input and completion before attaching confirmed read metadata.
 pub(crate) struct SkillObserver {
     access: Arc<SkillAccess>,
-    pending: HashMap<crate::provider::ToolAddress, Vec<SkillRead>>,
+    pending: HashMap<
+        (
+            forge_provider_api::ThreadId,
+            forge_provider_api::TurnId,
+            forge_provider_api::ItemId,
+        ),
+        Vec<SkillRead>,
+    >,
 }
 
 impl SkillObserver {
@@ -185,21 +189,67 @@ impl SkillObserver {
 
     /// Annotate successful completions without treating progress or filenames in output as reads.
     pub(crate) fn observe(&mut self, event: &ProviderEvent) -> Vec<SkillRead> {
-        let ProviderEvent::Tool { address, update } = event else {
+        use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart};
+        let ProviderEvent::Item {
+            thread_id,
+            turn_id,
+            item_id,
+            event,
+        } = event
+        else {
             return Vec::new();
         };
-        let reads = self.access.reads(event);
-        if !reads.is_empty() {
-            self.pending.insert(address.clone(), reads);
+        let key = (thread_id.clone(), turn_id.clone(), item_id.clone());
+        let descriptor = match event {
+            ItemEvent::Started(
+                ItemStart::CommandExecution(descriptor)
+                | ItemStart::FileChange(descriptor)
+                | ItemStart::ToolCall(descriptor),
+            )
+            | ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::DescriptorUpdated(descriptor),
+            } => Some(descriptor),
+            ItemEvent::Completed(
+                ItemCompletion::CommandExecution(completion)
+                | ItemCompletion::FileChange(completion)
+                | ItemCompletion::ToolCall(completion),
+            ) => completion.descriptor.as_ref(),
+            ItemEvent::Started(
+                ItemStart::UserMessage(_) | ItemStart::AgentMessage(_) | ItemStart::Reasoning(_),
+            )
+            | ItemEvent::Message { .. }
+            | ItemEvent::Tool { .. }
+            | ItemEvent::Completed(
+                ItemCompletion::UserMessage(_)
+                | ItemCompletion::AgentMessage(_)
+                | ItemCompletion::Reasoning(_),
+            ) => None,
+        };
+        if let Some(descriptor) = descriptor {
+            let reads = self.access.reads(item_id, descriptor);
+            self.pending.insert(key.clone(), reads);
         }
-        let crate::provider::ToolUpdate::Finished { outcome } = update else {
-            return Vec::new();
-        };
-        let reads = self.pending.remove(address).unwrap_or_default();
-        if matches!(outcome, crate::provider::ToolOutcome::Succeeded) {
-            reads
-        } else {
-            Vec::new()
+        match event {
+            ItemEvent::Completed(
+                ItemCompletion::CommandExecution(completion)
+                | ItemCompletion::FileChange(completion)
+                | ItemCompletion::ToolCall(completion),
+            ) => {
+                let reads = self.pending.remove(&key).unwrap_or_default();
+                if matches!(completion.outcome, crate::provider::ToolOutcome::Succeeded) {
+                    reads
+                } else {
+                    Vec::new()
+                }
+            }
+            ItemEvent::Started(_)
+            | ItemEvent::Message { .. }
+            | ItemEvent::Tool { .. }
+            | ItemEvent::Completed(
+                ItemCompletion::UserMessage(_)
+                | ItemCompletion::AgentMessage(_)
+                | ItemCompletion::Reasoning(_),
+            ) => Vec::new(),
         }
     }
 }
@@ -208,19 +258,17 @@ impl SkillObserver {
 pub(crate) struct SkillExecution {
     pub(crate) observer: Arc<Mutex<SkillObserver>>,
     pub(crate) access: Arc<SkillAccess>,
-    pub(crate) owner: ExecutionOwner,
+    pub(crate) owner: ThreadOwner,
     pub(crate) coordinator: Arc<crate::provider::approval::PermissionCoordinator>,
 }
 
 impl SkillExecution {
     /// Observe normalized tool events without exposing provider wire decoding.
-    pub(crate) fn event_observer(&self) -> Arc<dyn forge_provider_api::events::EventObserver> {
+    ///
+    /// The bridge relay calls this observer through `HostInvocation::observe`, which appends
+    /// each derived skill read after its source event under the same invocation scope.
+    pub(crate) fn event_observer(&self) -> Arc<dyn crate::provider::events::EventObserver> {
         Arc::new(SkillEventObserver(self.observer.clone()))
-    }
-
-    /// Attach the shared observer to streamed delivery or annotate collected fallback events.
-    pub(crate) fn sink(&self, sink: Option<ProviderEventSink>) -> Option<ProviderEventSink> {
-        sink.map(|sink| sink.with_observer(Arc::new(SkillEventObserver(self.observer.clone()))))
     }
 }
 
@@ -338,11 +386,13 @@ pub use forge_provider_api::skill::SkillRead;
 
 struct SkillEventObserver(Arc<Mutex<SkillObserver>>);
 
-impl forge_provider_api::events::EventObserver for SkillEventObserver {
+impl crate::provider::events::EventObserver for SkillEventObserver {
     fn additional_events(
         &self,
+        _scope: &crate::provider::EventScope,
         event: &ProviderEvent,
-    ) -> Result<Vec<ProviderEvent>, forge_provider_api::events::EventDeliveryError> {
+    ) -> Result<Vec<crate::provider::HostEvent>, forge_provider_api::events::EventDeliveryError>
+    {
         let read = self
             .0
             .lock()
@@ -353,13 +403,22 @@ impl forge_provider_api::events::EventObserver for SkillEventObserver {
             })?
             .observe(event);
         match event {
-            ProviderEvent::Tool { address, .. } if !read.is_empty() => {
-                Ok(vec![ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: crate::provider::ToolUpdate::SkillRead { read },
-                }])
-            }
-            _ => Ok(Vec::new()),
+            ProviderEvent::Item {
+                thread_id,
+                turn_id,
+                item_id,
+                ..
+            } if !read.is_empty() => Ok(vec![crate::provider::HostEvent::SkillRead {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                item_id: item_id.clone(),
+                read,
+            }]),
+            ProviderEvent::Provider { .. }
+            | ProviderEvent::Thread { .. }
+            | ProviderEvent::Turn { .. }
+            | ProviderEvent::Item { .. }
+            | ProviderEvent::Agent { .. } => Ok(Vec::new()),
         }
     }
 }
@@ -367,7 +426,11 @@ impl forge_provider_api::events::EventObserver for SkillEventObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+    use crate::provider::{TextUpdate, ToolOutcome};
+    use forge_provider_api::{
+        InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion, ToolDescriptor,
+        ToolItemEvent,
+    };
     use serde_json::json;
 
     fn fixture() -> (tempfile::TempDir, Arc<SkillAccess>, PathBuf) {
@@ -390,37 +453,37 @@ mod tests {
         (directory, access, bundle)
     }
 
-    fn event(id: &str, update: ToolUpdate) -> ProviderEvent {
-        ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: crate::provider::TurnAddress {
-                    scope: crate::provider::InvocationScope {
-                        owner: ExecutionOwner::root("session"),
-                        exchange_id: "exchange".into(),
-                        invocation_id: "invocation".into(),
-                    },
-                    thread_id: "provider".into(),
-                    turn_id: "turn".into(),
-                },
-                tool_id: id.into(),
-            },
-            update,
+    /// Create a native typed tool-item observation with immutable fixture ownership.
+    fn event(id: &str, event: ItemEvent) -> ProviderEvent {
+        ProviderEvent::Item {
+            thread_id: forge_provider_api::ThreadId::new("provider").unwrap(),
+            turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
+            item_id: forge_provider_api::ItemId::new(id).unwrap(),
+            event,
         }
     }
 
+    /// Admit the exact normalized read semantics inspected by the host observer.
     fn requested(id: &str, semantics: forge_provider_api::tool::ToolSemantics) -> ProviderEvent {
         event(
             id,
-            ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics,
-                    kind: ToolActivityKind::ToolCall,
-                    name: "fixture-tool".into(),
-                    title: "Fixture tool".into(),
-                    arguments: json!({}),
-                },
-            },
+            ItemEvent::Started(ItemStart::ToolCall(ToolDescriptor {
+                semantics,
+                name: "fixture-tool".into(),
+                title: "Fixture tool".into(),
+                arguments: InspectableArguments::new(json!({})),
+            })),
         )
+    }
+
+    /// Freeze the original native tool type with its actual outcome.
+    fn completed(outcome: ToolOutcome) -> ItemEvent {
+        ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+            outcome,
+            descriptor: None,
+            output: None,
+            changes: Default::default(),
+        }))
     }
 
     #[test]
@@ -445,19 +508,16 @@ mod tests {
                 observer
                     .observe(&event(
                         "read",
-                        ToolUpdate::Output {
-                            update: TextUpdate::Append("partial output".into()),
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Output(TextUpdate::Append(
+                                "partial output".into()
+                            ))
                         }
                     ))
                     .is_empty()
             );
             assert_eq!(observer.pending.len(), 1);
-            let reads = observer.observe(&event(
-                "read",
-                ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
-            ));
+            let reads = observer.observe(&event("read", completed(ToolOutcome::Succeeded)));
             assert_eq!(reads.len(), 1);
             assert_eq!(reads[0].resource_id, "fixture-id");
             assert_eq!(reads[0].tool_id, "read");
@@ -475,12 +535,7 @@ mod tests {
             observer.observe(&requested("unrelated", semantics));
             assert!(
                 observer
-                    .observe(&event(
-                        "unrelated",
-                        ToolUpdate::Finished {
-                            outcome: ToolOutcome::Succeeded
-                        }
-                    ))
+                    .observe(&event("unrelated", completed(ToolOutcome::Succeeded)))
                     .is_empty()
             );
         }
@@ -505,7 +560,7 @@ mod tests {
             ));
             assert!(
                 observer
-                    .observe(&event("failed", ToolUpdate::Finished { outcome }))
+                    .observe(&event("failed", completed(outcome)))
                     .is_empty()
             );
         }
@@ -562,12 +617,7 @@ mod tests {
                 directory: None,
             },
         ));
-        let reads = observer.observe(&event(
-            "alias",
-            ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            },
-        ));
+        let reads = observer.observe(&event("alias", completed(ToolOutcome::Succeeded)));
         assert_eq!(
             reads[0].path,
             dunce::canonicalize(bundle.join("SKILL.md"))
@@ -590,7 +640,8 @@ mod tests {
     -> Result<()> {
         use crate::buffer::projection::{ProjectionSource, TranscriptAction};
         use crate::exchange::{Exchange, ExchangeNode};
-        use crate::provider::{TurnAddress, TurnUpdate};
+        use crate::provider::TurnEvent;
+        use crate::provider::events::EventObserver;
         let (_directory, access, bundle) = fixture();
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"exchange","session_id":"session","agent_id":"primary","ordinal":1,
@@ -598,63 +649,72 @@ mod tests {
             "attributed_matches_checkpoint":false,"node_list":[]
         }))?;
         exchange.resume(0)?;
-        let binding = crate::turn::test_support::address(&exchange, "first").scope;
-        let (sink, mut stream) = crate::provider::events::channel(binding.clone());
-        let sink = sink.with_observer(Arc::new(SkillEventObserver(Arc::new(Mutex::new(
+        let observer = Arc::new(SkillEventObserver(Arc::new(Mutex::new(
             SkillObserver::new(access),
-        )))));
+        ))));
         for turn_id in ["first", "second"] {
-            let turn = TurnAddress {
-                scope: binding.clone(),
-                thread_id: "provider".into(),
-                turn_id: turn_id.into(),
-            };
-            exchange.observe_turn(
+            // Each turn owns a distinct invocation, so its native identity derives from that scope.
+            let turn = crate::turn::test_support::address(&exchange, turn_id);
+            let binding = turn.scope.clone();
+            let scope = crate::provider::EventScope::from(binding.clone());
+            exchange.observe_provider_event(
+                &binding.clone().into(),
                 &ProviderEvent::Turn {
-                    address: turn.clone(),
-                    update: TurnUpdate::Started { started_at_ms: 1 },
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    event: TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                        started_at_ms: 1,
+                    }),
                 },
                 1,
             )?;
             for tool_id in ["read-one", "read-two"] {
-                let address = crate::provider::ToolAddress {
-                    turn: turn.clone(),
-                    tool_id: tool_id.into(),
-                };
-                sink.send_wait(ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: ToolUpdate::Requested {
-                        invocation: ToolInvocation {
-                            semantics: forge_provider_api::tool::ToolSemantics::Read {
-                                paths: vec![bundle.join("SKILL.md").display().to_string()],
-                                directory: None,
-                            },
-                            kind: ToolActivityKind::ToolCall,
-                            name: "read".into(),
-                            title: "Read".into(),
-                            arguments: json!({"path":bundle.join("SKILL.md")}),
+                let start =
+                    forge_provider_api::ItemStart::ToolCall(forge_provider_api::ToolDescriptor {
+                        semantics: forge_provider_api::tool::ToolSemantics::Read {
+                            paths: vec![bundle.join("SKILL.md").display().to_string()],
+                            directory: None,
                         },
-                    },
-                })
-                .await?;
-                sink.send_wait(ProviderEvent::Tool {
-                    address,
-                    update: ToolUpdate::Finished {
-                        outcome: ToolOutcome::Succeeded,
-                    },
-                })
-                .await?;
-                while let Some(observation) = stream.try_next()? {
-                    exchange.observe_turn(&observation, 2)?;
+                        name: "read".into(),
+                        title: "Read".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(
+                            json!({"path":bundle.join("SKILL.md")}),
+                        ),
+                    });
+                let completed = forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::ToolCall(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                );
+                // Mirror the bridge relay: commit each native event, then the skill reads the
+                // invocation observer derives from it under the same scope.
+                for event in
+                    crate::provider::test_support::tool(&turn, tool_id.into(), start, [completed])
+                {
+                    let derived = observer.additional_events(&scope, &event)?;
+                    exchange.observe_event(
+                        &crate::provider::test_support::native_event(binding.clone(), event),
+                        2,
+                    )?;
+                    for event in derived {
+                        exchange.observe_event(
+                            &crate::provider::HarnessEvent::Host {
+                                scope: scope.clone(),
+                                event,
+                            },
+                            2,
+                        )?;
+                    }
                 }
             }
-            exchange.observe_turn(
-                &ProviderEvent::Turn {
-                    address: turn,
-                    update: TurnUpdate::Finished {
-                        outcome: crate::turn::TurnOutcome::Completed,
-                        completed_at_ms: 4,
-                    },
+            exchange.turn_mut(&turn)?.finish(
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                 },
                 4,
             )?;
@@ -672,6 +732,7 @@ mod tests {
         let rendered = crate::buffer::projection::project(
             ProjectionSource::Exchange(&exchange),
             &forge_buffer::width::WidthProfile::default(),
+            crate::buffer::projection::FIXTURE_NOW_MS,
             false,
             &HashMap::new(),
             &HashMap::new(),

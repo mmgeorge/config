@@ -34,12 +34,8 @@ impl IsolationAuth {
                 json!({"type":"chatgptAuthTokens","accessToken":token,"chatgptAccountId":account_id,"chatgptPlanType":plan})
             }
         };
-        rpc.request(
-            "account/login/start",
-            params,
-            ProviderOperation::SessionOpen,
-        )
-        .await?;
+        rpc.request("account/login/start", params, ProviderOperation::ThreadOpen)
+            .await?;
         Ok(())
     }
 
@@ -66,7 +62,7 @@ impl IsolationAuth {
             .request(
                 "getAuthStatus",
                 json!({"includeToken":true,"refreshToken":refresh}),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
             )
             .await?;
         if status.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(false) {
@@ -88,7 +84,7 @@ impl IsolationAuth {
                     .request(
                         "account/read",
                         json!({"refreshToken":false}),
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                     )
                     .await?;
                 let account_id = account
@@ -106,7 +102,7 @@ impl IsolationAuth {
                     .request(
                         "account/read",
                         json!({"refreshToken":false}),
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                     )
                     .await?;
                 if confirmed_account != account {
@@ -129,7 +125,7 @@ impl IsolationAuth {
             .request(
                 "getAuthStatus",
                 json!({"includeToken":true,"refreshToken":false}),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
             )
             .await?;
         if ["authMethod", "authToken", "requiresOpenaiAuth"]
@@ -238,7 +234,7 @@ fn model_catalog(model: &ProviderModel) -> Value {
 
 /// Classify private isolation preparation before starting any temporary native work.
 fn preparation_failure(kind: ProviderFailureKind) -> ProviderError {
-    ProviderFailure::new(ProviderOperation::SessionOpen, kind)
+    ProviderFailure::new(ProviderOperation::ThreadOpen, kind)
         .at_phase(
             forge_provider_api::error::ProviderPhase::Preparation,
             forge_provider_api::error::FailureDisposition::Unchanged,
@@ -329,7 +325,7 @@ mod tests {
             let runtime = super::super::runtime::CodexRuntime::isolated(command, home);
             let connection = runtime.connect().await.unwrap();
             let rpc = NativeRpc::new(connection);
-            let initialized = rpc.request("initialize", json!({"clientInfo":{"name":"forge-isolated-startup-fixture","version":"0.1.0"},"capabilities":{"experimentalApi":true}}), ProviderOperation::SessionOpen).await.unwrap();
+            let initialized = rpc.request("initialize", json!({"clientInfo":{"name":"forge-isolated-startup-fixture","version":"0.1.0"},"capabilities":{"experimentalApi":true}}), ProviderOperation::ThreadOpen).await.unwrap();
             rpc.close().await.unwrap(); runtime.shutdown().await.unwrap();
             assert!(initialized["userAgent"].as_str().unwrap().starts_with("forge-isolated-startup-fixture/0.164.0 "));
             assert!(!profile.path().join("home/auth.json").exists());

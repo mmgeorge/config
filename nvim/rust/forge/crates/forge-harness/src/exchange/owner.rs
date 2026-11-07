@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::active::{ActiveCommand, CommandEvent};
-#[cfg(test)]
 use super::command::InputControl;
 use super::command::{
     Command, CommandFailure, CommandId, CommandOutcome, CommandRequest, CommandResult,
@@ -31,7 +30,7 @@ use super::input_receipts::InputReceiptError;
 use super::input_receipts::{InputReceiptFact, InputReceiptWake, InputReceipts};
 use super::journal::{CommandJournalError, CommandRecord};
 use super::native_command::NativeCommandProgress;
-use super::queue::{CommandQueue, CommandReply};
+use super::queue::{CommandAdmission, CommandQueue, CommandReply};
 use super::rollback_run::{RollbackProgress, RollbackRecovery};
 use super::services::OwnerServices;
 use super::task_command::TaskCommandProgress;
@@ -277,9 +276,10 @@ impl ExchangeOwner {
                 shutdown_retry,
                 commands,
                 foreground_access: ForegroundAccess::Open,
+                configuration_attempt: None,
+                deferred_configuration: None,
                 input_receipts: InputReceipts::default(),
                 input_delivery: None,
-                idle_settlement: IdleSettlement::NotRequested,
                 question_inputs: super::question_input::QuestionInputs::default(),
                 question_waits: super::question_wait::QuestionWaits::default(),
                 question_tools: VecDeque::new(),
@@ -592,9 +592,10 @@ pub(crate) struct ExchangeDriver {
     shutdown_retry: Arc<tokio::sync::Notify>,
     commands: CommandQueue,
     foreground_access: ForegroundAccess,
+    configuration_attempt: Option<ConfigurationAttempt>,
+    deferred_configuration: Option<DeferredConfiguration>,
     input_receipts: InputReceipts,
     input_delivery: Option<InputDeliveryRun>,
-    idle_settlement: IdleSettlement,
     question_inputs: super::question_input::QuestionInputs,
     question_waits: super::question_wait::QuestionWaits,
     question_tools: VecDeque<super::question_tool::QuestionTool>,
@@ -604,6 +605,18 @@ pub(crate) struct ExchangeDriver {
     steering_order: Arc<tokio::sync::Semaphore>,
     task_check_requests: Vec<oneshot::Sender<Result<Option<InputReadiness>, InputOfferError>>>,
     reconnect_requests: VecDeque<PendingReconnect>,
+}
+
+/// Preserve the actual source boundary captured before an immutable configuration attempt.
+struct ConfigurationAttempt {
+    command: CommandId,
+    availability: Option<crate::provider::session_execution::NativeAvailabilityReceipt>,
+}
+
+/// Retain an unchanged configuration intent until later actual availability can be revalidated.
+struct DeferredConfiguration {
+    patch: super::command::SessionConfigurationPatch,
+    after: Option<crate::provider::session_execution::NativeAvailabilityReceipt>,
 }
 
 struct PendingReconnect {
@@ -728,10 +741,13 @@ impl ExchangeDriver {
         let mut check_scope: Option<crate::provider::InvocationScope> = None;
         let mut pending_check_tools: VecDeque<crate::checks::owner::ToolCheckRequest> =
             VecDeque::new();
+        // Tool-started runs outlive the provider turn that requested them, so their progress and
+        // configuration errors publish through this owner-lifetime stream rather than the turn sink.
+        let (tool_check_sink, mut tool_check_updates) = crate::broker::publication::channel();
         let mut pending_automatic_checks: VecDeque<crate::checks::owner::AutomaticCheckRequest> =
             VecDeque::new();
         let mut automatic_checks: Option<crate::broker::OwnedCheckCompletion> = None;
-        let mut automatic_action: Option<AutomaticAction> = None;
+        let mut automatic_action: Option<crate::broker::OwnedCheckProgress> = None;
         let mut automatic_publication: Option<AutomaticPublication> = None;
         let mut automatic_repair: Option<oneshot::Receiver<Result<DispatchResult>>> = None;
         let mut task_verification: Option<TaskVerification> = None;
@@ -1359,13 +1375,30 @@ impl ExchangeDriver {
                         )
                         .is_ok()
                         {
+                            if matches!(
+                                &queued.record.request.command,
+                                Command::ConfigureSession(
+                                    super::command::ConfigurationChange::Settings(_)
+                                )
+                            ) {
+                                self.deferred_configuration = None;
+                                self.configuration_attempt = Some(ConfigurationAttempt {
+                                    command: queued.record.request.id.clone(),
+                                    availability: services
+                                        .observer
+                                        .session_events()
+                                        .configuration_availability(),
+                                });
+                            }
                             let mut active = ActiveCommand::start(queued, &services);
-                            let pin = active.pin_cancellation_target(
-                                &event_status,
-                                foreground.as_mut().map(|runtime| &mut runtime.transaction),
-                                &mut *broker.lock().await,
-                                &services,
-                            );
+                            let pin = active
+                                .pin_cancellation_target(
+                                    &event_status,
+                                    foreground.as_mut().map(|runtime| &mut runtime.transaction),
+                                    &broker,
+                                    &services,
+                                )
+                                .await;
                             match pin {
                                 Ok((events, input)) => {
                                     let id = active.queued_mut().record.request.id.clone();
@@ -1458,10 +1491,12 @@ impl ExchangeDriver {
                     }
                 }
                 // Let the next admitted immediate input collect checks through the owner before delivery is retried.
+                // An in-flight input delivery does not exclude this: a delivery whose turn waits on
+                // `check_run` stays open while the run is active, and the run's collection is what
+                // lets that turn and the direct prompt proceed.
                 if !closed
                     && command.is_none()
                     && !self.commands.has_pending()
-                    && self.input_delivery.is_none()
                     && !self.commands.storage_unavailable()
                     && matches!(self.foreground_access, ForegroundAccess::Open)
                 {
@@ -1470,35 +1505,27 @@ impl ExchangeDriver {
                         .snapshot()
                         .map_err(InputOfferError::Queue)
                         .and_then(|snapshot| {
+                            // A direct prompt interrupts checks even behind explicitly queued
+                            // drafts, which wait for completion and must not hide it.
                             super::input_readiness::select_pending_input(
                                 snapshot,
                                 &services.questions,
-                                super::input_readiness::InputQueuePolicy::Ordered,
+                                super::input_readiness::InputQueuePolicy::AllowSteering,
                             )
                         });
                     if let Ok(super::input_readiness::PendingInput::Ready(selection)) = interrupt {
                         let (input, directive) = selection.into_parts();
                         if directive.is_none()
-                            && input.intent == crate::input::InputIntent::Auto
-                            && crate::input::input_purpose_is_current(
-                                &services.tasks,
-                                &services.questions,
-                                &input.purpose,
-                                &services.root,
-                                services.observer.session_id(),
+                            && interrupt_checks_for_direct_input(
+                                &input,
+                                &services,
+                                &trace,
+                                &session_id,
+                                update_step,
                             )
-                            .unwrap_or(false)
-                            && let Ok(Some(run_id)) = services.checks.active()
+                            && let Some(checks) = automatic_checks.as_mut()
                         {
-                            if let Err(error) = services.checks.cancel_for_collection(&run_id) {
-                                trace.record(&session_id, "exchange.check.input_collection_failed", serde_json::json!({
-                                    "input_id":input.id,"input_revision":input.revision,"run_id":run_id,
-                                    "reason":error.to_string(),"update_step":update_step,
-                                }));
-                            }
-                            if let Some(checks) = automatic_checks.as_mut() {
-                                let _ = checks.cancel();
-                            }
+                            let _ = checks.cancel();
                         }
                     }
                 }
@@ -1660,8 +1687,25 @@ impl ExchangeDriver {
                         match broker.try_lock() {
                             Ok(mut broker) => match broker.owner_control_view() {
                                 Ok(view) => {
-                                    let current =
-                                        view.steering_scope.as_ref() == Some(&request.scope);
+                                    // The check request and the provider's turn observation travel on
+                                    // separate channels, so a fast tool call can precede the observed
+                                    // turn. The foreground transaction's dispatched scope remains
+                                    // authoritative until that observation is drained. A finalizing
+                                    // turn has already returned from the provider, so no live tool
+                                    // call can still await this check; its scope is stale.
+                                    let dispatched = foreground
+                                        .as_ref()
+                                        .filter(|runtime| {
+                                            !matches!(
+                                                runtime.transaction,
+                                                ForegroundDispatch::Finalizing { .. }
+                                            )
+                                        })
+                                        .and_then(|runtime| {
+                                            runtime.transaction.invocation_scope().ok().flatten()
+                                        });
+                                    let current = dispatched.as_ref() == Some(&request.scope)
+                                        || view.steering_scope.as_ref() == Some(&request.scope);
                                     let published = view.events.into_iter().try_for_each(|event| {
                                         retain_publication(
                                             event,
@@ -1846,7 +1890,7 @@ impl ExchangeDriver {
                                 .take()
                                 .map(AutomaticPublication::close);
                         }
-                        Ok(action) => automatic_action = Some(AutomaticAction::Progress(action)),
+                        Ok(action) => automatic_action = Some(action),
                         Err(error) => {
                             checks.fail(error);
                             let _ = checks.cancel();
@@ -1855,13 +1899,10 @@ impl ExchangeDriver {
                 }
                 if matches!(
                     automatic_action,
-                    Some(AutomaticAction::Progress(
-                        crate::broker::OwnedCheckProgress::Ready(_)
-                    ))
+                    Some(crate::broker::OwnedCheckProgress::Ready(_))
                 ) {
-                    let Some(AutomaticAction::Progress(crate::broker::OwnedCheckProgress::Ready(
-                        mut outcome,
-                    ))) = automatic_action.take()
+                    let Some(crate::broker::OwnedCheckProgress::Ready(mut outcome)) =
+                        automatic_action.take()
                     else {
                         unreachable!("ready automatic outcome remains retained until publication")
                     };
@@ -1910,44 +1951,32 @@ impl ExchangeDriver {
                             .take()
                             .map(AutomaticPublication::close);
                     } else {
-                        automatic_action = Some(AutomaticAction::Progress(
-                            crate::broker::OwnedCheckProgress::Ready(outcome),
-                        ));
+                        automatic_action = Some(crate::broker::OwnedCheckProgress::Ready(outcome));
                     }
                 }
                 if automatic_available && let Some(action) = automatic_action.take() {
                     match action {
-                        AutomaticAction::Progress(
-                            crate::broker::OwnedCheckProgress::Revalidate,
-                        ) => {
-                            self.idle_settlement = IdleSettlement::Requested;
-                            automatic_action = Some(AutomaticAction::AwaitSettlement);
-                        }
-                        AutomaticAction::AwaitSettlement => {
-                            if matches!(self.idle_settlement, IdleSettlement::NotRequested) {
-                                if let Some(checks) = automatic_checks.as_mut() {
-                                    match broker.try_lock() {
-                                        Ok(mut broker) => {
-                                            if let Err(error) = checks.revalidate(&mut broker) {
-                                                checks.fail(error);
-                                                let _ = checks.cancel();
-                                            }
-                                        }
-                                        Err(_) => {
-                                            automatic_action =
-                                                Some(AutomaticAction::AwaitSettlement);
-                                            broker_deferred = true;
+                        crate::broker::OwnedCheckProgress::Revalidate => {
+                            if let Some(checks) = automatic_checks.as_mut() {
+                                match broker.try_lock() {
+                                    Ok(mut broker) => {
+                                        if let Err(error) = checks.revalidate(&mut broker) {
+                                            checks.fail(error);
+                                            let _ = checks.cancel();
                                         }
                                     }
+                                    Err(_) => {
+                                        automatic_action =
+                                            Some(crate::broker::OwnedCheckProgress::Revalidate);
+                                        broker_deferred = true;
+                                    }
                                 }
-                            } else {
-                                automatic_action = Some(AutomaticAction::AwaitSettlement);
                             }
                         }
-                        AutomaticAction::Progress(crate::broker::OwnedCheckProgress::Repair {
+                        crate::broker::OwnedCheckProgress::Repair {
                             prompt,
                             change_owner,
-                        }) => match services.execution.clone().try_acquire_owned() {
+                        } => match services.execution.clone().try_acquire_owned() {
                             Ok(execution) => match broker.try_lock() {
                                 Ok(mut broker) => {
                                     let sink = automatic_publication
@@ -1980,93 +2009,95 @@ impl ExchangeDriver {
                                     }
                                 }
                                 Err(_) => {
-                                    automatic_action = Some(AutomaticAction::Progress(
-                                        crate::broker::OwnedCheckProgress::Repair {
+                                    automatic_action =
+                                        Some(crate::broker::OwnedCheckProgress::Repair {
                                             prompt,
                                             change_owner,
-                                        },
-                                    ));
+                                        });
                                     broker_deferred = true;
                                 }
                             },
                             Err(_) => {
-                                automatic_action = Some(AutomaticAction::Progress(
-                                    crate::broker::OwnedCheckProgress::Repair {
-                                        prompt,
-                                        change_owner,
-                                    },
-                                ))
+                                automatic_action = Some(crate::broker::OwnedCheckProgress::Repair {
+                                    prompt,
+                                    change_owner,
+                                })
                             }
                         },
-                        action @ AutomaticAction::Progress(
-                            crate::broker::OwnedCheckProgress::Ready(_),
-                        ) => automatic_action = Some(action),
-                        AutomaticAction::Progress(
-                            crate::broker::OwnedCheckProgress::Pending
-                            | crate::broker::OwnedCheckProgress::Finished,
-                        ) => {}
+                        action @ crate::broker::OwnedCheckProgress::Ready(_) => {
+                            automatic_action = Some(action)
+                        }
+                        crate::broker::OwnedCheckProgress::Pending
+                        | crate::broker::OwnedCheckProgress::Finished => {}
                     }
                 }
                 if !closed
-                    && matches!(self.idle_settlement, IdleSettlement::Requested)
-                    && foreground.is_none()
-                    && pending.is_empty()
                     && command.is_none()
                     && !self.commands.has_pending()
-                    && !self.commands.storage_unavailable()
-                    && self.input_delivery.is_none()
-                    && self.steering.is_empty()
-                    && failed_foregrounds.is_empty()
-                    && cancellation_cleanup.is_empty()
-                    && rollback_cleanup.is_empty()
-                    && check_runs.is_empty()
-                    && pending_check_tools.is_empty()
-                    && task_verification.is_none()
-                    && (automatic_checks.is_none()
-                        || matches!(automatic_action, Some(AutomaticAction::AwaitSettlement)))
-                    && automatic_repair.is_none()
-                    && input_cleanup.is_empty()
-                    && matches!(self.foreground_access, ForegroundAccess::Open)
+                    && self
+                        .deferred_configuration
+                        .as_ref()
+                        .is_some_and(|deferred| {
+                            services
+                                .observer
+                                .session_events()
+                                .configuration_availability()
+                                .is_some_and(|receipt| Some(receipt) != deferred.after)
+                        })
                 {
-                    if let Ok(mut broker) = broker.try_lock() {
-                        self.idle_settlement = IdleSettlement::NotRequested;
-                        let (sink, updates) = crate::broker::publication::channel();
-                        match broker.begin_idle_foreground(sink) {
-                            Ok(Some((transaction, initial))) => {
-                                let id = uuid::Uuid::new_v4();
-                                pending.push_back(PreparedForeground {
-                                    id,
-                                    transaction,
-                                    messages: command_messages.clone(),
-                                    initial: Some(initial),
-                                    completion: ForegroundCompletion::Retained {
-                                        publications: services.publications.clone(),
-                                        messages: command_messages.clone(),
-                                    },
-                                    updates: Some(updates),
-                                    execution: None,
-                                });
-                                trace.record(
-                                    &session_id,
-                                    "exchange.idle_settlement.admitted",
-                                    serde_json::json!({
-                                        "work_id":id,"update_step":update_step,
-                                    }),
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                trace.record(
-                                    &session_id,
-                                    "exchange.idle_settlement.preparation_failed",
-                                    serde_json::json!({
-                                        "update_step":update_step,"reason":error.to_string(),
-                                    }),
-                                );
+                    match broker.try_lock() {
+                        Ok(broker) => {
+                            let retry = broker.pending_configuration_retry(
+                                &self
+                                    .deferred_configuration
+                                    .as_ref()
+                                    .expect("deferred configuration selected above")
+                                    .patch,
+                            );
+                            match retry {
+                                Ok(crate::broker::PendingConfigurationRetry::Blocked) => {}
+                                Ok(crate::broker::PendingConfigurationRetry::Obsolete) => {
+                                    self.deferred_configuration = None;
+                                }
+                                Ok(crate::broker::PendingConfigurationRetry::Ready(patch)) => {
+                                    self.deferred_configuration = None;
+                                    let (reply, _response) = oneshot::channel();
+                                    self.commands.admit(
+                                        CommandAdmission {
+                                            request: CommandRequest {
+                                                id: CommandId::new(
+                                                    uuid::Uuid::new_v4().to_string(),
+                                                )
+                                                .expect(
+                                                    "generated retry command identity is nonempty",
+                                                ),
+                                                command: Command::ConfigureSession(
+                                                    super::command::ConfigurationChange::Settings(
+                                                        *patch,
+                                                    ),
+                                                ),
+                                                input_control: InputControl::AtExecution,
+                                            },
+                                            reply,
+                                            task_admission: None,
+                                        },
+                                        None,
+                                        &trace,
+                                        &session_id,
+                                        update_step,
+                                    );
+                                }
+                                Err(error) => {
+                                    trace.record(&session_id, "exchange.configuration.retry_failed", serde_json::json!({"update_step":update_step,"reason":error.to_string()}));
+                                    self.commands.retention_failed(
+                                        &trace,
+                                        &session_id,
+                                        update_step,
+                                    );
+                                }
                             }
                         }
-                    } else {
-                        broker_deferred = true;
+                        Err(_) => broker_deferred = true,
                     }
                 }
                 if !foreground_at_entry
@@ -2166,9 +2197,7 @@ impl ExchangeDriver {
             if ready_wake.is_none()
                 && (matches!(
                     automatic_action,
-                    Some(AutomaticAction::Progress(
-                        crate::broker::OwnedCheckProgress::Ready(_)
-                    ))
+                    Some(crate::broker::OwnedCheckProgress::Ready(_))
                 ) || task_check_completion.is_some())
             {
                 continue;
@@ -2275,6 +2304,7 @@ impl ExchangeDriver {
                             None => std::future::pending().await,
                         }
                     } => DriverWake::TaskCheckUpdate(update),
+                    update = tool_check_updates.recv() => DriverWake::ToolCheckUpdate(update),
                     event = async {
                         match automatic_checks.as_mut() {
                             Some(checks) if checks.has_worker() => checks.next().await,
@@ -2968,6 +2998,30 @@ impl ExchangeDriver {
                     )
                     .await;
                 }
+                DriverWake::ToolCheckUpdate(Ok(Some(update))) => {
+                    publish_updates(
+                        &mut deferred_publications,
+                        &mut self.commands,
+                        vec![update],
+                        command_messages.as_ref(),
+                        OwnerUpdateContext {
+                            services: &services,
+                            trace: &trace,
+                            session: &session_id,
+                            step: update_step,
+                        },
+                    )
+                    .await;
+                }
+                // The owner retains a sender, so the stream closes only when the owner exits.
+                DriverWake::ToolCheckUpdate(Ok(None)) => {}
+                DriverWake::ToolCheckUpdate(Err(error)) => {
+                    trace.record(
+                        &session_id,
+                        "exchange.tool_check.stream_failed",
+                        serde_json::json!({"reason":error.to_string(),"update_step":update_step}),
+                    );
+                }
                 DriverWake::TaskCheckUpdate(Ok(None)) => task_check_updates = None,
                 DriverWake::TaskCheckUpdate(Err(error)) => {
                     task_check_updates = None;
@@ -3053,7 +3107,11 @@ impl ExchangeDriver {
                     request,
                 ))) => {
                     if pending_check_tools.len() < OWNER_QUEUE_CAPACITY {
-                        pending_check_tools.push_back(*request);
+                        let mut request = *request;
+                        if request.sink.is_some() {
+                            request.sink = Some(tool_check_sink.clone());
+                        }
+                        pending_check_tools.push_back(request);
                     } else {
                         let _ = request
                             .reply
@@ -3743,6 +3801,23 @@ impl ExchangeDriver {
                                 "command_id":id.as_str(),"code":error.code(),"reason":error.diagnostic(),"update_step":update_step,
                             }));
                             if let OperationFailure::Validation(error) = error {
+                                if error
+                                    .downcast_ref::<crate::provider::ProviderError>()
+                                    .is_some_and(configuration_waits_for_child)
+                                    && let Command::ConfigureSession(
+                                        super::command::ConfigurationChange::Settings(patch),
+                                    ) = &run.command.record.request.command
+                                    && let Some(attempt) = self
+                                        .configuration_attempt
+                                        .take()
+                                        .filter(|attempt| attempt.command == id)
+                                {
+                                    self.deferred_configuration = Some(DeferredConfiguration {
+                                        patch: patch.clone(),
+                                        after: attempt.availability,
+                                    });
+                                }
+
                                 let reason = error
                                     .downcast_ref::<ConfigurationRejection>()
                                     .copied()
@@ -3750,9 +3825,9 @@ impl ExchangeDriver {
                                         error.downcast_ref::<crate::provider::ProviderError>().map(|error| {
                                             ConfigurationRejection::Provider(
                                                 crate::provider::lifecycle_error::diagnostic(
-                                                    forge_provider_api::ProviderOperation::SessionConfigure,
+                                                    forge_provider_api::ProviderOperation::ThreadConfigure,
                                                     error,
-                                                ).kind,
+                                                ).kind(),
                                             )
                                         })
                                     })
@@ -3801,15 +3876,15 @@ impl ExchangeDriver {
                                     }
                                     OperationFailure::Reconciliation(error) => {
                                         let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                                            forge_provider_api::ProviderOperation::SessionConfigure, &error,
+                                            forge_provider_api::ProviderOperation::ThreadConfigure, &error,
                                         );
                                         trace.record(&session_id, "exchange.configuration.reconciliation_failed", serde_json::json!({
-                                            "command_id":command_id.as_str(),"update_step":update_step,"kind":diagnostic.kind,
+                                            "command_id":command_id.as_str(),"update_step":update_step,"kind":diagnostic.kind(),
                                         }));
                                         self.commands.finish(
                                             queued,
                                             Err(CommandFailure::ConfigurationReconcileFailed {
-                                                kind: diagnostic.kind,
+                                                kind: diagnostic.kind(),
                                             }),
                                             &trace,
                                             &session_id,
@@ -3982,16 +4057,16 @@ impl ExchangeDriver {
                             Err(TransitionFailure::Domain(error.into()))
                         }
                     };
-                    if let Some((kind, outcome)) = core_transition {
-                        if let Err(error) = record_owner_core(
+                    if let Some((kind, outcome)) = core_transition
+                        && let Err(error) = record_owner_core(
                             &mut self.commands,
                             &transition.core_transition(kind, outcome),
                             &trace,
                             &session_id,
                             update_step,
-                        ) {
-                            progress = Err(error);
-                        }
+                        )
+                    {
+                        progress = Err(error);
                     }
                     if let Ok(TransitionProgress::Finished { .. }) = &progress {
                         let record = transition.core_transition(
@@ -4461,6 +4536,9 @@ impl ExchangeDriver {
                             };
                             drop(execution);
                             notify(completion, id, outcome, &trace, &session_id, update_step);
+                            // Readiness answers Waiting while foreground work is active, so input
+                            // requeued during this turn needs a wake once the turn releases execution.
+                            services.input.changed.notify_one();
                         }
                         Err(error) => {
                             let runtime = foreground
@@ -4748,10 +4826,7 @@ impl ExchangeDriver {
         let steerable = broker
             .parent_input
             .capture()
-            .is_some_and(|parent| parent.is_open())
-            || ready.native_steer
-                && matches!(view.execution, crate::broker::ControlExecution::Native)
-                && view.steering_scope.is_some();
+            .is_some_and(|parent| parent.is_open());
         let policy = if services.execution.available_permits() == 0 && steerable {
             InputQueuePolicy::AllowSteering
         } else {
@@ -4772,6 +4847,11 @@ impl ExchangeDriver {
             PendingInput::Empty | PendingInput::Waiting => return Ok(CandidateAdmission::Waiting),
             PendingInput::WaitExecution => return Ok(CandidateAdmission::WaitExecution),
         };
+        if ready.checks_running {
+            // A running turn waiting on `check_run` keeps the owner busy, so the idle-path
+            // interruption cannot observe this prompt; request it here and wait for collection.
+            interrupt_checks_for_direct_input(&message, services, trace, session, step);
+        }
         if !crate::input::input_purpose_is_current(
             &services.tasks,
             &services.questions,
@@ -4794,16 +4874,6 @@ impl ExchangeDriver {
         trace.record(session, "exchange.input_readiness.selected", serde_json::json!({"input_id":input.id.as_str(),"input_revision":input.revision,"update_step":step}));
 
         // Install root or captured steering admission without lending permits to the readiness observer.
-        if message.intent == crate::input::InputIntent::Queue
-            && matches!(view.execution, crate::broker::ControlExecution::Native)
-        {
-            // A retained native invocation can outlive its root permit; waiting on a free permit spins.
-            return Ok(if services.execution.available_permits() == 0 {
-                CandidateAdmission::WaitExecution
-            } else {
-                CandidateAdmission::Waiting
-            });
-        }
         match services.execution.clone().try_acquire_owned() {
             Ok(execution) => {
                 return Ok(CandidateAdmission::Foreground(InputDeliveryOffer {
@@ -5042,7 +5112,7 @@ impl ExchangeDriver {
                     Some(TaskInputProduction::Superseded) => "superseded",
                 });
                 let result = production.map(|production| match production {
-                    Some(TaskInputProduction::Updated(update)) => publish_input_observation(update, Some(&output), services, trace, session, step),
+                    Some(TaskInputProduction::Updated(updates)) => updates.into_iter().for_each(|update| publish_input_observation(update, Some(&output), services, trace, session, step)),
                     Some(TaskInputProduction::ContinuationCancelled { task, input }) => {
                         trace.record(session, "exchange.task_input.continuation_cancelled", serde_json::json!({"readiness_id":id.0.to_string(),"task_id":task.as_str(),"input_id":input.as_str(),"update_step":step}));
                         let publication = services.observer.snapshot().and_then(|snapshot| {
@@ -5168,10 +5238,7 @@ impl ExchangeDriver {
                     publish_input_events(view.events, Some(&output), services, trace, session, &input, step);
                     let registry = broker.execution_registry();
                     let target = if let Some(parent) = broker.parent_input.capture().filter(crate::provider::SteeringTarget::is_open) {
-                        SteeringDispatchTarget::parent(parent, registry, crate::provider::ExecutionOwner::root(session))
-                    } else if ready.native_steer && matches!(view.execution, crate::broker::ControlExecution::Native) {
-                        let Some(scope) = view.steering_scope else { return Ok(false); };
-                        SteeringDispatchTarget::native(scope, registry)
+                        SteeringDispatchTarget::parent(parent, registry, crate::provider::ThreadOwner::root(session))
                     } else { return Ok(false); };
                     let Some(message) = services.input.claim(input.id.as_str(), input.revision, crate::input::InputRoute::Steering).map_err(InputOfferError::Queue)? else { return Ok(false); };
                     let claimed_revision = message.revision;
@@ -5262,22 +5329,6 @@ impl ExchangeDriver {
                                         &input,
                                         step,
                                     );
-                                    if matches!(
-                                        view.execution,
-                                        crate::broker::ControlExecution::Native
-                                    ) {
-                                        drop(control);
-                                        drop(execution);
-                                        notify_input_offer(
-                                            reply,
-                                            Ok(false),
-                                            trace,
-                                            session,
-                                            &input,
-                                            step,
-                                        );
-                                        return;
-                                    }
                                 }
                                 Err(error) => {
                                     drop(control);
@@ -5524,9 +5575,11 @@ impl ExchangeDriver {
                     },
                 };
                 self.commands.admit(
-                    request,
-                    reply,
-                    task_admission,
+                    CommandAdmission {
+                        request,
+                        reply,
+                        task_admission,
+                    },
                     active.map(ActiveCommand::queued_mut),
                     trace,
                     session,
@@ -5554,18 +5607,8 @@ impl ExchangeDriver {
                 let mut result = if self.commands.storage_unavailable() {
                     Err(super::provider_lifecycle::ProviderLifecycleFailure::StateUnavailable)
                 } else {
-                    let mut broker = broker.lock().await;
-                    initialized.and_then(|initialized| initialized.commit(&mut broker)).and_then(|snapshot| {
-                        if let Some(snapshot) = snapshot {
-                            let payload = serde_json::to_value(serde_json::json!({"snapshot":snapshot}))
-                                .map_err(|_| super::provider_lifecycle::ProviderLifecycleFailure::StateUnavailable)?;
-                            services.publications.publish(forge_protocol::message::SessionEvent {
-                                session_id: session.into(), event: "session_configured".into(), payload,
-                            }, output.as_ref())
-                                .map_err(|_| super::provider_lifecycle::ProviderLifecycleFailure::StateUnavailable)?;
-                        }
-                        Ok(())
-                    })
+                    let broker = broker.lock().await;
+                    initialized.and_then(|initialized| initialized.commit(&broker))
                 };
                 if result.is_ok() {
                     let catalog = { broker.lock().await.provider_catalog_request() };
@@ -5604,14 +5647,48 @@ impl ExchangeDriver {
                 if messages.is_none() {
                     *messages = output.clone();
                 }
-                self.idle_settlement = IdleSettlement::Requested;
-                let observed = {
+                let (observed, retirement) = {
                     let mut broker = broker.lock().await;
-                    self.input_receipts
+                    let observed = self
+                        .input_receipts
                         .observe_acceptance(services)
                         .map_err(anyhow::Error::from)
-                        .and_then(|()| broker.drain_session_events())
+                        .and_then(|()| broker.drain_session_events());
+                    let retired_binding = match services.observer.session_events().end() {
+                        Some(
+                            crate::provider::session_execution::ObservationEnd::Collected {
+                                retired_binding,
+                                ..
+                            }
+                            | crate::provider::session_execution::ObservationEnd::Lost {
+                                retired_binding,
+                                ..
+                            },
+                        ) => retired_binding,
+                        None => None,
+                    };
+                    let retirement = retired_binding
+                        .as_ref()
+                        .map(|binding| broker.observed_binding_retired(binding))
+                        .transpose();
+                    (observed, retirement)
                 };
+                // Consume the actual closed generation even when observation loss is reported after its prefix.
+                let retirement = match retirement {
+                    Ok(Some(delivery)) => delivery.deliver().await,
+                    Ok(None) => Ok(Vec::new()),
+                    Err(error) => Err(error),
+                };
+                let observed =
+                    match (observed, retirement) {
+                        (Ok(mut events), Ok(retirement)) => {
+                            events.extend(retirement);
+                            Ok(events)
+                        }
+                        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+                        (Err(error), Err(retirement)) => Err(error
+                            .context(format!("closed binding publication failed: {retirement:#}"))),
+                    };
                 let observed = observed
                     .and_then(|events| {
                         let event_count = events.len();
@@ -5627,7 +5704,6 @@ impl ExchangeDriver {
                         }
                         trace.record(session, "exchange.event.applied", serde_json::json!({
                         "source":"provider_session_inbox","update_step":step,"events":event_count,
-                        "idle_settlement":"requested",
                     }));
                         Ok(())
                     })
@@ -5826,6 +5902,36 @@ impl ProviderObservationError {
     pub(crate) fn owner_closed(&self) -> bool {
         matches!(self, Self::OwnerClosed)
     }
+
+    /// Get the stable diagnostic code that traces record in place of free-form error text.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::OwnerClosed => "owner_closed",
+            Self::ObservationLost => "observation_lost",
+            Self::Commit(_) => "observation_commit_failed",
+        }
+    }
+}
+
+/// Retry only a native child guard which certifies that configuration performed no mutation.
+fn configuration_waits_for_child(error: &crate::provider::ProviderError) -> bool {
+    match error {
+        crate::provider::ProviderError::Failure(failure) => {
+            failure.operation() == forge_provider_api::ProviderOperation::ThreadConfigure
+                && failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive
+                && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
+        }
+        crate::provider::ProviderError::PreparationFailed(source) => {
+            configuration_waits_for_child(source)
+        }
+        crate::provider::ProviderError::Combined { primary, secondary } => {
+            configuration_waits_for_child(primary)
+                && secondary
+                    .iter()
+                    .all(crate::broker::ConfigurationReconcileJob::unchanged_failure)
+        }
+        _ => false,
+    }
 }
 
 enum CommandIntent {
@@ -5835,12 +5941,6 @@ enum CommandIntent {
         command: Command,
     },
     Identified(CommandRequest),
-}
-
-/// Defer an internal idle-work request until the owner can safely admit its foreground lifetime.
-enum IdleSettlement {
-    NotRequested,
-    Requested,
 }
 
 /// Keep replacement barred when collection or a prior transition cannot establish availability.
@@ -5884,6 +5984,7 @@ enum DriverWake {
     ObservationRecovery(super::observation_recovery::RecoveryEvent),
     TaskCheck(Option<Result<crate::broker::TaskCheckEvent>>),
     TaskCheckUpdate(std::io::Result<Option<crate::broker::publication::SessionUpdate>>),
+    ToolCheckUpdate(std::io::Result<Option<crate::broker::publication::SessionUpdate>>),
     ShutdownRetry,
     Shutdown(super::shutdown::ShutdownEvent),
     AutomaticCheck(Option<Result<crate::broker::OwnedCheckResult>>),
@@ -5916,12 +6017,6 @@ enum DriverWake {
     CancellationCollected(Option<Result<CollectedCancellation, tokio::task::JoinError>>),
     RollbackCollected(Option<Result<(CommandId, RollbackRecovery), tokio::task::JoinError>>),
     FailedForeground(Option<Result<FailedForeground, tokio::task::JoinError>>),
-}
-
-/// Couple automatic-check revalidation to the one idle-settlement request it awaits.
-enum AutomaticAction {
-    Progress(crate::broker::OwnedCheckProgress),
-    AwaitSettlement,
 }
 
 /// Own the automatic-check stream through producer completion and final draining.
@@ -6159,6 +6254,47 @@ fn publish_input_events(
 }
 
 /// Publish owner-committed receipt progress independently of the producer's response waiter.
+/// Interrupt the active check run on behalf of a current direct prompt.
+///
+/// A direct prompt preempts checks whether the owner is idle or a running turn is waiting on a
+/// `check_run` result; input readiness retries delivery once the cancelled run is collected.
+/// Explicitly queued input and stale task input never interrupt checks. Returns whether a run
+/// was active and cancellation was requested.
+fn interrupt_checks_for_direct_input(
+    message: &crate::input::InputMessage,
+    services: &OwnerServices,
+    trace: &TraceStore,
+    session: &str,
+    step: u64,
+) -> bool {
+    if message.intent != crate::input::InputIntent::Auto
+        || !crate::input::input_purpose_is_current(
+            &services.tasks,
+            &services.questions,
+            &message.purpose,
+            &services.root,
+            services.observer.session_id(),
+        )
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(Some(run_id)) = services.checks.active() else {
+        return false;
+    };
+    if let Err(error) = services.checks.cancel_for_collection(&run_id) {
+        trace.record(
+            session,
+            "exchange.check.input_collection_failed",
+            serde_json::json!({
+                "input_id":message.id,"input_revision":message.revision,"run_id":run_id,
+                "reason":error.to_string(),"update_step":step,
+            }),
+        );
+    }
+    true
+}
+
 fn publish_input_observation(
     update: crate::input::InputUpdate,
     messages: Option<&MessageSender>,
@@ -6449,11 +6585,11 @@ async fn collect_failed_foreground(
     runtime.dispatch_effects(ForegroundEffectGate::CollectionOnly);
     let approvals = std::panic::AssertUnwindSafe(async {
         permissions
-            .cancel_owner(&crate::provider::ExecutionOwner::root(&session), None)
+            .cancel_owner(&crate::provider::ThreadOwner::root(&session), None)
             .await
             .map_err(|error| {
                 crate::provider::lifecycle_error::classify(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     error,
                 )
             })
@@ -6567,7 +6703,7 @@ enum ForegroundCompletion {
     },
     /// Notify a compatibility caller; its result publications retain their existing transport path.
     Caller(oneshot::Sender<Result<DispatchResult>>),
-    /// Retain terminal events for internal idle work without requiring an external forwarder.
+    /// Retain terminal events for owner-admitted work without requiring an external forwarder.
     Retained {
         publications: Arc<super::publication::SessionPublications>,
         messages: Option<MessageSender>,
@@ -6873,7 +7009,7 @@ impl ForegroundRuntime {
                 ForegroundSignal::LiveHost(request) => {
                     request.reject(crate::provider::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Runtime,
                         ),
                     ));

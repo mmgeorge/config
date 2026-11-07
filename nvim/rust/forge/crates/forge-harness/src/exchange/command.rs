@@ -846,6 +846,10 @@ pub(crate) enum CancellationOutcome {
     Cancelled {
         exchange: crate::provider::ExchangeId,
     },
+    /// The selected output-free exchange was removed by confirmed native retraction.
+    Retracted {
+        exchange: crate::provider::ExchangeId,
+    },
 }
 
 /// Preserve input/edit identities without confusing acceptance with native delivery.

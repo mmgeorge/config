@@ -25,6 +25,17 @@ return {
             and vim.b[buffer].forge_source_markdown ~= true
         end,
         render_modes = { 'n', 'c', 't', 'i' },
+        bullet = {
+          -- The overlay replaces only as many cells as its text, so a renumbered marker
+          -- shorter than the source (`1.` over `001.`) would leave `1.1.` on screen.
+          -- Right-align the number within the original marker width.
+          ordered_icons = function(context)
+            local marker = vim.trim(context.value)
+            local index = tonumber(marker:sub(1, #marker - 1)) or 0
+            local number = ('%d.'):format(index > 1 and index or context.index)
+            return (' '):rep(math.max(#marker - #number, 0)) .. number
+          end,
+        },
         custom_handlers = {
           markdown = require('markdown_math.display_handler'),
           latex = require('markdown_math.display_handler').latex,

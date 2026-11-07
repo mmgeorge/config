@@ -418,6 +418,42 @@ impl SessionInputQueue {
         Ok(Some(update))
     }
 
+    /// Remove queued task inputs whose task authority can never become current again.
+    /// Only undelivered, unreserved revisions are removed; delivery state owns every other message.
+    pub(crate) fn retire_task_input(
+        &self,
+        retired: &[(String, u64)],
+    ) -> Result<Option<InputUpdate>> {
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
+        let mut update = InputUpdate::default();
+        state.snapshot.messages.retain(|message| {
+            let remove = matches!(
+                message.purpose,
+                InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
+            ) && message.delivery() == InputDelivery::Queued
+                && message.reservation().is_none()
+                && retired
+                    .iter()
+                    .any(|(id, revision)| *id == message.id && *revision == message.revision);
+            if remove {
+                update.removed.push(message.id.clone());
+            }
+            !remove
+        });
+        if update.removed.is_empty() {
+            return Ok(None);
+        }
+        Self::advance(&mut state.snapshot, &mut update);
+        self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
+        Ok(Some(update))
+    }
+
     /// Publish an input reservation committed with its owning workflow transaction.
     pub(crate) fn refresh_workflow_reservation(&self) -> Result<()> {
         let mut retained = self
@@ -742,6 +778,44 @@ impl SessionInputQueue {
         drop(retained);
         self.changed.notify_one();
         Ok(update)
+    }
+
+    /// Retract the newest user prompt that no owner has claimed yet.
+    ///
+    /// A cancel can run before the owner claims a just-submitted prompt. That cancel
+    /// finds no foreground work, yet its suspension would refuse every later claim and
+    /// strand the prompt in the queue. Retracting it returns the draft to the composer
+    /// as a cancel of started work does. Deliberately queued follow-ups stay queued.
+    pub(crate) fn retract_unclaimed_submission(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<InputUpdate>> {
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
+        let Some(index) = state.snapshot.messages.iter().rposition(|message| {
+            matches!(message.purpose, InputPurpose::User)
+                && message.intent == InputIntent::Auto
+                && message.delivery() == InputDelivery::Queued
+                && message.reservation().is_none()
+                && message.submission_id().is_none()
+        }) else {
+            return Ok(None);
+        };
+        let message = state.snapshot.messages.remove(index);
+        let mut update = InputUpdate {
+            operation_id: Some(operation_id.to_owned()),
+            removed: vec![message.id.clone()],
+            retracted: Some(message.id),
+            ..InputUpdate::default()
+        };
+        Self::advance(&mut state.snapshot, &mut update);
+        self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
+        Ok(Some(update))
     }
 
     pub fn claim(

@@ -60,7 +60,7 @@ impl Exchange {
                     || matches!(&commentary.source, CommentarySource::Provider { turn_id, message_id }
                         if self.turn.iter().find(|turn| turn.id() == turn_id)
                             .and_then(|turn| turn.messages().iter().find(|message| message.id() == message_id))
-                            .is_some_and(|message| message.role() == Some(crate::provider::MessageRole::Response))),
+                            .is_some_and(|message| message.role() == Some(forge_provider_api::AgentMessageRole::Response))),
                 ExchangeEntry::Response { .. } => true,
                 ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
                     node.id() == id
@@ -108,7 +108,7 @@ impl Exchange {
                         .context("commentary references a missing provider message")?,
                 )
                 .filter(|message| {
-                    message.role() == Some(crate::provider::MessageRole::Commentary)
+                    message.role() == Some(forge_provider_api::AgentMessageRole::Commentary)
                         && !message.text().trim().is_empty()
                 }),
             };
@@ -203,9 +203,12 @@ impl Exchange {
                                 turn.messages().iter().find(|message| message.id() == id)
                             })
                             .context("timeline references a missing provider message")?;
+                        // Reasoning has no agent role, so delivery, not role, separates
+                        // outer response content from private or commentary text.
                         if !matches!(
-                            message.role(),
-                            None | Some(crate::provider::MessageRole::Response)
+                            message.delivery(),
+                            crate::turn::MessageDelivery::Final
+                                | crate::turn::MessageDelivery::Unknown
                         ) || message.text().trim().is_empty()
                         {
                             continue;
@@ -225,10 +228,7 @@ impl Exchange {
 mod tests {
     use super::*;
     use crate::exchange::InputIntent;
-    use crate::provider::{
-        MessageRole, ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
-        ToolUpdate,
-    };
+    use crate::provider::{ProviderEvent, TextUpdate, ToolOutcome};
     use serde_json::json;
 
     #[test]
@@ -244,45 +244,72 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "thought",
-            Some(MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Inspect files",
         );
-        exchange.observe_turn(&event, 1)?;
-        let mut event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn: address,
-                tool_id: "before".into(),
-            },
-            update: ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    title: "inspect".into(),
-                    name: "inspect".into(),
-                    kind: ToolActivityKind::Command,
-                    arguments: json!({}),
-                },
-            },
-        };
-        exchange.observe_turn(&event, 2)?;
+        exchange.observe_event(&event, 1)?;
+        let mut event = crate::turn::test_support::item_event(
+            &address,
+            "before",
+            forge_provider_api::ItemEvent::Started(
+                forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        title: "inspect".into(),
+                        name: "inspect".into(),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    },
+                ),
+            ),
+        );
+        exchange.observe_event(&event, 2)?;
         exchange.append_input(InputIntent::Steering, "Include tests".into(), 3)?;
-        if let ProviderEvent::Tool { address, .. } = &mut event {
-            address.tool_id = "after".into();
+        if let crate::provider::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item { item_id, .. } = boxed_native_event.as_mut()
+        {
+            *item_id = forge_provider_api::ItemId::new("after")?;
         }
-        exchange.observe_turn(&event, 4)?;
-        if let ProviderEvent::Tool { address, update } = &mut event {
-            address.tool_id = "before".into();
-            *update = ToolUpdate::Output {
-                update: TextUpdate::Replace("Late result".into()),
+        exchange.observe_event(&event, 4)?;
+        if let crate::provider::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item {
+                item_id,
+                event: update,
+                ..
+            } = boxed_native_event.as_mut()
+        {
+            *item_id = forge_provider_api::ItemId::new("before")?;
+            *update = forge_provider_api::ItemEvent::Tool {
+                event: forge_provider_api::ToolItemEvent::Output(TextUpdate::Replace(
+                    "Late result".into(),
+                )),
             };
         }
-        exchange.observe_turn(&event, 5)?;
-        if let ProviderEvent::Tool { update, .. } = &mut event {
-            *update = ToolUpdate::Finished {
-                outcome: ToolOutcome::Succeeded,
-            };
+        exchange.observe_event(&event, 5)?;
+        if let crate::provider::HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &mut event
+            && let ProviderEvent::Item { event: update, .. } = boxed_native_event.as_mut()
+        {
+            *update = forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::CommandExecution(
+                    forge_provider_api::ToolCompletion {
+                        outcome: ToolOutcome::Succeeded,
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    },
+                ),
+            );
         }
-        exchange.observe_turn(&event, 5)?;
-        exchange.observe_turn(&event, 6)?;
+        exchange.observe_event(&event, 5)?;
+        exchange.observe_event(&event, 6)?;
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         let content = restored.content(&restored.node_list.iter().collect::<Vec<_>>(), true)?;
         assert_eq!(content.commentary.len(), 1);
@@ -318,26 +345,34 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "first",
-            Some(MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Initial work",
         );
-        exchange.observe_turn(&event, 1)?;
+        exchange.observe_event(&event, 1)?;
         crate::turn::test_support::tool(
             &mut exchange,
             &address,
             "earlier",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 name: "earlier".into(),
                 title: "earlier".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             [
-                ToolUpdate::Started,
-                ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::ExecutionStarted,
                 },
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
             ],
             2,
         )?;
@@ -345,10 +380,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "ack",
-            Some(MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "I will run the relevant checks",
         );
-        exchange.observe_turn(&event, 4)?;
+        exchange.observe_event(&event, 4)?;
         let acknowledgement = exchange.node_list.last().unwrap().id().to_owned();
         exchange.append_input(InputIntent::Steering, "That was temporary".into(), 5)?;
         for index in 0..6 {
@@ -356,18 +391,28 @@ mod tests {
                 &mut exchange,
                 &address,
                 &format!("command-{index}"),
-                ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "inspect".into(),
-                    title: format!("inspect {index}"),
-                    arguments: json!({}),
-                },
-                [
-                    ToolUpdate::Started,
-                    ToolUpdate::Finished {
-                        outcome: ToolOutcome::Succeeded,
+                forge_provider_api::ItemStart::CommandExecution(
+                    forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "inspect".into(),
+                        title: format!("inspect {index}"),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
                     },
+                ),
+                [
+                    forge_provider_api::ItemEvent::Tool {
+                        event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                    },
+                    forge_provider_api::ItemEvent::Completed(
+                        forge_provider_api::ItemCompletion::CommandExecution(
+                            forge_provider_api::ToolCompletion {
+                                outcome: ToolOutcome::Succeeded,
+                                descriptor: None,
+                                output: None,
+                                changes: Default::default(),
+                            },
+                        ),
+                    ),
                 ],
                 index + 6,
             )?;
@@ -376,17 +421,18 @@ mod tests {
             &mut exchange,
             &address,
             "write",
-            ToolInvocation {
+            forge_provider_api::ItemStart::FileChange(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::FileChange,
                 name: "edit".into(),
                 title: "edit".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             [
-                ToolUpdate::Started,
-                ToolUpdate::Changes {
-                    changes: ProviderChangeSet {
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                },
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::Changes(ProviderChangeSet {
                         file: (0..9)
                             .map(|index| ProviderFileChange {
                                 path: format!("file-{index}.rs"),
@@ -395,11 +441,18 @@ mod tests {
                                 diff: format!("@@ -0,0 +1 @@\n+file {index}\n"),
                             })
                             .collect(),
-                    },
+                    }),
                 },
-                ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
-                },
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::FileChange(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
             ],
             12,
         )?;
@@ -407,10 +460,10 @@ mod tests {
         let event = crate::turn::test_support::message(
             &address,
             "next",
-            Some(MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Admission now reads committed state",
         );
-        exchange.observe_turn(&event, 13)?;
+        exchange.observe_event(&event, 13)?;
         let settled_group = exchange.clone();
         exchange.finish(super::super::ExchangeOutcome::Cancelled, 14)?;
         let reopened: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
@@ -431,6 +484,7 @@ mod tests {
                         columns,
                         ..Default::default()
                     },
+                    crate::buffer::projection::FIXTURE_NOW_MS,
                     false,
                     &Default::default(),
                     &Default::default(),
@@ -495,30 +549,40 @@ mod tests {
                     &address,
                     "existing",
                     Some(if phase == "commentary" {
-                        crate::provider::MessageRole::Commentary
+                        forge_provider_api::AgentMessageRole::Commentary
                     } else {
-                        crate::provider::MessageRole::Response
+                        forge_provider_api::AgentMessageRole::Response
                     }),
                     "Existing message",
                 );
-                exchange.observe_turn(&event, 1)?;
+                exchange.observe_event(&event, 1)?;
                 exchange.append_input(intent, "New input".into(), 2)?;
                 crate::turn::test_support::tool(
                     &mut exchange,
                     &address,
                     "later",
-                    ToolInvocation {
-                        semantics: Default::default(),
-                        kind: ToolActivityKind::Command,
-                        name: "later".into(),
-                        title: "later".into(),
-                        arguments: json!({}),
-                    },
-                    [
-                        ToolUpdate::Started,
-                        ToolUpdate::Finished {
-                            outcome: ToolOutcome::Succeeded,
+                    forge_provider_api::ItemStart::CommandExecution(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            name: "later".into(),
+                            title: "later".into(),
+                            arguments: forge_provider_api::InspectableArguments::new(json!({})),
                         },
+                    ),
+                    [
+                        forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                        },
+                        forge_provider_api::ItemEvent::Completed(
+                            forge_provider_api::ItemCompletion::CommandExecution(
+                                forge_provider_api::ToolCompletion {
+                                    outcome: ToolOutcome::Succeeded,
+                                    descriptor: None,
+                                    output: None,
+                                    changes: Default::default(),
+                                },
+                            ),
+                        ),
                     ],
                     3,
                 )?;

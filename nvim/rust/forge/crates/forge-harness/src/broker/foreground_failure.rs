@@ -19,6 +19,24 @@ pub(crate) struct ForegroundFailure {
     admission_effects: Option<AppliedProviderEvent>,
     admission_events: Vec<SessionEvent>,
     baseline_cleanup: FailureBaselinePhase,
+    settlement_commit: FailureSettlementCommit,
+}
+
+/// Track who returns a failed invocation's native settlement to its execution owner.
+///
+/// Engine closure discards every retained invocation, but scoped collection leaves the stopped
+/// invocation registered until its ticket commits. An uncommitted ticket keeps the owner
+/// occupied, so the next prompt would fail with "execution owner is unavailable or already
+/// active" although the failure settled cleanly.
+enum FailureSettlementCommit {
+    /// Engine closure or an undispatched admission leaves no retained invocation.
+    Closed,
+    /// Scoped collection stopped the invocation; failure settlement must commit its ticket.
+    Collected,
+    /// The settlement commit job owns the ticket.
+    Pending,
+    /// The commit reported its result, or no ticket remained to commit.
+    Complete,
 }
 
 enum FailureBaselinePhase {
@@ -175,7 +193,7 @@ impl FailureBaselineJob {
 /// Own the staged admission's provider fence and activated baseline worker.
 pub(crate) struct AdmissionCleanupJob {
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     baseline: AdmissionBaseline,
     native: AdmissionNativeCollection,
 }
@@ -302,6 +320,11 @@ impl HarnessBroker {
         } else {
             error
         };
+        if error.is::<TurnCancelled>() && transaction.collection.is_none() {
+            transaction.collection = Some(ForegroundCollection::Cancel(
+                crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed,
+            ));
+        }
         transaction.fail_live_host_observer(&self.trace, &self.session.id);
         if transaction.failure_cleanup_active {
             if error.is::<TurnCancelled>()
@@ -339,6 +362,179 @@ impl HarnessBroker {
         ))
     }
 
+    /// Settle a cancellation the exchange owner already collected, restoring an output-free prompt.
+    ///
+    /// The owner's collection stopped the native invocation, so a second cleanup would retire
+    /// its reader early. Failure settlement therefore starts with that collection as its
+    /// successful cleanup, and `advance_foreground_failure` makes the restore-or-finalize decision.
+    pub(crate) fn settle_collected_cancellation(
+        &mut self,
+        dispatch: &mut ForegroundDispatch,
+    ) -> Result<ForegroundAction> {
+        let ForegroundDispatch::Running { transaction, .. } = dispatch else {
+            anyhow::bail!("collected cancellation has no running foreground owner");
+        };
+        transaction.fail_live_host_observer(&self.trace, &self.session.id);
+        transaction.failure_cleanup_active = true;
+        transaction.failure_inbox_open = true;
+        self.complete_foreground_cleanup(dispatch, TurnCancelled.into(), Ok(()))
+    }
+
+    /// Decide whether foreground cleanup stops only the failed exchange instead of closing its engine.
+    ///
+    /// Cancellation and an elapsed tool deadline leave the session usable, so cleanup collects the
+    /// exchange's native turn through its scope and failure settlement later commits that turn's
+    /// ticket. Every other failure closes the engine.
+    pub(crate) fn collects_exchange_scope(original: &anyhow::Error) -> bool {
+        original.is::<TurnCancelled>()
+            || original.is::<crate::provider::tool_timeout::ToolTimeout>()
+    }
+
+    /// Commit a scoped-collected invocation's settlement after failure settlement drains.
+    ///
+    /// Run only once every failure checkpoint and publication has settled, which is when the
+    /// clean finalization path commits its own ticket. Skip the commit when no ticket remains.
+    fn begin_failure_settlement_commit(
+        &mut self,
+        dispatch: &mut ForegroundDispatch,
+    ) -> Result<Option<ForegroundAction>> {
+        let (ForegroundDispatch::Running {
+            transaction,
+            admission,
+        }
+        | ForegroundDispatch::Finalizing {
+            transaction,
+            admission,
+        }) = dispatch
+        else {
+            return Ok(None);
+        };
+        let Some(failure) = admission.failure.as_mut() else {
+            return Ok(None);
+        };
+        if !matches!(
+            failure.settlement_commit,
+            FailureSettlementCommit::Collected
+        ) || failure.cleanup.is_some()
+        {
+            return Ok(None);
+        }
+        failure.settlement_commit = FailureSettlementCommit::Complete;
+        let cell = transaction.settlement.clone();
+        let prepared = (|| -> Result<bool, ProviderError> {
+            if cell.checkout()?.ticket().is_none() {
+                return Ok(false);
+            }
+            cell.seal_effects(&[])?;
+            Ok(true)
+        })();
+        match prepared {
+            Ok(false) => Ok(None),
+            Ok(true) => {
+                failure.settlement_commit = FailureSettlementCommit::Pending;
+                Ok(Some(ForegroundAction::Effect(
+                    ForegroundJob::SettlementCommit {
+                        cell,
+                        requirement: SettlementRequirement::Native,
+                        undispatched: Vec::new(),
+                    },
+                )))
+            }
+            Err(error) => {
+                failure
+                    .secondary
+                    .push(format!("prepare collected settlement commit: {error:#}"));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Record the scoped-collected settlement commit and resume failure settlement.
+    pub(crate) fn complete_failure_settlement_commit(
+        &mut self,
+        dispatch: &mut ForegroundDispatch,
+        result: Result<(), crate::provider::session_execution::SettlementError>,
+    ) -> Result<ForegroundAction> {
+        let failure = match dispatch {
+            ForegroundDispatch::Running { admission, .. }
+            | ForegroundDispatch::Finalizing { admission, .. } => admission.failure.as_mut(),
+            ForegroundDispatch::Admitting(_)
+            | ForegroundDispatch::Done(_)
+            | ForegroundDispatch::Transitioning => None,
+        }
+        .context("settlement commit completed without its failure owner")?;
+        anyhow::ensure!(
+            matches!(failure.settlement_commit, FailureSettlementCommit::Pending),
+            "unexpected failure settlement commit"
+        );
+        failure.settlement_commit = FailureSettlementCommit::Complete;
+        if let Err(error) = result {
+            failure
+                .secondary
+                .push(format!("commit collected settlement: {error}"));
+        }
+        self.finish_foreground_failure(dispatch)
+    }
+
+    /// Decide whether a cancellation may restore its prompt instead of persisting a partial exchange.
+    ///
+    /// Both owner-collected cancellation and foreground failure settlement consult this one rule,
+    /// so a restoring Ctrl-C cannot depend on which path observed the native termination.
+    pub(crate) fn cancellation_restores_prompt(transaction: &ForegroundTransaction) -> bool {
+        transaction
+            .state
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.retraction_eligibility.is_output_free())
+            && matches!(
+                transaction.collection,
+                Some(ForegroundCollection::Cancel(
+                    crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed
+                ))
+            )
+    }
+
+    /// Create the native rollback request for the exact cancelled submission and history boundary.
+    fn output_free_retraction(
+        transaction: &ForegroundTransaction,
+    ) -> Result<Option<FailureBaselinePolicy>> {
+        let Some((scope, boundary)) = &transaction.retraction_boundary else {
+            return Ok(None);
+        };
+        let Some(submission) = &transaction.request.submission else {
+            return Ok(None);
+        };
+        let Some(handoff) = transaction.request.dispatch.observer().current()? else {
+            return Ok(None);
+        };
+        let record = submission.record()?;
+        if scope != &transaction.state.scope
+            || handoff.scope() != scope
+            || handoff.attempt_id() != &record.attempt_id
+            || !matches!(handoff.target(), forge_provider_api::submission::DispatchTarget::Input(id) if id == submission.receipt_id())
+        {
+            return Ok(None);
+        }
+        let operation = crate::provider::operation::OperationControl::new(
+            forge_provider_api::ProviderOperation::InputRetract,
+            forge_provider_api::OperationId::new(format!(
+                "retract:{}:{}",
+                submission.id(),
+                record.attempt_id.as_str()
+            ))?,
+        )?;
+        Ok(Some(FailureBaselinePolicy::Retract {
+            context: operation.context(),
+            request: forge_provider_api::InputRetractRequest {
+                scope: scope.clone(),
+                submission_id: submission.receipt_id().clone(),
+                attempt_id: record.attempt_id,
+                boundary: boundary.clone(),
+                authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation,
+            },
+        }))
+    }
+
     /// Retain the watchdog's failed tool observation before fencing the owner.
     pub(crate) fn handle_foreground_timeout(
         &mut self,
@@ -348,21 +544,20 @@ impl HarnessBroker {
         if !expired.claim_report() {
             return self.fail_foreground(transaction, expired.into());
         }
-        let observation = ProviderEvent::Tool {
-            address: expired.address.clone(),
-            update: crate::provider::ToolUpdate::Finished {
-                outcome: crate::provider::ToolOutcome::Failed {
-                    diagnostic: crate::provider::ToolDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Timeout,
-                        message: forge_provider_api::SanitizedMessage::new(expired.to_string())
-                            .expect("host diagnostic is nonempty"),
-                    },
-                },
+        let observation = crate::provider::HarnessEvent::Host {
+            scope: expired.address.turn.scope.clone().into(),
+            event: crate::provider::HostEvent::Failure {
+                failure: forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
+                    forge_provider_api::ProviderFailureKind::Timeout,
+                ),
+                message: forge_provider_api::SanitizedMessage::new(expired.to_string())
+                    .expect("timeout diagnostics are nonempty"),
             },
         };
-        transaction
-            .pending_session_observations
-            .push_back(observation);
+        transaction.pending_session_observations.push_back(
+            crate::provider::session_execution::OwnerObservation::Event(observation),
+        );
         self.fail_foreground(transaction, expired.into())
     }
 
@@ -410,6 +605,7 @@ impl HarnessBroker {
                     admission_effects: None,
                     admission_events: Vec::new(),
                     baseline_cleanup: FailureBaselinePhase::Unexamined,
+                    settlement_commit: FailureSettlementCommit::Closed,
                 });
                 Ok(ForegroundAction::WaitForPublicationDrain)
             }
@@ -512,7 +708,7 @@ impl HarnessBroker {
         Ok(ForegroundAction::Effect(ForegroundJob::AdmissionCleanup(
             AdmissionCleanupJob {
                 registry,
-                owner: crate::provider::ExecutionOwner::root(&self.session.id),
+                owner: crate::provider::ThreadOwner::root(&self.session.id),
                 baseline,
                 native,
             },
@@ -625,6 +821,7 @@ impl HarnessBroker {
         {
             staged.submission.cancel()?;
             self.store.delete_exchange(&staged.exchange.id)?;
+            self.release_automatic_session_name(&staged.exchange.prompt)?;
             if self
                 .exchange_runtime
                 .as_ref()
@@ -674,6 +871,9 @@ impl HarnessBroker {
                 staged
                     .exchange
                     .begin_finalization(outcome, self.clock.now_ms())?;
+                staged
+                    .exchange
+                    .settle_running_turns(outcome, self.clock.now_ms())?;
                 self.store.save_exchange(&staged.exchange)?;
                 if self.checkpoint.is_none() {
                     let mut changes = crate::exchange::ProviderDiffBuilder::default();
@@ -805,6 +1005,11 @@ impl HarnessBroker {
             _ => anyhow::bail!("cleanup completed without its foreground owner"),
         };
         if transaction.failure.is_none() {
+            let settlement_commit = if cleanup.is_ok() && Self::collects_exchange_scope(&original) {
+                FailureSettlementCommit::Collected
+            } else {
+                FailureSettlementCommit::Closed
+            };
             transaction.failure = Some(ForegroundFailure {
                 original,
                 cleanup: cleanup.err(),
@@ -821,6 +1026,7 @@ impl HarnessBroker {
                 admission_effects: None,
                 admission_events: Vec::new(),
                 baseline_cleanup: FailureBaselinePhase::Unexamined,
+                settlement_commit,
             });
         }
         if let Err(error) = self.collect_foreground_observations(transaction) {
@@ -868,6 +1074,12 @@ impl HarnessBroker {
         {
             return Ok(ForegroundAction::Wait);
         }
+        let restores_prompt = Self::cancellation_restores_prompt(transaction);
+        let native_retraction = if restores_prompt && self.capability.native_turn_rollback {
+            Self::output_free_retraction(transaction)?
+        } else {
+            None
+        };
         let failure = transaction.failure.as_mut().unwrap();
         self.trace.record(&self.session.id, "foreground.failure.advance", json!({
             "exchange_id":transaction.state.interaction.id,
@@ -877,26 +1089,20 @@ impl HarnessBroker {
             "checkpoint_done":failure.checkpoint_done,
             "baseline_pending":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.checkpoint.is_some()),
             "tools_blocked":transaction.state.runtime.as_ref().is_some_and(ExchangeRuntime::tools_blocked),
-            "retraction_eligible":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.retraction_eligible),
+            "retraction_eligible":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.retraction_eligibility.is_output_free()),
             "native_rollback":self.capability.native_turn_rollback,
             "restore_unconsumed_prompt":matches!(transaction.collection, Some(ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed))),
         }));
         if matches!(failure.baseline_cleanup, FailureBaselinePhase::Pending) {
             return Ok(ForegroundAction::Wait);
         }
-        let restoration_authorized = failure.original.is::<TurnCancelled>()
-            && failure.cleanup.is_none()
-            && transaction
-                .state
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.retraction_eligible)
-            && matches!(
-                transaction.collection,
-                Some(ForegroundCollection::Cancel(
-                    crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed
-                ))
-            );
+        // Restoration deletes the provisional exchange, and the exchange owner validates that
+        // exchange when its collection completes. `CollectionCompleted` resumes this decision.
+        if restores_prompt && admission.owner_collection_pending() {
+            return Ok(ForegroundAction::Wait);
+        }
+        let restoration_authorized =
+            failure.original.is::<TurnCancelled>() && failure.cleanup.is_none() && restores_prompt;
         let never_consumed = if restoration_authorized
             && matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
             && let Some(submission) = &transaction.request.submission
@@ -912,20 +1118,34 @@ impl HarnessBroker {
         } else {
             None
         };
+        let native_retraction = native_retraction.filter(|_| {
+            restoration_authorized
+                && never_consumed.is_none()
+                && matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
+        });
+        let cancelled = failure.original.is::<TurnCancelled>();
+        let (baseline_blocked, baseline_committed) =
+            transaction
+                .state
+                .runtime
+                .as_ref()
+                .map_or((false, false), |runtime| {
+                    (
+                        runtime.tools_blocked() && (runtime.checkpoint.is_some() || cancelled),
+                        !runtime.tools_blocked() && runtime.checkpoint.is_none(),
+                    )
+                });
+        // A committed baseline still permits retraction of an output-free prompt, but only an
+        // actual native rollback request may bypass the ordinary cancelled checkpoint.
+        let retract_after_baseline = native_retraction.is_some() && baseline_committed;
         if matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
-            && (never_consumed.is_some()
-                || transaction.state.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.tools_blocked()
-                        && (runtime.checkpoint.is_some() || failure.original.is::<TurnCancelled>())
-                }))
+            && (never_consumed.is_some() || baseline_blocked || retract_after_baseline)
         {
             let runtime = transaction
                 .state
                 .runtime
                 .as_mut()
                 .context("failed pre-baseline execution requires its checkpoint runtime")?;
-            let cancelled = failure.original.is::<TurnCancelled>();
-            let retractable = restoration_authorized && self.capability.native_turn_rollback;
             // This denied gate proves no provider tool could pass the baseline,
             // even when native collection reported failure. Collect its owned
             // worker independently; native cleanup failure still forbids rollback.
@@ -935,46 +1155,27 @@ impl HarnessBroker {
             // Retain checkpoint collection even when journal retirement proves no native input was sent.
             let baseline =
                 AbortedBaseline::new(runtime.checkpoint.take(), self.execution_registry());
-            let local_proof = never_consumed.is_some();
-            let mut policy = match never_consumed {
-                Some((submission, attempt)) => FailureBaselinePolicy::NeverConsumed {
+            let settles_now = never_consumed.is_some() || baseline_blocked;
+            let policy = match (never_consumed, native_retraction) {
+                (Some((submission, attempt)), _) => FailureBaselinePolicy::NeverConsumed {
                     submission,
                     attempt,
                 },
-                None => FailureBaselinePolicy::Retain,
+                (None, Some(policy)) => policy,
+                (None, None) => FailureBaselinePolicy::Retain,
             };
-            if !local_proof
-                && retractable
-                && let Some((scope, boundary)) = &transaction.retraction_boundary
-                && let Some(submission) = &transaction.request.submission
-                && let Some(handoff) = transaction.request.dispatch.observer().current()?
-            {
-                let record = submission.record()?;
-                if scope == &transaction.state.scope
-                    && handoff.scope() == scope
-                    && handoff.attempt_id() == &record.attempt_id
-                    && matches!(handoff.target(), forge_provider_api::submission::DispatchTarget::Input(id) if id == submission.receipt_id())
-                {
-                    let operation = crate::provider::operation::OperationControl::new(
-                        forge_provider_api::ProviderOperation::InputRetract,
-                        forge_provider_api::OperationId::new(format!(
-                            "retract:{}:{}",
-                            submission.id(),
-                            record.attempt_id.as_str()
-                        ))?,
-                    )?;
-                    policy = FailureBaselinePolicy::Retract {
-                        context: operation.context(),
-                        request: forge_provider_api::InputRetractRequest {
-                            scope: scope.clone(),
-                            submission_id: submission.receipt_id().clone(),
-                            attempt_id: record.attempt_id,
-                            boundary: boundary.clone(),
-                            authorization:
-                                forge_provider_api::RetractionAuthorization::OutputFreeCancellation,
-                        },
-                    };
-                }
+            failure.baseline_cleanup = FailureBaselinePhase::Pending;
+            // After a committed baseline, a retained rollback result continues through the
+            // ordinary cancelled checkpoint, so only an aborted baseline settles the exchange here.
+            if !settles_now {
+                return Ok(ForegroundAction::Effect(ForegroundJob::FailureBaseline(
+                    FailureBaselineJob {
+                        provider: self.provider.clone(),
+                        exchange_id: transaction.state.interaction.id.clone(),
+                        baseline,
+                        policy,
+                    },
+                )));
             }
             let interaction = &mut transaction.state.interaction;
             self.questions.cancel_chat(Some(&interaction.id))?;
@@ -996,7 +1197,6 @@ impl HarnessBroker {
             )?;
             self.store.save_exchange(interaction)?;
             failure.checkpoint_done = true;
-            failure.baseline_cleanup = FailureBaselinePhase::Pending;
             return Ok(ForegroundAction::Effect(ForegroundJob::FailureBaseline(
                 FailureBaselineJob {
                     provider: self.provider.clone(),
@@ -1025,13 +1225,6 @@ impl HarnessBroker {
             if interaction.is_finished() {
                 failure.checkpoint_done = true;
             } else {
-                if interaction
-                    .turn
-                    .last()
-                    .is_some_and(|turn| self.reopened_execution.active(&turn.provider().scope))
-                {
-                    return Ok(ForegroundAction::Wait);
-                }
                 let outcome = if failure.original.downcast_ref::<TurnCancelled>().is_some() {
                     crate::exchange::ExchangeOutcome::Cancelled
                 } else {
@@ -1039,13 +1232,15 @@ impl HarnessBroker {
                 };
                 let prepared: Result<Option<FinalCheckpointJob>> = (|| {
                     interaction.begin_finalization(outcome, self.clock.now_ms())?;
+                    // Native cleanup has joined; a terminal it dropped will not arrive later.
+                    interaction.settle_running_turns(outcome, self.clock.now_ms())?;
                     self.store.save_exchange(interaction)?;
                     if let Some(scope) = interaction
                         .turn
                         .last()
                         .map(|turn| turn.provider().scope.clone())
                     {
-                        self.reopened_execution.begin_settlement(&scope);
+                        self.host_settlement.begin_settlement(&scope);
                     }
                     if self.checkpoint.is_none() {
                         let mut changes = crate::exchange::ProviderDiffBuilder::default();
@@ -1073,7 +1268,7 @@ impl HarnessBroker {
                             .last()
                             .map(|turn| turn.provider().scope.clone())
                         {
-                            self.reopened_execution.end_settlement(&scope);
+                            self.host_settlement.end_settlement(&scope);
                         }
                         failure.checkpoint_done = true;
                     }
@@ -1083,7 +1278,7 @@ impl HarnessBroker {
                             .last()
                             .map(|turn| turn.provider().scope.clone())
                         {
-                            self.reopened_execution.end_settlement(&scope);
+                            self.host_settlement.end_settlement(&scope);
                         }
                         interaction.finalization_error = Some(format!("{error:#}"));
                         if let Err(save) = self.store.save_exchange(interaction) {
@@ -1153,6 +1348,8 @@ impl HarnessBroker {
         match result.outcome {
             Ok(BaselineDisposition::Retracted) => {
                 self.store.delete_exchange(&result.exchange_id)?;
+                self.release_automatic_session_name(&transaction.state.interaction.prompt)?;
+                self.retracted_exchange_id = Some(result.exchange_id.clone());
                 transaction.state.runtime.take();
                 failure.original = TurnRetracted {
                     prompt: transaction.state.interaction.prompt.clone(),
@@ -1224,7 +1421,7 @@ impl HarnessBroker {
                         .last()
                         .map(|turn| turn.provider().scope.clone())
                 {
-                    self.reopened_execution.end_settlement(&scope);
+                    self.host_settlement.end_settlement(&scope);
                 }
             }
             Ok(checkpoint_settlement::FinalCheckpointCommit::Committed(_)) => {
@@ -1236,7 +1433,7 @@ impl HarnessBroker {
                     .last()
                     .map(|turn| turn.provider().scope.clone())
                 {
-                    self.reopened_execution.end_settlement(&scope);
+                    self.host_settlement.end_settlement(&scope);
                 }
             }
             Err(error) => {
@@ -1256,7 +1453,7 @@ impl HarnessBroker {
                     .last()
                     .map(|turn| turn.provider().scope.clone())
                 {
-                    self.reopened_execution.end_settlement(&scope);
+                    self.host_settlement.end_settlement(&scope);
                 }
                 failure.checkpoint_done = true;
             }
@@ -1347,14 +1544,18 @@ impl HarnessBroker {
                 {
                     effects
                 } else {
-                    let diagnostic = crate::provider::ProviderDiagnostic {
+                    let diagnostic = super::publication::DiagnosticView {
                         kind: forge_provider_api::ProviderFailureKind::Unknown,
                         message: forge_provider_api::SanitizedMessage::new(format!(
                             "{:#}",
                             failure.original
                         ))
                         .expect("host diagnostic is nonempty"),
-                        fatal: failure.original.downcast_ref::<TurnCancelled>().is_none(),
+                        severity: super::publication::DiagnosticSeverity::Error,
+                        scope: crate::provider::EventScope::Binding {
+                            owner: crate::provider::ThreadOwner::root(&self.session.id),
+                        },
+                        native_scope: forge_provider_api::WarningScope::Provider,
                     };
                     AppliedProviderEvent::Effects(vec![
                         effects,
@@ -1554,15 +1755,49 @@ impl HarnessBroker {
         {
             return self.prepare_foreground_retraction(admission);
         }
-        let idle_scope = match &*dispatch {
-            ForegroundDispatch::Finalizing {
-                transaction,
-                admission,
-            } if admission.idle_reopen => Some(transaction.state.scope.clone()),
-            _ => None,
+        if let Some(action) = self.begin_failure_settlement_commit(dispatch)? {
+            return Ok(action);
+        }
+        let restarting = match &*dispatch {
+            ForegroundDispatch::Admitting(admission)
+            | ForegroundDispatch::Running { admission, .. }
+            | ForegroundDispatch::Finalizing { admission, .. } => {
+                admission.owner_collection_restarts()
+            }
+            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => false,
         };
-        if let Some(scope) = idle_scope {
-            self.reopened_execution.end_settlement(&scope);
+        let failed_task = match &*dispatch {
+            ForegroundDispatch::Running { transaction, .. }
+            | ForegroundDispatch::Finalizing { transaction, .. } => {
+                transaction.dispatched_task_permit.clone()
+            }
+            ForegroundDispatch::Admitting(admission) => match &admission.purpose {
+                crate::input::InputPurpose::TaskEntry { revision, .. }
+                | crate::input::InputPurpose::TaskContinuation { revision, .. } => self
+                    .task_controller
+                    .current()?
+                    .filter(|task| &task.revision == revision)
+                    .map(|task| task.permit()),
+                _ => None,
+            },
+            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => None,
+        };
+        if !restarting
+            && let Some(permit) = failed_task
+            && let Some(task) = self.task_controller.current()?
+            && permit.validate_observation(Some(&task)).is_ok()
+            && task.status() == crate::task::TaskStatus::Running
+            && matches!(
+                task.kind(),
+                crate::task::TaskKind::Goal | crate::task::TaskKind::Execute
+            )
+        {
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
+                crate::task::TaskChange::Pause,
+                self.clock.now_ms(),
+            )?;
         }
         let settlement = match &*dispatch {
             ForegroundDispatch::Running { transaction, .. }
@@ -1613,15 +1848,27 @@ impl HarnessBroker {
                 "owner_collected": admission.owner_collection_complete(),
             }),
         );
-        // Positive owner collection makes admission cancellation a settled result.
-        // Sending it through fatal recovery would fence an already-quiescent session.
-        if admission.owner_collection_complete()
-            && failure.original.is::<TurnCancelled>()
+        // Positive owner collection makes admission cancellation, and the output-free
+        // retraction it authorized, a settled result. An elapsed tool deadline is settled by the
+        // failure cleanup's own scoped collection. Sending any of them through fatal recovery
+        // would fence an already-quiescent session, so queued input could never dispatch again.
+        let tool_timeout = failure
+            .original
+            .is::<crate::provider::tool_timeout::ToolTimeout>();
+        if (admission.owner_collection_complete() || tool_timeout)
             && failure.cleanup.is_none()
             && failure.secondary.is_empty()
         {
-            let result = DispatchResult {
-                response: Response::failure(
+            let response = if let Some(retracted) = failure.original.downcast_ref::<TurnRetracted>()
+            {
+                Some(Response::failure_with_data(
+                    admission.request.id,
+                    "turn_retracted",
+                    retracted.to_string(),
+                    json!({"prompt":retracted.prompt}),
+                ))
+            } else if failure.original.is::<TurnCancelled>() {
+                Some(Response::failure(
                     admission.request.id,
                     if admission.owner_collection_restarts() {
                         "turn_reconfigured"
@@ -1629,11 +1876,24 @@ impl HarnessBroker {
                         "turn_cancelled"
                     },
                     failure.original.to_string(),
-                ),
-                event: std::mem::take(&mut admission.events),
+                ))
+            } else if tool_timeout {
+                Some(Response::failure(
+                    admission.request.id,
+                    super::request_failure_code(&failure.original),
+                    failure.original.to_string(),
+                ))
+            } else {
+                None
             };
-            *dispatch = ForegroundDispatch::Done(result);
-            return Ok(ForegroundAction::Finish);
+            if let Some(response) = response {
+                let result = DispatchResult {
+                    response,
+                    event: std::mem::take(&mut admission.events),
+                };
+                *dispatch = ForegroundDispatch::Done(result);
+                return Ok(ForegroundAction::Finish);
+            }
         }
         let error = if failure.cleanup.is_some() || !failure.secondary.is_empty() {
             let original_message = format!("{:#}", failure.original);
@@ -1720,7 +1980,7 @@ mod tests {
     #[test]
     fn report_retains_original_and_typed_cleanup_failure() {
         let cleanup = forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::Cancel,
+            forge_provider_api::ProviderOperation::TurnInterrupt,
             forge_provider_api::ProviderFailureKind::Protocol,
         )
         .at_phase(
@@ -1741,7 +2001,7 @@ mod tests {
         ));
         assert_eq!(
             report.to_string(),
-            "turn cancelled: provider Cancel failed: Protocol"
+            "turn cancelled: provider TurnInterrupt failed: Protocol"
         );
         let retracted = anyhow::Error::new(TurnRetracted {
             prompt: "retracted prompt".into(),
@@ -1761,7 +2021,7 @@ mod tests {
         ));
         assert_eq!(
             retracted.to_string(),
-            "Output-free turn retracted: provider Cancel failed: Protocol"
+            "Output-free turn retracted: provider TurnInterrupt failed: Protocol"
         );
     }
 
@@ -1869,7 +2129,7 @@ mod tests {
             broker.capability.native_turn_rollback = false;
             broker.turn_cancellation.arm();
             let original_model = broker.session.resolved_model.clone();
-            let prompt = "Keep this exact draft: α\nsecond line";
+            let prompt = "Keep this exact draft: Î±\nsecond line";
             let (sink, _updates) = publication::channel();
             let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
                 Request {
@@ -1892,7 +2152,7 @@ mod tests {
             let exchange_id = staged.exchange.id.clone();
             let engine = broker
                 .execution_registry()
-                .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+                .owner(crate::provider::ThreadOwner::root(&broker.session.id))
                 .await?;
             let mut transaction =
                 broker.construct_foreground_transaction(&staged, engine.clone())?;
@@ -2035,7 +2295,7 @@ mod tests {
         broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
         let engine = broker
             .execution_registry()
-            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .owner(crate::provider::ThreadOwner::root(&broker.session.id))
             .await?;
         let transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
         let mut dispatch = ForegroundDispatch::Running {

@@ -7,18 +7,12 @@ use super::{
 };
 use async_trait::async_trait;
 use forge_provider_api::{
-    OperationContext, ProviderError, ProviderEvent, ProviderFailure, ProviderModel,
-    ProviderRuntime,
+    AdapterActivity, OperationContext, ProviderError, ProviderFailure, ProviderModel,
     catalog::{McpQuery, QueryContext, WorkspaceContext},
-    completion::ProviderCompletion,
     error::{ProviderFailureKind, ProviderOperation},
     events::{self, ProviderEventSink, ProviderEventStream},
     generation::ReasoningSelection,
     input::PromptInput,
-    lifecycle::{
-        CompletionSnapshot, ExecutionFailure, ExecutionObservation, ExecutionResult,
-        ExecutionUpdate,
-    },
     permissions::{PermissionRequest, PermissionResponse, PermissionTarget},
     provider::Provider,
     session::{
@@ -44,7 +38,7 @@ pub struct CodexProvider {
     runtime_root: PathBuf,
     runtime: Arc<CodexRuntime>,
     bindings: Arc<Mutex<HashMap<BindingId, Arc<CodexBinding>>>>,
-    owners: Arc<Mutex<HashMap<forge_provider_api::ExecutionOwner, BindingId>>>,
+    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadOwner, BindingId>>>,
     catalog: Arc<Mutex<Option<CatalogConnection>>>,
     catalog_version: Arc<Mutex<forge_provider_api::VersionObservation>>,
     discovery: Arc<Mutex<Vec<Arc<NativeRpc>>>>,
@@ -66,7 +60,7 @@ impl CodexProvider {
     pub fn new(command: Vec<String>, runtime_root: PathBuf) -> Result<Self, ProviderError> {
         if command.is_empty() {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Rejected,
             ));
         }
@@ -176,7 +170,7 @@ impl CodexProvider {
         } else {
             ProviderFailureKind::SessionMissing
         };
-        Err(failure(ProviderOperation::InputSubmit, kind))
+        Err(failure(ProviderOperation::TurnStart, kind))
     }
 
     /// Exclude a second writable generation until every previous live or pending native owner is collected.
@@ -193,7 +187,7 @@ impl CodexProvider {
             .any(|fork| &fork.target == history)
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -205,7 +199,7 @@ impl CodexProvider {
             .any(|session| &session.history_id() == history)
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -219,7 +213,7 @@ impl CodexProvider {
         for pending in pending {
             if pending.history.lock().await.as_ref() == Some(history) {
                 return Err(failure(
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     ProviderFailureKind::ResourceConflict,
                 ));
             }
@@ -231,7 +225,7 @@ impl CodexProvider {
         super::operations::check()?;
         if self.closed.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::BindingClosed,
             ));
         }
@@ -239,7 +233,7 @@ impl CodexProvider {
             || self.owners.lock().await.contains_key(&request.owner)
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Rejected,
             ));
         }
@@ -257,14 +251,14 @@ impl CodexProvider {
                 || !request.configuration.resources.mcp.is_empty())
         {
             return Err(failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Policy,
             ));
         }
         validate_model_selection(&request.configuration.model)?;
         let security = CodexSecurity::new(&request.configuration.access)?;
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
             owner: request.owner.clone(),
         };
@@ -276,7 +270,7 @@ impl CodexProvider {
             .id()
             .clone();
         let profile = crate::profile::ResourceProfile::create(&self.runtime_root, "codex")
-            .map_err(|error| error.into_provider_error(ProviderOperation::SessionOpen))?;
+            .map_err(|error| error.into_provider_error(ProviderOperation::ThreadOpen))?;
         let prepared = Arc::new(PreparedProfile {
             profile: Mutex::new(Some(profile)),
         });
@@ -290,7 +284,7 @@ impl CodexProvider {
             .expect("open retains its prepared profile until pending ownership transfers");
         profile
             .bind_skills(&request.configuration.resources.skills, "skills")
-            .map_err(|error| error.into_provider_error(ProviderOperation::SessionOpen))?;
+            .map_err(|error| error.into_provider_error(ProviderOperation::ThreadOpen))?;
         let private_home = profile.path().to_path_buf();
         let resources = CodexResources::new(
             request.configuration.resources.clone(),
@@ -299,31 +293,23 @@ impl CodexProvider {
         let (runtime, isolation_auth) = if isolated {
             let rpc = self.catalog_connection().await?;
             let catalog = rpc
-                .request("model/list", json!({}), ProviderOperation::SessionOpen)
+                .request("model/list", json!({}), ProviderOperation::ThreadOpen)
                 .await?;
             let models = super::catalog::parse_model_catalog(&catalog);
             let selected = match request.configuration.model.model.as_deref() {
                 Some(id) => models.iter().find(|model| model.id == id),
                 None => models.iter().find(|model| model.is_default),
             }
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::SessionOpen,
-                    ProviderFailureKind::Rejected,
-                )
-            })?;
+            .ok_or_else(|| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected))?;
             let config = rpc
                 .request(
                     "config/read",
                     json!({"includeLayers":false,"cwd":request.workspace}),
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                 )
                 .await?;
             let config = config.get("config").ok_or_else(|| {
-                failure(
-                    ProviderOperation::SessionOpen,
-                    ProviderFailureKind::Protocol,
-                )
+                failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
             })?;
             let (command, home) =
                 super::isolation::runtime_command(&self.command, profile.path(), selected, config)?;
@@ -351,7 +337,7 @@ impl CodexProvider {
         super::operations::check()?;
         let connection = runtime.connect().await.map_err(|_| {
             failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Transport,
             )
         })?;
@@ -360,7 +346,7 @@ impl CodexProvider {
         let initialized = rpc.request("initialize", json!({
             "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"experimentalApi":true}
-        }), ProviderOperation::SessionOpen).await?;
+        }), ProviderOperation::ThreadOpen).await?;
         let requirement = forge_provider_api::version::RuntimeRequirement::new(
             crate::registry::select("codex").expect("Codex is registered"),
             self.command
@@ -382,10 +368,7 @@ impl CodexProvider {
             let version = reported
                 .and_then(|version| semver::Version::parse(version).ok())
                 .ok_or_else(|| {
-                    failure(
-                        ProviderOperation::SessionOpen,
-                        ProviderFailureKind::Protocol,
-                    )
+                    failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
                 })?;
             if version != semver::Version::new(0, 164, 0) {
                 return Err(forge_provider_api::capability::UnsupportedCapability(
@@ -409,7 +392,7 @@ impl CodexProvider {
             }),
             None => json!({
                 "cwd":request.workspace, "ephemeral":isolated, "historyMode":"paginated",
-                "experimentalRawEvents":false, "developerInstructions":request.system_instructions,
+                "experimentalRawEvents":true, "developerInstructions":request.system_instructions,
                 "dynamicTools":request.tools.iter().map(|tool| json!({
                     "name":tool.name,"description":tool.description,"inputSchema":tool.input_schema
                 })).collect::<Vec<_>>(),
@@ -438,7 +421,7 @@ impl CodexProvider {
             &rpc,
             &mut parameters,
             &request.configuration.model,
-            ProviderOperation::SessionOpen,
+            ProviderOperation::ThreadOpen,
         )
         .await?;
         security.apply_thread(&mut parameters, &request.workspace);
@@ -452,7 +435,7 @@ impl CodexProvider {
             "thread/start"
         };
         let result = rpc
-            .request(method, parameters, ProviderOperation::SessionOpen)
+            .request(method, parameters, ProviderOperation::ThreadOpen)
             .await?;
         let thread_id = result
             .pointer("/thread/id")
@@ -461,21 +444,12 @@ impl CodexProvider {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| request.history.resume_id().map(|id| id.as_str().to_owned()))
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::SessionOpen,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
-        let session_id =
-            forge_provider_api::ProviderSessionId::try_from(thread_id).map_err(|_| {
-                failure(
-                    ProviderOperation::SessionOpen,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
+            .ok_or_else(|| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol))?;
+        let session_id = forge_provider_api::ProviderSessionId::try_from(thread_id)
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol))?;
         *pending.history.lock().await = Some(session_id.clone());
         let binding = SessionBinding {
+            thread_id: request.thread_id.clone(),
             id: binding_id.clone(),
             provider_session_id: Some(session_id.clone()),
         };
@@ -485,11 +459,13 @@ impl CodexProvider {
             .request(
                 "getAuthStatus",
                 json!({"includeToken":false,"refreshToken":false}),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
             )
             .await
             .ok();
         let capabilities = negotiated_capabilities(reported, auth_status.as_ref());
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_thread(session_id.as_str(), &request.owner)?;
         let retained = Arc::new(CodexBinding {
             binding: binding.clone(),
             history: std::sync::Mutex::new(if request.history.resume_id().is_none() {
@@ -506,11 +482,16 @@ impl CodexProvider {
             owner: request.owner.clone(),
             workspace: request.workspace,
             model: Mutex::new(request.configuration.model.clone()),
+            native_confirmation: Mutex::new(native_model_confirmation(&result)?),
             runtime: Mutex::new(runtime),
             rpc: RpcHandle::from_shared(rpc),
             sink,
             stream: Mutex::new(Some(stream)),
-            normalization: Mutex::new(CodexNormalization::default()),
+            child_observations: Mutex::new(HashMap::new()),
+            child_runners: Arc::default(),
+            callback_requests: Mutex::new(HashMap::new()),
+            pending_messages: Mutex::new(Default::default()),
+            normalization: Mutex::new(normalization),
             resources: Mutex::new(resources),
             mcp_context: Mutex::new(mcp_context),
             profile: Mutex::new(pending.profile.lock().await.take()),
@@ -534,19 +515,23 @@ impl CodexProvider {
             configuration: Mutex::new(request.configuration.clone()),
             capabilities,
             settlements: Mutex::new(HashMap::new()),
-            outcomes: Mutex::new(HashMap::new()),
+            native_results: Mutex::new(HashMap::new()),
             close_failure: Mutex::new(None),
             close_lock: Mutex::new(()),
             settlement_lock: Mutex::new(()),
             retired_rpcs: Mutex::new(Vec::new()),
             retired_profiles: Mutex::new(Vec::new()),
             rollback: Mutex::new(None),
+            turn_context: Mutex::new(Default::default()),
         });
         self.bindings
             .lock()
             .await
             .insert(binding_id.clone(), retained.clone());
         *retained.terminal_observer.lock().await = Some(start_terminal_observer(&retained));
+        if let Some(start) = start_background_reader(&retained).await? {
+            let _ = start.send(());
+        }
         self.pending.lock().await.remove(&binding_id);
         self.owners.lock().await.insert(request.owner, binding_id);
         Ok(binding)
@@ -560,11 +545,11 @@ impl CodexProvider {
         pending: &crate::pending_input::PendingInput,
     ) -> Result<InputAcceptance, ProviderError> {
         let session = self.binding(binding).await?;
-        session.check_input_admission(ProviderOperation::InputSubmit)?;
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        session.check_input_admission(ProviderOperation::TurnStart)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         if session.stream.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
@@ -579,7 +564,7 @@ impl CodexProvider {
             )
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -592,23 +577,23 @@ impl CodexProvider {
                 || !request.recovered_inputs.is_empty())
         {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Policy,
             ));
         }
         let _admission = tokio::select! {
             biased;
-            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::InputSubmit).expect_err("preparation cancellation is sticky")),
+            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::TurnStart).expect_err("preparation cancellation is sticky")),
             admission = session.admission.lock() => admission,
         };
-        pending.check_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::TurnStart)?;
         super::operations::check()?;
-        session.check_input_admission(ProviderOperation::InputSubmit)?;
+        session.check_input_admission(ProviderOperation::TurnStart)?;
         collect_finished_execution(&session).await?;
         let mut active = session.active.lock().await;
         if active.is_some() {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::ExecutionActive,
             ));
         }
@@ -624,7 +609,7 @@ impl CodexProvider {
         stop_background_reader(&session).await?;
         tokio::select! {
             biased;
-            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::InputSubmit).expect_err("preparation cancellation is sticky")),
+            () = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::TurnStart).expect_err("preparation cancellation is sticky")),
             result = request.turn_control.before_send(&request.scope) => result?,
         }
         session
@@ -695,8 +680,7 @@ impl CodexProvider {
         });
         let rpc = session.rpc.lock().await;
         let effort =
-            apply_model_selection(&rpc, &mut params, &model, ProviderOperation::InputSubmit)
-                .await?;
+            apply_model_selection(&rpc, &mut params, &model, ProviderOperation::TurnStart).await?;
         drop(rpc);
         let enabled_tools = request
             .tools
@@ -712,12 +696,14 @@ impl CodexProvider {
                 enabled_tools.join(", ")
             )
         };
+        // Codex prefers its catalog's mode text over these per-turn instructions, so the same
+        // context is also appended to model-visible history before the turn starts.
         params["collaborationMode"] = json!({
             "mode":"default",
             "settings":{
                 "model":params["model"].clone(),
                 "reasoning_effort":effort.clone(),
-                "developer_instructions":instructions
+                "developer_instructions":instructions.clone()
             }
         });
         security.apply_turn(&mut params, &session.workspace);
@@ -726,11 +712,42 @@ impl CodexProvider {
             params["approvalPolicy"] = json!("never");
             params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
         }
+        let thread_id = session.history_id();
+        let compaction_count = session
+            .normalization
+            .lock()
+            .await
+            .compaction_count(thread_id.as_str());
+        let rpc = session.rpc.lock().await;
+        session
+            .turn_context
+            .lock()
+            .await
+            .deliver(&rpc, &thread_id, &instructions, compaction_count, || {
+                // An injection persists native history, so the thread can no longer be
+                // replaced as unused even if the turn never starts.
+                session
+                    .history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .establish();
+            })
+            .await?;
+        drop(rpc);
+        let native_confirmation = session
+            .native_confirmation
+            .lock()
+            .await
+            .as_ref()
+            .filter(|model| {
+                Some(model.model_id.as_str()) == params.get("model").and_then(Value::as_str)
+            })
+            .cloned();
         let token = recovery_token(&session, &request.submission_id, &request.attempt_id)?;
         if let Err(error) = request.receipt.clone().record_sending(Some(token)).await {
             return Err(record_receipt_failure(request.receipt.clone(), error).await);
         }
-        if let Err(error) = pending.check_admission(ProviderOperation::InputSubmit) {
+        if let Err(error) = pending.check_admission(ProviderOperation::TurnStart) {
             request
                 .receipt
                 .clone()
@@ -768,7 +785,12 @@ impl CodexProvider {
             }
         };
         request.dispatch.confirm();
-        let (turn_id, initial_messages) = match await_admission(&session, &request, id).await {
+        let NativeAdmission {
+            turn_id,
+            initial_messages,
+            model: admission_model,
+            started_at_ms: native_started_at_ms,
+        } = match await_admission(&session, &request, id).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 if matches!(&error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Rejected && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
@@ -816,50 +838,35 @@ impl CodexProvider {
             )
             .await);
         }
-        let address = forge_provider_api::TurnAddress {
-            scope: request.scope.clone(),
+        let native_address = NativeTurnAddress {
             thread_id: session.history_id().as_str().to_owned(),
-            turn_id: turn_id.clone().into(),
+            turn_id: NativeTurnId::new(turn_id.clone())?,
         };
-        let started = match ExecutionObservation::new(
-            request.scope.clone(),
-            ExecutionUpdate::Started {
-                address: address.clone(),
-            },
+        let address = match session.normalization.lock().await.admit_turn(
+            &native_address.thread_id,
+            native_address.turn_id.as_str(),
+            &request.scope,
         ) {
-            Ok(observation) => observation,
+            Ok(address) => address,
             Err(error) => {
                 return Err(fence_unobserved_acceptance(
                     &session,
                     &request,
-                    Some(&turn_id),
-                    error.into(),
+                    Some(turn_id.as_str()),
+                    error,
                 )
                 .await);
             }
         };
-        if let Err(error) = publish(
-            &session.sink,
-            &request.scope,
-            ProviderEvent::Execution {
-                observation: started,
-            },
-        )
-        .await
-        {
-            return Err(
-                fence_unobserved_acceptance(&session, &request, Some(&turn_id), error).await,
-            );
-        }
         let (cancel, receiver) = mpsc::unbounded_channel();
         if admitting.cancel.load(Ordering::Acquire) || session.is_fenced() {
             let _ = cancel.send(());
         }
         let (turn_updates, _) = watch::channel(Some(turn_id.clone()));
-        let submissions = Arc::new(Mutex::new(vec![request.submission_id.clone()]));
+        let submissions = Arc::new(Mutex::new(request.input_coverage()));
         let active_execution = ActiveExecution {
             scope: request.scope.clone(),
-            turn_id,
+            native_turn_id: turn_id,
             turn_updates,
             submissions: submissions.clone(),
             request: request.clone(),
@@ -869,21 +876,23 @@ impl CodexProvider {
         *active = Some(active_execution);
         let accepted_submission_id = request.submission_id.clone();
         let dispatched = request.dispatch.clone();
-        let session_task = session.clone();
-        let task = Arc::new(crate::retained_task::RetainedTask::new(
-            ProviderOperation::InputSubmit,
-            tokio::spawn(async move {
-                observe_execution(
-                    session_task,
-                    request,
-                    address,
-                    submissions,
-                    receiver,
-                    initial_messages,
-                )
-                .await
+        let task = Arc::new(crate::turn_runner::RetainedTurn::spawn(
+            Arc::new(CodexTurnDriver {
+                session: session.clone(),
+                started_at_ms: native_started_at_ms,
+                native_confirmation,
+                admission_model,
+                request,
+                address: address.clone(),
+                native_address,
+                submissions,
+                cancel: Mutex::new(Some(receiver)),
+                initial_messages: Mutex::new(Some(initial_messages)),
+                cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             }),
-        ));
+            session.sink.clone(),
+            address,
+        )?);
         active.as_mut().expect("active execution was inserted").task = Some(task.clone());
         let collector_session = session.clone();
         let collector_scope = active
@@ -891,6 +900,8 @@ impl CodexProvider {
             .expect("active execution was inserted")
             .scope
             .clone();
+        let started = task.clone();
+        drop(active);
         let collector = tokio::spawn(async move {
             collect_invocation(collector_session, collector_scope, task).await
         });
@@ -898,9 +909,10 @@ impl CodexProvider {
             .lock()
             .await
             .push(Arc::new(crate::retained_task::RetainedTask::new(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 collector,
             )));
+        started.started().await?;
         dispatched.confirm();
         Ok(InputAcceptance {
             submission_id: accepted_submission_id,
@@ -918,17 +930,29 @@ impl CodexProvider {
         let security = CodexSecurity::new(&configuration.access)?;
         if session.isolated {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Policy,
             ));
         }
         let _admission = session.admission.lock().await;
         super::operations::check()?;
-        session.check_input_admission(ProviderOperation::SessionConfigure)?;
+        session.check_input_admission(ProviderOperation::ThreadConfigure)?;
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        if session
+            .child_observations
+            .lock()
+            .await
+            .values()
+            .any(|child| child.result.borrow().is_none())
+        {
+            return Err(failure(
+                ProviderOperation::ThreadConfigure,
+                ProviderFailureKind::ResourceConflict,
             ));
         }
         let history = session
@@ -937,16 +961,16 @@ impl CodexProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let mut next_profile = crate::profile::ResourceProfile::create(&self.runtime_root, "codex")
-            .map_err(|error| error.into_provider_error(ProviderOperation::SessionConfigure))?;
+            .map_err(|error| error.into_provider_error(ProviderOperation::ThreadConfigure))?;
         if let Err(error) = next_profile.bind_skills(&resources.skills, "skills") {
-            let primary = error.into_provider_error(ProviderOperation::SessionConfigure);
+            let primary = error.into_provider_error(ProviderOperation::ThreadConfigure);
             return Err(match next_profile.close() {
                 Ok(()) => primary,
                 Err(error) => {
                     session.retired_profiles.lock().await.push(next_profile);
                     combine_primary(
                         primary,
-                        error.into_provider_error(ProviderOperation::SessionConfigure),
+                        error.into_provider_error(ProviderOperation::ThreadConfigure),
                     )
                 }
             });
@@ -968,7 +992,7 @@ impl CodexProvider {
                     .is_empty()
             {
                 return Err(failure(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::ResourceConflict,
                 ));
             }
@@ -976,7 +1000,7 @@ impl CodexProvider {
                 &current_rpc,
                 &mut model_parameters,
                 &configuration.model,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
             )
             .await?;
             Ok::<_, ProviderError>(())
@@ -991,7 +1015,7 @@ impl CodexProvider {
                     combine_primary(
                         primary,
                         configuration_preflight_error(
-                            error.into_provider_error(ProviderOperation::SessionConfigure),
+                            error.into_provider_error(ProviderOperation::ThreadConfigure),
                         ),
                     )
                 }
@@ -1021,7 +1045,7 @@ impl CodexProvider {
                 return Err(invalidate_configuration(
                     &session,
                     ProviderFailure::new(
-                        ProviderOperation::SessionConfigure,
+                        ProviderOperation::ThreadConfigure,
                         ProviderFailureKind::Transport,
                     )
                     .at_phase(
@@ -1039,7 +1063,7 @@ impl CodexProvider {
             let initialized = next_rpc.request("initialize", json!({
                 "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
                 "capabilities":{"experimentalApi":true}
-            }), ProviderOperation::SessionConfigure).await?;
+            }), ProviderOperation::ThreadConfigure).await?;
             let requirement = forge_provider_api::version::RuntimeRequirement::new(
                 crate::registry::select("codex").expect("Codex is registered"),
                 self.command
@@ -1063,7 +1087,7 @@ impl CodexProvider {
             let access = configuration.access.clone();
             let approval = configuration.approval;
             let mut parameters = match &history {
-                NativeHistory::Virgin(_) => json!({"cwd":session.workspace,"ephemeral":false,"historyMode":"paginated","experimentalRawEvents":false,"developerInstructions":session.system_instructions,"dynamicTools":session.native_tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"inputSchema":tool.input_schema})).collect::<Vec<_>>(),"config":{}}),
+                NativeHistory::Virgin(_) => json!({"cwd":session.workspace,"ephemeral":false,"historyMode":"paginated","experimentalRawEvents":true,"developerInstructions":session.system_instructions,"dynamicTools":session.native_tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"inputSchema":tool.input_schema})).collect::<Vec<_>>(),"config":{}}),
                 NativeHistory::Established(_) => json!({"threadId":thread_id.as_str(),"cwd":session.workspace,"excludeTurns":true,"developerInstructions":session.system_instructions,"config":{}}),
             };
             if !config.is_null() {
@@ -1078,21 +1102,21 @@ impl CodexProvider {
             security.apply_thread(&mut parameters, &session.workspace);
             // Loaded native threads ignore resume overrides; virgin threads have no
             // rollout at all. Collect the old writer before applying complete settings.
-            release_native_thread_writer(&current_rpc, &thread_id, ProviderOperation::SessionConfigure).await?;
+            release_native_thread_writer(&current_rpc, &thread_id, ProviderOperation::ThreadConfigure).await?;
             let method = match &history { NativeHistory::Virgin(_) => "thread/start", NativeHistory::Established(_) => "thread/resume" };
             let applied = next_rpc.request(
                     method,
                     parameters,
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                 )
                 .await?;
-            let next_id = applied.pointer("/thread/id").and_then(Value::as_str).ok_or_else(|| failure(ProviderOperation::SessionConfigure, ProviderFailureKind::Protocol))?;
-            let next_id = forge_provider_api::ProviderSessionId::try_from(next_id.to_owned()).map_err(|_| failure(ProviderOperation::SessionConfigure, ProviderFailureKind::Protocol))?;
-            if matches!(&history, NativeHistory::Established(_)) && next_id != thread_id { return Err(failure(ProviderOperation::SessionConfigure, ProviderFailureKind::HistoryConflict)); }
-            Ok::<_, ProviderError>((model, access, approval, next_id))
+            let next_id = applied.pointer("/thread/id").and_then(Value::as_str).ok_or_else(|| failure(ProviderOperation::ThreadConfigure, ProviderFailureKind::Protocol))?;
+            let next_id = forge_provider_api::ProviderSessionId::try_from(next_id.to_owned()).map_err(|_| failure(ProviderOperation::ThreadConfigure, ProviderFailureKind::Protocol))?;
+            if matches!(&history, NativeHistory::Established(_)) && next_id != thread_id { return Err(failure(ProviderOperation::ThreadConfigure, ProviderFailureKind::HistoryConflict)); }
+            Ok::<_, ProviderError>((model, access, approval, next_id, native_model_confirmation(&applied)?))
         }
         .await;
-        let (model, access, approval, next_history) = match resumed {
+        let (model, access, approval, next_history, native_confirmation) = match resumed {
             Ok(settings) => settings,
             Err(error) => {
                 let primary = invalidate_configuration(
@@ -1127,6 +1151,7 @@ impl CodexProvider {
         }
         *session.resources.lock().await = next_resources;
         *session.model.lock().await = model;
+        *session.native_confirmation.lock().await = native_confirmation;
         *session.access.lock().await = access;
         *session.approval.lock().await = approval;
         *session.configuration.lock().await = configuration.clone();
@@ -1151,11 +1176,10 @@ impl CodexProvider {
         if &next_history != history.id()
             && let Err(error) = session
                 .sink
-                .send_wait(ProviderEvent::SessionIdentity {
-                    scope: forge_provider_api::EventScope::Binding {
-                        owner: session.owner.clone(),
-                    },
-                    provider_session_id: next_history,
+                .activity_writer()
+                .send_wait(AdapterActivity::Thread {
+                    thread_id: session.owner.thread_id(),
+                    event: forge_provider_api::ThreadEvent::IdentityResolved(next_history),
                 })
                 .await
         {
@@ -1171,7 +1195,7 @@ impl CodexProvider {
                     return Err(invalidate_configuration(
                         &session,
                         failure(
-                            ProviderOperation::SessionConfigure,
+                            ProviderOperation::ThreadConfigure,
                             ProviderFailureKind::Runtime,
                         ),
                         forge_provider_api::ProviderPhase::Collection,
@@ -1229,7 +1253,7 @@ impl CodexProvider {
         if session.normalization.lock().await.replay_sensitive {
             return Ok(Outcome::Unavailable(Unavailable::NotCancelled));
         }
-        if !session.settlements.lock().await.get(&request.scope).is_some_and(|settlement| matches!(settlement, Ok(settlement) if matches!(settlement.result, ExecutionResult::Cancelled { .. }))) {
+        if !session.settlements.lock().await.get(&request.scope).is_some_and(|settlement| matches!(settlement, Ok(settlement) if matches!(settlement.completed.result().outcome(), forge_provider_api::turn::TurnOutcome::Interrupted))) {
             return Ok(Outcome::Unavailable(Unavailable::NotCancelled));
         }
         let rpc = session.rpc.lock().await;
@@ -1262,12 +1286,24 @@ impl CodexProvider {
         session.fenced.store(true, Ordering::Release);
         if let Err(error) = rpc
             .request(
-                "thread/rollback",
-                json!({"threadId":authorization.thread_id,"numTurns":1}),
+                "thread/revert",
+                json!({"threadId":authorization.thread_id,"beforeTurnId":authorization.turn_id.as_str()}),
                 ProviderOperation::InputRetract,
             )
             .await
         {
+            // A runtime without `thread/revert` rejects it through the generic invalid-request
+            // path before touching history. A positive rejection proves the cancelled turn
+            // remains, so the binding stays live and the turn stays cancelled.
+            if matches!(&error, ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            {
+                if !session.closing.load(Ordering::Acquire)
+                    && !session.invalidated.load(Ordering::Acquire)
+                {
+                    session.fenced.store(false, Ordering::Release);
+                }
+                return Ok(Outcome::Unavailable(Unavailable::Unsupported));
+            }
             invalidate_retraction(&session, error).await;
             return Ok(Outcome::Unknown);
         }
@@ -1313,6 +1349,8 @@ impl CodexProvider {
         };
         drop(rollback);
         session.rollback.lock().await.take();
+        // The revert may also remove context injected before the retracted turn.
+        session.turn_context.lock().await.invalidate();
         if !session.closing.load(Ordering::Acquire) && !session.invalidated.load(Ordering::Acquire)
         {
             session.fenced.store(false, Ordering::Release);
@@ -1326,26 +1364,26 @@ impl CodexProvider {
         request: SteeringRequest,
     ) -> Result<SteeringAcceptance, ProviderError> {
         let session = self.binding(binding).await?;
-        session.check_input_admission(ProviderOperation::InputSteer)?;
+        session.check_input_admission(ProviderOperation::TurnSteer)?;
         if request.scope.owner != session.owner {
             return Err(failure(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
         if session.stream.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 ProviderFailureKind::ResourceConflict,
             ));
         }
         let _admission = session.admission.lock().await;
-        session.check_input_admission(ProviderOperation::InputSteer)?;
+        session.check_input_admission(ProviderOperation::TurnSteer)?;
         let (initial_turn, submissions, prompt_request) = {
             let active = session.active.lock().await;
             let Some(execution) = active.as_ref() else {
                 return Err(failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::WrongInvocation,
                 ));
             };
@@ -1357,20 +1395,35 @@ impl CodexProvider {
                     .is_some_and(|task| task.is_finished())
             {
                 return Err(failure(
-                    ProviderOperation::InputSteer,
+                    ProviderOperation::TurnSteer,
                     ProviderFailureKind::WrongInvocation,
                 ));
             }
             (
-                execution.turn_id.clone(),
+                execution.native_turn_id.clone(),
                 execution.submissions.clone(),
                 execution.request.clone(),
             )
         };
         let submission_id = request.delivery.submission_id().cloned();
         let receipt = request.delivery.receipt().cloned();
+        let covered_input = receipt
+            .as_ref()
+            .map(|receipt| {
+                receipt.attempt_id().map(|attempt| {
+                    forge_provider_api::CoveredInput::new(receipt.id().clone(), attempt)
+                })
+            })
+            .transpose()?;
         if let (Some(receipt), Some(submission_id)) = (&receipt, &submission_id) {
-            let token = recovery_token(&session, submission_id, &receipt.attempt_id()?)?;
+            let token = recovery_token(
+                &session,
+                submission_id,
+                covered_input
+                    .as_ref()
+                    .expect("journaled steering retained its checked attempt")
+                    .attempt_id(),
+            )?;
             if let Err(error) = receipt.clone().record_sending(Some(token)).await {
                 return Err(record_receipt_failure(receipt.clone(), error).await);
             }
@@ -1386,7 +1439,7 @@ impl CodexProvider {
             .lock()
             .await
             .as_ref()
-            .map(|execution| execution.turn_id.clone())
+            .map(|execution| execution.native_turn_id.clone())
             .unwrap_or_else(|| initial_turn.clone());
         let mut params = json!({
             "threadId":session.history_id().as_str(),
@@ -1396,17 +1449,17 @@ impl CodexProvider {
         if let Some(submission_id) = &submission_id {
             params["clientUserMessageId"] = json!(native_input_id(
                 submission_id,
-                &receipt
+                covered_input
                     .as_ref()
-                    .expect("journaled delivery has a receipt")
-                    .attempt_id()?
+                    .expect("journaled steering retained its checked attempt")
+                    .attempt_id()
             ));
         }
         let result = session
             .rpc
             .lock()
             .await
-            .request("turn/steer", params, ProviderOperation::InputSteer)
+            .request("turn/steer", params, ProviderOperation::TurnSteer)
             .await;
         if let Err(error) = result {
             if matches!(&error, ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Unchanged && (failure.kind() == ProviderFailureKind::Rejected || failure.phase() == forge_provider_api::ProviderPhase::Admission))
@@ -1431,19 +1484,25 @@ impl CodexProvider {
             .await);
         }
         if let (Some(receipt), Some(submission_id)) = (receipt, submission_id) {
-            let accepted_token =
-                match recovery_token(&session, &submission_id, &receipt.attempt_id()?) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        return Err(fence_unobserved_acceptance(
-                            &session,
-                            &prompt_request,
-                            Some(&expected_turn_id),
-                            error,
-                        )
-                        .await);
-                    }
-                };
+            let accepted_token = match recovery_token(
+                &session,
+                &submission_id,
+                covered_input
+                    .as_ref()
+                    .expect("journaled steering retained its checked attempt")
+                    .attempt_id(),
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    return Err(fence_unobserved_acceptance(
+                        &session,
+                        &prompt_request,
+                        Some(&expected_turn_id),
+                        error,
+                    )
+                    .await);
+                }
+            };
             if let Err(error) = receipt.clone().record_accepted(Some(accepted_token)).await {
                 let primary = record_receipt_failure(receipt, error).await;
                 return Err(fence_unobserved_acceptance(
@@ -1454,7 +1513,9 @@ impl CodexProvider {
                 )
                 .await);
             }
-            submissions.lock().await.push(submission_id.clone());
+            let input = covered_input
+                .expect("journaled steering retained its checked receipt identity before dispatch");
+            submissions.lock().await.push(input);
             Ok(SteeringAcceptance::Journaled { submission_id })
         } else {
             Ok(SteeringAcceptance::Context)
@@ -1569,16 +1630,16 @@ impl CodexProvider {
         let session = self.binding(binding).await?;
         let observation = session.observations.read().await;
         let admission = session.admission.lock().await;
-        session.check_input_admission(ProviderOperation::SessionCompact)?;
+        session.check_input_admission(ProviderOperation::ThreadCompact)?;
         if *observation {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::BindingClosed,
             ));
         }
         if request.scope.owner() != &session.owner {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::WrongInvocation,
             ));
         }
@@ -1587,14 +1648,26 @@ impl CodexProvider {
         collect_settled_execution(&session).await?;
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        if session
+            .child_observations
+            .lock()
+            .await
+            .values()
+            .any(|child| child.result.borrow().is_none())
+        {
+            return Err(failure(
+                ProviderOperation::ThreadCompact,
+                ProviderFailureKind::ResourceConflict,
             ));
         }
         // Transfer exclusive notification consumption from the idle reader.
         super::operations::check()?;
         stop_background_reader(&session).await?;
-        let result = compact_session(&session, request).await;
+        let result = compact_session(&session, operation.context.id(), request).await;
         if matches!(&result, Err(ProviderError::Failure(failure))
             if matches!(failure.kind(), ProviderFailureKind::Timeout | ProviderFailureKind::Transport | ProviderFailureKind::Protocol | ProviderFailureKind::Cancelled)
                 && failure.disposition() != forge_provider_api::FailureDisposition::Unchanged)
@@ -1779,10 +1852,7 @@ impl CodexProvider {
                         // background work before publishing no-future-registration to cancel.
                         let restored = match start_background_reader(&session).await {
                             Ok(Some(start)) => start.send(()).map_err(|_| {
-                                failure(
-                                    ProviderOperation::InputSubmit,
-                                    ProviderFailureKind::Runtime,
-                                )
+                                failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime)
                             }),
                             Ok(None) => Ok(()),
                             Err(error) => Err(error),
@@ -1810,7 +1880,7 @@ impl CodexProvider {
             native.changed()
                 && native
                     .context
-                    .check_admission(ProviderOperation::InputSubmit)
+                    .check_admission(ProviderOperation::TurnStart)
                     .is_err()
         });
         if result.is_err() && interrupted {
@@ -1892,11 +1962,11 @@ impl CodexProvider {
             None => None,
         };
         if let Some(session) = &session {
-            session.check_input_admission(ProviderOperation::SessionFork)?;
+            session.check_input_admission(ProviderOperation::ThreadFork)?;
             collect_settled_execution(session).await?;
             if session.active.lock().await.is_some() {
                 return Err(failure(
-                    ProviderOperation::SessionFork,
+                    ProviderOperation::ThreadFork,
                     ProviderFailureKind::ExecutionActive,
                 ));
             }
@@ -1909,29 +1979,23 @@ impl CodexProvider {
             &rpc,
             &mut parameters,
             &request.target.configuration.model,
-            ProviderOperation::SessionFork,
+            ProviderOperation::ThreadFork,
         )
         .await?;
         security.apply_thread(&mut parameters, &request.target.workspace);
         let result = async {
             let value = rpc
-                .request("thread/fork", parameters, ProviderOperation::SessionFork)
+                .request("thread/fork", parameters, ProviderOperation::ThreadFork)
                 .await?;
             let id = value
                 .pointer("/thread/id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    failure(
-                        ProviderOperation::SessionFork,
-                        ProviderFailureKind::Protocol,
-                    )
+                    failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol)
                 })?;
             let id =
                 forge_provider_api::ProviderSessionId::try_from(id.to_owned()).map_err(|_| {
-                    failure(
-                        ProviderOperation::SessionFork,
-                        ProviderFailureKind::Protocol,
-                    )
+                    failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol)
                 })?;
             let operation = super::operations::current()
                 .expect("fork retains its operation owner")
@@ -1971,7 +2035,7 @@ impl CodexProvider {
         {
             return Ok(());
         }
-        release_native_thread_writer(&target.rpc, &target.target, ProviderOperation::SessionFork)
+        release_native_thread_writer(&target.rpc, &target.target, ProviderOperation::ThreadFork)
             .await?;
         self.fork_targets.lock().await.remove(&target.operation);
         Ok(())
@@ -2320,28 +2384,28 @@ impl CodexProvider {
             )
         } else {
             match native.operation {
-                ProviderOperation::InputSubmit
-                | ProviderOperation::InputSteer
-                | ProviderOperation::SessionFork
+                ProviderOperation::TurnStart
+                | ProviderOperation::TurnSteer
+                | ProviderOperation::ThreadFork
                 | ProviderOperation::TerminalTerminate => (
                     forge_provider_api::ProviderPhase::Dispatch,
                     forge_provider_api::FailureDisposition::Uncertain,
                 ),
-                ProviderOperation::Cancel => (
+                ProviderOperation::TurnInterrupt => (
                     forge_provider_api::ProviderPhase::Collection,
                     forge_provider_api::FailureDisposition::Uncertain,
                 ),
-                ProviderOperation::SessionClose | ProviderOperation::Shutdown => (
+                ProviderOperation::ThreadClose | ProviderOperation::Shutdown => (
                     forge_provider_api::ProviderPhase::Close,
                     forge_provider_api::FailureDisposition::Invalidated,
                 ),
-                ProviderOperation::SessionOpen
-                | ProviderOperation::SessionConfigure
+                ProviderOperation::ThreadOpen
+                | ProviderOperation::ThreadConfigure
                 | ProviderOperation::InputRetract => (
                     forge_provider_api::ProviderPhase::Collection,
                     forge_provider_api::FailureDisposition::Invalidated,
                 ),
-                ProviderOperation::SessionCompact => (
+                ProviderOperation::ThreadCompact => (
                     forge_provider_api::ProviderPhase::Observation,
                     forge_provider_api::FailureDisposition::Uncertain,
                 ),
@@ -2410,7 +2474,7 @@ impl CodexProvider {
         &self,
         binding: &BindingId,
         scope: &forge_provider_api::InvocationScope,
-    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
+    ) -> Result<CollectedInvocation, ProviderError> {
         self.pending_inputs.cancel(binding, scope).await;
         let session = self.binding(binding).await?;
         let admitting = session
@@ -2425,7 +2489,10 @@ impl CodexProvider {
             let mut done = admitting.done.subscribe();
             while !*done.borrow() {
                 done.changed().await.map_err(|_| {
-                    failure(ProviderOperation::Cancel, ProviderFailureKind::Transport)
+                    failure(
+                        ProviderOperation::TurnInterrupt,
+                        ProviderFailureKind::Transport,
+                    )
                 })?;
             }
         }
@@ -2444,17 +2511,22 @@ impl CodexProvider {
                     return settlement;
                 }
                 return Err(failure(
-                    ProviderOperation::Cancel,
+                    ProviderOperation::TurnInterrupt,
                     ProviderFailureKind::WrongInvocation,
                 ));
             };
-            let task = execution
-                .task
-                .clone()
-                .ok_or_else(|| failure(ProviderOperation::Cancel, ProviderFailureKind::Protocol))?;
+            let task = execution.task.clone().ok_or_else(|| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
             if !task.is_finished() && execution.turn_updates.borrow().is_some() {
                 execution.cancel.send(()).map_err(|_| {
-                    failure(ProviderOperation::Cancel, ProviderFailureKind::Transport)
+                    failure(
+                        ProviderOperation::TurnInterrupt,
+                        ProviderFailureKind::Transport,
+                    )
                 })?;
             }
             task
@@ -2466,7 +2538,12 @@ impl CodexProvider {
             .await
             .get(scope)
             .cloned()
-            .ok_or_else(|| failure(ProviderOperation::Cancel, ProviderFailureKind::Protocol))?
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Protocol,
+                )
+            })?
     }
 
     /// Revoke authority before collecting every retained native binding resource.
@@ -2486,7 +2563,7 @@ impl CodexProvider {
                 && !error.is_cancelled()
             {
                 errors.push(failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Runtime,
                 ));
             }
@@ -2514,6 +2591,27 @@ impl CodexProvider {
             errors.push(error);
         }
         let _admission = session.admission.lock().await;
+        let children = session.child_runners.lock().await.clone();
+        if !children.is_empty()
+            && let Some(start) = start_background_reader(&session).await?
+        {
+            let _ = start.send(());
+        }
+        for child in &children {
+            if child.native_result().await.is_none()
+                && let Err(error) = child.interrupt().await
+            {
+                errors.push(error);
+            }
+        }
+        for child in children {
+            if let Err(error) = child.join().await {
+                errors.push(error);
+            }
+        }
+        session.child_runners.lock().await.clear();
+        session.child_observations.lock().await.clear();
+        session.callback_requests.lock().await.clear();
         if let Err(error) = stop_background_reader(&session).await {
             errors.push(error);
         }
@@ -2546,7 +2644,7 @@ impl CodexProvider {
             if let Some(profile) = profile.as_mut()
                 && let Err(error) = profile.close()
             {
-                errors.push(error.into_provider_error(ProviderOperation::SessionClose));
+                errors.push(error.into_provider_error(ProviderOperation::ThreadClose));
             }
         }
         if let Err(error) = combine_errors(errors) {
@@ -2583,7 +2681,7 @@ impl CodexProvider {
                 let session = self.binding(&id).await?;
                 if session.is_fenced() {
                     return Err(failure(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::SessionMissing,
                     ));
                 }
@@ -2628,7 +2726,7 @@ impl CodexProvider {
             if let Some(profile) = profile.as_mut()
                 && let Err(error) = profile.close()
             {
-                errors.push(error.into_provider_error(ProviderOperation::SessionClose));
+                errors.push(error.into_provider_error(ProviderOperation::ThreadClose));
                 failed = true;
             }
             if !failed {
@@ -2655,7 +2753,7 @@ impl CodexProvider {
                     self.preparing.lock().await.remove(&id);
                 }
                 Err(error) => {
-                    errors.push(error.into_provider_error(ProviderOperation::SessionClose))
+                    errors.push(error.into_provider_error(ProviderOperation::ThreadClose))
                 }
             }
         }
@@ -2665,13 +2763,14 @@ impl CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: OperationContext,
         request: SessionRequest,
     ) -> Result<forge_provider_api::OpenedSession, ProviderError> {
+        request.validate_thread_owner()?;
         let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::SessionOpen);
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::ThreadOpen);
         let payload = request.identity();
         let target = CleanupTarget::Open(context.id().clone());
         let provider = self.clone();
@@ -2681,7 +2780,7 @@ impl Provider for CodexProvider {
             .open
             .take(
                 context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2689,7 +2788,7 @@ impl Provider for CodexProvider {
                         provider
                             .open_session(request)
                             .await
-                            .map_err(|error| operation_error(error, ProviderOperation::SessionOpen))
+                            .map_err(|error| operation_error(error, ProviderOperation::ThreadOpen))
                     })
                     .await
                 },
@@ -2698,7 +2797,7 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -2706,7 +2805,7 @@ impl Provider for CodexProvider {
     ) -> Result<forge_provider_api::ConfiguredSession, ProviderError> {
         let native = super::operations::NativeContext::new(
             context.clone(),
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
         );
         let payload = (binding.clone(), configuration.clone());
         let target = CleanupTarget::Binding {
@@ -2721,7 +2820,7 @@ impl Provider for CodexProvider {
             .configure
             .observe(
                 context,
-                ProviderOperation::SessionConfigure,
+                ProviderOperation::ThreadConfigure,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2730,7 +2829,7 @@ impl Provider for CodexProvider {
                             .configure_binding(&binding, configuration)
                             .await
                             .map_err(|error| {
-                                operation_error(error, ProviderOperation::SessionConfigure)
+                                operation_error(error, ProviderOperation::ThreadConfigure)
                             })
                     })
                     .await
@@ -2740,13 +2839,13 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: OperationContext,
         request: forge_provider_api::SessionForkRequest,
     ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
         let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::SessionFork);
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::ThreadFork);
         let payload = request.clone();
         let target = CleanupTarget::None;
         let provider = self.clone();
@@ -2756,7 +2855,7 @@ impl Provider for CodexProvider {
             .fork
             .observe(
                 context,
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2764,7 +2863,7 @@ impl Provider for CodexProvider {
                         provider
                             .fork_history(request)
                             .await
-                            .map_err(|error| operation_error(error, ProviderOperation::SessionFork))
+                            .map_err(|error| operation_error(error, ProviderOperation::ThreadFork))
                     })
                     .await
                 },
@@ -2773,7 +2872,7 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -2781,7 +2880,7 @@ impl Provider for CodexProvider {
     ) -> Result<forge_provider_api::CompactionResult, ProviderError> {
         let native = super::operations::NativeContext::new(
             context.clone(),
-            ProviderOperation::SessionCompact,
+            ProviderOperation::ThreadCompact,
         );
         let payload = (binding.clone(), request.clone());
         let target = CleanupTarget::Binding {
@@ -2796,7 +2895,7 @@ impl Provider for CodexProvider {
             .compact
             .observe(
                 context,
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2805,7 +2904,7 @@ impl Provider for CodexProvider {
                             .compact_binding(&binding, request)
                             .await
                             .map_err(|error| {
-                                operation_error(error, ProviderOperation::SessionCompact)
+                                operation_error(error, ProviderOperation::ThreadCompact)
                             })
                     })
                     .await
@@ -2815,13 +2914,13 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: OperationContext,
         binding: &BindingId,
     ) -> Result<(), ProviderError> {
         let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::SessionClose);
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::ThreadClose);
         let payload = binding.clone();
         let target = CleanupTarget::None;
         let binding = binding.clone();
@@ -2832,7 +2931,7 @@ impl Provider for CodexProvider {
             .close
             .observe(
                 context,
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2840,9 +2939,7 @@ impl Provider for CodexProvider {
                         super::operations::check()?;
                         super::operations::cleanup(provider.close_binding(&binding))
                             .await
-                            .map_err(|error| {
-                                operation_error(error, ProviderOperation::SessionClose)
-                            })
+                            .map_err(|error| operation_error(error, ProviderOperation::ThreadClose))
                     })
                     .await
                 },
@@ -2851,25 +2948,28 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: forge_provider_api::CancelRequest,
-    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
-        let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::Cancel);
+    ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
+        let native = super::operations::NativeContext::new(
+            context.clone(),
+            ProviderOperation::TurnInterrupt,
+        );
         let payload = (binding.clone(), request.clone());
         let target = CleanupTarget::None;
         let binding = binding.clone();
         let provider = self.clone();
         let cleanup_provider = self.clone();
+        let operation_id = context.id().clone();
         let worker_native = native.clone();
         self.records
             .cancel
             .observe(
                 context,
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2879,7 +2979,13 @@ impl Provider for CodexProvider {
                             provider.cancel_invocation(&binding, &request.scope),
                         )
                         .await
-                        .map_err(|error| operation_error(error, ProviderOperation::Cancel))
+                        .map(|collected| forge_provider_api::TurnInterruptResult {
+                            operation_id,
+                            thread_id: collected.address.thread_id,
+                            turn_id: collected.address.turn_id,
+                            watermark: collected.watermark,
+                        })
+                        .map_err(|error| operation_error(error, ProviderOperation::TurnInterrupt))
                     })
                     .await
                 },
@@ -2888,17 +2994,18 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: PromptRequest,
     ) -> Result<InputAcceptance, ProviderError> {
+        request.validate_turn_identity()?;
         let pending = self
             .pending_inputs
             .register(binding, &request.scope, context.id());
         let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::InputSubmit);
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::TurnStart);
         let payload = (binding.clone(), request.identity());
         let target = CleanupTarget::Binding {
             binding: binding.clone(),
@@ -2912,7 +3019,7 @@ impl Provider for CodexProvider {
             .submit
             .observe(
                 context,
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2920,7 +3027,7 @@ impl Provider for CodexProvider {
                         provider
                             .submit_input(&binding, request, pending)
                             .await
-                            .map_err(|error| operation_error(error, ProviderOperation::InputSubmit))
+                            .map_err(|error| operation_error(error, ProviderOperation::TurnStart))
                     })
                     .await
                 },
@@ -2929,14 +3036,14 @@ impl Provider for CodexProvider {
             .await
     }
 
-    async fn input_steer(
+    async fn turn_steer(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: SteeringRequest,
     ) -> Result<SteeringAcceptance, ProviderError> {
         let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::InputSteer);
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::TurnSteer);
         let payload = (binding.clone(), request.identity());
         let target = CleanupTarget::Binding {
             binding: binding.clone(),
@@ -2950,7 +3057,7 @@ impl Provider for CodexProvider {
             .steer
             .observe(
                 context,
-                ProviderOperation::InputSteer,
+                ProviderOperation::TurnSteer,
                 payload,
                 async move {
                     super::operations::scope(worker_native, async move {
@@ -2958,7 +3065,7 @@ impl Provider for CodexProvider {
                         provider
                             .steer_input(&binding, request)
                             .await
-                            .map_err(|error| operation_error(error, ProviderOperation::InputSteer))
+                            .map_err(|error| operation_error(error, ProviderOperation::TurnSteer))
                     })
                     .await
                 },
@@ -3310,14 +3417,367 @@ impl Provider for CodexProvider {
     }
 }
 
+/// Preserve a model positively reported by native startup rather than inferring a configured default.
+fn native_model_confirmation(
+    snapshot: &Value,
+) -> Result<Option<forge_provider_api::ResolvedModel>, ProviderError> {
+    let model = snapshot
+        .get("model")
+        .or_else(|| snapshot.pointer("/thread/model"));
+    match model {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(model)) => Ok(Some(forge_provider_api::ResolvedModel {
+            model_id: forge_provider_api::ModelId::new(model).map_err(|_| {
+                failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
+            })?,
+            observed_at_ms: now_ms(),
+        })),
+        Some(_) => Err(failure(
+            ProviderOperation::ThreadOpen,
+            ProviderFailureKind::Protocol,
+        )),
+    }
+}
+
+/// Keep a validated native turn identifier private to the Codex transport boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeTurnId(String);
+
+impl NativeTurnId {
+    /// Create a native identity without allowing an empty protocol correlation target.
+    fn new(value: impl Into<String>) -> Result<Self, ProviderError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(failure(
+                ProviderOperation::TurnStart,
+                ProviderFailureKind::Protocol,
+            ));
+        }
+        Ok(Self(value))
+    }
+    /// Get the native spelling only when addressing its owning protocol transport.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Retain native protocol correlation independently of published host identities.
+struct NativeTurnAddress {
+    thread_id: String,
+    turn_id: NativeTurnId,
+}
+
+/// Preserve collected canonical evidence for repeated exact-scope interruption.
+#[derive(Clone)]
+struct CollectedInvocation {
+    address: forge_provider_api::TurnAddress,
+    completed: forge_provider_api::CompletedTurn,
+    watermark: forge_provider_api::EventSequence,
+}
+
+/// Keep one native response and its cleanup behind the common retained turn runner.
+struct CodexTurnDriver {
+    session: Arc<CodexBinding>,
+    started_at_ms: i64,
+    native_confirmation: Option<forge_provider_api::ResolvedModel>,
+    admission_model: Option<forge_provider_api::ResolvedModel>,
+    request: PromptRequest,
+    address: forge_provider_api::TurnAddress,
+    native_address: NativeTurnAddress,
+    submissions: Arc<Mutex<Vec<forge_provider_api::CoveredInput>>>,
+    cancel: Mutex<Option<mpsc::UnboundedReceiver<()>>>,
+    initial_messages: Mutex<Option<Vec<Value>>>,
+    cleanup_errors: Arc<Mutex<Vec<ProviderError>>>,
+}
+
+#[async_trait]
+impl crate::turn_runner::NativeTurnDriver for CodexTurnDriver {
+    /// Observe the acknowledged native turn and retain its unique terminal outcome.
+    async fn run(
+        &self,
+        start: forge_provider_api::NativeTurnStart,
+    ) -> Result<forge_provider_api::TurnResult, ProviderError> {
+        start.observed(self.started_at_ms).await?;
+        if let Some(model) = &self.native_confirmation {
+            let event = self
+                .session
+                .normalization
+                .lock()
+                .await
+                .resolve_model(&self.address, model.clone());
+            if let Some(event) = event {
+                publish_event(&self.session, event).await?;
+            }
+        }
+        if let Some(model) = &self.admission_model {
+            let event = self
+                .session
+                .normalization
+                .lock()
+                .await
+                .resolve_model(&self.address, model.clone());
+            if let Some(event) = event {
+                publish_event(&self.session, event).await?;
+            }
+        }
+        let cancel =
+            self.cancel.lock().await.take().ok_or_else(|| {
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+            })?;
+        let initial =
+            self.initial_messages.lock().await.take().ok_or_else(|| {
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+            })?;
+        observe_execution(NativeTurnObservation {
+            session: self.session.clone(),
+            request: self.request.clone(),
+            address: self.address.clone(),
+            native_address: NativeTurnAddress {
+                thread_id: self.native_address.thread_id.clone(),
+                turn_id: self.native_address.turn_id.clone(),
+            },
+            submissions: self.submissions.clone(),
+            cancel,
+            initial_messages: initial,
+            retained_cleanup: self.cleanup_errors.clone(),
+        })
+        .await
+    }
+    /// Signal the original invocation without touching a successor's native resources.
+    async fn interrupt(&self) -> Result<(), ProviderError> {
+        let active = self.session.active.lock().await;
+        if let Some(active) = active
+            .as_ref()
+            .filter(|active| active.scope == self.address.scope)
+            && active.turn_updates.borrow().is_some()
+        {
+            active.cancel.send(()).map_err(|_| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Transport,
+                )
+            })?;
+        }
+        Ok(())
+    }
+    /// Transfer certified background observation after foreground callbacks have joined.
+    async fn collect(&self) -> Result<(), ProviderError> {
+        if self
+            .session
+            .normalization
+            .lock()
+            .await
+            .has_unresolved_sessions(&self.address)
+        {
+            self.session.fenced.store(true, Ordering::Release);
+            let error = ProviderError::from(
+                ProviderFailure::new(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Runtime,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Collection,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                ),
+            );
+            let mut retained = self.session.close_failure.lock().await;
+            if retained.is_none() {
+                *retained = Some(error.clone());
+            }
+            return Err(error);
+        }
+        combine_errors(std::mem::take(&mut *self.cleanup_errors.lock().await))?;
+        if let Some(start) = start_background_reader(&self.session).await? {
+            let _ = start.send(());
+        }
+        Ok(())
+    }
+}
+
+/// Retain the decoder's ordered terminal and callback-collection proof for one native child.
+struct ChildObservation {
+    address: forge_provider_api::TurnAddress,
+    callbacks: Arc<Mutex<Vec<Arc<crate::retained_task::RetainedTask>>>>,
+    result: watch::Sender<Option<Result<forge_provider_api::TurnResult, ProviderError>>>,
+    collected: watch::Sender<Option<Result<(), ProviderError>>>,
+}
+
+impl Drop for ChildObservation {
+    /// Fail pending child observation instead of inventing completion when its dispatcher is lost.
+    fn drop(&mut self) {
+        let error = failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport);
+        if self.result.borrow().is_none() {
+            self.result.send_replace(Some(Err(error.clone())));
+        }
+        if self.collected.borrow().is_none() {
+            self.collected.send_replace(Some(Err(error)));
+        }
+    }
+}
+
+/// Share the binding's transport while owning one child's exact native end and callback boundary.
+struct ObservedChildDriver {
+    session: Arc<CodexBinding>,
+    callbacks: Arc<Mutex<Vec<Arc<crate::retained_task::RetainedTask>>>>,
+    native_thread: String,
+    native_turn: String,
+    started_at_ms: i64,
+    started: Mutex<Option<tokio::sync::oneshot::Sender<Result<(), ProviderError>>>>,
+    result: watch::Receiver<Option<Result<forge_provider_api::TurnResult, ProviderError>>>,
+    collected: watch::Receiver<Option<Result<(), ProviderError>>>,
+}
+
+#[async_trait]
+impl crate::turn_runner::NativeTurnDriver for ObservedChildDriver {
+    /// Publish positive child start before exposing its first metadata or item activity.
+    async fn run(
+        &self,
+        start: forge_provider_api::NativeTurnStart,
+    ) -> Result<forge_provider_api::TurnResult, ProviderError> {
+        let started = start.observed(self.started_at_ms).await;
+        if let Some(observer) = self.started.lock().await.take() {
+            let _ = observer.send(started.clone());
+        }
+        started?;
+        let mut result = self.result.clone();
+        loop {
+            if let Some(result) = result.borrow_and_update().clone() {
+                return result;
+            }
+            result.changed().await.map_err(|_| {
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
+            })?;
+        }
+    }
+    /// Interrupt exactly this native child turn without redirecting the parent or a successor.
+    async fn interrupt(&self) -> Result<(), ProviderError> {
+        self.session
+            .rpc
+            .lock()
+            .await
+            .request(
+                "turn/interrupt",
+                json!({"threadId":self.native_thread,"turnId":self.native_turn}),
+                ProviderOperation::TurnInterrupt,
+            )
+            .await
+            .map(|_| ())
+    }
+    /// Await the dispatcher's proof that every preceding child callback was fully joined.
+    async fn collect(&self) -> Result<(), ProviderError> {
+        let mut collected = self.collected.clone();
+        loop {
+            let observed = collected.borrow_and_update().clone();
+            if let Some(collected) = observed {
+                collected?;
+                for callback in self.callbacks.lock().await.clone() {
+                    callback.join().await?;
+                }
+                return Ok(());
+            }
+            collected.changed().await.map_err(|_| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Transport,
+                )
+            })?;
+        }
+    }
+}
+
+/// Install child runners only from positively trusted and independently observed native starts.
+async fn begin_child_turns(
+    session: &Arc<CodexBinding>,
+    observations: &mut HashMap<forge_provider_api::TurnId, ChildObservation>,
+    retained: &Arc<Mutex<Vec<Arc<crate::turn_runner::RetainedTurn>>>>,
+) -> Result<(), ProviderError> {
+    let starts = session.normalization.lock().await.take_observed_starts();
+    for (address, native_thread, native_turn, started_at_ms) in starts {
+        let (result, observed) = watch::channel(None);
+        let (collected, collection) = watch::channel(None);
+        let (started, start) = tokio::sync::oneshot::channel();
+        let callbacks = Arc::new(Mutex::new(Vec::new()));
+        let driver = Arc::new(ObservedChildDriver {
+            session: session.clone(),
+            callbacks: callbacks.clone(),
+            native_thread,
+            native_turn,
+            started_at_ms,
+            started: Mutex::new(Some(started)),
+            result: observed,
+            collected: collection,
+        });
+        let runner = Arc::new(crate::turn_runner::RetainedTurn::spawn_observed(
+            driver,
+            session.sink.clone(),
+            address.clone(),
+        )?);
+        observations.insert(
+            address.turn_id.clone(),
+            ChildObservation {
+                address,
+                callbacks,
+                result,
+                collected,
+            },
+        );
+        retained.lock().await.push(runner);
+        start
+            .await
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))??;
+    }
+    Ok(())
+}
+
+/// Transfer exact child terminal evidence only after ordered native callbacks and activity delivery finish.
+async fn finish_child_turns(
+    session: &CodexBinding,
+    observations: &mut HashMap<forge_provider_api::TurnId, ChildObservation>,
+) -> Result<(), ProviderError> {
+    let normalization = session.normalization.lock().await;
+    for child in observations.values_mut() {
+        if child.result.borrow().is_some() {
+            continue;
+        }
+        if let Some((outcome, completed_at_ms)) = normalization.terminal_evidence(&child.address) {
+            let result = forge_provider_api::TurnResult::new(
+                outcome,
+                completed_at_ms,
+                None,
+                Vec::new(),
+                normalization.final_usage(&child.address),
+                None,
+            )
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+            child.result.send_replace(Some(Ok(result)));
+            // The binding dispatcher awaits each native request handler before consuming the next frame.
+            let collection = if normalization.has_unresolved_sessions(&child.address) {
+                Err(ProviderFailure::new(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Runtime,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Collection,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                )
+                .into())
+            } else {
+                Ok(())
+            };
+            child.collected.send_replace(Some(collection));
+        }
+    }
+    Ok(())
+}
+
 struct ActiveExecution {
     scope: forge_provider_api::InvocationScope,
-    turn_id: String,
+    native_turn_id: String,
     turn_updates: watch::Sender<Option<String>>,
-    submissions: Arc<Mutex<Vec<forge_provider_api::SubmissionId>>>,
+    submissions: Arc<Mutex<Vec<forge_provider_api::CoveredInput>>>,
     request: PromptRequest,
     cancel: mpsc::UnboundedSender<()>,
-    task: Option<Arc<crate::retained_task::RetainedTask>>,
+    task: Option<Arc<crate::turn_runner::RetainedTurn>>,
 }
 
 struct AdmittingInput {
@@ -3331,7 +3791,7 @@ struct AdmittingInput {
 struct RollbackAuthorization {
     thread_id: String,
     scope: forge_provider_api::InvocationScope,
-    turn_id: forge_provider_api::ProviderTurnId,
+    turn_id: NativeTurnId,
     submission_id: forge_provider_api::SubmissionId,
     attempt_id: forge_provider_api::DeliveryAttemptId,
 }
@@ -3346,14 +3806,19 @@ struct CodexBinding {
     history: std::sync::Mutex<NativeHistory>,
     native_tools: Vec<forge_provider_api::control::ControlToolDefinition>,
     opened_by: forge_provider_api::OperationId,
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     workspace: String,
     model: Mutex<ModelSelection>,
+    native_confirmation: Mutex<Option<forge_provider_api::ResolvedModel>>,
     runtime: Mutex<Arc<CodexRuntime>>,
     rpc: RpcHandle,
     sink: ProviderEventSink,
     stream: Mutex<Option<ProviderEventStream>>,
     normalization: Mutex<CodexNormalization>,
+    child_observations: Mutex<HashMap<forge_provider_api::TurnId, ChildObservation>>,
+    child_runners: Arc<Mutex<Vec<Arc<crate::turn_runner::RetainedTurn>>>>,
+    callback_requests: Mutex<HashMap<forge_provider_api::InvocationScope, PromptRequest>>,
+    pending_messages: Mutex<std::collections::VecDeque<Value>>,
     mcp_context: Mutex<super::protocol::McpContext>,
     resources: Mutex<CodexResources>,
     profile: Mutex<Option<crate::profile::ResourceProfile>>,
@@ -3367,6 +3832,7 @@ struct CodexBinding {
     background_reader: Mutex<Option<BackgroundReader>>,
     terminal_observer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     rollback: Mutex<Option<RollbackAuthorization>>,
+    turn_context: Mutex<super::turn_context::TurnContextDelivery>,
     admission: Mutex<()>,
     observations: Arc<tokio::sync::RwLock<bool>>,
     fenced: AtomicBool,
@@ -3378,12 +3844,10 @@ struct CodexBinding {
     configuration: Mutex<forge_provider_api::SessionConfiguration>,
     capabilities: forge_provider_api::capability::CapabilityManifest,
     settlements: Mutex<
-        HashMap<
-            forge_provider_api::InvocationScope,
-            Result<forge_provider_api::InvocationSettlement, ProviderError>,
-        >,
+        HashMap<forge_provider_api::InvocationScope, Result<CollectedInvocation, ProviderError>>,
     >,
-    outcomes: Mutex<HashMap<forge_provider_api::InvocationScope, ExecutionResult>>,
+    native_results:
+        Mutex<HashMap<forge_provider_api::InvocationScope, forge_provider_api::TurnResult>>,
     close_failure: Mutex<Option<ProviderError>>,
     close_lock: Mutex<()>,
     settlement_lock: Mutex<()>,
@@ -3558,7 +4022,7 @@ async fn invalidate_retraction(session: &CodexBinding, error: ProviderError) {
 fn configuration_preflight_error(error: ProviderError) -> ProviderError {
     match error {
         ProviderError::Failure(cause) => {
-            ProviderFailure::new(ProviderOperation::SessionConfigure, cause.kind())
+            ProviderFailure::new(ProviderOperation::ThreadConfigure, cause.kind())
                 .at_phase(
                     forge_provider_api::error::ProviderPhase::Admission,
                     forge_provider_api::error::FailureDisposition::Unchanged,
@@ -3596,7 +4060,7 @@ fn invalidate_configuration(
                 phase => phase,
             };
             cause
-                .for_operation(ProviderOperation::SessionConfigure)
+                .for_operation(ProviderOperation::ThreadConfigure)
                 .at_phase(phase, forge_provider_api::FailureDisposition::Invalidated)
                 .into()
         }
@@ -3636,7 +4100,7 @@ fn configuration_failure(
             return match report.origin() {
                 Some(origin) => configuration_failure(origin, fallback_phase),
                 None => ProviderFailure::new(
-                    ProviderOperation::SessionConfigure,
+                    ProviderOperation::ThreadConfigure,
                     ProviderFailureKind::Runtime,
                 )
                 .at_phase(
@@ -3697,7 +4161,7 @@ fn configuration_failure(
         ProviderError::Cancelled => (ProviderFailureKind::Cancelled, fallback_phase),
         ProviderError::Retryable(_) => (ProviderFailureKind::Runtime, fallback_phase),
     };
-    ProviderFailure::new(ProviderOperation::SessionConfigure, kind)
+    ProviderFailure::new(ProviderOperation::ThreadConfigure, kind)
         .at_phase(phase, forge_provider_api::FailureDisposition::Invalidated)
 }
 
@@ -3714,9 +4178,34 @@ async fn invalidate_background_observer(
         *cause = Some(error.clone());
     }
     drop(cause);
-    session
-        .sink
-        .fail(events::EventDeliveryError::Observation(observation));
+    let failure = match &error {
+        ProviderError::Failure(failure) => *failure,
+        _ => ProviderFailure::new(
+            ProviderOperation::TurnStart,
+            match observation {
+                forge_provider_api::ObservationFailure::Protocol => ProviderFailureKind::Protocol,
+                forge_provider_api::ObservationFailure::OwnershipConflict => {
+                    ProviderFailureKind::ResourceConflict
+                }
+                forge_provider_api::ObservationFailure::UnexpectedExecution => {
+                    ProviderFailureKind::WrongInvocation
+                }
+                forge_provider_api::ObservationFailure::Overflow
+                | forge_provider_api::ObservationFailure::Disconnected => {
+                    ProviderFailureKind::Transport
+                }
+                forge_provider_api::ObservationFailure::LifecycleUnavailable
+                | forge_provider_api::ObservationFailure::DeliveryUncertain => {
+                    ProviderFailureKind::Runtime
+                }
+            },
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Invalidated,
+        ),
+    };
+    session.sink.unavailable_because(failure, observation).await;
     error
 }
 
@@ -3724,61 +4213,32 @@ async fn invalidate_background_observer(
 async fn collect_invocation(
     session: Arc<CodexBinding>,
     scope: forge_provider_api::InvocationScope,
-    task: Arc<crate::retained_task::RetainedTask>,
+    task: Arc<crate::turn_runner::RetainedTurn>,
 ) -> Result<(), ProviderError> {
     let result = task.join().await;
+    if let Some(Ok(native)) = task.native_result().await {
+        session
+            .native_results
+            .lock()
+            .await
+            .entry(scope.clone())
+            .or_insert(native);
+    }
     let _settlement = session.settlement_lock.lock().await;
     if let Some(retained) = session.settlements.lock().await.get(&scope) {
         return retained.as_ref().map(|_| ()).map_err(Clone::clone);
     }
-    let result = match result {
-        Ok(()) => match session.outcomes.lock().await.get(&scope).cloned() {
-            Some(result) => Ok(forge_provider_api::InvocationSettlement {
-                binding_id: session.binding.id.clone(),
-                scope: scope.clone(),
-                result,
-                watermark: session.sink.watermark(),
-            }),
-            None => Err(failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )),
+    let result = result.map(|completed| CollectedInvocation {
+        address: forge_provider_api::TurnAddress {
+            scope: scope.clone(),
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope
+                .turn_id()
+                .expect("admitted invocation has checked turn identity"),
         },
-        Err(error) => Err(error),
-    };
-    let result = match result {
-        Ok(settlement) => {
-            let scoped = session.sink.invocation_sink(&scope)?;
-            scoped
-                .send_settlement(settlement)
-                .await
-                .map_err(ProviderError::from)
-        }
-        Err(error) => {
-            session.fenced.store(true, Ordering::Release);
-            let failure = match &error {
-                ProviderError::Failure(failure) => *failure,
-                _ => ProviderFailure::new(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Runtime,
-                )
-                .at_phase(
-                    forge_provider_api::error::ProviderPhase::Collection,
-                    forge_provider_api::error::FailureDisposition::Invalidated,
-                ),
-            };
-            let _ = publish(
-                &session.sink,
-                &scope,
-                ProviderEvent::SettlementFailed {
-                    scope: scope.clone(),
-                    failure,
-                },
-            )
-            .await;
-            Err(error)
-        }
-    };
+        completed,
+        watermark: session.sink.watermark(),
+    });
     if result.is_err() {
         session.fenced.store(true, Ordering::Release);
     }
@@ -3814,7 +4274,7 @@ async fn collect_retired(session: &CodexBinding) -> Result<(), ProviderError> {
     let mut retained_profiles = Vec::new();
     for mut profile in profiles.drain(..) {
         if let Err(error) = profile.close() {
-            errors.push(error.into_provider_error(ProviderOperation::SessionConfigure));
+            errors.push(error.into_provider_error(ProviderOperation::ThreadConfigure));
             retained_profiles.push(profile);
         }
     }
@@ -3822,14 +4282,24 @@ async fn collect_retired(session: &CodexBinding) -> Result<(), ProviderError> {
     combine_errors(errors)
 }
 
+/// Report whether Codex registered the root turn named by one `turn/interrupt` request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeInterrupt {
+    /// Codex accepted the interrupt, or no root turn was named.
+    Delivered,
+    /// Codex positively rejected the interrupt because it had no matching active turn.
+    NotActive,
+}
+
 /// Interrupt the native foreground and descendants while retaining independent terminal identities.
 async fn interrupt_native(
     session: &CodexBinding,
     thread_id: &str,
-    turn_id: Option<&forge_provider_api::ProviderTurnId>,
+    turn_id: Option<&NativeTurnId>,
     descendants: &super::descendants::DescendantTracker,
-) -> Result<(), ProviderError> {
+) -> Result<NativeInterrupt, ProviderError> {
     let mut errors = Vec::new();
+    let mut root = NativeInterrupt::Delivered;
     if let Some(turn_id) = turn_id
         && let Err(error) = session
             .rpc
@@ -3837,12 +4307,16 @@ async fn interrupt_native(
             .await
             .request(
                 "turn/interrupt",
-                json!({"threadId":thread_id,"turnId":turn_id}),
-                ProviderOperation::Cancel,
+                json!({"threadId":thread_id,"turnId":turn_id.as_str()}),
+                ProviderOperation::TurnInterrupt,
             )
             .await
     {
-        errors.push(error);
+        if interrupt_found_no_active_turn(&error) {
+            root = NativeInterrupt::NotActive;
+        } else {
+            errors.push(error);
+        }
     }
     for (thread_id, turn_id) in descendants.active_turns() {
         if let Some(turn_id) = turn_id
@@ -3852,15 +4326,94 @@ async fn interrupt_native(
                 .await
                 .request(
                     "turn/interrupt",
-                    json!({"threadId":thread_id,"turnId":turn_id}),
-                    ProviderOperation::Cancel,
+                    json!({"threadId":thread_id,"turnId":turn_id.as_str()}),
+                    ProviderOperation::TurnInterrupt,
                 )
                 .await
+            && !interrupt_found_no_active_turn(&error)
         {
             errors.push(error);
         }
     }
-    combine_errors(errors)
+    if let Some(turn_id) = turn_id
+        && let Err(error) = stop_foreground_commands(session, thread_id, turn_id.as_str()).await
+    {
+        errors.push(error);
+    }
+    combine_errors(errors).map(|()| root)
+}
+
+/// Get whether Codex positively rejected `turn/interrupt` because it had no matching active turn.
+///
+/// Codex answers an interrupt with an invalid-request error, leaving the thread unchanged, in
+/// two windows: after acknowledging `turn/start` but before registering the turn, and after the
+/// turn finished natively. Neither window leaves native work for the interrupt to stop.
+fn interrupt_found_no_active_turn(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Rejected && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+}
+
+/// Record one root interrupt attempt for the turn driver.
+///
+/// Codex rejects an interrupt while the turn is not yet interruptible: before `turn/started`,
+/// and briefly after it. The driver therefore retries on each later root notification. If the
+/// turn instead ended natively, its own `turn/completed` notification ends the retries.
+fn record_interrupt_attempt(
+    attempt: Result<NativeInterrupt, ProviderError>,
+    retry_pending: &mut bool,
+    errors: &mut Vec<ProviderError>,
+) {
+    match attempt {
+        Ok(NativeInterrupt::Delivered) => {}
+        Ok(NativeInterrupt::NotActive) => *retry_pending = true,
+        Err(error) => errors.push(error),
+    }
+}
+
+/// Terminate processes of the interrupted turn's foreground commands. Codex aborts the
+/// turn on `turn/interrupt` but leaves its exec processes running, so a cancelled
+/// command would otherwise keep running and report output after the turn settled.
+async fn stop_foreground_commands(
+    session: &CodexBinding,
+    thread_id: &str,
+    native_turn: &str,
+) -> Result<(), ProviderError> {
+    let item_ids = session
+        .normalization
+        .lock()
+        .await
+        .foreground_command_items(thread_id, native_turn);
+    if item_ids.is_empty() {
+        return Ok(());
+    }
+    for row in terminal_inventory(session, thread_id).await? {
+        if !row
+            .get("itemId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| item_ids.contains(id))
+        {
+            continue;
+        }
+        let process_id = row
+            .get("processId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+        session
+            .rpc
+            .lock()
+            .await
+            .request(
+                "thread/backgroundTerminals/terminate",
+                json!({"threadId":thread_id,"processId":process_id}),
+                ProviderOperation::TurnInterrupt,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 /// Get effective Codex support after validating the minimum native protocol version.
@@ -4054,11 +4607,12 @@ fn start_terminal_observer(session: &Arc<CodexBinding>) -> tokio::task::JoinHand
                     if previous.as_ref() != Some(&snapshot) {
                         if session
                             .sink
-                            .send_wait(ProviderEvent::Terminals {
-                                scope: forge_provider_api::EventScope::Binding {
-                                    owner: session.owner.clone(),
-                                },
-                                snapshot: snapshot.clone(),
+                            .activity_writer()
+                            .send_wait(AdapterActivity::Thread {
+                                thread_id: session.owner.thread_id(),
+                                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
+                                    snapshot.clone(),
+                                )),
                             })
                             .await
                             .is_err()
@@ -4068,25 +4622,28 @@ fn start_terminal_observer(session: &Arc<CodexBinding>) -> tokio::task::JoinHand
                         previous = Some(snapshot);
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     if session.closing.load(Ordering::Acquire) {
                         return;
                     }
-                    let diagnostic = forge_provider_api::ProviderDiagnostic {
-                        kind: ProviderFailureKind::Runtime,
-                        message: forge_provider_api::diagnostic::SanitizedMessage::new(
-                            "Background terminal inventory is unavailable.",
+                    previous = None;
+                    let failure = match error {
+                        ProviderError::Failure(failure) => failure,
+                        _ => ProviderFailure::new(
+                            ProviderOperation::TerminalList,
+                            ProviderFailureKind::Runtime,
                         )
-                        .expect("nonempty diagnostic"),
-                        fatal: false,
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Observation,
+                            forge_provider_api::FailureDisposition::Unchanged,
+                        ),
                     };
                     if session
                         .sink
-                        .send_wait(ProviderEvent::Diagnostic {
-                            scope: forge_provider_api::EventScope::Binding {
-                                owner: session.owner.clone(),
-                            },
-                            diagnostic,
+                        .activity_writer()
+                        .send_wait(AdapterActivity::Thread {
+                            thread_id: session.owner.thread_id(),
+                            event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(failure)),
                         })
                         .await
                         .is_err()
@@ -4195,14 +4752,31 @@ async fn release_native_thread_writer(
 /// Run native compaction while admission and notification consumption are exclusively owned.
 async fn compact_session(
     session: &Arc<CodexBinding>,
+    operation_id: &forge_provider_api::OperationId,
     request: forge_provider_api::CompactionRequest,
 ) -> Result<forge_provider_api::Compaction, ProviderError> {
-    let thread_id = session.history_id();
     session
         .normalization
         .lock()
         .await
         .bind(Some(request.scope.clone()));
+    let result = observe_compaction(session, operation_id).await;
+    // Release the operation scope so later provider-initiated compaction keeps its native
+    // identity and automatic provenance instead of inheriting this host attempt.
+    session
+        .normalization
+        .lock()
+        .await
+        .bind(None::<forge_provider_api::EventScope>);
+    result
+}
+
+/// Dispatch native compaction and read its notifications until the thread reports a terminal state.
+async fn observe_compaction(
+    session: &Arc<CodexBinding>,
+    operation_id: &forge_provider_api::OperationId,
+) -> Result<forge_provider_api::Compaction, ProviderError> {
+    let thread_id = session.history_id();
     session
         .rpc
         .lock()
@@ -4210,13 +4784,13 @@ async fn compact_session(
         .request(
             "thread/compact/start",
             json!({"threadId":thread_id}),
-            ProviderOperation::SessionCompact,
+            ProviderOperation::ThreadCompact,
         )
         .await?;
     loop {
         let mut message = session.rpc.lock().await.receive().await?;
         session.mcp_context.lock().await.normalize(&mut message);
-        let mut output = forge_provider_api::completion::ProviderOutput::default();
+        let mut output = super::normalization::CodexOutput::default();
         session
             .normalization
             .lock()
@@ -4225,24 +4799,59 @@ async fn compact_session(
             .await
             .map_err(|_| {
                 failure(
-                    ProviderOperation::SessionCompact,
+                    ProviderOperation::ThreadCompact,
                     ProviderFailureKind::Protocol,
                 )
             })?;
         let mut completed = None;
         for event in output.event {
-            if let ProviderEvent::Compaction { scope, update } = &event
-                && scope == &request.scope
-                && update.thread_id == thread_id.as_str()
-                && update.state != forge_provider_api::compaction::CompactionState::Running
-            {
-                completed = Some((**update).clone());
+            match &event {
+                AdapterActivity::Thread {
+                    event: forge_provider_api::ThreadEvent::CompactionUpdated(update),
+                    ..
+                } if update.thread_id == session.owner.thread_id().as_str()
+                    && update.state != forge_provider_api::compaction::CompactionState::Running =>
+                {
+                    completed = Some(update.as_ref().clone());
+                }
+                // Codex reports a failed compaction turn as an error on that turn, which
+                // the normalizer lifts to the thread because the operation owns no turn.
+                AdapterActivity::Thread {
+                    thread_id,
+                    event: forge_provider_api::ThreadEvent::Error { error },
+                } if thread_id == &session.owner.thread_id() => {
+                    completed = Some(failed_compaction(session, operation_id, error));
+                }
+                _ => {}
             }
-            publish_event(&session.sink, event).await?;
+            publish_event(session, event).await?;
         }
         if let Some(compaction) = completed {
             return Ok(compaction);
         }
+    }
+}
+
+/// Create the terminal failure record for a host compaction attempt from a native thread error.
+fn failed_compaction(
+    session: &CodexBinding,
+    operation_id: &forge_provider_api::OperationId,
+    error: &ProviderFailure,
+) -> forge_provider_api::Compaction {
+    forge_provider_api::Compaction {
+        id: operation_id.as_str().to_owned(),
+        thread_id: session.owner.thread_id().as_str().to_owned(),
+        state: forge_provider_api::compaction::CompactionState::Failed,
+        manual: true,
+        started_at_ms: None,
+        completed_at_ms: None,
+        result: forge_provider_api::compaction::CompactionResult {
+            error: Some(ProviderFailure::new(
+                ProviderOperation::ThreadCompact,
+                error.kind(),
+            )),
+            ..Default::default()
+        },
     }
 }
 
@@ -4278,7 +4887,7 @@ async fn record_receipt_failure(
 
 async fn fence_unobserved_acceptance(
     session: &CodexBinding,
-    request: &PromptRequest,
+    _request: &PromptRequest,
     turn_id: Option<&str>,
     primary: ProviderError,
 ) -> ProviderError {
@@ -4294,28 +4903,12 @@ async fn fence_unobserved_acceptance(
                 json!({
                     "threadId":thread_id,"turnId":turn_id
                 }),
-                ProviderOperation::Cancel,
+                ProviderOperation::TurnInterrupt,
             )
             .await
         {
             errors.push(error);
         }
-    }
-    let lost = ExecutionUpdate::ObservationLost {
-        failure: forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-        completion: Some(completion(session, &request.configuration.model).await),
-    };
-    if let Err(error) = publish(
-        &session.sink,
-        &request.scope,
-        ProviderEvent::Execution {
-            observation: ExecutionObservation::new(request.scope.clone(), lost)
-                .expect("observation loss belongs to the accepted invocation"),
-        },
-    )
-    .await
-    {
-        errors.push(error);
     }
     session.fenced.store(true, Ordering::Release);
     if let Some(execution) = session.active.lock().await.as_mut() {
@@ -4327,7 +4920,7 @@ async fn fence_unobserved_acceptance(
     let mut errors = errors.into_iter();
     let primary = errors
         .next()
-        .unwrap_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown));
+        .unwrap_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown));
     let secondary = errors.collect::<Vec<_>>();
     if secondary.is_empty() {
         primary
@@ -4339,21 +4932,53 @@ async fn fence_unobserved_acceptance(
     }
 }
 
-async fn observe_execution(
+/// Own the native reader, cancellation input, and retained collection proof for one turn.
+struct NativeTurnObservation {
     session: Arc<CodexBinding>,
     request: PromptRequest,
     address: forge_provider_api::TurnAddress,
-    submissions: Arc<Mutex<Vec<forge_provider_api::SubmissionId>>>,
-    mut cancel: mpsc::UnboundedReceiver<()>,
+    native_address: NativeTurnAddress,
+    submissions: Arc<Mutex<Vec<forge_provider_api::CoveredInput>>>,
+    cancel: mpsc::UnboundedReceiver<()>,
     initial_messages: Vec<Value>,
-) -> Result<(), ProviderError> {
+    retained_cleanup: Arc<Mutex<Vec<ProviderError>>>,
+}
+
+/// Observe the exact native turn through its retained terminal and collection boundaries.
+async fn observe_execution(
+    observation: NativeTurnObservation,
+) -> Result<forge_provider_api::TurnResult, ProviderError> {
+    let NativeTurnObservation {
+        session,
+        request,
+        address,
+        native_address,
+        submissions,
+        mut cancel,
+        initial_messages,
+        retained_cleanup,
+    } = observation;
     let mut cancelled = false;
+    // Codex acknowledges `turn/start` before its thread state registers the active turn and
+    // rejects an interrupt in that window with "no active turn to interrupt". The driver
+    // retries such a rejected interrupt once the root `turn/started` notification arrives.
+    let mut parent_started = false;
+    let mut retry_interrupt_on_start = false;
     let mut native_cleanup_failed = false;
     let mut cleanup_errors = Vec::new();
+    session
+        .callback_requests
+        .lock()
+        .await
+        .insert(request.scope.clone(), request.clone());
+    let mut child_observations = session.child_observations.lock().await;
     let mut descendants = super::descendants::DescendantTracker::default();
     let mut parent_terminal = None::<Value>;
-    let mut active_parent_turn = Some(address.turn_id.clone());
-    let mut initial_messages = initial_messages.into_iter();
+    let mut root_completion = None;
+    let mut active_parent_turn = Some(native_address.turn_id.clone());
+    let mut queued = std::mem::take(&mut *session.pending_messages.lock().await);
+    queued.extend(initial_messages);
+    let mut initial_messages = queued.into_iter();
     let result = loop {
         let native = if let Some(message) = initial_messages.next() {
             Ok(message)
@@ -4362,7 +4987,9 @@ async fn observe_execution(
                 signal = cancel.recv(), if !cancelled => {
                     if signal.is_some() {
                         cancelled = true;
-                        if let Err(error) = interrupt_native(&session, &address.thread_id, active_parent_turn.as_ref(), &descendants).await { cleanup_errors.push(error); native_cleanup_failed = true; }
+                        let mut errors = Vec::new();
+                        record_interrupt_attempt(interrupt_native(&session, &native_address.thread_id, active_parent_turn.as_ref(), &descendants).await, &mut retry_interrupt_on_start, &mut errors);
+                        if !errors.is_empty() { native_cleanup_failed = true; cleanup_errors.extend(errors); }
                     }
                     continue;
                 }
@@ -4375,7 +5002,7 @@ async fn observe_execution(
                 return Err(lose_observation(
                     &session,
                     &request,
-                    &address,
+                    &native_address,
                     &descendants,
                     error,
                     forge_provider_api::lifecycle::ObservationFailure::Disconnected,
@@ -4385,7 +5012,43 @@ async fn observe_execution(
         };
         session.mcp_context.lock().await.normalize(&mut message);
         let params = message.get("params").unwrap_or(&Value::Null);
-        descendants.observe(&message, &address.thread_id);
+        if message["method"]
+            .as_str()
+            .is_some_and(|method| method.eq_ignore_ascii_case("error"))
+        {
+            let result = async {
+                let events = session
+                    .normalization
+                    .lock()
+                    .await
+                    .normalize_retained(&message, &session.workspace)
+                    .await
+                    .map_err(|_| {
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                    })?
+                    .ok_or_else(|| {
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                    })?;
+                for event in events {
+                    publish_event(&session, event).await?;
+                }
+                Ok::<(), ProviderError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                return Err(lose_observation(
+                    &session,
+                    &request,
+                    &native_address,
+                    &descendants,
+                    error,
+                    forge_provider_api::ObservationFailure::Protocol,
+                )
+                .await);
+            }
+            continue;
+        }
+        descendants.observe(&message, &native_address.thread_id);
         session.approval_context.observe(&message);
         if message.get("method").is_some() && message.get("id").is_some() {
             if cancelled || session.is_fenced() {
@@ -4398,18 +5061,16 @@ async fn observe_execution(
                 continue;
             }
             let request_thread = params.get("threadId").and_then(Value::as_str);
-            if request_thread
-                .is_some_and(|thread| thread != address.thread_id && !descendants.owns(thread))
+            if let Some(thread) = request_thread
+                && thread != native_address.thread_id
+                && !session.normalization.lock().await.owns_child_thread(thread)
             {
                 return Err(lose_observation(
                     &session,
                     &request,
-                    &address,
+                    &native_address,
                     &descendants,
-                    failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Protocol,
-                    ),
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                     forge_provider_api::lifecycle::ObservationFailure::Protocol,
                 )
                 .await);
@@ -4421,18 +5082,18 @@ async fn observe_execution(
                         cancelled = true;
                         let mut errors = Vec::new();
                         if let Err(error) = session.rpc.lock().await.reject_request(message.get("id").unwrap_or(&Value::Null)).await { errors.push(error); }
-                        if let Err(error) = interrupt_native(&session, &address.thread_id, active_parent_turn.as_ref(), &descendants).await { errors.push(error); }
+                        record_interrupt_attempt(interrupt_native(&session, &native_address.thread_id, active_parent_turn.as_ref(), &descendants).await, &mut retry_interrupt_on_start, &mut errors);
                         if !errors.is_empty() { native_cleanup_failed = true; cleanup_errors.extend(errors); }
                     }
                     Ok(())
                 }
-                handled = handle_native_request(&session, &request, &message) => handled,
+                handled = dispatch_native_request(&session, &request, &message, &mut child_observations) => handled,
             };
             if let Err(error) = handled {
                 return Err(lose_observation(
                     &session,
                     &request,
-                    &address,
+                    &native_address,
                     &descendants,
                     error,
                     forge_provider_api::lifecycle::ObservationFailure::Protocol,
@@ -4442,13 +5103,14 @@ async fn observe_execution(
             continue;
         }
         let terminal = if params.get("threadId").and_then(Value::as_str)
-            == Some(address.thread_id.as_str())
+            == Some(native_address.thread_id.as_str())
             && message.get("method").and_then(Value::as_str) == Some("turn/completed")
             && params
                 .pointer("/turn/id")
                 .or_else(|| params.get("turnId"))
                 .and_then(Value::as_str)
-                .map(forge_provider_api::ProviderTurnId::from)
+                .map(NativeTurnId::new)
+                .transpose()?
                 == active_parent_turn
         {
             Some(
@@ -4463,8 +5125,14 @@ async fn observe_execution(
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
             continue;
         };
-        if thread_id != address.thread_id {
-            if !descendants.owns(thread_id) {
+        if thread_id != native_address.thread_id {
+            if !session
+                .normalization
+                .lock()
+                .await
+                .owns_child_thread(thread_id)
+            {
+                session.normalization.lock().await.defer_child(&message);
                 continue;
             }
             let events = session
@@ -4475,12 +5143,20 @@ async fn observe_execution(
                 .await;
             match events {
                 Ok(Some(events)) => {
+                    let (agents, events): (Vec<_>, Vec<_>) = events
+                        .into_iter()
+                        .partition(|event| matches!(event, AdapterActivity::Agent { .. }));
+                    for event in agents {
+                        publish_event(&session, event).await?;
+                    }
+                    begin_child_turns(&session, &mut child_observations, &session.child_runners)
+                        .await?;
                     for event in events {
-                        if let Err(error) = publish_event(&session.sink, event).await {
+                        if let Err(error) = publish_event(&session, event).await {
                             return Err(lose_observation(
                                 &session,
                                 &request,
-                                &address,
+                                &native_address,
                                 &descendants,
                                 error,
                                 forge_provider_api::lifecycle::ObservationFailure::Disconnected,
@@ -4494,16 +5170,19 @@ async fn observe_execution(
                     return Err(lose_observation(
                         &session,
                         &request,
-                        &address,
+                        &native_address,
                         &descendants,
-                        failure(
-                            ProviderOperation::InputSubmit,
-                            ProviderFailureKind::Protocol,
-                        ),
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                         forge_provider_api::lifecycle::ObservationFailure::Protocol,
                     )
                     .await);
                 }
+            }
+            finish_child_turns(&session, &mut child_observations).await?;
+            if active_parent_turn.is_none()
+                && let Some(terminal) = parent_terminal.take()
+            {
+                break terminal;
             }
             continue;
         }
@@ -4514,27 +5193,25 @@ async fn observe_execution(
                     .or_else(|| params.get("turnId"))
                     .and_then(Value::as_str)
                 {
-                    if turn_id != address.turn_id.as_str() {
+                    if turn_id != native_address.turn_id.as_str() {
                         return Err(lose_observation(
                             &session,
                             &request,
-                            &address,
+                            &native_address,
                             &descendants,
-                            failure(
-                                ProviderOperation::InputSubmit,
-                                ProviderFailureKind::Protocol,
-                            ),
+                            failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                             forge_provider_api::lifecycle::ObservationFailure::UnexpectedExecution,
                         )
                         .await);
                     }
-                    active_parent_turn = Some(turn_id.to_owned().into());
+                    active_parent_turn = Some(NativeTurnId::new(turn_id)?);
                     if let Some(execution) = session.active.lock().await.as_mut() {
-                        execution.turn_id = turn_id.to_owned();
+                        execution.native_turn_id = turn_id.to_owned();
                         execution
                             .turn_updates
                             .send_replace(Some(turn_id.to_owned()));
                     }
+                    parent_started = true;
                 }
             }
             Some("turn/completed") => {
@@ -4542,14 +5219,39 @@ async fn observe_execution(
                     .pointer("/turn/id")
                     .or_else(|| params.get("turnId"))
                     .and_then(Value::as_str)
-                    .map(forge_provider_api::ProviderTurnId::from);
+                    .map(NativeTurnId::new)
+                    .transpose()?;
                 if active_parent_turn.is_some() && active_parent_turn == completed_id {
                     active_parent_turn = None;
                 }
             }
             _ => {}
         }
-        let mut output = forge_provider_api::completion::ProviderOutput::default();
+        // Codex announces `turn/started` slightly before the turn accepts interrupts, so a
+        // rejected interrupt is retried on each later root notification until it is delivered
+        // or the turn completes on its own.
+        if parent_started
+            && active_parent_turn.is_some()
+            && std::mem::take(&mut retry_interrupt_on_start)
+        {
+            let mut errors = Vec::new();
+            record_interrupt_attempt(
+                interrupt_native(
+                    &session,
+                    &native_address.thread_id,
+                    active_parent_turn.as_ref(),
+                    &descendants,
+                )
+                .await,
+                &mut retry_interrupt_on_start,
+                &mut errors,
+            );
+            if !errors.is_empty() {
+                native_cleanup_failed = true;
+                cleanup_errors.extend(errors);
+            }
+        }
+        let mut output = super::normalization::CodexOutput::default();
         let mut normalization = session.normalization.lock().await;
         if let Err(_error) = normalization
             .normalize(&message, &mut output, None, &session.workspace)
@@ -4559,23 +5261,31 @@ async fn observe_execution(
             return Err(lose_observation(
                 &session,
                 &request,
-                &address,
+                &native_address,
                 &descendants,
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                ),
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                 forge_provider_api::lifecycle::ObservationFailure::Protocol,
             )
             .await);
         }
+        if let Some(observed) = normalization.terminal_evidence(&address) {
+            root_completion = Some(observed);
+        }
         drop(normalization);
-        for event in output.event {
-            if let Err(error) = publish(&session.sink, &request.scope, event).await {
+        let (agents, events): (Vec<_>, Vec<_>) = output
+            .event
+            .into_iter()
+            .partition(|event| matches!(event, AdapterActivity::Agent { .. }));
+        for event in agents {
+            publish_event(&session, event).await?;
+        }
+        begin_child_turns(&session, &mut child_observations, &session.child_runners).await?;
+        for event in events {
+            if let Err(error) = publish_event(&session, event).await {
                 return Err(lose_observation(
                     &session,
                     &request,
-                    &address,
+                    &native_address,
                     &descendants,
                     error,
                     forge_provider_api::lifecycle::ObservationFailure::Disconnected,
@@ -4583,165 +5293,100 @@ async fn observe_execution(
                 .await);
             }
         }
+        finish_child_turns(&session, &mut child_observations).await?;
         if let Some(terminal) = terminal {
-            parent_terminal = Some(terminal);
+            parent_terminal.get_or_insert(terminal);
         }
-        if descendants.active_count() == 0
-            && active_parent_turn.is_none()
+        if active_parent_turn.is_none()
             && let Some(terminal) = parent_terminal.take()
         {
             break terminal;
         }
     };
 
+    session
+        .pending_messages
+        .lock()
+        .await
+        .extend(initial_messages);
+    drop(child_observations);
     if let Some(execution) = session.active.lock().await.as_mut() {
         execution.turn_updates.send_replace(None);
     }
 
-    let covered_submissions = submissions.lock().await.clone();
-    let mut completion: ProviderCompletion = completion(&session, &request.configuration.model)
-        .await
-        .into();
-    completion.provider_checkpoint_id = Some(address.turn_id.as_str().to_owned());
-    let completion = CompletionSnapshot::from(completion);
-    let status = result.pointer("/status").and_then(Value::as_str);
-    let (mut outcome, failure_detail) = match status {
-        Some("completed") => (ExecutionResult::Completed { completion }, None),
-        Some("interrupted" | "cancelled") => (ExecutionResult::Cancelled { completion }, None),
-        Some("failed") => {
-            let native_error = result.get("error");
-            let kind =
-                native_error.map_or(ProviderFailureKind::Unknown, super::retry::failure_kind);
-            let retry_category = native_error.and_then(crate::codex::retry::transient_category);
-            let replay_sensitive = session.normalization.lock().await.replay_sensitive;
-            if let Some(category) = retry_category
-                && !replay_sensitive
-            {
-                (
-                    ExecutionResult::Failed {
-                        completion,
-                        failure: ExecutionFailure::Retryable {
-                            address: address.clone(),
-                            category,
-                            retry_after: None,
-                        },
-                    },
-                    Some(kind),
-                )
-            } else {
-                (
-                    ExecutionResult::Failed {
-                        completion,
-                        failure: ExecutionFailure::Terminal { kind },
-                    },
-                    Some(kind),
-                )
-            }
-        }
-        Some(_) => (
-            ExecutionResult::Failed {
-                completion,
-                failure: ExecutionFailure::Terminal {
-                    kind: ProviderFailureKind::Unknown,
-                },
-            },
-            Some(ProviderFailureKind::Unknown),
-        ),
+    let covered_inputs = submissions.lock().await.clone();
+    let (native_outcome, completed_at_ms) = match root_completion {
+        Some(outcome) => outcome,
         None => {
             return Err(lose_observation(
                 &session,
                 &request,
-                &address,
+                &native_address,
                 &descendants,
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                ),
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                 forge_provider_api::lifecycle::ObservationFailure::Protocol,
             )
             .await);
         }
     };
+    let native_outcome = match native_outcome {
+        forge_provider_api::turn::TurnOutcome::Failed { error, retry: _ } => {
+            let category = result
+                .get("error")
+                .and_then(crate::codex::retry::transient_category);
+            let replay_sensitive = session.normalization.lock().await.replay_sensitive;
+            let permitted = category.filter(|_| !replay_sensitive);
+            let retry = match permitted {
+                Some(_) => forge_provider_api::turn::RetryDecision::Allowed { retry_after: None },
+                None => forge_provider_api::turn::RetryDecision::NotAllowed,
+            };
+            forge_provider_api::turn::TurnOutcome::Failed { error, retry }
+        }
+        outcome @ (forge_provider_api::turn::TurnOutcome::Completed { .. }
+        | forge_provider_api::turn::TurnOutcome::Interrupted) => outcome,
+    };
     if cancelled
-        && matches!(status, Some("interrupted" | "cancelled"))
-        && submissions.lock().await.as_slice() == [request.submission_id.clone()]
+        && matches!(
+            native_outcome,
+            forge_provider_api::turn::TurnOutcome::Interrupted
+        )
+        && covered_inputs.as_slice()
+            == [forge_provider_api::CoveredInput::new(
+                request.submission_id.clone(),
+                request.attempt_id.clone(),
+            )]
         && !native_cleanup_failed
     {
         *session.rollback.lock().await = Some(RollbackAuthorization {
-            thread_id: address.thread_id.clone(),
+            thread_id: native_address.thread_id.clone(),
             scope: request.scope.clone(),
-            turn_id: address.turn_id.clone(),
+            turn_id: native_address.turn_id.clone(),
             submission_id: request.submission_id.clone(),
             attempt_id: request.attempt_id.clone(),
         });
     }
     if native_cleanup_failed {
-        let completion = match outcome {
-            ExecutionResult::Completed { completion }
-            | ExecutionResult::Cancelled { completion }
-            | ExecutionResult::Failed { completion, .. } => completion,
-        };
-        outcome = ExecutionResult::Failed {
-            completion,
-            failure: ExecutionFailure::Terminal {
-                kind: ProviderFailureKind::Runtime,
-            },
-        };
+        retained_cleanup.lock().await.extend(cleanup_errors);
     }
-    let _ = failure_detail;
-    session
-        .outcomes
-        .lock()
-        .await
-        .insert(request.scope.clone(), outcome.clone());
-    let completed_at_ms = now_ms();
-    let update = ExecutionUpdate::Finished {
-        address: address.clone(),
-        covered_submissions,
+    forge_provider_api::TurnResult::new(
+        native_outcome,
         completed_at_ms,
-        result: outcome,
-    };
-    let (background_start, background_error) = match start_background_reader(&session).await {
-        Ok(start) => (start, None),
-        Err(error) => (None, Some(error)),
-    };
-    let published = publish(
-        &session.sink,
-        &request.scope,
-        ProviderEvent::Execution {
-            observation: ExecutionObservation::new(request.scope.clone(), update)
-                .expect("terminal coverage belongs to its invocation"),
-        },
+        None,
+        covered_inputs,
+        session.normalization.lock().await.final_usage(&address),
+        Some(
+            forge_provider_api::CheckpointId::new(native_address.turn_id.as_str()).map_err(
+                |_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
+            )?,
+        ),
     )
-    .await;
-    if let Err(error) = published {
-        return Err(lose_observation(
-            &session,
-            &request,
-            &address,
-            &descendants,
-            error,
-            forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-        )
-        .await);
-    }
-    if let Some(start) = background_start {
-        let _ = start.send(());
-    }
-    let mut errors = Vec::new();
-    if let Some(error) = background_error {
-        errors.push(error);
-    }
-    if native_cleanup_failed {
-        errors.append(&mut cleanup_errors);
-    }
-    combine_errors(errors)
+    .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
 }
 
 async fn lose_observation(
     session: &CodexBinding,
-    request: &PromptRequest,
-    address: &forge_provider_api::TurnAddress,
+    _request: &PromptRequest,
+    native_address: &NativeTurnAddress,
     descendants: &super::descendants::DescendantTracker,
     primary: ProviderError,
     failure_kind: forge_provider_api::lifecycle::ObservationFailure,
@@ -4754,8 +5399,8 @@ async fn lose_observation(
     let mut errors = vec![primary];
     let mut active_turns = descendants.active_turns();
     active_turns.push((
-        address.thread_id.clone(),
-        Some(address.turn_id.as_str().to_owned()),
+        native_address.thread_id.clone(),
+        Some(native_address.turn_id.as_str().to_owned()),
     ));
     for (thread_id, turn_id) in active_turns {
         if let Some(turn_id) = turn_id
@@ -4768,7 +5413,7 @@ async fn lose_observation(
                     json!({
                         "threadId":thread_id,"turnId":turn_id
                     }),
-                    ProviderOperation::Cancel,
+                    ProviderOperation::TurnInterrupt,
                 )
                 .await
         {
@@ -4779,19 +5424,6 @@ async fn lose_observation(
         errors.push(error);
     }
 
-    let event = ProviderEvent::Execution {
-        observation: ExecutionObservation::new(
-            request.scope.clone(),
-            ExecutionUpdate::ObservationLost {
-                failure: failure_kind.clone(),
-                completion: Some(completion(session, &request.configuration.model).await),
-            },
-        )
-        .expect("observation loss belongs to the invocation scope"),
-    };
-    if let Err(error) = publish(&session.sink, &request.scope, event).await {
-        errors.push(error);
-    }
     session.fenced.store(true, Ordering::Release);
     if let Some(execution) = session.active.lock().await.as_mut() {
         execution.turn_updates.send_replace(None);
@@ -4824,18 +5456,10 @@ fn combine_primary(primary: ProviderError, secondary: ProviderError) -> Provider
     }
 }
 
-/// Continue admitted background tool observation after foreground settlement.
+/// Observe delayed accounting, thread errors, and identified background work while the binding is idle.
 async fn start_background_reader(
     session: &Arc<CodexBinding>,
 ) -> Result<Option<tokio::sync::oneshot::Sender<()>>, ProviderError> {
-    if !session
-        .normalization
-        .lock()
-        .await
-        .has_pending_background_tools()
-    {
-        return Ok(None);
-    }
     let mut slot = session.background_reader.lock().await;
     if let Some(reader) = slot.as_ref()
         && !reader.task.is_finished()
@@ -4851,22 +5475,24 @@ async fn start_background_reader(
     let (start, started) = tokio::sync::oneshot::channel();
     let retained = session.clone();
     let task = tokio::spawn(async move {
+        let observed = async {
         tokio::select! {
-            _ = started => {},
+            result = started => if result.is_err() { return Ok(()); },
             signal = cancelled.recv() => if signal.is_some() { return Ok(()); },
         }
+        {
+            let mut children = retained.child_observations.lock().await;
+            begin_child_turns(&retained, &mut children, &retained.child_runners).await?;
+            finish_child_turns(&retained, &mut children).await?;
+        }
         loop {
-            if !retained
-                .normalization
-                .lock()
-                .await
-                .has_pending_background_tools()
-            {
-                break;
-            }
-            let received = tokio::select! {
-                signal = cancelled.recv() => if signal.is_some() { break; } else { continue; },
-                received = async { retained.rpc.lock().await.receive().await } => received,
+            let pending = retained.pending_messages.lock().await.pop_front();
+            let received = match pending {
+                Some(message) => Ok(message),
+                None => tokio::select! {
+                    signal = cancelled.recv() => if signal.is_some() { break; } else { continue; },
+                    received = async { retained.rpc.lock().await.receive().await } => received,
+                },
             };
             let mut message = match received {
                 Ok(message) => message,
@@ -4895,19 +5521,23 @@ async fn start_background_reader(
             };
             retained.mcp_context.lock().await.normalize(&mut message);
             if message.get("method").is_some() && message.get("id").is_some() {
-                if let Err(error) = retained
-                    .rpc
+                let original = retained
+                    .callback_requests
                     .lock()
                     .await
-                    .reject_request(message.get("id").unwrap_or(&Value::Null))
-                    .await
-                {
-                    return Err(invalidate_background_observer(
-                        &retained,
-                        error,
-                        forge_provider_api::ObservationFailure::LifecycleUnavailable,
-                    )
-                    .await);
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(original) = original {
+                    let mut children = retained.child_observations.lock().await;
+                    dispatch_native_request(&retained, &original, &message, &mut children).await?;
+                } else {
+                    retained
+                        .rpc
+                        .lock()
+                        .await
+                        .reject_request(message.get("id").unwrap_or(&Value::Null))
+                        .await?;
                 }
                 continue;
             }
@@ -4928,8 +5558,16 @@ async fn start_background_reader(
             };
             match normalized {
                 Ok(Some(events)) => {
+                    let (agents, events): (Vec<_>, Vec<_>) = events
+                        .into_iter()
+                        .partition(|event| matches!(event, AdapterActivity::Agent { .. }));
+                    for event in agents {
+                        publish_event(&retained, event).await?;
+                    }
+                    let mut children = retained.child_observations.lock().await;
+                    begin_child_turns(&retained, &mut children, &retained.child_runners).await?;
                     for event in events {
-                        if let Err(error) = publish_event(&retained.sink, event).await {
+                        if let Err(error) = publish_event(&retained, event).await {
                             return Err(invalidate_background_observer(
                                 &retained,
                                 error,
@@ -4938,13 +5576,14 @@ async fn start_background_reader(
                             .await);
                         }
                     }
+                    finish_child_turns(&retained, &mut children).await?;
                 }
                 Ok(None) => {
                     if message.get("method").and_then(Value::as_str) == Some("turn/started") {
                         return Err(invalidate_background_observer(
                             &retained,
                             failure(
-                                ProviderOperation::InputSubmit,
+                                ProviderOperation::TurnStart,
                                 ProviderFailureKind::WrongInvocation,
                             ),
                             forge_provider_api::ObservationFailure::OwnershipConflict,
@@ -4955,10 +5594,7 @@ async fn start_background_reader(
                 Err(_error) => {
                     return Err(invalidate_background_observer(
                         &retained,
-                        failure(
-                            ProviderOperation::InputSubmit,
-                            ProviderFailureKind::Protocol,
-                        ),
+                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol),
                         forge_provider_api::ObservationFailure::Protocol,
                     )
                     .await);
@@ -4966,10 +5602,15 @@ async fn start_background_reader(
             }
         }
         Ok(())
+        }.await;
+        if observed.is_err() {
+            retained.child_observations.lock().await.clear();
+        }
+        observed
     });
     *slot = Some(BackgroundReader {
         cancel,
-        task: crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, task),
+        task: crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, task),
     });
     Ok(Some(start))
 }
@@ -4995,10 +5636,18 @@ async fn stop_background_commands(session: &CodexBinding) -> Result<(), Provider
         .pending_background_addresses();
     let mut owned = HashMap::<String, std::collections::HashSet<String>>::new();
     for address in &addresses {
-        owned
-            .entry(address.turn.thread_id.clone())
-            .or_default()
-            .insert(address.tool_id.as_str().to_owned());
+        let (thread, item) = session
+            .normalization
+            .lock()
+            .await
+            .native_tool(address)
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::ThreadClose,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?;
+        owned.entry(thread).or_default().insert(item);
     }
     for (thread_id, item_ids) in &owned {
         let rows = terminal_inventory(session, thread_id).await?;
@@ -5012,7 +5661,7 @@ async fn stop_background_commands(session: &CodexBinding) -> Result<(), Provider
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
                     failure(
-                        ProviderOperation::SessionClose,
+                        ProviderOperation::ThreadClose,
                         ProviderFailureKind::Protocol,
                     )
                 })?;
@@ -5025,12 +5674,12 @@ async fn stop_background_commands(session: &CodexBinding) -> Result<(), Provider
                     json!({
                         "threadId":thread_id,"processId":process_id
                     }),
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                 )
                 .await?;
             if result.get("terminated").and_then(Value::as_bool).is_none() {
                 return Err(failure(
-                    ProviderOperation::SessionClose,
+                    ProviderOperation::ThreadClose,
                     ProviderFailureKind::Protocol,
                 ));
             }
@@ -5042,7 +5691,7 @@ async fn stop_background_commands(session: &CodexBinding) -> Result<(), Provider
                 .is_some_and(|id| item_ids.contains(id))
         }) {
             return Err(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::Runtime,
             ));
         }
@@ -5054,7 +5703,7 @@ async fn stop_background_commands(session: &CodexBinding) -> Result<(), Provider
             .await
             .interrupt_background(&address)
         {
-            publish_event(&session.sink, event).await?;
+            publish_event(session, event).await?;
         }
     }
     Ok(())
@@ -5077,12 +5726,12 @@ async fn terminal_inventory(
                 json!({
                     "threadId":thread_id,"limit":100,"cursor":cursor
                 }),
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
             )
             .await?;
         let data = page.get("data").and_then(Value::as_array).ok_or_else(|| {
             failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::Protocol,
             )
         })?;
@@ -5092,13 +5741,78 @@ async fn terminal_inventory(
         };
         if !seen.insert(next.to_owned()) {
             return Err(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::Protocol,
             ));
         }
         cursor = Some(next.to_owned());
     }
     Ok(rows)
+}
+
+/// Resolve a live root or retained child callback to its original request authority.
+async fn callback_request(
+    session: &CodexBinding,
+    request: &PromptRequest,
+    params: &Value,
+) -> Option<(PromptRequest, super::normalization::NativeCallbackOwner)> {
+    let normalization = session.normalization.lock().await;
+    if let Ok(owner) = normalization.callback_owner(params, &request.scope) {
+        return Some((request.clone(), owner));
+    }
+    for original in session.callback_requests.lock().await.values() {
+        if let Ok(owner @ super::normalization::NativeCallbackOwner::ObservedChild(_)) =
+            normalization.callback_owner(params, &original.scope)
+        {
+            return Some((original.clone(), owner));
+        }
+    }
+    None
+}
+
+/// Transfer independently owned child callbacks before allowing root native-end observation to proceed.
+async fn dispatch_native_request(
+    session: &Arc<CodexBinding>,
+    request: &PromptRequest,
+    message: &Value,
+    children: &mut HashMap<forge_provider_api::TurnId, ChildObservation>,
+) -> Result<(), ProviderError> {
+    if let Some((original, super::normalization::NativeCallbackOwner::ObservedChild(address))) =
+        callback_request(session, request, &message["params"]).await
+    {
+        let Some(child) = children.get(&address.turn_id) else {
+            return session
+                .rpc
+                .lock()
+                .await
+                .reject_request(&message["id"])
+                .await;
+        };
+        let binding = session.clone();
+        let message = message.clone();
+        let task = tokio::spawn(async move {
+            let result = handle_native_request(&binding, &original, &message).await;
+            if result.is_err() {
+                let _ = binding
+                    .rpc
+                    .lock()
+                    .await
+                    .reject_request(&message["id"])
+                    .await;
+            }
+            result
+        });
+        child
+            .callbacks
+            .lock()
+            .await
+            .push(Arc::new(crate::retained_task::RetainedTask::new(
+                ProviderOperation::TurnStart,
+                task,
+            )));
+        return Ok(());
+    }
+    handle_native_request(session, request, message).await
 }
 
 async fn handle_native_request(
@@ -5111,15 +5825,12 @@ async fn handle_native_request(
             == Some("account/chatgptAuthTokens/refresh")
         && !session.is_fenced()
     {
-        let id = message.get("id").ok_or_else(|| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
+        let id = message
+            .get("id")
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
         let auth = session.isolation_auth.as_ref().ok_or_else(|| {
             failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Authentication,
             )
         })?;
@@ -5134,29 +5845,21 @@ async fn handle_native_request(
             .reject_request(message.get("id").unwrap_or(&Value::Null))
             .await;
     }
-    let id = message.get("id").ok_or_else(|| {
-        failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
-        )
-    })?;
+    let id = message
+        .get("id")
+        .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
     let method = message
         .get("method")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
+        .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
     let params = message.get("params").unwrap_or(&Value::Null);
+    let Some((request, owner)) = callback_request(session, request, params).await else {
+        return session.rpc.lock().await.reject_request(id).await;
+    };
     let response = match method {
         "item/tool/call" => {
             let call = super::decode::dynamic_tool_call(params).map_err(|_| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                )
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
             })?;
             let name = call.name.as_str();
             if !request.tools.iter().any(|tool| tool.name == name) {
@@ -5165,28 +5868,57 @@ async fn handle_native_request(
                     false,
                 )
             } else {
-                request.permissions.before_tool(&request.scope).await?;
-                let authorization = request
-                    .permissions
-                    .authorize(
-                        &request.scope,
-                        PermissionRequest {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            provider: crate::registry::select("codex")
-                                .expect("Codex is registered"),
-                            reason: None,
-                            target_list: vec![PermissionTarget::HostTool {
-                                name: name.to_owned(),
-                            }],
-                        },
-                    )
-                    .await;
+                match &owner {
+                    super::normalization::NativeCallbackOwner::Root => {
+                        request.permissions.before_tool(&request.scope).await?
+                    }
+                    super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+                        request
+                            .permissions
+                            .before_observed_child(&request.scope, child)
+                            .await?
+                    }
+                }
+                let permission = PermissionRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider: crate::registry::select("codex").expect("Codex is registered"),
+                    reason: None,
+                    target_list: vec![PermissionTarget::HostTool {
+                        name: name.to_owned(),
+                    }],
+                };
+                let authorization = match &owner {
+                    super::normalization::NativeCallbackOwner::Root => {
+                        request
+                            .permissions
+                            .authorize(&request.scope, permission)
+                            .await
+                    }
+                    super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+                        request
+                            .permissions
+                            .authorize_observed_child(&request.scope, child, permission)
+                            .await
+                    }
+                };
                 match authorization {
                     PermissionResponse::Allow => {
                         if session.is_fenced() {
                             return Err(ProviderError::Cancelled);
                         }
-                        match request.provider_tools.call(&request.scope, call).await {
+                        session.normalization.lock().await.replay_sensitive = true;
+                        let result = match &owner {
+                            super::normalization::NativeCallbackOwner::Root => {
+                                request.provider_tools.call(&request.scope, call).await
+                            }
+                            super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+                                request
+                                    .provider_tools
+                                    .call_observed_child(&request.scope, child, call)
+                                    .await
+                            }
+                        };
+                        match result {
                             Ok(text) => super::decode::dynamic_tool_response(text, true),
                             Err(_) => super::decode::dynamic_tool_response(
                                 "The requested tool could not be completed.".into(),
@@ -5210,22 +5942,29 @@ async fn handle_native_request(
         | "item/permissions/requestApproval"
         | "mcpServer/elicitation/request" => {
             let prepared = session.approval_context.prepare(message).map_err(|_| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                )
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
             })?;
-            let decision = request
-                .permissions
-                .authorize(&request.scope, prepared.request.clone())
-                .await;
+            let decision = match &owner {
+                super::normalization::NativeCallbackOwner::Root => {
+                    request
+                        .permissions
+                        .authorize(&request.scope, prepared.request.clone())
+                        .await
+                }
+                super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+                    request
+                        .permissions
+                        .authorize_observed_child(&request.scope, child, prepared.request.clone())
+                        .await
+                }
+            };
             if session.is_fenced() {
                 return Err(ProviderError::Cancelled);
             }
             prepared.validate().map_err(|_| {
                 ProviderError::from(
                     ProviderFailure::new(
-                        ProviderOperation::InputSubmit,
+                        ProviderOperation::TurnStart,
                         ProviderFailureKind::ResourceConflict,
                     )
                     .at_phase(
@@ -5234,22 +5973,11 @@ async fn handle_native_request(
                     ),
                 )
             })?;
-            let resolution = match decision {
-                PermissionResponse::Allow => {
-                    forge_provider_api::approval::ApprovalResolution::AllowOnce
-                }
-                PermissionResponse::Deny { .. } => {
-                    forge_provider_api::approval::ApprovalResolution::DenyOnce
-                }
-                PermissionResponse::Cancelled => {
-                    forge_provider_api::approval::ApprovalResolution::Cancel
-                }
-            };
-            super::approval::codex_response(message, resolution)
+            super::approval::codex_response(message, &decision)
         }
         _ => {
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Protocol,
             ));
         }
@@ -5319,41 +6047,26 @@ async fn apply_model_selection(
     Ok(reasoning)
 }
 
-async fn completion(session: &CodexBinding, model: &ModelSelection) -> CompletionSnapshot {
-    let provider = crate::registry::descriptor(
-        &crate::registry::select("codex").expect("Codex is registered"),
-    )
-    .expect("registered Codex descriptor");
-    let evidence = forge_provider_api::completion::TurnEvidence::default();
-    CompletionSnapshot::from(ProviderCompletion {
-        provider_session_id: Some(session.history_id()),
-        provider_checkpoint_id: None,
-        evidence,
-        capability: provider.capability.clone(),
-        runtime: ProviderRuntime {
-            provider: provider.label.clone(),
-            model: model.model.clone(),
-        },
-        metrics: Default::default(),
-    })
-}
-
-async fn publish(
-    sink: &ProviderEventSink,
-    _invocation: &forge_provider_api::InvocationScope,
-    event: ProviderEvent,
-) -> Result<(), ProviderError> {
-    publish_event(sink, event).await
-}
-
+/// Deliver restricted activity through the writer retained for the exact original object owner.
 async fn publish_event(
-    sink: &ProviderEventSink,
-    event: ProviderEvent,
+    session: &CodexBinding,
+    event: AdapterActivity,
 ) -> Result<(), ProviderError> {
-    let scoped = sink
-        .bind_scope(event.scope())
-        .map_err(ProviderError::from)?;
-    scoped.send_wait(event).await.map_err(ProviderError::from)
+    let writer = session.sink.activity_writer();
+    let address = session.normalization.lock().await.activity_address(&event);
+    let writer = match address {
+        Some(address) => writer.register_observed_turn(address)?,
+        None => writer,
+    };
+    writer.send_wait(event).await.map_err(ProviderError::from)
+}
+
+/// Preserve positively observed start identity and model metadata independently of receipt persistence.
+struct NativeAdmission {
+    turn_id: String,
+    initial_messages: Vec<Value>,
+    model: Option<forge_provider_api::ResolvedModel>,
+    started_at_ms: i64,
 }
 
 /// Observe exact native admission without making cancellation depend on its RPC acknowledgement.
@@ -5361,9 +6074,9 @@ async fn await_admission(
     session: &CodexBinding,
     request: &PromptRequest,
     request_id: u64,
-) -> Result<(String, Vec<Value>), ProviderError> {
+) -> Result<NativeAdmission, ProviderError> {
     let rpc = session.rpc.lock().await.shared();
-    let response = rpc.wait_response(request_id, ProviderOperation::InputSubmit);
+    let response = rpc.wait_response(request_id, ProviderOperation::TurnStart);
     tokio::pin!(response);
     let thread_id = session.history_id();
     let mut initial_messages = Vec::new();
@@ -5371,8 +6084,14 @@ async fn await_admission(
         tokio::select! {
             result = &mut response => {
                 let result = result?;
-                let turn_id = result.get("turnId").or_else(|| result.pointer("/turn/id")).and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Protocol))?;
-                return Ok((turn_id.to_owned(), initial_messages));
+                let turn_id = result.get("turnId").or_else(|| result.pointer("/turn/id")).and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+                let turn_id = turn_id.to_owned();
+                let model = match result.pointer("/turn/model").or_else(|| result.get("model")) {
+                    Some(Value::String(model)) => Some(forge_provider_api::ResolvedModel { model_id: forge_provider_api::ModelId::new(model).map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?, observed_at_ms: now_ms() }),
+                    None | Some(Value::Null) => None,
+                    Some(_) => return Err(failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)),
+                };
+                return Ok(NativeAdmission { turn_id, initial_messages, model, started_at_ms: now_ms() });
             }
             message = rpc.receive() => {
                 let message = message?;
@@ -5391,7 +6110,7 @@ async fn await_admission(
                     // invocation's start precedes its consumed terminal; no successor or goal scheduler
                     // can create another start while this exact attempt owns the admission mutex.
                     rpc.abandon_response(request_id).await;
-                    return Ok((turn_id, initial_messages));
+                    return Ok(NativeAdmission { turn_id, initial_messages, model: None, started_at_ms: now_ms() });
                 }
             }
         }
@@ -5437,6 +6156,19 @@ fn native_input_id(
 ) -> String {
     serde_json::to_string(&["forge-input-v2", submission.as_str(), attempt.as_str()])
         .expect("string identity arrays always serialize")
+}
+
+/// Recover the Forge submission that a native `userMessage.clientId` echoes.
+///
+/// Returns `None` for client IDs that `native_input_id` did not produce, such as input another
+/// client added to the shared thread.
+pub(super) fn submission_from_client_id(
+    client_id: &str,
+) -> Option<forge_provider_api::SubmissionId> {
+    let [scheme, submission, _attempt]: [String; 3] = serde_json::from_str(client_id).ok()?;
+    (scheme == "forge-input-v2")
+        .then(|| forge_provider_api::SubmissionId::try_from(submission).ok())
+        .flatten()
 }
 
 /// Create opaque sending evidence scoped to durable history, logical input, and delivery attempt.
@@ -5529,17 +6261,17 @@ fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderE
             | ProviderFailureKind::ResourceConflict,
         ) => (Phase::Admission, Disposition::Unchanged),
         (_, ProviderFailureKind::BindingClosed) => (Phase::Admission, Disposition::Closed),
-        (ProviderOperation::SessionClose | ProviderOperation::Shutdown, _) => {
+        (ProviderOperation::ThreadClose | ProviderOperation::Shutdown, _) => {
             (Phase::Close, Disposition::Invalidated)
         }
-        (ProviderOperation::Cancel, _) => (Phase::Interruption, Disposition::Uncertain),
-        (ProviderOperation::SessionConfigure, _) => (Phase::Preparation, Disposition::Invalidated),
-        (ProviderOperation::SessionCompact, _) => (Phase::Observation, Disposition::Invalidated),
-        (ProviderOperation::InputRetract | ProviderOperation::SessionFork, _) => {
+        (ProviderOperation::TurnInterrupt, _) => (Phase::Interruption, Disposition::Uncertain),
+        (ProviderOperation::ThreadConfigure, _) => (Phase::Preparation, Disposition::Invalidated),
+        (ProviderOperation::ThreadCompact, _) => (Phase::Observation, Disposition::Invalidated),
+        (ProviderOperation::InputRetract | ProviderOperation::ThreadFork, _) => {
             (Phase::Observation, Disposition::Uncertain)
         }
         (
-            ProviderOperation::SessionOpen
+            ProviderOperation::ThreadOpen
             | ProviderOperation::Inspect
             | ProviderOperation::Authenticate
             | ProviderOperation::ModelList
@@ -5547,8 +6279,8 @@ fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderE
             | ProviderOperation::McpList
             | ProviderOperation::TerminalList
             | ProviderOperation::TerminalTerminate
-            | ProviderOperation::InputSubmit
-            | ProviderOperation::InputSteer
+            | ProviderOperation::TurnStart
+            | ProviderOperation::TurnSteer
             | ProviderOperation::InputReconcile,
             _,
         ) => (Phase::Observation, Disposition::Uncertain),
@@ -5558,6 +6290,7 @@ fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderE
         .into()
 }
 
+/// Get a wall-clock timestamp for provider collection and retained-worker fixtures.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5647,6 +6380,10 @@ mod continuation_tests {
         submission::InputReceipt,
         turn_control::{HostTurnStatus, TurnControl},
     };
+    use forge_provider_api::{
+        ProviderEvent,
+        turn::{TurnCompletionReason, TurnOutcome},
+    };
 
     /// Allocate one immutable host operation identity; dropping its source never requests cancellation.
     fn context() -> OperationContext {
@@ -5680,6 +6417,7 @@ mod continuation_tests {
             CodexProvider::new(vec!["unused-fixture-command".into()], PathBuf::new()).unwrap();
         let owner = request().scope.owner;
         let binding = SessionBinding {
+            thread_id: owner.thread_id(),
             id: BindingId::new("compaction-binding").unwrap(),
             provider_session_id: Some("compaction-thread".try_into().unwrap()),
         };
@@ -5699,13 +6437,24 @@ mod continuation_tests {
             owner: owner.clone(),
             workspace: String::new(),
             model: Mutex::new(ModelSelection::default()),
+            native_confirmation: Mutex::new(None),
             runtime: Mutex::new(Arc::new(CodexRuntime::new(vec![
                 "unused-binding-fixture-command".into(),
             ]))),
             rpc: RpcHandle::new(NativeRpc::new(connection)),
             sink,
             stream: Mutex::new(None),
-            normalization: Mutex::new(CodexNormalization::default()),
+            child_observations: Mutex::new(HashMap::new()),
+            child_runners: Arc::default(),
+            callback_requests: Mutex::new(HashMap::new()),
+            pending_messages: Mutex::new(Default::default()),
+            normalization: Mutex::new({
+                let mut normalization = CodexNormalization::default();
+                normalization
+                    .admit_thread("compaction-thread", &owner)
+                    .unwrap();
+                normalization
+            }),
             mcp_context: Mutex::new(super::super::protocol::McpContext::default()),
             resources: Mutex::new(CodexResources::new(Default::default(), PathBuf::new())),
             profile: Mutex::new(None),
@@ -5719,6 +6468,7 @@ mod continuation_tests {
             background_reader: Mutex::new(None),
             terminal_observer: Mutex::new(None),
             rollback: Mutex::new(None),
+            turn_context: Mutex::new(Default::default()),
             admission: Mutex::new(()),
             observations: Arc::new(tokio::sync::RwLock::new(false)),
             fenced: AtomicBool::new(false),
@@ -5735,7 +6485,7 @@ mod continuation_tests {
             }),
             capabilities: codex_capabilities(),
             settlements: Mutex::new(HashMap::new()),
-            outcomes: Mutex::new(HashMap::new()),
+            native_results: Mutex::new(HashMap::new()),
             close_failure: Mutex::new(None),
             close_lock: Mutex::new(()),
             settlement_lock: Mutex::new(()),
@@ -5749,6 +6499,22 @@ mod continuation_tests {
             .insert(binding.id.clone(), session.clone());
         provider.owners.lock().await.insert(owner, binding.id);
         (provider, session, stream, socket)
+    }
+
+    /// Acknowledge the per-turn context injection that precedes a binding's first native turn.
+    async fn acknowledge_context_injection(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        let inject: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(inject["method"], "thread/inject_items");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id":inject["id"],"result":{}}).to_string().into(),
+            ))
+            .await
+            .unwrap();
     }
 
     struct ConfigureWireState {
@@ -5884,7 +6650,7 @@ mod continuation_tests {
             configuration.model.reasoning =
                 ReasoningSelection::Level(if cycle == 0 { "low" } else { "medium" }.into());
             let configured = provider
-                .session_configure(context(), &public_binding, configuration.clone())
+                .thread_configure(context(), &public_binding, configuration.clone())
                 .await
                 .unwrap();
             assert_eq!(configured.configuration, configuration);
@@ -5897,7 +6663,7 @@ mod continuation_tests {
                 assert_eq!(identity.binding_id, public_binding);
                 assert_eq!(identity.sequence, configured.watermark);
                 assert!(
-                    matches!(identity.event, ProviderEvent::SessionIdentity { provider_session_id, .. } if provider_session_id.as_str() == expected)
+                    matches!(identity.event, ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::IdentityResolved(provider_session_id), .. } if provider_session_id.as_str() == expected)
                 );
                 let token =
                     recovery_token(&session, &request().submission_id, &request().attempt_id)
@@ -5942,6 +6708,70 @@ mod continuation_tests {
         .unwrap();
     }
 
+    /// Create canonical native evidence for retained-runner lifecycle fixtures.
+    fn collected_result(
+        request: &PromptRequest,
+        outcome: forge_provider_api::turn::TurnOutcome,
+    ) -> forge_provider_api::TurnResult {
+        forge_provider_api::TurnResult::new(
+            outcome,
+            now_ms(),
+            None,
+            vec![forge_provider_api::CoveredInput::new(
+                request.submission_id.clone(),
+                request.attempt_id.clone(),
+            )],
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    struct FixtureDriver {
+        worker: Arc<crate::retained_task::RetainedTask<forge_provider_api::TurnResult>>,
+    }
+
+    #[async_trait]
+    impl crate::turn_runner::NativeTurnDriver for FixtureDriver {
+        /// Exercise the actual runner's native-start and canonical result contract.
+        async fn run(
+            &self,
+            start: forge_provider_api::NativeTurnStart,
+        ) -> Result<forge_provider_api::TurnResult, ProviderError> {
+            let result = self.worker.join().await?;
+            start.observed(result.completed_at_ms()).await?;
+            Ok(result)
+        }
+        /// Leave explicit native cancellation channels under each fixture's asserted ownership.
+        async fn interrupt(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        /// Collect fixtures that own no separate transport or callback resource.
+        async fn collect(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Route injected native workers through the production retained runner and its restricted publisher.
+    fn fixture_worker(
+        session: &Arc<CodexBinding>,
+        scope: &forge_provider_api::InvocationScope,
+        worker: Arc<crate::retained_task::RetainedTask<forge_provider_api::TurnResult>>,
+    ) -> Arc<crate::turn_runner::RetainedTurn> {
+        Arc::new(
+            crate::turn_runner::RetainedTurn::spawn(
+                Arc::new(FixtureDriver { worker }),
+                session.sink.clone(),
+                forge_provider_api::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: scope.owner.thread_id(),
+                    turn_id: scope.turn_id().unwrap(),
+                },
+            )
+            .unwrap(),
+        )
+    }
+
     /// Completed generation remains compactable even before its terminal publisher has returned.
     #[tokio::test]
     async fn compaction_collects_terminal_worker_and_preserves_native_failure_category() {
@@ -5949,14 +6779,15 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let (release, released) = tokio::sync::oneshot::channel();
-            let task = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, tokio::spawn(async move {
-                released.await.unwrap(); Ok(())
-            })));
-            let (cancel, mut cancelled) = mpsc::unbounded_channel();
             let request = request();
-            session.outcomes.lock().await.insert(request.scope.clone(), ExecutionResult::Completed { completion: completion(&session, &request.configuration.model).await });
+            let result = collected_result(&request, TurnOutcome::Completed { stop_reason: TurnCompletionReason::Normal });
+            let task = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move {
+                released.await.unwrap(); Ok(result)
+            })));
+        let task = fixture_worker(&session, &request.scope, task);
+            let (cancel, mut cancelled) = mpsc::unbounded_channel();
             *session.active.lock().await = Some(ActiveExecution {
-                scope: request.scope.clone(), turn_id: "finished-turn".into(),
+                scope: request.scope.clone(), native_turn_id: "finished-turn".into(),
                 turn_updates: watch::channel(None).0, submissions: Arc::new(Mutex::new(Vec::new())),
                 request, cancel, task: Some(task),
             });
@@ -5966,7 +6797,7 @@ mod continuation_tests {
                 },
             };
             let operation = context();
-            let mut pending = Box::pin(provider.session_compact(operation.clone(), &session.binding.id, compact(&operation)));
+            let mut pending = Box::pin(provider.thread_compact(operation.clone(), &session.binding.id, compact(&operation)));
             assert!(futures_util::poll!(pending.as_mut()).is_pending());
             assert!(cancelled.try_recv().is_err(), "compaction cancelled a finished generation");
             release.send(()).unwrap();
@@ -5993,10 +6824,97 @@ mod continuation_tests {
             assert_eq!(pending.await.unwrap().compaction.state, forge_provider_api::CompactionState::Completed);
             assert!(session.active.lock().await.is_none());
             let operation = context();
-            let error = provider.session_compact(operation.clone(), &session.binding.id, compact(&operation)).await.unwrap_err();
+            let error = provider.thread_compact(operation.clone(), &session.binding.id, compact(&operation)).await.unwrap_err();
             assert!(matches!(&error, ProviderError::Failure(failure)
-                if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::Rejected));
+                if failure.operation() == ProviderOperation::ThreadCompact && failure.kind() == ProviderFailureKind::Rejected));
             assert!(!error.to_string().contains("private native rejection"));
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// Codex streams compaction as an ordinary root turn; that turn belongs to the host
+    /// operation, so it must neither mint a host invocation nor rename the attempt.
+    #[tokio::test]
+    async fn compaction_turn_notifications_stay_inside_host_operation() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, mut events, mut socket) = compaction_fixture().await;
+            let wire = tokio::spawn(async move {
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/compact/start");
+                let compaction_item = json!({"id":"native-compaction","type":"contextCompaction"});
+                for message in [
+                    json!({"id":request["id"],"result":{}}),
+                    json!({"method":"turn/started","params":{"threadId":"compaction-thread","turn":{"id":"compaction-turn","status":"inProgress"}}}),
+                    json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"compaction-turn","item":compaction_item}}),
+                    json!({"method":"item/completed","params":{"threadId":"compaction-thread","turnId":"compaction-turn","item":compaction_item}}),
+                ] {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                }
+                while let Some(message) = socket.next().await {
+                    if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; }
+                }
+            });
+            let operation = context();
+            let request = forge_provider_api::CompactionRequest {
+                scope: forge_provider_api::EventScope::SessionOperation {
+                    owner: session.owner.clone(),
+                    operation_id: operation.id().clone(),
+                },
+            };
+            let result = provider.thread_compact(operation.clone(), &session.binding.id, request).await.unwrap();
+            assert_eq!(result.compaction.id, operation.id().as_str());
+            assert_eq!(result.compaction.state, forge_provider_api::CompactionState::Completed);
+            assert!(session.normalization.lock().await.take_observed_starts().is_empty(),
+                "the compaction turn was admitted as a host invocation");
+            let mut compaction_ids = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                match event.event {
+                    ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::CompactionUpdated(update), .. } => compaction_ids.push(update.id),
+                    ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } => panic!("compaction published turn-owned activity: {:?}", event.event),
+                    ProviderEvent::Thread { .. } | ProviderEvent::Provider { .. } | ProviderEvent::Agent { .. } => {}
+                }
+            }
+            assert_eq!(compaction_ids, [operation.id().as_str(), operation.id().as_str()]);
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// A native error on the compaction turn settles the host attempt as failed rather
+    /// than violating turn ownership and invalidating the binding.
+    #[tokio::test]
+    async fn compaction_turn_error_settles_host_attempt_as_failed() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let wire = tokio::spawn(async move {
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/compact/start");
+                for message in [
+                    json!({"id":request["id"],"result":{}}),
+                    json!({"method":"turn/started","params":{"threadId":"compaction-thread","turn":{"id":"compaction-turn","status":"inProgress"}}}),
+                    json!({"method":"error","params":{"threadId":"compaction-thread","turnId":"compaction-turn","error":{"message":"private native failure"}}}),
+                ] {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                }
+                while let Some(message) = socket.next().await {
+                    if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; }
+                }
+            });
+            let operation = context();
+            let request = forge_provider_api::CompactionRequest {
+                scope: forge_provider_api::EventScope::SessionOperation {
+                    owner: session.owner.clone(),
+                    operation_id: operation.id().clone(),
+                },
+            };
+            let result = provider.thread_compact(operation.clone(), &session.binding.id, request).await.unwrap();
+            assert_eq!(result.compaction.id, operation.id().as_str());
+            assert_eq!(result.compaction.state, forge_provider_api::CompactionState::Failed);
+            assert!(result.compaction.result.error.is_some_and(|error| error.operation() == ProviderOperation::ThreadCompact));
+            assert!(!session.invalidated.load(Ordering::Acquire));
             session.rpc.lock().await.close().await.unwrap();
             wire.await.unwrap();
         }).await.unwrap();
@@ -6047,7 +6965,7 @@ mod continuation_tests {
         let compacting_operation = operation.clone();
         let compacting = tokio::spawn(async move {
             compacting_provider
-                .session_compact(compacting_operation, &compacting_binding, request)
+                .thread_compact(compacting_operation, &compacting_binding, request)
                 .await
         });
         // Wait for correlated native progress before pausing time, so socket readiness
@@ -6055,7 +6973,7 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let event = events.recv().await.unwrap().expect("compaction observation remains live");
-                if matches!(event.event, ProviderEvent::Compaction { update, .. } if update.state == forge_provider_api::CompactionState::Running) { break; }
+                if matches!(event.event, ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::CompactionUpdated(update), .. } if update.state == forge_provider_api::CompactionState::Running) { break; }
             }
         }).await.unwrap();
         tokio::time::pause();
@@ -6070,12 +6988,12 @@ mod continuation_tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::Timeout && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain)
+            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadCompact && failure.kind() == ProviderFailureKind::Timeout && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain)
         );
         provider.records.compact.join_all().await.unwrap();
         assert!(
             operation
-                .check_admission(ProviderOperation::SessionCompact)
+                .check_admission(ProviderOperation::ThreadCompact)
                 .is_err()
         );
         assert!(session.invalidated.load(Ordering::Acquire));
@@ -6095,7 +7013,7 @@ mod continuation_tests {
             let (sibling_provider, mut sibling, _sibling_events, sibling_wire) = compaction_fixture().await;
             sibling_provider.bindings.lock().await.remove(&sibling.binding.id);
             let sibling_id = BindingId::new("sibling-binding").unwrap();
-            let sibling_owner = forge_provider_api::ExecutionOwner::root("sibling-owner");
+            let sibling_owner = forge_provider_api::ThreadOwner::root("sibling-owner");
             let (sink, _sibling_output) = events::channel(sibling_id.clone(), forge_provider_api::EventScope::Binding { owner: sibling_owner.clone() });
             let sibling_mut = Arc::get_mut(&mut sibling).expect("unregistered fixture binding has one owner");
             sibling_mut.binding.id = sibling_id.clone();
@@ -6128,7 +7046,7 @@ mod continuation_tests {
             let operation = OperationContext::new(forge_provider_api::OperationId::new("cancel-unacknowledged-compaction").unwrap(), std::time::Duration::from_secs(5), cancellation).unwrap();
             let request = forge_provider_api::CompactionRequest { scope: forge_provider_api::EventScope::SessionOperation { owner: session.owner.clone(), operation_id: operation.id().clone() } };
             let compacting_provider = provider.clone(); let binding = session.binding.id.clone(); let compacting_binding = binding.clone();
-            let compacting = tokio::spawn(async move { compacting_provider.session_compact(operation, &compacting_binding, request).await });
+            let compacting = tokio::spawn(async move { compacting_provider.thread_compact(operation, &compacting_binding, request).await });
             started.await.unwrap(); source.cancel();
             let error = compacting.await.unwrap().unwrap_err();
             let primary = match &error { ProviderError::Combined { primary, .. } => primary.as_ref(), error => error };
@@ -6149,7 +7067,7 @@ mod continuation_tests {
     async fn compaction_rejects_scope_context_identity_substitution() {
         let (provider, session, _events, _socket) = compaction_fixture().await;
         let error = provider
-            .session_compact(
+            .thread_compact(
                 context(),
                 &session.binding.id,
                 forge_provider_api::CompactionRequest {
@@ -6163,9 +7081,9 @@ mod continuation_tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::OperationConflict)
+            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadCompact && failure.kind() == ProviderFailureKind::OperationConflict)
         );
-        assert_eq!(session.sink.watermark().get(), 0);
+        let _ = session.sink.watermark();
         assert!(!session.is_fenced());
         session.rpc.lock().await.close().await.unwrap();
     }
@@ -6175,18 +7093,25 @@ mod continuation_tests {
     async fn compaction_rejects_active_turn_without_cancellation() {
         let (provider, session, _events, _socket) = compaction_fixture().await;
         let (release, released) = tokio::sync::oneshot::channel();
+        let request = request();
+        let completed = collected_result(
+            &request,
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Normal,
+            },
+        );
         let task = Arc::new(crate::retained_task::RetainedTask::new(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             tokio::spawn(async move {
                 released.await.unwrap();
-                Ok(())
+                Ok(completed)
             }),
         ));
+        let task = fixture_worker(&session, &request.scope, task);
         let (cancel, mut cancelled) = mpsc::unbounded_channel();
-        let request = request();
         *session.active.lock().await = Some(ActiveExecution {
             scope: request.scope.clone(),
-            turn_id: "running-turn".into(),
+            native_turn_id: "running-turn".into(),
             turn_updates: watch::channel(Some("running-turn".into())).0,
             submissions: Arc::new(Mutex::new(Vec::new())),
             request,
@@ -6195,7 +7120,7 @@ mod continuation_tests {
         });
         let operation = context();
         let error = provider
-            .session_compact(
+            .thread_compact(
                 operation.clone(),
                 &session.binding.id,
                 forge_provider_api::CompactionRequest {
@@ -6208,7 +7133,7 @@ mod continuation_tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::ExecutionActive));
+            if failure.operation() == ProviderOperation::ThreadCompact && failure.kind() == ProviderFailureKind::ExecutionActive));
         assert!(session.active.lock().await.is_some());
         assert!(cancelled.try_recv().is_err());
         release.send(()).unwrap();
@@ -6236,26 +7161,26 @@ mod continuation_tests {
                 },
             };
             let error = provider
-                .session_compact(operation, &session.binding.id, compact)
+                .thread_compact(operation, &session.binding.id, compact)
                 .await
                 .unwrap_err();
             assert!(matches!(error, ProviderError::Failure(failure)
                 if failure.kind() == expected
-                    && failure.operation() == ProviderOperation::SessionCompact));
+                    && failure.operation() == ProviderOperation::ThreadCompact));
             let fork = forge_provider_api::SessionForkRequest {
                 source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()),
                 target: forge_provider_api::ForkTarget {
-                    owner: forge_provider_api::ExecutionOwner::root("revoked-fork-target"),
+                    owner: forge_provider_api::ThreadOwner::root("revoked-fork-target"),
                     workspace: "workspace".into(),
                     configuration: session.configuration.lock().await.clone(),
                     system_instructions: String::new(),
                 },
             };
-            let error = provider.session_fork(context(), fork).await.unwrap_err();
+            let error = provider.thread_fork(context(), fork).await.unwrap_err();
             assert!(matches!(error, ProviderError::Failure(failure)
                 if failure.kind() == expected
-                    && failure.operation() == ProviderOperation::SessionFork));
-            assert_eq!(session.sink.watermark().get(), 0);
+                    && failure.operation() == ProviderOperation::ThreadFork));
+            let _ = session.sink.watermark();
             assert!(provider.fork_targets.lock().await.is_empty());
             session.rpc.lock().await.close().await.unwrap();
         }
@@ -6298,7 +7223,8 @@ mod continuation_tests {
         let (provider, session, _events, _socket) = compaction_fixture().await;
         session.fenced.store(true, Ordering::Release);
         let request = |owner| SessionRequest {
-            owner: forge_provider_api::ExecutionOwner::root(owner),
+            thread_id: (forge_provider_api::ThreadOwner::root(owner)).thread_id(),
+            owner: forge_provider_api::ThreadOwner::root(owner),
             mode: forge_provider_api::SessionMode::Interactive,
             workspace: "workspace".into(),
             history: forge_provider_api::SessionHistory::Durable {
@@ -6317,8 +7243,8 @@ mod continuation_tests {
             trace: Arc::new(FixtureAuthority),
         };
         let (first, second) = tokio::join!(
-            provider.session_open(context(), request("first-owner")),
-            provider.session_open(context(), request("second-owner"))
+            provider.thread_open(context(), request("first-owner")),
+            provider.thread_open(context(), request("second-owner"))
         );
         for opened in [first, second] {
             let error = match opened {
@@ -6326,7 +7252,7 @@ mod continuation_tests {
                 Err(error) => error,
             };
             assert!(
-                matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionOpen && failure.kind() == ProviderFailureKind::ResourceConflict)
+                matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadOpen && failure.kind() == ProviderFailureKind::ResourceConflict)
             );
         }
         assert_eq!(provider.bindings.lock().await.len(), 1);
@@ -6357,15 +7283,13 @@ mod continuation_tests {
             }
         });
         let input = request();
-        let address = forge_provider_api::TurnAddress {
-            scope: input.scope.clone(),
-            thread_id: session.history_id().to_string(),
-            turn_id: "overflow-turn".into(),
-        };
         let error = lose_observation(
             &session,
             &input,
-            &address,
+            &NativeTurnAddress {
+                thread_id: session.history_id().as_str().to_owned(),
+                turn_id: NativeTurnId::new("overflow-turn").unwrap(),
+            },
             &super::super::descendants::DescendantTracker::default(),
             ProviderError::Observation(forge_provider_api::ObservationFailure::Overflow),
             forge_provider_api::ObservationFailure::Disconnected,
@@ -6375,11 +7299,12 @@ mod continuation_tests {
             error,
             ProviderError::Observation(forge_provider_api::ObservationFailure::Overflow)
         ));
-        let event = events.recv().await.unwrap().unwrap();
-        assert!(
-            matches!(event.event, ProviderEvent::Execution { observation }
-            if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: forge_provider_api::ObservationFailure::Overflow, .. }))
-        );
+        assert!(matches!(
+            events.recv().await,
+            Err(events::EventDeliveryError::Observation(
+                forge_provider_api::ObservationFailure::Overflow
+            ))
+        ));
         assert!(matches!(
             events.recv().await,
             Err(events::EventDeliveryError::Observation(
@@ -6492,7 +7417,8 @@ mod continuation_tests {
         cases.push((isolation, ProviderFeature::IsolationMode));
         for (configuration, expected) in cases {
             let request = SessionRequest {
-                owner: forge_provider_api::ExecutionOwner::root("invalid-open"),
+                thread_id: (forge_provider_api::ThreadOwner::root("invalid-open")).thread_id(),
+                owner: forge_provider_api::ThreadOwner::root("invalid-open"),
                 mode: forge_provider_api::SessionMode::Interactive,
                 workspace: directory.path().to_string_lossy().into_owned(),
                 history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -6503,16 +7429,16 @@ mod continuation_tests {
                 system_instructions: String::new(),
                 trace: Arc::new(FixtureAuthority),
             };
-            assert!(matches!(provider.session_open(context(), request).await,
+            assert!(matches!(provider.thread_open(context(), request).await,
                 Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected));
             assert!(
-                matches!(provider.session_configure(context(), &session.binding.id, configuration.clone()).await,
+                matches!(provider.thread_configure(context(), &session.binding.id, configuration.clone()).await,
                 Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
             );
             assert!(
-                matches!(provider.session_fork(context(), forge_provider_api::SessionForkRequest {
+                matches!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest {
                 source: forge_provider_api::ForkSource::Checkpoint { provider_session_id: "unknown".try_into().unwrap(), checkpoint: forge_provider_api::CheckpointId::new("checkpoint").unwrap() },
-                target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("invalid-fork"),
+                target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("invalid-fork"),
                     workspace: directory.path().to_string_lossy().into_owned(), system_instructions: String::new(), configuration: configuration.clone() },
             }).await, Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
             );
@@ -6527,7 +7453,7 @@ mod continuation_tests {
             )
             .0;
             assert!(
-                matches!(provider.input_submit(context(), &session.binding.id, prompt).await,
+                matches!(provider.turn_start(context(), &session.binding.id, prompt).await,
                 Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
             );
             assert!(!session.is_fenced());
@@ -6558,10 +7484,12 @@ mod continuation_tests {
         )
         .unwrap();
         let error = match provider
-            .session_open(
+            .thread_open(
                 context(),
                 SessionRequest {
-                    owner: forge_provider_api::ExecutionOwner::root("profile-rejection"),
+                    thread_id: (forge_provider_api::ThreadOwner::root("profile-rejection"))
+                        .thread_id(),
+                    owner: forge_provider_api::ThreadOwner::root("profile-rejection"),
                     mode: forge_provider_api::SessionMode::Interactive,
                     workspace: "workspace".into(),
                     history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -6597,7 +7525,7 @@ mod continuation_tests {
             Err(error) => error,
         };
         assert!(
-            matches!(error, ProviderError::Failure(cause) if cause.operation() == ProviderOperation::SessionOpen && cause.kind() == ProviderFailureKind::Rejected)
+            matches!(error, ProviderError::Failure(cause) if cause.operation() == ProviderOperation::ThreadOpen && cause.kind() == ProviderFailureKind::Rejected)
         );
         assert!(provider.preparing.lock().await.is_empty());
         assert!(provider.pending.lock().await.is_empty());
@@ -6725,7 +7653,7 @@ mod continuation_tests {
                 let rows = native.map(|id| vec![json!({"processId":id,"command":"echo working"})]).unwrap_or_default();
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"data":rows}}).to_string().into())).await.unwrap();
                 let event = events.recv().await.unwrap().unwrap();
-                let ProviderEvent::Terminals { snapshot, .. } = event.event else { panic!("expected inventory"); };
+                let ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(snapshot)), .. } = event.event else { panic!("expected inventory"); };
                 assert_eq!(snapshot.terminal.len(), usize::from(native.is_some()));
                 if let Some(native) = native { assert_ne!(snapshot.terminal[0].id.as_str(), native); }
                 if native == Some("native-shell") {
@@ -6739,7 +7667,7 @@ mod continuation_tests {
             let request: Value = serde_json::from_str(replacement_socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(request["method"], "thread/backgroundTerminals/list");
             replacement_socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"data":[{"processId":"replacement-shell","command":"echo next"}]}}).to_string().into())).await.unwrap();
-            let ProviderEvent::Terminals { snapshot, .. } = events.recv().await.unwrap().unwrap().event else { panic!("expected replacement inventory"); };
+            let ProviderEvent::Thread { event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(snapshot)), .. } = events.recv().await.unwrap().unwrap().event else { panic!("expected replacement inventory"); };
             assert_eq!(snapshot.terminal.len(), 1);
             let rpc = session.rpc.lock().await.shared();
             let querying = tokio::spawn(async move { rpc.request("model/list", json!({}), ProviderOperation::ModelList).await });
@@ -6761,7 +7689,7 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let operation = context(); let operation_id = operation.id().clone();
-            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: "fork instructions".into() } };
+            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: "fork instructions".into() } };
             let (waiting, waited) = tokio::sync::oneshot::channel(); let (release, released) = tokio::sync::oneshot::channel();
             let wire = tokio::spawn(async move {
                 for (method, result) in [
@@ -6783,7 +7711,7 @@ mod continuation_tests {
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":source_read["id"],"result":{"data":[]}}).to_string().into())).await.unwrap();
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
-            let forking_provider = provider.clone(); let mut forking = tokio::spawn(async move { forking_provider.session_fork(operation, request).await });
+            let forking_provider = provider.clone(); let mut forking = tokio::spawn(async move { forking_provider.thread_fork(operation, request).await });
             waited.await.unwrap(); assert!(futures_util::poll!(&mut forking).is_pending());
             assert!(provider.fork_targets.lock().await.contains_key(&operation_id));
             let target = forge_provider_api::ProviderSessionId::try_from("fork-target".to_owned()).unwrap();
@@ -6802,7 +7730,7 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let operation = context(); let operation_id = operation.id().clone();
-            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
+            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
             let wire = tokio::spawn(async move {
                 for (method, reply) in [
                     ("model/list", json!({"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}})),
@@ -6816,9 +7744,9 @@ mod continuation_tests {
                 }
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
-            assert!(provider.session_fork(operation.clone(), request.clone()).await.is_err());
+            assert!(provider.thread_fork(operation.clone(), request.clone()).await.is_err());
             assert_eq!(provider.fork_targets.lock().await.get(&operation_id).unwrap().target.as_str(), "retained-fork-target");
-            assert!(provider.session_fork(operation, request).await.is_err());
+            assert!(provider.thread_fork(operation, request).await.is_err());
             provider.collect_fork_targets().await.unwrap(); assert!(provider.fork_targets.lock().await.is_empty()); assert!(!session.is_fenced());
             session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
         }).await.unwrap();
@@ -6832,7 +7760,7 @@ mod continuation_tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let (provider, session, _events, mut socket) = compaction_fixture().await;
                 let operation = context(); let operation_id = operation.id().clone();
-                let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
+                let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
                 let wire = tokio::spawn(async move {
                     for (method, result) in [
                         ("model/list", json!({"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]})),
@@ -6845,10 +7773,10 @@ mod continuation_tests {
                     }
                     while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
                 });
-                let error = provider.session_fork(operation.clone(), request.clone()).await.unwrap_err();
-                assert!(matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionFork && failure.kind() == ProviderFailureKind::Protocol && failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain));
+                let error = provider.thread_fork(operation.clone(), request.clone()).await.unwrap_err();
+                assert!(matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadFork && failure.kind() == ProviderFailureKind::Protocol && failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain));
                 assert_eq!(provider.fork_targets.lock().await.get(&operation_id).unwrap().target.as_str(), "malformed-cursor-target");
-                assert!(provider.session_fork(operation, request).await.is_err());
+                assert!(provider.thread_fork(operation, request).await.is_err());
                 assert!(!session.is_fenced());
                 session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
             }).await.unwrap();
@@ -6862,7 +7790,7 @@ mod continuation_tests {
         let request = forge_provider_api::SessionForkRequest {
             source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()),
             target: forge_provider_api::ForkTarget {
-                owner: forge_provider_api::ExecutionOwner::root("target"),
+                owner: forge_provider_api::ThreadOwner::root("target"),
                 workspace: "workspace".into(),
                 configuration: session.configuration.lock().await.clone(),
                 system_instructions: "supplied instructions".into(),
@@ -6874,7 +7802,7 @@ mod continuation_tests {
             .fork
             .observe(
                 operation.clone(),
-                ProviderOperation::SessionFork,
+                ProviderOperation::ThreadFork,
                 request.clone(),
                 async {
                     Ok(forge_provider_api::ProviderForkResult::unprofiled(
@@ -6884,7 +7812,7 @@ mod continuation_tests {
                 |reason| {
                     forge_provider_api::retained_operation::Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionFork,
+                            ProviderOperation::ThreadFork,
                             forge_provider_api::ProviderPhase::Admission,
                             forge_provider_api::FailureDisposition::Unchanged,
                         ),
@@ -6896,7 +7824,7 @@ mod continuation_tests {
             .unwrap();
         assert_eq!(
             provider
-                .session_fork(operation.clone(), request.clone())
+                .thread_fork(operation.clone(), request.clone())
                 .await
                 .unwrap()
                 .provider_session_id
@@ -6908,7 +7836,7 @@ mod continuation_tests {
             match changed {
                 0 => {
                     changed_request.target.owner =
-                        forge_provider_api::ExecutionOwner::root("substituted")
+                        forge_provider_api::ThreadOwner::root("substituted")
                 }
                 1 => {
                     changed_request.source = forge_provider_api::ForkSource::Checkpoint {
@@ -6933,16 +7861,16 @@ mod continuation_tests {
                 _ => unreachable!(),
             }
             let error = provider
-                .session_fork(operation.clone(), changed_request)
+                .thread_fork(operation.clone(), changed_request)
                 .await
                 .unwrap_err();
             assert!(
-                matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionFork && failure.kind() == ProviderFailureKind::OperationConflict)
+                matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadFork && failure.kind() == ProviderFailureKind::OperationConflict)
             );
         }
         assert_eq!(
             provider
-                .session_fork(operation, request)
+                .thread_fork(operation, request)
                 .await
                 .unwrap()
                 .provider_session_id
@@ -6968,6 +7896,7 @@ mod continuation_tests {
                 let models: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(models["method"], "model/list");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low"}]}}).to_string().into())).await.unwrap();
+                acknowledge_context_injection(&mut socket).await;
                 let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(start["method"], "turn/start");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/started","params":{"threadId":"compaction-thread","turn":{"id":"pending-ack-turn","status":"inProgress","items":[]}}}).to_string().into())).await.unwrap();
@@ -6982,13 +7911,83 @@ mod continuation_tests {
             });
             let submitting_provider = provider.clone();
             let submitting_binding = binding.clone();
-            let submitting = tokio::spawn(async move { submitting_provider.input_submit(context(), &submitting_binding, input).await });
+            let submitting = tokio::spawn(async move { submitting_provider.turn_start(context(), &submitting_binding, input).await });
             observed.wait().await.unwrap();
-            let settled = provider.cancel(context(), &binding, forge_provider_api::CancelRequest { scope }).await.unwrap();
-            assert!(matches!(settled.result, ExecutionResult::Cancelled { .. }));
+            let settled = provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope }).await.unwrap();
+            assert_eq!(settled.thread_id, session.owner.thread_id());
             assert!(session.active.lock().await.is_none());
             submitting.await.unwrap().unwrap();
             release_ack.send(()).unwrap();
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// Cancellation registered before any turn/start acknowledgment or turn/started waits for the
+    /// acknowledgment, then interrupts and collects that exact native turn.
+    ///
+    /// The wire models Codex, which acknowledges `turn/start` before registering the active turn
+    /// and rejects an interrupt in that window as an invalid request. The pre-queued cancellation
+    /// reaches the driver before any notification, so the first interrupt always meets that
+    /// rejection, and only a retry after `turn/started` stops the turn.
+    #[tokio::test]
+    async fn cancellation_before_start_acknowledgment_interrupts_after_admission() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let mut input = request();
+            let (dispatch, mut observed) = forge_provider_api::submission::DispatchReporter::channel(session.binding.id.clone(), input.scope.clone(), input.submission_id.clone(), input.attempt_id.clone());
+            input.dispatch = dispatch;
+            let scope = input.scope.clone();
+            let binding = session.binding.id.clone();
+            let (release_ack, released_ack) = tokio::sync::oneshot::channel();
+            let wire = tokio::spawn(async move {
+                let models: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(models["method"], "model/list");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low"}]}}).to_string().into())).await.unwrap();
+                acknowledge_context_injection(&mut socket).await;
+                let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(start["method"], "turn/start");
+                released_ack.await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"late-ack-turn"}}}).to_string().into())).await.unwrap();
+                let early: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(early["method"], "turn/interrupt");
+                assert_eq!(early["params"]["turnId"], "late-ack-turn");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":early["id"],"error":{"code":-32600,"message":"no active turn to interrupt"}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/started","params":{"threadId":"compaction-thread","turn":{"id":"late-ack-turn","status":"inProgress"}}}).to_string().into())).await.unwrap();
+                // Codex announces the turn slightly before it accepts interrupts.
+                let started: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(started["method"], "turn/interrupt");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":started["id"],"error":{"code":-32600,"message":"no active turn to interrupt"}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/diff/updated","params":{"threadId":"compaction-thread","turnId":"late-ack-turn","diff":""}}).to_string().into())).await.unwrap();
+                let interrupt: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(interrupt["method"], "turn/interrupt");
+                assert_eq!(interrupt["params"]["turnId"], "late-ack-turn");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":interrupt["id"],"result":{}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"late-ack-turn","status":"interrupted"}}}).to_string().into())).await.unwrap();
+                while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
+            });
+            let submitting_provider = provider.clone();
+            let submitting_binding = binding.clone();
+            let submitting = tokio::spawn(async move { submitting_provider.turn_start(context(), &submitting_binding, input).await });
+            observed.wait().await.unwrap();
+            let interrupting_provider = provider.clone();
+            let interrupting_binding = binding.clone();
+            let interrupting_scope = scope.clone();
+            let interrupting = tokio::spawn(async move { interrupting_provider.turn_interrupt(context(), &interrupting_binding, forge_provider_api::CancelRequest { scope: interrupting_scope }).await });
+            // Release the acknowledgment only after the cancellation is recorded on the admission.
+            loop {
+                let requested = session.admitting.lock().await.as_ref().is_some_and(|admitting| admitting.scope == scope && admitting.cancel.load(Ordering::Acquire));
+                if requested { break; }
+                tokio::task::yield_now().await;
+            }
+            release_ack.send(()).unwrap();
+            let settled = interrupting.await.unwrap().unwrap();
+            assert_eq!(settled.thread_id, session.owner.thread_id());
+            assert!(session.settlements.lock().await.get(&scope).is_some_and(|settlement| matches!(settlement, Ok(settlement) if matches!(settlement.completed.result().outcome(), TurnOutcome::Interrupted))));
+            assert!(session.active.lock().await.is_none());
+            assert!(!session.is_fenced());
+            submitting.await.unwrap().unwrap();
             session.rpc.lock().await.close().await.unwrap();
             wire.await.unwrap();
         }).await.unwrap();
@@ -7004,9 +8003,9 @@ mod continuation_tests {
                 let mut input = request(); let scope = input.scope.clone(); let binding = session.binding.id.clone();
                 input.dispatch = forge_provider_api::submission::DispatchReporter::channel(binding.clone(), scope.clone(), input.submission_id.clone(), input.attempt_id.clone()).0;
                 let admission = if poll_input { Some(session.admission.lock().await) } else { None };
-                let mut submitting = Box::pin(provider.input_submit(context(), &binding, input));
+                let mut submitting = Box::pin(provider.turn_start(context(), &binding, input));
                 if poll_input { assert!(futures_util::poll!(submitting.as_mut()).is_pending()); }
-                let mut cancelling = Box::pin(provider.cancel(context(), &binding, forge_provider_api::CancelRequest { scope }));
+                let mut cancelling = Box::pin(provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope }));
                 if poll_input { assert!(futures_util::poll!(cancelling.as_mut()).is_pending()); }
                 else { assert!(matches!(cancelling.as_mut().await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)); }
                 let error = submitting.await.unwrap_err();
@@ -7028,43 +8027,45 @@ mod continuation_tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let (provider, session, _events, mut socket) = compaction_fixture().await;
                 let mut normalization = session.normalization.lock().await; normalization.bind(Some(request().scope));
-                let mut output = forge_provider_api::completion::ProviderOutput::default();
-                normalization.normalize(&json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"prior-turn","item":{"type":"commandExecution","id":"prior-command","command":"background","status":"inProgress"}}}), &mut output, None, "").await.unwrap();
+                let _previous_address = normalization.admit_turn("compaction-thread", "prior-turn", &request().scope).unwrap();
+                let mut output = super::super::normalization::CodexOutput::default();
+                normalization.normalize(&json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"prior-turn","item":{"type":"commandExecution","id":"prior-command","command":"background","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), &mut output, None, "").await.unwrap();
                 normalization.normalize(&json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"prior-turn","status":"completed"}}}), &mut output, None, "").await.unwrap(); drop(normalization);
                 start_background_reader(&session).await.unwrap().unwrap().send(()).unwrap();
                 let gate = Arc::new(BeforeSendGate { entered: tokio::sync::Notify::new(), release: tokio::sync::Semaphore::new(0) });
                 let mut input = request(); input.turn_control = gate.clone(); let scope = input.scope.clone(); let binding = session.binding.id.clone();
                 input.dispatch = forge_provider_api::submission::DispatchReporter::channel(binding.clone(), scope.clone(), input.submission_id.clone(), input.attempt_id.clone()).0;
                 let submitting_provider = provider.clone(); let submitting_binding = binding.clone();
-                let submitting = tokio::spawn(async move { submitting_provider.input_submit(context(), &submitting_binding, input).await });
+                let submitting = tokio::spawn(async move { submitting_provider.turn_start(context(), &submitting_binding, input).await });
                 gate.entered.notified().await;
                 assert!(session.admitting.lock().await.is_some()); assert!(session.background_reader.lock().await.is_none());
                 let mut next = Box::pin(socket.next()); assert!(futures_util::poll!(next.as_mut()).is_pending()); drop(next);
                 if close_binding {
-                    provider.session_close(context(), &binding).await.unwrap();
+                    provider.thread_close(context(), &binding).await.unwrap();
                     assert!(matches!(submitting.await.unwrap(), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
                     assert!(provider.closed_bindings.lock().await.contains(&binding));
-                    assert!(matches!(provider.input_submit(context(), &binding, request()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Closed));
+                    assert!(matches!(provider.turn_start(context(), &binding, request()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Closed));
                     gate.release.add_permits(1);
                     assert!(matches!(socket.next().await, Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None));
                     return;
                 }
-                assert!(matches!(provider.cancel(context(), &binding, forge_provider_api::CancelRequest { scope: scope.clone() }).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
+                assert!(matches!(provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope: scope.clone() }).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
                 assert!(matches!(submitting.await.unwrap(), Err(ProviderError::PreparationFailed(_))));
                 assert!(!session.settlements.lock().await.contains_key(&scope)); assert!(!session.is_fenced()); assert!(session.background_reader.lock().await.is_some());
                 gate.release.add_permits(1);
                 let wire = tokio::spawn(async move {
                     let models: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(models["method"], "model/list");
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}}).to_string().into())).await.unwrap();
+                    acknowledge_context_injection(&mut socket).await;
                     let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(start["method"], "turn/start");
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"successor-turn"}}}).to_string().into())).await.unwrap();
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"successor-turn","status":"completed"}}}).to_string().into())).await.unwrap();
                     while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
                 });
-                let mut successor = request(); successor.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), "successor-exchange"); let successor_scope = successor.scope.clone();
+                let mut successor = request(); successor.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), "successor-exchange"); successor.turn_id = successor.scope.turn_id().unwrap(); let successor_scope = successor.scope.clone();
                 successor.dispatch = forge_provider_api::submission::DispatchReporter::channel(binding.clone(), successor.scope.clone(), successor.submission_id.clone(), successor.attempt_id.clone()).0;
-                provider.input_submit(context(), &binding, successor).await.unwrap();
-                assert!(matches!(provider.cancel(context(), &binding, forge_provider_api::CancelRequest { scope: successor_scope }).await.unwrap().result, ExecutionResult::Completed { .. }));
+                provider.turn_start(context(), &binding, successor).await.unwrap();
+                assert_eq!(provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope: successor_scope }).await.unwrap().thread_id, session.owner.thread_id());
                 stop_background_reader(&session).await.unwrap(); session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
             }).await.unwrap();
         }
@@ -7077,15 +8078,15 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let input = request(); let scope = input.scope.clone(); let (cancel, _) = mpsc::unbounded_channel();
-            *session.active.lock().await = Some(ActiveExecution { scope: scope.clone(), turn_id: "finished-native-turn".into(), turn_updates: watch::channel(Some("finished-native-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: input.clone(), cancel, task: None });
+            *session.active.lock().await = Some(ActiveExecution { scope: scope.clone(), native_turn_id: "finished-native-turn".into(), turn_updates: watch::channel(Some("finished-native-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: input.clone(), cancel, task: None });
             let wire = tokio::spawn(async move {
                 let steer: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(steer["method"], "turn/steer");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":steer["id"],"error":{"code":-32600,"message":"native turn no longer running"}}).to_string().into())).await.unwrap();
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
             let request = SteeringRequest { scope, delivery: forge_provider_api::SteeringDelivery::Journaled { receipt: input.receipt.clone() }, input: PromptInput::Text("late steering".into()), attachments: Vec::new(), task: None };
-            let error = provider.input_steer(context(), &session.binding.id, request).await.unwrap_err();
-            assert!(matches!(error, ProviderError::PreparationFailed(cause) if matches!(cause.as_ref(), ProviderError::Failure(failure) if failure.operation() == ProviderOperation::InputSteer && failure.kind() == ProviderFailureKind::Rejected && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)));
+            let error = provider.turn_steer(context(), &session.binding.id, request).await.unwrap_err();
+            assert!(matches!(error, ProviderError::PreparationFailed(cause) if matches!(cause.as_ref(), ProviderError::Failure(failure) if failure.operation() == ProviderOperation::TurnSteer && failure.kind() == ProviderFailureKind::Rejected && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)));
             assert!(!session.is_fenced()); session.active.lock().await.take(); session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
         }).await.unwrap();
     }
@@ -7104,12 +8105,13 @@ mod continuation_tests {
                 let models: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(models["method"], "model/list");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}}).to_string().into())).await.unwrap();
+                acknowledge_context_injection(&mut socket).await;
                 let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(start["method"], "turn/start");
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
             let submitting_provider = provider.clone(); let binding = session.binding.id.clone();
             let submitting_operation = operation.clone(); let submitting_input = input.clone(); let submitting_binding = binding.clone();
-            let submitting = tokio::spawn(async move { submitting_provider.input_submit(submitting_operation, &submitting_binding, submitting_input).await });
+            let submitting = tokio::spawn(async move { submitting_provider.turn_start(submitting_operation, &submitting_binding, submitting_input).await });
             observed.wait().await.unwrap(); source.cancel();
             assert!(submitting.await.unwrap().is_err());
             provider.records.submit.join_all().await.unwrap();
@@ -7117,11 +8119,11 @@ mod continuation_tests {
             assert!(provider.closed_bindings.lock().await.contains(&binding), "interrupted unknown-turn admission retained an uncollected native binding");
             assert!(matches!(&*session.history.lock().unwrap(), NativeHistory::Established(_)), "possibly dispatched input must permanently exclude virgin history replacement");
             let configuration = session.configuration.lock().await.clone();
-            assert!(provider.session_configure(context(), &binding, configuration).await.is_err());
+            assert!(provider.thread_configure(context(), &binding, configuration).await.is_err());
             wire.await.unwrap();
-            provider.session_close(context(), &binding).await.unwrap();
+            provider.thread_close(context(), &binding).await.unwrap();
             assert!(!provider.bindings.lock().await.contains_key(&binding));
-            assert!(provider.input_submit(operation, &binding, input).await.is_err());
+            assert!(provider.turn_start(operation, &binding, input).await.is_err());
         }).await.unwrap();
     }
 
@@ -7172,7 +8174,8 @@ mod continuation_tests {
             .send_request("turn/start", json!({}))
             .await
             .unwrap();
-        let (turn, messages) = await_admission(&session, &input, id).await.unwrap();
+        let admitted = await_admission(&session, &input, id).await.unwrap();
+        let (turn, messages) = (admitted.turn_id, admitted.initial_messages);
         assert_eq!(turn, "admitted-after-observations");
         assert_eq!(messages.len(), count + 1);
         for (sequence, message) in messages[..count].iter().enumerate() {
@@ -7196,45 +8199,727 @@ mod continuation_tests {
     async fn completed_invocation_settles_once_and_late_cancel_preserves_successor() {
         use futures_util::SinkExt;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let (provider, session, mut events, mut socket) = compaction_fixture().await;
             let request = request();
             let scope = request.scope.clone();
             session.normalization.lock().await.bind(Some(scope.clone()));
-            let address = forge_provider_api::TurnAddress { scope: scope.clone(), thread_id: "compaction-thread".into(), turn_id: "completed-turn".into() };
+            let address = forge_provider_api::TurnAddress { scope: scope.clone(), thread_id: request.thread_id.clone(), turn_id: request.turn_id.clone() };
+            session.normalization.lock().await.admit_turn("compaction-thread", "completed-turn", &scope).unwrap();
+            let expected_address = address.clone();
             let (cancel, receiver) = mpsc::unbounded_channel();
-            let submissions = Arc::new(Mutex::new(vec![request.submission_id.clone()]));
+            let submissions = Arc::new(Mutex::new(vec![forge_provider_api::CoveredInput::new(request.submission_id.clone(), request.attempt_id.clone())]));
             let worker_session = session.clone();
             let worker_request = request.clone();
             let worker_submissions = submissions.clone();
-            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, tokio::spawn(async move {
-                observe_execution(worker_session, worker_request, address, worker_submissions, receiver, Vec::new()).await
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move {
+                observe_execution(NativeTurnObservation {
+session: worker_session,
+request: worker_request,
+address: address.clone(),
+native_address: NativeTurnAddress { thread_id: "compaction-thread".into(), turn_id: NativeTurnId::new("completed-turn").unwrap() },
+submissions: worker_submissions,
+cancel: receiver,
+initial_messages: Vec::new(),
+retained_cleanup: Arc::new(Mutex::new(Vec::new())),
+
+}).await
             })));
-            *session.active.lock().await = Some(ActiveExecution { scope: scope.clone(), turn_id: "completed-turn".into(), turn_updates: watch::channel(Some("completed-turn".into())).0, submissions, request: request.clone(), cancel, task: Some(worker.clone()) });
+        let worker = fixture_worker(&session, &request.scope, worker);
+            *session.active.lock().await = Some(ActiveExecution { scope: scope.clone(), native_turn_id: "completed-turn".into(), turn_updates: watch::channel(Some("completed-turn".into())).0, submissions, request: request.clone(), cancel, task: Some(worker.clone()) });
+            let retained_worker = worker.clone();
             let collected_session = session.clone();
             let collected_scope = scope.clone();
             let collector = tokio::spawn(async move { collect_invocation(collected_session, collected_scope, worker).await });
             socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"completed-turn","status":"completed"}}}).to_string().into())).await.unwrap();
             collector.await.unwrap().unwrap();
             assert!(session.active.lock().await.is_none());
+            let native = retained_worker.join().await.unwrap().result().clone();
+            assert_eq!(native.covered_inputs(), &[forge_provider_api::CoveredInput::new(request.submission_id.clone(), request.attempt_id.clone())]);
+            assert_eq!(native.checkpoint_id().unwrap().as_str(), "completed-turn");
             let retained = session.settlements.lock().await.get(&scope).cloned().unwrap().unwrap();
-            assert!(matches!(retained.result, ExecutionResult::Completed { .. }));
+            assert!(matches!(retained.completed.result().outcome(), TurnOutcome::Completed { .. }));
             assert!(retained.watermark.get() > 0);
+            let completed = loop {
+                let event = events.recv().await.unwrap().unwrap();
+                if let ProviderEvent::Turn { thread_id, turn_id, event: forge_provider_api::TurnEvent::Completed(completed) } = event.event {
+                    assert_eq!(thread_id, expected_address.thread_id);
+                    assert_eq!(turn_id, expected_address.turn_id);
+                    break completed;
+                }
+            };
+            assert!(matches!(completed.result().outcome(), TurnOutcome::Completed { .. }));
+            assert_eq!(completed.result().checkpoint_id().unwrap().as_str(), "completed-turn");
+
             let mut successor = request;
-            successor.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), "successor");
+            successor.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), "successor"); successor.turn_id = successor.scope.turn_id().unwrap();
             let successor_scope = successor.scope.clone();
             let (cancel, mut cancelled) = mpsc::unbounded_channel();
             let (release, released) = tokio::sync::oneshot::channel();
-            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, tokio::spawn(async move { released.await.unwrap(); Ok(()) })));
-            *session.active.lock().await = Some(ActiveExecution { scope: successor_scope.clone(), turn_id: "successor-turn".into(), turn_updates: watch::channel(Some("successor-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: successor, cancel, task: Some(worker.clone()) });
-            let settled = provider.cancel(context(), &session.binding.id, forge_provider_api::CancelRequest { scope: scope.clone() }).await.unwrap();
+            let completed = collected_result(&successor, retained.completed.result().outcome());
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { released.await.unwrap(); Ok(completed) })));
+        let worker = fixture_worker(&session, &successor_scope, worker);
+            *session.active.lock().await = Some(ActiveExecution { scope: successor_scope.clone(), native_turn_id: "successor-turn".into(), turn_updates: watch::channel(Some("successor-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: successor, cancel, task: Some(worker.clone()) });
+            let settled = provider.turn_interrupt(context(), &session.binding.id, forge_provider_api::CancelRequest { scope: scope.clone() }).await.unwrap();
             assert_eq!(settled.watermark, retained.watermark);
-            assert!(matches!(settled.result, ExecutionResult::Completed { .. }));
+            assert_eq!(settled.thread_id, session.owner.thread_id());
             assert!(cancelled.try_recv().is_err());
             assert_eq!(session.active.lock().await.as_ref().unwrap().scope, successor_scope);
             release.send(()).unwrap(); worker.join().await.unwrap();
             session.active.lock().await.take();
             session.rpc.lock().await.close().await.unwrap();
         }).await.unwrap();
+    }
+
+    /// Preserve all grouped accepted inputs and publish confirmed native models after start.
+    #[tokio::test]
+    async fn native_acknowledgement_preserves_recovered_coverage_and_model_order() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, mut events, mut socket) = compaction_fixture().await;
+            let mut input = request();
+            let recovered = forge_provider_api::CoveredInput::new("earlier".try_into().unwrap(), forge_provider_api::DeliveryAttemptId::new("earlier-attempt").unwrap());
+            input.recovered_inputs.push(forge_provider_api::RecoveredInput { covered_input: recovered.clone(), input: PromptInput::Text("earlier request".into()), attachments: Vec::new(), instructions: String::new() });
+            input.dispatch = forge_provider_api::submission::DispatchReporter::channel(session.binding.id.clone(), input.scope.clone(), input.submission_id.clone(), input.attempt_id.clone()).0;
+            let expected = input.input_coverage();
+            let configured = session.model.lock().await.clone();
+            *session.native_confirmation.lock().await = Some(forge_provider_api::ResolvedModel { model_id: forge_provider_api::ModelId::new("native-model").unwrap(), observed_at_ms: now_ms() });
+            let wire = tokio::spawn(async move {
+                let model: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(model["method"], "model/list");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":model["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}}).to_string().into())).await.unwrap();
+                acknowledge_context_injection(&mut socket).await;
+                let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(start["method"], "turn/start");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"native-turn","model":"observed-model"}}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"native-turn","status":"completed"}}}).to_string().into())).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
+            });
+            provider.turn_start(context(), &session.binding.id, input.clone()).await.unwrap();
+            let mut started = false;
+            let mut models = Vec::new();
+            let completed = loop {
+                match events.recv().await.unwrap().unwrap().event {
+                    ProviderEvent::Turn { turn_id, event: forge_provider_api::TurnEvent::Started(_), .. } => { assert_eq!(turn_id, input.turn_id); started = true; }
+                    ProviderEvent::Turn { turn_id, event: forge_provider_api::TurnEvent::ModelResolved(resolved), .. } => { assert!(started); assert_eq!(turn_id, input.turn_id); models.push(resolved.model_id.as_str().to_owned()); }
+                    ProviderEvent::Turn { event: forge_provider_api::TurnEvent::Completed(completed), .. } => break completed,
+                    ProviderEvent::Provider { .. } | ProviderEvent::Thread { .. } | ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {}
+                }
+            };
+            assert!(started);
+            assert_eq!(models, ["native-model", "observed-model"]);
+            assert_eq!(completed.result().covered_inputs(), expected);
+            assert_eq!(*session.model.lock().await, configured);
+            provider.cancel_invocation(&session.binding.id, &input.scope).await.unwrap();
+            stop_background_reader(&session).await.unwrap();
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// Serve model selection, context injection, and turn lifecycle for sequential wire turns.
+    ///
+    /// With `injection_supported` false the runtime answers `thread/inject_items` the way a
+    /// runtime without the method does: an invalid-request error that carries no request id.
+    async fn serve_context_injection_wire(
+        mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        injection_supported: bool,
+        requests: Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        let mut turn_count = 0;
+        while let Some(Ok(message)) = socket.next().await {
+            if message.is_close() {
+                break;
+            }
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            requests.lock().unwrap().push(request.clone());
+            let replies = match request["method"].as_str() {
+                Some("model/list") => vec![
+                    json!({"id":request["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}}),
+                ],
+                Some("thread/inject_items") if injection_supported => vec![
+                    json!({"id":request["id"],"result":{}}),
+                    // Codex records injected items outside any turn and reports them as raw items.
+                    json!({"method":"rawResponseItem/completed","params":{"threadId":"compaction-thread","turnId":"injection-default-turn","item":request["params"]["items"][0]}}),
+                ],
+                Some("thread/inject_items") => vec![
+                    json!({"error":{"code":-32600,"message":"Invalid request: unknown variant `thread/inject_items`, expected one of `initialize`, `thread/start`"}}),
+                ],
+                Some("turn/start") => {
+                    turn_count += 1;
+                    let turn = format!("context-turn-{turn_count}");
+                    vec![
+                        json!({"id":request["id"],"result":{"turn":{"id":turn}}}),
+                        json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":turn,"status":"completed"}}}),
+                    ]
+                }
+                _ => vec![json!({"id":request["id"],"result":{}})],
+            };
+            for reply in replies {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        reply.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Run one complete turn carrying `instructions`, and reject any published row that exposes
+    /// injected developer context.
+    async fn run_context_turn(
+        provider: &CodexProvider,
+        session: &Arc<CodexBinding>,
+        events: &mut ProviderEventStream,
+        exchange: &str,
+        instructions: &str,
+    ) {
+        let mut input = request();
+        input.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), exchange);
+        input.turn_id = input.scope.turn_id().unwrap();
+        input.instructions = instructions.into();
+        input.dispatch = forge_provider_api::submission::DispatchReporter::channel(
+            session.binding.id.clone(),
+            input.scope.clone(),
+            input.submission_id.clone(),
+            input.attempt_id.clone(),
+        )
+        .0;
+        let scope = input.scope.clone();
+        provider
+            .turn_start(context(), &session.binding.id, input)
+            .await
+            .unwrap();
+        loop {
+            let event = events.recv().await.unwrap().unwrap().event;
+            assert!(
+                !format!("{event:?}").contains("Forge Harness turn context"),
+                "injected developer context must not surface as a host event: {event:?}"
+            );
+            if let ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Completed(_),
+                ..
+            } = event
+            {
+                break;
+            }
+        }
+        provider
+            .turn_interrupt(
+                context(),
+                &session.binding.id,
+                forge_provider_api::CancelRequest { scope },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Get the injected texts and turn-start instructions the wire received, in order.
+    fn context_wire_trace(requests: &std::sync::Mutex<Vec<Value>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request["method"].as_str()? {
+                "thread/inject_items" => Some(format!(
+                    "inject:{}",
+                    request["params"]["items"][0]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit("\n\n")
+                        .next()
+                        .unwrap()
+                )),
+                "turn/start" => Some(format!(
+                    "start:{}",
+                    request["params"]["collaborationMode"]["settings"]["developer_instructions"]
+                        .as_str()
+                        .unwrap()
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Per-turn context reaches model-visible history before `turn/start` whenever it differs
+    /// from the last injection, including after compaction rebuilds history, and unchanged
+    /// context is never repeated.
+    #[tokio::test]
+    async fn changed_turn_context_is_injected_before_turn_start_and_unchanged_context_is_not() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, mut events, socket) = compaction_fixture().await;
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wire = tokio::spawn(serve_context_injection_wire(socket, true, requests.clone()));
+            run_context_turn(&provider, &session, &mut events, "first", "approval ask").await;
+            run_context_turn(&provider, &session, &mut events, "repeat", "approval ask").await;
+            run_context_turn(&provider, &session, &mut events, "changed", "approval yolo").await;
+            stop_background_reader(&session).await.unwrap();
+            let mut output = super::super::normalization::CodexOutput::default();
+            session.normalization.lock().await.normalize(
+                &json!({"method":"item/completed","params":{"threadId":"compaction-thread","item":{"id":"automatic-compaction","type":"contextCompaction"}}}),
+                &mut output, None, "",
+            ).await.unwrap();
+            run_context_turn(&provider, &session, &mut events, "compacted", "approval yolo").await;
+            stop_background_reader(&session).await.unwrap();
+            let inject = requests.lock().unwrap().iter().find(|request| request["method"] == "thread/inject_items").cloned().unwrap();
+            assert_eq!(inject["params"]["threadId"], "compaction-thread");
+            assert_eq!(inject["params"]["items"][0]["type"], "message");
+            assert_eq!(inject["params"]["items"][0]["role"], "developer");
+            assert_eq!(inject["params"]["items"][0]["content"][0]["type"], "input_text");
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+            assert_eq!(context_wire_trace(&requests), [
+                "inject:approval ask", "start:approval ask",
+                "start:approval ask",
+                "inject:approval yolo", "start:approval yolo",
+                "inject:approval yolo", "start:approval yolo",
+            ]);
+        }).await.unwrap();
+    }
+
+    /// A runtime without `thread/inject_items` rejects it without a request id; the turn still
+    /// starts with collaboration-mode instructions, and later turns stop probing the method.
+    #[tokio::test]
+    async fn unknown_injection_method_falls_back_to_collaboration_mode_instructions() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, mut events, socket) = compaction_fixture().await;
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wire = tokio::spawn(serve_context_injection_wire(
+                socket,
+                false,
+                requests.clone(),
+            ));
+            run_context_turn(&provider, &session, &mut events, "first", "approval ask").await;
+            run_context_turn(&provider, &session, &mut events, "changed", "approval yolo").await;
+            stop_background_reader(&session).await.unwrap();
+            assert!(!session.is_fenced());
+            assert!(matches!(
+                *session.turn_context.lock().await,
+                super::super::turn_context::TurnContextDelivery::Unsupported
+            ));
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+            assert_eq!(
+                context_wire_trace(&requests),
+                [
+                    "inject:approval ask",
+                    "start:approval ask",
+                    "start:approval yolo",
+                ]
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Observe delayed accounting and idle thread errors without needing another foreground prompt.
+    #[tokio::test]
+    async fn idle_reader_preserves_delayed_usage_and_thread_error_scope() {
+        use futures_util::SinkExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_provider, session, mut events, mut socket) = compaction_fixture().await;
+            let request = request();
+            let address = session.normalization.lock().await.admit_turn("compaction-thread", "completed", &request.scope).unwrap();
+            let (_cancel, cancel) = mpsc::unbounded_channel();
+            let driver = Arc::new(CodexTurnDriver {
+                session: session.clone(), started_at_ms: now_ms(), native_confirmation: None, admission_model: None, request: request.clone(), address: address.clone(),
+                native_address: NativeTurnAddress { thread_id: "compaction-thread".into(), turn_id: NativeTurnId::new("completed").unwrap() },
+                submissions: Arc::new(Mutex::new(vec![forge_provider_api::CoveredInput::new(request.submission_id.clone(), request.attempt_id.clone())])),
+                cancel: Mutex::new(Some(cancel)), cleanup_errors: Arc::new(Mutex::new(Vec::new())),
+                initial_messages: Mutex::new(Some(vec![json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"completed","status":"completed"}}})])),
+            });
+            let turn = crate::turn_runner::RetainedTurn::spawn(driver, session.sink.clone(), address.clone()).unwrap();
+            turn.join().await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"compaction-thread","turnId":"completed","tokenUsage":{"last":{"inputTokens":10,"outputTokens":4},"total":{"inputTokens":10,"outputTokens":4,"totalTokens":14}}}}).to_string().into())).await.unwrap();
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"error","params":{"threadId":"compaction-thread","error":{"codexErrorInfo":"rateLimitExceeded"}}}).to_string().into())).await.unwrap();
+            let mut usage = false;
+            loop {
+                let event = events.recv().await.unwrap().unwrap().event;
+                match event {
+                    ProviderEvent::Turn { thread_id, turn_id, event: forge_provider_api::TurnEvent::Usage(report) } => {
+                        assert_eq!(thread_id, address.thread_id); assert_eq!(turn_id, address.turn_id);
+                        assert_eq!(report.usage().as_ref().unwrap().output, Some(4)); usage = true;
+                    }
+                    ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::Error { error } } => {
+                        assert_eq!(thread_id, address.thread_id); assert_eq!(error.kind(), ProviderFailureKind::RateLimited); break;
+                    }
+                    ProviderEvent::Provider { .. } | ProviderEvent::Thread { .. } | ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {}
+                }
+            }
+            assert!(usage); assert!(!session.is_fenced());
+            stop_background_reader(&session).await.unwrap();
+            session.rpc.lock().await.close().await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// Certify independent raw-yielded sessions and withhold completion for ambiguous resumed-session interruption.
+    #[tokio::test]
+    async fn interrupted_unified_exec_requires_positive_yield_before_collection_certificate() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for yielded in [true, false] {
+                let (provider, session, mut events, _socket) = compaction_fixture().await;
+                let request = request();
+                let address = session.normalization.lock().await.admit_turn("compaction-thread", "interrupted", &request.scope).unwrap();
+                let (_cancel, cancel) = mpsc::unbounded_channel();
+                let mut native = vec![json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"interrupted","item":{"type":"commandExecution","id":"command","command":"server","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}})];
+                if yielded { native.push(json!({"method":"rawResponseItem/completed","params":{"threadId":"compaction-thread","turnId":"interrupted","item":{"type":"function_call_output","call_id":"command","output":"Wall time: 0.0100 seconds\nProcess running with session ID 42\nOutput:\nready"}}})); }
+                native.push(json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"interrupted","status":"interrupted"}}}));
+                let driver = Arc::new(CodexTurnDriver {
+                    session: session.clone(), started_at_ms: now_ms(), native_confirmation: None, admission_model: None, request: request.clone(), address: address.clone(),
+                    native_address: NativeTurnAddress { thread_id: "compaction-thread".into(), turn_id: NativeTurnId::new("interrupted").unwrap() },
+                    submissions: Arc::new(Mutex::new(request.input_coverage())), cancel: Mutex::new(Some(cancel)),
+                    cleanup_errors: Arc::new(Mutex::new(Vec::new())),  initial_messages: Mutex::new(Some(native)),
+                });
+                let turn = crate::turn_runner::RetainedTurn::spawn(driver, session.sink.clone(), address.clone()).unwrap();
+                let completion = turn.join().await;
+                let native = turn.native_result().await.unwrap().unwrap();
+                assert_eq!(native.outcome(), TurnOutcome::Interrupted);
+                if yielded {
+                    assert_eq!(completion.unwrap().result(), &native);
+                    assert!(session.normalization.lock().await.has_pending_background_tools());
+                    assert!(!session.is_fenced());
+                    stop_background_reader(&session).await.unwrap();
+                } else {
+                    assert!(matches!(completion, Err(ProviderError::Failure(failure)) if failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
+                    assert!(session.is_fenced());
+                    assert!(provider.bindings.lock().await.contains_key(&session.binding.id));
+                    assert!(session.close_failure.lock().await.is_some());
+                    assert!(session.normalization.lock().await.has_unresolved_sessions(&address));
+                    let mut completed = false;
+                    loop { match events.recv().await.unwrap().unwrap().event {
+                        ProviderEvent::Turn { event: forge_provider_api::TurnEvent::Completed(_), .. } => completed = true,
+                        ProviderEvent::Provider { event: forge_provider_api::ProviderConnectionEvent::Unavailable(_) } => break,
+                        ProviderEvent::Provider { .. } | ProviderEvent::Thread { .. } | ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {}
+                    } }
+                    assert!(!completed);
+                }
+                session.rpc.lock().await.close().await.unwrap();
+            }
+        }).await.unwrap();
+    }
+
+    /// Hold an actual child host callback independently of its parent's native result.
+    struct HeldChildCallback {
+        parent: forge_provider_api::InvocationScope,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+    #[async_trait]
+    impl ProviderPermissions for HeldChildCallback {
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            panic!("child borrowed root checkpoint barrier")
+        }
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            panic!("child borrowed root policy")
+        }
+        async fn before_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+        ) -> Result<(), ProviderError> {
+            assert_eq!(parent, &self.parent);
+            assert!(!child.scope.owner.is_root());
+            Ok(())
+        }
+        async fn authorize_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            assert_eq!(parent, &self.parent);
+            assert!(!child.scope.owner.is_root());
+            PermissionResponse::Allow
+        }
+    }
+    #[async_trait]
+    impl ProviderTools for HeldChildCallback {
+        async fn call(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: ToolCall,
+        ) -> Result<String, ProviderError> {
+            panic!("child borrowed root executor")
+        }
+        async fn call_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+            _: ToolCall,
+        ) -> Result<String, ProviderError> {
+            assert_eq!(parent, &self.parent);
+            assert!(!child.scope.owner.is_root());
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            Ok("original child callback".into())
+        }
+    }
+
+    /// Publish root completion while an exact native child remains live, then retain it across a successor.
+    #[tokio::test]
+    async fn native_child_identity_learned_late_keeps_child_items_and_collection() {
+        use futures_util::SinkExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_, session, mut events, mut socket) = compaction_fixture().await;
+            let mut request = request();
+            let callback=Arc::new(HeldChildCallback {parent:request.scope.clone(),entered:tokio::sync::Notify::new(),release:tokio::sync::Semaphore::new(0)});
+            request.permissions=callback.clone(); request.provider_tools=callback.clone();
+            request.tools.push(forge_provider_api::control::ControlToolDefinition {name:"lsp_rename",description:"fixture",input_schema:json!({})});
+            let address = session.normalization.lock().await.admit_turn("compaction-thread", "parent", &request.scope).unwrap();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let (done, done_rx) = tokio::sync::oneshot::channel();
+            let wire_callback = callback.clone();
+            let wire = tokio::spawn(async move {
+                for message in [
+                    json!({"method":"turn/started","params":{"threadId":"native-child","turn":{"id":"child-turn"}}}),
+                    json!({"method":"item/completed","params":{"threadId":"compaction-thread","turnId":"parent","item":{"type":"subAgentActivity","id":"delegation","kind":"started","agentThreadId":"native-child"}}}),
+                    json!({"method":"item/agentMessage/delta","params":{"threadId":"native-child","turnId":"child-turn","itemId":"message","delta":"child response"}}),
+                    json!({"id":77,"method":"item/tool/call","params":{"threadId":"native-child","turnId":"child-turn","callId":"held-child-call","tool":"lsp_rename","arguments":{}}}),
+                    json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"parent","status":"completed"}}}),
+                ] {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                    if message["method"] == "item/tool/call" { wire_callback.entered.notified().await; }
+                }
+                released.await.unwrap();
+                for message in [
+                    json!({"method":"item/agentMessage/delta","params":{"threadId":"native-child","turnId":"child-turn","itemId":"message","delta":" tail"}}),
+                    json!({"method":"turn/completed","params":{"threadId":"native-child","turn":{"id":"child-turn","status":"completed"}}}),
+                    json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"successor","status":"completed"}}}),
+                ] { socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap(); }
+                let _ = done_rx.await;
+            });
+            let driver = |input: PromptRequest, address: forge_provider_api::TurnAddress, native: &str, cancel| {
+                Arc::new(CodexTurnDriver {
+                    session: session.clone(), started_at_ms: now_ms(), native_confirmation: None, admission_model: None,
+                    request: input.clone(), address, native_address: NativeTurnAddress { thread_id:"compaction-thread".into(), turn_id:NativeTurnId::new(native).unwrap() },
+                    submissions: Arc::new(Mutex::new(input.input_coverage())), cancel:Mutex::new(Some(cancel)),
+                    initial_messages:Mutex::new(Some(Vec::new())), cleanup_errors:Arc::default(),
+                })
+            };
+            let (_first_cancel, first_cancelled) = mpsc::unbounded_channel();
+            let first = crate::turn_runner::RetainedTurn::spawn(driver(request.clone(), address.clone(), "parent", first_cancelled), session.sink.clone(), address.clone()).unwrap();
+            assert!(matches!(first.join().await.unwrap().result().outcome(), TurnOutcome::Completed { .. }));
+            assert_eq!(callback.release.available_permits(),0,"parent returned while child callback is still held");
+            let mut child = None;
+            let mut original_item = None;
+            loop {
+                match events.recv().await.unwrap().unwrap().event {
+                    ProviderEvent::Turn { thread_id, turn_id, event:forge_provider_api::TurnEvent::Started(_) } if turn_id != address.turn_id => child=Some((thread_id,turn_id)),
+                    ProviderEvent::Item { thread_id, turn_id, item_id, .. } if child.as_ref().is_some_and(|(thread,turn)| thread==&thread_id && turn==&turn_id) => original_item=Some(item_id),
+                    ProviderEvent::Turn { turn_id, event:forge_provider_api::TurnEvent::Completed(_) ,..} if turn_id==address.turn_id => break,
+                    ProviderEvent::Turn { event:forge_provider_api::TurnEvent::Completed(_), .. } => panic!("held child completed before native terminal evidence"),
+                    ProviderEvent::Provider { .. } | ProviderEvent::Thread { .. } | ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {}
+                }
+            }
+            assert!(child.is_some()); assert!(original_item.is_some());
+            let children = session.child_runners.lock().await.clone();
+            assert!(children.len() == 1 && children[0].native_result().await.is_none());
+            stop_background_reader(&session).await.unwrap();
+            let mut successor=request.clone();
+            successor.scope=forge_provider_api::InvocationScope::new(request.scope.owner.clone(),"successor");
+            successor.turn_id=successor.scope.turn_id().unwrap();
+            let successor_address=session.normalization.lock().await.admit_turn("compaction-thread","successor",&successor.scope).unwrap();
+            let (_next_cancel, next_cancelled) = mpsc::unbounded_channel();
+            let next=crate::turn_runner::RetainedTurn::spawn(driver(successor,successor_address.clone(),"successor",next_cancelled),session.sink.clone(),successor_address.clone()).unwrap();
+            next.started().await.unwrap();
+            callback.release.add_permits(1);
+            release.send(()).unwrap();
+            next.join().await.unwrap();
+            let mut child_completed=false; let mut successor_completed=false; let mut tail=false;
+            while !(child_completed && successor_completed && tail) {
+                match events.recv().await.unwrap().unwrap().event {
+                    ProviderEvent::Item { thread_id,turn_id,item_id,event:forge_provider_api::ItemEvent::Message {event:forge_provider_api::MessageItemEvent::Delta(text)} } if text==" tail" => {
+                        assert_eq!(child.as_ref(),Some(&(thread_id,turn_id))); assert_eq!(original_item.as_ref(),Some(&item_id));tail=true;
+                    }
+                    ProviderEvent::Turn { turn_id,event:forge_provider_api::TurnEvent::Completed(_),.. } if child.as_ref().is_some_and(|(_,id)|id==&turn_id) => child_completed=true,
+                    ProviderEvent::Turn { turn_id,event:forge_provider_api::TurnEvent::Completed(_),.. } if turn_id==successor_address.turn_id => successor_completed=true,
+                    ProviderEvent::Provider { .. } | ProviderEvent::Thread { .. } | ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {}
+                }
+            }
+            stop_background_reader(&session).await.unwrap();
+            session.rpc.lock().await.close().await.unwrap();
+            done.send(()).unwrap();wire.await.unwrap();
+            session.child_runners.lock().await.clear();session.child_observations.lock().await.clear();session.callback_requests.lock().await.clear();
+        }).await.unwrap();
+    }
+
+    /// Canonical failure and legacy publication share the same retained retry permission.
+    #[tokio::test]
+    async fn canonical_native_failure_preserves_coverage_and_retry_decision() {
+        for (code, sensitive, allowed, kind) in [
+            (
+                "serverOverloaded",
+                false,
+                true,
+                ProviderFailureKind::Transport,
+            ),
+            (
+                "serverOverloaded",
+                true,
+                false,
+                ProviderFailureKind::Transport,
+            ),
+            (
+                "unauthorized",
+                false,
+                false,
+                ProviderFailureKind::Authentication,
+            ),
+        ] {
+            let (_provider, session, mut events, _socket) = compaction_fixture().await;
+            let request = request();
+            {
+                let mut normalization = session.normalization.lock().await;
+                normalization.bind(Some(request.scope.clone()));
+                normalization.replay_sensitive = sensitive;
+            }
+            let original = forge_provider_api::CoveredInput::new(
+                request.submission_id.clone(),
+                request.attempt_id.clone(),
+            );
+            let steering = forge_provider_api::CoveredInput::new(
+                "steering".try_into().unwrap(),
+                forge_provider_api::DeliveryAttemptId::new("steering-attempt").unwrap(),
+            );
+            let (_cancel, receiver) = mpsc::unbounded_channel();
+            let address = forge_provider_api::TurnAddress {
+                scope: request.scope.clone(),
+                thread_id: request.thread_id.clone(),
+                turn_id: request.turn_id.clone(),
+            };
+            session
+                .normalization
+                .lock()
+                .await
+                .admit_turn("compaction-thread", "failed-turn", &request.scope)
+                .unwrap();
+            let collected = observe_execution(NativeTurnObservation {
+session: session.clone(),
+request: request.clone(),
+address,
+native_address: NativeTurnAddress { thread_id: "compaction-thread".into(), turn_id: NativeTurnId::new("failed-turn").unwrap() },
+submissions: Arc::new(Mutex::new(vec![original.clone(), steering.clone(), original.clone()])),
+cancel: receiver,
+initial_messages: vec![json!({"method":"turn/completed", "params":{"threadId":"compaction-thread", "turn":{"id":"failed-turn", "status":"failed", "error":{"codexErrorInfo":code,"message":"private native error"}}}})],
+retained_cleanup: Arc::new(Mutex::new(Vec::new())),
+
+}).await.unwrap();
+            assert_eq!(collected.covered_inputs(), &[original, steering]);
+            assert!(
+                matches!(collected.outcome(), forge_provider_api::turn::TurnOutcome::Failed { error, retry }
+                if error.kind() == kind && matches!(retry, forge_provider_api::turn::RetryDecision::Allowed { .. }) == allowed)
+            );
+            let native = collected.clone();
+            let task = Arc::new(crate::retained_task::RetainedTask::new(
+                ProviderOperation::TurnStart,
+                tokio::spawn(async move { Ok(collected) }),
+            ));
+            let task = fixture_worker(&session, &request.scope, task);
+            collect_invocation(session.clone(), request.scope.clone(), task)
+                .await
+                .unwrap();
+            let event = loop {
+                let event = events.recv().await.unwrap().unwrap().event;
+                if matches!(
+                    event,
+                    ProviderEvent::Turn {
+                        event: forge_provider_api::TurnEvent::Completed(_),
+                        ..
+                    }
+                ) {
+                    break event;
+                }
+            };
+            assert!(
+                matches!(event, ProviderEvent::Turn { event: forge_provider_api::TurnEvent::Completed(completed), .. }
+                if completed.result() == &native)
+            );
+            let settlement = session
+                .settlements
+                .lock()
+                .await
+                .get(&request.scope)
+                .cloned()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    settlement.completed.result().outcome(),
+                    TurnOutcome::Failed {
+                        retry: forge_provider_api::turn::RetryDecision::Allowed { .. },
+                        ..
+                    }
+                ) == allowed
+            );
+            session.rpc.lock().await.close().await.unwrap();
+        }
+    }
+
+    /// A native result cannot become published success when foreground collection fails.
+    #[tokio::test]
+    async fn collection_failure_withholds_terminal_success_and_retains_failure() {
+        let (_provider, session, mut events, _socket) = compaction_fixture().await;
+        let request = request();
+        let native = collected_result(
+            &request,
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Normal,
+            },
+        );
+        let failure =
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Collection,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                );
+        let (release, released) = tokio::sync::oneshot::channel();
+        let task = Arc::new(crate::retained_task::RetainedTask::new(
+            ProviderOperation::TurnStart,
+            tokio::spawn(async move {
+                let _native = native;
+                released.await.unwrap();
+                Err::<forge_provider_api::TurnResult, _>(ProviderError::Failure(failure))
+            }),
+        ));
+        let task = fixture_worker(&session, &request.scope, task);
+        let mut collecting = Box::pin(collect_invocation(
+            session.clone(),
+            request.scope.clone(),
+            task.clone(),
+        ));
+        assert!(futures_util::poll!(collecting.as_mut()).is_pending());
+        let _ = session.sink.watermark();
+        release.send(()).unwrap();
+        assert!(
+            matches!(collecting.await, Err(ProviderError::Failure(observed)) if observed == failure)
+        );
+        assert!(session.is_fenced());
+        let event = loop {
+            let event = events.recv().await.unwrap().unwrap().event;
+            if let ProviderEvent::Provider {
+                event: forge_provider_api::ProviderConnectionEvent::Unavailable(unavailable),
+            } = event
+            {
+                break unavailable;
+            }
+        };
+        assert_eq!(event.failure, failure);
+        let watermark = session.sink.watermark();
+        assert!(
+            collect_invocation(session.clone(), request.scope, task)
+                .await
+                .is_err()
+        );
+        assert_eq!(session.sink.watermark(), watermark);
+        session.rpc.lock().await.close().await.unwrap();
     }
 
     /// A cancellation response deadline cannot discard the worker or its later authoritative settlement.
@@ -7245,26 +8930,18 @@ mod continuation_tests {
         let scope = input.scope.clone();
         let (cancel, mut cancelled) = mpsc::unbounded_channel();
         let (release, released) = tokio::sync::oneshot::channel();
-        let worker_session = session.clone();
-        let worker_scope = scope.clone();
-        let result = ExecutionResult::Cancelled {
-            completion: completion(&session, &input.configuration.model).await,
-        };
+        let result = collected_result(&input, TurnOutcome::Interrupted);
         let worker = Arc::new(crate::retained_task::RetainedTask::new(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             tokio::spawn(async move {
                 released.await.unwrap();
-                worker_session
-                    .outcomes
-                    .lock()
-                    .await
-                    .insert(worker_scope, result);
-                Ok(())
+                Ok(result)
             }),
         ));
+        let worker = fixture_worker(&session, &scope, worker);
         *session.active.lock().await = Some(ActiveExecution {
             scope: scope.clone(),
-            turn_id: "slow-cancellation".into(),
+            native_turn_id: "slow-cancellation".into(),
             turn_updates: watch::channel(Some("slow-cancellation".into())).0,
             submissions: Arc::new(Mutex::new(Vec::new())),
             request: input,
@@ -7284,7 +8961,7 @@ mod continuation_tests {
         let cancelling_operation = operation.clone();
         let cancelling = tokio::spawn(async move {
             cancelling_provider
-                .cancel(
+                .turn_interrupt(
                     cancelling_operation,
                     &cancelling_binding,
                     forge_provider_api::CancelRequest {
@@ -7308,14 +8985,14 @@ mod continuation_tests {
         release.send(()).unwrap();
         provider.records.cancel.join_all().await.unwrap();
         let settled = provider
-            .cancel(
+            .turn_interrupt(
                 operation,
                 &session.binding.id,
                 forge_provider_api::CancelRequest { scope },
             )
             .await
             .unwrap();
-        assert!(matches!(settled.result, ExecutionResult::Cancelled { .. }));
+        assert_eq!(settled.thread_id, session.owner.thread_id());
         assert!(session.active.lock().await.is_none());
         session.rpc.lock().await.close().await.unwrap();
     }
@@ -7338,12 +9015,12 @@ mod continuation_tests {
         });
         *session.background_reader.lock().await = Some(BackgroundReader {
             cancel,
-            task: crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, worker),
+            task: crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, worker),
         });
         let configuration = session.configuration.lock().await.clone();
         assert!(
             provider
-                .session_configure(context(), &session.binding.id, configuration)
+                .thread_configure(context(), &session.binding.id, configuration)
                 .await
                 .is_err()
         );
@@ -7359,7 +9036,7 @@ mod continuation_tests {
     async fn configure_replacement_failure_preserves_cause_and_invalidated_disposition() {
         let (_provider, session, _events, _socket) = compaction_fixture().await;
         let cause = ProviderFailure::new(
-            ProviderOperation::SessionConfigure,
+            ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Rejected,
         )
         .at_phase(
@@ -7406,14 +9083,12 @@ mod continuation_tests {
         ] {
             let (_provider, session, _events, _socket) = compaction_fixture().await;
             let original_is_version = matches!(&original, ProviderError::RuntimeVersion(_));
-            let independent = ProviderFailure::new(
-                ProviderOperation::SessionClose,
-                ProviderFailureKind::Timeout,
-            )
-            .at_phase(
-                forge_provider_api::ProviderPhase::Close,
-                forge_provider_api::FailureDisposition::Uncertain,
-            );
+            let independent =
+                ProviderFailure::new(ProviderOperation::ThreadClose, ProviderFailureKind::Timeout)
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Close,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    );
             let error = invalidate_configuration(
                 &session,
                 ProviderError::Combined {
@@ -7432,7 +9107,7 @@ mod continuation_tests {
                 panic!("specialized cause lost");
             };
             assert!(
-                matches!(*primary, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionConfigure && failure.kind() == expected_kind && failure.phase() == expected_phase && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
+                matches!(*primary, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadConfigure && failure.kind() == expected_kind && failure.phase() == expected_phase && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
             );
             assert_eq!(secondary.len(), 1);
             assert_eq!(
@@ -7451,8 +9126,9 @@ mod continuation_tests {
             let (provider, session, _events, socket) = compaction_fixture().await;
             let mut normalization = session.normalization.lock().await;
             normalization.bind(Some(request().scope));
-            let mut output = forge_provider_api::completion::ProviderOutput::default();
-            normalization.normalize(&json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"old","item":{"type":"commandExecution","id":"command","command":"slow command","status":"inProgress"}}}), &mut output, None, "").await.unwrap();
+            let _old_address = normalization.admit_turn("compaction-thread", "old", &request().scope).unwrap();
+            let mut output = super::super::normalization::CodexOutput::default();
+            normalization.normalize(&json!({"method":"item/started","params":{"threadId":"compaction-thread","turnId":"old","item":{"type":"commandExecution","id":"command","command":"slow command","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), &mut output, None, "").await.unwrap();
             normalization.normalize(&json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"old","status":"completed"}}}), &mut output, None, "").await.unwrap();
             assert!(normalization.has_pending_background_tools()); drop(normalization);
             start_background_reader(&session).await.unwrap().unwrap().send(()).unwrap();
@@ -7462,7 +9138,7 @@ mod continuation_tests {
             assert!(matches!(&*session.close_failure.lock().await, Some(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Transport));
             session.fenced.store(false, Ordering::Release);
             assert!(session.is_fenced());
-            assert!(provider.session_fork(context(), forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("blocked-fork"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } }).await.is_err());
+            assert!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("blocked-fork"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } }).await.is_err());
             let _ = stop_background_reader(&session).await;
             let _ = session.rpc.lock().await.close().await;
         }).await.unwrap();
@@ -7482,8 +9158,8 @@ mod continuation_tests {
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
             let configuration = session.configuration.lock().await.clone();
-            let error = provider.session_configure(context(), &session.binding.id, configuration).await.unwrap_err();
-            assert!(matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionConfigure && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::error::FailureDisposition::Unchanged));
+            let error = provider.thread_configure(context(), &session.binding.id, configuration).await.unwrap_err();
+            assert!(matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadConfigure && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::error::FailureDisposition::Unchanged));
             assert!(!session.is_fenced());
             assert!(session.retired_rpcs.lock().await.is_empty());
             session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
@@ -7504,7 +9180,7 @@ mod continuation_tests {
         });
         *session.background_reader.lock().await = Some(BackgroundReader {
             cancel,
-            task: crate::retained_task::RetainedTask::new(ProviderOperation::InputSubmit, worker),
+            task: crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, worker),
         });
         let request = SteeringRequest {
             scope: request().scope,
@@ -7514,11 +9190,11 @@ mod continuation_tests {
             task: None,
         };
         let error = provider
-            .input_steer(context(), &session.binding.id, request)
+            .turn_steer(context(), &session.binding.id, request)
             .await
             .unwrap_err();
         assert!(
-            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::InputSteer && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::TurnSteer && failure.kind() == ProviderFailureKind::WrongInvocation && failure.phase() == forge_provider_api::ProviderPhase::Admission && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         assert!(!cancelled.load(Ordering::Acquire));
         assert!(session.background_reader.lock().await.is_some());
@@ -7542,22 +9218,22 @@ mod continuation_tests {
         wrong.scope =
             forge_provider_api::InvocationScope::new(session.owner.clone(), "wrong-invocation");
         assert!(
-            matches!(provider.input_submit(context(), &session.binding.id, wrong).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            matches!(provider.turn_start(context(), &session.binding.id, wrong).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         session.invalidated.store(true, Ordering::Release);
         assert!(
-            matches!(provider.input_submit(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
+            matches!(provider.turn_start(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
         );
         session.invalidated.store(false, Ordering::Release);
         session.closing.store(true, Ordering::Release);
         assert!(
-            matches!(provider.input_submit(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
+            matches!(provider.turn_start(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
         );
         session.closing.store(false, Ordering::Release);
         let (cancel, _) = mpsc::unbounded_channel();
         *session.active.lock().await = Some(ActiveExecution {
             scope: input.scope.clone(),
-            turn_id: "existing-turn".into(),
+            native_turn_id: "existing-turn".into(),
             turn_updates: watch::channel(Some("existing-turn".into())).0,
             submissions: Arc::new(Mutex::new(Vec::new())),
             request: input.clone(),
@@ -7565,7 +9241,7 @@ mod continuation_tests {
             task: None,
         });
         assert!(
-            matches!(provider.input_submit(context(), &session.binding.id, input).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::ExecutionActive && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            matches!(provider.turn_start(context(), &session.binding.id, input).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::ExecutionActive && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         session.active.lock().await.take();
         session.rpc.lock().await.close().await.unwrap();
@@ -7610,19 +9286,26 @@ mod continuation_tests {
     #[tokio::test]
     async fn configure_rejects_active_invocation_without_sending_cancel() {
         let (provider, session, _events, _socket) = compaction_fixture().await;
-        let request = request();
         let (cancel, mut cancelled) = mpsc::unbounded_channel();
         let (release, released) = tokio::sync::oneshot::channel();
+        let request = request();
+        let completed = collected_result(
+            &request,
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Normal,
+            },
+        );
         let worker = Arc::new(crate::retained_task::RetainedTask::new(
-            ProviderOperation::InputSubmit,
+            ProviderOperation::TurnStart,
             tokio::spawn(async move {
                 released.await.unwrap();
-                Ok(())
+                Ok(completed)
             }),
         ));
+        let worker = fixture_worker(&session, &request.scope, worker);
         *session.active.lock().await = Some(ActiveExecution {
             scope: request.scope.clone(),
-            turn_id: "running".into(),
+            native_turn_id: "running".into(),
             turn_updates: watch::channel(Some("running".into())).0,
             submissions: Arc::new(Mutex::new(Vec::new())),
             request,
@@ -7631,11 +9314,11 @@ mod continuation_tests {
         });
         let configuration = session.configuration.lock().await.clone();
         let error = provider
-            .session_configure(context(), &session.binding.id, configuration)
+            .thread_configure(context(), &session.binding.id, configuration)
             .await
             .unwrap_err();
         assert!(
-            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionConfigure && failure.kind() == ProviderFailureKind::ExecutionActive)
+            matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadConfigure && failure.kind() == ProviderFailureKind::ExecutionActive)
         );
         assert!(cancelled.try_recv().is_err());
         release.send(()).unwrap();
@@ -7653,15 +9336,21 @@ mod continuation_tests {
             let input = request();
             let operation = context();
             let request = forge_provider_api::InputRetractRequest { scope: input.scope.clone(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone(), boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap(), authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation };
-            *session.rollback.lock().await = Some(RollbackAuthorization { thread_id: "compaction-thread".into(), scope: input.scope.clone(), turn_id: "cancelled-turn".into(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone() });
-            session.settlements.lock().await.insert(input.scope.clone(), Ok(forge_provider_api::InvocationSettlement { binding_id: session.binding.id.clone(), scope: input.scope.clone(), result: ExecutionResult::Cancelled { completion: completion(&session, &input.configuration.model).await }, watermark: session.sink.watermark() }));
+            *session.rollback.lock().await = Some(RollbackAuthorization { thread_id: "compaction-thread".into(), scope: input.scope.clone(), turn_id: NativeTurnId::new("cancelled-turn").unwrap(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone() });
+            let native = collected_result(&input, TurnOutcome::Interrupted);
+            let address = forge_provider_api::TurnAddress { scope: input.scope.clone(), thread_id: input.thread_id.clone(), turn_id: input.turn_id.clone() };
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { Ok(native) })));
+            let worker = fixture_worker(&session, &input.scope, worker);
+            let completed = worker.join().await.unwrap();
+            session.settlements.lock().await.insert(input.scope.clone(), Ok(CollectedInvocation { address, completed, watermark: session.sink.watermark() }));
             let client_id = native_input_id(&input.submission_id, &input.attempt_id);
             let wire = tokio::spawn(async move {
                 let read: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(read["method"], "thread/read");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":read["id"],"result":{"thread":{"turns":[{"id":"cancelled-turn","status":"interrupted","items":[{"type":"userMessage","clientId":client_id}]}]}}}).to_string().into())).await.unwrap();
                 let rollback: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                assert_eq!(rollback["method"], "thread/rollback");
+                assert_eq!(rollback["method"], "thread/revert");
+                assert_eq!(rollback["params"]["beforeTurnId"], "cancelled-turn");
                 socket.close(None).await.unwrap();
             });
             assert_eq!(provider.input_retract(operation.clone(), &session.binding.id, request.clone()).await.unwrap(), forge_provider_api::InputRetractOutcome::Unknown);
@@ -7675,6 +9364,137 @@ mod continuation_tests {
             assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::OperationConflict));
             let _ = session.rpc.lock().await.close().await;
         }).await.unwrap();
+    }
+
+    /// A Codex runtime without `thread/revert` rejects it before touching history.
+    /// The positive rejection leaves the binding usable and reports retraction as unsupported.
+    #[tokio::test]
+    async fn rejected_rollback_keeps_binding_usable_and_reports_unsupported() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let input = request();
+            let operation = context();
+            let request = forge_provider_api::InputRetractRequest { scope: input.scope.clone(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone(), boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap(), authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation };
+            *session.rollback.lock().await = Some(RollbackAuthorization { thread_id: "compaction-thread".into(), scope: input.scope.clone(), turn_id: NativeTurnId::new("cancelled-turn").unwrap(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone() });
+            let native = collected_result(&input, TurnOutcome::Interrupted);
+            let address = forge_provider_api::TurnAddress { scope: input.scope.clone(), thread_id: input.thread_id.clone(), turn_id: input.turn_id.clone() };
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { Ok(native) })));
+            let worker = fixture_worker(&session, &input.scope, worker);
+            let completed = worker.join().await.unwrap();
+            session.settlements.lock().await.insert(input.scope.clone(), Ok(CollectedInvocation { address, completed, watermark: session.sink.watermark() }));
+            let client_id = native_input_id(&input.submission_id, &input.attempt_id);
+            let wire = tokio::spawn(async move {
+                let read: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":read["id"],"result":{"thread":{"turns":[{"id":"cancelled-turn","status":"interrupted","items":[{"type":"userMessage","clientId":client_id}]}]}}}).to_string().into())).await.unwrap();
+                let rollback: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(rollback["method"], "thread/revert");
+                assert_eq!(rollback["params"]["beforeTurnId"], "cancelled-turn");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":rollback["id"],"error":{"code":-32600,"message":"Invalid request: unknown variant `thread/revert`"}}).to_string().into())).await.unwrap();
+                socket
+            });
+            assert_eq!(
+                provider.input_retract(operation, &session.binding.id, request).await.unwrap(),
+                forge_provider_api::InputRetractOutcome::Unavailable(forge_provider_api::InputRetractUnavailable::Unsupported)
+            );
+            assert!(!session.is_fenced());
+            assert!(!session.invalidated.load(Ordering::Acquire));
+            assert!(session.close_failure.lock().await.is_none());
+            let _socket = wire.await.unwrap();
+            let _ = session.rpc.lock().await.close().await;
+        }).await.unwrap();
+    }
+
+    /// `thread/revert` removes the output-free cancelled turn, and the verified history
+    /// authorizes retraction while the binding stays usable.
+    #[tokio::test]
+    async fn reverted_turn_retracts_and_keeps_binding_usable() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let input = request();
+            let operation = context();
+            let request = forge_provider_api::InputRetractRequest { scope: input.scope.clone(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone(), boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap(), authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation };
+            *session.rollback.lock().await = Some(RollbackAuthorization { thread_id: "compaction-thread".into(), scope: input.scope.clone(), turn_id: NativeTurnId::new("cancelled-turn").unwrap(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone() });
+            let native = collected_result(&input, TurnOutcome::Interrupted);
+            let address = forge_provider_api::TurnAddress { scope: input.scope.clone(), thread_id: input.thread_id.clone(), turn_id: input.turn_id.clone() };
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { Ok(native) })));
+            let worker = fixture_worker(&session, &input.scope, worker);
+            let completed = worker.join().await.unwrap();
+            session.settlements.lock().await.insert(input.scope.clone(), Ok(CollectedInvocation { address, completed, watermark: session.sink.watermark() }));
+            let client_id = native_input_id(&input.submission_id, &input.attempt_id);
+            let wire = tokio::spawn(async move {
+                let read: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":read["id"],"result":{"thread":{"turns":[{"id":"cancelled-turn","status":"interrupted","items":[{"type":"userMessage","clientId":client_id}]}]}}}).to_string().into())).await.unwrap();
+                let rollback: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(rollback["method"], "thread/revert");
+                assert_eq!(rollback["params"]["beforeTurnId"], "cancelled-turn");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"thread/reverted","params":{"threadId":"compaction-thread"}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":rollback["id"],"result":{"thread":{"turns":[]}}}).to_string().into())).await.unwrap();
+                let verify: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(verify["method"], "thread/read");
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":verify["id"],"result":{"thread":{"turns":[]}}}).to_string().into())).await.unwrap();
+                socket
+            });
+            assert_eq!(
+                provider.input_retract(operation, &session.binding.id, request).await.unwrap(),
+                forge_provider_api::InputRetractOutcome::Retracted { boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap() }
+            );
+            assert!(!session.is_fenced());
+            assert!(!session.invalidated.load(Ordering::Acquire));
+            assert!(session.close_failure.lock().await.is_none());
+            let _socket = wire.await.unwrap();
+            let _ = session.rpc.lock().await.close().await;
+        }).await.unwrap();
+    }
+
+    /// A Codex no-active-turn rejection keeps the interrupt pending without fencing, while any
+    /// other interrupt failure is a cleanup error.
+    #[test]
+    fn interrupt_rejection_keeps_the_interrupt_pending() {
+        let rejection = ProviderError::from(
+            ProviderFailure::new(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Rejected,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Unchanged,
+            ),
+        );
+        assert!(interrupt_found_no_active_turn(&rejection));
+        let mut errors = Vec::new();
+        let mut retry = false;
+        record_interrupt_attempt(Ok(NativeInterrupt::NotActive), &mut retry, &mut errors);
+        assert!(retry && errors.is_empty());
+        retry = false;
+        record_interrupt_attempt(Ok(NativeInterrupt::Delivered), &mut retry, &mut errors);
+        assert!(!retry && errors.is_empty());
+        let transport = failure(
+            ProviderOperation::TurnInterrupt,
+            ProviderFailureKind::Transport,
+        );
+        assert!(!interrupt_found_no_active_turn(&transport));
+        record_interrupt_attempt(Err(transport), &mut retry, &mut errors);
+        assert!(!retry && errors.len() == 1);
+    }
+
+    /// A native user item's client ID links back to the Forge submission that produced it.
+    #[test]
+    fn client_id_recovers_only_forge_submissions() {
+        let submission = forge_provider_api::SubmissionId::try_from("input").unwrap();
+        let attempt = forge_provider_api::DeliveryAttemptId::new("attempt").unwrap();
+        assert_eq!(
+            submission_from_client_id(&native_input_id(&submission, &attempt)),
+            Some(submission)
+        );
+        assert_eq!(submission_from_client_id("typed-in-another-client"), None);
+        assert_eq!(
+            submission_from_client_id(r#"["other","input","attempt"]"#),
+            None
+        );
     }
 
     /// Empty or mismatched native history cannot prove nonacceptance or authorize a resend.
@@ -7771,6 +9591,122 @@ mod continuation_tests {
         }
     }
 
+    /// Record dedicated child authority calls and fail if the root capability is substituted.
+    struct ChildCallbackAuthority {
+        parent: forge_provider_api::InvocationScope,
+        child: forge_provider_api::TurnAddress,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl ProviderPermissions for ChildCallbackAuthority {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            panic!("native child callback used root authorization")
+        }
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            panic!("native child callback used root checkpoint barrier")
+        }
+        async fn before_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+        ) -> Result<(), ProviderError> {
+            assert_eq!(parent, &self.parent);
+            assert_eq!(child, &self.child);
+            self.calls.lock().unwrap().push("before");
+            Ok(())
+        }
+        async fn authorize_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            assert_eq!(parent, &self.parent);
+            assert_eq!(child, &self.child);
+            self.calls.lock().unwrap().push("authorize");
+            PermissionResponse::Allow
+        }
+    }
+
+    #[async_trait]
+    impl ProviderTools for ChildCallbackAuthority {
+        async fn call(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: ToolCall,
+        ) -> Result<String, ProviderError> {
+            panic!("native child callback used root tool capability")
+        }
+        async fn call_observed_child(
+            &self,
+            parent: &forge_provider_api::InvocationScope,
+            child: &forge_provider_api::TurnAddress,
+            call: ToolCall,
+        ) -> Result<String, ProviderError> {
+            assert_eq!(parent, &self.parent);
+            assert_eq!(child, &self.child);
+            assert_eq!(call.id.as_str(), "original-child-call");
+            self.calls.lock().unwrap().push("call");
+            Ok("child effect".into())
+        }
+    }
+
+    /// Route an actual native callback to the original child and deny absent, retired, or successor scope.
+    #[tokio::test]
+    async fn native_child_host_callback_never_borrows_root_or_successor_authority() {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_, session, _events, mut socket) = compaction_fixture().await;
+            let mut request = request();
+            let child = {
+                let mut normalization = session.normalization.lock().await;
+                normalization.admit_turn("compaction-thread", "parent", &request.scope).unwrap();
+                for message in [
+                    json!({"method":"item/completed","params":{"threadId":"compaction-thread","turnId":"parent","item":{"type":"subAgentActivity","id":"delegation","kind":"started","agentThreadId":"native-child"}}}),
+                    json!({"method":"turn/started","params":{"threadId":"native-child","turn":{"id":"child-turn"}}}),
+                    json!({"method":"turn/completed","params":{"threadId":"compaction-thread","turn":{"id":"parent","status":"completed"}}}),
+                ] {
+                    normalization.normalize(&message, &mut super::super::normalization::CodexOutput::default(), None, "").await.unwrap();
+                }
+                let starts = normalization.take_observed_starts();
+                starts.into_iter().find(|(_, thread, _, _)| thread == "native-child").unwrap().0
+            };
+            let authority = Arc::new(ChildCallbackAuthority { parent: request.scope.clone(), child, calls: std::sync::Mutex::new(Vec::new()) });
+            request.permissions = authority.clone(); request.provider_tools = authority.clone();
+            request.tools.push(forge_provider_api::control::ControlToolDefinition { name:"lsp_rename", description:"fixture", input_schema:json!({}) });
+            let message = json!({"id":10,"method":"item/tool/call","params":{"threadId":"native-child","turnId":"child-turn","callId":"original-child-call","tool":"lsp_rename","arguments":{}}});
+            handle_native_request(&session, &request, &message).await.unwrap();
+            let response: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(response["result"]["success"], true);
+            assert_eq!(*authority.calls.lock().unwrap(), ["before","authorize","call"]);
+            let mut successor = request.clone();
+            successor.scope = forge_provider_api::InvocationScope::new(request.scope.owner.clone(), "successor");
+            for (active, envelope) in [(&successor, message.clone()), (&request, json!({"id":11,"method":"item/tool/call","params":{"callId":"original-child-call","tool":"lsp_rename","arguments":{}}}))] {
+                handle_native_request(&session, active, &envelope).await.unwrap();
+                let denied: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert!(denied.get("error").is_some());
+            }
+            session.callback_requests.lock().await.insert(request.scope.clone(), request.clone());
+            handle_native_request(&session, &successor, &message).await.unwrap();
+            let original: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(original["result"]["success"], true, "retained child must use its original request during a successor");
+            session.normalization.lock().await.normalize(&json!({"method":"turn/completed","params":{"threadId":"native-child","turn":{"id":"child-turn","status":"completed"}}}), &mut super::super::normalization::CodexOutput::default(), None, "").await.unwrap();
+            handle_native_request(&session, &request, &message).await.unwrap();
+            let denied: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert!(denied.get("error").is_some());
+            assert_eq!(*authority.calls.lock().unwrap(), ["before","authorize","call","before","authorize","call"]);
+            session.rpc.lock().await.close().await.unwrap();
+        }).await.unwrap();
+    }
+
     struct FixtureAuthority;
 
     impl forge_provider_api::ProviderTrace for FixtureAuthority {
@@ -7803,7 +9739,7 @@ mod continuation_tests {
             _: ToolCall,
         ) -> Result<String, ProviderError> {
             Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Rejected,
             ))
         }
@@ -7888,21 +9824,21 @@ mod continuation_tests {
 
     fn request() -> PromptRequest {
         let authority = Arc::new(FixtureAuthority);
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ThreadOwner::root("continuation-test"),
+            "invocation",
+        );
         let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
             forge_provider_api::BindingId::new("binding").unwrap(),
-            forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("continuation-test"),
-                "invocation",
-            ),
+            scope.clone(),
             forge_provider_api::SubmissionId::try_from("submission").unwrap(),
             forge_provider_api::DeliveryAttemptId::new("attempt").unwrap(),
         );
         PromptRequest {
             dispatch,
-            scope: forge_provider_api::InvocationScope::new(
-                forge_provider_api::ExecutionOwner::root("continuation-test"),
-                "invocation",
-            ),
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
             mode: forge_provider_api::input::PromptMode::Chat,
             configuration: InvocationConfiguration {
                 model: ModelSelection::default(),

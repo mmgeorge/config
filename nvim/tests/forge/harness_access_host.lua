@@ -10,19 +10,24 @@ vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and 
 package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = executable }) return function() end end }
 local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
-local operation, starts, current_session = {}, 0, nil
-local model_frames, original_refresh = {}, nil
+local starts, current_session = 0, nil
+local model_frames, original_refresh, original_transition = {}, nil, nil
+-- Task commands complete through `forge.command`, which publishes no Lua operation state, so the
+-- fixture counts controller transitions between dispatch and their settled callback.
+local transitions = { in_flight = 0, completed = 0 }
 client.session_events_subscribe(function(event, payload)
-  if event == "task_operation" then operation[payload.id] = payload end
   if event == "provider_event" and payload.kind == "turn_started" then starts = starts + 1 end
-  if event == "session_configured" then current_session = payload.session or payload end
+  if event == "session_configured" then current_session = payload.snapshot.session end
 end)
 local function await(predicate, message)
   local settled = vim.wait(10000, predicate, 10)
   local state = require("forge.session").harness
   assert(settled, message .. " " .. vim.inspect({
-    operation = operation, access = state.access_abbreviation,
-    approval_mode = state.session and state.session.approval_mode, task_operation = state.task_operation,
+    transitions = transitions, starts = starts, access = state.access_abbreviation,
+    approval_mode = state.session and state.session.approval_mode, activity = state.activity,
+    task = state.session and state.session.active_task and {
+      status = state.session.active_task.status, revision = state.session.active_task.revision,
+    },
   }))
 end
 local function request(session_id, method, params)
@@ -66,6 +71,15 @@ local success, failure = xpcall(function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
   local startup_frames = {}
+  original_transition = controller.task_transition
+  controller.task_transition = function(action, submitted_text, completed, method)
+    transitions.in_flight = transitions.in_flight + 1
+    return original_transition(action, submitted_text, function(applied)
+      transitions.in_flight = transitions.in_flight - 1
+      transitions.completed = transitions.completed + 1
+      if completed then completed(applied) end
+    end, method)
+  end
   original_refresh = controller.refresh_winbar
   controller.refresh_winbar = function(...)
     original_refresh(...)
@@ -86,12 +100,18 @@ local success, failure = xpcall(function()
     end
   end
   assert(pending_seen, "host startup did not capture the first frame")
-  await(function() return state.session.resolved_model == "mock-model" end, "initial model cache seed")
+  -- Only a provider's Turn.ModelResolved confirms the actual model, so an idle default stays unknown.
+  assert(state.session.model == "default" and state.session.resolved_model == nil,
+    "idle startup claimed an unconfirmed model: " .. tostring(state.session.resolved_model))
   for _, approval in ipairs({ "allow", "ask", "allow", "ask" }) do
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/yolo" })
     controller.submit()
-    await(function() return not state.task_operation and not state.busy end, "idle YOLO toggle")
-    assert(state.access_abbreviation == "rxwx" and state.session.approval_mode == approval)
+    -- Command completion and the session_configured publication are separate events, so await
+    -- the published policy rather than the command response alone.
+    await(function()
+      return transitions.in_flight == 0 and not require("forge.views.harness.activity").busy(state)
+        and state.access_abbreviation == "rxwx" and state.session.approval_mode == approval
+    end, "idle YOLO toggle to " .. approval)
     assert(state.session.access.sandbox == false, "unsupported provider enabled sandbox on YOLO exit")
     assert_configuration_presentation(state)
     assert(request(session_id, "session.task.get", {}) == nil and starts == 0, "YOLO toggle created work")
@@ -100,14 +120,14 @@ local success, failure = xpcall(function()
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { command })
     controller.submit()
     assert_configuration_presentation(state)
-    await(function() return not state.task_operation and not state.busy end, command)
+    await(function() return transitions.in_flight == 0 and not require("forge.views.harness.activity").busy(state) end, command)
     assert(request(session_id, "session.task.get", {}) == nil, "configuration created a workflow")
     assert(starts == 0, "idle configuration started provider work")
   end
   model_frames = {}
   local idle_applied
   controller.configure({ effort = "high" }, function(value) idle_applied = value end)
-  await(function() return idle_applied and not state.task_operation and not state.busy end, "idle model configuration")
+  await(function() return idle_applied and transitions.in_flight == 0 and not require("forge.views.harness.activity").busy(state) end, "idle model configuration")
   assert_model_frames(false)
   local initial_response = mock.hold(session_id)
   require("forge.views.harness.controller").task_transition({ action = "goal", text = "Continue until interrupted" })
@@ -115,20 +135,26 @@ local success, failure = xpcall(function()
   assert(pending.prompt:find("Continue until interrupted", 1, true), "held a different goal")
   await(function() return starts == 1 end, "goal start")
   local access = { sandbox = false, read_access = "workspace", write_access = "workspace",
-    readable_directory = { data }, writable_directory = { workspace }, isolation_mode = "elevated" }
+    readable_directory = { data }, writable_directory = { workspace } }
   local applied
   model_frames = {}
+  -- Each restarted goal turn needs its own held response; an unheld mock turn completes at once,
+  -- and the goal would continue on its own until the no-progress limit blocks it.
+  local restart_hold = mock.hold(session_id)
   require("forge.views.harness.controller").configure({ access = access, effort = "low" }, function(value) applied = value end)
   assert_configuration_presentation(state)
   await(function() return starts == 2 end, "configuration did not resume goal")
+  restart_hold:wait()
   assert(applied == true and state.session.access.sandbox == false, "configuration waited for goal completion")
   assert_model_frames(true)
   assert(current_session.access.sandbox == false and #current_session.access.writable_directory == 1)
   assert(current_session.access.read_access == "workspace" and #current_session.access.readable_directory == 1)
   assert(current_session.approval_mode == "ask")
   local task_id = current_session.active_task.revision
+  restart_hold = mock.hold(session_id)
   require("forge.views.harness.controller").toggle_write()
   await(function() return starts == 3 end, "Read approval mode paused the task")
+  restart_hold:wait()
   assert(current_session.approval_mode == "ask" and current_session.access.write_access == "off" and current_session.access.sandbox == false)
   assert(current_session.active_task.revision == task_id)
   for index, step in ipairs({
@@ -141,17 +167,22 @@ local success, failure = xpcall(function()
     { "/yolo", "rxwx", "allow" },
     { "/write", "rx", "allow" },
   }) do
+    restart_hold = mock.hold(session_id)
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { step[1] })
     controller.submit()
     assert_configuration_presentation(state)
-    await(function() return starts == index + 3 and state.access_abbreviation == step[2] end, step[1])
-    assert(state.session.approval_mode == step[3] and state.session.active_task.revision == task_id)
+    await(function()
+      return starts == index + 3 and state.access_abbreviation == step[2] and state.session.approval_mode == step[3]
+    end, step[1])
+    restart_hold:wait()
+    assert(state.session.active_task.revision == task_id, step[1] .. " replaced the running task revision: "
+      .. vim.inspect({ before = task_id, current = state.session.active_task }))
     assert(state.session.access.sandbox == false, "policy command changed sandbox selection")
   end
-  request(session_id, "session.command.apply", { operation_id = "pause", action = "pause" })
-  await(function() return operation.pause and operation.pause.state == "completed" end, "pause")
+  -- The request settles only after the command's committed outcome.
+  request(session_id, "session.command.apply", { operation_id = require("forge.command").identity(), action = "pause" })
   request(session_id, "session.turn.cancel", {})
-  await(function() return not state.busy end, "paused provider cleanup")
+  await(function() return not require("forge.views.harness.activity").busy(state) end, "paused provider cleanup")
   local paused_task = request(session_id, "session.task.get", {})
   assert(paused_task.revision ~= task_id and paused_task.goal.state == "paused", "pause did not renew the task revision")
   task_id = paused_task.revision
@@ -159,25 +190,20 @@ local success, failure = xpcall(function()
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
     controller.submit()
   end
-  local previous_operations = {}
-  for id in pairs(operation) do previous_operations[id] = true end
+  local previous_completed = transitions.completed
   submit("/write full")
   submit("/ask")
   await(function()
-    local completed = 0
-    for id, current in pairs(operation) do
-      if not previous_operations[id] and current.state == "completed" then completed = completed + 1 end
-    end
-    return completed == 2
+    return transitions.completed - previous_completed == 2 and transitions.in_flight == 0
   end, "rapid permission operations did not settle")
-  local observed = request(session_id, "session.state.get", {})
+  local observed = dofile(root .. "/nvim/tests/forge/support/state.lua").get()
   assert(state.access_abbreviation == "rxwx" and state.session.approval_mode == "ask",
     "rapid independent permission changes: " .. vim.inspect({
       displayed = state.access_abbreviation, persisted = observed.access_abbreviation,
       access = observed.session.access, approval = observed.session.approval_mode,
     }))
   for _ = 1, 4 do submit("/write") end
-  await(function() return state.access_abbreviation == "rxw" and not state.task_operation end,
+  await(function() return state.access_abbreviation == "rxw" and transitions.in_flight == 0 end,
     "rapid write toggles were lost or restored full access")
   local paused = require("forge.views.harness.task").current(state)
   assert(paused.revision == task_id and require("forge.views.harness.task").status(paused) == "paused",
@@ -186,19 +212,19 @@ local success, failure = xpcall(function()
   model_frames = {}
   local paused_applied
   controller.configure({ effort = "high" }, function(value) paused_applied = value end)
-  await(function() return paused_applied and not state.task_operation and not state.busy end, "paused model configuration")
+  await(function() return paused_applied and transitions.in_flight == 0 and not require("forge.views.harness.activity").busy(state) end, "paused model configuration")
   assert_model_frames(false)
   submit("/yolo")
   submit("/yolo")
   await(function() return state.access_abbreviation == "rxwx" and state.session.approval_mode == "ask"
-    and not state.task_operation end, "paused YOLO toggles")
+    and transitions.in_flight == 0 end, "paused YOLO toggles")
   assert(state.session.access.sandbox == false)
   assert(require("forge.views.harness.task").status(require("forge.views.harness.task").current(state)) == "paused", "YOLO exit resumed paused work")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Queued after the current task" })
   controller.queue_submit()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Unsubmitted draft" })
   controller.toggle_write()
-  await(function() return state.access_abbreviation == "rx" and not state.task_operation end, "draft-safe write toggle")
+  await(function() return state.access_abbreviation == "rx" and transitions.in_flight == 0 end, "draft-safe write toggle")
   assert(#state.queue == 1 and state.queue[1].text == "Queued after the current task")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "Unsubmitted draft")
   local resumed_response = mock.hold(session_id)
@@ -214,7 +240,7 @@ local success, failure = xpcall(function()
   request(session_id, "session.turn.cancel", {})
   await(function()
     local current = require("forge.views.harness.task").current(state)
-    return not state.task_operation and not state.busy and current and require("forge.views.harness.task").status(current) == "paused"
+    return transitions.in_flight == 0 and not require("forge.views.harness.activity").busy(state) and current and require("forge.views.harness.task").status(current) == "paused"
   end, "pause held response")
   assert(require("forge.views.harness.task").status(require("forge.views.harness.task").current(state)) == "paused")
   task_id = state.session.active_task.revision
@@ -236,10 +262,12 @@ local success, failure = xpcall(function()
     "recovery did not preserve and fence the paused goal: " .. vim.inspect(recovered_task))
   local created = request(session_id, "session.new", { name = "Cached default" })
   assert(created.session.id ~= session_id and created.session.model == "default")
-  assert(created.session.resolved_model == "mock-model", "new conversation waited for another model catalog lookup: "
+  -- A new conversation has run no turn, so it must not inherit another session's confirmed model.
+  assert(created.session.resolved_model == nil, "new conversation inherited an unconfirmed model: "
     .. vim.inspect({ recovered = recovered.session.resolved_model, created = created.session.resolved_model }))
 end, debug.traceback)
 if original_refresh then require("forge.views.harness.controller").refresh_winbar = original_refresh end
+if original_transition then require("forge.views.harness.controller").task_transition = original_transition end
 local state = require("forge.session").harness
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

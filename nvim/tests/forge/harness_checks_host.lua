@@ -6,7 +6,8 @@ local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -17,31 +18,34 @@ local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
-local answered = {}
+local approval = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/approval.lua")
+local responder = approval.responder()
 local configuration_reviews = 0
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
 end
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
+local function answer_approvals()
+  approval.answer_pending(responder, function(pending)
+    for _, target in ipairs(pending.targets) do
+      if target.title == "Update project checks" then
+        configuration_reviews = configuration_reviews + 1
+        assert(target.detail:find(".forge.json", 1, true), "configuration review omitted changes")
+      end
+    end
+  end)
+end
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua. Polling loops read state
+  -- before other requests, so answer pending approvals here too or polling never unblocks them.
+  if method == "session.state.get" then
+    answer_approvals()
+    return state_snapshot.get()
+  end
   local settled, value, failure
   client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(result, error) value, failure, settled = result, error, true end)
   assert(vim.wait(10000, function()
-    for _, approval in ipairs(state.approval or {}) do
-      if not answered[approval.id] then
-        answered[approval.id] = true
-        for _, item in ipairs(approval.item_list) do
-          if item.title == "Update project checks" then
-            configuration_reviews = configuration_reviews + 1
-            assert(item.detail:find(".forge.json", 1, true), "configuration review omitted changes")
-          end
-        end
-        local answers = {}
-        for _, item in ipairs(approval.item_list) do answers[#answers + 1] = {item_id = item.id, choice_id = "allow_once"} end
-        client.request({ method = "session.approval.resolve", params = {approval_id = approval.id, answer_list = answers}, session_id = assert(require("forge.session").harness.session).id }, function(_, error)
-          assert(not error, tostring(error))
-        end)
-      end
-    end
+    answer_approvals()
     return settled
   end, 10), method .. " timeout")
   assert(not failure, method .. ": " .. tostring(failure))

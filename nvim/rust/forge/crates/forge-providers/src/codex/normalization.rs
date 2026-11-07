@@ -1,1180 +1,2071 @@
 use super::decode::*;
 use anyhow::Result;
 use forge_provider_api::agent::{
-    AgentId as ProviderAgentId, AgentLifecycleEvent, AgentLifecycleKind,
+    AgentActiveState, AgentDelegation, AgentDescription, AgentEvent, AgentLifecycleEvent,
 };
 use forge_provider_api::compaction::CompactionResult;
-use forge_provider_api::completion::ProviderOutput;
+
 use forge_provider_api::*;
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Classify terminal status once for transcript and retained native execution.
+pub(super) fn terminal_outcome(
+    turn: &Value,
+) -> std::result::Result<forge_provider_api::turn::TurnOutcome, ProviderError> {
+    use forge_provider_api::turn::{TurnCompletionReason, TurnOutcome};
+    match turn.get("status").and_then(Value::as_str) {
+        Some("completed") => Ok(TurnOutcome::Completed {
+            stop_reason: TurnCompletionReason::Normal,
+        }),
+        Some("interrupted" | "cancelled") => Ok(TurnOutcome::Interrupted),
+        Some("failed") => Ok(TurnOutcome::Failed {
+            error: ProviderFailure::new(
+                ProviderOperation::TurnStart,
+                turn.get("error")
+                    .map_or(ProviderFailureKind::Unknown, super::retry::failure_kind),
+            )
+            .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain),
+            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+        }),
+        Some(_) | None => Err(protocol_error()),
+    }
+}
+
+/// Validate every supplied spelling of one native error identity before resolving ownership.
+fn error_identity(
+    params: &Value,
+    paths: &[&str],
+) -> std::result::Result<Option<String>, ProviderError> {
+    let mut identity = None;
+    for path in paths {
+        match params.pointer(path) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) if !value.trim().is_empty() => {
+                if identity.as_ref().is_some_and(|retained| retained != value) {
+                    return Err(protocol_error());
+                }
+                identity = Some(value.clone());
+            }
+            Some(
+                Value::String(_)
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_),
+            ) => return Err(protocol_error()),
+        }
+    }
+    Ok(identity)
+}
+
 fn protocol_error() -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(
-        ProviderOperation::InputSubmit,
+        ProviderOperation::TurnStart,
         ProviderFailureKind::Protocol,
     ))
 }
 
+/// Collect decoded activity before ordered delivery to the retained host owner.
+#[derive(Default)]
+pub(super) struct CodexOutput {
+    pub(super) event: Vec<AdapterActivity>,
+}
+
+/// Map native protocol identities to normalized host objects under exact retained owners.
 #[derive(Default)]
 pub struct CodexNormalization {
     scope: Option<EventScope>,
-    turn_owners: HashMap<(String, ProviderTurnId), InvocationScope>,
-    message: HashMap<MessageAddress, NativeMessage>,
-    tool: HashMap<ToolAddress, NativeTool>,
-    checklist: HashMap<(TurnAddress, String), ProviderChecklistUpdate>,
+    threads: HashMap<String, ThreadOwner>,
+    turns: HashMap<(String, String), TurnAddress>,
+    items: HashMap<(TurnId, String, ItemPart), NativeItem>,
+    pending_child: HashMap<String, Vec<Value>>,
+    observed_starts: Vec<(TurnAddress, String, String, i64)>,
+    /// Native `(thread, turn)` cycles that carried a host session operation, such as
+    /// manual compaction. They own no host invocation, so late notifications for them
+    /// contribute only thread-level facts.
+    operation_turns: std::collections::HashSet<(String, String)>,
+    terminal: HashMap<TurnId, (forge_provider_api::turn::TurnOutcome, i64)>,
+    usage: HashMap<TurnId, Vec<TurnUsageReport>>,
+    /// Native thread → the turn that owns its latest cumulative usage key. Codex
+    /// repeats the previous call's `last` breakdown with an unchanged cumulative
+    /// total when a later turn ends before any model call completes.
+    thread_usage: HashMap<String, (TurnId, String)>,
+    models: HashMap<TurnId, ModelId>,
+    unresolved_sessions: std::collections::HashSet<TurnId>,
+    agents: HashMap<String, forge_provider_api::AgentId>,
+    pending_agents: HashMap<(TurnId, String), forge_provider_api::AgentId>,
+    delegations: HashMap<String, AgentDelegation>,
+    /// Native thread → compaction notifications observed on it. Compaction rebuilds model-visible
+    /// history, so context the adapter appended earlier may no longer reach the model.
+    compaction_counts: HashMap<String, u64>,
     pub replay_sensitive: bool,
 }
 
-#[derive(Default)]
-struct NativeMessage {
-    role: Option<MessageRole>,
-    text: String,
-    published: bool,
-    completed: bool,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ItemPart {
+    Message,
+    Summary(u64),
+    Reasoning(u64),
+    Tool,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum NativeToolLifetime {
+/// Retain a positively established background item's immutable host owner for native collection.
+pub(super) struct BackgroundItemAddress {
+    turn: TurnAddress,
+    item_id: ItemId,
+}
+
+/// Preserve positive native unified-exec ownership separately from independent lifetime proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeItemLifetime {
     Foreground,
+    UnifiedExec { process_id: String },
     Background,
+    NativeExited,
+    UnobservableProcess,
 }
 
-struct NativeTool {
-    title: String,
-    terminal: bool,
-    lifetime: NativeToolLifetime,
-    kind: ToolActivityKind,
-    has_changes: bool,
-    request: NativeToolRequest,
+/// Retain exact callback routing without substituting the active root for a native child.
+pub(super) enum NativeCallbackOwner {
+    Root,
+    ObservedChild(TurnAddress),
 }
 
-#[derive(Default)]
-struct NativeToolRequest {
-    name: Option<Value>,
-    namespace: Option<Value>,
-    arguments: Option<Value>,
-    command: Option<Value>,
-    cwd: Option<Value>,
-    item_type: Option<Value>,
+struct NativeItem {
+    id: ItemId,
+    start: ItemStart,
+    text: String,
+    completed: Option<String>,
+    lifetime: NativeItemLifetime,
+    descriptor: Option<forge_provider_api::tool::ToolDescriptor>,
+    output: String,
+    changes: ProviderChangeSet,
 }
 
-impl NativeToolRequest {
-    /// Reject contradictions in supplied request fields while accepting sparse progress events.
-    fn observe(&mut self, params: &Value) -> Result<()> {
-        let envelope = params.get("update").unwrap_or(params);
-        let item = envelope.get("item").unwrap_or(envelope);
-        let supplied = Self {
-            name: item
-                .get("tool")
-                .or_else(|| item.get("name"))
-                .or_else(|| item.get("toolName"))
-                .or_else(|| item.get("tool_name"))
-                .filter(|value| !value.is_null())
-                .cloned(),
-            namespace: item
-                .get("server")
-                .or_else(|| item.get("namespace"))
-                .filter(|value| !value.is_null())
-                .cloned(),
-            arguments: item.get("arguments").cloned(),
-            command: item
-                .get("command")
-                .or_else(|| envelope.get("command"))
-                .filter(|value| !value.is_null())
-                .cloned(),
-            cwd: item
-                .get("cwd")
-                .or_else(|| envelope.get("cwd"))
-                .filter(|value| !value.is_null())
-                .cloned(),
-            item_type: item.get("type").filter(|value| !value.is_null()).cloned(),
-        };
-        for (previous, current) in [
-            (&self.name, &supplied.name),
-            (&self.namespace, &supplied.namespace),
-            (&self.arguments, &supplied.arguments),
-            (&self.command, &supplied.command),
-            (&self.cwd, &supplied.cwd),
-            (&self.item_type, &supplied.item_type),
-        ] {
-            if let (Some(previous), Some(current)) = (previous, current)
-                && previous != current
-            {
-                return Err(protocol_error().into());
-            }
-        }
-        self.name = self.name.take().or(supplied.name);
-        self.namespace = self.namespace.take().or(supplied.namespace);
-        self.arguments = self.arguments.take().or(supplied.arguments);
-        self.command = self.command.take().or(supplied.command);
-        self.cwd = self.cwd.take().or(supplied.cwd);
-        self.item_type = self.item_type.take().or(supplied.item_type);
-        Ok(())
+impl NativeItem {
+    /// Report whether Forge closed this tool itself, at turn end or background
+    /// teardown, rather than from a native terminal snapshot. Native completions
+    /// record their non-empty JSON signature; `finish_tool` records an empty one.
+    fn completion_synthesized(&self) -> bool {
+        self.completed.as_deref() == Some("")
+            && !matches!(
+                self.start,
+                ItemStart::UserMessage(_) | ItemStart::AgentMessage(_) | ItemStart::Reasoning(_)
+            )
     }
 }
 
 impl CodexNormalization {
-    /// Bind new admission while preserving known native identities from the same owner.
+    /// Get the number of compaction notifications observed on one native thread.
+    pub(super) fn compaction_count(&self, native_thread: &str) -> u64 {
+        self.compaction_counts
+            .get(native_thread)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Bind the next admitted operation without reassigning retained native objects.
     pub fn bind(&mut self, scope: Option<impl Into<EventScope>>) {
-        let scope = scope.map(Into::into);
-        if let Some(scope) = &scope {
-            self.turn_owners
-                .retain(|_, owner| &owner.owner == scope.owner());
-            self.message
-                .retain(|address, _| &address.turn.scope.owner == scope.owner());
-            self.checklist
-                .retain(|(address, _), _| &address.scope.owner == scope.owner());
-            self.tool
-                .retain(|address, _| &address.turn.scope.owner == scope.owner());
-        }
-        self.scope = scope;
+        self.scope = scope.map(Into::into);
         self.replay_sensitive = false;
     }
 
-    /// Normalize only native turns already bound to an original invocation.
+    /// Register a positively established native conversation with its independent host owner.
+    pub(super) fn admit_thread(
+        &mut self,
+        native: &str,
+        owner: &ThreadOwner,
+    ) -> std::result::Result<(), ProviderError> {
+        if native.trim().is_empty() || self.threads.get(native).is_some_and(|old| old != owner) {
+            return Err(protocol_error());
+        }
+        self.threads.insert(native.to_owned(), owner.clone());
+        Ok(())
+    }
+
+    /// Allocate one host turn identity for the acknowledged native response cycle.
+    pub(super) fn admit_turn(
+        &mut self,
+        thread: &str,
+        native_turn: &str,
+        scope: &InvocationScope,
+    ) -> std::result::Result<TurnAddress, ProviderError> {
+        self.admit_thread(thread, &scope.owner)?;
+        if native_turn.trim().is_empty() {
+            return Err(protocol_error());
+        }
+        let key = (thread.to_owned(), native_turn.to_owned());
+        if let Some(old) = self.turns.get(&key) {
+            if &old.scope != scope {
+                return Err(protocol_error());
+            }
+            return Ok(old.clone());
+        }
+        let address = TurnAddress {
+            scope: scope.clone(),
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().map_err(|_| protocol_error())?,
+        };
+        self.turns.insert(key, address.clone());
+        Ok(address)
+    }
+
+    /// Identify a native turn that a host session operation, not an invocation, owns.
+    fn operation_turn(&self, params: &Value) -> bool {
+        let Some(thread) = pointer_string(params, &["/threadId", "/thread_id"]) else {
+            return false;
+        };
+        pointer_string(params, &["/turnId", "/turn_id", "/turn/id"])
+            .is_some_and(|turn| self.operation_turns.contains(&(thread, turn)))
+    }
+
+    /// Identify a compaction item by the bound host operation when it compacts that
+    /// operation's thread, so host attempt and native progress settle one record.
+    fn compaction_id(
+        &self,
+        thread: &ThreadOwner,
+        params: &Value,
+    ) -> std::result::Result<String, ProviderError> {
+        if let Some(EventScope::SessionOperation {
+            owner,
+            operation_id,
+        }) = &self.scope
+            && owner == thread
+        {
+            return Ok(operation_id.as_str().to_owned());
+        }
+        pointer_string(params, &["/item/id"]).ok_or_else(protocol_error)
+    }
+
+    /// Transfer positively observed child starts to their common retained lifecycle owner.
+    pub(super) fn take_observed_starts(&mut self) -> Vec<(TurnAddress, String, String, i64)> {
+        std::mem::take(&mut self.observed_starts)
+    }
+
+    /// Check a native child thread against its retained trusted registration.
+    pub(super) fn owns_child_thread(&self, native: &str) -> bool {
+        self.agents.contains_key(native) && self.threads.contains_key(native)
+    }
+
+    /// Resolve explicit native callback identities through their original admitted ancestry.
+    pub(super) fn callback_owner(
+        &self,
+        params: &Value,
+        parent: &InvocationScope,
+    ) -> std::result::Result<NativeCallbackOwner, ProviderError> {
+        let thread = error_identity(
+            params,
+            &[
+                "/threadId",
+                "/thread_id",
+                "/turn/threadId",
+                "/turn/thread_id",
+            ],
+        )?
+        .ok_or_else(protocol_error)?;
+        let turn = error_identity(params, &["/turnId", "/turn_id", "/turn/id"])?
+            .ok_or_else(protocol_error)?;
+        let address = self
+            .turns
+            .get(&(thread.clone(), turn))
+            .ok_or_else(protocol_error)?;
+        if self.terminal.contains_key(&address.turn_id) {
+            return Err(protocol_error());
+        }
+        if &address.scope == parent {
+            return Ok(NativeCallbackOwner::Root);
+        }
+        let mut ancestor_thread = thread;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            let delegation = self
+                .delegations
+                .get(&ancestor_thread)
+                .ok_or_else(protocol_error)?;
+            let ((native_thread, _), ancestor) = self
+                .turns
+                .iter()
+                .find(|(_, candidate)| {
+                    candidate.thread_id == delegation.parent_thread_id
+                        && candidate.turn_id == delegation.parent_turn_id
+                })
+                .ok_or_else(protocol_error)?;
+            if &ancestor.scope == parent {
+                return Ok(NativeCallbackOwner::ObservedChild(address.clone()));
+            }
+            if ancestor.scope.owner.is_root() || !visited.insert(ancestor.turn_id.clone()) {
+                return Err(protocol_error());
+            }
+            ancestor_thread = native_thread.clone();
+        }
+    }
+
+    /// Get the native terminal outcome retained before any provider collection waits.
+    pub(super) fn terminal_evidence(
+        &self,
+        address: &TurnAddress,
+    ) -> Option<(forge_provider_api::turn::TurnOutcome, i64)> {
+        self.terminal.get(&address.turn_id).copied()
+    }
+
+    /// Publish a newly confirmed model under the original turn while deduplicating identical replay.
+    pub(super) fn resolve_model(
+        &mut self,
+        address: &TurnAddress,
+        model: ResolvedModel,
+    ) -> Option<AdapterActivity> {
+        if self.models.get(&address.turn_id) == Some(&model.model_id) {
+            return None;
+        }
+        self.models
+            .insert(address.turn_id.clone(), model.model_id.clone());
+        Some(AdapterActivity::Turn {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            event: TurnMetadataEvent::ModelResolved(model),
+        })
+    }
+
+    /// Identify native terminal evidence whose command lifetime remains unobservable.
+    pub(super) fn has_unresolved_sessions(&self, address: &TurnAddress) -> bool {
+        self.unresolved_sessions.contains(&address.turn_id)
+    }
+
+    /// Get identified accounting retained for the original response cycle.
+    pub(super) fn final_usage(&self, address: &TurnAddress) -> Vec<TurnUsageReport> {
+        self.usage
+            .get(&address.turn_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Resolve a normalized activity to its retained native owner's writer scope.
+    pub(super) fn activity_address(&self, activity: &AdapterActivity) -> Option<TurnAddress> {
+        let (thread, turn) = match activity {
+            AdapterActivity::Turn {
+                thread_id, turn_id, ..
+            }
+            | AdapterActivity::Item {
+                thread_id, turn_id, ..
+            } => (thread_id, Some(turn_id)),
+            AdapterActivity::Thread { thread_id, .. } => (thread_id, None),
+            AdapterActivity::Agent { .. } | AdapterActivity::Warning(_) => return None,
+        };
+        self.turns
+            .values()
+            .find(|address| {
+                &address.thread_id == thread && turn.is_none_or(|turn| &address.turn_id == turn)
+            })
+            .cloned()
+    }
+
+    /// Resolve only previously admitted native turns; current admission never supplies missing ownership.
+    fn address(&self, params: &Value) -> Option<TurnAddress> {
+        let thread = pointer_string(
+            params,
+            &[
+                "/threadId",
+                "/thread_id",
+                "/turn/threadId",
+                "/turn/thread_id",
+            ],
+        )?;
+        if let Some(turn) = pointer_string(params, &["/turnId", "/turn_id", "/turn/id"]) {
+            return self.turns.get(&(thread, turn)).cloned();
+        }
+        if ["/turnId", "/turn_id", "/turn/id"]
+            .iter()
+            .any(|path| params.pointer(path).is_some())
+        {
+            return None;
+        }
+        let item = pointer_string(params, &["/itemId", "/item_id", "/item/id"])?;
+        let mut owners = self
+            .items
+            .iter()
+            .filter(|((_, native, part), value)| {
+                native == &item
+                    && *part == ItemPart::Tool
+                    && value.lifetime == NativeItemLifetime::Background
+            })
+            .filter_map(|((turn, _, _), _)| {
+                self.turns.iter().find_map(|((native_thread, _), address)| {
+                    (native_thread == &thread && &address.turn_id == turn)
+                        .then_some(address.clone())
+                })
+            });
+        let owner = owners.next()?;
+        if owners.any(|other| other != owner) {
+            return None;
+        }
+        Some(owner)
+    }
+
+    /// Route explicitly correlated native errors without inventing a turn from current work.
+    fn native_error(&self, params: &Value) -> std::result::Result<AdapterActivity, ProviderError> {
+        let thread = error_identity(params, &["/threadId", "/thread_id", "/thread/id"])?
+            .ok_or_else(protocol_error)?;
+        let error = ProviderFailure::new(
+            ProviderOperation::TurnStart,
+            super::retry::failure_kind(params.get("error").unwrap_or(params)),
+        )
+        .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain);
+        match error_identity(params, &["/turnId", "/turn_id", "/turn/id"])? {
+            Some(turn)
+                if !self
+                    .operation_turns
+                    .contains(&(thread.clone(), turn.clone())) =>
+            {
+                let address = self.turns.get(&(thread, turn)).ok_or_else(protocol_error)?;
+                Ok(AdapterActivity::Turn {
+                    thread_id: address.thread_id.clone(),
+                    turn_id: address.turn_id.clone(),
+                    event: TurnMetadataEvent::Error { error },
+                })
+            }
+            Some(_) | None => Ok(AdapterActivity::Thread {
+                thread_id: self
+                    .threads
+                    .get(&thread)
+                    .ok_or_else(protocol_error)?
+                    .thread_id(),
+                event: ThreadEvent::Error { error },
+            }),
+        }
+    }
+
+    /// Normalize late observations only for exact retained native ownership.
     pub async fn normalize_retained(
         &mut self,
         message: &Value,
         workspace: &str,
-    ) -> Result<Option<Vec<ProviderEvent>>> {
+    ) -> Result<Option<Vec<AdapterActivity>>> {
         let params = message.get("params").unwrap_or(&Value::Null);
-        let Some((thread_id, turn_id)) = Self::native_identity(params) else {
-            return Ok(None);
-        };
-        let Some(owner) = self.turn_owners.get(&(thread_id, turn_id)).cloned() else {
-            return Ok(None);
-        };
-        let previous = self.scope.replace(owner.into());
-        let replay_sensitive = self.replay_sensitive;
-        let mut output = ProviderOutput::default();
-        let result = self.normalize(message, &mut output, None, workspace).await;
-        self.scope = previous;
-        self.replay_sensitive = replay_sensitive;
-        result?;
-        Ok(Some(output.event))
-    }
-
-    fn native_identity(params: &Value) -> Option<(String, ProviderTurnId)> {
-        Some((
-            pointer_string(
-                params,
-                &[
-                    "/threadId",
-                    "/thread_id",
-                    "/turn/threadId",
-                    "/turn/thread_id",
-                ],
-            )?,
-            pointer_string(params, &["/turnId", "/turn_id", "/turn/id"])?.into(),
-        ))
-    }
-
-    /// Identify retained commands whose native updates can outlive foreground completion.
-    pub fn has_pending_background_tools(&self) -> bool {
-        self.tool
-            .values()
-            .any(|tool| tool.lifetime == NativeToolLifetime::Background && !tool.terminal)
-    }
-
-    /// Get exact admitted command owners that still require native shutdown evidence.
-    pub fn pending_background_addresses(&self) -> Vec<ToolAddress> {
-        self.tool
-            .iter()
-            .filter(|(_, tool)| tool.lifetime == NativeToolLifetime::Background && !tool.terminal)
-            .map(|(address, _)| address.clone())
-            .collect()
-    }
-
-    /// Settle only a still-pending command after native inventory proves its absence.
-    pub fn interrupt_background(&mut self, address: &ToolAddress) -> Option<ProviderEvent> {
-        let tool = self.tool.get_mut(address)?;
-        if tool.lifetime != NativeToolLifetime::Background || tool.terminal {
-            return None;
+        if message["method"]
+            .as_str()
+            .is_some_and(|method| method.eq_ignore_ascii_case("error"))
+        {
+            return Ok(Some(vec![self.native_error(params)?]));
         }
-        tool.terminal = true;
-        Some(ProviderEvent::Tool {
-            address: address.clone(),
-            update: ToolUpdate::Finished {
-                outcome: ToolOutcome::Interrupted,
-            },
-        })
+        if self.operation_turn(params) {
+            return self.activities(message, workspace).map(Some);
+        }
+        if self.address(params).is_none() && message["method"] != "turn/started" {
+            if message["method"]
+                .as_str()
+                .is_some_and(|method| method.to_ascii_lowercase().contains("tokenusage"))
+            {
+                return self.activities(message, workspace).map(Some);
+            }
+            self.defer_child(message);
+            return Ok(None);
+        }
+        if message["method"] == "turn/started"
+            && let Some(thread) = pointer_string(params, &["/threadId", "/thread_id"])
+        {
+            if self.address(params).is_none()
+                && self.threads.contains_key(&thread)
+                && !self.agents.contains_key(&thread)
+            {
+                return Err(protocol_error().into());
+            }
+            if !self.threads.contains_key(&thread) {
+                self.pending_child
+                    .entry(thread)
+                    .or_default()
+                    .push(message.clone());
+                return Ok(None);
+            }
+        }
+        self.activities(message, workspace).map(Some)
     }
 
-    /// Normalize only a previously admitted background tool under its original invocation.
+    /// Retain early child observations privately until native delegation establishes a trusted relationship.
+    pub(super) fn defer_child(&mut self, message: &Value) {
+        if let Some(thread) = pointer_string(
+            message.get("params").unwrap_or(&Value::Null),
+            &["/threadId", "/thread_id"],
+        ) {
+            self.pending_child
+                .entry(thread)
+                .or_default()
+                .push(message.clone());
+        }
+    }
+
+    /// Observe output for positively established independent background work.
     pub async fn normalize_background(
         &mut self,
         message: &Value,
         workspace: &str,
-    ) -> Result<Option<Vec<ProviderEvent>>> {
-        let method = message["method"].as_str().unwrap_or_default();
+    ) -> Result<Option<Vec<AdapterActivity>>> {
         let params = message.get("params").unwrap_or(&Value::Null);
-        if !is_tool_lifecycle_event(&method.to_ascii_lowercase(), params) {
+        let Some(address) = self.address(params) else {
+            return Ok(None);
+        };
+        let Some(item) = pointer_string(params, &["/itemId", "/item_id", "/item/id"]) else {
+            return Ok(None);
+        };
+        if !self
+            .items
+            .get(&(address.turn_id, item, ItemPart::Tool))
+            .is_some_and(|item| item.lifetime == NativeItemLifetime::Background)
+        {
             return Ok(None);
         }
-        let Some(thread_id) = pointer_string(params, &["/threadId", "/thread_id"]) else {
-            return Ok(None);
+        self.activities(message, workspace).map(Some)
+    }
+
+    /// Identify retained background work without reopening completed foreground items.
+    pub fn has_pending_background_tools(&self) -> bool {
+        self.items
+            .values()
+            .any(|item| item.lifetime == NativeItemLifetime::Background && item.completed.is_none())
+    }
+
+    /// Resolve a retained host command to private protocol identities for exact native collection.
+    pub(super) fn native_tool(&self, address: &BackgroundItemAddress) -> Option<(String, String)> {
+        let native = self.items.iter().find_map(|((turn, native, part), item)| {
+            (turn == &address.turn.turn_id
+                && *part == ItemPart::Tool
+                && item.id.as_str() == address.item_id.as_str())
+            .then_some(native.clone())
+        })?;
+        let thread = self
+            .turns
+            .iter()
+            .find_map(|((thread, _), turn)| (turn == &address.turn).then_some(thread.clone()))?;
+        Some((thread, native))
+    }
+
+    /// Get exact background item owners for native collection.
+    pub(super) fn pending_background_addresses(&self) -> Vec<BackgroundItemAddress> {
+        self.items
+            .iter()
+            .filter(|(_, item)| {
+                item.lifetime == NativeItemLifetime::Background && item.completed.is_none()
+            })
+            .filter_map(|((turn, _, _), item)| {
+                self.turns
+                    .values()
+                    .find(|address| &address.turn_id == turn)
+                    .map(|address| BackgroundItemAddress {
+                        turn: address.clone(),
+                        item_id: item.id.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Name the native command items a user interrupt must stop: foreground commands of
+    /// the interrupted native turn that have no native terminal status. Backgrounded and
+    /// unified-exec sessions keep their independent lifetime.
+    pub(super) fn foreground_command_items(
+        &self,
+        thread_id: &str,
+        native_turn: &str,
+    ) -> std::collections::HashSet<String> {
+        let Some(address) = self
+            .turns
+            .get(&(thread_id.to_owned(), native_turn.to_owned()))
+        else {
+            return Default::default();
         };
-        let Some(turn_id) = pointer_string(params, &["/turnId", "/turn_id", "/turn/id"]) else {
-            return Ok(None);
-        };
-        let Some(item_id) = pointer_string(params, &["/itemId", "/item_id", "/item/id"]) else {
-            return Ok(None);
-        };
-        let owner = self.tool.iter().find_map(|(address, tool)| {
-            (tool.lifetime == NativeToolLifetime::Background
-                && address.turn.thread_id == thread_id
-                && address.turn.turn_id.as_str() == turn_id
-                && address.tool_id.as_str() == item_id)
-                .then(|| address.turn.scope.clone())
-        });
-        let Some(owner) = owner else { return Ok(None) };
-        let previous = self.scope.replace(owner.into());
-        let replay_sensitive = self.replay_sensitive;
-        let mut output = ProviderOutput::default();
-        let result = self.normalize(message, &mut output, None, workspace).await;
-        self.scope = previous;
-        self.replay_sensitive = replay_sensitive;
-        result?;
-        Ok(Some(output.event))
+        self.items
+            .iter()
+            .filter(|((turn, _, part), item)| {
+                turn == &address.turn_id
+                    && *part == ItemPart::Tool
+                    && matches!(item.start, ItemStart::CommandExecution(_))
+                    && item.lifetime == NativeItemLifetime::Foreground
+                    && (item.completed.is_none() || item.completion_synthesized())
+            })
+            .map(|((_, native, _), _)| native.clone())
+            .collect()
     }
 
-    fn address(&self, params: &Value) -> Option<TurnAddress> {
-        let (thread_id, turn_id) = Self::native_identity(params)?;
-        let scope = self
-            .turn_owners
-            .get(&(thread_id.clone(), turn_id.clone()))
-            .cloned()
-            .or_else(|| self.scope.as_ref()?.invocation().cloned())?;
-        Some(TurnAddress {
-            scope,
-            thread_id,
-            turn_id,
-        })
-    }
-
-    fn required_address(&self, _method: &str, params: &Value) -> Result<TurnAddress> {
-        Ok(self.address(params).ok_or_else(protocol_error)?)
-    }
-
-    fn required_item_id(_method: &str, params: &Value) -> Result<String> {
-        Ok(pointer_string(params, &["/itemId", "/item_id", "/item/id"])
-            .ok_or_else(protocol_error)?)
-    }
-
-    fn text(
+    /// Close retained background work only after the native inventory establishes absence.
+    pub(super) fn interrupt_background(
         &mut self,
-        address: MessageAddress,
-        classification: Option<MessageClassification>,
-        text: Option<String>,
-        completed: bool,
-    ) -> Result<Vec<ProviderEvent>> {
-        let state = self.message.entry(address.clone()).or_default();
-        let mut events = Vec::new();
-        if let Some(classification) = classification
-            && let Some(previous) = state.role
-            && classification != MessageClassification::Known(previous)
-        {
-            return Err(protocol_error().into());
-        }
-        if state.completed
-            && let Some(text) = &text
-            && ((completed && text != &state.text) || (!completed && !text.is_empty()))
-        {
-            return Err(protocol_error().into());
-        }
-        if let Some(MessageClassification::Known(role)) = classification {
-            if state.published && state.role.is_none() {
-                events.push(ProviderEvent::Message {
-                    address: address.clone(),
-                    update: MessageUpdate::Classified { role },
-                });
-            }
-            state.role = Some(role);
-        }
-        let Some(text) = text else { return Ok(events) };
-        if state.completed {
-            return Ok(events);
-        }
-        if completed {
-            state.text = text.clone();
-        } else {
-            state.text.push_str(&text);
-        }
-        if !state.published && !state.text.is_empty() {
-            state.published = true;
-            self.replay_sensitive = true;
-            events.push(ProviderEvent::Message {
-                address: address.clone(),
-                update: MessageUpdate::Started {
-                    classification: state
-                        .role
-                        .map(MessageClassification::Known)
-                        .unwrap_or(MessageClassification::Unclassified),
-                    text: state.text.clone(),
-                },
-            });
-        } else if state.published && !completed && !text.is_empty() {
-            self.replay_sensitive = true;
-            events.push(ProviderEvent::Message {
-                address: address.clone(),
-                update: MessageUpdate::Delta { text: text.clone() },
-            });
-        }
-        if completed {
-            state.completed = true;
-            if state.published {
-                events.push(ProviderEvent::Message {
-                    address,
-                    update: MessageUpdate::Completed { text },
-                });
-            }
-        }
-        Ok(events)
+        address: &BackgroundItemAddress,
+    ) -> Option<AdapterActivity> {
+        let item = self.items.iter_mut().find_map(|((turn, _, _), item)| {
+            (turn == &address.turn.turn_id
+                && item.id.as_str() == address.item_id.as_str()
+                && item.lifetime == NativeItemLifetime::Background
+                && item.completed.is_none())
+            .then_some(item)
+        })?;
+        Some(finish_tool(
+            &address.turn,
+            item,
+            ToolOutcome::Interrupted,
+            None,
+            None,
+        ))
     }
 
-    pub async fn normalize(
+    /// Decode one native notification into restricted activity records.
+    pub(super) async fn normalize(
         &mut self,
         message: &Value,
-        output: &mut ProviderOutput,
-        sink: Option<&ProviderEventSink>,
+        output: &mut CodexOutput,
+        sink: Option<&AdapterActivityWriter>,
         workspace: &str,
     ) -> Result<()> {
-        let Some(event_scope) = self.scope.clone() else {
-            return Ok(());
-        };
+        let activities = self.activities(message, workspace)?;
+        for activity in activities {
+            if let Some(sink) = sink {
+                sink.send_wait(activity).await?;
+            } else {
+                output.event.push(activity);
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve typed item identity, content, outcome, and exact native error scope.
+    fn activities(&mut self, message: &Value, workspace: &str) -> Result<Vec<AdapterActivity>> {
         let method = message["method"].as_str().unwrap_or_default();
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        if let Some(value) = available_compact_update(&params) {
-            output.completion.metrics.native_compact_update = Some(value);
-        }
-        if let (Some(scope), Some(identity)) =
-            (event_scope.invocation(), Self::native_identity(&params))
+        let params = message.get("params").unwrap_or(&Value::Null);
+        if method.eq_ignore_ascii_case("error")
+            || params.pointer("/item/type").and_then(Value::as_str) == Some("error")
         {
-            self.turn_owners
-                .entry(identity)
-                .or_insert_with(|| scope.clone());
+            return Ok(vec![self.native_error(params)?]);
         }
-        let address = self.address(&params);
-        let event_scope = address
-            .as_ref()
-            .map(|address| EventScope::from(address.scope.clone()))
-            .unwrap_or(event_scope);
         let mut events = Vec::new();
+        let native_thread = pointer_string(params, &["/threadId", "/thread_id"]);
+        if let Some(usage) = context_usage(params) {
+            let thread = native_thread
+                .as_ref()
+                .and_then(|thread| self.threads.get(thread))
+                .ok_or_else(protocol_error)?;
+            events.push(AdapterActivity::Thread {
+                thread_id: thread.thread_id(),
+                event: ThreadEvent::ContextUsage(usage),
+            });
+        }
         let item_type = params
             .pointer("/item/type")
             .and_then(Value::as_str)
             .unwrap_or_default();
         if matches!(method, "item/started" | "item/completed") && item_type == "contextCompaction" {
+            let (native_id, thread) = native_thread
+                .as_ref()
+                .and_then(|native_id| self.threads.get_key_value(native_id))
+                .ok_or_else(protocol_error)?;
+            *self.compaction_counts.entry(native_id.clone()).or_default() += 1;
+            events.push(AdapterActivity::Thread {
+                thread_id: thread.thread_id(),
+                event: ThreadEvent::CompactionUpdated(Box::new(Compaction {
+                    id: self.compaction_id(thread, params)?,
+                    thread_id: thread.thread_id().as_str().to_owned(),
+                    state: if method == "item/started" {
+                        CompactionState::Running
+                    } else {
+                        CompactionState::Completed
+                    },
+                    manual: self
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.invocation().is_none()),
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    result: CompactionResult::default(),
+                })),
+            });
+            return Ok(events);
+        }
+        if method == "turn/started"
+            && let (Some(thread), Some(turn)) = (
+                native_thread.as_ref(),
+                pointer_string(params, &["/turnId", "/turn/id"]),
+            )
+            && !self.turns.contains_key(&(thread.clone(), turn.clone()))
+        {
+            let owner = self
+                .threads
+                .get(thread)
+                .cloned()
+                .ok_or_else(protocol_error)?;
+            // Codex runs `thread/compact/start` as a turn on the compacted thread. That
+            // turn executes the bound host operation; admitting it as an invocation would
+            // publish activity under a scope the host never created.
+            if let Some(EventScope::SessionOperation {
+                owner: operation_owner,
+                ..
+            }) = &self.scope
+                && operation_owner == &owner
             {
-                let id = Self::required_item_id(method, &params)?;
-                let thread_id = pointer_string(&params, &["/threadId", "/thread_id"])
+                self.operation_turns.insert((thread.clone(), turn));
+                return Ok(events);
+            }
+            let scope = InvocationScope::new(owner, uuid::Uuid::new_v4().to_string());
+            let address = self.admit_turn(thread, &turn, &scope)?;
+            self.observed_starts
+                .push((address, thread.clone(), turn, timestamp()));
+        }
+        if self.operation_turn(params) {
+            return Ok(events);
+        }
+        let Some(address) = self.address(params) else {
+            if method == "turn/started" || method == "turn/completed" || method.starts_with("item/")
+            {
+                return Err(protocol_error().into());
+            }
+            return Ok(events);
+        };
+        if let Some(model) = params
+            .pointer("/turn/model")
+            .or_else(|| params.get("model"))
+            .and_then(Value::as_str)
+        {
+            let model = ResolvedModel {
+                model_id: ModelId::new(model).map_err(|_| protocol_error())?,
+                observed_at_ms: timestamp(),
+            };
+            if let Some(event) = self.resolve_model(&address, model) {
+                events.push(event);
+            }
+        }
+        if method == "rawResponseItem/completed" {
+            let raw = &params["item"];
+            if matches!(
+                raw["type"].as_str(),
+                Some("function_call_output" | "custom_tool_call_output")
+            ) {
+                let call = raw
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|call| !call.is_empty())
                     .ok_or_else(protocol_error)?;
-                events.push(ProviderEvent::Compaction {
-                    scope: event_scope.clone(),
-                    update: Box::new(Compaction {
-                        id,
-                        thread_id,
-                        state: if method == "item/started" {
-                            CompactionState::Running
-                        } else {
-                            CompactionState::Completed
-                        },
-                        manual: event_scope.invocation().is_none(),
-                        started_at_ms: None,
-                        completed_at_ms: None,
-                        result: CompactionResult::default(),
-                    }),
+                if let Some(item) =
+                    self.items
+                        .get_mut(&(address.turn_id.clone(), call.to_owned(), ItemPart::Tool))
+                    && let NativeItemLifetime::UnifiedExec { process_id } = &item.lifetime
+                {
+                    let output = raw
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .ok_or_else(protocol_error)?;
+                    match native_exec_reply(output)? {
+                        NativeExecReply::Yielded {
+                            process_id: observed,
+                        } => {
+                            if process_id != observed {
+                                return Err(protocol_error().into());
+                            }
+                            item.lifetime = NativeItemLifetime::Background;
+                            events.push(item_event(
+                                &address,
+                                &item.id,
+                                ItemEvent::Tool {
+                                    event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+                                },
+                            ));
+                        }
+                        NativeExecReply::Exited => item.lifetime = NativeItemLifetime::NativeExited,
+                        NativeExecReply::Unknown => {}
+                    }
+                }
+            }
+        } else if method == "turn/completed" {
+            let outcome = terminal_outcome(&params["turn"])?;
+            if self
+                .terminal
+                .get(&address.turn_id)
+                .is_some_and(|(old, _)| old != &outcome)
+            {
+                return Err(protocol_error().into());
+            }
+            self.terminal
+                .entry(address.turn_id.clone())
+                .or_insert((outcome, timestamp()));
+            // Codex 0.164 keeps unified_exec_manager in Session after normal TurnComplete;
+            // only its exit watcher emits command completion. A known started process with
+            // no command-end at this ordered boundary therefore retains an independent lifetime.
+            if matches!(
+                outcome,
+                forge_provider_api::turn::TurnOutcome::Completed { .. }
+            ) {
+                for ((turn, _, _), item) in &mut self.items {
+                    if turn == &address.turn_id
+                        && item.completed.is_none()
+                        && matches!(item.lifetime, NativeItemLifetime::UnifiedExec { .. })
+                    {
+                        item.lifetime = NativeItemLifetime::Background;
+                        events.push(item_event(
+                            &address,
+                            &item.id,
+                            ItemEvent::Tool {
+                                event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+                            },
+                        ));
+                    }
+                }
+            }
+            for ((turn, _, _), item) in &mut self.items {
+                if turn != &address.turn_id
+                    || item.completed.is_some()
+                    || item.lifetime == NativeItemLifetime::Background
+                {
+                    continue;
+                }
+                if matches!(
+                    item.lifetime,
+                    NativeItemLifetime::UnifiedExec { .. }
+                        | NativeItemLifetime::UnobservableProcess
+                ) {
+                    self.unresolved_sessions.insert(address.turn_id.clone());
+                    continue;
+                }
+                match &item.start {
+                    ItemStart::UserMessage(_)
+                    | ItemStart::AgentMessage(_)
+                    | ItemStart::Reasoning(_) => {
+                        events.push(finish_message(&address, item, MessageOutcome::Interrupted));
+                    }
+                    ItemStart::CommandExecution(_)
+                    | ItemStart::FileChange(_)
+                    | ItemStart::ToolCall(_) => {
+                        events.push(finish_tool(
+                            &address,
+                            item,
+                            ToolOutcome::Interrupted,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+        } else if method.to_ascii_lowercase().contains("tokenusage") {
+            // Context adjustments describe occupancy and do not certify token expenditure.
+            if let Some(NativeUsageObservation::Expenditure {
+                report_key,
+                usage,
+                cumulative,
+                cumulative_total,
+            }) = usage_update(params)
+            {
+                // An unchanged cumulative total spends nothing, so a repeat that reaches a
+                // later turn belongs to the turn that first reported it.
+                let thread = address.thread_id.as_str().to_owned();
+                if self
+                    .thread_usage
+                    .get(&thread)
+                    .is_some_and(|(turn, key)| *key == report_key && *turn != address.turn_id)
+                {
+                    return Ok(events);
+                }
+                self.thread_usage
+                    .insert(thread, (address.turn_id.clone(), report_key.clone()));
+                let report = TurnUsageReport::tokens(
+                    UsageReportId::new(report_key).map_err(|_| protocol_error())?,
+                    None,
+                    timestamp(),
+                    Some(usage),
+                    Some(cumulative),
+                    cumulative_total,
+                )
+                .map_err(|_| protocol_error())?;
+                let reports = self.usage.entry(address.turn_id.clone()).or_default();
+                if let Some(old) = reports
+                    .iter_mut()
+                    .find(|old| old.report_id() == report.report_id())
+                {
+                    old.merge(&report).map_err(|_| protocol_error())?;
+                } else {
+                    reports.push(report.clone());
+                }
+                events.push(AdapterActivity::Turn {
+                    thread_id: address.thread_id.clone(),
+                    turn_id: address.turn_id.clone(),
+                    event: TurnMetadataEvent::Usage(report),
                 });
             }
-            for event in events {
-                if let Some(sink) = sink {
-                    sink.send_wait(event).await?;
-                } else {
-                    output.event.push(event);
-                }
-            }
-            return Ok(());
-        }
-        let Some(scope) = event_scope.invocation().cloned() else {
-            if let Some(usage) = context_usage(&params) {
-                output.completion.metrics.context_usage = Some(usage);
-            }
-            if method.eq_ignore_ascii_case("error") {
-                let event = ProviderEvent::Diagnostic {
-                    scope: event_scope,
-                    diagnostic: ProviderDiagnostic {
-                        kind: super::retry::failure_kind(params.get("error").unwrap_or(&params)),
-                        message: SanitizedMessage::new("Provider reported an error.")
-                            .expect("static diagnostic text is nonempty"),
-                        fatal: true,
-                    },
-                };
-                if let Some(sink) = sink {
-                    sink.send_wait(event).await?;
-                } else {
-                    output.event.push(event);
-                }
-            }
-            return Ok(());
-        };
-        if method.eq_ignore_ascii_case("item/agentMessage/delta")
-            || (matches!(method, "item/started" | "item/completed")
-                && item_type.eq_ignore_ascii_case("agentMessage"))
+        } else if matches!(method, "item/started" | "item/completed") && item_type == "userMessage"
         {
-            {
-                let turn = self.required_address(method, &params)?;
-                let id = Self::required_item_id(method, &params)?;
-                let phase = params
-                    .pointer("/item/phase")
-                    .or_else(|| params.get("phase"));
-                let phase = match phase {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(phase)) => Some(phase.as_str()),
-                    Some(_) => {
-                        return Err(protocol_error().into());
-                    }
-                };
-                let classification = match phase {
-                    Some("commentary") => {
-                        Some(MessageClassification::Known(MessageRole::Commentary))
-                    }
-                    Some("final_answer") => {
-                        Some(MessageClassification::Known(MessageRole::Response))
-                    }
-                    None => None,
-                    Some(_phase) => {
-                        events.push(ProviderEvent::Diagnostic {
-                            scope: scope.clone().into(),
-                            diagnostic: ProviderDiagnostic {
-                                kind: ProviderFailureKind::Protocol,
-                                message: SanitizedMessage::new(
-                                    "Provider reported an unsupported message phase.",
-                                )
-                                .expect("static diagnostic text is nonempty"),
-                                fatal: false,
-                            },
-                        });
-                        Some(MessageClassification::Unclassified)
-                    }
-                };
-                let completed = method == "item/completed";
-                let text = if method.eq_ignore_ascii_case("item/agentMessage/delta") {
-                    params["delta"].as_str().map(str::to_owned)
-                } else {
+            let native = pointer_string(params, &["/item/id"]).ok_or_else(protocol_error)?;
+            let text = params
+                .pointer("/item/content")
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .or_else(|| {
                     params
                         .pointer("/item/text")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
-                        .or_else(|| completed.then(String::new))
-                };
-                events.extend(self.text(
-                    MessageAddress {
-                        turn,
-                        message_id: MessageId::Native(id),
-                    },
-                    classification,
-                    text,
-                    completed,
-                )?);
-            }
-        } else if matches!(
-            method,
-            "item/reasoning/summaryTextDelta"
-                | "item/reasoning/textDelta"
-                | "item/reasoning/summaryPartAdded"
-        ) || (matches!(method, "item/started" | "item/completed")
-            && item_type == "reasoning")
+                });
+            self.message(
+                &address,
+                native,
+                ItemPart::Message,
+                ItemStart::UserMessage(UserMessageStart {
+                    text: String::new(),
+                    submission_id: params
+                        .pointer("/item/clientId")
+                        .and_then(Value::as_str)
+                        .and_then(super::provider::submission_from_client_id),
+                }),
+                if method == "item/completed" {
+                    NativeTextObservation::Completed(text.as_deref())
+                } else {
+                    NativeTextObservation::Progress(text.as_deref())
+                },
+                &mut events,
+            )?;
+        } else if method.eq_ignore_ascii_case("item/agentMessage/delta")
+            || (matches!(method, "item/started" | "item/completed") && item_type == "agentMessage")
         {
+            let native = pointer_string(params, &["/itemId", "/item_id", "/item/id"])
+                .ok_or_else(protocol_error)?;
+            let classification = match params
+                .pointer("/item/phase")
+                .or_else(|| params.get("phase"))
             {
-                let turn = self.required_address(method, &params)?;
-                let id = Self::required_item_id(method, &params)?;
-                let completed = method == "item/completed";
-                if method.eq_ignore_ascii_case("item/reasoning/summaryTextDelta") {
-                    let index = params["summaryIndex"].as_u64().unwrap_or(0);
-                    events.extend(self.text(
-                        MessageAddress {
-                            turn,
-                            message_id: MessageId::Synthetic(format!("{id}:summary:{index}")),
+                None | Some(Value::Null) => MessageClassification::Unclassified,
+                Some(Value::String(phase)) if phase == "commentary" => {
+                    MessageClassification::Known(AgentMessageRole::Commentary)
+                }
+                Some(Value::String(phase)) if phase == "final_answer" => {
+                    MessageClassification::Known(AgentMessageRole::Response)
+                }
+                Some(Value::String(_)) => {
+                    events.push(AdapterActivity::Warning(ProviderWarning {
+                        scope: WarningScope::Turn {
+                            thread_id: address.thread_id.clone(),
+                            turn_id: address.turn_id.clone(),
                         },
-                        Some(MessageClassification::Known(MessageRole::ThoughtSummary)),
-                        params["delta"].as_str().map(str::to_owned),
-                        false,
-                    )?);
-                } else if method.eq_ignore_ascii_case("item/reasoning/textDelta") {
-                    let index = params["contentIndex"].as_u64().unwrap_or(0);
-                    events.extend(self.text(
-                        MessageAddress {
-                            turn,
-                            message_id: MessageId::Synthetic(format!("{id}:thought:{index}")),
+                        kind: ProviderWarningKind::UnsupportedMessageClassification,
+                        message: SanitizedMessage::new(
+                            "Provider reported an unsupported message phase.",
+                        )
+                        .expect("static text"),
+                    }));
+                    MessageClassification::Unclassified
+                }
+                Some(_) => return Err(protocol_error().into()),
+            };
+            let completed = method == "item/completed";
+            let text = if method.ends_with("/delta") {
+                params["delta"].as_str()
+            } else {
+                params.pointer("/item/text").and_then(Value::as_str)
+            };
+            self.message(
+                &address,
+                native,
+                ItemPart::Message,
+                ItemStart::AgentMessage(AgentMessageStart {
+                    text: String::new(),
+                    classification,
+                }),
+                if completed {
+                    NativeTextObservation::Completed(text)
+                } else {
+                    NativeTextObservation::Progress(text)
+                },
+                &mut events,
+            )?;
+        } else if method.starts_with("item/reasoning/")
+            || (matches!(method, "item/started" | "item/completed") && item_type == "reasoning")
+        {
+            let native = pointer_string(params, &["/itemId", "/item_id", "/item/id"])
+                .ok_or_else(protocol_error)?;
+            if method.ends_with("summaryTextDelta")
+                || method.ends_with("textDelta")
+                || method.ends_with("summaryPartAdded")
+            {
+                let summary =
+                    method.ends_with("summaryTextDelta") || method.ends_with("summaryPartAdded");
+                let index = params[if summary {
+                    "summaryIndex"
+                } else {
+                    "contentIndex"
+                }]
+                .as_u64()
+                .ok_or_else(protocol_error)?;
+                self.message(
+                    &address,
+                    native,
+                    if summary {
+                        ItemPart::Summary(index)
+                    } else {
+                        ItemPart::Reasoning(index)
+                    },
+                    ItemStart::Reasoning(ReasoningStart {
+                        text: String::new(),
+                        kind: if summary {
+                            ReasoningKind::Summary
+                        } else {
+                            ReasoningKind::Full
                         },
-                        Some(MessageClassification::Known(MessageRole::Thought)),
-                        params["delta"].as_str().map(str::to_owned),
-                        false,
-                    )?);
-                } else if matches!(method, "item/started" | "item/completed") {
-                    for (field, role, suffix) in [
-                        ("summary", MessageRole::ThoughtSummary, "summary"),
-                        ("content", MessageRole::Thought, "thought"),
-                    ] {
-                        for (index, content) in params["item"][field]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .enumerate()
-                        {
-                            let text = content
-                                .as_str()
-                                .or_else(|| content["text"].as_str())
-                                .map(str::to_owned);
-                            events.extend(self.text(
-                                MessageAddress {
-                                    turn: turn.clone(),
-                                    message_id: MessageId::Synthetic(format!(
-                                        "{id}:{suffix}:{index}"
-                                    )),
+                    }),
+                    NativeTextObservation::Progress(params["delta"].as_str()),
+                    &mut events,
+                )?;
+            } else if matches!(method, "item/started" | "item/completed") {
+                for (field, summary) in [("summary", true), ("content", false)] {
+                    for (index, text) in params["item"][field]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                    {
+                        let index = u64::try_from(index).map_err(|_| protocol_error())?;
+                        self.message(
+                            &address,
+                            native.clone(),
+                            if summary {
+                                ItemPart::Summary(index)
+                            } else {
+                                ItemPart::Reasoning(index)
+                            },
+                            ItemStart::Reasoning(ReasoningStart {
+                                text: String::new(),
+                                kind: if summary {
+                                    ReasoningKind::Summary
+                                } else {
+                                    ReasoningKind::Full
                                 },
-                                Some(MessageClassification::Known(role)),
-                                text,
-                                completed,
-                            )?);
-                        }
+                            }),
+                            if method == "item/completed" {
+                                NativeTextObservation::Completed(
+                                    text.as_str().or_else(|| text["text"].as_str()),
+                                )
+                            } else {
+                                NativeTextObservation::Progress(
+                                    text.as_str().or_else(|| text["text"].as_str()),
+                                )
+                            },
+                            &mut events,
+                        )?;
                     }
                 }
             }
-        } else if matches!(method, "turn/started" | "turn/completed") {
+        } else if method == "item/commandExecution/terminalInteraction" {
+            let native =
+                pointer_string(params, &["/itemId", "/item_id"]).ok_or_else(protocol_error)?;
+            let process = pointer_string(params, &["/processId", "/process_id"])
+                .filter(|id| !id.is_empty())
+                .ok_or_else(protocol_error)?;
+            let stdin = params
+                .get("stdin")
+                .and_then(Value::as_str)
+                .ok_or_else(protocol_error)?;
+            let item = self
+                .items
+                .get_mut(&(address.turn_id.clone(), native, ItemPart::Tool))
+                .ok_or_else(protocol_error)?;
+            if item.completion_synthesized() && matches!(item.start, ItemStart::CommandExecution(_))
             {
-                let address = self.required_address(method, &params)?;
-                let now = timestamp();
-                let update = if method == "turn/started" {
-                    TurnUpdate::Started { started_at_ms: now }
-                } else {
-                    let outcome = match params.pointer("/turn/status").and_then(Value::as_str) {
-                        Some("failed") => forge_provider_api::turn::TurnOutcome::Failed,
-                        Some("interrupted") => forge_provider_api::turn::TurnOutcome::Interrupted,
-                        _ => forge_provider_api::turn::TurnOutcome::Completed,
-                    };
-                    if outcome == forge_provider_api::turn::TurnOutcome::Completed {
-                        for (tool_address, tool) in &mut self.tool {
-                            if tool_address.turn == address
-                                && tool.kind == ToolActivityKind::Command
-                                && !tool.terminal
-                                && tool.lifetime == NativeToolLifetime::Foreground
-                            {
-                                tool.lifetime = NativeToolLifetime::Background;
-                                events.push(ProviderEvent::Tool {
-                                    address: tool_address.clone(),
-                                    update: ToolUpdate::Backgrounded,
-                                });
-                            }
+                return Ok(events);
+            }
+            if !matches!(item.start, ItemStart::CommandExecution(_)) || item.completed.is_some() {
+                return Err(protocol_error().into());
+            }
+            if let NativeItemLifetime::UnifiedExec { process_id } = &item.lifetime
+                && process_id != &process
+            {
+                return Err(protocol_error().into());
+            }
+            // In pinned process_manager::write_stdin, empty stdin emits TerminalInteraction
+            // only while its response retains process_id; nonempty stdin also emits on exit.
+            if stdin.is_empty() && item.lifetime != NativeItemLifetime::Background {
+                item.lifetime = NativeItemLifetime::Background;
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Tool {
+                        event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+                    },
+                ));
+            }
+        } else if is_tool_lifecycle_event(&method.to_ascii_lowercase(), params) {
+            let snapshot =
+                normalize_tool_activity(method, params, workspace)?.ok_or_else(protocol_error)?;
+            let key = (address.turn_id.clone(), snapshot.id, ItemPart::Tool);
+            let mut descriptor = super::tool_semantics::normalize_descriptor(
+                forge_provider_api::tool::ToolDescriptor {
+                    semantics: Default::default(),
+                    name: snapshot.name,
+                    title: snapshot.title,
+                    arguments: forge_provider_api::tool::InspectableArguments::new(
+                        snapshot.arguments,
+                    ),
+                },
+                snapshot.kind,
+            );
+            let first = !self.items.contains_key(&key);
+            if first && self.terminal.contains_key(&address.turn_id) {
+                return Err(protocol_error().into());
+            }
+            let item = self.items.entry(key).or_insert_with(|| NativeItem {
+                id: new_item_id(),
+                start: match snapshot.kind {
+                    NativeToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
+                    NativeToolKind::FileChange => ItemStart::FileChange(descriptor.clone()),
+                    NativeToolKind::ToolCall => ItemStart::ToolCall(descriptor.clone()),
+                },
+                text: String::new(),
+                completed: None,
+                lifetime: NativeItemLifetime::Foreground,
+                descriptor: Some(descriptor.clone()),
+                output: String::new(),
+                changes: Default::default(),
+            });
+            if method == "item/started"
+                && snapshot.kind == NativeToolKind::Command
+                && snapshot.status == Some(ToolStatus::Running)
+                && params.pointer("/item/source").and_then(Value::as_str)
+                    == Some("unifiedExecStartup")
+            {
+                let process_id = params
+                    .pointer("/item/processId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(protocol_error)?;
+                match &item.lifetime {
+                    NativeItemLifetime::UnifiedExec {
+                        process_id: retained,
+                    } if retained != process_id => return Err(protocol_error().into()),
+                    NativeItemLifetime::Foreground => {
+                        item.lifetime = NativeItemLifetime::UnifiedExec {
+                            process_id: process_id.to_owned(),
                         }
                     }
-                    let pending = self
-                        .message
-                        .iter()
-                        .filter(|(message, state)| {
-                            message.turn == address && state.published && !state.completed
-                        })
-                        .map(|(message, _)| message.clone())
-                        .collect::<Vec<_>>();
-                    for message in pending {
-                        let state = self.message.get_mut(&message).expect("known Codex message");
-                        state.completed = true;
-                        events.push(ProviderEvent::Message {
-                            address: message,
-                            update: if outcome == forge_provider_api::turn::TurnOutcome::Completed {
-                                MessageUpdate::Completed {
-                                    text: state.text.clone(),
-                                }
-                            } else {
-                                MessageUpdate::Interrupted
-                            },
-                        });
-                    }
-                    TurnUpdate::Finished {
-                        outcome,
-                        completed_at_ms: now,
-                    }
+                    NativeItemLifetime::UnifiedExec { .. }
+                    | NativeItemLifetime::Background
+                    | NativeItemLifetime::NativeExited
+                    | NativeItemLifetime::UnobservableProcess => {}
+                }
+            }
+            if method == "item/started"
+                && snapshot.kind == NativeToolKind::Command
+                && params
+                    .pointer("/item/processId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                && params
+                    .pointer("/item/source")
+                    .and_then(Value::as_str)
+                    .is_none_or(|source| {
+                        !matches!(
+                            source,
+                            "agent" | "userShell" | "unifiedExecStartup" | "unifiedExecInteraction"
+                        )
+                    })
+            {
+                item.lifetime = NativeItemLifetime::UnobservableProcess;
+            }
+            if let Some(previous) = &item.descriptor {
+                if descriptor.name == "tool" {
+                    descriptor.name = previous.name.clone();
+                }
+                if matches!(
+                    descriptor.title.as_str(),
+                    "tool" | "command" | "file changes"
+                ) {
+                    descriptor.title = previous.title.clone();
+                }
+                let envelope = params.get("update").unwrap_or(params);
+                let supplied = envelope.get("item").unwrap_or(envelope);
+                if !["arguments", "command", "cwd"]
+                    .iter()
+                    .any(|field| supplied.get(field).is_some() || envelope.get(field).is_some())
+                {
+                    descriptor.arguments = previous.arguments.clone();
+                    descriptor.semantics = previous.semantics.clone();
+                }
+            }
+            let same_kind = matches!(
+                (&item.start, snapshot.kind),
+                (ItemStart::CommandExecution(_), NativeToolKind::Command)
+                    | (ItemStart::FileChange(_), NativeToolKind::FileChange)
+                    | (ItemStart::ToolCall(_), NativeToolKind::ToolCall)
+            );
+            if !same_kind {
+                return Err(protocol_error().into());
+            }
+            if item.completion_synthesized() {
+                // Codex keeps a process alive after `turn/interrupt`, so its output and
+                // final status can arrive after Forge closed the item as interrupted.
+                // The turn is settled; this late activity belongs to no observer.
+                return Ok(events);
+            }
+            if item.completed.is_some() {
+                if method != "item/completed" {
+                    return Err(protocol_error().into());
+                }
+                let outcome = match snapshot.status {
+                    Some(ToolStatus::Succeeded) => ToolOutcome::Succeeded,
+                    Some(ToolStatus::Cancelled) => ToolOutcome::Cancelled,
+                    Some(ToolStatus::Interrupted) => ToolOutcome::Interrupted,
+                    Some(ToolStatus::Failed) => ToolOutcome::Failed {
+                        diagnostic: ToolDiagnostic {
+                            kind: ProviderFailureKind::Unknown,
+                            message: SanitizedMessage::new("Provider tool failed")
+                                .expect("static text"),
+                        },
+                    },
+                    Some(ToolStatus::Denied) => ToolOutcome::Denied {
+                        reason: SanitizedMessage::new("Provider denied this tool call")
+                            .expect("static text"),
+                    },
+                    Some(ToolStatus::Running) | None => return Err(protocol_error().into()),
                 };
-                events.push(ProviderEvent::Turn { address, update });
+                let signature = serde_json::to_string(&(
+                    &outcome,
+                    &descriptor,
+                    &snapshot.output,
+                    &snapshot.change,
+                ))?;
+                if item.completed.as_ref() == Some(&signature) {
+                    return Ok(events);
+                }
+                return Err(protocol_error().into());
             }
-        } else if method.to_ascii_lowercase().contains("tokenusage") {
-            if let (Some(address), Some(update)) = (address.clone(), usage_update(&params)) {
-                events.push(ProviderEvent::Usage { address, update });
+            if first {
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Started(item.start.clone()),
+                ));
+            } else if item.descriptor.as_ref() != Some(&descriptor) {
+                item.descriptor = Some(descriptor.clone());
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Tool {
+                        event: forge_provider_api::tool::ToolItemEvent::DescriptorUpdated(
+                            descriptor.clone(),
+                        ),
+                    },
+                ));
             }
-            if let Some(usage) = context_usage(&params) {
-                output.completion.metrics.context_usage = Some(usage.clone());
-                events.push(ProviderEvent::Runtime {
-                    scope: scope.clone(),
-                    update: RuntimeUpdate::ContextUsage { usage },
+            self.replay_sensitive = true;
+            if let Some(status) = snapshot.status
+                && status == ToolStatus::Running
+                && method == "item/started"
+            {
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Tool {
+                        event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+                    },
+                ));
+            }
+            if let Some(text) = &snapshot.output {
+                if snapshot.output_delta {
+                    item.output.push_str(text);
+                } else {
+                    item.output = text.clone();
+                }
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Tool {
+                        event: forge_provider_api::tool::ToolItemEvent::Output(
+                            if snapshot.output_delta {
+                                TextUpdate::Append(text.clone())
+                            } else {
+                                TextUpdate::Replace(text.clone())
+                            },
+                        ),
+                    },
+                ));
+            }
+            if !snapshot.change.is_empty() {
+                item.changes = snapshot.change.clone();
+                events.push(item_event(
+                    &address,
+                    &item.id,
+                    ItemEvent::Tool {
+                        event: forge_provider_api::tool::ToolItemEvent::Changes(
+                            snapshot.change.clone(),
+                        ),
+                    },
+                ));
+            }
+            if let Some(status) = snapshot.status {
+                let outcome = match status {
+                    ToolStatus::Running => None,
+                    ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
+                    ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
+                    ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
+                    ToolStatus::Failed => Some(ToolOutcome::Failed {
+                        diagnostic: ToolDiagnostic {
+                            kind: ProviderFailureKind::Unknown,
+                            message: SanitizedMessage::new("Provider tool failed")
+                                .expect("static text"),
+                        },
+                    }),
+                    ToolStatus::Denied => Some(ToolOutcome::Denied {
+                        reason: SanitizedMessage::new("Provider denied this tool call")
+                            .expect("static text"),
+                    }),
+                };
+                if let Some(outcome) = outcome {
+                    let signature = serde_json::to_string(&(
+                        &outcome,
+                        &descriptor,
+                        &snapshot.output,
+                        &snapshot.change,
+                    ))?;
+                    if item.completed.as_ref().is_some_and(|old| old != &signature) {
+                        return Err(protocol_error().into());
+                    }
+                    if item.completed.is_none() {
+                        let event =
+                            finish_tool(&address, item, outcome, Some(descriptor), snapshot.output);
+                        item.completed = Some(signature);
+                        events.push(event);
+                    }
+                }
+            }
+        } else if let Some(update) = normalize_checklist_update(method, params) {
+            self.replay_sensitive = true;
+            events.push(AdapterActivity::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event: TurnMetadataEvent::ChecklistUpdated(update),
+            });
+        }
+        for native in normalize_agent_lifecycle(method, params).map_err(|_| protocol_error())? {
+            let Some(parent) = native
+                .parent_thread_id
+                .as_ref()
+                .and_then(|parent| self.threads.get(parent))
+                .cloned()
+            else {
+                return Err(protocol_error().into());
+            };
+            let pending_key = (
+                address.turn_id.clone(),
+                pointer_string(params, &["/itemId", "/item_id", "/item/id"])
+                    .ok_or_else(protocol_error)?,
+            );
+            let parent_agent_id = native
+                .parent_thread_id
+                .as_ref()
+                .and_then(|thread| self.agents.get(thread))
+                .cloned();
+            let delegation = AgentDelegation {
+                parent_thread_id: address.thread_id.clone(),
+                parent_turn_id: address.turn_id.clone(),
+                parent_item_id: self
+                    .items
+                    .get(&(
+                        address.turn_id.clone(),
+                        pending_key.1.clone(),
+                        ItemPart::Tool,
+                    ))
+                    .map(|item| item.id.clone()),
+            };
+            let Some(thread) = native.provider_thread_id else {
+                if !native.starts_child {
+                    return Err(protocol_error().into());
+                }
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.pending_agents.entry(pending_key)
+                {
+                    let agent_id =
+                        forge_provider_api::AgentId::new(uuid::Uuid::new_v4().to_string())
+                            .expect("UUID is nonempty");
+                    e.insert(agent_id.clone());
+                    events.push(AdapterActivity::Agent {
+                        agent_id,
+                        event: AgentEvent::Lifecycle {
+                            event: AgentLifecycleEvent::Started {
+                                agent: AgentDescription {
+                                    parent_agent_id,
+                                    delegation: Some(delegation),
+                                    thread_id: None,
+                                    definition: None,
+                                    nickname: None,
+                                    task: native.task,
+                                },
+                                state: AgentActiveState::Starting,
+                            },
+                        },
+                    });
+                }
+                continue;
+            };
+            let pending = self.pending_agents.remove(&pending_key);
+            let first = !self.agents.contains_key(&thread);
+            let first_lifecycle = first && pending.is_none();
+            if first && !native.starts_child {
+                return Err(protocol_error().into());
+            }
+            let agent_id = self
+                .agents
+                .entry(thread.clone())
+                .or_insert_with(|| {
+                    pending.unwrap_or_else(|| {
+                        forge_provider_api::AgentId::new(uuid::Uuid::new_v4().to_string())
+                            .expect("UUID is nonempty")
+                    })
+                })
+                .clone();
+            let child_owner = ThreadOwner::new(parent.session_id().clone(), agent_id.clone())
+                .map_err(|_| protocol_error())?;
+            self.admit_thread(&thread, &child_owner)?;
+            let pending_child = self.pending_child.remove(&thread).unwrap_or_default();
+            let delegation = self
+                .delegations
+                .entry(thread.clone())
+                .or_insert(delegation)
+                .clone();
+            let description = AgentDescription {
+                parent_agent_id,
+                delegation: Some(delegation),
+                thread_id: Some(child_owner.thread_id()),
+                definition: None,
+                nickname: None,
+                task: native.task,
+            };
+            let lifecycle = match native.status {
+                NativeAgentStatus::Active(state) if first_lifecycle => {
+                    AgentLifecycleEvent::Started {
+                        agent: description,
+                        state,
+                    }
+                }
+                NativeAgentStatus::Active(state) => AgentLifecycleEvent::Updated {
+                    agent: description,
+                    state,
+                },
+                NativeAgentStatus::Finished(outcome) => AgentLifecycleEvent::Finished {
+                    agent: description,
+                    outcome,
+                },
+            };
+            events.push(AdapterActivity::Agent {
+                agent_id: agent_id.clone(),
+                event: AgentEvent::Lifecycle { event: lifecycle },
+            });
+            if first {
+                events.push(AdapterActivity::Agent {
+                    agent_id,
+                    event: AgentEvent::ConversationResolved {
+                        thread_id: child_owner.thread_id(),
+                    },
                 });
             }
-        } else {
-            let lifecycle = normalize_agent_lifecycle(method, &params);
-            if !lifecycle.is_empty() {
-                for native in lifecycle {
-                    let Some(thread_id) = native.provider_thread_id else {
-                        continue;
-                    };
-                    let Ok(agent_id) = ProviderAgentId::try_from(thread_id.clone()) else {
-                        continue;
-                    };
-                    let Ok(conversation_id) = ProviderSessionId::try_from(thread_id) else {
-                        continue;
-                    };
-                    let kind = if native.starts_child {
-                        AgentLifecycleKind::Started
-                    } else if native.status.is_active() {
-                        AgentLifecycleKind::Updated
-                    } else {
-                        AgentLifecycleKind::Finished
-                    };
-                    events.push(ProviderEvent::Agent {
-                        scope: scope.clone(),
-                        update: AgentUpdate::Lifecycle {
-                            event: AgentLifecycleEvent {
-                                agent_id,
-                                parent_agent_id: None,
-                                conversation_id: Some(conversation_id),
-                                kind,
-                                definition: native.definition,
-                                nickname: native.nickname,
-                                task: native.task,
-                                state: native.status,
-                            },
-                        },
-                    });
-                }
-            } else if is_tool_lifecycle_event(&method.to_ascii_lowercase(), &params) {
-                {
-                    let turn = self.required_address(method, &params)?;
-                    let snapshot = normalize_tool_activity(method, &params, workspace)
-                        .map_err(|_| protocol_error())?
-                        .ok_or_else(protocol_error)?;
-                    let address = ToolAddress {
-                        turn,
-                        tool_id: snapshot.id.clone().into(),
-                    };
-                    let first = !self.tool.contains_key(&address);
-                    let native = self
-                        .tool
-                        .entry(address.clone())
-                        .or_insert_with(|| NativeTool {
-                            title: String::new(),
-                            terminal: false,
-                            lifetime: NativeToolLifetime::Foreground,
-                            kind: snapshot.kind,
-                            has_changes: false,
-                            request: NativeToolRequest::default(),
-                        });
-                    native.request.observe(&params)?;
-                    self.replay_sensitive = true;
-                    output.completion.evidence.tool_called = true;
-                    output.completion.evidence.workspace_changed |=
-                        successful_file_change(&snapshot);
-                    native.has_changes |= !snapshot.change.is_empty();
-                    if native.kind == ToolActivityKind::FileChange
-                        && native.has_changes
-                        && snapshot.status == Some(ToolStatus::Succeeded)
-                    {
-                        output.completion.evidence.workspace_changed = true;
-                    }
-                    if first {
-                        native.title = snapshot.title.clone();
-                        events.push(ProviderEvent::Tool {
-                            address: address.clone(),
-                            update: ToolUpdate::Requested {
-                                invocation: crate::codex::normalize_invocation(ToolInvocation {
-                                    semantics: Default::default(),
-                                    kind: snapshot.kind,
-                                    name: snapshot.name,
-                                    title: snapshot.title.clone(),
-                                    arguments: snapshot.arguments,
-                                }),
-                            },
-                        });
-                    } else if native.title != snapshot.title
-                        && !matches!(snapshot.title.as_str(), "tool" | "command" | "file changes")
-                    {
-                        native.title = snapshot.title.clone();
-                        events.push(ProviderEvent::Tool {
-                            address: address.clone(),
-                            update: ToolUpdate::TitleChanged {
-                                title: snapshot.title.clone(),
-                            },
-                        });
-                    }
-                    if first {
-                        events.push(ProviderEvent::Tool {
-                            address: address.clone(),
-                            update: ToolUpdate::Started,
-                        });
-                    }
-                    if let Some(text) = snapshot.output {
-                        events.push(ProviderEvent::Tool {
-                            address: address.clone(),
-                            update: ToolUpdate::Output {
-                                update: if snapshot.output_delta {
-                                    TextUpdate::Append(text)
-                                } else {
-                                    TextUpdate::Replace(text)
-                                },
-                            },
-                        });
-                    }
-                    if !snapshot.change.is_empty() {
-                        events.push(ProviderEvent::Tool {
-                            address: address.clone(),
-                            update: ToolUpdate::Changes {
-                                changes: snapshot.change,
-                            },
-                        });
-                    }
-                    if !native.terminal
-                        && let Some(status) = snapshot.status
-                    {
-                        let outcome = match status {
-                            ToolStatus::Running => None,
-                            ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
-                            ToolStatus::Failed => Some(ToolOutcome::Failed {
-                                diagnostic: ToolDiagnostic {
-                                    kind: ProviderFailureKind::Unknown,
-                                    message: SanitizedMessage::new("Provider tool failed")
-                                        .expect("static diagnostic is valid"),
-                                },
-                            }),
-                            ToolStatus::Denied => Some(ToolOutcome::Denied {
-                                reason: forge_provider_api::diagnostic::SanitizedMessage::new(
-                                    "Provider denied this tool call",
-                                )
-                                .expect("static denial is nonempty"),
-                            }),
-                            ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
-                            ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
-                        };
-                        if let Some(outcome) = outcome {
-                            native.terminal = true;
-                            events.push(ProviderEvent::Tool {
-                                address,
-                                update: ToolUpdate::Finished { outcome },
-                            });
-                        }
-                    }
-                }
-            } else if method.to_ascii_lowercase().contains("plan")
-                && let (Some(address), Some(mut update)) =
-                    (address, normalize_checklist_update(method, &params))
-            {
-                let key = (address.clone(), update.scope_id.clone());
-                if let Some(previous) = self.checklist.get(&key) {
-                    if update.name.is_none() {
-                        update.name = previous.name.clone();
-                    }
-                    if !update.replace_entries {
-                        update.entry_list = previous.entry_list.clone();
-                    }
-                }
-                self.replay_sensitive = true;
-                self.checklist.insert(key, update.clone());
-                events.push(ProviderEvent::Checklist { address, update });
-            } else if method.eq_ignore_ascii_case("error")
-                || item_type.eq_ignore_ascii_case("error")
-            {
-                let retryable = params
-                    .get("error")
-                    .and_then(super::retry::transient_category)
-                    .is_some();
-                if !retryable || self.replay_sensitive {
-                    events.push(ProviderEvent::Diagnostic {
-                        scope: scope.clone().into(),
-                        diagnostic: ProviderDiagnostic {
-                            kind: super::retry::failure_kind(
-                                params.get("error").unwrap_or(&params),
-                            ),
-                            message: SanitizedMessage::new("Provider reported an error.")
-                                .expect("static diagnostic text is nonempty"),
-                            fatal: true,
-                        },
-                    });
-                }
+            for pending in pending_child {
+                events.extend(self.activities(&pending, workspace)?);
             }
         }
-        for event in events {
-            if let Some(sink) = sink {
-                sink.send_wait(event).await?;
-            } else {
-                output.event.push(event);
+        Ok(events)
+    }
+
+    /// Admit immutable text types and reject conflicting final snapshots or post-completion deltas.
+    fn message(
+        &mut self,
+        address: &TurnAddress,
+        native: String,
+        part: ItemPart,
+        start: ItemStart,
+        observation: NativeTextObservation<'_>,
+        events: &mut Vec<AdapterActivity>,
+    ) -> Result<()> {
+        let (text, completed) = match observation {
+            NativeTextObservation::Progress(text) => (text, false),
+            NativeTextObservation::Completed(text) => (text, true),
+        };
+        let key = (address.turn_id.clone(), native, part);
+        let first = !self.items.contains_key(&key);
+        if first && self.terminal.contains_key(&address.turn_id) {
+            return Err(protocol_error().into());
+        }
+        let item = self.items.entry(key).or_insert_with(|| NativeItem {
+            id: new_item_id(),
+            start: start.clone(),
+            text: String::new(),
+            completed: None,
+            lifetime: NativeItemLifetime::Foreground,
+            descriptor: None,
+            output: String::new(),
+            changes: Default::default(),
+        });
+        let same_kind = matches!(
+            (&item.start, &start),
+            (ItemStart::UserMessage(_), ItemStart::UserMessage(_))
+                | (ItemStart::AgentMessage(_), ItemStart::AgentMessage(_))
+                | (ItemStart::Reasoning(_), ItemStart::Reasoning(_))
+        );
+        if !same_kind {
+            return Err(protocol_error().into());
+        }
+        if let (ItemStart::AgentMessage(old), ItemStart::AgentMessage(incoming)) =
+            (&item.start, &start)
+            && incoming.classification != MessageClassification::Unclassified
+            && incoming.classification != old.classification
+            && (old.classification != MessageClassification::Unclassified
+                || item.completed.is_some())
+        {
+            return Err(protocol_error().into());
+        }
+        if item.completed.is_some() {
+            if completed && text.is_some_and(|text| text == item.text) {
+                return Ok(());
             }
+            return Err(protocol_error().into());
+        }
+        if first {
+            events.push(item_event(
+                address,
+                &item.id,
+                ItemEvent::Started(start.clone()),
+            ));
+        }
+        if let (ItemStart::AgentMessage(old), ItemStart::AgentMessage(incoming)) =
+            (&mut item.start, start)
+            && incoming.classification != MessageClassification::Unclassified
+            && incoming.classification != old.classification
+        {
+            if old.classification != MessageClassification::Unclassified {
+                return Err(protocol_error().into());
+            }
+            old.classification = incoming.classification;
+            events.push(item_event(
+                address,
+                &item.id,
+                ItemEvent::Message {
+                    event: MessageItemEvent::Classified(incoming.classification),
+                },
+            ));
+        }
+        if completed {
+            if let Some(text) = text {
+                item.text = text.to_owned();
+            }
+            events.push(finish_message(address, item, MessageOutcome::Completed));
+        } else if let Some(text) = text {
+            item.text.push_str(text);
+            events.push(item_event(
+                address,
+                &item.id,
+                ItemEvent::Message {
+                    event: MessageItemEvent::Delta(text.to_owned()),
+                },
+            ));
         }
         Ok(())
     }
 }
 
+/// Distinguish a native text delta from an authoritative final snapshot.
+enum NativeTextObservation<'a> {
+    Progress(Option<&'a str>),
+    Completed(Option<&'a str>),
+}
+
+/// Distinguish native unified-exec yield evidence from exit and unsupported output shapes.
+enum NativeExecReply<'a> {
+    Yielded { process_id: &'a str },
+    Exited,
+    Unknown,
+}
+
+/// Parse only the pinned native generated header, never command output after its Output delimiter.
+fn native_exec_reply(output: &str) -> Result<NativeExecReply<'_>> {
+    let Some((header, _)) = output.split_once("\nOutput:\n") else {
+        return Ok(NativeExecReply::Unknown);
+    };
+    let mut lines = header.lines().peekable();
+    if lines
+        .peek()
+        .is_some_and(|line| line.starts_with("Chunk ID: "))
+    {
+        lines.next();
+    }
+    let Some(wall_time) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Wall time: "))
+        .and_then(|value| value.strip_suffix(" seconds"))
+    else {
+        return Ok(NativeExecReply::Unknown);
+    };
+    if !wall_time
+        .parse::<f64>()
+        .is_ok_and(|value| value.is_finite() && value >= 0.0)
+    {
+        return Ok(NativeExecReply::Unknown);
+    }
+    let mut process = None;
+    let mut exited = false;
+    for line in lines {
+        if let Some(id) = line.strip_prefix("Process running with session ID ") {
+            if id.is_empty()
+                || !id.bytes().all(|byte| byte.is_ascii_digit())
+                || process.replace(id).is_some()
+            {
+                return Err(protocol_error().into());
+            }
+        } else if let Some(code) = line.strip_prefix("Process exited with code ") {
+            if exited || code.parse::<i32>().is_err() {
+                return Err(protocol_error().into());
+            }
+            exited = true;
+        } else if let Some(count) = line.strip_prefix("Original token count: ") {
+            if count.parse::<u64>().is_err() {
+                return Err(protocol_error().into());
+            }
+        } else {
+            return Ok(NativeExecReply::Unknown);
+        }
+    }
+    Ok(match process {
+        Some(process_id) => NativeExecReply::Yielded { process_id },
+        None if exited => NativeExecReply::Exited,
+        None => NativeExecReply::Unknown,
+    })
+}
+
+/// Allocate an opaque host item identity independently of native strings and derived reasoning keys.
+fn new_item_id() -> ItemId {
+    ItemId::new(uuid::Uuid::new_v4().to_string()).expect("UUID is nonempty")
+}
+
+/// Address one typed update at its immutable host item owner.
+fn item_event(address: &TurnAddress, item_id: &ItemId, event: ItemEvent) -> AdapterActivity {
+    AdapterActivity::Item {
+        thread_id: address.thread_id.clone(),
+        turn_id: address.turn_id.clone(),
+        item_id: item_id.clone(),
+        event,
+    }
+}
+
+/// Freeze partial or final text while retaining the admitted message representation.
+fn finish_message(
+    address: &TurnAddress,
+    item: &mut NativeItem,
+    outcome: MessageOutcome,
+) -> AdapterActivity {
+    let completion = MessageCompletion {
+        text: item.text.clone(),
+        outcome,
+    };
+    item.completed = Some(item.text.clone());
+    let completion = match item.start {
+        ItemStart::UserMessage(_) => ItemCompletion::UserMessage(completion),
+        ItemStart::AgentMessage(_) => ItemCompletion::AgentMessage(completion),
+        ItemStart::Reasoning(_) => ItemCompletion::Reasoning(completion),
+        ItemStart::CommandExecution(_) | ItemStart::FileChange(_) | ItemStart::ToolCall(_) => {
+            unreachable!("text completion only applies to message items")
+        }
+    };
+    item_event(address, &item.id, ItemEvent::Completed(completion))
+}
+
+/// Freeze actual native tool outcome and all independently observed final snapshots.
+fn finish_tool(
+    address: &TurnAddress,
+    item: &mut NativeItem,
+    outcome: ToolOutcome,
+    descriptor: Option<forge_provider_api::tool::ToolDescriptor>,
+    output: Option<String>,
+) -> AdapterActivity {
+    let completion = forge_provider_api::tool::ToolCompletion {
+        outcome,
+        descriptor,
+        output,
+        changes: item.changes.clone(),
+    };
+    item.completed = Some(String::new());
+    let completion = match item.start {
+        ItemStart::CommandExecution(_) => ItemCompletion::CommandExecution(completion),
+        ItemStart::FileChange(_) => ItemCompletion::FileChange(completion),
+        ItemStart::ToolCall(_) => ItemCompletion::ToolCall(completion),
+        ItemStart::UserMessage(_) | ItemStart::AgentMessage(_) | ItemStart::Reasoning(_) => {
+            unreachable!("tool completion only applies to tool items")
+        }
+    };
+    item_event(address, &item.id, ItemEvent::Completed(completion))
+}
+
+/// Capture the native observation time before cleanup or delayed publication.
 fn timestamp() -> i64 {
-    std::time::SystemTime::now()
+    let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use serde_json::json;
 
-    fn is_protocol(error: &anyhow::Error) -> bool {
-        error.downcast_ref::<ProviderError>().is_some_and(|error| {
-            matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Protocol)
-        })
-    }
-
-    fn scope() -> InvocationScope {
-        InvocationScope::new(ExecutionOwner::root("session"), "exchange")
-    }
-
-    fn message_address(scope: InvocationScope) -> MessageAddress {
-        MessageAddress {
-            turn: TurnAddress {
-                scope,
-                thread_id: "thread".into(),
-                turn_id: "turn".into(),
-            },
-            message_id: MessageId::Native("message".into()),
-        }
-    }
-
-    /// Keep native background evidence on its original invocation across subsequent bindings.
-    #[tokio::test]
-    async fn background_tool_updates_preserve_original_owner_across_bind() -> Result<()> {
-        let owner = scope();
-        let mut normalization = CodexNormalization::default();
-        normalization.bind(Some(owner.clone()));
-        let mut output = ProviderOutput::default();
-        normalization
-            .normalize(
-                &json!({"method":"item/started","params":{
-            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
-            "command":"slow command","status":"inProgress"}}}),
-                &mut output,
-                None,
-                "",
-            )
-            .await?;
-        normalization
-            .normalize(
-                &json!({"method":"turn/completed","params":{
-            "threadId":"thread","turn":{"id":"old","status":"completed"}}}),
-                &mut output,
-                None,
-                "",
-            )
-            .await?;
-        assert!(output.event.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: ToolUpdate::Backgrounded,
-                ..
-            }
-        )));
-        let before = normalization
-            .normalize_background(
-                &json!({"method":"item/commandExecution/outputDelta",
-            "params":{"threadId":"thread","turnId":"old","itemId":"command","delta":"first"}}),
-                "",
-            )
-            .await?
-            .unwrap();
-        assert!(
-            before
-                .iter()
-                .all(|event| event.scope().invocation() == Some(&owner))
-        );
-        normalization.bind(Some(InvocationScope::new(owner.owner.clone(), "next")));
-        for (thread, turn, item) in [
-            ("foreign", "old", "command"),
-            ("thread", "foreign", "command"),
-            ("thread", "old", "foreign"),
-        ] {
-            assert!(
-                normalization
-                    .normalize_background(
-                        &json!({"method":"item/commandExecution/outputDelta",
-                "params":{"threadId":thread,"turnId":turn,"itemId":item,"delta":"foreign"}}),
-                        ""
-                    )
-                    .await?
-                    .is_none()
-            );
-        }
-        let completed = normalization.normalize_background(&json!({"method":"item/completed","params":{
-            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
-            "command":"slow command","status":"completed","aggregatedOutput":"first end","exitCode":0}}}), "").await?.unwrap();
-        assert!(
-            completed
-                .iter()
-                .all(|event| event.scope().invocation() == Some(&owner))
-        );
-        assert!(completed.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded
-                },
-                ..
-            }
-        )));
-        assert!(!completed.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: ToolUpdate::Requested { .. } | ToolUpdate::Started,
-                ..
-            }
-        )));
-        let repeated = normalization.normalize_background(&json!({"method":"item/completed","params":{
-            "threadId":"thread","turnId":"old","item":{"type":"commandExecution","id":"command",
-            "command":"slow command","status":"completed","aggregatedOutput":"first end","exitCode":0}}}), "").await?.unwrap();
-        assert!(!repeated.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: ToolUpdate::Finished { .. },
-                ..
-            }
-        )));
-        normalization.bind(Some(InvocationScope::new(
-            ExecutionOwner::root("foreign"),
-            "next",
-        )));
-        assert!(!normalization.has_pending_background_tools());
-        Ok(())
-    }
-
-    /// Explicit failed or interrupted turns never grant background lifetime.
-    #[tokio::test]
-    async fn interrupted_native_turn_does_not_retain_command_lifetime() -> Result<()> {
-        for status in ["failed", "interrupted"] {
-            let mut normalization = CodexNormalization::default();
-            normalization.bind(Some(scope()));
-            let mut output = ProviderOutput::default();
-            normalization.normalize(&json!({"method":"item/started","params":{
-                "threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"command",
-                "command":"slow command","status":"inProgress"}}}), &mut output, None, "").await?;
-            normalization
-                .normalize(
-                    &json!({"method":"turn/completed","params":{
-                "threadId":"thread","turn":{"id":"turn","status":status}}}),
-                    &mut output,
-                    None,
-                    "",
-                )
-                .await?;
-            assert!(!normalization.has_pending_background_tools());
-            assert!(!output.event.iter().any(|event| matches!(
-                event,
-                ProviderEvent::Tool {
-                    update: ToolUpdate::Backgrounded,
-                    ..
-                }
-            )));
-        }
-        Ok(())
-    }
-
+    /// Keep cancelled, missing, and future terminal statuses from becoming successful answers.
     #[test]
-    fn completed_text_is_immutable_and_duplicate_snapshots_are_idempotent() -> Result<()> {
-        let mut normalization = CodexNormalization::default();
-        let address = message_address(scope());
-        normalization.text(
-            address.clone(),
-            Some(MessageClassification::Known(MessageRole::Response)),
-            Some("partial".into()),
-            false,
-        )?;
-        normalization.text(address.clone(), None, Some("authoritative".into()), true)?;
-        assert!(
-            normalization
-                .text(address.clone(), None, Some("authoritative".into()), true)?
-                .is_empty()
+    fn terminal_status_preserves_native_evidence() {
+        use forge_provider_api::turn::{TurnCompletionReason, TurnOutcome};
+        assert_eq!(
+            terminal_outcome(&json!({"status":"completed"})).unwrap(),
+            TurnOutcome::Completed {
+                stop_reason: TurnCompletionReason::Normal
+            }
         );
-        for (text, completed) in [("changed", true), ("late delta", false)] {
-            let error = normalization
-                .text(address.clone(), None, Some(text.into()), completed)
-                .unwrap_err();
-            assert!(is_protocol(&error));
-            assert_eq!(normalization.message[&address].text, "authoritative");
-        }
-        let empty = MessageAddress {
-            message_id: MessageId::Native("empty".into()),
-            ..address
-        };
-        assert!(
-            normalization
-                .text(empty.clone(), None, Some(String::new()), true)?
-                .is_empty()
-        );
-        assert!(
-            normalization
-                .text(empty, None, Some("revived".into()), true)
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn known_classification_cannot_change_after_publication() -> Result<()> {
-        let mut normalization = CodexNormalization::default();
-        let address = message_address(scope());
-        normalization.text(
-            address.clone(),
-            Some(MessageClassification::Unclassified),
-            Some("working".into()),
-            false,
-        )?;
-        let classified = normalization.text(
-            address.clone(),
-            Some(MessageClassification::Known(MessageRole::Commentary)),
-            None,
-            false,
-        )?;
-        assert!(matches!(
-            classified.as_slice(),
-            [ProviderEvent::Message {
-                update: MessageUpdate::Classified {
-                    role: MessageRole::Commentary
-                },
-                ..
-            }]
-        ));
-        for classification in [
-            MessageClassification::Known(MessageRole::Response),
-            MessageClassification::Unclassified,
-        ] {
-            let error = normalization
-                .text(address.clone(), Some(classification), None, false)
-                .unwrap_err();
-            assert!(is_protocol(&error));
+        for status in ["interrupted", "cancelled"] {
             assert_eq!(
-                normalization.message[&address].role,
-                Some(MessageRole::Commentary)
+                terminal_outcome(&json!({"status":status})).unwrap(),
+                TurnOutcome::Interrupted
             );
         }
+        for raw in [json!({}), json!({"status":"future"}), json!({"status":42})] {
+            assert!(terminal_outcome(&raw).is_err());
+        }
+    }
+
+    /// Keep identical native IDs in separate turns and reasoning representations from aliasing.
+    #[tokio::test]
+    async fn native_identity_mapping_keeps_original_turn_and_item_owners() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let first = normalization.admit_turn("native", "turn-one", &scope)?;
+        let second = normalization.admit_turn(
+            "native",
+            "turn-two",
+            &InvocationScope::new(scope.owner.clone(), "two"),
+        )?;
+        assert_ne!(first.turn_id, second.turn_id);
+        for turn in ["turn-one", "turn-two"] {
+            normalization.activities(&json!({"method":"item/agentMessage/delta", "params":{"threadId":"native","turnId":turn,"itemId":"same","delta":"text"}}), "")?;
+        }
+        normalization.activities(&json!({"method":"item/reasoning/summaryTextDelta", "params":{"threadId":"native","turnId":"turn-one","itemId":"same","summaryIndex":0,"delta":"summary"}}), "")?;
+        let ids = normalization
+            .items
+            .values()
+            .map(|item| item.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 3);
         Ok(())
     }
 
-    #[tokio::test]
-    async fn recognized_content_requires_native_identity_but_inactive_scopes_do_not() -> Result<()>
-    {
-        for message in [
-            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","itemId":"message","delta":"text"}}),
-            json!({"method":"item/agentMessage/delta","params":{"turnId":"turn","itemId":"message","delta":"text"}}),
-            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"text"}}),
-            json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread","turnId":"turn","delta":"thought"}}),
-            json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","command":"check"}}}),
-            json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","itemId":"command","delta":"output"}}),
-        ] {
-            let mut normalization = CodexNormalization::default();
-            let mut output = ProviderOutput::default();
-            normalization
-                .normalize(&message, &mut output, None, "")
-                .await?;
-            normalization.bind(Some(EventScope::SessionOperation {
-                owner: ExecutionOwner::root("session"),
-                operation_id: forge_provider_api::OperationId::new("catalog").unwrap(),
-            }));
-            normalization
-                .normalize(&message, &mut output, None, "")
-                .await?;
-            normalization.bind(Some(scope()));
-            let error = normalization
-                .normalize(&message, &mut output, None, "")
-                .await
-                .unwrap_err();
+    /// Keep nested compaction metadata in the same host thread as its public envelope.
+    #[test]
+    fn compaction_metadata_uses_registered_host_thread_identity() -> Result<()> {
+        let owner = ThreadOwner::root("compaction-owner");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_thread("private-native-thread", &owner)?;
+        for method in ["item/started", "item/completed"] {
+            let events = normalization.activities(&json!({"method":method,"params":{
+                "threadId":"private-native-thread","item":{"id":"compact","type":"contextCompaction"}
+            }}), "")?;
             assert!(
-                is_protocol(&error),
-                "malformed native frame is classified as protocol failure"
+                matches!(events.as_slice(), [AdapterActivity::Thread { thread_id, event: ThreadEvent::CompactionUpdated(compaction) }]
+                if thread_id == &owner.thread_id() && compaction.thread_id == thread_id.as_str())
             );
-            assert!(output.event.is_empty());
-            assert!(normalization.message.is_empty());
-            assert!(normalization.tool.is_empty());
-            assert!(!output.completion.evidence.tool_called);
         }
-        let mut normalization = CodexNormalization::default();
-        normalization.bind(Some(scope()));
-        normalization.normalize(&json!({"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn","command":"check"}}), &mut ProviderOutput::default(), None, "").await?;
         Ok(())
     }
 
-    #[tokio::test]
-    async fn unknown_and_missing_phases_remain_unclassified() -> Result<()> {
-        for phase in [Value::Null, json!("future_phase"), json!("")] {
-            let mut normalization = CodexNormalization::default();
-            normalization.bind(Some(scope()));
-            let mut output = ProviderOutput::default();
-            normalization
-                .normalize(
-                    &json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn",
-                "item":{"type":"agentMessage","id":"message","phase":phase,"text":""}}}),
-                    &mut output,
-                    None,
-                    "",
-                )
-                .await?;
-            normalization.normalize(&json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"message","delta":"text"}}), &mut output, None, "").await?;
-            assert!(output.event.iter().any(|event| matches!(event, ProviderEvent::Message { update: MessageUpdate::Started { classification: MessageClassification::Unclassified, text }, .. } if text == "text")));
-            assert!(!output.event.iter().any(|event| matches!(
-                event,
-                ProviderEvent::Message {
-                    update: MessageUpdate::Classified { .. },
-                    ..
+    /// Close unfinished foreground work without inferring background lifetime from turn success.
+    #[test]
+    fn completed_turn_requires_explicit_native_lifetime_evidence() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "turn", &scope)?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
+        let events = normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":"completed"}}}), "")?;
+        assert!(!normalization.has_pending_background_tools());
+        assert!(events.iter().any(|event| matches!(event, AdapterActivity::Item { event: ItemEvent::Completed(ItemCompletion::CommandExecution(completion)), .. } if completion.outcome == ToolOutcome::Interrupted)));
+        assert!(matches!(
+            normalization.terminal_evidence(&address),
+            Some((forge_provider_api::turn::TurnOutcome::Completed { .. }, _))
+        ));
+        Ok(())
+    }
+
+    /// Certify an unpolled unified-exec session only at normal native end, never from a process ID alone.
+    #[test]
+    fn unpolled_unified_exec_requires_source_process_and_normal_native_end() -> Result<()> {
+        for source in [Some("unifiedExecStartup"), Some("agent"), None] {
+            for status in ["completed", "interrupted", "failed"] {
+                let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+                let mut normalization = CodexNormalization::default();
+                normalization.admit_turn("native", "turn", &scope)?;
+                let mut item = json!({"type":"commandExecution","id":"command","command":"server","status":"inProgress","processId":"42"});
+                if let Some(source) = source {
+                    item["source"] = json!(source);
                 }
-            )));
-            assert_eq!(output.event.iter().filter(|event| matches!(event, ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == ProviderFailureKind::Protocol && diagnostic.message.as_str() == "Provider reported an unsupported message phase.")).count(), usize::from(!phase.is_null()));
+                normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":item}}), "")?;
+                let events = normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":status}}}), "")?;
+                let expected = source == Some("unifiedExecStartup") && status == "completed";
+                assert_eq!(normalization.has_pending_background_tools(), expected);
+                assert_eq!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AdapterActivity::Item {
+                            event: ItemEvent::Tool {
+                                event: forge_provider_api::tool::ToolItemEvent::Backgrounded
+                            },
+                            ..
+                        }
+                    )),
+                    expected
+                );
+            }
         }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn derived_reasoning_identity_cannot_alias_a_native_message() -> Result<()> {
+    /// A user interrupt stops the turn's foreground commands but not unified-exec sessions.
+    #[test]
+    fn interrupt_selects_only_foreground_commands_of_the_turn() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
         let mut normalization = CodexNormalization::default();
-        normalization.bind(Some(scope()));
-        let mut output = ProviderOutput::default();
-        for message in [
-            json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn",
-                "item":{"type":"agentMessage","id":"reasoning:summary:0","phase":"final_answer","text":"response"}}}),
-            json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread","turnId":"turn","itemId":"reasoning","summaryIndex":0,"delta":"summary"}}),
-            json!({"method":"item/reasoning/textDelta","params":{"threadId":"thread","turnId":"turn","itemId":"reasoning","contentIndex":0,"delta":"thought"}}),
-            json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn",
-                "item":{"type":"reasoning","id":"reasoning","summary":["final summary"],"content":["final thought"]}}}),
-        ] {
+        normalization.admit_turn("native", "turn", &scope)?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"sleep","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"server","command":"server","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), "")?;
+        assert_eq!(
+            normalization.foreground_command_items("native", "turn"),
+            std::collections::HashSet::from(["sleep".to_owned()])
+        );
+        assert!(
             normalization
-                .normalize(&message, &mut output, None, "")
-                .await?;
-        }
-        assert_eq!(normalization.message.len(), 3);
-        for (id, expected, role) in [
-            (
-                MessageId::Native("reasoning:summary:0".into()),
-                "response",
-                MessageRole::Response,
-            ),
-            (
-                MessageId::Synthetic("reasoning:summary:0".into()),
-                "final summary",
-                MessageRole::ThoughtSummary,
-            ),
-            (
-                MessageId::Synthetic("reasoning:thought:0".into()),
-                "final thought",
-                MessageRole::Thought,
-            ),
+                .foreground_command_items("native", "other")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// A command that outlives `turn/interrupt` reports its output and status after Forge
+    /// closed it as interrupted; that late activity is absorbed, not a protocol failure.
+    #[test]
+    fn late_native_activity_after_an_interrupted_turn_is_absorbed() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_turn("native", "turn", &scope)?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
+        let interrupted = normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":"interrupted"}}}), "")?;
+        assert!(interrupted.iter().any(|event| matches!(
+            event,
+            AdapterActivity::Item {
+                event: ItemEvent::Completed(ItemCompletion::CommandExecution(_)),
+                ..
+            }
+        )));
+        let delta = normalization.activities(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","turnId":"turn","itemId":"command","delta":"late"}}), "")?;
+        let completed = normalization.activities(&json!({"method":"item/completed","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"Start-Sleep 40","status":"completed","exitCode":0,"aggregatedOutput":"late"}}}), "")?;
+        assert!(delta.is_empty() && completed.is_empty());
+        Ok(())
+    }
+
+    /// Trust only generated header lifetime evidence for the exact original unified-exec call and process.
+    #[test]
+    fn raw_yield_evidence_checks_owner_process_and_ignores_stdout_spoofing() -> Result<()> {
+        for (reported_process, stdout_spoof, expected) in [
+            ("42", false, true),
+            ("99", false, false),
+            ("42", true, false),
         ] {
-            let state = normalization
-                .message
-                .iter()
-                .find_map(|(address, state)| (address.message_id == id).then_some(state))
-                .unwrap();
-            assert_eq!(state.text, expected);
-            assert_eq!(state.role, Some(role));
-            assert!(state.completed);
+            let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+            let mut normalization = CodexNormalization::default();
+            let address = normalization.admit_turn("native", "turn", &scope)?;
+            normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"server","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), "")?;
+            let output = if stdout_spoof {
+                "Wall time: 0.0100 seconds\nProcess exited with code 0\nOutput:\nProcess running with session ID 42".to_owned()
+            } else {
+                format!(
+                    "Chunk ID: native-chunk\nWall time: 0.0100 seconds\nProcess running with session ID {reported_process}\nOriginal token count: 2\nOutput:\nready"
+                )
+            };
+            let result = normalization.activities(&json!({"method":"rawResponseItem/completed","params":{"threadId":"native","turnId":"turn","item":{"type":"function_call_output","call_id":"command","output":output}}}), "");
+            assert_eq!(normalization.has_pending_background_tools(), expected);
+            assert_eq!(result.is_ok(), reported_process == "42");
+            normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":"interrupted"}}}), "")?;
+            assert_eq!(
+                normalization.has_unresolved_sessions(&address),
+                !expected && !stdout_spoof
+            );
+        }
+        Ok(())
+    }
+
+    /// Preserve the original turn for turnless output after a successor is admitted.
+    #[tokio::test]
+    async fn certified_background_output_keeps_original_owner_across_successor() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "old", &scope)?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"old","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
+        let poll = normalization.activities(&json!({"method":"item/commandExecution/terminalInteraction", "params":{"threadId":"native","turnId":"old","itemId":"command","processId":"42","stdin":""}}), "")?;
+        assert!(poll.iter().any(|event| matches!(
+            event,
+            AdapterActivity::Item {
+                event: ItemEvent::Tool {
+                    event: forge_provider_api::tool::ToolItemEvent::Backgrounded
+                },
+                ..
+            }
+        )));
+        normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"old","status":"completed"}}}), "")?;
+        let next = normalization.admit_turn(
+            "native",
+            "new",
+            &InvocationScope::new(scope.owner.clone(), "two"),
+        )?;
+        let events = normalization.normalize_background(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","itemId":"command","delta":"late"}}), "").await?.unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| matches!(event, AdapterActivity::Item { turn_id, .. } if turn_id == &address.turn_id && turn_id != &next.turn_id)));
+        assert!(normalization.normalize_background(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"foreign","itemId":"command","delta":"foreign"}}), "").await?.is_none());
+        Ok(())
+    }
+
+    /// Freeze authoritative message snapshots and reject conflicting replay before changing content.
+    #[test]
+    fn final_text_snapshots_are_idempotent_and_immutable() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_turn("native", "turn", &scope)?;
+        let delta = json!({"method":"item/agentMessage/delta","params":{"threadId":"native","turnId":"turn","itemId":"message","delta":"partial"}});
+        normalization.activities(&delta, "")?;
+        let final_snapshot = json!({"method":"item/completed","params":{"threadId":"native","turnId":"turn","item":{"type":"agentMessage","id":"message","phase":"final_answer","text":"final"}}});
+        normalization.activities(&final_snapshot, "")?;
+        assert!(normalization.activities(&final_snapshot, "")?.is_empty());
+        assert!(normalization.activities(&delta, "").is_err());
+        let mut conflict = final_snapshot;
+        conflict["params"]["item"]["text"] = json!("conflict");
+        assert!(normalization.activities(&conflict, "").is_err());
+        assert_eq!(normalization.items.values().next().unwrap().text, "final");
+        Ok(())
+    }
+
+    /// Keep multiple native reports identified and never count context compaction as expenditure.
+    #[test]
+    fn usage_replays_keep_one_report_and_context_adjustments_are_separate() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "turn", &scope)?;
+        let usage = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"turn","tokenUsage":{"last":{"inputTokens":10,"outputTokens":5},"total":{"inputTokens":30,"outputTokens":20,"totalTokens":50}}}});
+        normalization.activities(&usage, "")?;
+        normalization.activities(&usage, "")?;
+        assert_eq!(normalization.final_usage(&address).len(), 1);
+        let adjustment = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"turn","tokenUsage":{"last":{"inputTokens":0,"outputTokens":0},"total":{"inputTokens":20,"outputTokens":10,"totalTokens":30}}}});
+        normalization.activities(&adjustment, "")?;
+        assert_eq!(normalization.final_usage(&address).len(), 1);
+        let later_scope = InvocationScope::new(ThreadOwner::root("session"), "two");
+        let later = normalization.admit_turn("native", "later", &later_scope)?;
+        let replay = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"later","tokenUsage":{"last":{"inputTokens":10,"outputTokens":5},"total":{"inputTokens":30,"outputTokens":20,"totalTokens":50}}}});
+        normalization.activities(&replay, "")?;
+        assert!(
+            normalization.final_usage(&later).is_empty(),
+            "a later turn must not inherit the previous call's unchanged usage"
+        );
+        let spent = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"later","tokenUsage":{"last":{"inputTokens":12,"outputTokens":3},"total":{"inputTokens":42,"outputTokens":23,"totalTokens":65}}}});
+        normalization.activities(&spent, "")?;
+        assert_eq!(normalization.final_usage(&later).len(), 1);
+        Ok(())
+    }
+
+    /// Resolve a child learned after spawn acknowledgement without replacing its original host agent.
+    #[test]
+    fn late_native_child_identity_resolves_the_original_pending_agent() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_turn("native", "parent", &scope)?;
+        let pending = normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"parent","item":{"type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","status":"inProgress","senderThreadId":"native","receiverThreadIds":[]}}}), "")?;
+        let pending_id = pending
+            .iter()
+            .find_map(|event| match event {
+                AdapterActivity::Agent {
+                    agent_id,
+                    event:
+                        AgentEvent::Lifecycle {
+                            event: AgentLifecycleEvent::Started { agent, .. },
+                        },
+                } if agent.thread_id.is_none() => Some(agent_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let resolved = normalization.activities(&json!({"method":"item/completed","params":{"threadId":"native","turnId":"parent","item":{"type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","status":"completed","senderThreadId":"native","receiverThreadIds":["native-child"]}}}), "")?;
+        assert!(resolved.iter().any(|event| matches!(event, AdapterActivity::Agent { agent_id, event: AgentEvent::ConversationResolved { .. } } if agent_id == &pending_id)));
+        assert_eq!(normalization.agents.get("native-child"), Some(&pending_id));
+        Ok(())
+    }
+
+    /// Keep sparse output from erasing request metadata and reject changed final descriptors.
+    #[test]
+    fn sparse_tool_progress_preserves_descriptor_and_final_replay_is_checked() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_turn("native", "turn", &scope)?;
+        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"cargo check","cwd":"workspace","status":"inProgress"}}}), "")?;
+        let descriptor = normalization
+            .items
+            .values()
+            .next()
+            .unwrap()
+            .descriptor
+            .clone()
+            .unwrap();
+        let progress = normalization.activities(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","turnId":"turn","itemId":"command","delta":"checking"}}), "")?;
+        assert_eq!(
+            normalization
+                .items
+                .values()
+                .next()
+                .unwrap()
+                .descriptor
+                .as_ref(),
+            Some(&descriptor)
+        );
+        assert!(!progress.iter().any(|event| matches!(
+            event,
+            AdapterActivity::Item {
+                event: ItemEvent::Tool {
+                    event: forge_provider_api::tool::ToolItemEvent::DescriptorUpdated(_)
+                },
+                ..
+            }
+        )));
+        let final_snapshot = json!({"method":"item/completed","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"cargo check","cwd":"workspace","status":"completed","aggregatedOutput":"checked"}}});
+        normalization.activities(&final_snapshot, "")?;
+        assert!(normalization.activities(&final_snapshot, "")?.is_empty());
+        let mut conflicting = final_snapshot;
+        conflicting["params"]["item"]["command"] = json!("different command");
+        assert!(normalization.activities(&conflicting, "").is_err());
+        assert_eq!(
+            normalization
+                .items
+                .values()
+                .next()
+                .unwrap()
+                .descriptor
+                .as_ref(),
+            Some(&descriptor)
+        );
+        Ok(())
+    }
+
+    /// Preserve explicit error correlation and reject foreign or conflicting supplied identities.
+    #[test]
+    fn native_errors_require_retained_exact_ownership() -> Result<()> {
+        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "turn", &scope)?;
+        assert!(
+            matches!(normalization.native_error(&json!({"threadId":"native","turnId":"turn"}))?, AdapterActivity::Turn { turn_id, .. } if turn_id == address.turn_id)
+        );
+        for params in [
+            json!({"threadId":"foreign","turnId":"turn"}),
+            json!({"threadId":"native","turnId":"foreign"}),
+            json!({"threadId":"native","turnId":"turn","turn_id":"other"}),
+        ] {
+            assert!(normalization.native_error(&params).is_err());
         }
         Ok(())
     }

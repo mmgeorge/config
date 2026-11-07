@@ -1,5 +1,6 @@
 local M = {}
-local directory = vim.fs.dirname(debug.getinfo(1, "S").source:sub(2))
+-- Resolve against the load-time working directory so a later directory change keeps this path.
+local directory = vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))
 ---@class ForgeHarperRuleRequest
 ---@field rule string
 ---@field callback fun(failure?: string)

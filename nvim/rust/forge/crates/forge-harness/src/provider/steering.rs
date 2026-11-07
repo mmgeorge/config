@@ -4,7 +4,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 const MAX_STEERING_REQUESTS: usize = 256;
 
-use super::{ProviderError, ProviderEvent, ProviderEventSink};
+use super::{HarnessEventSink, ProviderError};
 
 #[derive(Clone, Debug)]
 /// Distinguishes user steering from child results delivered without user-prompt rendering.
@@ -116,7 +116,7 @@ impl SteeringTarget {
             .await
             .map_err(|error| {
                 super::lifecycle_error::classify(
-                    forge_provider_api::ProviderOperation::InputSteer,
+                    forge_provider_api::ProviderOperation::TurnSteer,
                     error,
                 )
             })
@@ -128,7 +128,7 @@ pub struct ActiveSteering {
     lane: SteeringLane,
     generation: u64,
     receiver: mpsc::Receiver<SteerCommand>,
-    event_sink: Option<ProviderEventSink>,
+    event_sink: Option<HarnessEventSink>,
 }
 
 /// Carries one steering input and its provider acknowledgement.
@@ -140,7 +140,7 @@ pub struct SteerCommand {
     pub submission: Option<Arc<super::submission::Submission>>,
     pub operation: ActiveTurnOperation,
     completion: Option<oneshot::Sender<std::result::Result<(), ProviderError>>>,
-    event_sink: Option<ProviderEventSink>,
+    event_sink: Option<HarnessEventSink>,
     publish_input: bool,
     task_start: Option<crate::exchange::TaskStart>,
 }
@@ -179,7 +179,7 @@ impl SteeringLane {
     }
 
     /// Attach a receiver to the active provider turn before accepting steering input.
-    pub fn activate(&self, event_sink: Option<ProviderEventSink>) -> Result<ActiveSteering> {
+    pub fn activate(&self, event_sink: Option<HarnessEventSink>) -> Result<ActiveSteering> {
         let (sender, receiver) = mpsc::channel(MAX_STEERING_REQUESTS + 1);
         let mut state = self.state.lock().expect("steering lane lock poisoned");
         anyhow::ensure!(
@@ -297,12 +297,12 @@ impl ActiveSteering {
     pub(crate) fn retire(&mut self) {
         self.receiver.close();
         let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
-        if state.generation == self.generation {
-            if let Some(sender) = state.sender.take() {
-                sender.ordinary.close();
-                #[cfg(test)]
-                sender.interrupt.close();
-            }
+        if state.generation == self.generation
+            && let Some(sender) = state.sender.take()
+        {
+            sender.ordinary.close();
+            #[cfg(test)]
+            sender.interrupt.close();
         }
     }
     /// Drains input already admitted before a provider-turn boundary.
@@ -328,12 +328,12 @@ impl ActiveSteering {
 impl Drop for ActiveSteering {
     fn drop(&mut self) {
         let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
-        if state.generation == self.generation {
-            if let Some(sender) = state.sender.take() {
-                sender.ordinary.close();
-                #[cfg(test)]
-                sender.interrupt.close();
-            }
+        if state.generation == self.generation
+            && let Some(sender) = state.sender.take()
+        {
+            sender.ordinary.close();
+            #[cfg(test)]
+            sender.interrupt.close();
         }
     }
 }
@@ -369,7 +369,7 @@ impl SteerCommand {
     pub(crate) async fn complete_with(
         mut self,
         operation: impl std::future::Future<Output = Result<super::retry::RetryAttempt>>,
-        event_sink: ProviderEventSink,
+        event_sink: HarnessEventSink,
     ) -> Result<(super::retry::RetryAttempt, Option<Self>)> {
         self.event_sink = Some(event_sink);
         let mut operation = Box::pin(operation);
@@ -407,7 +407,7 @@ impl SteerCommand {
         } else {
             result.as_ref().map(|_| ()).map_err(|error| {
                 super::lifecycle_error::classify_source(
-                    forge_provider_api::ProviderOperation::InputSteer,
+                    forge_provider_api::ProviderOperation::TurnSteer,
                     error.as_ref(),
                 )
                 .into()
@@ -446,7 +446,7 @@ impl SteerCommand {
                     return Ok(Some(self));
                 }
                 self.complete(Err(super::lifecycle_error::classify_source(
-                    forge_provider_api::ProviderOperation::InputSteer,
+                    forge_provider_api::ProviderOperation::TurnSteer,
                     error.as_ref(),
                 )
                 .into()))
@@ -474,42 +474,38 @@ impl SteerCommand {
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let event = (|| -> Result<ProviderEvent> {
-                let input_id = self
+            let publication = async {
+                let receipt = self
                     .submission
-                    .as_ref()
-                    .map(|submission| submission.record().map(|record| record.input_message_id))
-                    .transpose()?
-                    .flatten();
-                let acknowledgement = match self.task_start.take() {
-                    Some(start) => crate::provider::InputAcknowledgement::TaskStarted {
-                        input_id,
+                    .clone()
+                    .context("successful steering requires its journal receipt")?;
+                let presentation = match self.task_start.take() {
+                    Some(start) => super::session_execution::InputPresentation::TaskStarted {
                         start,
                         prompt: self.text.clone(),
                     },
-                    None => crate::provider::InputAcknowledgement::Steering {
-                        input_id,
+                    None => super::session_execution::InputPresentation::Steering {
                         text: self.text.clone(),
                     },
                 };
-                Ok(ProviderEvent::InputAccepted {
-                    scope: event_sink.invocation_scope()?.clone(),
-                    acknowledgement,
-                })
-            })();
-            if let Err(error) = async {
-                event_sink.send_wait(event?).await?;
+                event_sink
+                    .send_acceptance(
+                        event_sink.invocation_scope()?.clone(),
+                        receipt,
+                        presentation,
+                    )
+                    .await?;
                 Ok::<(), anyhow::Error>(())
             }
-            .await
-            {
+            .await;
+            if let Err(error) = publication {
                 result = Err(error);
             }
         }
         if let Some(completion) = self.completion.take() {
             let _ = completion.send(result.map_err(|error| {
                 super::lifecycle_error::classify(
-                    forge_provider_api::ProviderOperation::InputSteer,
+                    forge_provider_api::ProviderOperation::TurnSteer,
                     error,
                 )
             }));
@@ -543,7 +539,7 @@ impl Drop for SteerCommand {
 fn not_admitted() -> ProviderError {
     ProviderError::PreparationFailed(Box::new(ProviderError::Failure(
         forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::InputSteer,
+            forge_provider_api::ProviderOperation::TurnSteer,
             forge_provider_api::ProviderFailureKind::Rejected,
         ),
     )))
@@ -552,7 +548,8 @@ fn not_admitted() -> ProviderError {
 #[cfg(test)]
 mod test {
     use super::SteeringLane;
-    use crate::provider::{ExecutionOwner, InputAcknowledgement, InvocationScope, ProviderEvent};
+    use crate::provider::session_execution::{InputPresentation, OwnerObservation};
+    use crate::provider::{InvocationScope, ThreadOwner};
 
     /// A captured sender must reject retirement instead of delivering to the replacement turn.
     #[tokio::test]
@@ -579,7 +576,7 @@ mod test {
 
     fn scope() -> InvocationScope {
         InvocationScope {
-            owner: ExecutionOwner::root("steering"),
+            owner: ThreadOwner::root("steering"),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
@@ -671,7 +668,7 @@ mod test {
         let command = active.receive().await.unwrap();
         submission.sending(None)?;
         let failure = forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::InputSteer,
+            forge_provider_api::ProviderOperation::TurnSteer,
             forge_provider_api::ProviderFailureKind::Timeout,
         )
         .at_phase(
@@ -726,6 +723,7 @@ mod test {
             let mut request = Box::pin(lane.steer(sequence.to_string().into()));
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             pending.push(request);
+            tokio::task::yield_now().await;
         }
         let mut overflow = Box::pin(lane.steer("overflow".into()));
         assert!(futures_util::poll!(overflow.as_mut()).is_pending());
@@ -834,7 +832,7 @@ mod test {
         let error = lane.steer("too late".into()).await.unwrap_err();
         assert!(
             matches!(error.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::PreparationFailed(cause))
-            if matches!(cause.as_ref(), crate::provider::ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::InputSteer && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged))
+            if matches!(cause.as_ref(), crate::provider::ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::TurnSteer && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged))
         );
     }
 
@@ -915,11 +913,11 @@ mod test {
         command.complete(Ok(())).await;
         delivery.await?;
         let event = events.recv().await?.unwrap();
-        let ProviderEvent::InputAccepted {
+        let OwnerObservation::InputAcceptance {
             scope: accepted_scope,
-            acknowledgement:
-                InputAcknowledgement::TaskStarted {
-                    input_id,
+            receipt,
+            presentation:
+                InputPresentation::TaskStarted {
                     start: accepted_start,
                     prompt: accepted_prompt,
                 },
@@ -930,37 +928,67 @@ mod test {
         assert_eq!(accepted_scope, scope());
         assert_eq!(accepted_prompt, prompt);
         assert_eq!(accepted_start, start);
-        assert_eq!(input_id.as_deref(), Some("task-entry"));
+        assert_eq!(
+            receipt.record()?.input_message_id.as_deref(),
+            Some("task-entry")
+        );
         assert!(events.try_recv().is_err());
         Ok(())
     }
 
     #[tokio::test]
-    async fn emits_only_provider_acknowledged_input() {
+    async fn emits_only_provider_acknowledged_input() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let store = crate::provider::submission::SubmissionStore::open(directory.path(), trace)?;
+        let catalog = crate::provider::ProviderCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "steering".into(),
+            workspace: "workspace".into(),
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+            provider_session_id: None,
+        };
+        let receipt = store.prepare_input(
+            &catalog,
+            crate::provider::ProviderInput::from_text("accepted"),
+            forge_providers::registry::default_id(),
+            None,
+        )?;
         let lane = SteeringLane::default();
         let (event_sink, mut event_stream) = crate::provider::events::channel(scope());
-        let mut active = lane.activate(Some(event_sink)).unwrap();
+        let mut active = lane.activate(Some(event_sink))?;
         let accepted_lane = lane.clone();
-        let accepted = tokio::spawn(async move { accepted_lane.steer("accepted".into()).await });
+        let accepted = tokio::spawn(async move {
+            accepted_lane
+                .steer(super::SteeringInput::User {
+                    text: "accepted".into(),
+                    attachments: vec![],
+                    submission: Some(receipt),
+                })
+                .await
+        });
         let accepted_command = active.receive().await.unwrap();
         accepted_command.complete(Ok(())).await;
-        accepted.await.unwrap().unwrap();
-        let event = event_stream.recv().await.unwrap().expect("steering event");
-        assert!(matches!(
-            event,
-            ProviderEvent::InputAccepted {
-                scope: accepted_scope,
-                acknowledgement: InputAcknowledgement::Steering { input_id: None, text },
-            } if accepted_scope == scope() && text == "accepted"
-        ));
-
+        accepted.await??;
+        let event = event_stream
+            .recv()
+            .await?
+            .expect("steering receipt owner observation");
+        assert!(
+            matches!(event, OwnerObservation::InputAcceptance { scope: accepted_scope,
+            presentation: InputPresentation::Steering { text }, .. } if accepted_scope == scope() && text == "accepted")
+        );
         let rejected_lane = lane.clone();
         let rejected = tokio::spawn(async move { rejected_lane.steer("rejected".into()).await });
-        let rejected_command = active.receive().await.unwrap();
-        rejected_command
+        active
+            .receive()
+            .await
+            .unwrap()
             .complete(Err(anyhow::anyhow!("provider rejected steering")))
             .await;
-        assert!(rejected.await.unwrap().is_err());
+        assert!(rejected.await?.is_err());
         assert!(event_stream.try_recv().is_err());
+        Ok(())
     }
 }

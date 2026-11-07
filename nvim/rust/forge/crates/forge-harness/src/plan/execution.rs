@@ -100,7 +100,8 @@ impl VerificationReport {
                     "a passed assessment cannot retain unresolved findings"
                 );
                 ensure!(
-                    !self.evidence.is_empty(),
+                    !self.evidence.is_empty()
+                        || self.checks.iter().any(|check| !check.evidence.is_empty()),
                     "a passed assessment requires verification evidence"
                 );
                 Ok(VerificationAssessment::Passed)
@@ -130,14 +131,29 @@ impl VerificationReport {
     }
     /// Validate check identities and evidence before a phase transition is committed.
     pub(crate) fn validate_checks(&self, actions: &[String]) -> Result<()> {
+        // Each rejection names the exact expected labels so a model can correct its
+        // report instead of retrying a contract it cannot see.
+        let expected = || {
+            actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| format!("{}. {action}", index + 1))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         ensure!(
             self.checks.len() == actions.len(),
-            "report every accepted manual verification action"
+            "report every accepted manual verification action: expected {} entries labeled exactly, in order: {}; got {}",
+            actions.len(),
+            expected(),
+            self.checks.len()
         );
-        for (check, action) in self.checks.iter().zip(actions) {
+        for (position, (check, action)) in self.checks.iter().zip(actions).enumerate() {
             ensure!(
                 check.category == VerificationCategory::Manual && check.label == *action,
-                "verification must contain only accepted manual actions in order"
+                "verification must contain only accepted manual actions in order: entry {} must have category manual and label exactly {action:?}; expected labels: {}",
+                position + 1,
+                expected()
             );
             ensure!(
                 !check.summary.trim().is_empty(),
@@ -354,6 +370,24 @@ pub struct PlanExecutionRecord {
 }
 
 impl PlanExecutionRecord {
+    /// Get the selected commands of this revision's passing Harness check run.
+    ///
+    /// Verify tells the model to cite these instead of rerunning them, so an empty result
+    /// means Harness ran no automated check for the revision and no such claim holds.
+    pub(crate) fn passed_check_commands(
+        &self,
+    ) -> impl Iterator<Item = &crate::checks::CommandCheck> {
+        self.check_runs
+            .last()
+            .filter(|run| {
+                run.revision == self.revision
+                    && run.state == crate::checks::CheckState::Passed
+                    && run.outcome() == VerificationOutcome::Passed
+            })
+            .into_iter()
+            .flat_map(|run| run.commands.iter().filter(|command| command.selected))
+    }
+
     /// Validate a completion request without changing the accepted state on rejection.
     pub fn finish_phase(
         &mut self,
@@ -447,6 +481,31 @@ impl PlanExecutionRecord {
             "generation":self.generation,"findings":self.findings,"instructions":self.instructions()})
     }
 
+    /// Describe Verify work from the checks Harness actually ran for this revision, so the
+    /// model never cites a passing automated check that no run recorded.
+    fn verify_instructions(&self) -> String {
+        let passed = self
+            .passed_check_commands()
+            .map(|command| {
+                command
+                    .context
+                    .as_ref()
+                    .map_or(command.command.as_str(), |context| context.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let checks = if passed.is_empty() {
+            "Harness ran no automated check commands for this revision, because no configured check runs automatically for these changes, so execution.verification_evidence has no `Harness check` entry. When an action requires a check, find it with check_definition_list, run it with check_run, and cite that check_run result as evidence. Do not edit source or revise the plan.".to_owned()
+        } else {
+            format!(
+                "Harness has already passed the declaration check and these automated checks for this revision: {}. If an action requests one of them, report its recorded result instead of running it again, citing the matching `Harness check` entry from execution.verification_evidence. Run any other check an action requires with check_run. Do not rerun passed checks, edit source, or revise the plan.",
+                passed.join(", ")
+            )
+        };
+        format!(
+            "Perform only the accepted plan's manual verification actions, in order. {checks} Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
+        )
+    }
+
     /// Build phase-specific continuation guidance from durable state.
     pub fn instructions(&self) -> String {
         if self.state != PlanExecutionState::Active {
@@ -458,6 +517,7 @@ impl PlanExecutionRecord {
         if self.phase == PlanPhase::Checking {
             return "Harness runs the declaration and accepted checks locally. No model turn runs in this phase.".into();
         }
+        let verify;
         let work = match self.phase {
             PlanPhase::Implement => {
                 "Implement the accepted design and its tests. The accepted plan is frozen during Implement. Make justified deviations when needed, such as internal helpers, and explain them in your completion summary. Do not edit or submit the plan, update declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance checks in the Checking phase. When the code is written, call plan_phase_done. Differences in declarations, calls, or accesses do not block finishing Implement."
@@ -469,11 +529,12 @@ impl PlanExecutionRecord {
                 "Harness runs the declaration and accepted checks locally. No model turn runs in this phase."
             }
             PlanPhase::Verify => {
-                "Perform only the accepted plan's manual verification actions, in order. If an action requests an automated check already passed by Harness, report its recorded result and evidence instead of running it again. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
+                verify = self.verify_instructions();
+                verify.as_str()
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
-            " Report verification.checks with one entry per accepted manual action, in plan order. Each entry has category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a short result summary, and evidence tool IDs. List checks that could not run as blocked, with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI shows the structured report, so keep the final response brief."
+            " Report verification.checks with one entry per accepted manual action, in plan order. Each entry has category (manual), a label copied verbatim from the accepted verification action, outcome (passed, failed, or blocked), a short result summary, and evidence tool IDs. List checks that could not run as blocked, with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI shows the structured report, so keep the final response brief."
         } else {
             ""
         };
@@ -602,6 +663,25 @@ impl ExecutionControlSender {
 
 #[cfg(test)]
 mod tests {
+    /// The Verify prompt asks for evidence on each check entry, so that evidence
+    /// alone must establish a passed assessment.
+    #[test]
+    fn passed_verification_accepts_evidence_on_its_check_entries() {
+        let mut report: VerificationReport = serde_json::from_value(json!({
+            "outcome":"passed", "checks":[
+                {"category":"manual","label":"Run the unit-test check","outcome":"passed",
+                 "summary":"Harness check passed","evidence":["check-run:0"]}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            report.assessment(),
+            Ok(VerificationAssessment::Passed)
+        ));
+        report.checks[0].evidence.clear();
+        assert!(report.assessment().is_err());
+    }
+
     #[test]
     fn manual_results_match_the_accepted_inventory() {
         let mut report: VerificationReport = serde_json::from_value(json!({
@@ -610,7 +690,22 @@ mod tests {
             ]
         })).unwrap();
         assert!(report.validate_checks(&["Open window".into()]).is_ok());
-        assert!(report.validate_checks(&["Resize window".into()]).is_err());
+        let mislabeled = report
+            .validate_checks(&["Resize window".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mislabeled.contains("\"Resize window\"") && mislabeled.contains("1. Resize window"),
+            "a label mismatch must name the expected label: {mislabeled}"
+        );
+        let missing = report
+            .validate_checks(&["Open window".into(), "Close window".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("expected 2 entries") && missing.contains("2. Close window"),
+            "a count mismatch must list every expected action: {missing}"
+        );
         assert!(report.validate_checks(&[]).is_err());
         report.checks[0].category = VerificationCategory::Automated;
         assert!(report.validate_checks(&["Open window".into()]).is_err());
@@ -649,6 +744,42 @@ mod tests {
             created_at_ms: 0,
             completed_at_ms: None,
         }
+    }
+
+    /// Verify claims only the automated checks that this revision's Harness run executed;
+    /// a run with no eligible command must send the model to the check tools instead.
+    #[test]
+    fn verify_instructions_report_only_checks_that_ran() {
+        let mut record = execution();
+        record.phase = PlanPhase::Verify;
+        let run = |selected: bool, state: &str| -> crate::checks::CheckRun {
+            serde_json::from_value(json!({
+                "id":"run","owner":{"kind":"session","session_id":"session"},"revision":1,
+                "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+                "started_at_ms":1,"completed_at_ms":2,"state":"passed",
+                "progress":SemanticProgress::default(),
+                "workspace_identity":null,"workspace_digest":{},"commands":[{
+                    "id":"run:0","command":"python -m unittest","state":state,"selected":selected,
+                    "started_at_ms":1,"completed_at_ms":2,"exit_code":0,"error":null,"stdout":"",
+                    "stderr":"","output":"","output_bytes":0,"preview":"",
+                    "context":{"definition_id":"unit","name":"unit-tests","area":".","reason":"manual",
+                        "matched_files":[],"category":"test","directory":".","selection":{"kind":"all"},
+                        "resolved":null,"depends_on":[],"receipt":"unused"}
+                }]
+            }))
+            .unwrap()
+        };
+        record.check_runs.push(run(false, "skipped"));
+        let instructions = record.instructions();
+        assert!(
+            !instructions.contains("already passed"),
+            "Verify claimed automated checks that never ran: {instructions}"
+        );
+        assert!(instructions.contains("ran no automated check commands"));
+        assert!(instructions.contains("check_run"));
+        record.check_runs = vec![run(true, "passed")];
+        let instructions = record.instructions();
+        assert!(instructions.contains("already passed the declaration check and these automated checks for this revision: unit-tests."));
     }
 
     #[test]

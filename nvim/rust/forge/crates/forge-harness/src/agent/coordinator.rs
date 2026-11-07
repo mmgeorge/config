@@ -10,10 +10,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{Agent, AgentSelection, AgentSource, AgentTask};
+use super::{Agent, AgentContinuationPolicy, AgentSelection, AgentSource, AgentTask};
 use crate::{
     exchange::ExchangeState,
-    provider::{ExecutionOwner, ProviderCompletion, ProviderEvent},
+    provider::{ProviderCompletion, ThreadOwner},
 };
 
 pub const MAX_ACTIVE_CHILDREN: usize = 8;
@@ -122,21 +122,30 @@ pub enum AgentCommand {
         task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Event {
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         task_id: String,
-        event: Box<ProviderEvent>,
+        event: Box<crate::provider::session_execution::OwnerObservation>,
     },
     Completed {
-        owner: ExecutionOwner,
+        owner: ThreadOwner,
         task_id: String,
         output: Box<Result<ProviderCompletion>>,
+        host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
         cleanup_error: Option<String>,
     },
 }
 
+/// Decide scheduling separately from actual resource collection and native completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentSettlementDisposition {
+    Ready,
+    RequiresAuthorization,
+    CleanupFailed,
+}
+
 /// Retains authenticated turn ownership until the broker admits a model operation.
 pub struct AgentRequestAuthority {
-    pub owner: ExecutionOwner,
+    pub owner: ThreadOwner,
     pub parent_exchange_id: String,
     pub expired: watch::Receiver<bool>,
     pub(crate) task: Option<crate::tools::TaskAuthority>,
@@ -301,17 +310,18 @@ pub struct ReservedAgentWork {
     pub agent: Agent,
     pub task: AgentTask,
     pub launch: bool,
+    continuation_authorization: Option<forge_provider_api::ExchangeId>,
 }
 
 #[derive(Clone, Debug)]
 struct AdmittedExecution {
-    owner: ExecutionOwner,
+    owner: ThreadOwner,
     task: crate::provider::TaskId,
     exchange: crate::provider::ExchangeId,
 }
 
 impl AgentWork {
-    pub fn owner(&self) -> &ExecutionOwner {
+    pub fn owner(&self) -> &ThreadOwner {
         &self.execution.owner
     }
     pub fn task_id(&self) -> &crate::provider::TaskId {
@@ -323,16 +333,23 @@ impl AgentWork {
 }
 
 impl ReservedAgentWork {
+    /// Get the exact stopped task acknowledged by this explicit user admission.
+    pub fn continuation_authorization(&self) -> Option<&forge_provider_api::ExchangeId> {
+        self.continuation_authorization.as_ref()
+    }
+
     fn committed(&self) -> AgentWork {
         AgentWork {
             agent: self.agent.clone(),
             task: self.task.clone(),
             launch: self.launch,
             execution: AdmittedExecution {
-                owner: ExecutionOwner {
-                    session_id: self.agent.session_id.clone().into(),
-                    agent_id: self.agent.id.clone().into(),
-                },
+                owner: ThreadOwner::new(
+                    self.agent.session_id.clone().into(),
+                    forge_provider_api::AgentId::new(self.agent.id.clone())
+                        .expect("registered agent identity is nonempty"),
+                )
+                .expect("registered session and agent identities are nonempty"),
                 task: self.task.id.clone().into(),
                 exchange: self.task.id.clone().into(),
             },
@@ -380,6 +397,19 @@ impl AgentAdmission {
                 .is_some_and(|execution| execution.active_task_id == admission.task.id);
             return Ok(AgentCommit::Existing(work));
         }
+        if let Some(current) = state.agent_by_id.get(&admission.agent.id) {
+            match &admission.continuation_authorization {
+                Some(stopped) => ensure!(
+                    admission.task.source == AgentSource::User
+                        && matches!(&current.continuation, AgentContinuationPolicy::RequiresAuthorization { task_id } if task_id == stopped),
+                    "child continuation authorization is stale"
+                ),
+                None => ensure!(
+                    current.continuation == admission.agent.continuation,
+                    "child continuation policy changed during admission"
+                ),
+            }
+        }
         ensure!(
             state
                 .admission_by_operation
@@ -387,7 +417,8 @@ impl AgentAdmission {
                 .is_some_and(|reserved| Arc::ptr_eq(reserved, admission)),
             "child reservation was cancelled"
         );
-        let launch = !state.execution_by_agent.contains_key(&admission.agent.id)
+        let launch = matches!(admission.agent.continuation, AgentContinuationPolicy::Ready)
+            && !state.execution_by_agent.contains_key(&admission.agent.id)
             && !state.pending_launches.iter().any(|id| {
                 state
                     .task_by_id
@@ -466,6 +497,7 @@ struct ChildExecution {
 #[derive(Default)]
 struct AgentStateStore {
     quiescence_count: usize,
+    foreground_claim_count: usize,
     agent_by_id: HashMap<String, Agent>,
     task_by_id: HashMap<String, AgentTask>,
     admission_by_operation: HashMap<String, Arc<ReservedAgentWork>>,
@@ -480,6 +512,7 @@ pub struct AgentCoordinator {
     enabled: AtomicBool,
     state: Arc<Mutex<AgentStateStore>>,
     receiver: Mutex<mpsc::Receiver<AgentCommand>>,
+    foreground_deferred: Mutex<VecDeque<AgentCommand>>,
     sender: AgentCommandSender,
     activity: watch::Sender<u64>,
     profiles: Mutex<Option<Arc<super::AgentProfileStore>>>,
@@ -505,6 +538,27 @@ impl Drop for AgentQuiescence {
     }
 }
 
+#[must_use]
+/// Reserves queued agent commands for the active root turn, which authenticates model requests
+/// against its own exchange. Dropping the claim wakes the idle drain for any commands left behind.
+pub struct AgentForegroundClaim {
+    coordinator: Arc<AgentCoordinator>,
+}
+
+impl Drop for AgentForegroundClaim {
+    fn drop(&mut self) {
+        self.coordinator
+            .state
+            .lock()
+            .expect("agent state poisoned")
+            .foreground_claim_count -= 1;
+        self.coordinator
+            .sender
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+}
+
 impl AgentCoordinator {
     pub fn new(session_id: String) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel(64);
@@ -516,6 +570,7 @@ impl AgentCoordinator {
             enabled: AtomicBool::new(false),
             state: state.clone(),
             receiver: Mutex::new(receiver),
+            foreground_deferred: Mutex::new(VecDeque::new()),
             sender: AgentCommandSender {
                 sender,
                 revision,
@@ -603,8 +658,8 @@ impl AgentCoordinator {
             "description":format!("Default: {}.\n{description}",snapshot.document.default_profile)}))
     }
 
-    pub fn owns(&self, owner: &ExecutionOwner) -> bool {
-        owner.session_id == forge_provider_api::SessionId::from(self.session_id.as_str())
+    pub fn owns(&self, owner: &ThreadOwner) -> bool {
+        *owner.session_id() == forge_provider_api::SessionId::from(self.session_id.as_str())
     }
 
     pub fn activity(&self) -> watch::Receiver<u64> {
@@ -648,6 +703,26 @@ impl AgentCoordinator {
         }
     }
 
+    /// Routes queued commands to the active root turn until the returned claim drops.
+    pub(crate) fn claim_foreground(self: &Arc<Self>) -> AgentForegroundClaim {
+        self.state
+            .lock()
+            .expect("agent state poisoned")
+            .foreground_claim_count += 1;
+        AgentForegroundClaim {
+            coordinator: Arc::clone(self),
+        }
+    }
+
+    /// Reports whether an active root turn owns the command queue.
+    pub(crate) fn foreground_claimed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("agent state poisoned")
+            .foreground_claim_count
+            > 0
+    }
+
     /// Prevents parent continuation while cancellation or a policy transition owns child cleanup.
     pub(crate) fn is_quiescing(&self) -> bool {
         self.state
@@ -663,6 +738,44 @@ impl AgentCoordinator {
             .expect("agent request receiver poisoned")
             .try_recv()
             .ok()
+    }
+
+    /// Receives the next command for the active root turn, starting with requests the idle
+    /// drain handed over.
+    pub(crate) fn try_receive_foreground(&self) -> Option<AgentCommand> {
+        let deferred = self
+            .foreground_deferred
+            .lock()
+            .expect("deferred agent commands poisoned")
+            .pop_front();
+        deferred.or_else(|| self.try_receive())
+    }
+
+    /// Receives the next command for the idle drain. Handed-over requests return to it only
+    /// after the root turn released its claim, so it can reject them as unauthenticated.
+    pub(crate) fn try_receive_idle(&self) -> Option<AgentCommand> {
+        if !self.foreground_claimed() {
+            let deferred = self
+                .foreground_deferred
+                .lock()
+                .expect("deferred agent commands poisoned")
+                .pop_front();
+            if deferred.is_some() {
+                return deferred;
+            }
+        }
+        self.try_receive()
+    }
+
+    /// Hands a request to the active root turn and wakes its agent wait.
+    pub(crate) fn defer_to_foreground(&self, command: AgentCommand) {
+        self.foreground_deferred
+            .lock()
+            .expect("deferred agent commands poisoned")
+            .push_back(command);
+        self.sender
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn reserve_spawn(
@@ -753,6 +866,7 @@ impl AgentCoordinator {
             agent,
             task,
             launch,
+            continuation_authorization: None,
         });
         state
             .admission_by_operation
@@ -773,7 +887,18 @@ impl AgentCoordinator {
     ) -> Result<AgentAdmission> {
         validate_message(message)?;
         let mut state = self.state.lock().expect("agent state poisoned");
-        let agent = resolve_agent(&state, &self.session_id, target)?.clone();
+        let mut agent = resolve_agent(&state, &self.session_id, target)?.clone();
+        let continuation_authorization = if request.source == AgentSource::User {
+            match agent.continuation.clone() {
+                AgentContinuationPolicy::RequiresAuthorization { task_id } => {
+                    agent.authorize_continuation(&task_id)?;
+                    Some(task_id)
+                }
+                AgentContinuationPolicy::Ready => None,
+            }
+        } else {
+            None
+        };
         if let Some(existing) = state.admission_by_operation.get(&request.operation_id) {
             ensure!(
                 existing.agent.id == agent.id
@@ -807,7 +932,8 @@ impl AgentCoordinator {
                 admission.launch && !state.task_by_id.contains_key(&admission.task.id)
             })
             .count();
-        let launch = !state.execution_by_agent.contains_key(&agent.id)
+        let launch = matches!(agent.continuation, AgentContinuationPolicy::Ready)
+            && !state.execution_by_agent.contains_key(&agent.id)
             && state.execution_by_agent.len() + reserved_launches < MAX_ACTIVE_CHILDREN
             && state.pending_launches.is_empty();
         if let Some(execution) = state.execution_by_agent.get(&agent.id) {
@@ -869,6 +995,7 @@ impl AgentCoordinator {
             agent,
             task,
             launch,
+            continuation_authorization,
         });
         state
             .admission_by_operation
@@ -1010,6 +1137,23 @@ impl AgentCoordinator {
             "child state crosses root ownership"
         );
         let mut state = self.state.lock().expect("agent state poisoned");
+        if let AgentContinuationPolicy::RequiresAuthorization { task_id } = &agent.continuation {
+            let stopped = if task.id == task_id.as_str() {
+                &task
+            } else {
+                state
+                    .task_by_id
+                    .get(task_id.as_str())
+                    .context("child continuation policy points to an unknown task")?
+            };
+            ensure!(
+                stopped.agent_id == agent.id
+                    && stopped.session_id == agent.session_id
+                    && stopped.completed_at_ms.is_some(),
+                "child continuation policy requires its original collected task"
+            );
+        }
+
         state.agent_by_id.insert(agent.id.clone(), agent);
         state.task_by_id.insert(task.id.clone(), task);
         self.activity
@@ -1075,9 +1219,30 @@ impl AgentCoordinator {
         &self,
         agent_id: &str,
         task_id: &str,
-        cleanup_failed: bool,
+        disposition: AgentSettlementDisposition,
     ) -> Result<Option<AgentWork>> {
         let mut state = self.state.lock().expect("agent state poisoned");
+        let authorization_required = match &state
+            .agent_by_id
+            .get(agent_id)
+            .context("child identity missing")?
+            .continuation
+        {
+            AgentContinuationPolicy::Ready => {
+                ensure!(
+                    disposition != AgentSettlementDisposition::RequiresAuthorization,
+                    "stopped child policy must be durably retained before releasing execution"
+                );
+                false
+            }
+            AgentContinuationPolicy::RequiresAuthorization { task_id: stopped } => {
+                ensure!(
+                    stopped.as_str() == task_id,
+                    "child continuation policy belongs to another task"
+                );
+                true
+            }
+        };
         let Some(execution) = state.execution_by_agent.get_mut(agent_id) else {
             return Ok(None);
         };
@@ -1085,8 +1250,16 @@ impl AgentCoordinator {
             execution.active_task_id == task_id,
             "stale task cannot settle a newer child turn"
         );
-        if cleanup_failed {
+        if disposition == AgentSettlementDisposition::CleanupFailed {
             execution.cleanup_failed = true;
+            self.activity
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+            return Ok(None);
+        }
+        if authorization_required {
+            let pending = std::mem::take(&mut execution.pending);
+            state.execution_by_agent.remove(agent_id);
+            state.pending_launches.extend(pending);
             self.activity
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
             return Ok(None);
@@ -1112,10 +1285,12 @@ impl AgentCoordinator {
                 .clone();
             Ok(Some(AgentWork {
                 execution: AdmittedExecution {
-                    owner: ExecutionOwner {
-                        session_id: self.session_id.clone().into(),
-                        agent_id: agent.id.clone().into(),
-                    },
+                    owner: ThreadOwner::new(
+                        self.session_id.clone().into(),
+                        forge_provider_api::AgentId::new(agent.id.clone())
+                            .expect("registered agent identity is nonempty"),
+                    )
+                    .expect("registered session and agent identities are nonempty"),
                     task: task.id.clone().into(),
                     exchange: task.id.clone().into(),
                 },
@@ -1151,10 +1326,12 @@ impl AgentCoordinator {
             return Ok(None);
         }
         let Some(index) = state.pending_launches.iter().position(|id| {
-            state
-                .task_by_id
-                .get(id)
-                .is_some_and(|task| !state.execution_by_agent.contains_key(&task.agent_id))
+            state.task_by_id.get(id).is_some_and(|task| {
+                !state.execution_by_agent.contains_key(&task.agent_id)
+                    && state.agent_by_id.get(&task.agent_id).is_some_and(|agent| {
+                        matches!(agent.continuation, AgentContinuationPolicy::Ready)
+                    })
+            })
         }) else {
             return Ok(None);
         };
@@ -1199,10 +1376,12 @@ impl AgentCoordinator {
         );
         Ok(Some(AgentWork {
             execution: AdmittedExecution {
-                owner: ExecutionOwner {
-                    session_id: self.session_id.clone().into(),
-                    agent_id: agent.id.clone().into(),
-                },
+                owner: ThreadOwner::new(
+                    self.session_id.clone().into(),
+                    forge_provider_api::AgentId::new(agent.id.clone())
+                        .expect("registered agent identity is nonempty"),
+                )
+                .expect("registered session and agent identities are nonempty"),
                 task: task.id.clone().into(),
                 exchange: task.id.clone().into(),
             },

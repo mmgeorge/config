@@ -1,5 +1,4 @@
 local client = require("forge.client")
-local config = require("forge.infra.config")
 local model_options = require("forge.views.harness.model_options")
 
 ---@class ForgeSubagentModel
@@ -21,7 +20,7 @@ Selection.__index = Selection
 local function provider_choices()
   local result = { "inherit" }
   local provider_ids = {}
-  for provider, descriptor in pairs(config.options.harness.providers or {}) do
+  for provider, descriptor in pairs(client.provider_map()) do
     if descriptor.selectable ~= false then provider_ids[#provider_ids + 1] = provider end
   end
   table.sort(provider_ids)
@@ -40,7 +39,7 @@ end
 ---@param root table
 ---@return ForgeSubagentModel?
 local function selected_model(catalog, value, root)
-  local selected = value == "inherit" and (root.resolved_model or root.model) or value
+  local selected = value == "inherit" and root.model or value
   for _, model in ipairs(catalog.models) do
     if model.id == selected or selected == "default" and model.is_default then return model end
   end

@@ -31,51 +31,48 @@ fn background_provider(
     .expect("mock fixture descriptor");
     let provider = crate::provider::test_support::EventFixtureProvider::new(
         descriptor,
-        move |request, sink, mut cancelled| {
+        move |request, sink, start, mut cancelled| {
             let pending = prompt_pending.clone();
             async move {
                 let scope = request.scope.clone();
                 let turn = crate::provider::TurnAddress {
                     scope: scope.clone(),
-                    thread_id: "fixture-thread".into(),
-                    turn_id: "fixture-turn".into(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
                 };
                 let address = crate::provider::ToolAddress {
-                    turn: turn.clone(),
-                    tool_id: "background-tool".into(),
+                    turn,
+                    item_id: forge_provider_api::ItemId::new("background-tool").unwrap(),
                 };
-                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                    scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                        address: turn.clone(),
+                start.observed(1).await?;
+                use forge_provider_api::message::{ItemEvent, ItemStart};
+                use forge_provider_api::tool::ToolItemEvent;
+                let descriptor = forge_provider_api::tool::ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "exec".into(),
+                    title: "Background command".into(),
+                    arguments: forge_provider_api::tool::InspectableArguments::new(
+                        serde_json::json!({}),
+                    ),
+                };
+                for event in [
+                    ItemEvent::Started(ItemStart::CommandExecution(descriptor)),
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
                     },
-                )?;
-                sink.send_wait(ProviderEvent::Execution { observation })
-                    .await?;
-                for update in [
-                    crate::provider::ToolUpdate::Requested {
-                        invocation: crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::Command,
-                            name: "exec".into(),
-                            title: "Background command".into(),
-                            arguments: serde_json::json!({}),
-                        },
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::Output(crate::provider::TextUpdate::Append(
+                            "BEGIN\n".into(),
+                        )),
                     },
-                    crate::provider::ToolUpdate::Started,
-                    crate::provider::ToolUpdate::Output {
-                        update: crate::provider::TextUpdate::Append("BEGIN\n".into()),
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::Backgrounded,
                     },
-                    crate::provider::ToolUpdate::Backgrounded,
                 ] {
-                    sink.send_wait(ProviderEvent::Tool {
-                        address: address.clone(),
-                        update,
-                    })
-                    .await?;
+                    sink.send_wait(tool_activity(&address, event)).await?;
                 }
                 *pending.lock().unwrap() = Some(BackgroundObservation {
-                    scope: scope.clone(),
+                    scope,
                     address: address.clone(),
                 });
                 if matches!(finish, BackgroundFinish::NoisyTimeout) {
@@ -83,51 +80,21 @@ fn background_provider(
                         tokio::select! {
                             changed = cancelled.changed() => {
                                 if changed.is_err() || *cancelled.borrow() {
-                                    sink.send_wait(ProviderEvent::Execution {
-                                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                                            scope.clone(),
-                                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                                address: turn.clone(), covered_submissions: vec![request.submission_id.clone()],
-                                                completed_at_ms: 1,
-                                                result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                                                    completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                                                },
-                                            },
-                                        )?,
-                                    }).await?;
-                                    return Ok(());
+                                    return Ok(crate::provider::test_support::native_result(&request, forge_provider_api::turn::TurnOutcome::Interrupted));
                                 }
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
-                                sink.send_wait(ProviderEvent::Tool {
-                                    address: address.clone(),
-                                    update: crate::provider::ToolUpdate::Output {
-                                        update: crate::provider::TextUpdate::Append("still running\n".into()),
-                                    },
-                                }).await?;
+                                sink.send_wait(tool_activity(&address, ItemEvent::Tool { event: ToolItemEvent::Output(crate::provider::TextUpdate::Append("still running\n".into())) })).await?;
                             }
                         }
                     }
                 }
-                // Foreground completion and full binding retirement are independent evidence.
-                // Keep the background tool live until its native collection hook below.
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        scope,
-                        forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                            address: turn,
-                            covered_submissions: vec![request.submission_id],
-                            completed_at_ms: 1,
-                            result: forge_provider_api::lifecycle::ExecutionResult::Completed {
-                                completion:
-                                    forge_provider_api::completion::ProviderCompletion::default()
-                                        .into(),
-                            },
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
             }
         },
     );
@@ -149,7 +116,7 @@ fn background_provider(
                 )
                 .await?;
             }
-            if owner.session_id.as_str().is_empty() {
+            if owner.session_id().as_str().is_empty() {
                 return Err(fixture_provider_error(
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ));
@@ -199,6 +166,19 @@ fn background_provider(
     provider
 }
 
+/// Create canonical original-owner activity for the background fixture.
+fn tool_activity(
+    address: &crate::provider::ToolAddress,
+    event: forge_provider_api::message::ItemEvent,
+) -> forge_provider_api::AdapterActivity {
+    forge_provider_api::AdapterActivity::Item {
+        thread_id: address.turn.thread_id.clone(),
+        turn_id: address.turn.turn_id.clone(),
+        item_id: forge_provider_api::ItemId::new(address.item_id.as_str()).unwrap(),
+        event,
+    }
+}
+
 async fn publish_background_terminal(
     provider: &crate::provider::test_support::EventFixtureProvider,
     pending: &std::sync::Mutex<Option<BackgroundObservation>>,
@@ -215,18 +195,29 @@ async fn publish_background_terminal(
     }
     let sink = provider.invocation_sink(&observed.scope).await?;
     for sequence in 0..output_count {
-        sink.send_wait(ProviderEvent::Tool {
-            address: observed.address.clone(),
-            update: crate::provider::ToolUpdate::Output {
-                update: crate::provider::TextUpdate::Append(format!("END-{sequence}\n")),
+        sink.send_wait(tool_activity(
+            &observed.address,
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::Output(
+                    crate::provider::TextUpdate::Append(format!("END-{sequence}\n")),
+                ),
             },
-        })
+        ))
         .await?;
     }
-    sink.send_wait(ProviderEvent::Tool {
-        address: observed.address,
-        update: crate::provider::ToolUpdate::Finished { outcome },
-    })
+    sink.send_wait(tool_activity(
+        &observed.address,
+        forge_provider_api::message::ItemEvent::Completed(
+            forge_provider_api::message::ItemCompletion::CommandExecution(
+                forge_provider_api::tool::ToolCompletion {
+                    outcome,
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                },
+            ),
+        ),
+    ))
     .await?;
     Ok(())
 }
@@ -240,8 +231,12 @@ async fn reject_foreign_background_scope(
     };
     let session_sink = provider.event_sink(&observed.scope.owner).await?;
     let mut foreign = observed.scope;
-    foreign.owner.agent_id = "foreign-child".into();
-    session_sink.bind_scope(forge_provider_api::EventScope::from(foreign))?;
+    foreign.owner = ThreadOwner::new(
+        foreign.owner.session_id().clone(),
+        forge_provider_api::AgentId::new("foreign-child").unwrap(),
+    )
+    .expect("fixture identities are nonempty");
+    session_sink.invocation_writer(&foreign)?;
     Err(fixture_provider_error(
         forge_provider_api::ProviderFailureKind::Protocol,
     ))
@@ -249,23 +244,24 @@ async fn reject_foreign_background_scope(
 
 fn fixture_provider_error(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::InputSubmit,
+        forge_provider_api::ProviderOperation::TurnStart,
         kind,
     ))
 }
 async fn collect_background_child(
     finish: BackgroundFinish,
     output_count: usize,
-) -> Result<Vec<ProviderEvent>> {
+) -> Result<Vec<OwnerObservation>> {
     let fixture = tempfile::tempdir()?;
     let trace = Arc::new(crate::trace::TraceStore::open(fixture.path())?);
     let store = SubmissionStore::open(fixture.path(), trace.clone())?;
     let coordinator = crate::agent::AgentCoordinator::new("session".into());
     let (_cancel, cancellation) = watch::channel(false);
-    let owner = ExecutionOwner {
-        session_id: "session".into(),
-        agent_id: "child".into(),
-    };
+    let owner = ThreadOwner::new(
+        "session".into(),
+        forge_provider_api::AgentId::new("child").unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
     let shutdown_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let native = background_provider(finish, output_count, shutdown_called.clone());
     let test_provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
@@ -306,6 +302,7 @@ async fn collect_background_child(
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         },
@@ -314,6 +311,9 @@ async fn collect_background_child(
         sender: coordinator.sender(),
         lsp_lease: None,
     };
+    // Waiting on the send revision instead of yielding lets a paused clock auto-advance
+    // while the child runtime idles, so deadline fixtures expire without real waits.
+    let mut revision = coordinator.subscribe();
     let running = tokio::spawn(runtime.run());
     let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut events = Vec::new();
@@ -337,6 +337,7 @@ async fn collect_background_child(
                     task_id,
                     output,
                     cleanup_error,
+                    ..
                 }) => {
                     assert_eq!(completed_owner, owner);
                     assert_eq!(task_id, "child-task");
@@ -364,7 +365,10 @@ async fn collect_background_child(
                 Some(AgentCommand::Request { .. }) => {
                     anyhow::bail!("fixture unexpectedly issued a control request")
                 }
-                None => tokio::task::yield_now().await,
+                None => revision
+                    .changed()
+                    .await
+                    .context("agent coordinator closed before child completion")?,
             }
         }
     })
@@ -383,40 +387,54 @@ async fn collect_background_child(
 }
 
 fn assert_background_completion(
-    events: &[ProviderEvent],
+    events: &[OwnerObservation],
     outcome: crate::provider::ToolOutcome,
     output_count: usize,
 ) {
     let mut text = String::new();
     let mut terminal_count = 0;
-    for event in events {
-        if let ProviderEvent::Tool { address, update } = event {
-            assert_eq!(address.tool_id.as_str(), "background-tool");
-            assert_eq!(address.turn.scope.exchange_id.as_str(), "child-task");
-            match update {
-                crate::provider::ToolUpdate::Output {
-                    update: crate::provider::TextUpdate::Append(part),
+    for observation in events {
+        if let OwnerObservation::Event(HarnessEvent::Native {
+            scope,
+            event: boxed_native_event,
+            ..
+        }) = observation
+            && let forge_provider_api::ProviderEvent::Item { item_id, event, .. } =
+                boxed_native_event.as_ref()
+        {
+            assert_eq!(item_id.as_str(), "background-tool");
+            assert_eq!(
+                scope.invocation().unwrap().exchange_id.as_str(),
+                "child-task"
+            );
+            use forge_provider_api::message::{ItemCompletion, ItemEvent};
+            match event {
+                ItemEvent::Tool {
+                    event:
+                        forge_provider_api::tool::ToolItemEvent::Output(
+                            crate::provider::TextUpdate::Append(part),
+                        ),
                 } => {
                     assert_eq!(terminal_count, 0, "output followed terminal settlement");
                     text.push_str(part);
                 }
-                crate::provider::ToolUpdate::Finished { outcome: received } => {
-                    terminal_count += 1;
-                    assert_eq!(received, &outcome);
-                }
-                crate::provider::ToolUpdate::Output {
-                    update: crate::provider::TextUpdate::Replace(part),
+                ItemEvent::Tool {
+                    event:
+                        forge_provider_api::tool::ToolItemEvent::Output(
+                            crate::provider::TextUpdate::Replace(part),
+                        ),
                 } => {
                     assert_eq!(terminal_count, 0, "output followed terminal settlement");
                     text = part.clone();
                 }
-                crate::provider::ToolUpdate::Requested { .. }
-                | crate::provider::ToolUpdate::TitleChanged { .. }
-                | crate::provider::ToolUpdate::Input { .. }
-                | crate::provider::ToolUpdate::Started
-                | crate::provider::ToolUpdate::Backgrounded
-                | crate::provider::ToolUpdate::Changes { .. }
-                | crate::provider::ToolUpdate::SkillRead { .. } => {}
+                ItemEvent::Completed(ItemCompletion::CommandExecution(completion)) => {
+                    terminal_count += 1;
+                    assert_eq!(completion.outcome, outcome);
+                }
+                ItemEvent::Started(_)
+                | ItemEvent::Message { .. }
+                | ItemEvent::Tool { .. }
+                | ItemEvent::Completed(_) => {}
             }
         }
     }
@@ -434,18 +452,14 @@ fn assert_background_completion(
 }
 
 /// Continuous shell output cannot defer a child deadline or prevent cleanup.
-#[tokio::test]
+///
+/// The paused clock advances through the fixture's output ticks to the tool deadline, so
+/// the timeout expires in virtual time rather than after a real second.
+#[tokio::test(start_paused = true)]
 async fn noisy_child_tool_timeout_stops_execution_and_cleans_up() -> Result<()> {
     let events = collect_background_child(BackgroundFinish::NoisyTimeout, 0).await?;
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, ProviderEvent::Tool {
-        update: crate::provider::ToolUpdate::Finished {
-            outcome: crate::provider::ToolOutcome::Failed { diagnostic },
-        }, ..
-    } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Timeout))
-    );
+    assert!(events.iter().any(|event| matches!(event, OwnerObservation::Event(HarnessEvent::Host {
+        event: crate::provider::HostEvent::Failure { failure, .. }, .. }) if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)));
     Ok(())
 }
 
@@ -485,12 +499,15 @@ async fn foreign_owner_event_scope_fails_child_without_forwarding_or_skipping_cl
     let events = collect_background_child(BackgroundFinish::ForeignOwner, 1).await?;
     assert!(
         !events.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: crate::provider::ToolUpdate::Finished { .. },
-                ..
-            }
-        )),
+           event,
+           OwnerObservation::Event(HarnessEvent::Native {
+               event: boxed_native_event,
+               ..
+           })
+        if matches!(boxed_native_event.as_ref(), forge_provider_api::ProviderEvent::Item {
+                   event: forge_provider_api::message::ItemEvent::Completed(_),
+                   ..
+               }))),
         "foreign terminal event reached the child coordinator"
     );
     Ok(())
@@ -503,12 +520,15 @@ async fn prior_task_session_event_fails_child_without_forwarding_or_skipping_cle
     let events = collect_background_child(BackgroundFinish::PriorTask, 1).await?;
     assert!(
         !events.iter().any(|event| matches!(
-            event,
-            ProviderEvent::Tool {
-                update: crate::provider::ToolUpdate::Finished { .. },
-                ..
-            }
-        )),
+           event,
+           OwnerObservation::Event(HarnessEvent::Native {
+               event: boxed_native_event,
+               ..
+           })
+        if matches!(boxed_native_event.as_ref(), forge_provider_api::ProviderEvent::Item {
+                   event: forge_provider_api::message::ItemEvent::Completed(_),
+                   ..
+               }))),
         "prior-task terminal event reached the current child coordinator"
     );
     Ok(())
@@ -536,10 +556,13 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         let (_cancel, cancellation) = watch::channel(false);
         let mut request = ProviderRequest {
             dispatch: forge_provider_api::submission::DispatchTracker::default(),
-            execution_owner: Some(ExecutionOwner {
-                session_id: "session".into(),
-                agent_id: "child".into(),
-            }),
+            execution_owner: Some(
+                ThreadOwner::new(
+                    "session".into(),
+                    forge_provider_api::AgentId::new("child").unwrap(),
+                )
+                .expect("registered session and agent identities are nonempty"),
+            ),
             harness_session_id: "session".into(),
             workspace: fixture.path().to_string_lossy().into_owned(),
             input: ProviderInput::from_text("child request"),
@@ -552,6 +575,7 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
             approval_mode: ApprovalMode::Ask,
             provider_session_id: None,
             submission: None,
+            acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
         };
@@ -565,23 +589,9 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         let handler_dispatches = dispatched.clone();
         let native = crate::provider::test_support::EventFixtureProvider::new(
             descriptor,
-            move |request, sink, _| {
+            move |_request, _sink, _start, _| {
                 handler_dispatches.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                async move {
-                    // This accepted native input was cancelled before execution; retain its coverage.
-                    sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        request.scope,
-                        forge_provider_api::lifecycle::ExecutionUpdate::ResolvedWithoutExecution {
-                            covered_submissions: vec![request.submission_id], completed_at_ms: 1,
-                            result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                                completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                            },
-                        },
-                    )?,
-                }).await?;
-                    Ok(())
-                }
+                async move { Err(ProviderError::Cancelled) }
             },
         );
         let collected = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -639,10 +649,11 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
                 assert!(matches!(state, SubmissionState::Accepted { .. }))
             }
         }
-        let expected_owner = ExecutionOwner {
-            session_id: "session".into(),
-            agent_id: "child".into(),
-        };
+        let expected_owner = ThreadOwner::new(
+            "session".into(),
+            forge_provider_api::AgentId::new("child").unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
         let (output, cleanup_error) = loop {
             match coordinator
                 .try_receive()
@@ -665,6 +676,7 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
                     task_id,
                     output,
                     cleanup_error,
+                    ..
                 } => {
                     assert_eq!(owner, expected_owner);
                     assert_eq!(task_id, "child-task");
@@ -723,5 +735,126 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         );
         assert!(cleanup_error.is_none(), "{cleanup_error:?}");
     }
+    Ok(())
+}
+
+/// Persist actual child mutation facts separately when the canonical native outcome is failure.
+#[tokio::test]
+async fn committed_child_file_change_survives_native_error() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("changed.rs");
+    std::fs::write(&path, "old")?;
+    let context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
+    let slot = context.provider_completion.clone();
+    let retained = slot.clone();
+    let changed_path = path.clone();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().unwrap(),
+        )?,
+        move |request, _writer, start, _cancel| {
+            let slot = retained.clone();
+            let path = changed_path.clone();
+            async move {
+                start.observed(1).await?;
+                std::fs::write(&path, "new").map_err(crate::provider::test_support::io_failure)?;
+                let mut completion = ProviderCompletion::default();
+                completion
+                    .host_file_changes
+                    .push(crate::tools::lsp::HostFileChange {
+                        scope: request.scope.clone(),
+                        call_id: forge_provider_api::control::ToolCallId::new("committed-call")
+                            .unwrap(),
+                        native_item_id: None,
+                        changes: forge_provider_api::ProviderChangeSet {
+                            file: vec![forge_provider_api::ProviderFileChange {
+                                path: path.to_string_lossy().into_owned(),
+                                move_path: None,
+                                kind: forge_provider_api::ProviderChangeKind::Update,
+                                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                            }],
+                        },
+                    });
+                slot.publish(completion)?;
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Failed {
+                        error: forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                        retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+                    },
+                ))
+            }
+        },
+    );
+    let session = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let provider = session.provider_handle();
+    let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+    let coordinator = crate::agent::AgentCoordinator::new("session".into());
+    let (_cancel, cancellation) = watch::channel(false);
+    let owner = ThreadOwner::new("session".into(), forge_provider_api::AgentId::new("child")?)?;
+    AgentRuntime {
+        execution_registry: Arc::new(
+            crate::provider::session_execution::SessionExecutionRegistry::new(
+                provider.clone(),
+                trace.clone(),
+            ),
+        ),
+        provider,
+        tool_timeout: Default::default(),
+        trace: trace.clone(),
+        submission_store: SubmissionStore::open(directory.path(), trace)?,
+        permission: crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+        request: ProviderRequest {
+            dispatch: Default::default(),
+            execution_owner: Some(owner.clone()),
+            harness_session_id: "session".into(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            input: ProviderInput::from_text("change"),
+            mode: PromptMode::Chat,
+            model: "fixture".into(),
+            effort: "low".into(),
+            context_window: None,
+            service_tier: ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            acknowledged_child_reports: Vec::new(),
+            recovered_input: Vec::new(),
+            control_context: Some(context),
+        },
+        task_id: "child-task".into(),
+        cancellation,
+        sender: coordinator.sender(),
+        lsp_lease: None,
+    }
+    .run()
+    .await?;
+    let (output, changes) = loop {
+        match coordinator
+            .try_receive()
+            .context("child completion missing")?
+        {
+            AgentCommand::Completed {
+                output,
+                host_file_changes,
+                ..
+            } => break (output, host_file_changes),
+            AgentCommand::Event { .. } => {}
+            AgentCommand::Request { .. } => anyhow::bail!("fixture requested unrelated work"),
+        }
+    };
+    assert!(output.is_err());
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].scope.owner, owner);
+    assert_eq!(changes[0].scope.exchange_id.as_str(), "child-task");
+    assert_eq!(changes[0].call_id.as_str(), "committed-call");
+    assert!(changes[0].native_item_id.is_none());
+    assert_eq!(std::fs::read_to_string(path)?, "new");
+    assert!(slot.preview()?.batches.is_empty());
+    assert_eq!(slot.collected_file_changes(), changes);
     Ok(())
 }

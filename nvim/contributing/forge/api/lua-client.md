@@ -123,13 +123,17 @@ Return the current local integer generation without I/O. A new process advances 
 
 Return whether a process exists and is not draining. This predicate does not promise initialized services or spare admission capacity.
 
+### `provider_map()`
+
+Return the effective provider map without I/O: the host's `provider.registry.list` descriptors merged with user `harness.providers` overrides. The client retains the registry for its process generation. `config.setup` replaces `config.options` and resets `harness.providers` to the user overrides, so this accessor and the startup paths re-derive the map from the retained registry whenever `config.options` no longer holds the adopted table. Read providers through this accessor rather than `config.options.harness.providers`. Before the first registry reply, it returns the configured map.
+
 ### `session_initialize(callback, options, startup)`
 
 Ensure the runtime and requested initial-session workflow. `callback` is optional. `options` is optional and accepts `services_only`, `session_id`, `new_session_name`, or `lease_conflict_action = "new"`. `startup` is an optional timing observer used by the Harness view.
 
 `services_only = true` returns `{ initialized = true }` without a session. Otherwise the callback receives a session snapshot. An explicit `session_id` resumes that ID, including when another session is already initialized. An explicit new-session choice creates a new session. Concurrent callers retain their own choices. No explicit-target failure selects another session.
 
-An interactive session snapshot can arrive before provider startup completes. Codex and Copilot initialization runs asynchronously without submitting model input, and a later `session_configured` event carries the retained provider thread identity. Startup failures arrive as session `backend_event` errors and are also returned by MCP inspection. Service-only initialization does not start a provider conversation.
+An interactive session snapshot can arrive before provider startup completes. Startup attaches provider observation asynchronously and opens no native conversation, so a new chat has no provider thread identity until its first input opens one. The resolved identity then reaches the client in the next session snapshot. Startup failures arrive as session `backend_event` errors and are also returned by MCP inspection. Service-only initialization does not start a provider conversation either.
 
 The first interactive initialization with no options uses the configured initial-session workflow. This convenience belongs to opening the Harness UI. General requests use service-only initialization and cannot invoke it as a side effect.
 

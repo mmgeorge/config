@@ -22,7 +22,7 @@ if vim.g.forge_wrap_alignment_child then
   } }).kind == "Applied")
   require("forge.input").open(owner, transcript_window, { margin = 0,
     columns = { signcolumn = "yes:1", statuscolumn = "%s" },
-    wrapping = { indent = true, options = "shift:0" } })
+    wrapping = layout.transcript_wrapping })
   vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { string.rep("composer ", 25) })
   layout.resize_composer(composer_buffer, composer_window)
   vim.api.nvim_set_current_win(transcript_window)

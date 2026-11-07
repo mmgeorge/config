@@ -77,6 +77,41 @@ enum DiffSide {
 }
 
 impl RepositoryToolScope {
+    /// Fork the captured read capability under independently retired native-child ownership.
+    pub(crate) fn fork_observed(
+        &self,
+        scope: &crate::provider::InvocationScope,
+    ) -> Result<Arc<Self>> {
+        ensure!(
+            scope.owner.session_id().as_str() == self.session,
+            "native child repository scope crosses session"
+        );
+        let authority = self
+            .authority
+            .read()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))?
+            .as_ref()
+            .map(crate::tools::TaskAuthority::snapshot)
+            .transpose()?;
+        Ok(Arc::new(Self {
+            session: self.session.clone(),
+            interaction: scope.exchange_id.to_string(),
+            workspace: self.workspace.clone(),
+            policy: self.policy.clone(),
+            repository: self.repository.clone(),
+            diff: self.diff.clone(),
+            active: AtomicBool::new(true),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            authority: std::sync::RwLock::new(authority),
+        }))
+    }
+
+    /// Revoke this child's own repository reads without changing its parent capability.
+    pub(crate) fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+    }
+
     pub(crate) fn open(
         session: String,
         interaction: String,

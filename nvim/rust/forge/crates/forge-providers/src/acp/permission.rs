@@ -88,6 +88,14 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
                 );
             }
         }
+        anyhow::ensure!(
+            paths.is_empty()
+                || matches!(
+                    tool["kind"].as_str(),
+                    Some("read" | "search" | "edit" | "delete" | "move")
+                ),
+            "ACP file permission omitted known read/write operation semantics"
+        );
         for path in paths {
             target_list.push(if write {
                 PermissionTarget::Write { path }
@@ -174,5 +182,35 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+    /// An opaque path-bearing native operation cannot gain write authority through a read decision.
+    #[test]
+    fn path_permissions_require_positive_native_read_or_write_semantics() {
+        for provider in [ProviderKind::Claude, ProviderKind::Antigravity] {
+            for kind in [Value::Null, json!("other"), json!("future")] {
+                assert!(
+                    permission_request(provider, &json!({"kind":kind, "rawInput":{"path":"file"}}))
+                        .is_err()
+                );
+            }
+            let read = permission_request(
+                provider,
+                &json!({"kind":"read", "rawInput":{"path":"file"}}),
+            )
+            .unwrap();
+            assert!(matches!(
+                read.target_list.as_slice(),
+                [PermissionTarget::Read { .. }]
+            ));
+            let write = permission_request(
+                provider,
+                &json!({"kind":"edit", "rawInput":{"path":"file"}}),
+            )
+            .unwrap();
+            assert!(matches!(
+                write.target_list.as_slice(),
+                [PermissionTarget::Write { .. }]
+            ));
+        }
     }
 }

@@ -5,7 +5,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 /// Distinguish native transport failure from malformed data and bounded observation loss.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -56,13 +56,16 @@ enum Command {
 impl CodexConnection {
     /// Connect once and immediately start the owner of the native socket.
     pub async fn connect(endpoint: &str) -> Result<Self, CodexConnectionError> {
-        let (socket, _) =
-            connect_async(endpoint)
-                .await
-                .map_err(|source| CodexConnectionError::Transport {
-                    operation: "connect shared Codex app-server",
-                    source: Arc::new(source),
-                })?;
+        // Native snapshots may contain a complete large tool result in a single frame.
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_frame_size(None)
+            .max_message_size(None);
+        let (socket, _) = connect_async_with_config(endpoint, Some(config), false)
+            .await
+            .map_err(|source| CodexConnectionError::Transport {
+                operation: "connect shared Codex app-server",
+                source: Arc::new(source),
+            })?;
         let (commands, receive_commands) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let (publish, received) = mpsc::unbounded_channel();
         let (failure, failures) = watch::channel(None);

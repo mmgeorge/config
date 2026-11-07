@@ -45,7 +45,7 @@ pub trait Provider: Send + Sync + 'static {
     /// Create the reader before returning and retain cleanup across dropped awaits. The caller
     /// installs stream consumption before submission. Resume and isolated modes may be unsupported;
     /// reject them before allocation or dispatch. Successful close deletes isolated temporary history.
-    async fn session_open(
+    async fn thread_open(
         &self,
         context: OperationContext,
         request: SessionRequest,
@@ -56,7 +56,7 @@ pub trait Provider: Send + Sync + 'static {
     /// the confirmed configuration, matching capabilities, and observation watermark. Reject busy
     /// or unsupported changes before writes; uncertain partial replacement invalidates the binding.
     /// Invocation overrides remain local to their invocation and do not replace these defaults.
-    async fn session_configure(
+    async fn thread_configure(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -67,12 +67,12 @@ pub trait Provider: Send + Sync + 'static {
     /// Establish the stable source before target mutation; leave the source unchanged and do not
     /// open the target's live binding. Retain disposition under the context ID. An ambiguous target
     /// creation does not authorize a fresh fork; unsupported sources reject before target creation.
-    async fn session_fork(
+    async fn thread_fork(
         &self,
         context: OperationContext,
         request: SessionForkRequest,
     ) -> Result<ProviderForkResult, ProviderError> {
-        context.check_admission(ProviderOperation::SessionFork)?;
+        context.check_admission(ProviderOperation::ThreadFork)?;
         let _ = request;
         Err(UnsupportedCapability(ProviderFeature::NativeFork).into())
     }
@@ -81,13 +81,13 @@ pub trait Provider: Send + Sync + 'static {
     /// Require SessionOperation scope with the same ID as the context; reject a mismatched scope,
     /// active execution, or unsupported compaction before effects. An RPC acknowledgement alone
     /// does not establish completion. Retain uncertain disposition so retry cannot compact twice.
-    async fn session_compact(
+    async fn thread_compact(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: CompactionRequest,
     ) -> Result<CompactionResult, ProviderError> {
-        context.check_admission(ProviderOperation::SessionCompact)?;
+        context.check_admission(ProviderOperation::ThreadCompact)?;
         let _ = (binding, request);
         Err(UnsupportedCapability(ProviderFeature::NativeCompact).into())
     }
@@ -97,7 +97,7 @@ pub trait Provider: Send + Sync + 'static {
     /// durable history. Success also deletes temporary history. Preserve the first failure and all
     /// unfinished ownership for later collection; failure never restores admission or touches a
     /// replacement generation. No caller fence, cancel, or cleanup preamble is required.
-    async fn session_close(
+    async fn thread_close(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -112,12 +112,12 @@ pub trait Provider: Send + Sync + 'static {
     /// WrongInvocation proves no matching preparation can still install native work: retain exact
     /// scope prevention and join its registration handoff before reporting absence. This never
     /// authorizes stopping another scope or treating unknown input delivery as not consumed.
-    async fn cancel(
+    async fn turn_interrupt(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: CancelRequest,
-    ) -> Result<InvocationSettlement, ProviderError>;
+    ) -> Result<TurnInterruptResult, ProviderError>;
 
     /// Admit journaled input into an idle execution slot with exact attempt and invocation authority.
     /// Install cancellation and collection ownership plus immutable configuration before dispatch;
@@ -127,7 +127,7 @@ pub trait Provider: Send + Sync + 'static {
     /// Admission/Preparation with Unchanged disposition is positive non-consumption evidence.
     /// After possible dispatch, preserve uncertainty unless native rejection proves non-consumption;
     /// represent that proven rejection as PreparationFailed with its original typed cause.
-    async fn input_submit(
+    async fn turn_start(
         &self,
         context: OperationContext,
         binding: &BindingId,
@@ -142,13 +142,13 @@ pub trait Provider: Send + Sync + 'static {
     /// A completed target rejected before delivery is not uncertain delivery. Preserve its
     /// Admission/Unchanged cause, or use PreparationFailed for a positively rejected native send;
     /// malformed acknowledgement after dispatch remains Observation/Uncertain.
-    async fn input_steer(
+    async fn turn_steer(
         &self,
         context: OperationContext,
         binding: &BindingId,
         request: SteeringRequest,
     ) -> Result<SteeringAcceptance, ProviderError> {
-        context.check_admission(ProviderOperation::InputSteer)?;
+        context.check_admission(ProviderOperation::TurnSteer)?;
         let _ = (binding, request);
         Err(UnsupportedCapability(ProviderFeature::NativeSteer).into())
     }
@@ -227,7 +227,7 @@ pub trait Provider: Send + Sync + 'static {
     }
 
     /// Read normalized native skill definitions and availability for the explicit query target.
-    /// Keep enablement writes exclusively in session_configure; reading cannot mutate an active
+    /// Keep enablement writes exclusively in thread_configure; reading cannot mutate an active
     /// binding. Unsupported discovery rejects rather than claiming an empty successful catalog.
     async fn skill_list(
         &self,
@@ -472,7 +472,7 @@ impl CompactionRequest {
             EventScope::SessionOperation { .. }
             | EventScope::Binding { .. }
             | EventScope::Invocation { .. } => Err(ProviderFailure::new(
-                ProviderOperation::SessionCompact,
+                ProviderOperation::ThreadCompact,
                 ProviderFailureKind::OperationConflict,
             )
             .into()),

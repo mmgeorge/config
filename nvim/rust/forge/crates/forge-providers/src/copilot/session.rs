@@ -146,7 +146,7 @@ pub async fn open(
                     github_copilot_sdk::ErrorKind::Session(
                         github_copilot_sdk::SessionErrorKind::NotFound(_),
                     ) => anyhow::Error::new(native_failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         ProviderFailureKind::SessionMissing,
                     )),
                     _ => error.into(),
@@ -216,7 +216,7 @@ pub async fn open(
                     github_copilot_sdk::ErrorKind::Session(
                         github_copilot_sdk::SessionErrorKind::NotFound(_),
                     ) => anyhow::Error::new(native_failure(
-                        ProviderOperation::SessionOpen,
+                        ProviderOperation::ThreadOpen,
                         ProviderFailureKind::SessionMissing,
                     )),
                     _ => error.into(),
@@ -237,7 +237,7 @@ pub async fn open(
                         .map(ProviderError::Observation)
                         .unwrap_or_else(|| {
                             native_failure(
-                                ProviderOperation::SessionOpen,
+                                ProviderOperation::ThreadOpen,
                                 ProviderFailureKind::Initialization,
                             )
                         })
@@ -246,7 +246,7 @@ pub async fn open(
                     return Err(ProviderError::PreparationCleanup {
                         cause: Box::new(cause),
                         cleanup: Box::new(super::error::native_failure(
-                            ProviderOperation::SessionClose,
+                            ProviderOperation::ThreadClose,
                             ProviderFailureKind::Runtime,
                         )),
                     }
@@ -265,7 +265,7 @@ pub async fn open(
     result.map_err(|error| {
         error.downcast::<ProviderError>().unwrap_or_else(|_| {
             native_failure(
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Initialization,
             )
         })
@@ -290,7 +290,7 @@ pub(super) async fn confirm_isolated_instructions(
         .await
         .map_err(|_| {
             ProviderError::Failure(
-                ProviderFailure::new(ProviderOperation::SessionOpen, ProviderFailureKind::Policy)
+                ProviderFailure::new(ProviderOperation::ThreadOpen, ProviderFailureKind::Policy)
                     .at_phase(
                         forge_provider_api::ProviderPhase::Preparation,
                         forge_provider_api::FailureDisposition::Invalidated,
@@ -299,7 +299,7 @@ pub(super) async fn confirm_isolated_instructions(
         })?;
     if !result.success {
         return Err(ProviderError::Failure(
-            ProviderFailure::new(ProviderOperation::SessionOpen, ProviderFailureKind::Policy)
+            ProviderFailure::new(ProviderOperation::ThreadOpen, ProviderFailureKind::Policy)
                 .at_phase(
                     forge_provider_api::ProviderPhase::Preparation,
                     forge_provider_api::FailureDisposition::Invalidated,

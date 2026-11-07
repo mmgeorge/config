@@ -1,6 +1,6 @@
 use super::{CheckConfig, CheckSupervisor, ConfigSnapshot, RunRequest};
 use crate::{
-    provider::{PromptMode, ProviderEventSink},
+    provider::{HarnessEventSink, PromptMode},
     session::{ApprovalMode, CheckShell},
 };
 use anyhow::{Context, Result, ensure};
@@ -68,7 +68,7 @@ pub(crate) struct CheckToolScope {
 
 #[derive(Clone)]
 struct CheckDelivery {
-    authorization: ProviderEventSink,
+    authorization: HarnessEventSink,
     lifecycle: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
@@ -83,7 +83,7 @@ pub(crate) struct CheckAuthority {
     pub permission: ApprovalMode,
     pub permissions: Arc<crate::provider::approval::PermissionCoordinator>,
     pub scope: crate::provider::InvocationScope,
-    pub authorization_sink: ProviderEventSink,
+    pub authorization_sink: HarnessEventSink,
     pub editing: Arc<AtomicBool>,
     pub can_run: bool,
     pub agent: Arc<crate::agent::AgentCoordinator>,
@@ -213,7 +213,7 @@ impl CheckToolScope {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
                     .get(
                         &self.runner.workspace.to_string_lossy(),
-                        self.scope.owner.session_id.as_str(),
+                        self.scope.owner.session_id().as_str(),
                         &self.provider,
                     )?
                     .desired;
@@ -237,6 +237,7 @@ impl CheckToolScope {
                 }
                 definitions["automatic_checks"] = json!(settings.automatic_checks_enabled());
                 definitions["check_timing"] = json!(settings.check_timing.unwrap_or_default());
+                definitions["check_editing"] = json!(self.editing_enabled());
                 definitions
             }
             "check_definition_details" => {
@@ -410,7 +411,7 @@ impl CheckToolScope {
         &self,
         mode: ApprovalMode,
         target_list: Vec<crate::permissions::matcher::PermissionTarget>,
-        authorization: &ProviderEventSink,
+        authorization: &HarnessEventSink,
     ) -> Result<()> {
         if target_list.is_empty() {
             return Ok(());

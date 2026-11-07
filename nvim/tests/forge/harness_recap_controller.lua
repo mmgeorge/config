@@ -11,29 +11,29 @@ client.request = function(request_specification, callback)
   local params = request_specification.params or {}
 
   if host.request(method, params, callback) then return end
-  assert(method == "session.document" and params.operation == "recap")
-  requests[#requests + 1] = callback
+  if method == "session.document" then
+    assert(params.operation == "recap")
+    requests[#requests + 1] = callback
+    return
+  end
+  prompt = { method = method, params = params }
 end
-client.request = function(request_specification)
-  local method = request_specification.method
-  local params = request_specification.params or {}
-   prompt = { method = method, params = params } end
 controller.render = function() end
 controller.refresh_winbar = function() end
 state.session = { id = "recap-controller", model = "test" }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
-state.capability, state.queue, state.busy = {}, {}, true
+state.capability, state.queue = {}, {}
 input.attach(state, function() end)
-state.busy = true
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 local function compose(text) vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text }) end
 compose("/recap")
 controller.queue_submit()
-assert(#requests == 1 and #state.queue == 0 and state.busy)
+assert(#requests == 1 and #state.queue == 0 and require("forge.views.harness.activity").busy(state))
 requests[1]({ text = "Recap text" })
 compose("Next task")
 controller.queue_submit()
 assert(state.recap.text and #state.queue == 1, "queue admission erased the recap")
-state.busy = false
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
 host.flush()
 controller.render()
 assert((not prompt or prompt.method ~= "session.prompt.submit") and state.recap.text, "presentation independently dispatched the host queue")

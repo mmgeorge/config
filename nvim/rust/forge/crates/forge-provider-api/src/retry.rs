@@ -22,15 +22,78 @@ pub struct ProviderRetry {
     pub retry_at_ms: Option<i64>,
 }
 
-/// Adapter proof that a terminal transient failure produced no replay-sensitive output.
+/// Retain canonical native permission to retry after shared delivery and effect checks.
 #[derive(Clone, Debug)]
 pub struct RetryableFailure {
-    /// Completed native turn that retains the original request in provider history.
-    pub address: TurnAddress,
-    /// Normalized retry class selected by the provider adapter.
-    pub category: RetryCategory,
-    /// Provider-required minimum wait before another attempt, absent when none was reported.
-    pub retry_after: Option<Duration>,
+    address: TurnAddress,
+    category: RetryCategory,
+    result: crate::TurnResult,
+}
+
+impl RetryableFailure {
+    /// Create retry authorization only from a retained failed turn that explicitly permits it.
+    pub fn new(
+        address: TurnAddress,
+        result: &crate::TurnResult,
+        category: RetryCategory,
+    ) -> Result<Self, crate::ProviderError> {
+        if address.thread_id != address.scope.owner.thread_id()
+            || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
+        {
+            return Err(crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::WrongInvocation,
+            )
+            .into());
+        }
+        match result.outcome() {
+            crate::turn::TurnOutcome::Failed {
+                retry: crate::turn::RetryDecision::Allowed { .. },
+                ..
+            } => Ok(Self {
+                address,
+                category,
+                result: result.clone(),
+            }),
+            crate::turn::TurnOutcome::Completed { .. }
+            | crate::turn::TurnOutcome::Interrupted
+            | crate::turn::TurnOutcome::Failed {
+                retry: crate::turn::RetryDecision::NotAllowed,
+                ..
+            } => Err(crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::Rejected,
+            )
+            .into()),
+        }
+    }
+    /// Get the original completed turn that remains in native history.
+    pub fn address(&self) -> &TurnAddress {
+        &self.address
+    }
+    /// Get the normalized transient failure category.
+    pub fn category(&self) -> RetryCategory {
+        self.category
+    }
+    /// Get the provider-required delay from the retained canonical decision.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self.result.outcome() {
+            crate::turn::TurnOutcome::Failed {
+                retry: crate::turn::RetryDecision::Allowed { retry_after },
+                ..
+            } => retry_after,
+            crate::turn::TurnOutcome::Completed { .. }
+            | crate::turn::TurnOutcome::Interrupted
+            | crate::turn::TurnOutcome::Failed {
+                retry: crate::turn::RetryDecision::NotAllowed,
+                ..
+            } => unreachable!("retry authorization constructor retained an allowed failed turn"),
+        }
+    }
+    /// Get the original native terminal evidence used to authorize this retry.
+    pub fn result(&self) -> &crate::TurnResult {
+        &self.result
+    }
 }
 
 impl fmt::Display for RetryableFailure {

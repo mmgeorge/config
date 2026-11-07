@@ -125,6 +125,17 @@ pub(super) async fn execute(
     let scope = runtime.context.lsp.clone().ok_or(MutationError::Access(
         "LSP tools require an enabled active editor interaction",
     ))?;
+    let original_scope =
+        runtime
+            .context
+            .question_invocation
+            .clone()
+            .ok_or(MutationError::Access(
+                "Rename requires its original authenticated host invocation.",
+            ))?;
+    let call_id = invocation.call_id.clone().ok_or(MutationError::Access(
+        "Rename requires its original authenticated host call.",
+    ))?;
     let name = invocation.name.clone();
     let arguments = invocation.arguments;
     let request = parse(&name, arguments.clone())?;
@@ -170,27 +181,49 @@ pub(super) async fn execute(
     let prepared: super::transaction::Prepared =
         serde_json::from_value(prepared).map_err(MutationError::Json)?;
     let publication = runtime.context.provider_completion.clone();
+    let live = runtime.context.live_host_effects.clone();
+    let observed = runtime.context.observed_file_changes.clone();
+    let live_scope = original_scope.clone();
+    let live_call = call_id.clone();
     // The worker owns both guards: dropping the provider future cannot release buffers during a write.
-    let result = tokio::task::spawn_blocking(move || -> Result<String> {
-        let _guard = guard;
-        let mut hold = hold;
-        let mut transaction = super::transaction::Transaction::prepare(&scope, &policy, prepared)?;
-        scope.check().map_err(MutationError::Service)?;
-        transaction.commit()?;
-        hold.committed = true;
-        scope
-            .changes
-            .publish(&name, &arguments, transaction.changes());
-        let mut completion = crate::provider::ProviderCompletion::default();
-        completion.native.evidence.workspace_changed = transaction.changed();
-        completion.native.evidence.tool_called = true;
-        publication
-            .publish(completion)
+    let (result, batch) = runtime
+        .lsp_mutations
+        .run(
+            move || -> Result<(String, crate::provider::HostEffectBatch)> {
+                let _guard = guard;
+                let mut hold = hold;
+                let mut transaction =
+                    super::transaction::Transaction::prepare(&scope, &policy, prepared)?;
+                scope.check().map_err(MutationError::Service)?;
+                transaction.commit()?;
+                hold.committed = true;
+                let mut completion = crate::provider::ProviderCompletion::default();
+                completion.host_file_changes.push(super::HostFileChange {
+                    scope: original_scope,
+                    call_id,
+                    native_item_id: None,
+                    changes: transaction.changes(),
+                });
+                completion.native.evidence.workspace_changed = transaction.changed();
+                completion.native.evidence.tool_called = true;
+                let batch = publication
+                    .publish_batch(completion)
+                    .map_err(MutationError::Publication)?;
+                Ok((transaction.summary(), batch))
+            },
+        )
+        .await?;
+    if let Some(observed) = observed {
+        for change in &batch.completion.host_file_changes {
+            observed
+                .send_host_file_change(change.clone())
+                .map_err(|error| MutationError::Publication(error.into()))?;
+        }
+    } else if let Some(live) = live {
+        live.commit(live_scope, live_call, batch)
+            .await
             .map_err(MutationError::Publication)?;
-        Ok(transaction.summary())
-    })
-    .await
-    .map_err(MutationError::Worker)??;
+    }
     Ok(ControlToolResult {
         invocation: None,
         message: result,

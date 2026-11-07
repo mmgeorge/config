@@ -2214,7 +2214,7 @@ mod tests {
         drop(queue);
         {
             let connection =
-                rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
+                rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
             let snapshot: String = connection.query_row(
                 "SELECT payload FROM input_session WHERE session_id='session'",
                 [],

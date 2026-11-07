@@ -164,7 +164,11 @@ async fn saturated_child_admission(followup: bool) -> Result<()> {
             while !*cancelled.borrow() {
                 cancelled.changed().await?;
             }
-            settling.settled(&first_agent, &first_task, false)?;
+            settling.settled(
+                &first_agent,
+                &first_task,
+                crate::agent::AgentSettlementDisposition::Ready,
+            )?;
             Ok::<(), anyhow::Error>(())
         });
         controller.attach_agents(&sink).await?;
@@ -208,7 +212,11 @@ async fn saturated_child_admission(followup: bool) -> Result<()> {
         ensure!(replayed.id == task.id);
         for work in active.into_iter().skip(1) {
             children.interrupt(&work.agent.id)?;
-            children.settled(&work.agent.id, &work.task.id, false)?;
+            children.settled(
+                &work.agent.id,
+                &work.task.id,
+                crate::agent::AgentSettlementDisposition::Ready,
+            )?;
         }
         Ok::<(), anyhow::Error>(())
     }

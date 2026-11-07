@@ -415,7 +415,9 @@ function CommandSource:get_completions(_, callback)
         ::continue::
       end
     end
-    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    -- Command labels contain spaces, so typing arguments must re-query: a cached
+    -- top-level list would otherwise be fuzzy-filtered against the argument word.
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = true })
   end
   if command_start and (session.harness.capability or {}).ultrafast_mode then
     self:request_model_list(complete_commands)

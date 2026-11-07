@@ -166,13 +166,13 @@ local success, failure = xpcall(function()
     "reopening detached review did not establish a fresh native attachment")
   review.command_set.action_by_id.accept.run({})
   answer_decision("", "<Esc>")
-  assert(not pending and not state.busy, "cancelling the decision sent an RPC")
+  assert(not pending and not require("forge.views.harness.activity").busy(state), "cancelling the decision sent an RPC")
 
   review.command_set.action_by_id.accept.run({})
   local captured_digest = review.plan.review_digest
   review.plan.review_digest = "changed-while-popup-open"
   answer_decision("stale comment", "<CR>")
-  assert(not pending and not state.busy, "stale review digest sent an RPC")
+  assert(not pending and not require("forge.views.harness.activity").busy(state), "stale review digest sent an RPC")
   review.plan.review_digest = captured_digest
 
   review.command_set.action_by_id.accept.run({})
@@ -184,7 +184,7 @@ local success, failure = xpcall(function()
   local decision_ok, decision_failure = pcall(answer_decision, "stale tick comment", "<CR>")
   vim.api.nvim_buf_get_changedtick = original_get_changedtick
   assert(decision_ok, decision_failure)
-  assert(not pending and not state.busy, "stale changedtick sent an RPC")
+  assert(not pending and not require("forge.views.harness.activity").busy(state), "stale changedtick sent an RPC")
 
   review.command_set.action_by_id.accept.run({})
   assert(not pending, "approval dispatched before the decision popup was answered")
@@ -193,7 +193,7 @@ local success, failure = xpcall(function()
     and pending.params.review.document == review.owner.document and pending.params.digest == nil)
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
   pending.callback({ command_result = { outcome = { outcome = "task", result = { disposition = "awaiting_input" } } } })
-  assert(activated and state.plan_review == nil and not state.busy)
+  assert(activated and state.plan_review == nil and not require("forge.views.harness.activity").busy(state))
   assert(execution == nil, "approval issued a second execution command")
   assert(vim.api.nvim_get_current_win() == state.transcript_win, "approval did not return to Harness")
   assert(vim.api.nvim_buf_is_valid(review.buf), "closing PlanReview deleted its physical buffer")
@@ -221,16 +221,22 @@ local success, failure = xpcall(function()
   native.open(review.plan)
   review = state.plan_review
   review.owner.annotation_saving, review.owner.saving = true, true
+  local dispatched_before_queue = pending
   review.command_set.action_by_id.accept.run({})
   answer_decision("", "<CR>")
-  assert(#review.owner.pending_operation == 1 and state.busy)
+  -- The session owner publishes activity, so a queued submission proves itself by
+  -- staying queued behind the save instead of by a Lua-side busy flag.
+  assert(#review.owner.pending_operation == 1 and pending == dispatched_before_queue,
+    "approval dispatched while an annotation save was still in flight")
   generation = 2
   native.open(review.plan)
   local recovered = state.plan_review
   assert(recovered ~= review and recovered.owner.ready)
+  assert(pending ~= dispatched_before_queue and pending.method == "session.plan.accept",
+    "recovery did not dispatch the queued approval")
   assert(pending.params.review.document == recovered.owner.document)
   pending.callback({ session = { id = "plan-session" } })
-  assert(recovered.owner.closed and not state.plan_review and not state.busy,
+  assert(recovered.owner.closed and not state.plan_review and not require("forge.views.harness.activity").busy(state),
     "recovered submission completion retained the replacement review")
 end, debug.traceback)
 if state.plan_review and state.plan_review.owner then state.plan_review.owner.close() end

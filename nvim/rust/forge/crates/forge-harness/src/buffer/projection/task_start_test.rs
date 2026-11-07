@@ -1,6 +1,6 @@
 use super::*;
 use crate::exchange::{ExchangeOrigin, TaskStart};
-use crate::provider::{ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate};
+use crate::provider::ToolOutcome;
 use crate::timeline::{SessionEventRecord, TimelineEvent, TimelineOwner};
 use serde_json::json;
 
@@ -221,11 +221,11 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
         let commentary = crate::turn::test_support::message(
             &address,
             "commentary",
-            Some(crate::provider::MessageRole::Commentary),
+            Some(forge_provider_api::AgentMessageRole::Commentary),
             "Inspecting startup",
         );
         if !before_commentary {
-            active.observe_turn(&commentary, 1)?;
+            active.observe_event(&commentary, 1)?;
         }
         let event = TimelineEvent::Session {
             event: Box::new(SessionEventRecord {
@@ -240,24 +240,32 @@ fn task_start_matches_idle_and_active_presentation() -> Result<()> {
             }),
         };
         if before_commentary {
-            active.observe_turn(&commentary, 3)?;
+            active.observe_event(&commentary, 3)?;
         }
         crate::turn::test_support::tool(
             &mut active,
             &address,
             "inspect",
-            ToolInvocation {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
                 semantics: Default::default(),
-                kind: ToolActivityKind::Command,
                 name: "inspect".into(),
                 title: "Inspect files".into(),
-                arguments: json!({}),
-            },
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            }),
             [
-                ToolUpdate::Started,
-                ToolUpdate::Finished {
-                    outcome: ToolOutcome::Succeeded,
+                forge_provider_api::ItemEvent::Tool {
+                    event: forge_provider_api::ToolItemEvent::ExecutionStarted,
                 },
+                forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: ToolOutcome::Succeeded,
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                ),
             ],
             4,
         )?;

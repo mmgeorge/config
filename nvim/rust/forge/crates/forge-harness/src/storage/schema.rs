@@ -158,7 +158,17 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS agent_task_record (
+            CREATE TABLE IF NOT EXISTS observed_binding_unavailable (
+                binding_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS observed_agent_record (
+                binding_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(binding_id,agent_id),
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );            CREATE TABLE IF NOT EXISTS agent_task_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,

@@ -3,10 +3,29 @@ use std::{fmt, io, time::Duration};
 use forge_protocol::outbound::{self, MessageReceiver, MessageSender};
 
 use super::{
-    BindingId, BoundProviderEvent, EventScope, InvocationScope, MessageUpdate, ProviderError,
-    ProviderEvent, TextUpdate, ToolUpdate,
+    BindingId, BoundProviderEvent, EventScope, InvocationScope, ProviderError, ProviderEvent,
+    TextUpdate,
 };
 
+/// Own connection delivery while the shared retained runner owns terminal publication.
+///
+/// Native adapters cannot obtain a terminal publisher from a connection sink.
+///
+/// ```compile_fail
+/// use forge_provider_api::{ProviderEventSink, TurnAddress};
+/// fn publish(sink: ProviderEventSink, address: TurnAddress) {
+///     let publisher = sink.turn_publisher(address);
+/// }
+/// ```
+///
+/// Observed child turns use the same retained runner boundary.
+///
+/// ```compile_fail
+/// use forge_provider_api::{ProviderEventSink, TurnAddress};
+/// fn publish(sink: ProviderEventSink, address: TurnAddress) {
+///     let publisher = sink.observed_turn_publisher(address);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct ProviderEventSink {
     binding_id: BindingId,
@@ -16,6 +35,53 @@ pub struct ProviderEventSink {
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
     published: std::sync::Arc<std::sync::atomic::AtomicU64>,
     observer: Vec<std::sync::Arc<dyn EventObserver>>,
+    ownership: std::sync::Arc<std::sync::Mutex<ActivityOwnership>>,
+}
+
+#[derive(Default)]
+struct ActivityOwnership {
+    claimed_turns: std::collections::HashSet<(crate::ThreadId, crate::TurnId)>,
+    registered_turns: std::collections::HashMap<crate::TurnId, crate::TurnAddress>,
+    started_turns: std::collections::HashSet<(crate::ThreadId, crate::TurnId)>,
+    completed_turns: std::collections::HashSet<(crate::ThreadId, crate::TurnId)>,
+    ended_turns: std::collections::HashSet<(crate::ThreadId, crate::TurnId)>,
+    not_started: std::collections::HashMap<crate::TurnId, ProviderError>,
+    resolution_changed: std::sync::Arc<tokio::sync::Notify>,
+    pending_models:
+        std::collections::HashMap<(crate::ThreadId, crate::TurnId), Vec<crate::ResolvedModel>>,
+    items: std::collections::HashMap<crate::ItemId, ItemOwner>,
+    identical_replays: u64,
+}
+
+/// Give publication a checked admission result rather than silently repeating replayed effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationAdmission {
+    /// Apply a newly validated observation to its original owner.
+    Apply,
+    /// Acknowledge an exactly matching replay without publishing its effects again.
+    IdenticalReplay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ItemOwner {
+    thread_id: crate::ThreadId,
+    turn_id: crate::TurnId,
+    kind: ItemKind,
+    initial: Vec<u8>,
+    completion: Option<Vec<u8>>,
+    background: bool,
+    executing: bool,
+    classification: Option<crate::MessageClassification>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItemKind {
+    UserMessage,
+    AgentMessage,
+    Reasoning,
+    CommandExecution,
+    FileChange,
+    ToolCall,
 }
 
 pub struct ProviderEventStream {
@@ -25,6 +91,8 @@ pub struct ProviderEventStream {
     queued: Option<BoundProviderEvent>,
     deadline: tokio::time::Instant,
     deferred_error: Option<EventDeliveryError>,
+    ownership: std::sync::Arc<std::sync::Mutex<ActivityOwnership>>,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct EventReceiver {
@@ -115,6 +183,8 @@ pub fn channel(
 ) -> (ProviderEventSink, ProviderEventStream) {
     let (sender, receiver) = outbound::channel();
     let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let ownership = Default::default();
+    let published = Default::default();
     (
         ProviderEventSink {
             binding_id: binding_id.clone(),
@@ -122,8 +192,9 @@ pub fn channel(
             sender,
             failure: failure.clone(),
             delivery: Default::default(),
-            published: Default::default(),
+            published: std::sync::Arc::clone(&published),
             observer: Vec::new(),
+            ownership: std::sync::Arc::clone(&ownership),
         },
         ProviderEventStream {
             binding_id: binding_id.clone(),
@@ -138,6 +209,8 @@ pub fn channel(
             queued: None,
             deadline: tokio::time::Instant::now(),
             deferred_error: None,
+            ownership,
+            published,
         },
     )
 }
@@ -146,6 +219,22 @@ impl ProviderEventSink {
     /// Get the binding generation that owns every event sent through this sink.
     pub fn binding_id(&self) -> &BindingId {
         &self.binding_id
+    }
+
+    /// Reject native admission once this exact binding has failed or lost its sole receiver.
+    pub fn check(&self) -> Result<(), EventDeliveryError> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(error);
+        }
+        if self.sender.is_closed() {
+            return Err(EventDeliveryError::Closed);
+        }
+        Ok(())
     }
 
     /// Get the final successfully published sequence, independently of owner consumption.
@@ -181,7 +270,7 @@ impl ProviderEventSink {
     pub fn invocation_scope(&self) -> Result<&InvocationScope, ProviderError> {
         self.scope.invocation().ok_or_else(|| {
             ProviderError::Failure(crate::error::ProviderFailure::new(
-                crate::error::ProviderOperation::InputSubmit,
+                crate::error::ProviderOperation::TurnStart,
                 crate::error::ProviderFailureKind::Rejected,
             ))
         })
@@ -240,7 +329,158 @@ impl ProviderEventSink {
         })
     }
 
-    fn validate(&self, event: &ProviderEvent) -> Result<(), EventDeliveryError> {
+    /// Fence connection-owned observation loss independently of any active turn or diagnostic capacity.
+    pub async fn unavailable(&self, failure: crate::ProviderFailure) {
+        self.fence_unavailable(failure, crate::ObservationFailure::LifecycleUnavailable);
+    }
+
+    /// Fence connection-owned observation loss with its known cause, so the first
+    /// recorded failure reports what actually happened rather than a generic loss.
+    pub async fn unavailable_because(
+        &self,
+        failure: crate::ProviderFailure,
+        observation: crate::ObservationFailure,
+    ) {
+        self.fence_unavailable(failure, observation);
+    }
+
+    /// Fence idle native observation loss while preserving its exact first stream cause.
+    pub async fn observation_unavailable(&self, observation: crate::ObservationFailure) {
+        let kind = match observation {
+            crate::ObservationFailure::Disconnected => crate::ProviderFailureKind::Transport,
+            crate::ObservationFailure::Overflow => crate::ProviderFailureKind::Runtime,
+            crate::ObservationFailure::DeliveryUncertain => crate::ProviderFailureKind::Unknown,
+            crate::ObservationFailure::LifecycleUnavailable
+            | crate::ObservationFailure::Protocol
+            | crate::ObservationFailure::OwnershipConflict
+            | crate::ObservationFailure::UnexpectedExecution => {
+                crate::ProviderFailureKind::Protocol
+            }
+        };
+        let failure = crate::ProviderFailure::new(crate::ProviderOperation::TurnStart, kind)
+            .at_phase(
+                crate::ProviderPhase::Observation,
+                crate::FailureDisposition::Invalidated,
+            );
+        self.fence_unavailable(failure, observation);
+    }
+
+    /// Attempt the availability notification without depending on transport capacity for fencing.
+    fn fence_unavailable(
+        &self,
+        failure: crate::ProviderFailure,
+        observation: crate::ObservationFailure,
+    ) {
+        let message =
+            crate::SanitizedMessage::new("Provider observation or foreground collection failed")
+                .expect("static normalized failure text is sanitized");
+        let _ = self.send(ProviderEvent::Provider {
+            event: crate::ProviderConnectionEvent::Unavailable(crate::ProviderUnavailable {
+                failure,
+                message,
+            }),
+        });
+        self.fail(EventDeliveryError::Observation(observation));
+    }
+
+    /// Publish effective capabilities through the owning connection runtime.
+    pub async fn capabilities_changed(
+        &self,
+        capabilities: crate::CapabilityManifest,
+    ) -> Result<(), EventDeliveryError> {
+        self.send_wait(ProviderEvent::Provider {
+            event: crate::ProviderConnectionEvent::CapabilitiesChanged(capabilities),
+        })
+        .await
+    }
+
+    /// Create a restricted writer sharing this connection's exact ownership and ordering.
+    pub fn activity_writer(&self) -> AdapterActivityWriter {
+        AdapterActivityWriter { sink: self.clone() }
+    }
+
+    /// Create the retained runner's lifecycle publication authority for an admitted host turn.
+    pub(crate) fn turn_publisher(
+        &self,
+        address: crate::TurnAddress,
+    ) -> Result<TurnPublisher, ProviderError> {
+        if address.thread_id != address.scope.owner.thread_id()
+            || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
+            || self.scope.owner() != &address.scope.owner
+        {
+            return Err(crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::WrongInvocation,
+            )
+            .into());
+        }
+        let sink = if self.scope.invocation() == Some(&address.scope) {
+            self.clone()
+        } else {
+            self.invocation_sink(&address.scope)?
+        };
+        {
+            let mut ownership = self
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (address.thread_id.clone(), address.turn_id.clone());
+            if ownership.claimed_turns.contains(&key)
+                || ownership
+                    .registered_turns
+                    .get(&address.turn_id)
+                    .is_some_and(|registered| registered != &address)
+            {
+                return Err(crate::ProviderFailure::new(
+                    crate::ProviderOperation::TurnStart,
+                    crate::ProviderFailureKind::WrongInvocation,
+                )
+                .into());
+            }
+            ownership
+                .registered_turns
+                .insert(address.turn_id.clone(), address.clone());
+            ownership.claimed_turns.insert(key);
+        }
+        Ok(TurnPublisher {
+            sink,
+            address,
+            started: Default::default(),
+            started_changed: Default::default(),
+            observed: Default::default(),
+        })
+    }
+
+    /// Create lifecycle authority for a positively correlated native child with independent collection ownership.
+    pub(crate) fn observed_turn_publisher(
+        &self,
+        address: crate::TurnAddress,
+    ) -> Result<TurnPublisher, ProviderError> {
+        let writer = self
+            .activity_writer()
+            .register_observed_turn(address.clone())?;
+        writer.sink.turn_publisher(address)
+    }
+
+    /// Retain an immutable typed ownership record before any native turn publication.
+    fn register_turn(&self, address: &crate::TurnAddress) -> Result<(), EventDeliveryError> {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match ownership.registered_turns.entry(address.turn_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() != address => Err(
+                EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict),
+            ),
+            std::collections::hash_map::Entry::Occupied(_) => Ok(()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(address.clone());
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_scope(&self, event: &ProviderEvent) -> Result<(), EventDeliveryError> {
         if let Some(error) = self
             .failure
             .lock()
@@ -249,80 +489,282 @@ impl ProviderEventSink {
         {
             return Err(error);
         }
-        if let ProviderEvent::Settled { settlement } = event
-            && settlement.binding_id != self.binding_id
+        if let ProviderEvent::Thread {
+            thread_id,
+            event: crate::ThreadEvent::CompactionUpdated(compaction),
+        } = event
+            && compaction.thread_id != thread_id.as_str()
         {
-            let error =
-                EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict);
-            self.fail(error.clone());
-            return Err(error);
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::OwnershipConflict,
+            ));
         }
-        let received = event.scope();
-        if received != self.scope {
-            let error = EventDeliveryError::OwnershipMismatch {
-                expected: Box::new(self.scope.clone()),
-                received: Box::new(received),
-            };
-            self.fail(error.clone());
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub async fn send_wait(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
-        self.validate(&event)?;
-        for observer in &self.observer {
-            observer
-                .before_delivery(&event)
-                .inspect_err(|error| self.fail(error.clone()))?;
-        }
-        let _delivery = self.delivery.lock().await;
-        let mut additional = Vec::new();
-        for observer in &self.observer {
-            additional.extend(observer.additional_events(&event).inspect_err(|error| {
-                self.fail(error.clone());
-            })?);
-        }
-        self.send_encoded(event).await?;
-        for event in additional {
-            self.send_encoded(event).await?;
-        }
-        Ok(())
-    }
-
-    /// Publish successful collection with its exact stream position under the shared delivery lock.
-    /// The returned receipt and event carry the same watermark, even with concurrent publishers.
-    pub async fn send_settlement(
-        &self,
-        mut settlement: crate::InvocationSettlement,
-    ) -> Result<crate::InvocationSettlement, EventDeliveryError> {
-        let _delivery = self.delivery.lock().await;
-        settlement.watermark =
-            self.watermark()
-                .successor()
-                .ok_or(EventDeliveryError::Observation(
-                    crate::ObservationFailure::Protocol,
-                ))?;
-        let event = ProviderEvent::Settled {
-            settlement: Box::new(settlement.clone()),
+        let (thread, turn) = match event {
+            ProviderEvent::Thread { thread_id, .. } => (Some(thread_id), None),
+            ProviderEvent::Turn {
+                thread_id, turn_id, ..
+            }
+            | ProviderEvent::Item {
+                thread_id, turn_id, ..
+            } => (Some(thread_id), Some(turn_id)),
+            ProviderEvent::Provider { .. } | ProviderEvent::Agent { .. } => (None, None),
         };
-        self.validate(&event)?;
-        let mut additional = Vec::new();
+        if turn.is_some_and(|turn| {
+            self.ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .not_started
+                .contains_key(turn)
+        }) {
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::UnexpectedExecution,
+            ));
+        }
+        if thread.is_some_and(|thread| thread != &self.scope.owner().thread_id())
+            || turn.is_some_and(|turn| {
+                self.scope
+                    .invocation()
+                    .is_none_or(|scope| scope.turn_id().as_ref() != Ok(turn))
+            })
+        {
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::OwnershipConflict,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Count identical item replays acknowledged without publishing their effects again.
+    pub fn identical_replay_count(&self) -> u64 {
+        self.ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .identical_replays
+    }
+
+    /// Validate and admit item state only while the shared delivery lock owns its publication order.
+    ///
+    /// An item start or completion whose identity, owner, type, and encoded contents exactly match
+    /// the retained record is an identical replay. Any other repeated observation still fails.
+    fn validate(&self, event: &ProviderEvent) -> Result<ObservationAdmission, EventDeliveryError> {
+        let mut admission = ObservationAdmission::Apply;
+        self.validate_scope(event)?;
+        if let ProviderEvent::Turn {
+            thread_id,
+            turn_id,
+            event: crate::TurnEvent::Started(_),
+        } = event
+            && self
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ended_turns
+                .contains(&(thread_id.clone(), turn_id.clone()))
+        {
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::UnexpectedExecution,
+            ));
+        }
+        if let ProviderEvent::Item {
+            thread_id,
+            turn_id,
+            item_id,
+            event,
+        } = event
+        {
+            let mut ownership = self
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let invalid =
+                || EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict);
+            let retired =
+                || EventDeliveryError::Observation(crate::ObservationFailure::UnexpectedExecution);
+            let key = (thread_id.clone(), turn_id.clone());
+            let turn_completed =
+                ownership.completed_turns.contains(&key) || ownership.ended_turns.contains(&key);
+            match event {
+                crate::ItemEvent::Started(start) => {
+                    let kind = match start {
+                        crate::ItemStart::UserMessage(_) => ItemKind::UserMessage,
+                        crate::ItemStart::AgentMessage(_) => ItemKind::AgentMessage,
+                        crate::ItemStart::Reasoning(_) => ItemKind::Reasoning,
+                        crate::ItemStart::CommandExecution(_) => ItemKind::CommandExecution,
+                        crate::ItemStart::FileChange(_) => ItemKind::FileChange,
+                        crate::ItemStart::ToolCall(_) => ItemKind::ToolCall,
+                    };
+                    let initial =
+                        serde_json::to_vec(start).map_err(EventDeliveryError::transport)?;
+                    if let Some(previous) = ownership.items.get(item_id) {
+                        if previous.thread_id != *thread_id
+                            || previous.turn_id != *turn_id
+                            || previous.kind != kind
+                            || previous.initial != initial
+                        {
+                            return Err(invalid());
+                        }
+                        admission = ObservationAdmission::IdenticalReplay;
+                    } else {
+                        if turn_completed {
+                            return Err(retired());
+                        }
+                        ownership.items.insert(
+                            item_id.clone(),
+                            ItemOwner {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                kind,
+                                initial,
+                                completion: None,
+                                background: false,
+                                executing: false,
+                                classification: match start {
+                                    crate::ItemStart::AgentMessage(start) => {
+                                        Some(start.classification)
+                                    }
+                                    crate::ItemStart::UserMessage(_)
+                                    | crate::ItemStart::Reasoning(_)
+                                    | crate::ItemStart::CommandExecution(_)
+                                    | crate::ItemStart::FileChange(_)
+                                    | crate::ItemStart::ToolCall(_) => None,
+                                },
+                            },
+                        );
+                    }
+                }
+                crate::ItemEvent::Message { event } => {
+                    let owner = ownership.items.get_mut(item_id).ok_or_else(invalid)?;
+                    if owner.thread_id != *thread_id
+                        || owner.turn_id != *turn_id
+                        || !matches!(
+                            owner.kind,
+                            ItemKind::UserMessage | ItemKind::AgentMessage | ItemKind::Reasoning
+                        )
+                    {
+                        return Err(invalid());
+                    }
+                    match event {
+                        crate::MessageItemEvent::Delta(_) => {
+                            if turn_completed || owner.completion.is_some() {
+                                return Err(retired());
+                            }
+                        }
+                        crate::MessageItemEvent::Classified(incoming) => {
+                            let current = owner.classification.as_mut().ok_or_else(invalid)?;
+                            if turn_completed && current != incoming {
+                                return Err(retired());
+                            }
+                            match (*current, *incoming) {
+                                (_, crate::MessageClassification::Unclassified) => {}
+                                (
+                                    crate::MessageClassification::Unclassified,
+                                    crate::MessageClassification::Known(_),
+                                ) => *current = *incoming,
+                                (
+                                    crate::MessageClassification::Known(prior),
+                                    crate::MessageClassification::Known(next),
+                                ) if prior == next => {}
+                                (
+                                    crate::MessageClassification::Known(_),
+                                    crate::MessageClassification::Known(_),
+                                ) => return Err(invalid()),
+                            }
+                        }
+                    }
+                }
+                crate::ItemEvent::Tool { event } => {
+                    let owner = ownership.items.get_mut(item_id).ok_or_else(invalid)?;
+                    if owner.thread_id != *thread_id
+                        || owner.turn_id != *turn_id
+                        || !matches!(
+                            owner.kind,
+                            ItemKind::CommandExecution | ItemKind::FileChange | ItemKind::ToolCall
+                        )
+                    {
+                        return Err(invalid());
+                    }
+                    if turn_completed && (!owner.background || owner.completion.is_some()) {
+                        return Err(retired());
+                    }
+                    match event {
+                        crate::ToolItemEvent::ExecutionStarted => {
+                            if owner.completion.is_some() {
+                                return Err(retired());
+                            }
+                            owner.executing = true;
+                        }
+                        crate::ToolItemEvent::Backgrounded => {
+                            if owner.kind != ItemKind::CommandExecution
+                                || !owner.executing
+                                || owner.completion.is_some()
+                            {
+                                return Err(invalid());
+                            }
+                            owner.background = true;
+                        }
+                        crate::ToolItemEvent::DescriptorUpdated(_)
+                        | crate::ToolItemEvent::TitleChanged(_)
+                        | crate::ToolItemEvent::Input(_)
+                        | crate::ToolItemEvent::Output(_)
+                        | crate::ToolItemEvent::Changes(_) => {}
+                    }
+                }
+                crate::ItemEvent::Completed(completion) => {
+                    let owner = ownership.items.get_mut(item_id).ok_or_else(invalid)?;
+                    if owner.thread_id != *thread_id || owner.turn_id != *turn_id {
+                        return Err(invalid());
+                    }
+                    let kind = match completion {
+                        crate::ItemCompletion::UserMessage(_) => ItemKind::UserMessage,
+                        crate::ItemCompletion::AgentMessage(_) => ItemKind::AgentMessage,
+                        crate::ItemCompletion::Reasoning(_) => ItemKind::Reasoning,
+                        crate::ItemCompletion::CommandExecution(_) => ItemKind::CommandExecution,
+                        crate::ItemCompletion::FileChange(_) => ItemKind::FileChange,
+                        crate::ItemCompletion::ToolCall(_) => ItemKind::ToolCall,
+                    };
+                    if owner.kind != kind {
+                        return Err(invalid());
+                    }
+                    let encoded =
+                        serde_json::to_vec(completion).map_err(EventDeliveryError::transport)?;
+                    match &owner.completion {
+                        Some(previous) if previous != &encoded => return Err(invalid()),
+                        Some(_) => admission = ObservationAdmission::IdenticalReplay,
+                        None => {
+                            if turn_completed && !owner.background {
+                                return Err(retired());
+                            }
+                            owner.completion = Some(encoded);
+                        }
+                    }
+                }
+            }
+            if admission == ObservationAdmission::IdenticalReplay {
+                ownership.identical_replays += 1;
+            }
+        }
+        Ok(admission)
+    }
+
+    async fn send_wait(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
+        self.validate_scope(&event)
+            .inspect_err(|error| self.fail(error.clone()))?;
         for observer in &self.observer {
             observer
                 .before_delivery(&event)
                 .inspect_err(|error| self.fail(error.clone()))?;
-            additional.extend(
-                observer
-                    .additional_events(&event)
-                    .inspect_err(|error| self.fail(error.clone()))?,
-            );
         }
-        self.send_encoded(event).await?;
-        for event in additional {
-            self.send_encoded(event).await?;
+        let _delivery = self.delivery.lock().await;
+        let admission = self
+            .validate(&event)
+            .inspect_err(|error| self.fail(error.clone()))?;
+        if admission == ObservationAdmission::IdenticalReplay {
+            return Ok(());
         }
-        Ok(settlement)
+        self.send_encoded(event)
+            .await
+            .inspect_err(|error| self.fail(error.clone()))?;
+        Ok(())
     }
 
     /// Encode and publish an event under the shared delivery lock before advancing its watermark.
@@ -345,6 +787,19 @@ impl ProviderEventSink {
                     .map_err(EventDeliveryError::queue)?;
             }
         }
+        if let ProviderEvent::Turn {
+            thread_id,
+            turn_id,
+            event: crate::TurnEvent::Completed(_),
+            ..
+        } = &event.event
+        {
+            self.ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completed_turns
+                .insert((thread_id.clone(), turn_id.clone()));
+        }
         self.published
             .store(event.sequence.get(), std::sync::atomic::Ordering::Release);
         Ok(())
@@ -362,29 +817,28 @@ impl ProviderEventSink {
     }
 
     /// Deliver a native event and its host observations without waiting for channel capacity.
-    pub fn send(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
-        self.validate(&event)?;
+    fn send(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
+        self.validate_scope(&event)
+            .inspect_err(|error| self.fail(error.clone()))?;
         let _delivery = self.delivery.try_lock().map_err(|_| {
             let error =
                 EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow);
             self.fail(error.clone());
             error
         })?;
+        let admission = self
+            .validate(&event)
+            .inspect_err(|error| self.fail(error.clone()))?;
+        if admission == ObservationAdmission::IdenticalReplay {
+            return Ok(());
+        }
         for observer in &self.observer {
             observer
                 .before_delivery(&event)
                 .inspect_err(|error| self.fail(error.clone()))?;
         }
-        let mut additional = Vec::new();
-        for observer in &self.observer {
-            additional.extend(observer.additional_events(&event).inspect_err(|error| {
-                self.fail(error.clone());
-            })?);
-        }
-        self.send_immediate(event)?;
-        for event in additional {
-            self.send_immediate(event)?;
-        }
+        self.send_immediate(event)
+            .inspect_err(|error| self.fail(error.clone()))?;
         Ok(())
     }
 
@@ -396,6 +850,13 @@ impl ProviderEventSink {
             .get_or_insert(error.clone());
         self.sender
             .record_failure(&io::Error::other(error.to_string()));
+        let changed = self
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolution_changed
+            .clone();
+        changed.notify_waiters();
     }
 
     pub async fn failed(&self) -> EventDeliveryError {
@@ -550,6 +1011,14 @@ impl EventReceiver {
 }
 
 impl ProviderEventStream {
+    /// Create a read-only view of original turn registrations that outlives this receiver.
+    pub fn registrations(&self) -> TurnRegistrationReader {
+        TurnRegistrationReader {
+            ownership: self.ownership.clone(),
+            published: self.published.clone(),
+            failure: self.input.failure.clone(),
+        }
+    }
     /// Get the exact live generation whose events this stream consumes.
     pub fn binding_id(&self) -> &BindingId {
         &self.binding_id
@@ -636,14 +1105,35 @@ impl ProviderEventStream {
 }
 
 fn batchable(event: &ProviderEvent) -> bool {
-    event.message_delta().is_some() || event.tool_output_delta().is_some()
+    output_text(event).is_some()
+}
+
+fn output_text(event: &ProviderEvent) -> Option<&str> {
+    match event {
+        ProviderEvent::Item {
+            event:
+                crate::message::ItemEvent::Message {
+                    event: crate::message::MessageItemEvent::Delta(text),
+                },
+            ..
+        }
+        | ProviderEvent::Item {
+            event:
+                crate::message::ItemEvent::Tool {
+                    event: crate::tool::ToolItemEvent::Output(TextUpdate::Append(text)),
+                },
+            ..
+        } => Some(text),
+        ProviderEvent::Provider { .. }
+        | ProviderEvent::Thread { .. }
+        | ProviderEvent::Turn { .. }
+        | ProviderEvent::Item { .. }
+        | ProviderEvent::Agent { .. } => None,
+    }
 }
 
 fn output_bytes(event: &ProviderEvent) -> usize {
-    event
-        .message_delta()
-        .or_else(|| event.tool_output_delta())
-        .map_or(0, str::len)
+    output_text(event).map_or(0, str::len)
 }
 
 fn merge_output(pending: &mut ProviderEvent, event: &ProviderEvent) -> bool {
@@ -652,34 +1142,45 @@ fn merge_output(pending: &mut ProviderEvent, event: &ProviderEvent) -> bool {
     }
     match (pending, event) {
         (
-            ProviderEvent::Message {
-                address: previous_address,
-                update: MessageUpdate::Delta { text: previous },
-            },
-            ProviderEvent::Message {
-                address,
-                update: MessageUpdate::Delta { text },
-            },
-        ) if previous_address == address => {
-            previous.push_str(text);
-            true
-        }
-        (
-            ProviderEvent::Tool {
-                address: previous_address,
-                update:
-                    ToolUpdate::Output {
-                        update: TextUpdate::Append(previous),
+            ProviderEvent::Item {
+                thread_id: prior_thread,
+                turn_id: prior_turn,
+                item_id: prior_item,
+                event:
+                    crate::message::ItemEvent::Message {
+                        event: crate::message::MessageItemEvent::Delta(previous),
                     },
             },
-            ProviderEvent::Tool {
-                address,
-                update:
-                    ToolUpdate::Output {
-                        update: TextUpdate::Append(text),
+            ProviderEvent::Item {
+                thread_id,
+                turn_id,
+                item_id,
+                event:
+                    crate::message::ItemEvent::Message {
+                        event: crate::message::MessageItemEvent::Delta(text),
                     },
             },
-        ) if previous_address == address => {
+        )
+        | (
+            ProviderEvent::Item {
+                thread_id: prior_thread,
+                turn_id: prior_turn,
+                item_id: prior_item,
+                event:
+                    crate::message::ItemEvent::Tool {
+                        event: crate::tool::ToolItemEvent::Output(TextUpdate::Append(previous)),
+                    },
+            },
+            ProviderEvent::Item {
+                thread_id,
+                turn_id,
+                item_id,
+                event:
+                    crate::message::ItemEvent::Tool {
+                        event: crate::tool::ToolItemEvent::Output(TextUpdate::Append(text)),
+                    },
+            },
+        ) if prior_thread == thread_id && prior_turn == turn_id && prior_item == item_id => {
             previous.push_str(text);
             true
         }
@@ -700,507 +1201,891 @@ pub trait EventObserver: Send + Sync {
     fn before_delivery(&self, _event: &ProviderEvent) -> Result<(), EventDeliveryError> {
         Ok(())
     }
+}
 
-    /// Produce host observations immediately after the event on the same delivery channel.
-    fn additional_events(
+/// Read immutable native turn registrations independently of the sole event receiver.
+#[derive(Clone)]
+pub struct TurnRegistrationReader {
+    ownership: std::sync::Arc<std::sync::Mutex<ActivityOwnership>>,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
+}
+
+impl TurnRegistrationReader {
+    /// Get the native publication boundary preceding an ownership callback's proof lookup.
+    pub fn watermark(&self) -> crate::EventSequence {
+        crate::EventSequence::new(self.published.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Get an exact registered thread's owner without selecting an active or visible turn.
+    pub fn thread_owner(&self, thread_id: &crate::ThreadId) -> Option<crate::ThreadOwner> {
+        let ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut owners = ownership
+            .registered_turns
+            .values()
+            .filter(|address| &address.thread_id == thread_id)
+            .map(|address| &address.scope.owner);
+        let original = owners.next()?;
+        owners
+            .all(|owner| owner == original)
+            .then(|| original.clone())
+    }
+
+    /// Get a definitive no-start operation error retained after successful native collection.
+    pub fn not_started_error(&self, turn_id: &crate::TurnId) -> Option<ProviderError> {
+        self.ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .not_started
+            .get(turn_id)
+            .cloned()
+    }
+
+    /// Observe the original runner's start or collected no-start result after an operation waiter expires.
+    pub async fn start_result(&self, turn_id: &crate::TurnId) -> Result<(), ProviderError> {
+        let changed = {
+            let ownership = self
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !ownership.registered_turns.contains_key(turn_id) {
+                return Err(crate::ProviderFailure::new(
+                    crate::ProviderOperation::TurnStart,
+                    crate::ProviderFailureKind::WrongInvocation,
+                )
+                .into());
+            }
+            ownership.resolution_changed.clone()
+        };
+        loop {
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let ownership = self
+                    .ownership
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(error) = ownership.not_started.get(turn_id) {
+                    return Err(error.clone());
+                }
+                if let Some(address) = ownership.registered_turns.get(turn_id)
+                    && ownership
+                        .started_turns
+                        .contains(&(address.thread_id.clone(), address.turn_id.clone()))
+                {
+                    return Ok(());
+                }
+            }
+            if let Some(error) = self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(error.into());
+            }
+            notified.await;
+        }
+    }
+
+    /// Get the original registered owner without substituting a current or visible turn.
+    pub fn registered_turn(&self, turn_id: &crate::TurnId) -> Option<crate::TurnAddress> {
+        self.ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registered_turns
+            .get(turn_id)
+            .cloned()
+    }
+}
+
+/// Publish native activity without access to turn completion or host notifications.
+///
+/// Completion cannot cross the activity writer's publication boundary:
+/// ```compile_fail
+/// use forge_provider_api::{AdapterActivityWriter, CompletedTurn, ProviderEvent, ThreadId, TurnId, TurnEvent};
+/// fn finish(writer: &AdapterActivityWriter, thread_id: ThreadId, turn_id: TurnId, completed: CompletedTurn) {
+///     writer.send(ProviderEvent::Turn { thread_id, turn_id, event: TurnEvent::Completed(completed) }).unwrap();
+/// }
+/// ```
+/// Distinct ID categories cannot be exchanged:
+/// ```compile_fail
+/// use forge_provider_api::{AdapterActivity, ThreadId, TurnId, TurnMetadataEvent, ProviderFailure};
+/// fn swapped(thread_id: ThreadId, turn_id: TurnId, error: ProviderFailure) {
+///     let _ = AdapterActivity::Turn { thread_id: turn_id, turn_id: thread_id, event: TurnMetadataEvent::Error { error } };
+/// }
+/// ```
+#[derive(Clone)]
+pub struct AdapterActivityWriter {
+    sink: ProviderEventSink,
+}
+
+impl AdapterActivityWriter {
+    /// Get the original provider binding.
+    pub fn binding_id(&self) -> &BindingId {
+        self.sink.binding_id()
+    }
+    /// Get the retained host authority of this writer.
+    pub fn scope(&self) -> &EventScope {
+        self.sink.scope()
+    }
+    /// Reject callbacks after the original binding has failed or lost its event reader.
+    pub fn check(&self) -> Result<(), EventDeliveryError> {
+        self.sink.check()
+    }
+
+    /// Get the original admitted scope for turn-owned callbacks.
+    pub fn invocation_scope(&self) -> Result<&InvocationScope, ProviderError> {
+        self.sink.invocation_scope()
+    }
+    /// Get the final successfully published event position.
+    pub fn watermark(&self) -> crate::EventSequence {
+        self.sink.watermark()
+    }
+    /// Bind connection observations to one original admitted turn.
+    pub fn invocation_writer(&self, scope: &InvocationScope) -> Result<Self, EventDeliveryError> {
+        Ok(Self {
+            sink: self.sink.invocation_sink(scope)?,
+        })
+    }
+    /// Bind explicitly observed child activity to its immutable native ownership.
+    pub fn register_observed_turn(
         &self,
-        _event: &ProviderEvent,
-    ) -> Result<Vec<ProviderEvent>, EventDeliveryError> {
-        Ok(Vec::new())
+        address: crate::TurnAddress,
+    ) -> Result<Self, EventDeliveryError> {
+        if address.scope.owner.session_id() != self.sink.scope.owner().session_id()
+            || address.thread_id != address.scope.owner.thread_id()
+            || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
+        {
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::OwnershipConflict,
+            ));
+        }
+        self.sink.register_turn(&address)?;
+        Ok(Self {
+            sink: ProviderEventSink {
+                scope: address.scope.into(),
+                ..self.sink.clone()
+            },
+        })
+    }
+    /// Publish permitted activity while waiting for bounded transport capacity.
+    pub async fn send_wait(
+        &self,
+        activity: crate::AdapterActivity,
+    ) -> Result<(), EventDeliveryError> {
+        self.sink
+            .validate_scope(&ProviderEvent::from(activity.clone()))
+            .inspect_err(|error| self.sink.fail(error.clone()))?;
+        let activity = self.retain_prestart_model(activity);
+        match activity {
+            Some(activity) => self.sink.send_wait(activity.into()).await,
+            None => Ok(()),
+        }
+    }
+    /// Publish permitted activity without waiting for bounded capacity.
+    pub fn send(&self, activity: crate::AdapterActivity) -> Result<(), EventDeliveryError> {
+        self.sink
+            .validate_scope(&ProviderEvent::from(activity.clone()))
+            .inspect_err(|error| self.sink.fail(error.clone()))?;
+        let activity = self.retain_prestart_model(activity);
+        match activity {
+            Some(activity) => self.sink.send(activity.into()),
+            None => Ok(()),
+        }
+    }
+    /// Retain only positively correlated model metadata until its native turn has started.
+    fn retain_prestart_model(
+        &self,
+        activity: crate::AdapterActivity,
+    ) -> Option<crate::AdapterActivity> {
+        if let crate::AdapterActivity::Turn {
+            thread_id,
+            turn_id,
+            event: crate::TurnMetadataEvent::ModelResolved(model),
+        } = activity
+        {
+            let mut ownership = self
+                .sink
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (thread_id.clone(), turn_id.clone());
+            if !ownership.started_turns.contains(&key) {
+                ownership.pending_models.entry(key).or_default().push(model);
+                return None;
+            }
+            return Some(crate::AdapterActivity::Turn {
+                thread_id,
+                turn_id,
+                event: crate::TurnMetadataEvent::ModelResolved(model),
+            });
+        }
+        Some(activity)
+    }
+    /// Record the first observation failure independently of transport capacity.
+    pub fn fail(&self, error: EventDeliveryError) {
+        self.sink.fail(error);
+    }
+    /// Await the first retained observation failure.
+    pub async fn failed(&self) -> EventDeliveryError {
+        self.sink.failed().await
+    }
+}
+
+/// Own lifecycle publication for one retained shared turn runner.
+pub(crate) struct TurnPublisher {
+    sink: ProviderEventSink,
+    address: crate::TurnAddress,
+    started: std::sync::Arc<tokio::sync::Mutex<Option<i64>>>,
+    started_changed: std::sync::Arc<tokio::sync::Notify>,
+    observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Announce positively attributed native start without granting completion authority.
+#[derive(Clone)]
+pub struct NativeTurnStart {
+    sink: ProviderEventSink,
+    address: crate::TurnAddress,
+    started: std::sync::Arc<tokio::sync::Mutex<Option<i64>>>,
+    started_changed: std::sync::Arc<tokio::sync::Notify>,
+    observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TurnPublisher {
+    /// Create the adapter's restricted positive-start capability.
+    pub(crate) fn start_handle(&self) -> NativeTurnStart {
+        NativeTurnStart {
+            sink: self.sink.clone(),
+            address: self.address.clone(),
+            started: self.started.clone(),
+            started_changed: self.started_changed.clone(),
+            observed: self.observed.clone(),
+        }
+    }
+    /// Check whether positively attributed native work began.
+    pub(crate) async fn has_started(&self) -> bool {
+        self.observed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Seal foreground activity at the native boundary before resource collection can wait.
+    pub(crate) async fn native_ended(&self) {
+        let _delivery = self.sink.delivery.lock().await;
+        self.sink
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended_turns
+            .insert((self.address.thread_id.clone(), self.address.turn_id.clone()));
+    }
+
+    /// Publish one collected native result without changing its outcome.
+    pub(crate) async fn completed(
+        self,
+        result: crate::TurnResult,
+        collected_at_ms: i64,
+    ) -> Result<crate::CompletedTurn, ProviderError> {
+        let valid_timestamp = self
+            .started
+            .lock()
+            .await
+            .is_some_and(|started| result.completed_at_ms() >= started);
+        if !self.has_started().await || !valid_timestamp {
+            let failure = crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::Protocol,
+            )
+            .at_phase(
+                crate::ProviderPhase::Observation,
+                crate::FailureDisposition::Invalidated,
+            );
+            self.sink.unavailable(failure).await;
+            return Err(failure.into());
+        }
+        let completed = crate::CompletedTurn::new(result, collected_at_ms);
+        self.sink
+            .send_wait(ProviderEvent::Turn {
+                thread_id: self.address.thread_id,
+                turn_id: self.address.turn_id,
+                event: crate::TurnEvent::Completed(completed.clone()),
+            })
+            .await?;
+        Ok(completed)
+    }
+    /// Retain a collected no-start operation error without constructing native turn completion.
+    pub(crate) fn not_started(self, error: ProviderError) {
+        if self.observed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let changed = {
+            let mut ownership = self
+                .sink
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ownership
+                .pending_models
+                .remove(&(self.address.thread_id, self.address.turn_id.clone()));
+            ownership
+                .not_started
+                .entry(self.address.turn_id)
+                .or_insert(error);
+            ownership.resolution_changed.clone()
+        };
+        changed.notify_waiters();
+    }
+
+    /// Fence the original connection while preserving the operation's first failure.
+    pub(crate) async fn unavailable(&self, failure: crate::ProviderFailure) {
+        self.sink.unavailable(failure).await;
+    }
+}
+
+impl NativeTurnStart {
+    /// Get whether positive native start has crossed its ordered publication boundary.
+    pub fn is_observed(&self) -> bool {
+        self.observed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait for positive native start without changing input acceptance or owning cancellation.
+    pub async fn wait_observed(&self) {
+        loop {
+            let changed = self.started_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_observed() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Publish the first positive start once, preserving its original native timestamp.
+    pub async fn observed(&self, started_at_ms: i64) -> Result<(), ProviderError> {
+        let mut started = self.started.lock().await;
+        if started.is_some() {
+            return Ok(());
+        }
+        let _delivery = self.sink.delivery.lock().await;
+        let event = ProviderEvent::Turn {
+            thread_id: self.address.thread_id.clone(),
+            turn_id: self.address.turn_id.clone(),
+            event: crate::TurnEvent::Started(crate::turn::TurnStarted { started_at_ms }),
+        };
+        self.sink.validate(&event)?;
+        for observer in &self.sink.observer {
+            observer.before_delivery(&event)?;
+        }
+        self.sink
+            .send_encoded(event)
+            .await
+            .inspect_err(|error| self.sink.fail(error.clone()))?;
+        *started = Some(started_at_ms);
+        self.observed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.started_changed.notify_waiters();
+        let (pending_model, resolution_changed) = {
+            let mut ownership = self
+                .sink
+                .ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (self.address.thread_id.clone(), self.address.turn_id.clone());
+            ownership.started_turns.insert(key.clone());
+            let pending = ownership.pending_models.remove(&key);
+            (pending, ownership.resolution_changed.clone())
+        };
+        resolution_changed.notify_waiters();
+        for model in pending_model.unwrap_or_default() {
+            let event = ProviderEvent::Turn {
+                thread_id: self.address.thread_id.clone(),
+                turn_id: self.address.turn_id.clone(),
+                event: crate::TurnEvent::ModelResolved(model),
+            };
+            for observer in &self.sink.observer {
+                observer.before_delivery(&event)?;
+            }
+            self.sink
+                .send_encoded(event)
+                .await
+                .inspect_err(|error| self.sink.fail(error.clone()))?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BindingId, ExecutionOwner, MessageAddress, MessageId, TurnAddress};
-    use serde_json::json;
+    use crate::{AdapterActivity, ThreadOwner, TurnAddress, TurnEvent, TurnMetadataEvent};
 
-    struct Observer {
-        fail: bool,
+    /// Create one exact host registration before native dispatch.
+    fn fixture() -> (ProviderEventSink, ProviderEventStream, TurnAddress) {
+        let scope = InvocationScope::new(ThreadOwner::root("owner"), "exchange");
+        let address = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope: scope.clone(),
+        };
+        let binding = BindingId::new("binding").unwrap();
+        let (sink, stream) = channel(binding, scope);
+        (sink, stream, address)
     }
 
-    impl EventObserver for Observer {
-        fn additional_events(
-            &self,
-            event: &ProviderEvent,
-        ) -> Result<Vec<ProviderEvent>, EventDeliveryError> {
-            if self.fail {
-                return Err(EventDeliveryError::transport("observer failed"));
-            }
-            Ok(vec![ProviderEvent::Runtime {
-                scope: event.scope().invocation().unwrap().clone(),
-                update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
-            }])
-        }
-    }
-
-    /// A sticky native failure follows already accepted output and retains its classification.
+    /// Reject contradictory nested compaction ownership before observers or transport mutation.
     #[tokio::test]
-    async fn queued_output_precedes_typed_observation_failure() -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.send_wait(message(
-            "answer",
-            MessageUpdate::Delta {
-                text: "accepted".into(),
+    async fn compaction_payload_must_match_its_original_normalized_thread() {
+        for inner in ["native-unmapped-thread", "foreign-normalized-thread"] {
+            let (sink, mut stream, address) = fixture();
+            let event = AdapterActivity::Thread {
+                thread_id: address.thread_id.clone(),
+                event: crate::ThreadEvent::CompactionUpdated(Box::new(crate::Compaction {
+                    id: "compaction".into(),
+                    thread_id: inner.into(),
+                    state: crate::CompactionState::Running,
+                    manual: false,
+                    started_at_ms: Some(1),
+                    completed_at_ms: None,
+                    result: Default::default(),
+                })),
+            };
+            assert!(matches!(
+                sink.activity_writer().send_wait(event).await,
+                Err(EventDeliveryError::Observation(
+                    crate::ObservationFailure::OwnershipConflict
+                ))
+            ));
+            assert_eq!(sink.watermark().get(), 0);
+            assert!(matches!(
+                stream.try_next(),
+                Err(EventDeliveryError::Observation(
+                    crate::ObservationFailure::OwnershipConflict
+                ))
+            ));
+        }
+        let (sink, mut stream, address) = fixture();
+        sink.activity_writer()
+            .send_wait(AdapterActivity::Thread {
+                thread_id: address.thread_id.clone(),
+                event: crate::ThreadEvent::CompactionUpdated(Box::new(crate::Compaction {
+                    id: "compaction".into(),
+                    thread_id: address.thread_id.as_str().to_owned(),
+                    state: crate::CompactionState::Running,
+                    manual: false,
+                    started_at_ms: Some(1),
+                    completed_at_ms: None,
+                    result: Default::default(),
+                })),
+            })
+            .await
+            .unwrap();
+        let delivered = stream.recv().await.unwrap().unwrap();
+        assert_eq!(&delivered.binding_id, sink.binding_id());
+        assert_eq!(delivered.sequence.get(), 1);
+        assert!(matches!(delivered.event, ProviderEvent::Thread {
+            thread_id, event: crate::ThreadEvent::CompactionUpdated(compaction)
+        } if thread_id == address.thread_id && compaction.thread_id == thread_id.as_str()));
+    }
+
+    /// Capability changes retain the connection owner and the same ordered binding envelope.
+    #[tokio::test]
+    async fn capability_changes_retain_original_binding_source() {
+        let (sink, mut stream, _) = fixture();
+        sink.capabilities_changed(crate::CapabilityManifest::from_descriptor(
+            crate::ProviderDescriptor {
+                kind: crate::ProviderId::new("test-provider").unwrap(),
+                label: "Test provider".into(),
+                capability: Default::default(),
             },
         ))
-        .await?;
-        sink.fail(EventDeliveryError::Observation(
-            crate::lifecycle::ObservationFailure::Overflow,
-        ));
-        sink.fail(EventDeliveryError::Observation(
-            crate::lifecycle::ObservationFailure::Disconnected,
-        ));
-        assert!(
-            matches!(stream.recv().await?, Some(super::BoundProviderEvent { event: ProviderEvent::Message {
-            update: MessageUpdate::Delta { text }, ..
-        }, .. }) if text == "accepted")
-        );
+        .await
+        .unwrap();
+        let delivered = stream.recv().await.unwrap().unwrap();
+        assert_eq!(&delivered.binding_id, sink.binding_id());
+        assert_eq!(delivered.sequence, sink.watermark());
         assert!(matches!(
-            stream.recv().await,
-            Err(EventDeliveryError::Observation(
-                crate::lifecycle::ObservationFailure::Overflow
-            ))
+            delivered.event,
+            ProviderEvent::Provider {
+                event: crate::ProviderConnectionEvent::CapabilitiesChanged(_)
+            }
         ));
-        assert!(matches!(
-            sink.failed().await,
-            EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow)
-        ));
-        Ok(())
     }
 
-    /// Preserve emitted watermark evidence when output batching combines many stream positions.
+    /// Buffer pre-start native model evidence and publish it immediately after positive start.
     #[tokio::test]
-    async fn batched_events_preserve_published_watermark_and_lifecycle_barriers()
-    -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(binding(), scope());
-        assert_eq!(sink.watermark(), crate::EventSequence::new(0));
-        sink.send_wait(message("one", MessageUpdate::Delta { text: "a".into() }))
-            .await?;
-        let sibling = sink.clone();
-        sibling
-            .send_wait(message("one", MessageUpdate::Delta { text: "b".into() }))
-            .await?;
-        sink.send_wait(ProviderEvent::Runtime {
-            scope: scope(),
-            update: crate::RuntimeUpdate::ForegroundIdle,
-        })
-        .await?;
-        assert_eq!(sink.watermark(), crate::EventSequence::new(3));
-        let output = stream.recv().await?.unwrap();
-        assert_eq!(output.sequence, crate::EventSequence::new(2));
-        assert_eq!(output.event.message_delta(), Some("ab"));
-        let barrier = stream.recv().await?.unwrap();
-        assert_eq!(barrier.sequence, sink.watermark());
+    async fn model_waits_for_positive_start_and_preserves_publication_order() {
+        let (sink, mut stream, address) = fixture();
+        let publisher = sink.turn_publisher(address.clone()).unwrap();
+        sink.activity_writer()
+            .send_wait(AdapterActivity::Turn {
+                thread_id: address.thread_id,
+                turn_id: address.turn_id,
+                event: TurnMetadataEvent::ModelResolved(crate::ResolvedModel {
+                    model_id: crate::ModelId::new("confirmed").unwrap(),
+                    observed_at_ms: 7,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(sink.watermark().get(), 0);
+        publisher.start_handle().observed(8).await.unwrap();
         assert!(matches!(
-            barrier.event,
-            ProviderEvent::Runtime {
-                update: crate::RuntimeUpdate::ForegroundIdle,
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Turn {
+                event: TurnEvent::Started(crate::turn::TurnStarted { started_at_ms: 8 }),
                 ..
             }
         ));
-        Ok(())
-    }
-
-    /// Correlate the settlement result with its actual envelope under concurrent publication.
-    #[tokio::test]
-    async fn settlement_receipt_matches_envelope_under_concurrent_publication() -> anyhow::Result<()>
-    {
-        let (sink, mut stream) = channel(binding(), scope());
-        let publishing = async {
-            for received_bytes in 0..8 {
-                sink.send_wait(ProviderEvent::Runtime {
-                    scope: scope(),
-                    update: crate::RuntimeUpdate::Progress { received_bytes },
-                })
-                .await?;
-            }
-            Ok::<(), EventDeliveryError>(())
-        };
-        let settlement = crate::InvocationSettlement {
-            binding_id: binding(),
-            scope: scope(),
-            result: crate::ExecutionResult::Completed {
-                completion: crate::completion::ProviderCompletion::default().into(),
-            },
-            watermark: crate::EventSequence::default(),
-        };
-        let (published, receipt) = tokio::join!(publishing, sink.send_settlement(settlement));
-        published?;
-        let receipt = receipt?;
-        let mut observed = None;
-        for _ in 0..9 {
-            let envelope = stream
-                .recv()
-                .await?
-                .expect("all nine envelopes were published");
-            if let ProviderEvent::Settled { settlement } = envelope.event {
-                assert_eq!(settlement.watermark, envelope.sequence);
-                observed = Some(settlement.watermark);
-            }
-        }
-        assert_eq!(observed, Some(receipt.watermark));
-        Ok(())
-    }
-
-    /// Rebind host output only within one exchange while keeping native invocation sinks immutable.
-    #[test]
-    fn successor_output_scope_rejects_same_invocation_and_other_exchanges() {
-        let original = scope();
-        let (sink, _stream) = channel(binding(), original.clone());
-        assert!(sink.successor_invocation_sink(&original).is_err());
-        let mut successor = original.clone();
-        successor.invocation_id = "successor".into();
-        assert!(sink.successor_invocation_sink(&successor).is_ok());
-        assert!(sink.invocation_sink(&successor).is_err());
-        successor.exchange_id = "unrelated".into();
-        assert!(sink.successor_invocation_sink(&successor).is_err());
-    }
-
-    /// Reject a missing normalized event instead of satisfying a lifecycle watermark falsely.
-    #[tokio::test]
-    async fn sequence_gap_is_observation_failure_before_owner_consumption() {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.sender
-            .send(BoundProviderEvent {
-                binding_id: binding(),
-                sequence: crate::EventSequence::new(2),
-                event: message(
-                    "missing-first",
-                    MessageUpdate::Delta {
-                        text: "unsafe".into(),
-                    },
-                ),
-            })
-            .unwrap();
         assert!(matches!(
-            stream.recv().await,
-            Err(EventDeliveryError::Observation(
-                crate::ObservationFailure::Protocol
-            ))
-        ));
-    }
-
-    /// Preserve host observations immediately after their native event on the same channel.
-    #[tokio::test]
-    async fn host_observer_preserves_native_event_order() -> anyhow::Result<()> {
-        for synchronous in [false, true] {
-            let (sink, mut stream) = channel(binding(), scope());
-            let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: false }));
-            let event = message(
-                "observed",
-                MessageUpdate::Delta {
-                    text: "text".into(),
-                },
-            );
-            if synchronous {
-                sink.send(event)?;
-            } else {
-                sink.send_wait(event).await?;
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Turn {
+                event: TurnEvent::ModelResolved(_),
+                ..
             }
-            assert!(matches!(
-                stream.try_next()?,
-                Some(super::BoundProviderEvent {
-                    event: ProviderEvent::Message { .. },
-                    ..
-                })
-            ));
-            assert!(matches!(
-                stream.try_next()?,
-                Some(super::BoundProviderEvent {
-                    event: ProviderEvent::Runtime {
-                        update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
-                        ..
-                    },
-                    ..
-                })
-            ));
-        }
-        Ok(())
-    }
-
-    /// Fail the delivery channel when a host observer cannot produce required observations.
-    #[tokio::test]
-    async fn host_observer_failure_reaches_event_consumers() {
-        for synchronous in [false, true] {
-            let (sink, stream) = channel(binding(), scope());
-            let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: true }));
-            let event = message(
-                "observed",
-                MessageUpdate::Delta {
-                    text: "text".into(),
-                },
-            );
-            let result = if synchronous {
-                sink.send(event)
-            } else {
-                sink.send_wait(event).await
-            };
-            assert!(result.is_err());
-            assert!(stream.check().is_err());
-        }
-    }
-
-    /// Preserve the accepted prefix and wake consumers when synchronous delivery cannot remain ordered.
-    #[tokio::test]
-    async fn synchronous_send_contention_reports_typed_observation_loss() -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.send(message(
-            "accepted",
-            MessageUpdate::Delta {
-                text: "prefix".into(),
-            },
-        ))?;
-        let delivery = sink.delivery.lock().await;
-        assert!(matches!(
-            sink.send(message(
-                "lost",
-                MessageUpdate::Delta {
-                    text: "lost".into()
-                }
-            )),
-            Err(EventDeliveryError::Observation(
-                crate::lifecycle::ObservationFailure::Overflow
-            ))
         ));
-        drop(delivery);
+        publisher.start_handle().observed(9).await.unwrap();
+        assert_eq!(sink.watermark().get(), 2);
+    }
+
+    /// Reject an otherwise well-typed model observation belonging to another turn before buffering it.
+    #[tokio::test]
+    async fn foreign_turn_is_rejected_before_prestart_model_buffering() {
+        let (sink, _stream, address) = fixture();
         assert!(
-            matches!(stream.recv().await?, Some(super::BoundProviderEvent { event: ProviderEvent::Message {
-            update: MessageUpdate::Delta { text }, ..
-        }, .. }) if text == "prefix")
+            sink.activity_writer()
+                .send_wait(AdapterActivity::Turn {
+                    thread_id: address.thread_id,
+                    turn_id: crate::TurnId::new("foreign").unwrap(),
+                    event: TurnMetadataEvent::ModelResolved(crate::ResolvedModel {
+                        model_id: crate::ModelId::new("confirmed").unwrap(),
+                        observed_at_ms: 7,
+                    })
+                })
+                .await
+                .is_err()
         );
-        assert!(matches!(
-            stream.recv().await,
-            Err(EventDeliveryError::Observation(
-                crate::lifecycle::ObservationFailure::Overflow
-            ))
-        ));
-        assert!(matches!(
-            sink.failed().await,
-            EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow)
-        ));
-        Ok(())
+        assert!(sink.ownership.lock().unwrap().pending_models.is_empty());
     }
 
-    fn scope() -> InvocationScope {
-        InvocationScope {
-            owner: ExecutionOwner::root("session"),
-            exchange_id: "exchange".into(),
-            invocation_id: "invocation".into(),
-        }
-    }
-
-    fn binding() -> BindingId {
-        BindingId::new("binding").unwrap()
-    }
-
-    fn message(id: &str, update: MessageUpdate) -> ProviderEvent {
-        ProviderEvent::Message {
-            address: MessageAddress {
-                turn: TurnAddress {
-                    scope: scope(),
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                },
-                message_id: MessageId::Native(id.into()),
-            },
-            update,
-        }
-    }
-
-    /// Keep retained delivery inside its session and preserve exact invocation validation.
+    /// Keep item type and original turn immutable across independently scoped publishers.
     #[tokio::test]
-    async fn session_observer_rebinds_only_its_owned_invocations() -> anyhow::Result<()> {
-        let original = scope();
-        let (session_sink, mut stream) = channel(
-            binding(),
-            EventScope::Binding {
-                owner: original.owner.clone(),
-            },
-        );
-        let retained_sink = session_sink.invocation_sink(&original)?;
-        let update = message(
-            "retained",
-            MessageUpdate::Delta {
-                text: "original invocation".into(),
-            },
-        );
-        retained_sink.send_wait(update).await?;
-        let received = stream.recv().await?.expect("retained event was sent");
-        assert_eq!(received.event.scope(), EventScope::from(original.clone()));
-
-        let mut later = original.clone();
-        later.invocation_id = "later-invocation".into();
-        later.exchange_id = "later-exchange".into();
-        assert!(retained_sink.invocation_sink(&later).is_err());
-        let later_sink = session_sink.invocation_sink(&later)?;
-        assert!(later_sink.validate(&received.event).is_err());
-
-        let mut sibling = original.clone();
-        sibling.owner.agent_id = "another-agent".into();
-        assert!(session_sink.invocation_sink(&sibling).is_err());
-        let mut foreign = original;
-        foreign.owner = ExecutionOwner::root("foreign-session");
-        assert!(session_sink.invocation_sink(&foreign).is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_transfer_reports_normalized_transport_failure() {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.sender
-            .send(json!({"forge_event_part": {
-                "sequence": 1, "part_count": 2, "total_bytes": 4, "payload": "ab"
-            }}))
+    async fn item_identity_cannot_move_to_another_turn_or_change_kind() {
+        let (sink, _stream, address) = fixture();
+        let item_id = crate::ItemId::new("original").unwrap();
+        let activity = |turn_id| AdapterActivity::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id,
+            item_id: item_id.clone(),
+            event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(crate::ReasoningStart {
+                text: "partial".into(),
+                kind: crate::ReasoningKind::Full,
+            })),
+        };
+        sink.activity_writer()
+            .send_wait(activity(address.turn_id))
+            .await
             .unwrap();
-        assert!(matches!(
-            stream.recv().await,
-            Err(EventDeliveryError::InvalidTransportData)
-        ));
-    }
-
-    #[tokio::test]
-    async fn closed_transfer_reports_progress_instead_of_generic_eof() {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.sender
-            .send(json!({"forge_event_part": {
-                "sequence": 0, "part_count": 2, "total_bytes": 4, "payload": "ab"
-            }}))
-            .unwrap();
-        drop(sink);
-        assert!(matches!(
-            stream.recv().await,
-            Err(EventDeliveryError::IncompleteTransfer {
-                received_parts: 1,
-                expected_parts: 2,
-                received_bytes: 2,
-                expected_bytes: 4,
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn foreign_invocation_scope_is_rejected_before_delivery() {
-        let (sink, mut stream) = channel(binding(), scope());
-        let mut foreign = scope();
-        foreign.invocation_id = "foreign".into();
-        let error = sink
-            .send_wait(ProviderEvent::Runtime {
-                scope: foreign,
-                update: crate::RuntimeUpdate::ForegroundIdle,
+        let successor = InvocationScope::new(address.scope.owner.clone(), "successor");
+        let sibling = ProviderEventSink {
+            scope: successor.clone().into(),
+            ..sink.clone()
+        };
+        assert!(
+            sibling
+                .activity_writer()
+                .send_wait(activity(successor.turn_id().unwrap()))
+                .await
+                .is_err()
+        );
+        let (sink, _fresh_stream, address) = fixture();
+        sink.activity_writer()
+            .send_wait(AdapterActivity::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: item_id.clone(),
+                event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(
+                    crate::ReasoningStart {
+                        text: "partial".into(),
+                        kind: crate::ReasoningKind::Full,
+                    },
+                )),
             })
             .await
-            .unwrap_err();
+            .unwrap();
+        assert!(
+            sink.activity_writer()
+                .send_wait(AdapterActivity::Item {
+                    thread_id: address.thread_id,
+                    turn_id: address.scope.turn_id().unwrap(),
+                    item_id,
+                    event: crate::ItemEvent::Completed(crate::ItemCompletion::AgentMessage(
+                        crate::MessageCompletion {
+                            text: "wrong".into(),
+                            outcome: crate::MessageOutcome::Completed
+                        }
+                    ))
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    /// Identical start and completion replays are acknowledged once; changed replays still fail.
+    #[tokio::test]
+    async fn identical_item_replay_is_acknowledged_without_republication() {
+        let (sink, mut stream, address) = fixture();
+        let item = |event| AdapterActivity::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: crate::ItemId::new("replayed").unwrap(),
+            event,
+        };
+        let start = || {
+            crate::ItemEvent::Started(crate::ItemStart::Reasoning(crate::ReasoningStart {
+                text: "partial".into(),
+                kind: crate::ReasoningKind::Full,
+            }))
+        };
+        let completion = |text: &str| {
+            crate::ItemEvent::Completed(crate::ItemCompletion::Reasoning(
+                crate::MessageCompletion {
+                    text: text.into(),
+                    outcome: crate::MessageOutcome::Completed,
+                },
+            ))
+        };
+        let writer = sink.activity_writer();
+        for event in [start(), start(), completion("final"), completion("final")] {
+            writer.send_wait(item(event)).await.unwrap();
+        }
+        assert_eq!(sink.identical_replay_count(), 2);
+        assert_eq!(sink.watermark().get(), 2);
         assert!(matches!(
-            error,
-            EventDeliveryError::OwnershipMismatch { .. }
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Item {
+                event: crate::ItemEvent::Started(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Item {
+                event: crate::ItemEvent::Completed(_),
+                ..
+            }
+        ));
+        assert!(writer.send_wait(item(completion("changed"))).await.is_err());
+    }
+
+    /// Drain accepted output before exposing the first retained stream failure.
+    #[tokio::test]
+    async fn unavailable_preserves_accepted_output_and_first_failure() {
+        let (sink, mut stream, address) = fixture();
+        let publisher = sink.turn_publisher(address).unwrap();
+        publisher.start_handle().observed(1).await.unwrap();
+        sink.fail(EventDeliveryError::Observation(
+            crate::ObservationFailure::Disconnected,
+        ));
+        publisher
+            .unavailable(crate::ProviderFailure::new(
+                crate::ProviderOperation::TurnStart,
+                crate::ProviderFailureKind::Runtime,
+            ))
+            .await;
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Turn {
+                event: TurnEvent::Started(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::Disconnected
+            ))
+        ));
+    }
+
+    /// Reject reversed native time without replacing it with the later host collection clock.
+    #[tokio::test]
+    async fn contradictory_native_completion_time_fences_without_a_certificate() {
+        let (sink, mut stream, address) = fixture();
+        let publisher = sink.turn_publisher(address).unwrap();
+        publisher.start_handle().observed(10).await.unwrap();
+        let result = crate::TurnResult::new(
+            crate::turn::TurnOutcome::Interrupted,
+            9,
+            None,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert!(publisher.completed(result, 20).await.is_err());
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Turn {
+                event: TurnEvent::Started(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap().event,
+            ProviderEvent::Provider {
+                event: crate::ProviderConnectionEvent::Unavailable(_),
+                ..
+            }
         ));
         assert!(stream.recv().await.is_err());
     }
 
+    /// New native foreground work after collection must fence its original connection.
     #[tokio::test]
-    async fn message_batches_preserve_message_phase_and_snapshot_barriers() {
-        let (sink, mut stream) = channel(binding(), scope());
-        let producer = async {
-            for _ in 0..100 {
-                sink.send_wait(message("one", MessageUpdate::Delta { text: "λ".into() }))
-                    .await
-                    .unwrap();
-            }
-            sink.send_wait(message(
-                "one",
-                MessageUpdate::Completed {
-                    text: "complete".into(),
-                },
-            ))
-            .await
-            .unwrap();
-            sink.send_wait(message(
-                "two",
-                MessageUpdate::Delta {
-                    text: "second".into(),
-                },
-            ))
-            .await
-            .unwrap();
-        };
-        let consumer = async {
-            assert_eq!(
-                stream.recv().await.unwrap().unwrap().event.message_delta(),
-                Some("λ".repeat(100).as_str())
-            );
-            assert!(matches!(
-                stream.recv().await.unwrap(),
-                Some(super::BoundProviderEvent {
-                    event: ProviderEvent::Message {
-                        update: MessageUpdate::Completed { .. },
-                        ..
+    async fn retired_foreground_item_admission_fences_the_shared_binding() {
+        let (sink, _stream, address) = fixture();
+        let publisher = sink.turn_publisher(address.clone()).unwrap();
+        publisher.start_handle().observed(1).await.unwrap();
+        let result = crate::TurnResult::new(
+            crate::turn::TurnOutcome::Interrupted,
+            2,
+            None,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        publisher.completed(result, 3).await.unwrap();
+        let result = sink
+            .activity_writer()
+            .send_wait(crate::AdapterActivity::Item {
+                thread_id: address.thread_id,
+                turn_id: address.turn_id,
+                item_id: crate::ItemId::new("new-foreground").unwrap(),
+                event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(
+                    crate::ReasoningStart {
+                        text: "late work".into(),
+                        kind: crate::ReasoningKind::Full,
                     },
-                    ..
-                })
-            ));
-            assert_eq!(
-                stream.recv().await.unwrap().unwrap().event.message_delta(),
-                Some("second")
-            );
-        };
-        tokio::join!(producer, consumer);
+                )),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::UnexpectedExecution
+            ))
+        ));
+        assert!(matches!(
+            sink.failed().await,
+            EventDeliveryError::Observation(crate::ObservationFailure::UnexpectedExecution)
+        ));
     }
 
+    /// Only originally backgrounded command work may continue after its foreground turn completes.
     #[tokio::test]
-    async fn typed_events_preserve_barriers_and_full_content_under_backpressure() {
-        let (sink, mut stream) = channel(binding(), scope());
-        let text = "λ\n".repeat(forge_protocol::MAX_FRAME_BYTES);
-        let expected = text.clone();
-        let producer = async move {
-            sink.send_wait(message("large", MessageUpdate::Completed { text }))
-                .await
-                .unwrap();
+    async fn collected_turn_keeps_original_background_output_and_final_completion() {
+        let (sink, mut stream, address) = fixture();
+        let publisher = sink.turn_publisher(address.clone()).unwrap();
+        publisher.start_handle().observed(1).await.unwrap();
+        let item = |event| crate::AdapterActivity::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: crate::ItemId::new("background").unwrap(),
+            event,
         };
-        let consumer = async {
-            match stream.recv().await.unwrap().unwrap() {
-                super::BoundProviderEvent {
-                    event:
-                        ProviderEvent::Message {
-                            update: MessageUpdate::Completed { text },
-                            ..
-                        },
-                    ..
-                } => assert_eq!(text, expected),
-                event => panic!("unexpected event {event:?}"),
-            }
-        };
-        tokio::join!(producer, consumer);
+        let writer = sink.activity_writer();
+        writer
+            .send_wait(item(crate::ItemEvent::Started(
+                crate::ItemStart::CommandExecution(crate::ToolDescriptor {
+                    name: "command".into(),
+                    title: "Command".into(),
+                    semantics: Default::default(),
+                    arguments: crate::InspectableArguments::new(serde_json::json!({})),
+                }),
+            )))
+            .await
+            .unwrap();
+        writer
+            .send_wait(item(crate::ItemEvent::Tool {
+                event: crate::ToolItemEvent::ExecutionStarted,
+            }))
+            .await
+            .unwrap();
+        writer
+            .send_wait(item(crate::ItemEvent::Tool {
+                event: crate::ToolItemEvent::Backgrounded,
+            }))
+            .await
+            .unwrap();
+        let result = crate::TurnResult::new(
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: crate::turn::TurnCompletionReason::Normal,
+            },
+            2,
+            None,
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        publisher.completed(result, 3).await.unwrap();
+        writer
+            .send_wait(item(crate::ItemEvent::Tool {
+                event: crate::ToolItemEvent::Output(crate::TextUpdate::Append(
+                    "late original output".into(),
+                )),
+            }))
+            .await
+            .unwrap();
+        writer
+            .send_wait(item(crate::ItemEvent::Completed(
+                crate::ItemCompletion::CommandExecution(crate::ToolCompletion {
+                    outcome: crate::ToolOutcome::Succeeded,
+                    descriptor: None,
+                    output: None,
+                    changes: Default::default(),
+                }),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(sink.watermark().get(), 7);
+        for _ in 0..7 {
+            assert!(stream.recv().await.unwrap().is_some());
+        }
+        assert!(stream.check().is_ok());
     }
 
-    #[tokio::test]
-    async fn cancelled_receive_retains_partial_batch_for_final_drain() {
-        let (sink, mut stream) = channel(binding(), scope());
-        sink.send_wait(message(
-            "one",
-            MessageUpdate::Delta {
-                text: "partial".into(),
-            },
-        ))
-        .await
+    /// Retain explicit child ownership registration independently of whichever turn is visible.
+    #[test]
+    fn child_registration_is_original_and_rejects_reassignment() {
+        let (sink, stream, address) = fixture();
+        let child_owner = ThreadOwner::new(
+            address.scope.owner.session_id().clone(),
+            crate::AgentId::new("child").unwrap(),
+        )
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), stream.recv())
-                .await
-                .is_err()
-        );
-        sink.send_wait(message(
-            "one",
-            MessageUpdate::Delta {
-                text: " tail".into(),
-            },
-        ))
-        .await
-        .unwrap();
+        let scope = InvocationScope::new(child_owner, "child-exchange");
+        let child = TurnAddress {
+            thread_id: scope.owner.thread_id(),
+            turn_id: scope.turn_id().unwrap(),
+            scope,
+        };
+        sink.activity_writer()
+            .register_observed_turn(child.clone())
+            .unwrap();
         assert_eq!(
-            stream.try_recv().unwrap().event.message_delta(),
-            Some("partial tail")
+            stream.registrations().registered_turn(&child.turn_id),
+            Some(child.clone())
         );
+        let foreign = TurnAddress {
+            thread_id: address.thread_id,
+            turn_id: child.turn_id,
+            scope: address.scope,
+        };
+        assert!(sink.register_turn(&foreign).is_err());
     }
 }

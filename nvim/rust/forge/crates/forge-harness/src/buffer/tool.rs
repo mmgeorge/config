@@ -32,7 +32,9 @@ pub struct ToolOutputView {
     database: Option<StoredOutput>,
     saved: Arc<String>,
     parsed: OnceLock<std::result::Result<ParsedOutput, String>>,
-    heading: Option<crate::turn::ToolCall>,
+    /// Source heading fields and the tool-clock reading captured with them, so an inline
+    /// activation renders the same elapsed time as the projection that produced it.
+    heading: Option<(crate::turn::ToolCall, crate::turn::ToolInstant)>,
     owner: String,
     pub(super) group: String,
     /// Show the current tool's output without an empty placeholder or overflow row.
@@ -281,20 +283,8 @@ impl ToolOutputView {
         Ok(snapshot)
     }
     /// Retains source heading fields without copying the saved output or change tree.
-    pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
-        self.heading = Some(crate::turn::ToolCall {
-            command_shell: None,
-            started_at_ms: call.started_at_ms,
-            completed_at_ms: call.completed_at_ms,
-            checklist_item_id: None,
-            id: call.id.clone(),
-            kind: call.kind.clone(),
-            title: call.title.clone(),
-            output: Default::default(),
-            status: call.status.clone(),
-            failed: call.failed,
-            change: Default::default(),
-        });
+    pub(super) fn heading(&mut self, call: &crate::turn::ToolCall, now: crate::turn::ToolInstant) {
+        self.heading = Some((call.heading(), now));
     }
 
     /// Associates inline chunks with their containing projected entry.
@@ -308,8 +298,8 @@ impl ToolOutputView {
     }
 
     /// Renders activation headings from source metadata rather than truncated native text.
-    pub(super) fn header(&self) -> Option<&crate::turn::ToolCall> {
-        self.heading.as_ref()
+    pub(super) fn header(&self) -> Option<(&crate::turn::ToolCall, crate::turn::ToolInstant)> {
+        self.heading.as_ref().map(|(call, now)| (call, *now))
     }
 
     /// Keeps the parser and saved bytes while adopting newly projected heading ownership.

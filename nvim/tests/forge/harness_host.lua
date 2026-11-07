@@ -1,11 +1,13 @@
 vim.loader.enable(false)
+local state_snapshot = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/state.lua")
 local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local name = "forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 local executable = data .. "/" .. name
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+executable = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors = {}
@@ -43,7 +45,7 @@ local success, failure = xpcall(function()
   held_response:release()
   assert(vim.wait(10000, function()
     local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-    return #errors > 0 or (not state.busy and text:find("Mock response:", 1, true) ~= nil)
+    return #errors > 0 or (not require("forge.views.harness.activity").busy(state) and text:find("Mock response:", 1, true) ~= nil)
   end, 10), "native Harness response did not settle")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "durable native admission did not clear composer")
@@ -75,10 +77,17 @@ local success, failure = xpcall(function()
       if message.text == text then return message end
     end
   end
+  -- Settled input has no unacknowledged editor draft and no confirmed message in delivery.
   local function input_settled()
-    return state.input.sending == nil and #state.input.pending == 0
+    if #state.input.drafts > 0 then return false end
+    for _, message in ipairs(state.input.confirmed) do
+      if message.delivery == "delivering" then return false end
+    end
+    return true
   end
   local function request(method, params, expected_error)
+    -- Snapshot reads replay their publication page; see support/state.lua.
+    if method == "session.state.get" and expected_error == nil then return state_snapshot.get() end
     local done, value, failure = false
     local context = require("forge.event_contract").method_policy(method).session_context
     local session_id = context == "required" and state.session.id or nil
@@ -163,7 +172,7 @@ local success, failure = xpcall(function()
   assert(second_queued_response:wait().prompt == second_queued, "explicit follow-ups were reordered")
   second_queued_response:release()
   assert(vim.wait(10000, function()
-    return #errors > 0 or (not state.busy and input_settled() and #state.input.confirmed == 0)
+    return #errors > 0 or (not require("forge.views.harness.activity").busy(state) and input_settled() and #state.input.confirmed == 0)
   end, 10), "queued follow-ups did not finish after the active response")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(state.session.name == renamed, "provider completion overwrote the active rename")
@@ -178,11 +187,12 @@ local success, failure = xpcall(function()
   end)
   assert(vim.wait(3000, function() return log_status ~= nil end, 10))
   assert(log_status.enabled and log_status.path:find(state.session.id, 1, true))
-  local prompt_record
-  for _, line in ipairs(vim.fn.readfile(log_status.path)) do
-    if line:find(prompt, 1, true) then prompt_record = line break end
+  -- Session traces retain allowlisted diagnostic metadata only, never conversation bodies.
+  local trace_lines = vim.fn.readfile(log_status.path)
+  assert(#trace_lines > 0, "session trace recorded no diagnostics")
+  for _, line in ipairs(trace_lines) do
+    assert(not line:find(prompt, 1, true), "session trace retained a prompt body")
   end
-  assert(prompt_record, "session trace lost prompt body")
   local cleared_status
   client.request({ method = "session.trace.clear", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(result, error)
     assert(not error, error)
@@ -266,20 +276,25 @@ local success, failure = xpcall(function()
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(state.session.name == renamed, "active rename did not survive host restart")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft survives collected host")
+  -- The host commits queued input durably before confirming it, so a replacement host restores the
+  -- same confirmed message rather than an uncertain editor draft, and does not deliver it on startup.
+  local recovery
   local recovered_queue = vim.wait(3000, function()
-    return not state.input.refreshing and #state.input.rejected == 1
+    if state.input.refreshing then return false end
+    for _, message in ipairs(state.input.confirmed) do
+      if message.id == restart_message_id then recovery = message end
+    end
+    return recovery ~= nil
   end, 10)
-  assert(recovered_queue, "host replacement lost the recoverable queue: " .. vim.inspect({
-    confirmed = state.input.confirmed, rejected = state.input.rejected, queue = state.queue,
+  assert(recovered_queue, "host replacement lost the durable queue: " .. vim.inspect({
+    confirmed = state.input.confirmed, drafts = state.input.drafts, queue = state.queue,
     epoch = state.runtime_epoch, input_epoch = state.input.runtime_epoch,
   }))
-  local recovery = state.input.rejected[1]
-  assert(recovery.id == restart_message_id and recovery.delivery == "unknown" and recovery.local_only,
-    "host replacement made unresolved queued text executable")
+  assert(recovery.delivery == "queued" and recovery.text == "Recover queued text after host replacement"
+    and #state.input.drafts == 0, "host replacement changed queued input: " .. vim.inspect(recovery))
   for _, exchange in ipairs(request("session.exchange.list", {})) do
     assert(exchange.prompt ~= recovery.text, "host replacement automatically replayed queued text")
   end
-  require("forge.views.harness.input_state").discard_rejected(state, recovery.id)
   assert(require("forge.infra.perf").enabled("harness"), "saved logging preference lost on restart")
   local compaction_count = 0
   for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
@@ -290,7 +305,7 @@ local success, failure = xpcall(function()
   assert(initialized.code == 0, initialized.stderr)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan build the feature" })
   controller.submit()
-  assert(vim.wait(10000, function() return #errors > 0 or (not state.busy and state.active_plan) end, 10),
+  assert(vim.wait(10000, function() return #errors > 0 or (not require("forge.views.harness.activity").busy(state) and state.active_plan) end, 10),
     "complete-text planning submission did not settle")
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "planning admission did not clear the draft")

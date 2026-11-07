@@ -29,51 +29,82 @@ impl<'exchange> ExchangeLayout<'exchange> {
             .iter()
             .filter(|node| !questions.nested.contains(node.id()))
             .collect::<Vec<_>>();
-        activity.retain(|node| match node {
-            ExchangeNode::PlanEvent { event } => match &event.content {
-                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if event.node_count == 0
-                        && matches!(
-                            lifecycle.kind,
-                            crate::plan::PlanLifecycleKind::Accepted
-                                | crate::plan::PlanLifecycleKind::ChangesRequested
-                        ) =>
+        // Results move ahead of the response of the turn that produced them, including
+        // a plan submission recorded after that response. Once a later turn starts in
+        // the same exchange (a continued plan revision, or a restart after interruption),
+        // its results stay in source order after the earlier response instead.
+        let mut first_response_turn = None;
+        let mut later_turn_start = activity.len();
+        for (position, node) in activity.iter().enumerate() {
+            let ExchangeNode::TurnContent { turn_id, .. } = node else {
+                continue;
+            };
+            match first_response_turn {
+                None if is_outer_message(exchange, node)? => {
+                    first_response_turn = Some(turn_id.as_str());
+                }
+                Some(response_turn) if response_turn != turn_id.as_str() => {
+                    later_turn_start = position;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let mut position = 0;
+        activity.retain(|node| {
+            let before_response = position < later_turn_start;
+            position += 1;
+            match node {
+                ExchangeNode::PlanEvent { event } => match &event.content {
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if event.node_count == 0
+                            && matches!(
+                                lifecycle.kind,
+                                crate::plan::PlanLifecycleKind::Accepted
+                                    | crate::plan::PlanLifecycleKind::ChangesRequested
+                            ) =>
+                    {
+                        opening.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if before_response
+                            && matches!(
+                                lifecycle.kind,
+                                crate::plan::PlanLifecycleKind::Created
+                                    | crate::plan::PlanLifecycleKind::RevisionCreated
+                            ) =>
+                    {
+                        results.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution {
+                        event:
+                            crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
+                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. },
+                    } => {
+                        conclusion.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution { .. }
+                    | crate::plan::PlanEventContent::Resolution { .. }
+                        if before_response =>
+                    {
+                        results.push(*node);
+                        false
+                    }
+                    _ => true,
+                },
+                ExchangeNode::ArtifactChange { .. }
+                | ExchangeNode::ImplementationReport { .. }
+                | ExchangeNode::VerificationResult { .. }
+                    if before_response =>
                 {
-                    opening.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if matches!(
-                        lifecycle.kind,
-                        crate::plan::PlanLifecycleKind::Created
-                            | crate::plan::PlanLifecycleKind::RevisionCreated
-                    ) =>
-                {
-                    results.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Execution {
-                    event:
-                        crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                        | crate::plan::PlanExecutionLifecycleEvent::Failed { .. },
-                } => {
-                    conclusion.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Execution { .. }
-                | crate::plan::PlanEventContent::Resolution { .. } => {
                     results.push(*node);
                     false
                 }
                 _ => true,
-            },
-            ExchangeNode::ArtifactChange { .. }
-            | ExchangeNode::ImplementationReport { .. }
-            | ExchangeNode::VerificationResult { .. } => {
-                results.push(*node);
-                false
             }
-            _ => true,
         });
         let mut response_position = activity.len();
         let mut response_turn = None;

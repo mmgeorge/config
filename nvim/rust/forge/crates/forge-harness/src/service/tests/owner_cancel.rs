@@ -16,6 +16,10 @@ use std::time::Duration;
 enum CollectionBoundary {
     Preparing,
     Active,
+    /// Hold native execution after the provider echoes the submitted user message, as Codex does.
+    ActiveAfterUserEcho,
+    /// Hold native execution inside a started shell tool until its deadline stops the turn.
+    ActiveInTool,
     PreparingThenActive,
 }
 
@@ -50,56 +54,90 @@ async fn slow_collection_fixture(
     let (steering_accepted, steering_receipts) = tokio::sync::mpsc::unbounded_channel();
     let (dispatched, dispatches) = tokio::sync::mpsc::unbounded_channel();
     let owner: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> = Arc::default();
-    let observed_owner = owner.clone();
     let descriptor = forge_providers::registry::descriptor(
         &forge_providers::registry::nonselectable_id().unwrap(),
     )
     .unwrap();
     let native = crate::provider::test_support::EventFixtureProvider::new(
         descriptor,
-        move |request, sink, mut cancelled| {
+        move |request, sink, start, mut cancelled| {
             let dispatched = dispatched.clone();
-            let owner = observed_owner.clone();
             let started = started.clone();
             let steered_submissions = steered_submissions.clone();
             let held_active = matches!(
                 boundary,
-                CollectionBoundary::Active | CollectionBoundary::PreparingThenActive
+                CollectionBoundary::Active
+                    | CollectionBoundary::ActiveAfterUserEcho
+                    | CollectionBoundary::ActiveInTool
+                    | CollectionBoundary::PreparingThenActive
             ) && executions.fetch_add(1, Ordering::AcqRel) == 0;
+            let echo_user_message =
+                held_active && boundary == CollectionBoundary::ActiveAfterUserEcho;
+            let run_tool = held_active && boundary == CollectionBoundary::ActiveInTool;
             async move {
-                use forge_provider_api::lifecycle::{
-                    ExecutionObservation, ExecutionResult, ExecutionUpdate,
-                };
-                let thread_id = owner
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap()
-                    .observer
-                    .snapshot()
-                    .unwrap()
-                    .session
-                    .provider_session_id
-                    .unwrap();
-                let address = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id,
-                    turn_id: request.scope.invocation_id.as_str().into(),
-                };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope.clone(),
-                        ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )?,
-                })
-                .await?;
-                let completion = forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some(address.thread_id.clone().try_into().unwrap()),
-                    ..Default::default()
+                start.observed(1).await?;
+                if echo_user_message {
+                    let item_id = forge_provider_api::ItemId::new("echoed-user-message")
+                        .expect("fixture item ID is valid");
+                    let text = match &request.input {
+                        forge_provider_api::input::PromptInput::Text(text) => text.clone(),
+                        _ => String::new(),
+                    };
+                    for event in [
+                        forge_provider_api::ItemEvent::Started(
+                            forge_provider_api::ItemStart::UserMessage(
+                                forge_provider_api::UserMessageStart {
+                                    text: text.clone(),
+                                    submission_id: Some(request.submission_id.clone()),
+                                },
+                            ),
+                        ),
+                        forge_provider_api::ItemEvent::Completed(
+                            forge_provider_api::ItemCompletion::UserMessage(
+                                forge_provider_api::MessageCompletion {
+                                    text,
+                                    outcome: forge_provider_api::MessageOutcome::Completed,
+                                },
+                            ),
+                        ),
+                    ] {
+                        sink.send_wait(forge_provider_api::AdapterActivity::Item {
+                            thread_id: request.thread_id.clone(),
+                            turn_id: request.turn_id.clone(),
+                            item_id: item_id.clone(),
+                            event,
+                        })
+                        .await?;
+                    }
                 }
-                .into();
+                let tool_event = |event| forge_provider_api::AdapterActivity::Item {
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    item_id: forge_provider_api::ItemId::new("held-shell-command")
+                        .expect("fixture item ID is valid"),
+                    event,
+                };
+                if run_tool {
+                    for event in [
+                        forge_provider_api::ItemEvent::Started(
+                            forge_provider_api::ItemStart::ToolCall(
+                                forge_provider_api::ToolDescriptor {
+                                    semantics: Default::default(),
+                                    name: "shell".into(),
+                                    title: "Held fixture command".into(),
+                                    arguments: forge_provider_api::InspectableArguments::new(
+                                        json!({"command":"ping -n 30 127.0.0.1"}),
+                                    ),
+                                },
+                            ),
+                        ),
+                        forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::ExecutionStarted,
+                        },
+                    ] {
+                        sink.send_wait(tool_event(event)).await?;
+                    }
+                }
                 let result = if held_active {
                     let _ = started.send(());
                     while !*cancelled.borrow() {
@@ -108,30 +146,56 @@ async fn slow_collection_fixture(
                             .await
                             .map_err(|_| crate::provider::ProviderError::Cancelled)?;
                     }
-                    ExecutionResult::Cancelled { completion }
+                    if run_tool {
+                        let completion = forge_provider_api::ToolCompletion {
+                            outcome: crate::provider::ToolOutcome::Failed {
+                                diagnostic: forge_provider_api::ToolDiagnostic {
+                                    kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                    message: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                        "fixture tool interrupted",
+                                    )
+                                    .expect("static diagnostic is valid"),
+                                },
+                            },
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        };
+                        sink.send_wait(tool_event(forge_provider_api::ItemEvent::Completed(
+                            forge_provider_api::ItemCompletion::ToolCall(completion),
+                        )))
+                        .await?;
+                    }
+                    forge_provider_api::turn::TurnOutcome::Interrupted
                 } else {
-                    let _ = dispatched.send(request.input);
-                    ExecutionResult::Completed { completion }
+                    let _ = dispatched.send(request.input.clone());
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    }
                 };
-                let mut covered_submissions = vec![request.submission_id];
-                covered_submissions.extend(std::mem::take(
+                let mut covered = vec![forge_provider_api::CoveredInput::new(
+                    request.submission_id.clone(),
+                    request.attempt_id.clone(),
+                )];
+                covered.extend(std::mem::take(
                     &mut *steered_submissions
                         .lock()
                         .expect("fixture steering receipts poisoned"),
                 ));
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(
-                        request.scope,
-                        ExecutionUpdate::Finished {
-                            address: address.clone(),
-                            covered_submissions,
-                            completed_at_ms: 2,
-                            result,
-                        },
-                    )?,
-                })
-                .await?;
-                Ok(())
+                // A native history boundary lets an output-free interruption authorize retraction.
+                let boundary = echo_user_message.then(|| {
+                    forge_provider_api::CheckpointId::new(format!(
+                        "echo-boundary:{}",
+                        request.submission_id.as_str()
+                    ))
+                    .expect("fixture checkpoint ID is valid")
+                });
+                forge_provider_api::TurnResult::new(result, 2, None, covered, Vec::new(), boundary)
+                    .map_err(|_| {
+                        crate::provider::ProviderError::Observation(
+                            forge_provider_api::ObservationFailure::Protocol,
+                        )
+                    })
             }
         },
     );
@@ -143,7 +207,10 @@ async fn slow_collection_fixture(
                 observed_steering
                     .lock()
                     .expect("fixture steering receipts poisoned")
-                    .push(receipt.id().clone());
+                    .push(forge_provider_api::CoveredInput::new(
+                        receipt.id().clone(),
+                        receipt.attempt_id()?,
+                    ));
                 let _ = steering_accepted.send(receipt.id().clone());
             }
             Ok(())
@@ -223,7 +290,9 @@ async fn slow_collection_fixture(
                 .await?
                 .context("first input never reached pre-acceptance preparation")?;
         }
-        CollectionBoundary::Active => {
+        CollectionBoundary::Active
+        | CollectionBoundary::ActiveAfterUserEcho
+        | CollectionBoundary::ActiveInTool => {
             tokio::time::timeout(Duration::from_secs(5), starts.recv())
                 .await?
                 .context("first input never emitted its native start observation")?;
@@ -234,7 +303,7 @@ async fn slow_collection_fixture(
         .lock()
         .await
         .execution_registry()
-        .existing_owner(&crate::provider::ExecutionOwner::root(
+        .existing_owner(&crate::provider::ThreadOwner::root(
             controller.observer.session_id(),
         ))?
         .context("fixture broker has no retained root execution owner")?;
@@ -304,6 +373,16 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
             method: "session.prompt.submit".into(),
             params: json!({"operation_id":"resume-after-preaccept-cancel","input_id":"resumed-turn-after-preaccept","text":"Resume after early cancellation"}),
         }, &fixture.sink).await?;
+        // The output-free first prompt is retracted rather than retained as a cancelled exchange.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                if fixture.events.lock().expect("fixture events poisoned").iter()
+                    .any(|(_, event)| event["event"] == "input_changed"
+                        && event["payload"]["retracted"] == "prompt-input:slow-first") { break; }
+                changed.await;
+            }
+        }).await.context("pre-acceptance cancellation did not retract its output-free prompt")?;
         tokio::time::timeout(Duration::from_secs(5), fixture.starts.recv())
             .await.context("resumed input never emitted native Started")?
             .context("native start observation channel closed")?;
@@ -371,7 +450,7 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
                 let changed = fixture.events_changed.notified();
                 let completed = fixture.events.lock().expect("fixture events poisoned")
                     .iter().filter(|(_, event)| event["event"] == "exchange_complete").count();
-                if completed >= 3 { break; }
+                if completed >= 2 { break; }
                 changed.await;
             }
         }).await.context("following prompt never completed its publication")?;
@@ -383,6 +462,219 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
             "cancellation or final publication emitted a provider observation error");
         Ok::<(), anyhow::Error>(())
     }.await;
+    fixture.finish(scenario).await
+}
+
+/// Restore an output-free prompt when Ctrl-C arrives after the provider echoes it.
+///
+/// Codex reports the submitted prompt as a native user-message item before any assistant
+/// output. That echo is not provider activity, so a restoring cancellation must still retract
+/// the native turn, delete the provisional exchange, and publish `retracted` for the input.
+#[tokio::test]
+async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> Result<()> {
+    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveAfterUserEcho).await?;
+    let scenario = async {
+        // The echo precedes the fixture's start signal, so wait until the broker applied it.
+        let exchange_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                let echoed = SqliteStore::read_only(&fixture.controller.data_root)?
+                    .list_exchange(fixture.controller.observer.session_id())?
+                    .into_iter()
+                    .find(|exchange| {
+                        exchange
+                            .turn
+                            .iter()
+                            .flat_map(|turn| turn.messages())
+                            .next()
+                            .is_some()
+                    })
+                    .map(|exchange| exchange.id);
+                if let Some(exchange_id) = echoed {
+                    break Ok::<_, anyhow::Error>(exchange_id);
+                }
+                changed.await;
+            }
+        })
+        .await
+        .context("provider user-message echo was never applied")??;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .controller
+                .exchange_owner
+                .execute_command(Command::CancelExchange(CancelExchangeRequest {
+                    input: CancelledInputPolicy::RestoreIfUnconsumed,
+                })),
+        )
+        .await
+        .context("restoring cancellation never settled")?
+        .context("restoring cancellation failed")?;
+        // Input settlement publishes after the cancellation command commits its outcome.
+        let input_updates = || {
+            fixture
+                .events
+                .lock()
+                .expect("fixture events poisoned")
+                .iter()
+                .filter(|(_, event)| event["event"] == "input_changed")
+                .map(|(_, event)| event["payload"].clone())
+                .collect::<Vec<_>>()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                if input_updates()
+                    .iter()
+                    .any(|update| update["retracted"].is_string())
+                {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "output-free cancellation published no retracted input update: {:?}",
+                input_updates()
+            )
+        })?;
+        ensure!(
+            SqliteStore::read_only(&fixture.controller.data_root)?
+                .load_exchange(&exchange_id)?
+                .is_none(),
+            "retracted prompt retained its provisional exchange"
+        );
+        let retained_name = crate::session::SessionStore::load_session(
+            &SqliteStore::read_only(&fixture.controller.data_root)?,
+            fixture.controller.observer.session_id(),
+        )?
+        .context("fixture session is missing")?
+        .name;
+        ensure!(
+            retained_name.is_empty(),
+            "retracted first prompt still names the session: {retained_name:?}"
+        );
+        // Retraction commits the collected invocation, so the execution owner admits new work.
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 802,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"after-retraction","text":"Prompt after retraction"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match fixture.dispatches.recv().await {
+                    Some(forge_provider_api::input::PromptInput::Text(text))
+                        if text == "Prompt after retraction" =>
+                    {
+                        break Ok(());
+                    }
+                    Some(_) => {}
+                    None => break Err(anyhow::anyhow!("fixture dispatch channel closed")),
+                }
+            }
+        })
+        .await
+        .context("session stayed unavailable after retraction")??;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    fixture.finish(scenario).await
+}
+
+/// A tool deadline fails its exchange once, collects the turn, and dispatches the next prompt.
+///
+/// The fixture holds a started shell tool, as Codex does for `ping -n 30`. The test forces the
+/// armed watchdog's expiry instead of waiting on the real clock.
+#[tokio::test]
+async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result<()> {
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveInTool).await?;
+    let scenario = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                if fixture
+                    .controller
+                    .observer
+                    .session_events()
+                    .expire_running_tool_deadlines()?
+                    > 0
+                {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                changed.await;
+            }
+        })
+        .await
+        .context("tool deadline never armed")??;
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                let failed = SqliteStore::read_only(&fixture.controller.data_root)?
+                    .list_exchange(fixture.controller.observer.session_id())?
+                    .into_iter()
+                    .any(|exchange| exchange.state() == crate::exchange::ExchangeState::Failed);
+                if failed {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                changed.await;
+            }
+        })
+        .await;
+        failed.context("timed-out exchange never settled as failed")??;
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 803,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"after-timeout","text":"Prompt after timeout"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match fixture.dispatches.recv().await {
+                    Some(forge_provider_api::input::PromptInput::Text(text))
+                        if text == "Prompt after timeout" =>
+                    {
+                        break Ok(());
+                    }
+                    Some(_) => {}
+                    None => break Err(anyhow::anyhow!("fixture dispatch channel closed")),
+                }
+            }
+        })
+        .await
+        .context("prompt after tool timeout stayed queued")??;
+        let timeout_notices: Vec<_> = fixture
+            .events
+            .lock()
+            .expect("fixture events poisoned")
+            .iter()
+            .filter(|(_, event)| event.to_string().contains("tool_timeout"))
+            .map(|(_, event)| event["event"].clone())
+            .collect();
+        ensure!(
+            timeout_notices
+                .iter()
+                .filter(|event| *event == "error")
+                .count()
+                <= 1,
+            "tool timeout was announced more than once: {timeout_notices:?}"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     fixture.finish(scenario).await
 }
 

@@ -1,4 +1,5 @@
 mod attachments;
+mod child_turn;
 mod connection;
 mod kind;
 mod resources;
@@ -7,7 +8,7 @@ mod profile;
 mod response;
 
 pub use connection::{AcpConnection, AcpConnectionError, AcpHandler, AcpLaunch, AcpRemoteFailure};
-pub(crate) use response::{PromptOutcome, prompt_outcome, validate_prompt_response};
+pub(crate) use response::{PromptOutcome, validate_prompt_response};
 pub mod runtime;
 
 pub mod submission;
@@ -26,4 +27,3 @@ mod session_fixture_test;
 mod wire_fixture_test;
 
 mod tool_semantics;
-pub use tool_semantics::normalize_invocation;

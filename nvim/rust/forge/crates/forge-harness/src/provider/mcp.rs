@@ -118,12 +118,8 @@ impl McpDiscovery {
 mod test {
     use super::*;
     use crate::provider::ProviderDescriptor;
-    use forge_provider_api::{
-        ProviderError,
-        catalog::{
-            McpDefinition as NativeMcpDefinition, McpStatus as NativeMcpStatus, McpTransportKind,
-        },
-        events::ProviderEventSink,
+    use forge_provider_api::catalog::{
+        McpDefinition as NativeMcpDefinition, McpStatus as NativeMcpStatus, McpTransportKind,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -162,7 +158,15 @@ mod test {
     ) -> Arc<Provider> {
         let fixture = crate::provider::test_support::EventFixtureProvider::new(
             descriptor(),
-            |_request, _sink: ProviderEventSink, _cancelled| async { Ok::<(), ProviderError>(()) },
+            |request, _sink, start, _cancelled| async move {
+                start.observed(1).await?;
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            },
         )
         .with_mcp_list(move |query| {
             let release = release.clone();
@@ -365,22 +369,30 @@ mod tests {
         let descriptor = forge_providers::registry::descriptor(
             &forge_providers::registry::nonselectable_id().expect("fixture identity"),
         )?;
-        let native =
-            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-                Ok(())
-            })
-            .with_mcp_list(|query| async move {
-                match query {
-                    McpQuery::Configured(_) => {
-                        panic!("host-owned definitions must not query native configuration")
-                    }
-                    McpQuery::Observed(_) => Ok(vec![
-                        server("ready", true, McpStatus::Connected),
-                        server("disabled", true, McpStatus::Connected),
-                        server("unselected", true, McpStatus::Connected),
-                    ]),
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            |request, _, start, _| async move {
+                start.observed(1).await?;
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            },
+        )
+        .with_mcp_list(|query| async move {
+            match query {
+                McpQuery::Configured(_) => {
+                    panic!("host-owned definitions must not query native configuration")
                 }
-            });
+                McpQuery::Observed(_) => Ok(vec![
+                    server("ready", true, McpStatus::Connected),
+                    server("disabled", true, McpStatus::Connected),
+                    server("unselected", true, McpStatus::Connected),
+                ]),
+            }
+        });
         let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let provider = fixture.provider_handle();
         let mut missing = server("missing", true, McpStatus::Unavailable);

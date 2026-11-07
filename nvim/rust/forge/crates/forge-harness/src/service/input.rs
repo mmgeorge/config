@@ -127,6 +127,16 @@ impl SessionController {
                     Ok(InputProgress::Started) => continue,
                     Ok(InputProgress::WaitExecution) => true,
                     Ok(InputProgress::Waiting) => false,
+                    // Shutdown can close the exchange owner between the stopping check
+                    // above and this admission attempt. No input remains deliverable once
+                    // shutdown began, so that failure ends the loop without an error.
+                    Err(_)
+                        if controller.input_stopping.load(Ordering::Acquire)
+                            || controller.coordinator.execution.is_closed() =>
+                    {
+                        while jobs.join_next().await.is_some() {}
+                        break;
+                    }
                     Err(error) => {
                         let _ = sink.send_event(SessionEvent {
                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
@@ -194,7 +204,7 @@ impl SessionController {
             .lock()
             .await
             .execution_registry()
-            .existing_owner(&crate::provider::ExecutionOwner::root(&snapshot.session.id))?;
+            .existing_owner(&crate::provider::ThreadOwner::root(&snapshot.session.id))?;
         let native_active = engine
             .map(|engine| engine.active_invocation_scope())
             .transpose()?

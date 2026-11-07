@@ -12,7 +12,7 @@ use forge_provider_api::control::{ControlToolDefinition, ProviderTools};
 use forge_provider_api::permissions::ProviderPermissions;
 use forge_provider_api::terminal::TerminalSnapshot;
 use forge_provider_api::trace::ProviderTrace;
-use forge_provider_api::{Compaction, ExecutionOwner, ProviderError, ProviderEventSink};
+use forge_provider_api::{Compaction, ProviderError, ProviderEventSink, ThreadOwner};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::future::Future;
@@ -37,7 +37,7 @@ pub enum ClientShutdown {
 /// Select native history and model settings independently of host workflow state.
 pub struct SessionSelection {
     /// Retain callback authority even when this preparation has no event subscriber yet.
-    pub execution_owner: forge_provider_api::ExecutionOwner,
+    pub execution_owner: forge_provider_api::ThreadOwner,
     /// Correlate diagnostics with the host session.
     pub correlation_id: String,
     /// Resume this native conversation only when no binding is retained.
@@ -70,21 +70,21 @@ type StartupTask =
 
 /// Own native session replacement, history boundaries, and background readers.
 pub struct CopilotSessions<P> {
-    slots: Mutex<HashMap<ExecutionOwner, SessionSlot<P>>>,
-    provisional: Arc<std::sync::Mutex<HashMap<ExecutionOwner, Arc<CopilotSession>>>>,
-    leases: Arc<std::sync::Mutex<HashMap<ExecutionOwner, Arc<P>>>>,
-    startups: std::sync::Mutex<HashMap<ExecutionOwner, StartupTask>>,
-    failed_startups: std::sync::Mutex<HashMap<ExecutionOwner, Arc<ProviderError>>>,
-    terminals: Mutex<HashMap<ExecutionOwner, CopilotTerminalMonitor>>,
-    subscriptions: Mutex<HashMap<ExecutionOwner, CompactionSubscription>>,
-    turns: Mutex<HashMap<ExecutionOwner, Arc<CopilotTurnEvent>>>,
+    slots: Mutex<HashMap<ThreadOwner, SessionSlot<P>>>,
+    provisional: Arc<std::sync::Mutex<HashMap<ThreadOwner, Arc<CopilotSession>>>>,
+    leases: Arc<std::sync::Mutex<HashMap<ThreadOwner, Arc<P>>>>,
+    startups: std::sync::Mutex<HashMap<ThreadOwner, StartupTask>>,
+    failed_startups: std::sync::Mutex<HashMap<ThreadOwner, Arc<ProviderError>>>,
+    terminals: Mutex<HashMap<ThreadOwner, CopilotTerminalMonitor>>,
+    subscriptions: Mutex<HashMap<ThreadOwner, CompactionSubscription>>,
+    turns: Mutex<HashMap<ThreadOwner, Arc<CopilotTurnEvent>>>,
     trace: Arc<dyn ProviderTrace>,
-    generations: Mutex<HashMap<ExecutionOwner, GenerationBinding>>,
+    generations: Mutex<HashMap<ThreadOwner, GenerationBinding>>,
     collections: Mutex<Vec<SessionCollection>>,
 }
 
 struct GenerationBinding {
-    owner: forge_provider_api::ExecutionOwner,
+    owner: forge_provider_api::ThreadOwner,
     generation: ClientGeneration,
     observer: Option<tokio::task::JoinHandle<()>>,
 }
@@ -164,7 +164,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .await
                 .map_err(|cleanup| ProviderError::PreparationCleanup {
                     cause: Box::new(super::error::native_failure(
-                        forge_provider_api::ProviderOperation::SessionOpen,
+                        forge_provider_api::ProviderOperation::ThreadOpen,
                         forge_provider_api::ProviderFailureKind::Runtime,
                     )),
                     cleanup: Box::new(cleanup),
@@ -233,9 +233,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .map(|tool| tool.mcp_value())
             .collect();
         if active.is_some() {
-            super::operation::dispatch_for(
-                forge_provider_api::ProviderOperation::SessionConfigure,
-            )?;
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::ThreadConfigure)?;
             self.disconnect(&selection.execution_owner, &mut active)
                 .await?;
         }
@@ -264,7 +262,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -314,7 +312,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             Err(error) => {
                 let cause = error.downcast::<ProviderError>().unwrap_or_else(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::SessionOpen,
+                        forge_provider_api::ProviderOperation::ThreadOpen,
                         forge_provider_api::ProviderFailureKind::Runtime,
                     )
                 });
@@ -362,7 +360,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the currently published native binding without creating one.
-    pub async fn active(&self, key: &ExecutionOwner) -> Option<Arc<CopilotSession>> {
+    pub async fn active(&self, key: &ThreadOwner) -> Option<Arc<CopilotSession>> {
         let slot = self.slots.lock().await.get(key).cloned()?;
         slot.lock()
             .await
@@ -373,7 +371,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Record possible native input only against the binding that will receive it.
     pub async fn mark_submitted(
         &self,
-        key: &ExecutionOwner,
+        key: &ThreadOwner,
         session: &Arc<CopilotSession>,
     ) -> Result<(), ProviderError> {
         let slot = self.slot(key).await;
@@ -383,7 +381,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .filter(|binding| Arc::ptr_eq(&binding.session, session))
             .ok_or_else(|| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?;
@@ -392,7 +390,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the repair caution associated with the published history.
-    pub async fn repair(&self, key: &ExecutionOwner) -> Option<HistoryRepair> {
+    pub async fn repair(&self, key: &ThreadOwner) -> Option<HistoryRepair> {
         self.slot(key)
             .await
             .lock()
@@ -402,7 +400,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get startup failures without exposing mutable native session state.
-    pub async fn mcp_failures(&self, key: &ExecutionOwner) -> HashMap<String, String> {
+    pub async fn mcp_failures(&self, key: &ThreadOwner) -> HashMap<String, String> {
         self.slot(key)
             .await
             .lock()
@@ -413,7 +411,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the control lane shared by native prompt and cancellation operations.
-    pub async fn turn(&self, key: &ExecutionOwner) -> Arc<CopilotTurnEvent> {
+    pub async fn turn(&self, key: &ThreadOwner) -> Arc<CopilotTurnEvent> {
         self.turns
             .lock()
             .await
@@ -423,7 +421,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Bind background compaction observations before creating a native session.
-    pub async fn subscribe(&self, key: ExecutionOwner, sink: ProviderEventSink) {
+    pub async fn subscribe(&self, key: ThreadOwner, sink: ProviderEventSink) {
         self.subscriptions
             .lock()
             .await
@@ -452,7 +450,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     pub async fn fail_generation(
         &self,
         failed: &FailedGeneration,
-    ) -> Result<Vec<forge_provider_api::ExecutionOwner>, ProviderError> {
+    ) -> Result<Vec<forge_provider_api::ThreadOwner>, ProviderError> {
         let keys = self
             .generations
             .lock()
@@ -461,13 +459,23 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .filter(|(_, binding)| failed.matches(&binding.generation))
             .map(|(key, binding)| (key.clone(), binding.owner.clone()))
             .collect::<Vec<_>>();
-        let subscriptions = self.subscriptions.lock().await;
+        let targets = {
+            let subscriptions = self.subscriptions.lock().await;
+            keys.into_iter()
+                .map(|(key, owner)| {
+                    (
+                        owner,
+                        subscriptions
+                            .get(&key)
+                            .map(|subscription| subscription.sink.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut owners = Vec::new();
-        for (key, owner) in keys {
-            if let Some(subscription) = subscriptions.get(&key) {
-                subscription.sink.fail(
-                    forge_provider_api::events::EventDeliveryError::Observation(failed.failure()),
-                );
+        for (owner, sink) in targets {
+            if let Some(sink) = sink {
+                sink.observation_unavailable(failed.failure()).await;
             }
             owners.push(owner);
         }
@@ -511,7 +519,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             })?;
             entry.state = SessionCollectionState::Complete(joined.unwrap_or_else(|_error| {
                 Err(Arc::new(super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )))
             }));
@@ -538,13 +546,13 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Preserve idle failure delivery independently of active invocation contexts or queue capacity.
     async fn bind_generation(
         &self,
-        key: &ExecutionOwner,
+        key: &ThreadOwner,
         generation: ClientGeneration,
-        owner: forge_provider_api::ExecutionOwner,
+        owner: forge_provider_api::ThreadOwner,
     ) -> Result<(), ProviderError> {
         if &owner != key {
             return Err(super::error::native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ));
         }
@@ -555,9 +563,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .get(key)
             .map(|subscription| subscription.sink.clone());
         if let (Some(sink), Some(failure)) = (&sink, generation.failure()) {
-            sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
-                failure,
-            ));
+            sink.observation_unavailable(failure).await;
         }
         let mut generations = self.generations.lock().await;
         // Serialize admission with the collector's key snapshot. A stopped
@@ -566,7 +572,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         if let Some(previous) = generations.get(key) {
             if !previous.generation.same(&generation) {
                 return Err(super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ));
             }
@@ -578,10 +584,9 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             let mut failure = generation.failures();
             tokio::spawn(async move {
                 loop {
-                    if let Some(reason) = failure.borrow().clone() {
-                        sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
-                            reason,
-                        ));
+                    let reason = failure.borrow().clone();
+                    if let Some(reason) = reason {
+                        sink.observation_unavailable(reason).await;
                         break;
                     }
                     if failure.changed().await.is_err() {
@@ -618,7 +623,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -635,7 +640,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                         Ok(Err(_)) => {}
                         Err(_error) => {
                             return Err(super::error::native_failure(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 forge_provider_api::ProviderFailureKind::Protocol,
                             ));
                         }
@@ -646,7 +651,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                     .lock()
                     .map_err(|_| {
                         super::error::native_failure(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Protocol,
                         )
                     })?
@@ -661,7 +666,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 if let Some(binding) = active.as_mut() {
                     if !binding.session.belongs_to(proof.failed_generation()) {
                         return Err(super::error::native_failure(
-                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderOperation::TurnStart,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ));
                     }
@@ -680,7 +685,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -693,7 +698,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -702,7 +707,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -711,7 +716,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -726,7 +731,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 // Sticky failure is already published; this owned worker joins its failure relay.
                 observer.await.map_err(|_error| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?;
@@ -741,7 +746,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Correlate one manual compaction with native notifications around its RPC.
     pub async fn compact(
         &self,
-        key: &ExecutionOwner,
+        key: &ThreadOwner,
         id: String,
     ) -> Result<Compaction, ProviderError> {
         let slot = self.slot(key).await;
@@ -749,7 +754,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             let active = slot.lock().await;
             let binding = active.as_ref().ok_or_else(|| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?;
@@ -772,14 +777,12 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Prove a refresh retains the submitted native identity before preserving its shell helper.
-    pub(super) async fn retains_identity_on_refresh(&self, key: &ExecutionOwner) -> bool {
+    pub(super) async fn retains_identity_on_refresh(&self, key: &ThreadOwner) -> bool {
         let slot = self.slot(key).await;
-        let retained = slot
-            .lock()
+        slot.lock()
             .await
             .as_ref()
-            .is_some_and(|binding| matches!(binding.history, SessionHistory::Submitted));
-        retained
+            .is_some_and(|binding| matches!(binding.history, SessionHistory::Submitted))
     }
 
     /// Attach native terminal notifications before publishing a new or configured binding.
@@ -791,6 +794,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .active(&publication.owner)
             .await
             .context("terminal session is not attached")?;
+        session
+            .events
+            .bind(publication.sink.activity_writer())
+            .await?;
         let mut monitors = self.terminals.lock().await;
         if let Some(monitor) = monitors.get_mut(&publication.owner) {
             if monitor.observes(&session) {
@@ -807,7 +814,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the latest streamed inventory without issuing a native request.
-    pub async fn terminals(&self, key: &ExecutionOwner) -> Result<TerminalSnapshot> {
+    pub async fn terminals(&self, key: &ThreadOwner) -> Result<TerminalSnapshot> {
         match self
             .terminals
             .lock()
@@ -825,7 +832,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Stop one native command and invalidate its retained snapshot.
-    pub async fn terminate(&self, key: &ExecutionOwner, id: &str) -> Result<()> {
+    pub async fn terminate(&self, key: &ThreadOwner, id: &str) -> Result<()> {
         self.active(key)
             .await
             .context("Copilot session is not attached")?
@@ -904,14 +911,14 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Retain the native profile independently until binding cleanup has joined every foreground worker.
-    pub async fn resources(&self, key: &ExecutionOwner) -> Option<Arc<P>> {
+    pub async fn resources(&self, key: &ThreadOwner) -> Option<Arc<P>> {
         let slot = self.slots.lock().await.get(key).cloned()?;
         let active = slot.lock().await;
         active.as_ref().and_then(|binding| binding._profile.clone())
     }
 
     /// Disconnect one collected owner before allowing its history to be resumed.
-    pub async fn retire(&self, key: &ExecutionOwner) -> Result<()> {
+    pub async fn retire(&self, key: &ThreadOwner) -> Result<()> {
         self.ensure_startup_collected(key)?;
         let slot = self.slots.lock().await.get(key).cloned();
         if let Some(slot) = slot {
@@ -943,7 +950,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Join a healthy owner's failure relay before removing its generation registration.
-    async fn retire_generation_observer(&self, key: &ExecutionOwner) -> Result<(), ProviderError> {
+    async fn retire_generation_observer(&self, key: &ThreadOwner) -> Result<(), ProviderError> {
         let mut generations = self.generations.lock().await;
         if let Some(binding) = generations.get_mut(key)
             && let Some(observer) = binding.observer.as_mut()
@@ -954,7 +961,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 Err(error) if error.is_cancelled() => {}
                 Err(_error) => {
                     return Err(super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     ));
                 }
@@ -971,7 +978,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .lock()
             .map_err(|_| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?
@@ -983,7 +990,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .lock()
             .map_err(|_| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?
@@ -991,8 +998,8 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .map(|(key, error)| (key.clone(), error.as_ref().clone()))
             .collect();
         failed_startups.sort_by(|left, right| {
-            (left.0.session_id.as_str(), left.0.agent_id.as_str())
-                .cmp(&(right.0.session_id.as_str(), right.0.agent_id.as_str()))
+            (left.0.session_id().as_str(), left.0.agent_id().as_str())
+                .cmp(&(right.0.session_id().as_str(), right.0.agent_id().as_str()))
         });
         let mut failures: Vec<_> = failed_startups
             .into_iter()
@@ -1005,7 +1012,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             if let Err(error) = self.collect_startup(&key).await {
                 failures.push(error.downcast::<ProviderError>().unwrap_or_else(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::SessionOpen,
+                        forge_provider_api::ProviderOperation::ThreadOpen,
                         forge_provider_api::ProviderFailureKind::Runtime,
                     )
                 }));
@@ -1021,7 +1028,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let provisional: Vec<_> = {
             let pending = self.provisional.lock().map_err(|_| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?;
@@ -1047,7 +1054,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                         .lock()
                         .map_err(|_| {
                             super::error::native_failure(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 forge_provider_api::ProviderFailureKind::Protocol,
                             )
                         })?
@@ -1056,7 +1063,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                         .lock()
                         .map_err(|_| {
                             super::error::native_failure(
-                                forge_provider_api::ProviderOperation::InputSubmit,
+                                forge_provider_api::ProviderOperation::TurnStart,
                                 forge_provider_api::ProviderFailureKind::Protocol,
                             )
                         })?
@@ -1102,7 +1109,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -1112,7 +1119,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -1122,7 +1129,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -1131,7 +1138,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .lock()
                 .map_err(|_| {
                     super::error::native_failure(
-                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderOperation::TurnStart,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     )
                 })?
@@ -1153,7 +1160,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the preparation lock for one native session owner.
-    async fn slot(&self, key: &ExecutionOwner) -> SessionSlot<P> {
+    async fn slot(&self, key: &ThreadOwner) -> SessionSlot<P> {
         self.slots
             .lock()
             .await
@@ -1163,7 +1170,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Join one owned startup without surrendering its handle when the waiter is cancelled.
-    async fn collect_startup(&self, key: &ExecutionOwner) -> Result<Option<Arc<CopilotSession>>> {
+    async fn collect_startup(&self, key: &ThreadOwner) -> Result<Option<Arc<CopilotSession>>> {
         let startup = self
             .startups
             .lock()
@@ -1182,7 +1189,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             Err(_) => {
                 return Err(ProviderError::PreparationCleanup {
                     cause: Box::new(super::error::native_failure(
-                        forge_provider_api::ProviderOperation::SessionOpen,
+                        forge_provider_api::ProviderOperation::ThreadOpen,
                         forge_provider_api::ProviderFailureKind::Runtime,
                     )),
                     cleanup: Box::new(ProviderError::DeliveryUncertain),
@@ -1214,7 +1221,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             }
             Err(_error) => {
                 let error = Arc::new(super::error::native_failure(
-                    forge_provider_api::ProviderOperation::SessionOpen,
+                    forge_provider_api::ProviderOperation::ThreadOpen,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ));
                 self.failed_startups
@@ -1228,7 +1235,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Fence reuse while a startup failed without proving its cleanup.
-    fn ensure_startup_collected(&self, key: &ExecutionOwner) -> Result<()> {
+    fn ensure_startup_collected(&self, key: &ThreadOwner) -> Result<()> {
         if let Some(error) = self
             .failed_startups
             .lock()
@@ -1238,7 +1245,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             return Err(ProviderError::PreparationCleanup {
                 cause: Box::new(error.as_ref().clone()),
                 cleanup: Box::new(super::error::native_failure(
-                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderOperation::TurnInterrupt,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 )),
             }
@@ -1273,7 +1280,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Join old observers and retire its native router while retaining every unfinished handle.
     async fn disconnect(
         &self,
-        key: &ExecutionOwner,
+        key: &ThreadOwner,
         active: &mut Option<SessionBinding<P>>,
     ) -> Result<()> {
         let Some(binding) = active.as_mut() else {
@@ -1317,11 +1324,12 @@ mod tests {
     #[tokio::test]
     async fn structured_owners_keep_colliding_text_labels_independent() {
         let sessions = CopilotSessions::<()>::new(Arc::new(Trace));
-        let child = ExecutionOwner {
-            session_id: "a".into(),
-            agent_id: "b".into(),
-        };
-        let root = ExecutionOwner::root("a:agent:b");
+        let child = ThreadOwner::new(
+            "a".into(),
+            forge_provider_api::agent::AgentId::new("b").unwrap(),
+        )
+        .expect("registered session and agent identities are nonempty");
+        let root = ThreadOwner::root("a:agent:b");
         assert_ne!(child, root);
         assert!(!Arc::ptr_eq(
             &sessions.slot(&child).await,
@@ -1377,7 +1385,7 @@ mod tests {
             _: forge_provider_api::control::ToolCall,
         ) -> Result<String, ProviderError> {
             Err(crate::copilot::error::native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         }
@@ -1618,10 +1626,10 @@ mod tests {
                         .provisional
                         .lock()
                         .unwrap()
-                        .insert(ExecutionOwner::root("owner"), session.clone());
+                        .insert(ThreadOwner::root("owner"), session.clone());
                 } else {
                     sessions.slots.lock().await.insert(
-                        ExecutionOwner::root("owner"),
+                        ThreadOwner::root("owner"),
                         Arc::new(Mutex::new(Some(SessionBinding {
                             session: session.clone(),
                             history: SessionHistory::Prepared,
@@ -1635,10 +1643,10 @@ mod tests {
                 }
                 if !provisional {
                     sessions
-                        .mark_submitted(&ExecutionOwner::root("owner"), &session)
+                        .mark_submitted(&ThreadOwner::root("owner"), &session)
                         .await
                         .unwrap();
-                    let slot = sessions.slot(&ExecutionOwner::root("owner")).await;
+                    let slot = sessions.slot(&ThreadOwner::root("owner")).await;
                     assert!(matches!(
                         slot.lock().await.as_ref().unwrap().history,
                         SessionHistory::Submitted
@@ -1646,7 +1654,7 @@ mod tests {
                 }
                 sessions.close_observers().await.unwrap();
                 let scope = forge_provider_api::InvocationScope::new(
-                    forge_provider_api::ExecutionOwner::root("owner"),
+                    forge_provider_api::ThreadOwner::root("owner"),
                     "exchange",
                 );
                 let (sink, _events) = forge_provider_api::events::channel(
@@ -1659,7 +1667,7 @@ mod tests {
                         ".".into(),
                     ),
                     output: forge_provider_api::completion::ProviderCompletion::default(),
-                    sink,
+                    sink: sink.activity_writer(),
                 }));
                 assert!(
                     session.events.attach(context).await.is_err(),
@@ -1704,7 +1712,7 @@ mod tests {
                 .acquire(
                     async move { Ok((client, None)) },
                     SessionSelection {
-                        execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
+                        execution_owner: forge_provider_api::ThreadOwner::root("owner"),
                         correlation_id: "owner".into(),
                         session_id: None,
                         model: None,
@@ -1869,7 +1877,7 @@ mod tests {
                 .acquire(
                     async move { Ok((client, None)) },
                     SessionSelection {
-                        execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
+                        execution_owner: forge_provider_api::ThreadOwner::root("owner"),
                         correlation_id: "owner".into(),
                         session_id: None,
                         model: None,
@@ -1916,7 +1924,7 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .get(&ExecutionOwner::root("owner"))
+            .get(&ThreadOwner::root("owner"))
             .unwrap()
             .path()
             .to_owned();
@@ -1924,7 +1932,7 @@ mod tests {
         release.send(()).unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            sessions.retire(&ExecutionOwner::root("owner")),
+            sessions.retire(&ThreadOwner::root("owner")),
         )
         .await
         .unwrap()
@@ -1951,7 +1959,7 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .insert(ExecutionOwner::root("owner"), profile.clone());
+            .insert(ThreadOwner::root("owner"), profile.clone());
         let worker_profile = profile.clone();
         drop(profile);
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -1959,7 +1967,7 @@ mod tests {
             let _profile = worker_profile;
             let _ = wait.await;
             Err(crate::copilot::error::native_failure(
-                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderOperation::TurnStart,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         });
@@ -1968,11 +1976,11 @@ mod tests {
             .startups
             .lock()
             .unwrap()
-            .insert(ExecutionOwner::root("owner"), startup.clone());
+            .insert(ThreadOwner::root("owner"), startup.clone());
         let waiter_sessions = sessions.clone();
         let waiter = tokio::spawn(async move {
             waiter_sessions
-                .collect_startup(&ExecutionOwner::root("owner"))
+                .collect_startup(&ThreadOwner::root("owner"))
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1989,17 +1997,14 @@ mod tests {
                 .startups
                 .lock()
                 .unwrap()
-                .contains_key(&ExecutionOwner::root("owner"))
+                .contains_key(&ThreadOwner::root("owner"))
         );
         assert!(
             profile_path.exists(),
             "resource lease disappeared while startup was owned"
         );
         release.send(()).unwrap();
-        let error = match sessions
-            .collect_startup(&ExecutionOwner::root("owner"))
-            .await
-        {
+        let error = match sessions.collect_startup(&ThreadOwner::root("owner")).await {
             Err(error) => error,
             Ok(_) => panic!("startup failure was lost"),
         };
@@ -2013,7 +2018,7 @@ mod tests {
                 .startups
                 .lock()
                 .unwrap()
-                .contains_key(&ExecutionOwner::root("owner"))
+                .contains_key(&ThreadOwner::root("owner"))
         );
         assert!(
             !profile_path.exists(),
@@ -2031,9 +2036,9 @@ mod tests {
             ("second", ProviderFailureKind::Transport),
         ] {
             sessions.failed_startups.lock().unwrap().insert(
-                ExecutionOwner::root(key),
+                ThreadOwner::root(key),
                 Arc::new(super::super::error::native_failure(
-                    ProviderOperation::SessionOpen,
+                    ProviderOperation::ThreadOpen,
                     kind,
                 )),
             );
@@ -2060,32 +2065,33 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .insert(ExecutionOwner::root("owner"), profile);
+            .insert(ThreadOwner::root("owner"), profile);
         let task = tokio::spawn(async {
             Err(ProviderError::PreparationCleanup {
                 cause: Box::new(crate::copilot::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 )),
                 cleanup: Box::new(crate::copilot::error::native_failure(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Transport,
                 )),
             })
         });
-        sessions.startups.lock().unwrap().insert(
-            ExecutionOwner::root("owner"),
-            Arc::new(Mutex::new(Some(task))),
-        );
+        sessions
+            .startups
+            .lock()
+            .unwrap()
+            .insert(ThreadOwner::root("owner"), Arc::new(Mutex::new(Some(task))));
         assert!(
             sessions
-                .collect_startup(&ExecutionOwner::root("owner"))
+                .collect_startup(&ThreadOwner::root("owner"))
                 .await
                 .is_err()
         );
         assert!(
             sessions
-                .ensure_startup_collected(&ExecutionOwner::root("owner"))
+                .ensure_startup_collected(&ThreadOwner::root("owner"))
                 .is_err()
         );
         assert!(path.exists(), "failed cleanup released its resource lease");

@@ -10,7 +10,10 @@ vim.fn.writefile({ vim.json.encode({ checks = {
   ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "print queue-verified", label = "Queue verification", category = "test" } }
 } }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
+-- Resolve before the fixture changes into its workspace; the script path is relative to the launch directory.
+local check_storage = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/check_storage.lua")
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 package.loaded["forge.builder"] = { ensure = function(callback)
@@ -35,7 +38,10 @@ local function await(predicate, message)
       checks_deferred = state.checks_deferred, automatic_checks = state.automatic_checks }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
+local state_snapshot = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/state.lua")
 local function request(method, params)
+  -- Snapshot reads replay their publication page; see support/state.lua.
+  if method == "session.state.get" then return state_snapshot.get() end
   local done, result, failure
   client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, problem) result, failure, done = value, problem, true end)
   await(function() return done end, method .. " did not complete")
@@ -46,9 +52,17 @@ local function submit(text, queued)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
   if queued then controller.queue_submit() else controller.submit() end
 end
+-- Lua copies checks_deferred only from state snapshots, and no event republishes it when queue
+-- completion clears the gate, so deferral is read from the host's authoritative snapshot.
+local function host_deferred()
+  return request("session.state.get").checks_deferred == true
+end
 local function completed()
-  return not require("forge.views.harness.activity").busy(state) and not state.state_sync_pending
-    and not state.checks_running and not state.checks_deferred and #state.queue == 0
+  if require("forge.views.harness.activity").busy(state) or state.state_sync_pending
+    or state.checks_running or #state.queue > 0 then return false end
+  -- Read both gate fields from one snapshot: the host clears deferral as it admits the completion run.
+  local snapshot = request("session.state.get")
+  return snapshot.checks_deferred ~= true and snapshot.checks_running ~= true
 end
 local function executed()
   local count = 0
@@ -58,6 +72,11 @@ local function executed()
     end
   end
   return count
+end
+-- The host clears deferral while it admits the completion run, before that run reports activity,
+-- so a gate that must run checks is settled only once its execution is recorded.
+local function completed_after(execution_count)
+  return function() return completed() and executed() >= execution_count end
 end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
@@ -81,14 +100,14 @@ local success, failure = xpcall(function()
   controller.configure({ check_timing = "after_queue" }, function(value) live_setting = value end)
   await(function() return live_setting end, "active timing configuration failed")
   assert(starts == 1 and require("forge.views.harness.activity").busy(state), "changing timing restarted the active provider")
-  local baseline = data .. "/forge/harness/" .. state.session.id .. "/checks/change-baseline.json"
+  local baseline = check_storage.path(data, state.session.id, "change-baseline.json")
   await(function() return vim.fn.filereadable(baseline) == 1 end, "change baseline missing")
   local owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner
   submit("Second queued item", true)
   vim.fn.writefile({ "first batch edit" }, workspace .. "/source.txt")
   await(function() return starts == 2 end, "queue did not advance")
   assert(executed() == 0, "checks ran between queued work under the default")
-  await(completed, "queue did not finish its completion checks")
+  await(completed_after(1), "queue did not finish its completion checks")
   assert(executed() == 1, "final gate lost the earlier queued edit")
   assert(vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner == owner,
     "the last item replaced the first change baseline")
@@ -118,14 +137,25 @@ local success, failure = xpcall(function()
   await(function() return vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner ~= owner end,
     "deletion batch did not capture its baseline")
   submit("Remove this pending item", true)
+  -- Edit the host-confirmed queued entry; until admission settles the composer only holds a local draft.
+  await(function()
+    for _, entry in ipairs(state.input.confirmed) do
+      if entry.text == "Remove this pending item" and entry.delivery == "queued" then return true end
+    end
+    return false
+  end, "queued item was not confirmed by the host")
   controller.edit_queued(-1)
+  assert(state.queue_edit, "queued item did not enter editing")
   vim.fn.writefile({ "third batch edit" }, workspace .. "/source.txt")
-  await(function() return not require("forge.views.harness.activity").busy(state) and state.checks_deferred end, "editing did not retain the deferred gate")
+  await(function() return not require("forge.views.harness.activity").busy(state) and host_deferred() end, "editing did not retain the deferred gate")
   assert(executed() == 2, "checks ran while queued work remained")
   submit("")
-  await(completed, "removing the final queued item did not run checks")
+  await(completed_after(3), "removing the final queued item did not run checks")
   assert(starts == 5 and executed() == 3, "queue removal lost validation or started deleted work: "
-    .. vim.inspect({ starts = starts, history = request("session.check.list").history }))
+    .. vim.inspect({ starts = starts, executed = executed(), history = vim.tbl_map(function(run)
+      return { trigger = run.context and run.context.trigger, state = run.state, owner = run.owner,
+        commands = vim.tbl_map(function(command) return { state = command.state, started_at_ms = command.started_at_ms, reused = command.reused_from ~= nil } end, run.commands), started_at_ms = run.started_at_ms }
+    end, request("session.check.list").history) }))
 
   submit("Work with automatic checks disabled")
   await(function() return starts == 6 end, "disabled-check work did not start")
@@ -152,7 +182,7 @@ local success, failure = xpcall(function()
   await(function() return vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner ~= owner end,
     "enabled-check work did not capture its baseline")
   vim.fn.writefile({ "edit after completion checking enabled" }, workspace .. "/source.txt")
-  await(completed, "enabled-check work did not complete")
+  await(completed_after(5), "enabled-check work did not complete")
   assert(executed() == 5, "re-enabling did not restore the completion gate: "
     .. vim.inspect({ automatic_checks = request("session.state.get").automatic_checks,
       history = vim.tbl_map(function(run)

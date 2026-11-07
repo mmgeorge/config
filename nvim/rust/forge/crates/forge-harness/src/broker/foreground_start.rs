@@ -63,6 +63,21 @@ impl HarnessBroker {
             }
         }
 
+        request.acknowledged_child_reports = attached_results
+            .iter()
+            .filter(|task| {
+                task.source == crate::agent::AgentSource::Model
+                    && task.parent_exchange_id == staged.exchange.id
+                    && matches!(
+                        task.state,
+                        ExchangeState::Interrupted
+                            | ExchangeState::Cancelled
+                            | ExchangeState::Failed
+                    )
+            })
+            .map(|task| task.id.clone().into())
+            .collect();
+
         // Every scoped callback must share the same owner-confirmed revision handle,
         // including scopes captured before the provider bridge clones this context.
         if let Some(context) = &mut request.control_context {
@@ -197,7 +212,7 @@ impl HarnessBroker {
             .run(),
             self.turn_cancellation.capture(),
             watchdog,
-        );
+        )?;
         let mut scan_interval = tokio::time::interval_at(
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),
@@ -222,7 +237,6 @@ impl HarnessBroker {
             native,
             native_open: true,
             collection: None,
-            idle_native_active: false,
             provider_event_sink,
             engine,
             steering: ProviderSteering {
@@ -232,6 +246,7 @@ impl HarnessBroker {
                 refresh_readiness: false,
             },
             agent_revision,
+            _agent_foreground_claim: self.agent_coordinator.claim_foreground(),
             question_changes: self.questions.changed.subscribe(),
             execution_receiver,
             pending_revision: None,

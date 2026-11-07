@@ -24,6 +24,20 @@ local function intact()
   assert(vim.api.nvim_win_get_buf(state.transcript_win) == state.transcript_buf)
   assert(vim.api.nvim_win_get_buf(state.composer_win) == state.composer_buf)
 end
+---@return integer[]
+local function foreign_harness_windows()
+  local foreign = {}
+  for _, window in ipairs(vim.api.nvim_list_wins()) do
+    local buffer = vim.api.nvim_win_get_buf(window)
+    if (buffer == state.transcript_buf or buffer == state.composer_buf)
+      and window ~= state.transcript_win and window ~= state.composer_win then
+      foreign[#foreign + 1] = window
+    end
+  end
+  return foreign
+end
+-- A script run with -l never idles in the main loop, so fire the idle event the lock observes.
+local function drain() vim.api.nvim_exec_autocmds("SafeState", {}) end
 
 for _, pane in ipairs({ "transcript_win", "composer_win" }) do
   open()
@@ -35,6 +49,20 @@ for _, pane in ipairs({ "transcript_win", "composer_win" }) do
     input(keys)
     intact()
   end
+  -- Neovim's :windo splits a 'winfixbuf' window before visiting windows, and netrw runs :windo at VimEnter.
+  vim.api.nvim_set_current_win(state[pane])
+  vim.cmd("windo echo")
+  drain()
+  local foreign = foreign_harness_windows()
+  assert(#foreign == 0, ":windo left unowned Harness windows " .. vim.inspect(foreign))
+  assert(vim.api.nvim_get_current_win() == state[pane], "rejecting the :windo split lost the focused pane")
+  intact()
+  vim.cmd("new")
+  local scratch_window = vim.api.nvim_get_current_win()
+  drain()
+  assert(vim.api.nvim_win_is_valid(scratch_window), "the pane lock closed a split showing a foreign buffer")
+  vim.api.nvim_win_close(scratch_window, true)
+  vim.api.nvim_set_current_win(state[pane])
   local preview = vim.api.nvim_create_buf(false, true)
   workspace.set_buffer(state.transcript_win, preview)
   assert(vim.wo[state.transcript_win].winfixbuf)

@@ -6,26 +6,48 @@ use crate::provider::ProviderError;
 type Result<T> = std::result::Result<T, ProviderError>;
 use tokio::sync::Notify;
 
-use crate::provider::ProviderEvent;
+use super::OwnerObservation;
+use crate::provider::HarnessEvent;
 
 /// Distinguish explicitly collected owners from a native observation failure.
 #[derive(Clone, Debug)]
 pub(crate) enum ObservationEnd {
-    Collected(super::OwnerCloseReason),
-    Lost(forge_provider_api::lifecycle::ObservationFailure),
+    Collected {
+        reason: super::OwnerCloseReason,
+        retired_binding: Option<forge_provider_api::BindingId>,
+    },
+    Lost {
+        failure: forge_provider_api::lifecycle::ObservationFailure,
+        retired_binding: Option<forge_provider_api::BindingId>,
+    },
+}
+
+/// Capture an actual source boundary that may release a deferred configuration intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeAvailabilityReceipt {
+    TurnCollected {
+        binding_id: forge_provider_api::BindingId,
+        sequence: forge_provider_api::EventSequence,
+    },
+    AgentEnded {
+        binding_id: forge_provider_api::BindingId,
+        sequence: forge_provider_api::EventSequence,
+    },
+    BindingRetired(forge_provider_api::BindingId),
 }
 
 /// Retain provider session events while the foreground request owns the broker.
 #[derive(Default)]
 pub(crate) struct SessionObservationInbox {
-    pending: Mutex<VecDeque<ProviderEvent>>,
+    pending: Mutex<VecDeque<OwnerObservation>>,
     ready: Notify,
     closed: Arc<AtomicBool>,
     monitor_closed: Arc<Notify>,
     failure_reported: AtomicBool,
-    idle_settlement_requested: AtomicBool,
     failure: Mutex<Option<forge_provider_api::lifecycle::ObservationFailure>>,
     collected: Mutex<Option<super::OwnerCloseReason>>,
+    retired_binding: Mutex<Option<forge_provider_api::BindingId>>,
+    availability: Mutex<Option<NativeAvailabilityReceipt>>,
     watchdogs: Mutex<
         HashMap<
             crate::provider::InvocationId,
@@ -46,18 +68,63 @@ impl SessionObservationInbox {
         if !self.is_closed() {
             return None;
         }
+        let retired_binding = self
+            .retired_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(failure) = self
             .failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            return Some(ObservationEnd::Lost(failure));
+            return Some(ObservationEnd::Lost {
+                failure,
+                retired_binding,
+            });
         }
         self.collected
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map(ObservationEnd::Collected)
+            .map(|reason| ObservationEnd::Collected {
+                reason,
+                retired_binding,
+            })
+    }
+
+    /// Get the last accepted native availability boundary, without treating it as collection proof.
+    pub(crate) fn configuration_availability(&self) -> Option<NativeAvailabilityReceipt> {
+        self.availability
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Retain only an actual closed binding generation without changing the original observation cause.
+    pub(crate) fn record_retired_binding(
+        &self,
+        binding: forge_provider_api::BindingId,
+    ) -> Result<()> {
+        let mut retired = self
+            .retired_binding
+            .lock()
+            .map_err(|_| inbox_poisoned("retired binding receipt lock poisoned"))?;
+        if retired
+            .as_ref()
+            .is_some_and(|previous| previous != &binding)
+        {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            ));
+        }
+        *self
+            .availability
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(NativeAvailabilityReceipt::BindingRetired(binding.clone()));
+        *retired = Some(binding);
+        Ok(())
     }
 
     /// Publish collected resource ownership without inventing native execution completion.
@@ -67,16 +134,6 @@ impl SessionObservationInbox {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
         self.close();
-    }
-    /// Wake the session owner when a foreground admission finds idle host work.
-    pub(crate) fn request_idle_settlement(&self) {
-        self.idle_settlement_requested
-            .store(true, Ordering::Release);
-        self.ready.notify_one();
-    }
-
-    pub(crate) fn take_idle_settlement_request(&self) -> bool {
-        self.idle_settlement_requested.swap(false, Ordering::AcqRel)
     }
     /// Close observation only after the native owner has stopped publishing.
     pub(crate) fn close(&self) {
@@ -110,7 +167,7 @@ impl SessionObservationInbox {
     }
 
     /// Queue a complete event before notifying either idle or active broker delivery.
-    pub(crate) fn push(&self, event: ProviderEvent) -> Result<()> {
+    pub(crate) fn push(&self, event: HarnessEvent) -> Result<()> {
         self.observe_tools(&event)?;
         let mut pending = self
             .pending
@@ -124,14 +181,115 @@ impl SessionObservationInbox {
                 forge_provider_api::lifecycle::ObservationFailure::Overflow,
             ));
         }
-        pending.push_back(event);
+        let availability = match &event {
+            HarnessEvent::Native { source, event, .. } => match event.as_ref() {
+                forge_provider_api::ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::Completed(_),
+                    ..
+                } => Some(NativeAvailabilityReceipt::TurnCollected {
+                    binding_id: source.binding_id.clone(),
+                    sequence: source.sequence,
+                }),
+                forge_provider_api::ProviderEvent::Agent {
+                    event:
+                        forge_provider_api::agent::AgentEvent::Lifecycle {
+                            event: forge_provider_api::agent::AgentLifecycleEvent::Finished { .. },
+                        },
+                    ..
+                } => Some(NativeAvailabilityReceipt::AgentEnded {
+                    binding_id: source.binding_id.clone(),
+                    sequence: source.sequence,
+                }),
+                _ => None,
+            },
+            HarnessEvent::Host { .. } => None,
+        };
+        if let Some(availability) = availability {
+            *self
+                .availability
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(availability);
+        }
+        pending.push_back(OwnerObservation::Event(event));
+        drop(pending);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// Preserve events and actual input receipts in one ordered owner queue.
+    pub(crate) fn push_observation(&self, observation: OwnerObservation) -> Result<()> {
+        match observation {
+            OwnerObservation::Event(event) => self.push(event),
+            OwnerObservation::HostFileChange {
+                binding_id,
+                scope,
+                change,
+            } => {
+                if scope != change.scope {
+                    return Err(ProviderError::Observation(
+                        forge_provider_api::ObservationFailure::OwnershipConflict,
+                    ));
+                }
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .map_err(|_| inbox_poisoned("session event inbox poisoned"))?;
+                if self.is_closed() {
+                    return Err(inbox_poisoned("session observation generation is closed"));
+                }
+                if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
+                    return Err(ProviderError::Observation(
+                        forge_provider_api::ObservationFailure::Overflow,
+                    ));
+                }
+                pending.push_back(OwnerObservation::HostFileChange {
+                    binding_id,
+                    scope,
+                    change,
+                });
+                drop(pending);
+                self.ready.notify_one();
+                Ok(())
+            }
+            OwnerObservation::InputAcceptance {
+                scope,
+                receipt,
+                presentation,
+            } => self.push_acceptance(scope, receipt, presentation),
+        }
+    }
+
+    /// Retain a committed input receipt without publishing a native or host event.
+    pub(crate) fn push_acceptance(
+        &self,
+        scope: crate::provider::InvocationScope,
+        receipt: Arc<crate::provider::submission::Submission>,
+        presentation: super::InputPresentation,
+    ) -> Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| inbox_poisoned("session event inbox poisoned"))?;
+        if self.is_closed() {
+            return Err(inbox_poisoned("session observation generation is closed"));
+        }
+        if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow,
+            ));
+        }
+        pending.push_back(OwnerObservation::InputAcceptance {
+            scope,
+            receipt,
+            presentation,
+        });
         drop(pending);
         self.ready.notify_one();
         Ok(())
     }
 
     /// Notify every retained attempt watchdog before foreground or idle delivery.
-    fn observe_tools(&self, event: &ProviderEvent) -> Result<()> {
+    fn observe_tools(&self, event: &HarnessEvent) -> Result<()> {
         if let Some(scope) = event.scope().invocation() {
             let watchdogs: Vec<_> = self
                 .watchdogs
@@ -145,13 +303,34 @@ impl SessionObservationInbox {
             for watchdog in watchdogs {
                 watchdog.observe(event).map_err(|error| {
                     crate::provider::lifecycle_error::classify(
-                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        forge_provider_api::error::ProviderOperation::TurnStart,
                         error,
                     )
                 })?;
             }
         }
         Ok(())
+    }
+
+    /// Force expiry in every routed watchdog that has armed an execution deadline.
+    ///
+    /// Returns how many watchdogs were triggered. Tool observations reach the watchdog
+    /// asynchronously, so tests retry until a deadline is armed instead of waiting for it.
+    #[cfg(test)]
+    pub(crate) fn expire_running_tool_deadlines(&self) -> Result<usize> {
+        let armed: Vec<_> = self
+            .watchdogs
+            .lock()
+            .map_err(|_| inbox_poisoned("tool watchdog registry poisoned"))?
+            .values()
+            .flatten()
+            .filter_map(Weak::upgrade)
+            .filter(|watchdog| watchdog.has_running_deadline())
+            .collect();
+        for watchdog in &armed {
+            watchdog.force_expiry();
+        }
+        Ok(armed.len())
     }
 
     /// Route late command observations to the watchdog that owns their original invocation.
@@ -184,7 +363,7 @@ impl SessionObservationInbox {
         {
             previous.retire_idle().map_err(|error| {
                 crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::InputSubmit,
+                    forge_provider_api::error::ProviderOperation::TurnStart,
                     error,
                 )
             })?;
@@ -202,7 +381,7 @@ impl SessionObservationInbox {
     ) -> Result<()> {
         watchdog.finish_foreground().map_err(|error| {
             crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderOperation::TurnStart,
                 error,
             )
         })?;
@@ -229,7 +408,7 @@ impl SessionObservationInbox {
             {
                 let failure = self.retain_watchdog_failure(
                     crate::provider::lifecycle_error::classify_source(
-                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        forge_provider_api::error::ProviderOperation::TurnStart,
                         &error,
                     ),
                 );
@@ -251,46 +430,41 @@ impl SessionObservationInbox {
                     let timeout = tokio::select! {
                         biased;
                         () = wait_for_close(&closed, &monitor_closed) => return Ok(()),
-                        timeout = watchdog.expired() => timeout.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::InputSubmit, error))?,
+                        timeout = watchdog.expired() => timeout.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::TurnStart, error))?,
                     };
                     let Some(timeout) = timeout else {
                         if !tokio::select! {
                             biased;
                             () = wait_for_close(&closed, &monitor_closed) => Ok(false),
-                            resumed = watchdog.resumed() => resumed.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::InputSubmit, error)),
+                            resumed = watchdog.resumed() => resumed.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::TurnStart, error)),
                         }? {
                             return Ok(());
                         }
                         continue;
                     };
+                    // The attached foreground fails its exchange and collects the native turn
+                    // itself. Collecting here as well closed the observation stream the
+                    // foreground was still reading, so its failure settlement could stop in
+                    // Finalizing. Only a deadline left unreported by the released foreground is
+                    // the monitor's to collect.
+                    tokio::select! {
+                        biased;
+                        () = wait_for_close(&closed, &monitor_closed) => return Ok(()),
+                        released = watchdog.foreground_released() => released.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::TurnStart, error))?,
+                    }
+                    if !timeout.claim_report() {
+                        return Ok(());
+                    }
                     let publication = (|| -> Result<()> {
-                        if !timeout.claim_report() {
-                            return Ok(());
-                        }
                         let Some(inbox) = inbox.upgrade() else {
                             return Ok(());
                         };
-                        inbox.push(ProviderEvent::Tool {
-                            address: timeout.address.clone(),
-                            update: crate::provider::ToolUpdate::Finished {
-                                outcome: crate::provider::ToolOutcome::Failed {
-                                    diagnostic: crate::provider::ToolDiagnostic {
-                                        kind: forge_provider_api::ProviderFailureKind::Timeout,
-                                        message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
-                                            .expect("static diagnostic is nonempty"),
-                                    },
-                                },
-                            },
-                        })?;
-                        inbox.push(ProviderEvent::Diagnostic {
-                            scope: scope.clone().into(),
-                            diagnostic: crate::provider::ProviderDiagnostic {
-                                kind: forge_provider_api::ProviderFailureKind::Timeout,
-                                message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
-                                    .expect("static diagnostic is nonempty"),
-                                fatal: true,
-                            },
-                        })
+                        inbox.push(HarnessEvent::Host { scope: scope.clone().into(), event: crate::provider::HostEvent::Failure {
+                            failure: forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::TurnStart,
+                                forge_provider_api::ProviderFailureKind::Timeout),
+                            message: forge_provider_api::SanitizedMessage::new("Tool execution timed out").expect("static text is nonempty"),
+                        } })
+
                     })();
                     if let Err(ProviderError::Observation(failure)) = &publication
                         && let Some(inbox) = inbox.upgrade()
@@ -313,15 +487,11 @@ impl SessionObservationInbox {
             if let Err(error) = result
                 && let Some(inbox) = inbox.upgrade()
             {
-                let _ = inbox.push(ProviderEvent::Diagnostic {
-                    scope: scope.into(),
-                    diagnostic: crate::provider::ProviderDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Runtime,
-                        message: forge_provider_api::SanitizedMessage::new("Tool timeout cleanup failed")
-                            .expect("static diagnostic is nonempty"),
-                        fatal: true,
-                    },
-                });
+                let _ = inbox.push(HarnessEvent::Host { scope: scope.into(), event: crate::provider::HostEvent::Failure {
+                    failure: forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::ThreadClose,
+                        forge_provider_api::ProviderFailureKind::Runtime),
+                    message: forge_provider_api::SanitizedMessage::new("Tool timeout cleanup failed").expect("static text is nonempty"),
+                } });
                 inbox.retain_watchdog_failure(error);
                 inbox.fail(forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable);
                 inbox.close();
@@ -349,7 +519,7 @@ impl SessionObservationInbox {
                 && !error.is_cancelled()
             {
                 self.retain_watchdog_failure(crate::provider::lifecycle_error::classify_source(
-                    forge_provider_api::error::ProviderOperation::InputSubmit,
+                    forge_provider_api::error::ProviderOperation::TurnStart,
                     &error,
                 ));
             }
@@ -395,12 +565,12 @@ impl SessionObservationInbox {
     }
 
     /// Take queued events in provider order without holding the lock during delivery.
-    pub(crate) fn drain(&self) -> Result<Vec<ProviderEvent>> {
+    pub(crate) fn drain(&self) -> Result<Vec<OwnerObservation>> {
         self.drain_up_to(usize::MAX)
     }
 
     /// Take only the prefix that fits its next owner, preserving sticky failure until a nonzero drain.
-    pub(crate) fn drain_up_to(&self, limit: usize) -> Result<Vec<ProviderEvent>> {
+    pub(crate) fn drain_up_to(&self, limit: usize) -> Result<Vec<OwnerObservation>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -449,7 +619,6 @@ impl SessionObservationInbox {
             .map_err(|_| inbox_poisoned("session event inbox poisoned"))?
             .is_empty();
         Ok(pending
-            || self.idle_settlement_requested.load(Ordering::Acquire)
             || (self.is_closed()
                 && self
                     .failure
@@ -463,7 +632,7 @@ impl SessionObservationInbox {
         let notified = self.ready.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if self.is_closed() || self.idle_settlement_requested.load(Ordering::Acquire) {
+        if self.is_closed() {
             return Ok(());
         }
         if !self
@@ -501,11 +670,11 @@ async fn wait_for_close(closed: &AtomicBool, changed: &Notify) {
     }
 }
 
-impl forge_provider_api::events::EventObserver for SessionObservationInbox {
+impl crate::provider::events::EventObserver for SessionObservationInbox {
     /// Route active invocation events to retained background watchdogs as well as the current attempt.
     fn before_delivery(
         &self,
-        event: &ProviderEvent,
+        event: &HarnessEvent,
     ) -> std::result::Result<(), forge_provider_api::events::EventDeliveryError> {
         self.observe_tools(event)
             .map_err(forge_provider_api::events::EventDeliveryError::transport)
@@ -515,7 +684,7 @@ impl forge_provider_api::events::EventObserver for SessionObservationInbox {
 /// Preserve typed inbox synchronization failures at the engine boundary.
 fn inbox_poisoned(_component: &'static str) -> ProviderError {
     ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
-        forge_provider_api::error::ProviderOperation::InputSubmit,
+        forge_provider_api::error::ProviderOperation::TurnStart,
         forge_provider_api::ProviderFailureKind::Runtime,
     ))
 }
@@ -561,14 +730,15 @@ mod tests {
         use forge_provider_api::{ProviderFailure, ProviderFailureKind, ProviderOperation};
         let inbox = super::SessionObservationInbox::default();
         let first = inbox.retain_watchdog_failure(
-            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Transport).into(),
-        );
-        let second = inbox.retain_watchdog_failure(
             ProviderFailure::new(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Transport,
             )
             .into(),
+        );
+        let second = inbox.retain_watchdog_failure(
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                .into(),
         );
         assert_eq!(first.collection().len(), 1);
         assert_eq!(second.collection().len(), 2);
@@ -592,13 +762,34 @@ mod tests {
     use super::*;
     use anyhow::Result;
 
-    fn fixture_diagnostic(message: impl Into<String>) -> crate::provider::ProviderDiagnostic {
-        crate::provider::ProviderDiagnostic {
-            kind: forge_provider_api::ProviderFailureKind::Unknown,
-            message: forge_provider_api::SanitizedMessage::new(message)
-                .expect("fixture diagnostic is nonempty"),
-            fatal: false,
+    /// Create a scoped host notification for queue ordering fixtures.
+    fn notice(scope: crate::provider::EventScope, message: impl Into<String>) -> HarnessEvent {
+        HarnessEvent::Host {
+            scope,
+            event: crate::provider::HostEvent::Failure {
+                failure: forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                ),
+                message: forge_provider_api::SanitizedMessage::new(message)
+                    .expect("fixture text is nonempty"),
+            },
         }
+    }
+    /// Create an original-owner tool observation for deadline fixtures.
+    fn tool_observation(
+        address: crate::provider::ToolAddress,
+        event: forge_provider_api::message::ItemEvent,
+    ) -> HarnessEvent {
+        crate::provider::test_support::native_event(
+            address.turn.scope.clone(),
+            forge_provider_api::ProviderEvent::Item {
+                thread_id: address.turn.thread_id,
+                turn_id: address.turn.turn_id,
+                item_id: address.item_id,
+                event,
+            },
+        )
     }
 
     /// Accept sustained traffic above one inbox capacity when the owner drains each bounded window.
@@ -606,15 +797,12 @@ mod tests {
     fn bounded_draining_preserves_large_observation_stream() -> Result<()> {
         let inbox = SessionObservationInbox::default();
         let scope = crate::provider::EventScope::Binding {
-            owner: crate::provider::ExecutionOwner::root("session"),
+            owner: crate::provider::ThreadOwner::root("session"),
         };
         let mut observed = Vec::new();
         let count = forge_protocol::MAX_PENDING_FRAMES * 4;
         for index in 0..count {
-            inbox.push(ProviderEvent::Diagnostic {
-                scope: scope.clone(),
-                diagnostic: fixture_diagnostic(format!("frame-{index}: α🦀")),
-            })?;
+            inbox.push(notice(scope.clone(), format!("frame-{index}: α🦀")))?;
             if (index + 1) % forge_protocol::MAX_PENDING_FRAMES == 0 {
                 loop {
                     let prefix = inbox.drain_up_to(17)?;
@@ -623,10 +811,14 @@ mod tests {
                     }
                     assert!(prefix.len() <= 17);
                     for frame in prefix {
-                        let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
+                        let OwnerObservation::Event(HarnessEvent::Host {
+                            event: crate::provider::HostEvent::Failure { message, .. },
+                            ..
+                        }) = frame
+                        else {
                             anyhow::bail!("bounded transfer changed an observation");
                         };
-                        observed.push(diagnostic.message.to_string());
+                        observed.push(message.to_string());
                     }
                 }
             }
@@ -648,11 +840,13 @@ mod tests {
     fn bounded_drain_preserves_full_prefix_and_does_not_acknowledge_loss_without_capacity()
     -> Result<()> {
         let inbox = SessionObservationInbox::default();
-        let event = |index| ProviderEvent::Diagnostic {
-            scope: crate::provider::EventScope::Binding {
-                owner: crate::provider::ExecutionOwner::root("session"),
-            },
-            diagnostic: fixture_diagnostic(format!("frame-{index:03}: α🦀")),
+        let event = |index| {
+            notice(
+                crate::provider::EventScope::Binding {
+                    owner: crate::provider::ThreadOwner::root("session"),
+                },
+                format!("frame-{index:03}: α🦀"),
+            )
         };
         for index in 0..forge_protocol::MAX_PENDING_FRAMES {
             inbox.push(event(index))?;
@@ -672,10 +866,14 @@ mod tests {
             let prefix = inbox.drain_up_to(17)?;
             assert!(!prefix.is_empty() && prefix.len() <= 17);
             for frame in prefix {
-                let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
+                let OwnerObservation::Event(HarnessEvent::Host {
+                    event: crate::provider::HostEvent::Failure { message, .. },
+                    ..
+                }) = frame
+                else {
                     anyhow::bail!("partial drain changed a frame");
                 };
-                observed.push(diagnostic.message.to_string());
+                observed.push(message.to_string());
             }
             assert!(
                 !inbox.ready_for_replacement()?,
@@ -735,24 +933,10 @@ mod tests {
                     label: "Watchdog collection fixture".into(),
                     capability: Default::default(),
                 },
-                move |request, sink, mut cancelled| {
+                move |request, _sink, start, mut cancelled| {
                     let entered = entered.clone();
                     async move {
-                        let address = crate::provider::TurnAddress {
-                            scope: request.scope.clone(),
-                            thread_id: "thread".into(),
-                            turn_id: "admitted".into(),
-                        };
-                        sink.send_wait(ProviderEvent::Execution {
-                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                                request.scope.clone(),
-                                forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                                    address: address.clone(),
-                                },
-                            )
-                            .expect("fixture native address belongs to its invocation"),
-                        })
-                        .await?;
+                        start.observed(1).await?;
                         entered.add_permits(1);
                         loop {
                             if *cancelled.borrow_and_update() {
@@ -762,19 +946,10 @@ mod tests {
                                 return Err(ProviderError::DeliveryUncertain);
                             }
                         }
-                        sink.send_wait(ProviderEvent::Execution {
-                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                                request.scope,
-                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                                    address, covered_submissions: vec![request.submission_id],
-                                    completed_at_ms: crate::provider::retry::now_ms(),
-                                    result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
-                                        completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                                    },
-                                },
-                            ).expect("fixture cancellation covers its admitted input"),
-                        }).await?;
-                        Ok(())
+                        Ok(crate::provider::test_support::native_result(
+                            &request,
+                            forge_provider_api::turn::TurnOutcome::Interrupted,
+                        ))
                     }
                 },
             );
@@ -782,14 +957,14 @@ mod tests {
             let provider = session.provider_handle();
             let registry = super::super::SessionExecutionRegistry::new(provider.clone(), trace);
             let scope = crate::provider::InvocationScope::new(
-                crate::provider::ExecutionOwner::root("session"),
+                crate::provider::ThreadOwner::root("session"),
                 "exchange",
             );
             let engine = registry.owner(scope.owner.clone()).await?;
             let input = crate::provider::ProviderRequest {
                 dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: Some(scope.owner.clone()),
-                harness_session_id: scope.owner.session_id.to_string(),
+                harness_session_id: scope.owner.session_id().to_string(),
                 workspace: directory.path().to_string_lossy().into_owned(),
                 input: crate::provider::ProviderInput::from_text("timeout fixture"),
                 mode: crate::provider::PromptMode::Chat,
@@ -801,13 +976,14 @@ mod tests {
                 approval_mode: crate::session::ApprovalMode::Ask,
                 provider_session_id: None,
                 submission: None,
+                acknowledged_child_reports: Vec::new(),
                 recovered_input: Vec::new(),
                 control_context: None,
             };
             let turn = crate::provider::TurnAddress {
                 scope: scope.clone(),
-                thread_id: "thread".into(),
-                turn_id: "admitted".into(),
+                thread_id: scope.owner.thread_id(),
+                turn_id: scope.turn_id()?,
             };
             let (sink, _events) = crate::provider::events::channel(scope.clone());
             let running = engine.clone();
@@ -827,7 +1003,9 @@ mod tests {
     }
 
     /// Preserve typed loss and still cancel native work when timeout publication meets a full inbox.
-    #[tokio::test]
+    ///
+    /// The paused clock auto-advances to the watchdog deadline once the stalled fixture idles.
+    #[tokio::test(start_paused = true)]
     async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
         let work = AdmittedWork::start().await?;
         let scope = work.scope.clone();
@@ -839,24 +1017,23 @@ mod tests {
             },
         )?);
         inbox.watch_tools(&scope, &watchdog)?;
-        inbox.push(ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
+        inbox.push(tool_observation(
+            crate::provider::ToolAddress {
                 turn: work.turn.clone(),
-                tool_id: "stalled".into(),
+                item_id: forge_provider_api::ItemId::new("stalled").unwrap(),
             },
-            update: crate::provider::ToolUpdate::Started,
-        })?;
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))?;
         let event_count = forge_protocol::MAX_PENDING_FRAMES;
         for _ in 1..event_count {
-            inbox.push(ProviderEvent::Diagnostic {
-                scope: scope.clone().into(),
-                diagnostic: crate::provider::ProviderDiagnostic {
-                    kind: forge_provider_api::ProviderFailureKind::Unknown,
-                    message: forge_provider_api::SanitizedMessage::new("accepted output")
-                        .expect("fixture diagnostic is nonempty"),
-                    fatal: false,
-                },
-            })?;
+            inbox.push(notice(
+                scope.clone().into(),
+                forge_provider_api::SanitizedMessage::new("accepted output")
+                    .expect("fixture diagnostic is nonempty")
+                    .to_string(),
+            ))?;
         }
         inbox.start_tool_monitor(scope, watchdog, work.provider.clone())?;
         let cancellation =
@@ -899,8 +1076,69 @@ mod tests {
         Ok(())
     }
 
+    /// Leave timeout collection to the attached foreground, then collect an unreported expiry.
+    ///
+    /// Both the foreground and this monitor observe one deadline. A monitor that also collected
+    /// closed the observation stream under the foreground's failure settlement. The paused clock
+    /// auto-advances to the deadline once the stalled fixture idles.
+    #[tokio::test(start_paused = true)]
+    async fn attached_foreground_owns_timeout_collection_until_release() -> Result<()> {
+        let mut work = AdmittedWork::start().await?;
+        let scope = work.scope.clone();
+        let inbox = Arc::new(SessionObservationInbox::default());
+        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
+            crate::session::InputTimeout {
+                amount: 1,
+                unit: crate::session::TimeoutUnit::S,
+            },
+        )?);
+        let owner = crate::provider::tool_timeout::ForegroundToolOwner::attach(watchdog.clone())?;
+        inbox.watch_tools(&scope, &watchdog)?;
+        inbox.push(tool_observation(
+            crate::provider::ToolAddress {
+                turn: work.turn.clone(),
+                item_id: forge_provider_api::ItemId::new("stalled").unwrap(),
+            },
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))?;
+        assert_eq!(inbox.drain()?.len(), 1);
+        inbox.start_tool_monitor(scope, watchdog.clone(), work.provider.clone())?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            watchdog.timeout()?.is_some(),
+            "the fixture deadline did not elapse"
+        );
+        assert!(
+            !work.result.is_finished(),
+            "the monitor collected native work owned by its foreground"
+        );
+        assert!(
+            inbox.drain()?.is_empty(),
+            "the monitor reported a timeout owned by its foreground"
+        );
+        drop(owner);
+        let cancellation =
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut work.result).await??;
+        assert!(
+            matches!(cancellation, Err(ProviderError::Cancelled)),
+            "{cancellation:?}"
+        );
+        assert!(inbox.drain()?.iter().any(|event| matches!(event,
+            OwnerObservation::Event(HarnessEvent::Host { event: crate::provider::HostEvent::Failure { failure, .. }, .. })
+                if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)));
+        inbox.close();
+        inbox.retire_background().await?;
+        work.registry.close().await?;
+        work.provider.shutdown().await?;
+        Ok(())
+    }
+
     /// Keep timeout observation alive for admitted native work after its result waiter has gone.
-    #[tokio::test]
+    ///
+    /// The paused clock auto-advances to the watchdog deadline once the admitted fixture idles.
+    #[tokio::test(start_paused = true)]
     async fn admitted_execution_rearms_tool_deadlines_without_a_result_waiter() -> Result<()> {
         let work = AdmittedWork::start().await?;
         work.result.abort();
@@ -918,26 +1156,30 @@ mod tests {
         inbox.monitor_background(scope.clone(), watchdog, work.provider.clone())?;
         assert!(inbox.drain()?.is_empty());
         let turn = work.turn.clone();
-        inbox.push(ProviderEvent::Execution {
-            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                scope.clone(),
-                forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                    address: turn.clone(),
-                },
-            )?,
-        })?;
-        inbox.push(ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
-                turn,
-                tool_id: "admitted-tool".into(),
+        inbox.push(crate::provider::test_support::native_event(
+            turn.scope.clone(),
+            forge_provider_api::ProviderEvent::Turn {
+                thread_id: turn.thread_id.clone(),
+                turn_id: turn.turn_id.clone(),
+                event: forge_provider_api::TurnEvent::Started(
+                    forge_provider_api::turn::TurnStarted { started_at_ms: 1 },
+                ),
             },
-            update: crate::provider::ToolUpdate::Started,
-        })?;
+        ))?;
+        inbox.push(tool_observation(
+            crate::provider::ToolAddress {
+                turn,
+                item_id: forge_provider_api::ItemId::new("admitted-tool").unwrap(),
+            },
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))?;
         assert_eq!(inbox.drain()?.len(), 2);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if inbox.drain()?.iter().any(|event| matches!(event,
-                    ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Timeout)) {
+                    OwnerObservation::Event(HarnessEvent::Host { event: crate::provider::HostEvent::Failure { failure, .. }, .. }) if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)) {
                     return Ok::<(), anyhow::Error>(());
                 }
                 inbox.notified().await?;
@@ -958,66 +1200,79 @@ mod tests {
         Ok(())
     }
 
-    /// Route a late background completion to its retired watchdog after a new attempt registers.
+    /// Route a late background completion to its original scope after a new attempt registers.
     #[tokio::test(start_paused = true)]
     async fn retained_watchdogs_keep_their_original_background_tools() -> Result<()> {
         let inbox = Arc::new(SessionObservationInbox::default());
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("session"),
-            "exchange",
-        );
+        let owner = crate::provider::ThreadOwner::root("session");
+        let first_scope = crate::provider::InvocationScope::new(owner.clone(), "first");
+        let second_scope = crate::provider::InvocationScope::new(owner, "second");
         let address = crate::provider::ToolAddress {
             turn: crate::provider::TurnAddress {
-                scope: scope.clone(),
-                thread_id: "thread".into(),
-                turn_id: "first".into(),
+                thread_id: first_scope.owner.thread_id().clone(),
+                turn_id: first_scope.turn_id()?,
+                scope: first_scope.clone(),
             },
-            tool_id: "background".into(),
+            item_id: forge_provider_api::ItemId::new("background").unwrap(),
         };
         let timeout = crate::session::InputTimeout {
             amount: 1,
             unit: crate::session::TimeoutUnit::S,
         };
         let first = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
-        first.observe(&ProviderEvent::Tool {
-            address: address.clone(),
-            update: crate::provider::ToolUpdate::Started,
-        })?;
-        first.observe(&ProviderEvent::Tool {
-            address: address.clone(),
-            update: crate::provider::ToolUpdate::Backgrounded,
-        })?;
-        assert!(first.finish_foreground()?);
-        inbox.watch_tools(&scope, &first)?;
-        let second = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
-        inbox.watch_tools(&scope, &second)?;
-        let (sink, _stream) = crate::provider::events::channel(scope);
-        let sink = sink.with_observer(inbox.clone());
-        sink.send_wait(ProviderEvent::Tool {
-            address: address.clone(),
-            update: crate::provider::ToolUpdate::Finished {
-                outcome: crate::provider::ToolOutcome::Succeeded,
+        first.observe(&tool_observation(
+            address.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
             },
-        })
-        .await?;
-        let mut later = address;
-        later.turn.turn_id = "second".into();
-        sink.send_wait(ProviderEvent::Tool {
-            address: later.clone(),
-            update: crate::provider::ToolUpdate::Started,
-        })
-        .await?;
-
+        ))?;
+        first.observe(&tool_observation(
+            address.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+            },
+        ))?;
+        assert!(first.finish_foreground()?);
+        inbox.watch_tools(&first_scope, &first)?;
+        let second = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
+        inbox.watch_tools(&second_scope, &second)?;
+        inbox.push(tool_observation(
+            address,
+            forge_provider_api::message::ItemEvent::Completed(
+                forge_provider_api::message::ItemCompletion::ToolCall(
+                    forge_provider_api::tool::ToolCompletion {
+                        outcome: crate::provider::ToolOutcome::Succeeded,
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    },
+                ),
+            ),
+        ))?;
+        let later = crate::provider::ToolAddress {
+            turn: crate::provider::TurnAddress {
+                thread_id: second_scope.owner.thread_id().clone(),
+                turn_id: second_scope.turn_id()?,
+                scope: second_scope,
+            },
+            item_id: forge_provider_api::ItemId::new("foreground").unwrap(),
+        };
+        inbox.push(tool_observation(
+            later.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))?;
         assert!(first.expired().await?.is_none());
         assert_eq!(second.expired().await?.unwrap().address, later);
         Ok(())
     }
 
-    /// Keep an older completed scope observable after a later exchange registers its own tracker.
+    /// Keep an admitted background item observable after another exchange registers its tracker.
     #[tokio::test(start_paused = true)]
     async fn distinct_retained_scopes_keep_idle_watchdogs() -> Result<()> {
         let inbox = Arc::new(SessionObservationInbox::default());
-        let owner = crate::provider::ExecutionOwner::root("session");
+        let owner = crate::provider::ThreadOwner::root("session");
         let first_scope = crate::provider::InvocationScope::new(owner.clone(), "first");
         let second_scope = crate::provider::InvocationScope::new(owner, "second");
         let timeout = crate::session::InputTimeout {
@@ -1025,33 +1280,39 @@ mod tests {
             unit: crate::session::TimeoutUnit::S,
         };
         let first = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
-        first.finish_foreground()?;
+        let tool = crate::provider::ToolAddress {
+            turn: crate::provider::TurnAddress {
+                thread_id: first_scope.owner.thread_id().clone(),
+                turn_id: first_scope.turn_id()?,
+                scope: first_scope.clone(),
+            },
+            item_id: forge_provider_api::ItemId::new("old-scope-tool").unwrap(),
+        };
+        first.observe(&tool_observation(
+            tool.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))?;
+        first.observe(&tool_observation(
+            tool.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+            },
+        ))?;
+        assert!(first.finish_foreground()?);
         inbox.watch_tools(&first_scope, &first)?;
         let second = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
         second.finish_foreground()?;
         inbox.watch_tools(&second_scope, &second)?;
-
-        let turn = crate::provider::TurnAddress {
-            scope: first_scope,
-            thread_id: "thread".into(),
-            turn_id: "reopened-first".into(),
-        };
-        inbox.push(ProviderEvent::Execution {
-            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                turn.scope.clone(),
-                forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                    address: turn.clone(),
-                },
-            )?,
-        })?;
-        let tool = crate::provider::ToolAddress {
-            turn,
-            tool_id: "old-scope-tool".into(),
-        };
-        inbox.push(ProviderEvent::Tool {
-            address: tool.clone(),
-            update: crate::provider::ToolUpdate::Started,
-        })?;
+        inbox.push(tool_observation(
+            tool.clone(),
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::TitleChanged(
+                    "still running".into(),
+                ),
+            },
+        ))?;
         assert_eq!(first.expired().await?.unwrap().address, tool);
         assert!(second.expired().await?.is_none());
         Ok(())
@@ -1069,27 +1330,27 @@ mod tests {
         while !failed.is_finished() {
             tokio::task::yield_now().await;
         }
-        inbox
-            .background_tasks
-            .lock()
-            .unwrap()
-            .spawn(std::future::pending());
+        let (release, pending) = tokio::sync::oneshot::channel();
+        inbox.background_tasks.lock().unwrap().spawn(async move {
+            let _ = pending.await;
+        });
         inbox.close();
-        assert!(inbox.retire_background().await.is_err());
+        let collection = inbox.retire_background();
+        tokio::pin!(collection);
+        assert!(futures_util::poll!(collection.as_mut()).is_pending());
+        release.send(()).unwrap();
+        assert!(collection.await.is_err());
         assert!(inbox.retire_background().await.is_err());
         assert!(
             inbox
-                .push(ProviderEvent::Diagnostic {
-                    scope: crate::provider::EventScope::Binding {
-                        owner: crate::provider::ExecutionOwner::root("session"),
+                .push(notice(
+                    crate::provider::EventScope::Binding {
+                        owner: crate::provider::ThreadOwner::root("session"),
                     },
-                    diagnostic: crate::provider::ProviderDiagnostic {
-                        kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new("stale")
-                            .expect("fixture diagnostic is nonempty"),
-                        fatal: false,
-                    },
-                })
+                    forge_provider_api::SanitizedMessage::new("stale")
+                        .expect("fixture diagnostic is nonempty")
+                        .to_string()
+                ))
                 .is_err()
         );
         Ok(())
@@ -1099,17 +1360,14 @@ mod tests {
     #[tokio::test]
     async fn failure_survives_until_preceding_events_drain() -> Result<()> {
         let inbox = SessionObservationInbox::default();
-        let event = ProviderEvent::Diagnostic {
-            scope: crate::provider::EventScope::Binding {
-                owner: crate::provider::ExecutionOwner::root("session"),
+        let event = notice(
+            crate::provider::EventScope::Binding {
+                owner: crate::provider::ThreadOwner::root("session"),
             },
-            diagnostic: crate::provider::ProviderDiagnostic {
-                kind: forge_provider_api::ProviderFailureKind::Unknown,
-                message: forge_provider_api::SanitizedMessage::new("before failure")
-                    .expect("fixture diagnostic is nonempty"),
-                fatal: false,
-            },
-        };
+            forge_provider_api::SanitizedMessage::new("before failure")
+                .expect("fixture diagnostic is nonempty")
+                .to_string(),
+        );
         inbox.push(event)?;
         inbox.fail(forge_provider_api::lifecycle::ObservationFailure::Overflow);
         inbox.close();
@@ -1132,20 +1390,22 @@ mod tests {
     #[tokio::test]
     async fn notification_retains_events_before_waiter_starts() -> Result<()> {
         let inbox = SessionObservationInbox::default();
-        let event = ProviderEvent::Tool {
-            address: crate::provider::ToolAddress {
+        let event = tool_observation(
+            crate::provider::ToolAddress {
                 turn: crate::provider::TurnAddress {
                     scope: crate::provider::InvocationScope::new(
-                        crate::provider::ExecutionOwner::root("session"),
+                        crate::provider::ThreadOwner::root("session"),
                         "exchange",
                     ),
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
+                    thread_id: forge_provider_api::ThreadId::new("thread").unwrap(),
+                    turn_id: forge_provider_api::TurnId::new("turn").unwrap(),
                 },
-                tool_id: "background".into(),
+                item_id: forge_provider_api::ItemId::new("background").unwrap(),
             },
-            update: crate::provider::ToolUpdate::Backgrounded,
-        };
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::Backgrounded,
+            },
+        );
         inbox.push(event)?;
         inbox.notified().await?;
         assert_eq!(inbox.drain()?.len(), 1);

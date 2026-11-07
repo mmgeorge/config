@@ -623,16 +623,13 @@ impl HarnessService {
         if let Some(params) = request.params.as_object_mut() {
             params.remove("_command");
         }
-        if cancellation::handles(&request)
-            || native_permission::handles(&request)
-            || native_settings::handles(&request)
-            || compaction::handles(&request)
-            || local_configuration::handles(&request)
-            || task_state::handles(&controller, &request)?
-        {
-            return Ok(());
-        }
-        anyhow::bail!("unsupported owner task action")
+        // Share the owner-command alias set with the transport coordinator, so an alias such as
+        // conversation-only undo is never admitted by one boundary and rejected by the other.
+        anyhow::ensure!(
+            command::handles_owner_command(&controller, &request)?,
+            "unsupported owner task action"
+        );
+        Ok(())
     }
 
     /// Route an operation without transferring a host-held execution permit.
@@ -872,15 +869,24 @@ impl HarnessService {
         let capture_stage = edit_trace
             .as_ref()
             .map(|trace| trace.stage("service.capture_submission"));
-        if matches!(
-            method,
-            RuntimeMethod::SessionPlanAccept
-                | RuntimeMethod::SessionPlanChangesRequest
-                | RuntimeMethod::SessionPlanCancel
-                | RuntimeMethod::SessionPlanEntityRename
-                | RuntimeMethod::SessionPlanTestDelete
-                | RuntimeMethod::SessionPlanCheckUpdate
-        ) {
+        // Normalization rewrites `session.plan.accept` into the `execute` owner command,
+        // so acceptance from PlanReview is recognized by its review document. Without
+        // this capture the command carries no reviewed digest and would accept
+        // whichever revision is latest instead of the one the user reviewed.
+        let reviewed_execute = method == RuntimeMethod::SessionCommandApply
+            && request.params["action"] == "execute"
+            && request.params.get("review").is_some();
+        if reviewed_execute
+            || matches!(
+                method,
+                RuntimeMethod::SessionPlanAccept
+                    | RuntimeMethod::SessionPlanChangesRequest
+                    | RuntimeMethod::SessionPlanCancel
+                    | RuntimeMethod::SessionPlanEntityRename
+                    | RuntimeMethod::SessionPlanTestDelete
+                    | RuntimeMethod::SessionPlanCheckUpdate
+            )
+        {
             let controller = registry.resolve(&session_id).await?;
             if !task_state::normalize_review_retry(&controller, &mut request).await? {
                 let params = request
@@ -924,6 +930,12 @@ impl HarnessService {
                         .as_object()
                         .context("plan review capture is not an object")?
                     {
+                        // Acceptance needs only the reviewed identity. Its saved comments
+                        // travel as draft annotations; passing them as execute
+                        // annotations would turn the acceptance into a revision request.
+                        if reviewed_execute && !matches!(key.as_str(), "plan_id" | "digest") {
+                            continue;
+                        }
                         params.insert(key.clone(), value.clone());
                     }
                 }
@@ -1451,7 +1463,7 @@ impl SessionController {
             return Ok(());
         }
         let mut schedule = self.observer.input_schedule.subscribe();
-        let owner = crate::provider::ExecutionOwner::root(
+        let owner = crate::provider::ThreadOwner::root(
             self.catalog_request.read().await.harness_session_id.clone(),
         );
         let mut feedback = self.permission.subscribe_timeout_feedback(&owner)?;
@@ -1993,7 +2005,18 @@ async fn route_request(
             .mock_response_control()
             .context("provider.mock_response requires the mock provider")?;
         let command = serde_json::from_value(request.params)?;
-        let result = control.dispatch(&session_id, command).await?;
+        let result = match command {
+            crate::provider::mock_response::MockResponseCommand::ExpireApproval => {
+                let owner = crate::provider::ThreadOwner::root(&session_id);
+                let expired_count = controller.permission.expire_pending_for_owner(&owner)?;
+                anyhow::ensure!(
+                    expired_count > 0,
+                    "no timed approval is pending for {session_id}"
+                );
+                serde_json::json!({ "expired": expired_count })
+            }
+            command => control.dispatch(&session_id, command).await?,
+        };
         message_sink
             .send_response(Response::success(request.id, result)?)
             .await?;
@@ -2035,14 +2058,6 @@ async fn route_request(
             SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
                 .load_preference(&selected.workspace, &selected.provider)?;
         crate::provider::select_model_settings(&mut model_list, preference.as_ref());
-        let event = if let Ok(mut broker) = controller.broker.try_lock() {
-            broker.resolve_default_model(&model_list)?
-        } else {
-            Vec::new()
-        };
-        for event in event {
-            message_sink.send_event(event).await?;
-        }
         message_sink
             .send_response(Response::success(request.id, model_list)?)
             .await?;
@@ -2181,6 +2196,7 @@ async fn route_request(
                     approval_mode: catalog.approval_mode,
                     provider_session_id: None,
                     submission: None,
+                    acknowledged_child_reports: Vec::new(),
                     recovered_input: Vec::new(),
                     control_context: None,
                 },
@@ -2450,7 +2466,7 @@ async fn start_session_fork(
     task.spawn(async move {
         let provider_started = Instant::now();
         let mut result = provider
-            .session_fork(preparation.provider_request)
+            .thread_fork(preparation.provider_request)
             .await
             .map_err(|error| format!("{error:#}"));
         if let Ok(result) = &mut result {
@@ -2569,7 +2585,7 @@ async fn delete_session(
         controller.broker.lock().await.release_lease()?;
     }
     let mut store = SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?;
-    let session = store.load_session(&target)?.context("session not found")?;
+    let session = crate::broker::SessionNotFound::require(store.load_session(&target)?, &target)?;
     let plans = crate::plan::PlanFileStore::new(
         std::path::Path::new(&registry.initialize.data_root),
         &session.workspace,

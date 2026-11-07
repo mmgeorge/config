@@ -47,7 +47,10 @@ impl DescendantTracker {
             }
         }
 
-        for lifecycle in super::decode::agent_lifecycle_list(message) {
+        // Normalization rejects a malformed collaboration item from this same message as a
+        // protocol failure, so ownership tracking only admits validated records.
+        let lifecycle_list = super::decode::agent_lifecycle_list(message).unwrap_or_default();
+        for lifecycle in lifecycle_list {
             if !lifecycle
                 .parent_thread_id
                 .as_deref()
@@ -62,10 +65,9 @@ impl DescendantTracker {
                 continue;
             }
             let resumes = lifecycle.status.is_active()
-                && matches!(
-                    lifecycle.operation.to_ascii_lowercase().as_str(),
-                    "sendinput" | "wait" | "resumeagent"
-                );
+                && lifecycle
+                    .tool
+                    .is_some_and(super::decode::CollabAgentTool::resumes_child);
             if lifecycle.starts_child || resumes {
                 self.owned_thread.insert(thread.clone());
             }
@@ -116,6 +118,7 @@ impl DescendantTracker {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn owns(&self, thread: &str) -> bool {
         self.owned_thread.contains(thread)
     }
@@ -127,6 +130,7 @@ impl DescendantTracker {
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn active_count(&self) -> usize {
         self.active_turn_by_thread.len()
     }
@@ -162,7 +166,7 @@ mod tests {
             "parent",
         );
         tracker.observe(&json!({"method":"item/completed","params":{"threadId":"foreign","item":{
-            "type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["foreign-child"],"status":"completed"
+            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"foreign","receiverThreadIds":["foreign-child"],"status":"completed"
         }}}), "parent");
         assert!(!tracker.owns("foreign"));
         assert!(!tracker.owns("foreign-child"));
@@ -173,7 +177,7 @@ mod tests {
     fn trusted_child_turn_is_retained_until_its_exact_completion() {
         let mut tracker = DescendantTracker::default();
         tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{
-            "type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"
+            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"parent","receiverThreadIds":["child"],"status":"completed"
         }}}), "parent");
         assert!(tracker.owns("child"));
         assert_eq!(tracker.active_count(), 1);
@@ -193,7 +197,7 @@ mod tests {
     fn retained_child_resumption_waits_for_a_new_turn_identity() {
         let mut tracker = DescendantTracker::default();
         tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{
-            "type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"
+            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"parent","receiverThreadIds":["child"],"status":"completed"
         }}}), "parent");
         tracker.observe(
             &json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"old"}}}),
@@ -205,7 +209,7 @@ mod tests {
         );
         tracker.observe(
             &json!({"method":"item/completed","params":{"threadId":"parent","item":{
-                "type":"collabAgentToolCall","tool":"wait","receiverThreadIds":["child"],
+                "type":"collabAgentToolCall","id":"wait","tool":"wait","senderThreadId":"parent","receiverThreadIds":["child"],
                 "agentsStates":{"child":{"status":"running"}},"status":"completed"
             }}}),
             "parent",

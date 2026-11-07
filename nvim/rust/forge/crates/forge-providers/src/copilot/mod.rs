@@ -1,4 +1,5 @@
 mod catalog;
+mod child_turn;
 mod client_generation;
 mod compaction;
 mod control;
@@ -17,8 +18,6 @@ mod operation;
 mod permission;
 mod prompt;
 pub(crate) mod provider;
-mod rejection;
-mod retry;
 mod runtime;
 mod session;
 mod session_directory;
@@ -33,3 +32,6 @@ mod tool_semantics;
 
 #[cfg(test)]
 mod test_peer;
+
+#[cfg(test)]
+mod test_turn;

@@ -120,7 +120,7 @@ impl OwnerShutdown {
                         // installs a replacement, whose observer must also be retired here.
                         let retirement = ShutdownRetirement {
                             registry: broker.execution_registry(),
-                            owner: crate::provider::ExecutionOwner::root(
+                            owner: crate::provider::ThreadOwner::root(
                                 services.observer.session_id(),
                             ),
                             inbox: services.observer.session_events(),
@@ -282,7 +282,7 @@ enum ShutdownState {
 /// Keep the exact final generation alive until native and observation collection succeeds.
 pub(super) struct ShutdownRetirement {
     registry: std::sync::Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
+    owner: crate::provider::ThreadOwner,
     inbox: std::sync::Arc<crate::provider::session_execution::SessionObservationInbox>,
 }
 

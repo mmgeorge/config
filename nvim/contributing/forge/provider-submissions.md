@@ -8,9 +8,9 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 `provider/submission.rs` owns `provider-submissions.sqlite3` under the current Harness `state/vN/` directory, using WAL and FULL synchronous commits and retaining that version's lifetime lease. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
 
-Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter reports delivery separately from execution completion. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
+Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter returns direct `InputAcceptance` from `turn_start` or typed steering acceptance from `turn_steer`, independently of the later canonical `Turn.Completed` event. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
 
-An explicit `NotConsumed` result proves that the addressed delivery did not consume input; it carries no native continuation authority. The host may retain that input for a later explicitly owned admission after the previous invocation settles. That admission uses ordinary `input_submit`, a fresh invocation scope, and a fresh delivery attempt for the original journal entry. An accepted result, disconnect, or unknown outcome never permits replay. Native terminal coverage, native resource settlement, and host commit all precede the completed host result.
+An explicit `NotConsumed` result proves that the addressed delivery did not consume input; it carries no native continuation authority. The host may retain that input for a later explicitly owned admission after the previous invocation settles. That admission uses ordinary `turn_start`, a fresh invocation scope, and a fresh delivery attempt for the original journal entry. An accepted result, disconnect, or unknown outcome never permits replay. Native terminal coverage, native resource settlement, and host commit all precede the completed host result.
 
 | State | Meaning |
 | --- | --- |
@@ -60,7 +60,7 @@ The [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle)
 
 ## Recovery before the next prompt
 
-Before a later prompt dispatches, the runner reconciles older uncertain entries. It includes only definitely undelivered inputs as earlier context, keeping their order, skills, and attachments. Later queued inputs cannot be included in an earlier submission. Acceptance of a combined message commits all included inputs in one transaction, so a failed commit leaves them recoverable without authorizing duplicate execution.
+Before a later prompt dispatches, the runner reconciles older uncertain entries. It includes only definitely undelivered inputs as earlier context, keeping their order, skills, and attachments. Later queued inputs cannot be included in an earlier submission. Acceptance of a combined message commits all included inputs in one transaction, so a failed commit leaves them recoverable without authorizing duplicate execution. Each recovered input carries its original `CoveredInput { submission_id, attempt_id }`; the native `TurnResult` covers those exact attempts and the current input together. A new grouped prompt cannot rewrite an earlier input's journal identity.
 
 Failure to reconcile blocks dispatch and reports the last error, keeping both the earlier input and the newest prompt saved. A timeout after dispatch cannot enter the steering fallback queue. Accepted but unfinished work stays a failed or interrupted exchange rather than being relabeled as missing input.
 

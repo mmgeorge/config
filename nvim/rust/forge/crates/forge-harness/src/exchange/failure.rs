@@ -72,12 +72,12 @@ impl OperationFailure {
         let reason = match self {
             Self::InputReconciliation(error) => {
                 let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderOperation::TurnStart,
                     error,
                 );
                 format!(
                     "Input receipt reconciliation failed ({:?})",
-                    diagnostic.kind
+                    diagnostic.kind()
                 )
             }
             Self::Validation(source) => {
@@ -94,12 +94,12 @@ impl OperationFailure {
             }
             Self::Reconciliation(error) => {
                 let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                    forge_provider_api::ProviderOperation::SessionConfigure,
+                    forge_provider_api::ProviderOperation::ThreadConfigure,
                     error,
                 );
                 format!(
                     "Provider settings application failed ({:?})",
-                    diagnostic.kind
+                    diagnostic.kind()
                 )
             }
             Self::Transition(TransitionFailure::Domain(_)) => {

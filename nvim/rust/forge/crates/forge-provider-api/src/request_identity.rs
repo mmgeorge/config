@@ -31,7 +31,8 @@ impl<T: ?Sized> Eq for AuthorityIdentity<T> {}
 /// upgrade or exercise that authority. The enclosing retained record determines key lifetime.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SessionRequestIdentity {
-    owner: ExecutionOwner,
+    thread_id: crate::ThreadId,
+    owner: ThreadOwner,
     mode: SessionMode,
     workspace: String,
     history: SessionHistory,
@@ -46,6 +47,7 @@ impl From<&SessionRequest> for SessionRequestIdentity {
     /// Snapshot the complete open request without retaining live resource owners.
     fn from(request: &SessionRequest) -> Self {
         let SessionRequest {
+            thread_id,
             owner,
             mode,
             workspace,
@@ -58,6 +60,7 @@ impl From<&SessionRequest> for SessionRequestIdentity {
             trace,
         } = request;
         Self {
+            thread_id: thread_id.clone(),
             owner: owner.clone(),
             mode: *mode,
             workspace: workspace.clone(),
@@ -79,6 +82,8 @@ impl From<&SessionRequest> for SessionRequestIdentity {
 /// The values include input and credentials and must not be logged or treated as authority.
 #[derive(Clone, Eq, PartialEq)]
 pub struct PromptRequestIdentity {
+    thread_id: crate::ThreadId,
+    turn_id: crate::TurnId,
     scope: InvocationScope,
     mode: PromptMode,
     configuration: InvocationConfiguration,
@@ -103,6 +108,8 @@ impl From<&PromptRequest> for PromptRequestIdentity {
     /// Snapshot every input and authority field, making future fields a compile-time obligation.
     fn from(request: &PromptRequest) -> Self {
         let PromptRequest {
+            thread_id,
+            turn_id,
             scope,
             mode,
             configuration,
@@ -124,6 +131,8 @@ impl From<&PromptRequest> for PromptRequestIdentity {
             host_effects,
         } = request;
         Self {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
             scope: scope.clone(),
             mode: *mode,
             configuration: configuration.clone(),
@@ -217,7 +226,8 @@ mod tests {
         let trace: Arc<dyn ProviderTrace> = Arc::new(Trace);
         let trace_lifetime = Arc::downgrade(&trace);
         let request = SessionRequest {
-            owner: ExecutionOwner::root("weak-operation-owner"),
+            thread_id: (ThreadOwner::root("weak-operation-owner")).thread_id(),
+            owner: ThreadOwner::root("weak-operation-owner"),
             mode: SessionMode::Interactive,
             workspace: "fixture".into(),
             history: SessionHistory::Durable { resume: None },
@@ -246,7 +256,7 @@ mod tests {
         store
             .observe(
                 context.clone(),
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 identity.clone(),
                 async move {
                     drop(request);
@@ -255,7 +265,7 @@ mod tests {
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionOpen,
+                            ProviderOperation::ThreadOpen,
                             ProviderPhase::Preparation,
                             FailureDisposition::Uncertain,
                         ),
@@ -272,13 +282,13 @@ mod tests {
         store
             .observe(
                 context,
-                ProviderOperation::SessionOpen,
+                ProviderOperation::ThreadOpen,
                 identity,
                 async { panic!("cached operation must not dispatch again") },
                 |reason| {
                     Interruption::new(
                         reason.failure(
-                            ProviderOperation::SessionOpen,
+                            ProviderOperation::ThreadOpen,
                             ProviderPhase::Preparation,
                             FailureDisposition::Uncertain,
                         ),

@@ -141,7 +141,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let launcher = directory.path().join("fixture-cli.CMD");
         std::fs::write(&launcher, "@echo off\r\n").unwrap();
-        std::fs::write(directory.path().join("fixture-cli.exe.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(
+            directory.path().join("fixture-cli.exe.cmd"),
+            "@echo off\r\n",
+        )
+        .unwrap();
 
         assert_eq!(
             executable_at(
@@ -152,7 +156,11 @@ mod tests {
             Some(launcher)
         );
         assert_eq!(
-            executable_at("fixture-cli.exe", directory.path(), std::ffi::OsStr::new("")),
+            executable_at(
+                "fixture-cli.exe",
+                directory.path(),
+                std::ffi::OsStr::new("")
+            ),
             None
         );
     }
@@ -168,7 +176,8 @@ mod tests {
             "@echo off\r\necho %~1 %~2\r\n",
         )
         .unwrap();
-        let launcher = executable_at("fixture-cli", directory.path(), installation.as_os_str()).unwrap();
+        let launcher =
+            executable_at("fixture-cli", directory.path(), installation.as_os_str()).unwrap();
         let mut child = command(
             launcher.to_str().unwrap(),
             &["app-server".into(), "two words".into()],

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum ExchangeOrigin {
     #[default]
     User,
+    /// Observe provider-native child work without claiming a Harness task or user submission.
+    NativeAgent,
     TaskStarted {
         start: TaskStart,
     },

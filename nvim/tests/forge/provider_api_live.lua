@@ -34,7 +34,8 @@ local workspace, data, config = vim.fs.joinpath(root, "workspace"), vim.fs.joinp
 local artifacts, hooks = vim.fs.joinpath(root, "artifacts"), vim.fs.joinpath(root, "empty-hooks")
 for _, path in ipairs({ workspace, data, config, artifacts, hooks }) do assert(vim.fn.mkdir(path, "p") == 1, path) end
 local binary = vim.fs.joinpath(root, "forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
-assert(vim.uv.fs_copyfile(source_binary, binary))
+-- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   if kind == "data" then return data end

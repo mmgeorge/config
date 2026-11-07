@@ -19,12 +19,13 @@ notifications.info = function(message) messages[#messages + 1] = message end
 notifications.error = notifications.info
 state.session = { id = "background-test" }
 state.capability = { background_terminals = true }
-state.busy, state.queue = true, {}
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
+state.queue = {}
 state.presentation = { terminals = { refresh = function() refreshed = refreshed + 1 end } }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/bg" })
 controller.queue_submit()
-assert(#requests == 1 and #state.queue == 0 and state.busy, "background picker changed exchange or queue")
+assert(#requests == 1 and #state.queue == 0 and require("forge.views.harness.activity").busy(state), "background picker changed exchange or queue")
 assert(requests[1].params.operation == "background_terminals")
 requests[1].callback({ supported = true, terminal = {
   { id = "first", command = "cargo\ntest" }, { id = "second", command = "npm run dev" },
@@ -34,7 +35,7 @@ assert(#requests == 1, "opening the picker terminated a process")
 opened.on_confirm({ option = opened.page_list[1].option_list[2] })
 assert(requests[2].params.operation == "terminate_terminal" and requests[2].params.id == "second")
 requests[2].callback({})
-assert(refreshed == 1 and state.busy, "termination restarted or completed the exchange")
+assert(refreshed == 1 and require("forge.views.harness.activity").busy(state), "termination restarted or completed the exchange")
 controller.open_background_picker()
 requests[3].callback({ supported = true, terminal = {} })
 assert(#opened.page_list[1].option_list == 0

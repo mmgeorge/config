@@ -52,7 +52,7 @@ local ok, failure = xpcall(function()
   vim.fn.maparg("<Space>", "n", false, true).callback()
   assert(pending == active, "rapid toggles submitted concurrent plan edits")
   pending.callback(nil, "fixture rejection")
-  assert(not state.busy and review.owner.checks[1].enabled, "failed toggle changed canonical state")
+  assert(not require("forge.views.harness.activity").busy(state) and review.owner.checks[1].enabled, "failed toggle changed canonical state")
   vim.fn.maparg("<Space>", "n", false, true).callback()
   version, enabled = 2, false
   pending.callback({ plan = { id = "plan", state = "awaiting_review", working_path = path, review_digest = "digest:2" },
@@ -79,7 +79,7 @@ local ok, failure = xpcall(function()
   pending.callback({ plan = { id = "plan", state = "awaiting_review", working_path = path, review_digest = "digest:4" },
     review = presentation(review.owner.document) })
   assert(#vim.api.nvim_buf_get_lines(review.buf, 0, -1, false) == 1, "disabled check remains in the plan")
-  assert(not state.busy and review.owner.version == 4)
+  assert(not require("forge.views.harness.activity").busy(state) and review.owner.version == 4)
   pending = nil
   review.plan.state = "accepted"
   review.command_set.action_by_id.checks.run({})

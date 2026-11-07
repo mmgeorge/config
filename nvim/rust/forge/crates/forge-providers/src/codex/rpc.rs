@@ -14,6 +14,14 @@ use std::{
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+/// Distinguish a runtime that lacks a request method from every answered reply.
+pub(super) enum MethodReply {
+    /// The runtime answered the request; the value is its decoded `result`.
+    Answered(Value),
+    /// The runtime predates the method and rejected its name before reading the request.
+    UnknownMethod,
+}
+
 /// Share native RPC methods without serializing their independent send and receive paths.
 #[derive(Clone)]
 pub(super) struct RpcHandle {
@@ -100,7 +108,7 @@ impl NativeRpc {
                 let received = match reader_connection.receive().await {
                     Ok(received) => received,
                     Err(error) => {
-                        let error = crate::error::codex(error, ProviderOperation::InputSubmit);
+                        let error = crate::error::codex(error, ProviderOperation::TurnStart);
                         let pending = std::mem::take(&mut *reader_waiters.lock().await);
                         for (_, waiter) in pending {
                             let _ = waiter.send(Err(error.clone()));
@@ -112,10 +120,8 @@ impl NativeRpc {
                 let value = match &received.value {
                     Ok(value) => value,
                     Err(_) => {
-                        let error = failure(
-                            ProviderOperation::InputSubmit,
-                            ProviderFailureKind::Protocol,
-                        );
+                        let error =
+                            failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
                         let pending = std::mem::take(&mut *reader_waiters.lock().await);
                         for (_, waiter) in pending {
                             let _ = waiter.send(Err(error.clone()));
@@ -127,6 +133,23 @@ impl NativeRpc {
                 if let Some(id) = response_id(value) {
                     if let Some(waiter) = reader_waiters.lock().await.remove(&id) {
                         let _ = waiter.send(decode_frame(received));
+                    }
+                    continue;
+                }
+                if uncorrelated_error(value) {
+                    // Codex rejects an unparseable request, such as an unknown method, before it
+                    // reads the request id. Only a sole waiter can own that rejection; with
+                    // several in flight the owner is unknowable, so every waiter fails.
+                    let mut waiters = reader_waiters.lock().await;
+                    if waiters.len() == 1 {
+                        let (_, waiter) = waiters.drain().next().expect("one waiter is pending");
+                        let _ = waiter.send(decode_frame(received));
+                    } else {
+                        let error =
+                            failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
+                        for (_, waiter) in waiters.drain() {
+                            let _ = waiter.send(Err(error.clone()));
+                        }
                     }
                     continue;
                 }
@@ -181,8 +204,22 @@ impl NativeRpc {
         params: Value,
         operation: ProviderOperation,
     ) -> Result<Value, ProviderError> {
+        match self.method_request(method, params, operation).await? {
+            MethodReply::Answered(result) => Ok(result),
+            MethodReply::UnknownMethod => Err(failure(operation, ProviderFailureKind::Rejected)),
+        }
+    }
+
+    /// Send a request whose method an older runtime may not define, reporting that absence apart
+    /// from every other rejection so the caller can fall back without guessing at error text.
+    pub(super) async fn method_request(
+        &self,
+        method: &str,
+        params: Value,
+        operation: ProviderOperation,
+    ) -> Result<MethodReply, ProviderError> {
         let id = self.send_request(method, params).await?;
-        let response = self.wait_response(id, operation);
+        let response = self.wait_reply(id, operation);
         let context = super::operations::current();
         if let Some(context) = context {
             // These identity-addressed mutations retain late acknowledgement so an expired
@@ -211,6 +248,18 @@ impl NativeRpc {
         id: u64,
         operation: ProviderOperation,
     ) -> Result<Value, ProviderError> {
+        match self.wait_reply(id, operation).await? {
+            MethodReply::Answered(result) => Ok(result),
+            MethodReply::UnknownMethod => Err(failure(operation, ProviderFailureKind::Rejected)),
+        }
+    }
+
+    /// Await one request response, separating an unknown-method rejection from decoded results.
+    async fn wait_reply(
+        &self,
+        id: u64,
+        operation: ProviderOperation,
+    ) -> Result<MethodReply, ProviderError> {
         let receiver = self
             .responses
             .lock()
@@ -223,7 +272,10 @@ impl NativeRpc {
         let response = receiver.await;
         self.waiters.lock().await.remove(&id);
         let result = response.map_err(|_| failure(operation, ProviderFailureKind::Transport))??;
-        decode_result(&result, operation, &method)
+        if unknown_method(&result, &method) {
+            return Ok(MethodReply::UnknownMethod);
+        }
+        decode_result(&result, operation, &method).map(MethodReply::Answered)
     }
 
     /// Release obsolete acknowledgement bookkeeping after positive native lifecycle admission.
@@ -236,19 +288,12 @@ impl NativeRpc {
 
     /// Write one native notification without adding a JSON-RPC request identity.
     pub(super) async fn notify(&self, method: &str, params: Value) -> Result<(), ProviderError> {
-        let encoded =
-            serde_json::to_string(&json!({"method":method,"params":params})).map_err(|_| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
-        self.connection.send(encoded).await.map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Transport,
-            )
-        })
+        let encoded = serde_json::to_string(&json!({"method":method,"params":params}))
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+        self.connection
+            .send(encoded)
+            .await
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))
     }
 
     /// Send one server request and retain its private response waiter before writing.
@@ -276,14 +321,9 @@ impl NativeRpc {
             .next_id
             .fetch_add(1, Ordering::Relaxed)
             .checked_add(1)
-            .ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown))?;
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
         let encoded = serde_json::to_string(&json!({"id":id,"method":method,"params":params}))
-            .map_err(|_| {
-                failure(
-                    ProviderOperation::InputSubmit,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
         let (sender, receiver) = oneshot::channel();
         self.waiters.lock().await.insert(id, sender);
         self.responses.lock().await.insert(id, receiver);
@@ -300,7 +340,7 @@ impl NativeRpc {
             self.responses.lock().await.remove(&id);
             self.methods.lock().await.remove(&id);
             return Err(failure(
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 ProviderFailureKind::Transport,
             ));
         }
@@ -316,10 +356,7 @@ impl NativeRpc {
                 .recv()
                 .await
                 .ok_or_else(|| {
-                    failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Transport,
-                    )
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
                 })?
                 .and_then(decode_frame)
         };
@@ -334,18 +371,12 @@ impl NativeRpc {
 
     /// Respond to a native server request without exposing its identity to Harness.
     pub(super) async fn respond(&self, id: &Value, result: Value) -> Result<(), ProviderError> {
-        let encoded = serde_json::to_string(&json!({"id":id,"result":result})).map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        self.connection.send(encoded).await.map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Transport,
-            )
-        })
+        let encoded = serde_json::to_string(&json!({"id":id,"result":result}))
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+        self.connection
+            .send(encoded)
+            .await
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))
     }
 
     /// Reject a native server request when no foreground invocation owns its callbacks.
@@ -353,18 +384,11 @@ impl NativeRpc {
         let encoded = serde_json::to_string(&json!({
             "id":id,"error":{"code":-32001,"message":"No active provider invocation"}
         }))
-        .map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        self.connection.send(encoded).await.map_err(|_| {
-            failure(
-                ProviderOperation::InputSubmit,
-                ProviderFailureKind::Transport,
-            )
-        })
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
+        self.connection
+            .send(encoded)
+            .await
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))
     }
 
     /// Collect the socket owner and dispatcher after native session work has settled.
@@ -373,7 +397,7 @@ impl NativeRpc {
         let pending = std::mem::take(&mut *self.waiters.lock().await);
         for (_, waiter) in pending {
             let _ = waiter.send(Err(failure(
-                ProviderOperation::SessionClose,
+                ProviderOperation::ThreadClose,
                 ProviderFailureKind::BindingClosed,
             )));
         }
@@ -389,7 +413,7 @@ impl NativeRpc {
                 Ok(()) => Ok(()),
                 Err(error) if error.is_cancelled() => Ok(()),
                 Err(_) => Err(failure(
-                    ProviderOperation::InputSubmit,
+                    ProviderOperation::TurnStart,
                     ProviderFailureKind::Runtime,
                 )),
             };
@@ -424,12 +448,26 @@ fn terminal_inventory_changed(message: &Value) -> bool {
 }
 
 fn decode_frame(received: ReceivedMessage) -> Result<Value, ProviderError> {
-    received.value.map_err(|_| {
-        failure(
-            ProviderOperation::InputSubmit,
-            ProviderFailureKind::Protocol,
-        )
-    })
+    received
+        .value
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
+}
+
+/// Recognize an error response whose request id the native runtime could not recover.
+fn uncorrelated_error(message: &Value) -> bool {
+    message.get("method").is_none()
+        && message.get("error").is_some()
+        && message.get("id").is_none_or(Value::is_null)
+}
+
+/// Recognize the serde rejection Codex sends when its request enum has no variant for `method`.
+fn unknown_method(message: &Value, method: &str) -> bool {
+    !method.is_empty()
+        && message.pointer("/error/code").and_then(Value::as_i64) == Some(-32600)
+        && message
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains(&format!("unknown variant `{method}`")))
 }
 
 fn response_id(message: &Value) -> Option<u64> {
@@ -555,11 +593,11 @@ mod tests {
             cancellation,
         );
         let native =
-            super::super::operations::NativeContext::new(context, ProviderOperation::InputSubmit);
+            super::super::operations::NativeContext::new(context, ProviderOperation::TurnStart);
         let request = tokio::spawn(async move {
             super::super::operations::scope(native, async move {
                 request_rpc
-                    .request("turn/start", json!({}), ProviderOperation::InputSubmit)
+                    .request("turn/start", json!({}), ProviderOperation::TurnStart)
                     .await
             })
             .await
@@ -579,9 +617,9 @@ mod tests {
     /// A known durable writer conflict retains a safe resource reason instead of native error text.
     #[test]
     fn active_writer_resume_rejection_is_a_normalized_resource_conflict() {
-        let error = decode_result(&json!({"error":{"code":-32600,"message":"thread private-thread-id already has an active writer"}}), ProviderOperation::SessionOpen, "thread/resume").unwrap_err();
+        let error = decode_result(&json!({"error":{"code":-32600,"message":"thread private-thread-id already has an active writer"}}), ProviderOperation::ThreadOpen, "thread/resume").unwrap_err();
         assert!(
-            matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         assert!(!error.to_string().contains("private-thread-id"));
     }
@@ -604,7 +642,7 @@ mod tests {
                 while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
             });
             let rpc = NativeRpc::new(CodexConnection::connect(&format!("ws://{address}")).await.unwrap());
-            assert_eq!(rpc.request("fixture/ping", json!({}), ProviderOperation::InputSubmit).await.unwrap(), json!({"ok":true}));
+            assert_eq!(rpc.request("fixture/ping", json!({}), ProviderOperation::TurnStart).await.unwrap(), json!({"ok":true}));
             for sequence in 0..count {
                 assert_eq!(rpc.receive().await.unwrap()["params"]["sequence"], sequence);
             }
@@ -646,7 +684,7 @@ mod tests {
             cancellation,
         );
         let native =
-            super::super::operations::NativeContext::new(context, ProviderOperation::InputSubmit);
+            super::super::operations::NativeContext::new(context, ProviderOperation::TurnStart);
         source.cancel();
         let error = super::super::operations::scope(
             native.clone(),
@@ -727,7 +765,7 @@ mod tests {
         *rpc.reader.lock().await = Some(task);
         let error = rpc.close().await.unwrap_err();
         assert!(matches!(&error, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::InputSubmit
+            if failure.operation() == ProviderOperation::TurnStart
             && failure.kind() == ProviderFailureKind::Runtime));
         assert!(!format!("{error:?} {error}").contains("private dispatcher panic marker"));
         let source = std::error::Error::source(&error).unwrap();
@@ -778,7 +816,7 @@ mod tests {
             ),
         ] {
             let error = decode_result(&json!({"id":17,"error":{"code":code,"message":message,"data":"private-native-payload"}}),
-                ProviderOperation::InputSubmit, method).unwrap_err();
+                ProviderOperation::TurnStart, method).unwrap_err();
             assert!(
                 matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected)
             );
@@ -795,7 +833,7 @@ mod tests {
         assert_eq!(
             decode_result(
                 &json!({"id":17,"result":null}),
-                ProviderOperation::InputSubmit,
+                ProviderOperation::TurnStart,
                 "turn/start"
             )
             .unwrap(),
@@ -803,7 +841,7 @@ mod tests {
         );
         for malformed in [json!({"id":17}), json!({"id":17,"result":null,"error":{}})] {
             assert!(
-                matches!(decode_result(&malformed, ProviderOperation::InputSubmit, "turn/start"),
+                matches!(decode_result(&malformed, ProviderOperation::TurnStart, "turn/start"),
                 Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Protocol)
             );
         }
@@ -831,7 +869,7 @@ mod tests {
         );
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            rpc.request("turn/start", json!({}), ProviderOperation::InputSubmit),
+            rpc.request("turn/start", json!({}), ProviderOperation::TurnStart),
         )
         .await
         .expect("malformed frame must release the request")
@@ -840,6 +878,52 @@ mod tests {
             matches!(&error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Protocol)
         );
         assert!(!format!("{error:?} {error}").contains("private-native"));
+        let _ = rpc.close().await;
+        server.await.unwrap();
+    }
+
+    /// Codex rejects an unknown method before it parses the request id, so the error frame
+    /// carries no id. The sole waiting request must receive that rejection as its response.
+    #[tokio::test]
+    async fn uncorrelated_rejection_answers_the_sole_waiting_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _request = socket.next().await;
+            socket
+                .send(Message::Text(
+                    json!({"error":{"code":-32600,"message":"Invalid request: unknown variant `thread/rollback`"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _closed = socket.next().await;
+        });
+        let rpc = NativeRpc::new(
+            CodexConnection::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc.request(
+                "thread/rollback",
+                json!({}),
+                ProviderOperation::InputRetract,
+            ),
+        )
+        .await
+        .expect("an uncorrelated rejection must answer the sole waiting request")
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            ProviderError::Failure(failure)
+                if failure.kind() == ProviderFailureKind::Rejected
+                    && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
+        ));
         let _ = rpc.close().await;
         server.await.unwrap();
     }
@@ -880,7 +964,7 @@ mod tests {
             .unwrap();
         let rpc = NativeRpc::new(connection);
         let result = rpc
-            .request("turn/start", json!({}), ProviderOperation::InputSubmit)
+            .request("turn/start", json!({}), ProviderOperation::TurnStart)
             .await
             .unwrap();
         assert_eq!(result["turnId"], "turn");
@@ -905,7 +989,7 @@ mod tests {
             .unwrap();
         let rpc = NativeRpc::new(connection);
         let error = rpc
-            .request("turn/start", json!({}), ProviderOperation::InputSubmit)
+            .request("turn/start", json!({}), ProviderOperation::TurnStart)
             .await
             .unwrap_err();
         assert!(

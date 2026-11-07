@@ -216,8 +216,18 @@ end
 local function tab_navigation_survives_resize()
   local spec = field_spec(function() end)
   spec.page_list[1].option_list[1].fields[1].value = string.rep("界", 600) .. "tail"
+  -- Headless Neovim without an attached UI ignores 'columns' and 'lines' for window layout, and the
+  -- picker sizes itself from its host windows. Resize the host window itself; a neighboring split
+  -- absorbs the columns it releases.
+  local host = vim.api.nvim_get_current_win()
+  local host_width, host_height = vim.api.nvim_win_get_width(host) - 2, vim.api.nvim_win_get_height(host)
+  vim.cmd("rightbelow vnew")
+  local neighbor = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_win(host)
+  vim.api.nvim_win_set_width(host, host_width)
   picker.open(spec)
-  vim.o.columns, vim.o.lines = 52, 16
+  vim.api.nvim_win_set_width(host, 52)
+  vim.api.nvim_win_set_height(host, 14)
   picker.update(spec)
   local instance = picker._state_for_test()
   assert_equal(instance.frame.content_column, 0)
@@ -229,7 +239,8 @@ local function tab_navigation_survives_resize()
   assert(instance.frame.option_scroll_max > 0, "long field became unreachable")
   press("<PageDown>")
   assert(picker._state_for_test().frame.option_offset > 0, "long field did not scroll")
-  vim.o.columns, vim.o.lines = 110, 38
+  vim.api.nvim_win_set_width(host, host_width)
+  vim.api.nvim_win_set_height(host, host_height)
   picker.update(spec)
   instance = picker._state_for_test()
   assert_equal(instance.frame.content_column, 0)
@@ -238,6 +249,7 @@ local function tab_navigation_survives_resize()
     assert(vim.fn.strdisplaywidth(line) <= vim.api.nvim_win_get_width(instance.win), "resized row overflow")
   end
   picker.close(false)
+  vim.api.nvim_win_close(neighbor, true)
 end
 
 --- Keep form columns stable across focus changes without splitting model names or row labels.

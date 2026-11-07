@@ -15,7 +15,8 @@ local original_error = notifications.error
 local composer = vim.api.nvim_create_buf(false, true)
 state.session = { id = "responsive", provider = "mock", model = "test", effort = "medium" }
 state.composer_buf, state.composer_win = composer, vim.api.nvim_get_current_win()
-state.busy, state.queue = true, {}
+dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
+state.queue = {}
 local routed, configured = {}, {}
 local success, failure = xpcall(function()
   controller.submit = function()
@@ -73,6 +74,7 @@ local success, failure = xpcall(function()
   state.capability = { model_selection = true }
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, composer)
+  catalog.clear()
   state.model_list, state.model_provider = nil, nil
   local model_response
   client.request = function(request_specification, callback)
@@ -99,26 +101,32 @@ local success, failure = xpcall(function()
   assert(not picker.is_open() and reported == "catalog unavailable",
     "failed effort discovery left a permanent loading picker")
   controller.configure = original_configure
-  local transition_complete, applied
-  controller.task_transition = function(_, _, completed) transition_complete = completed end
-  controller.configure({ effort = "high" }, function(result) applied = result end)
-  transition_complete(true)
-  assert(applied == true, "successful active configuration was reported as unsuccessful")
-  state.busy, state.task_operation = false, nil
+  -- The session owner's FIFO orders configuration against active work, so Lua sends each
+  -- change immediately and completes it from that change's own acknowledgement.
   local configuration_request = {}
-  controller.task_transition = function(action, _, callback)
-    assert(action.action == "configure")
-    configuration_request[#configuration_request + 1] = { params = action.config, callback = callback }
+  client.request = function(request_specification, callback)
+    assert(request_specification.method == "session.configure", request_specification.method)
+    assert(request_specification.session_id == state.session.id)
+    configuration_request[#configuration_request + 1] = { params = request_specification.params, callback = callback }
   end
+  local applied
+  controller.configure({ effort = "high" }, function(result) applied = result end)
+  assert(#configuration_request == 1 and configuration_request[1].params.effort == "high",
+    "active configuration waited for work to stop before reaching the session owner")
+  configuration_request[1].callback({})
+  assert(applied == true, "successful active configuration was reported as unsuccessful")
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(state, false)
+  state.task_operation = nil
+  configuration_request = {}
   local first_applied, second_applied
   controller.configure({ shell = "system" }, function(result) first_applied = result end)
   controller.configure({ plan_compact = true }, function(result) second_applied = result end)
   assert(#configuration_request == 2 and second_applied == nil)
   state.session.shell = "system"
-  configuration_request[1].callback(true)
+  configuration_request[1].callback({})
   assert(#configuration_request == 2, "Lua delayed an explicit configuration")
   state.session.plan_compact = true
-  configuration_request[2].callback(true)
+  configuration_request[2].callback({})
   assert(first_applied == true and second_applied == true,
     "successive idle configuration edits lost their completion callbacks")
   local resource_picker = require("forge.views.harness.provider_picker")

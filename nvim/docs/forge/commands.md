@@ -350,6 +350,13 @@ navigates to the live file, whose contents may have changed since capture.
 The raw diff opens in a separate read-only tab when the transcript window is
 protected. Press `q` in that diff to return to the transcript.
 
+When the provider reports a checklist, the exchange shows it as **Provider-reported
+checklist** after its activity. The heading counts completed entries and names the checklist.
+Each entry shows `[ ]` pending, `[>]` in progress, `[x]` completed, or `[-]` superseded,
+exactly as the provider reported it. This is the provider's own progress note: completing
+every entry does not complete a plan, goal, or check, and an interrupted turn leaves
+unfinished entries unchecked. Exchanges without a reported checklist show no section.
+
 A file created and deleted within the captured interval is absent from the workspace result
 but remains in Reported edits. An empty saved comparison produces no workspace-change row.
 Missing checkpoint evidence displays **Workspace changes unavailable**, including non-Git
@@ -381,6 +388,9 @@ streams. Operation failures remain visible when logging is off.
 
 Inside Harness, `/sessions`
 opens durable session search and `/undo` opens the interaction list directly.
+In session search, Enter with **Open: Current Tab** shows the chosen session in the current
+tab, or focuses the tab that already shows it; `Tab` switches to **Open: New Tab**. `Ctrl-J`
+deletes the selected saved session and closes every tab that shows it.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
 rollback works without a file checkpoint. Confirming conversation rollback collects
@@ -452,6 +462,10 @@ explicitly queued follow-ups still wait for the active work to finish.
 including while editing a queued message. Drafts and queued follow-ups remain
 unsent while the task is paused. With a child timeline selected, it interrupts
 that child without sending the draft.
+Interrupting a prompt before the model shows any reply, reasoning, or tool activity
+removes that exchange and returns the prompt to the composer; the provider's echo of
+your own prompt does not count as activity. After visible activity, the exchange stays
+in history as cancelled.
 Pending steering appears above queued follow-ups in the status split. Explicitly
 queued messages remain visible while execution is paused or idle. Direct submissions
 enter exchange history. The lower prompt buffer contains only the draft being edited.
@@ -533,7 +547,10 @@ Press `?` for the full key help. A fixed two-line area describes the selected se
 Category and field selection survive resizing, updates, and returns from child editors.
 
 **Models** contains Main, Ask, and Background model sections. Main and Background
-include their own Compact toggle and threshold: 64k, 128k, 256k, or 512k.
+include their own Compact toggle and threshold: 64k, 128k, 256k, or 512k. Once the provider
+reports the main model's context window, the Main threshold offers only values below it.
+Main and Ask list the current session's models. A Background settings failure
+disables only the Background rows.
 Ask serves Plan Review questions created with `A` and defaults to the main planning
 model. Turn on **Override** to select a separate model, thinking level, and speed.
 Answers run in a forked session using the same provider and appear below their
@@ -642,6 +659,8 @@ observable progress or the configured total allowance, which defaults to 20 turn
 Reads and phase changes do not replenish the allowance. Explicit task resume
 starts a new allowance while retaining the phase, accepted artifact, and findings.
 After a host restart, unfinished tasks require explicit resume before work starts.
+Accepting a paused plan with `oY` keeps the pause, so its tool-approval question stays
+hidden. A notice asks for `/task resume`, which presents the question.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method

@@ -293,8 +293,8 @@ impl BackgroundManager {
         {
             let inbox = &runtime.retained.observer;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let mut pending: Option<(crate::provider::EventScope, crate::provider::Compaction)> =
-                None;
+            let mut pending: Option<String> = None;
+            let root_thread = crate::provider::ThreadOwner::root(&session_id).thread_id();
             loop {
                 let observations = async {
                     inbox.notified().await?;
@@ -316,16 +316,45 @@ impl BackgroundManager {
                 // owner end. Intentional collection is not a native terminal.
                 let observed = match observed {
                     Ok(Ok(None)) => {
-                        match inbox.end() {
+                        let end = inbox.end();
+                        let retired_binding = match &end {
                             Some(
-                                crate::provider::session_execution::ObservationEnd::Collected(
-                                    reason,
-                                ),
-                            ) => {
-                                let reason = match reason {
-                                crate::provider::session_execution::OwnerCloseReason::Cancelled => "cancelled",
-                                crate::provider::session_execution::OwnerCloseReason::Shutdown => "shutdown",
+                                crate::provider::session_execution::ObservationEnd::Collected {
+                                    retired_binding,
+                                    ..
+                                }
+                                | crate::provider::session_execution::ObservationEnd::Lost {
+                                    retired_binding,
+                                    ..
+                                },
+                            ) => retired_binding.as_ref(),
+                            None => None,
+                        };
+                        if let Some(binding) = retired_binding {
+                            let retired = match broker.observed_binding_retired(binding) {
+                                Ok(delivery) => delivery.deliver().await.map(|_| ()),
+                                Err(error) => Err(error),
                             };
+                            if let Err(error) = retired {
+                                observation = ObservationContinuity::Lost;
+                                report(
+                                    &request.delivery,
+                                    &session_id,
+                                    format!(
+                                        "Could not retain Background binding retirement: {error:#}"
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                        match end {
+                            Some(
+                                crate::provider::session_execution::ObservationEnd::Collected {
+                                    reason,
+                                    ..
+                                },
+                            ) => {
+                                let reason = match reason { crate::provider::session_execution::OwnerCloseReason::Cancelled => "cancelled", crate::provider::session_execution::OwnerCloseReason::Shutdown => "shutdown" };
                                 broker.trace.record(
                                     &session_id,
                                     "background.observation_collected",
@@ -336,9 +365,10 @@ impl BackgroundManager {
                                 }
                                 Ok(Ok(None))
                             }
-                            Some(crate::provider::session_execution::ObservationEnd::Lost(
+                            Some(crate::provider::session_execution::ObservationEnd::Lost {
                                 failure,
-                            )) => Ok(Err(crate::provider::ProviderError::Observation(failure))),
+                                ..
+                            }) => Ok(Err(crate::provider::ProviderError::Observation(failure))),
                             None => Ok(Ok(None)),
                         }
                     }
@@ -362,16 +392,24 @@ impl BackgroundManager {
                 match observed {
                     Ok(Ok(Some(events))) => {
                         for event in events {
-                            if let crate::provider::ProviderEvent::Compaction {
-                                scope,
-                                update: compaction,
-                            } = &event
+                            if let crate::provider::session_execution::OwnerObservation::Event(
+                                crate::provider::HarnessEvent::Native {
+                                    event: boxed_native_event,
+                                    ..
+                                },
+                            ) = &event
+                                && let crate::provider::ProviderEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+                                } = boxed_native_event.as_ref()
+                                && thread_id == &root_thread
                             {
                                 native_compaction_observed = true;
                                 pending = if compaction.state
                                     == crate::provider::CompactionState::Running
                                 {
-                                    Some((scope.clone(), *compaction.clone()))
+                                    Some(compaction.id.clone())
                                 } else {
                                     None
                                 };
@@ -392,23 +430,14 @@ impl BackgroundManager {
                         }
                     }
                     _ => {
-                        if let Some((scope, mut compaction)) = pending.take() {
-                            compaction.state = crate::provider::CompactionState::Unconfirmed;
-                            compaction.result.diagnostic =
-                                Some(forge_provider_api::ProviderDiagnostic {
-                                    kind: forge_provider_api::ProviderFailureKind::Transport,
-                                    message: forge_provider_api::SanitizedMessage::new(
-                                        "Provider compaction completion was not confirmed",
-                                    )
-                                    .expect("static diagnostic is nonempty"),
-                                    fatal: false,
-                                });
-                            let _ = broker.observe_session_event(
-                                crate::provider::ProviderEvent::Compaction {
-                                    scope,
-                                    update: Box::new(compaction),
-                                },
-                            );
+                        if let Some(id) = pending.take() {
+                            let marked = match broker.observed_compaction_observation_lost(&id) {
+                                Ok(delivery) => delivery.deliver().await.map(|_| ()),
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = marked {
+                                report(&request.delivery, &session_id, format!("Could not retain unconfirmed Background compaction: {error:#}")).await;
+                            }
                             report(
                                 &request.delivery,
                                 &session_id,
@@ -421,26 +450,9 @@ impl BackgroundManager {
                 }
             }
         }
-        let settled = if matches!(observation, ObservationContinuity::Reliable) {
-            match broker.finalize_observed_execution().await {
-                Ok(_) => true,
-                Err(error) => {
-                    let _ =
-                        broker.background_failure("continuation_settlement", format!("{error:#}"));
-                    report(
-                        &request.delivery,
-                        &session_id,
-                        format!("Background continuation settlement failed: {error}"),
-                    )
-                    .await;
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        let reusable = matches!(observation, ObservationContinuity::Reliable);
         if succeeded
-            && settled
+            && reusable
             && !native_compaction_observed
             && let Err(error) = broker.auto_compact().await
         {
@@ -452,7 +464,7 @@ impl BackgroundManager {
             )
             .await;
         }
-        if !succeeded || !settled {
+        if !succeeded || !reusable {
             let _preparation = self.preparation.lock().await;
             let removed = self.retained.lock().await.remove(&key);
             if let Some(removed) = removed
@@ -614,7 +626,7 @@ impl BackgroundManager {
             )?;
             let recovery = async {
                 let registry = broker.execution_registry();
-                let owner = crate::provider::ExecutionOwner::root(&retained.retained.session_id);
+                let owner = crate::provider::ThreadOwner::root(&retained.retained.session_id);
                 let engine = registry.owner(owner.clone()).await?;
                 let mut retained = retained;
                 if !engine.is_healthy().await {
@@ -722,7 +734,7 @@ impl BackgroundManager {
         let mut broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&runtime))?;
         let session_id = broker.snapshot()?.session.id;
         let registry = broker.execution_registry();
-        let owner = crate::provider::ExecutionOwner::root(&session_id);
+        let owner = crate::provider::ThreadOwner::root(&session_id);
         registry.owner(owner.clone()).await?;
         let observer = registry.observer(owner)?;
         let retained = Arc::new(RetainedBackground {
@@ -1248,7 +1260,7 @@ mod tests {
         let (mut broker, retained, ownership, _model) = manager.prepare(&request, &key).await?;
         let session_id = retained.retained.session_id.clone();
         let old_observer = retained.retained.observer.clone();
-        let owner = crate::provider::ExecutionOwner::root(&session_id);
+        let owner = crate::provider::ThreadOwner::root(&session_id);
         let registry = broker.execution_registry();
         let old_engine = registry.owner(owner.clone()).await?;
         old_observer.fail(forge_provider_api::lifecycle::ObservationFailure::Disconnected);
@@ -1261,9 +1273,10 @@ mod tests {
         .await?;
         assert!(matches!(
             old_observer.end(),
-            Some(crate::provider::session_execution::ObservationEnd::Lost(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected
-            ))
+            Some(crate::provider::session_execution::ObservationEnd::Lost {
+                failure: forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+                ..
+            })
         ));
         drop(retained);
         broker.release_lease()?;
@@ -1289,7 +1302,7 @@ mod tests {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
             source: crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::SessionClose,
+                    forge_provider_api::ProviderOperation::ThreadClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ),
             )
@@ -1300,7 +1313,7 @@ mod tests {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
             source: crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::SessionClose,
+                    forge_provider_api::ProviderOperation::ThreadClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ),
             )

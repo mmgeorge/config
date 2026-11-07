@@ -8,7 +8,7 @@ mod timeout;
 pub use forge_provider_api::access::{AccessPolicy, DirectoryScope, WriteScope};
 pub use shell::CheckShell;
 pub(crate) use timeout::InputSchedule;
-pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
+pub use timeout::{InputDeadline, InputTimeout, InputTimeoutError, ResolutionSource, TimeoutUnit};
 pub mod continuation;
 pub mod state_machine;
 use std::collections::BTreeMap;
