@@ -12,11 +12,11 @@ description: >-
 
 # nextest
 
-cargo-nextest runs every test in its own process. That model enables per-test timeouts, retries, and cross-process scheduling, and it breaks in-process coordination from `cargo test`, such as shared mutexes. This skill covers nextest 0.9.151; the installed binary is authoritative for its own version through `cargo nextest help repo-config`, `help user-config`, and `help filterset`.
+cargo-nextest runs every test in its own process. That model enables per-test timeouts, retries, and cross-process scheduling, and it breaks in-process coordination from `cargo test`, such as shared mutexes.
 
 ## Prerequisites
 
-Check for nextest with `cargo nextest --version`. When it is missing, report that rather than installing it or falling back to `cargo test`. nextest does not run doctests, so run `cargo test --doc` separately when documentation examples change.
+Check for nextest with `cargo nextest --version`. When it is missing, report that rather than installing it or falling back to `cargo test`.
 
 ## Usage
 
