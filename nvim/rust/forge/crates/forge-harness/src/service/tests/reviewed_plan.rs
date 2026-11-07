@@ -35,6 +35,27 @@ pub(super) async fn reviewed_execution_fixture_with_acceptance(
     acceptance: forge_provider_api::testing::TestInputAcceptance,
     edit_and_resubmit: bool,
 ) -> Result<Value> {
+    reviewed_fixture(
+        service,
+        controller,
+        session_id,
+        sink,
+        acceptance,
+        edit_and_resubmit,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn reviewed_fixture(
+    service: &HarnessService,
+    controller: &Arc<SessionController>,
+    session_id: &str,
+    sink: &MessageSender,
+    acceptance: forge_provider_api::testing::TestInputAcceptance,
+    edit_and_resubmit: bool,
+    customize: impl FnOnce(&mut crate::plan::DeclarationDesign) -> Result<()>,
+) -> Result<Value> {
     use crate::provider::mock_response::MockResponseCommand;
     use forge_provider_api::testing::{TestPromptScript, TestPromptStep, TestPromptTerminal};
     controller.trace.configure(true)?;
@@ -48,6 +69,7 @@ pub(super) async fn reviewed_execution_fixture_with_acceptance(
         "src/owner.rs".into(),
         "/// Own application state.\npub struct Owner;\n".into(),
     );
+    customize(&mut design)?;
     document.design = Some(design);
     let plan = controller
         .observer
@@ -58,7 +80,7 @@ pub(super) async fn reviewed_execution_fixture_with_acceptance(
     // Opening a test registry and attaching its input worker do not start the provider.
     service.start_provider_session(session_id, sink).await?;
     // Arm the scenario only after startup has installed the native session.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !controller.provider_ready().await {
             if let Some(error) = controller
                 .provider_startup_error

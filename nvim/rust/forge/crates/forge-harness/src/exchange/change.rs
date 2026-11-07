@@ -503,6 +503,7 @@ mod test {
 #[cfg(test)]
 mod host_effect_tests {
     use super::*;
+    use crate::provider::ScopeOwner;
     use crate::provider::{InvocationScope, ThreadOwner};
     use crate::tools::lsp::HostFileChange;
     use forge_provider_api::control::ToolCallId;
@@ -512,12 +513,12 @@ mod host_effect_tests {
     fn committed_host_changes_keep_original_identity_and_survive_reload_without_native_items()
     -> anyhow::Result<()> {
         let scope = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         };
         let mut exchange: Exchange = serde_json::from_value(
-            json!({"id":"exchange","session_id":"session","agent_id":scope.owner.agent_id(),"ordinal":1,"prompt":"Rename","state":"running","created_at_ms":0,"attributed_matches_checkpoint":false,"node_list":[]}),
+            json!({"id":"exchange","session_id":"session","agent_id":scope.owner().agent_id(),"ordinal":1,"prompt":"Rename","state":"running","created_at_ms":0,"attributed_matches_checkpoint":false,"node_list":[]}),
         )?;
         let effect = HostFileChange {
             scope: scope.clone(),

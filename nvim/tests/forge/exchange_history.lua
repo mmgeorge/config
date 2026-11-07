@@ -65,6 +65,19 @@ local ok, failure = xpcall(function()
   require("forge.views.harness.controller").open_undo_picker()
   assert(options and #options == 2, "undo must include only current settled history")
   assert(options[1].id == "2" and options[2].id == "1", "interrupted history must remain undoable")
+
+  -- Harness-authored task prompts are provider instructions, so undo names their notice and never
+  -- restores them into the composer as if the user had typed them.
+  history[1].origin = { kind = "task_started", start = { kind = "execute", title = "Ship the parser" } }
+  history[1].prompt = "Start the Execute task for this accepted plan. Execution ID: internal"
+  require("forge.views.harness.controller").open_undo_picker()
+  assert(options[2].detail == "complete · Execution started: Ship the parser", options[2].detail)
+  state.composer_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "draft" })
+  local controller = require("forge.views.harness.controller")
+  controller.restore_rolled_back_prompt(history[1])
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft",
+    "undo restored a Harness-authored task prompt into the composer")
 end, debug.traceback)
 
 if not ok then

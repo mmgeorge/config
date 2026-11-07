@@ -137,7 +137,9 @@ mod tests {
                     message: forge_provider_api::SanitizedMessage::new("child open rejected")?,
                     severity: crate::broker::publication::DiagnosticSeverity::Error,
                     scope: crate::provider::EventScope::Binding {
-                        owner: crate::provider::ThreadOwner::root("review-answer"),
+                        thread_id: forge_provider_api::ThreadId::from(
+                            crate::provider::ThreadOwner::root("review-answer"),
+                        ),
                     },
                     native_scope: forge_provider_api::WarningScope::Provider,
                 },

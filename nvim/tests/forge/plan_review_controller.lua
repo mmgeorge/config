@@ -72,7 +72,7 @@ client.request = function(request_specification, callback)
   else callback({}) end
 end
 local success, failure = xpcall(function()
-  require("forge.views.plan_review.native_controller").open({ id = "plan", working_path = path, review_digest = "canonical" })
+  require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review", working_path = path, review_digest = "canonical" })
   local review = state.plan_review
   assert(review and review.owner.ready)
   assert(vim.wo[review.win].virtualedit == "", "PlanReview allows selecting past real text")
@@ -152,7 +152,7 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), origin), "comma did not return to jump origin")
   local hidden_tab = review.tab
   vim.cmd("tabclose")
-  require("forge.views.plan_review.native_controller").open({ id = "plan", working_path = path, review_digest = "canonical" })
+  require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review", working_path = path, review_digest = "canonical" })
   assert(review.tab ~= hidden_tab and review.tab == vim.api.nvim_get_current_tabpage())
   assert(review.win == vim.api.nvim_get_current_win(), "hidden review did not transfer its window ownership")
   local detached = review.owner
@@ -160,7 +160,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_exec_autocmds("BufEnter", { buffer = review.buf })
   assert(not detached.attached(), "closed review remained reusable")
   vim.cmd("tabclose")
-  require("forge.views.plan_review.native_controller").open({ id = "plan", working_path = path, review_digest = "canonical" })
+  require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review", working_path = path, review_digest = "canonical" })
   review = state.plan_review
   assert(detached.closed and review.owner ~= detached and review.owner.attached(),
     "reopening detached review did not establish a fresh native attachment")

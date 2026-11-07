@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capability::{ProviderFeature, UnsupportedCapability},
     catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition, WorkspaceContext},
-    terminal::{TerminalId, TerminalSnapshot},
+    terminal::{TerminalId, TerminalInventory},
     *,
 };
 
@@ -259,7 +259,7 @@ pub trait Provider: Send + Sync + 'static {
         &self,
         context: OperationContext,
         binding: &BindingId,
-    ) -> Result<TerminalSnapshot, ProviderError> {
+    ) -> Result<TerminalInventory, ProviderError> {
         context.check_admission(ProviderOperation::TerminalList)?;
         let _ = binding;
         Err(UnsupportedCapability(ProviderFeature::BackgroundTerminals).into())

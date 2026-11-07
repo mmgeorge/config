@@ -3,6 +3,7 @@ local cached = true
 local cleared = 0
 package.loaded["forge.integrations.ai_commit"] = {
   populate_commit_buffer_when_ready = function() end,
+  cancel_buffer_generation = function() end,
   state = function() return cached and { state = "ready" } or nil end,
   clear = function() cached = false; cleared = cleared + 1 end,
 }

@@ -50,8 +50,9 @@ local ok,failure=xpcall(function()
     fixture.wait(case.prefix)
     local stages={}
     for character in case.suffix:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
+      local before=fixture.text()
       fixture.type(character)
-      vim.wait(200,function() return false end,10)
+      assert(vim.wait(2500,function() return fixture.text()~=before end,5),'typed character did not reach the buffer')
       stages[#stages+1]={typed=character,text=fixture.text()}
     end
     observations[#observations+1]={

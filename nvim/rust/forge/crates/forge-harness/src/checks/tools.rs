@@ -1,4 +1,5 @@
 use super::{CheckConfig, CheckSupervisor, ConfigSnapshot, RunRequest};
+use crate::provider::ScopeOwner;
 use crate::{
     provider::{HarnessEventSink, PromptMode},
     session::{ApprovalMode, CheckShell},
@@ -89,6 +90,22 @@ pub(crate) struct CheckAuthority {
     pub agent: Arc<crate::agent::AgentCoordinator>,
     pub cancelled: tokio::sync::watch::Receiver<bool>,
     pub sink: Option<crate::broker::publication::SessionUpdateSink>,
+}
+
+/// Decide whether a foreground model may start `check_run` itself.
+///
+/// Harness owns checks while writing can race them: during check setup, while delegated agents
+/// run, and in every plan-execution phase except Verify. Verify forbids source edits, so a check
+/// its manual actions require cannot race a writer, and its instructions direct the model to run
+/// such checks with `check_run`.
+pub(crate) fn model_may_run_checks(
+    check_setup_active: bool,
+    active_agent_count: usize,
+    execution_phase: Option<crate::plan::execution::PlanPhase>,
+) -> bool {
+    !check_setup_active
+        && active_agent_count == 0
+        && execution_phase.is_none_or(|phase| phase == crate::plan::execution::PlanPhase::Verify)
 }
 
 pub(crate) struct CheckToolLease(Arc<CheckToolScope>);
@@ -213,7 +230,7 @@ impl CheckToolScope {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
                     .get(
                         &self.runner.workspace.to_string_lossy(),
-                        self.scope.owner.session_id().as_str(),
+                        self.scope.owner().session_id().as_str(),
                         &self.provider,
                     )?
                     .desired;
@@ -350,9 +367,8 @@ impl CheckToolScope {
                             PromptMode::Plan
                                 | PromptMode::PlanDiscussion
                                 | PromptMode::PlanQuestion
-                                | PromptMode::ExecutePlan
                         ),
-                    "automated checks are owned by Harness during plan execution and cannot race active writing agents"
+                    "automated checks are owned by Harness outside plan verification and cannot race active writing agents"
                 );
                 let request = RunRequest::try_from(serde_json::from_value::<
                     super::CheckRunRequest,
@@ -912,6 +928,27 @@ impl CheckSupervisor {
             self.publish(&run, sink).await?;
         }
         self.catalog(None)
+    }
+}
+
+#[cfg(test)]
+mod run_admission_tests {
+    use super::model_may_run_checks;
+    use crate::plan::execution::PlanPhase;
+
+    #[test]
+    fn verify_is_the_only_execution_phase_whose_model_may_run_checks() {
+        assert!(model_may_run_checks(false, 0, None));
+        assert!(model_may_run_checks(false, 0, Some(PlanPhase::Verify)));
+        for phase in [
+            PlanPhase::Implement,
+            PlanPhase::Checking,
+            PlanPhase::Resolve,
+        ] {
+            assert!(!model_may_run_checks(false, 0, Some(phase)), "{phase:?}");
+        }
+        assert!(!model_may_run_checks(true, 0, Some(PlanPhase::Verify)));
+        assert!(!model_may_run_checks(false, 1, Some(PlanPhase::Verify)));
     }
 }
 

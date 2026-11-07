@@ -75,13 +75,6 @@ end
 require("forge").setup({ about_auto_generate = false })
 local status = require("forge.status")
 local state = status.open({ workspace = fixture })
----@type table<integer, boolean>
-local context_ready = {}
-local unsubscribe = client.document_events_subscribe(state.document, function(event, payload)
-  if event == "status.update" and payload.phase == "context" then
-    for _, body in ipairs(payload.body or {}) do context_ready[body.file] = true end
-  end
-end)
 
 local success, failure = xpcall(function()
   vim.api.nvim_set_hl(0, "Normal", { fg = 0xffffff, bg = 0 })
@@ -124,7 +117,7 @@ local success, failure = xpcall(function()
     require("forge.nodes").set_open(state.replica, 0, "file:" .. file.id, true)
     status.demand(state)
     assert(vim.wait(10000, function()
-      return context_ready[file.id] and state.replica.file[file.id].body and state.done[file.id] and not state.request_active
+      return state.replica.file[file.id].body and state.done[file.id] and not state.request_active
     end, 10), "semantic context did not load for " .. entry.path)
     local body = state.replica.file[file.id].body
     ---@type string[]
@@ -169,7 +162,6 @@ local success, failure = xpcall(function()
   assert(#notices == 0, table.concat(notices, "\n"))
 end, debug.traceback)
 
-unsubscribe()
 status.close(state)
 client.host_stop()
 assert(vim.wait(10000, function() return client._client.process == nil end, 20), "Forge host did not stop")

@@ -20,6 +20,7 @@ mod supervisor;
 #[cfg(test)]
 mod tests;
 mod tools;
+pub(crate) use tools::model_may_run_checks;
 
 pub use activity::{CheckActivity, CheckCommandActivity};
 pub use applicability::{CheckApplicability, CheckTrigger};

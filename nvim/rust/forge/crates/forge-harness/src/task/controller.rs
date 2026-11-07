@@ -214,37 +214,6 @@ impl SessionTaskController {
                 execution.record.findings = vec![diagnostic];
                 execution.record.generation += 1;
             }
-            #[cfg(test)]
-            super::TaskEvent::VerificationInputsChanged(source) => {
-                let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
-                    anyhow::bail!("verification invalidation requires execution");
-                };
-                ensure!(
-                    execution.record.phase == crate::plan::PlanPhase::Verify
-                        && execution.record.state == PlanExecutionState::Active,
-                    "verification invalidation requires active Verify"
-                );
-                execution.record.phase = crate::plan::PlanPhase::Checking;
-                execution.record.generation += 1;
-                execution.record.findings = vec!["Automated evidence no longer covers the current inputs. Run Check before manual verification.".into()];
-                if task
-                    .entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.delivery == super::TaskInputDelivery::Pending)
-                {
-                    task.entry = None;
-                }
-                task.renew(now_ms);
-                task.turn = Some(super::TaskTurn {
-                    id: source,
-                    continuation: Some(super::TaskContinuation {
-                        id: super::TaskInputId::fresh(),
-                        reason: "Recheck changed verification inputs".into(),
-                        delivery: super::TaskInputDelivery::Pending,
-                        work: super::TaskWork::Checks,
-                    }),
-                });
-            }
             super::TaskEvent::EntryPreparationFinished => {
                 task.entry
                     .as_mut()
@@ -1952,7 +1921,7 @@ impl SessionTaskController {
                 active
                     .as_mut()
                     .context("session has no active task")?
-                    .request_entry(instruction, now_ms)?;
+                    .request_resume_entry(instruction, now_ms)?;
             }
             TaskChange::ResumeWithChecks(completed_turn) => {
                 Self::apply_draft_change(active, TaskChange::Resume, now_ms)?;

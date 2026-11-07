@@ -31,7 +31,7 @@ function M.request(state, render)
       or client.host_get_generation() ~= generation then return end
     if failure then
       state.recap = nil
-      notifications.error(failure, "Harness recap")
+      notifications.error("Recap unavailable: " .. tostring(failure), "Harness recap")
     elseif not result or type(result.text) ~= "string" or vim.trim(result.text) == "" then
       state.recap = nil
       notifications.error("Recap completed without text", "Harness recap")

@@ -40,15 +40,21 @@ local function stop()
   client.host_stop()
   await(function() return client._client.process == nil end, "host collection")
 end
+local mock = dofile(origin .. "/nvim/tests/forge/support/mock_provider.lua")
+-- Hold the provider so the edits land while the exchange is active, then cancel it. Submission
+-- settles at admission, so finalization is read from the exchange record.
 local function exchange(edits)
-  vim.fn.delete(workspace .. "/mock-provider-change.txt")
-  local done, failure
-  client.request({ method = "session.prompt.submit", params = { text = "Checkpoint integration fixture" }, session_id = current_session_id }, function(_, problem) done, failure = true, problem end)
-  await(function() return vim.fn.filereadable(workspace .. "/mock-provider-change.txt") == 1 end, "provider did not start")
+  local held = mock.hold(current_session_id, "chat")
+  local before = #(request("session.exchange.list") or {})
+  request("session.prompt.submit", { text = "Checkpoint integration fixture" })
+  held:wait()
   for name, content in pairs(edits) do write(name, content) end
   request("session.turn.cancel")
-  await(function() return done end, "cancelled exchange did not finalize")
-  assert(failure and failure:find("cancel", 1, true), failure)
+  local history
+  await(function()
+    history = request("session.exchange.list") or {}
+    return #history == before + 1 and history[#history].state == "cancelled"
+  end, "cancelled exchange did not finalize")
 end
 local success, failure = xpcall(function()
   git({ "init", "-q" })
@@ -63,7 +69,7 @@ local success, failure = xpcall(function()
   write("b", "initial unstaged b")
   local initial_index = vim.fn.readblob(workspace .. "/.git/index")
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "writing-blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "blocking" } } } } })
   local session_id = open().session.id
   exchange({ a = "first a", b = "first b" })
   exchange({ a = "second a", c = "second c" })

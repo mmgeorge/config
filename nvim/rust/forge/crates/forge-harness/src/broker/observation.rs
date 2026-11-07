@@ -45,17 +45,16 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
-    /// Read negotiated task steering support without querying or configuring a provider.
-    pub(crate) fn task_steering_supported(&self, kind: crate::task::TaskKind) -> Result<bool> {
+    /// Read negotiated native steering support without querying or configuring a provider.
+    ///
+    /// Steering is a provider fact; Harness admits steering of an active task of any kind
+    /// whenever the provider reports native steering.
+    pub(crate) fn native_steer_supported(&self) -> Result<bool> {
         let metadata = self
             .metadata
             .read()
             .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
-        Ok(metadata.capability.native_steer
-            && metadata
-                .manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.task_steering.contains(&kind)))
+        Ok(metadata.capability.native_steer)
     }
 
     /// Get the bounded internal check route installed by the session exchange owner.
@@ -90,19 +89,7 @@ impl BrokerObserver {
             .read()
             .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
             .clone();
-        let task = self
-            .admission
-            .runtime()?
-            .active_task
-            .as_ref()
-            .map(|task| task.kind());
-        let native_steer = metadata.capability.native_steer
-            && task.is_none_or(|kind| {
-                metadata
-                    .manifest
-                    .as_ref()
-                    .is_some_and(|manifest| manifest.task_steering.contains(&kind))
-            });
+        let native_steer = metadata.capability.native_steer;
         let mut has_approval = false;
         for approval in self.permission_coordinator.pending_list()? {
             if let Some(id) = approval.exchange_id {
@@ -1017,20 +1004,14 @@ mod tests {
         )?;
         let mut manifest = CapabilityManifest::from_descriptor(broker.provider.descriptor());
         manifest.effective_revision = 1;
-        manifest.task_steering = vec![crate::task::TaskKind::Goal];
-        manifest
-            .capability
-            .iter_mut()
-            .find(|entry| entry.id == CapabilityId::NativeSteer)
-            .context("capability manifest omits steering")?
-            .support = Support::Supported;
+        manifest.set_support(CapabilityId::NativeSteer, Support::Supported);
         let initial = manifest.clone();
         for (reported, expected) in [
             (manifest.clone(), true),
             (
                 {
                     manifest.effective_revision = 2;
-                    manifest.task_steering = vec![crate::task::TaskKind::Plan];
+                    manifest.set_support(CapabilityId::NativeSteer, Support::Unsupported);
                     manifest
                 },
                 false,
@@ -1055,21 +1036,38 @@ mod tests {
     }
     /// First late native confirmation updates only the latest root cycle of the still-current binding.
     #[tokio::test]
-    async fn late_first_model_confirmation_respects_latest_root_turn_and_binding() -> Result<()> {
+    async fn late_first_model_confirmation_applies_to_current_turn() -> Result<()> {
+        assert_late_first_model_confirmation(Boundary::Current).await
+    }
+
+    #[tokio::test]
+    async fn late_first_model_confirmation_yields_to_successor_turn() -> Result<()> {
+        assert_late_first_model_confirmation(Boundary::SuccessorTurn).await
+    }
+
+    #[tokio::test]
+    async fn late_first_model_confirmation_yields_to_successor_exchange() -> Result<()> {
+        assert_late_first_model_confirmation(Boundary::SuccessorExchange).await
+    }
+
+    #[tokio::test]
+    async fn late_first_model_confirmation_ignores_retired_binding() -> Result<()> {
+        assert_late_first_model_confirmation(Boundary::RetiredBinding).await
+    }
+
+    #[derive(Clone, Copy)]
+    enum Boundary {
+        Current,
+        SuccessorTurn,
+        SuccessorExchange,
+        RetiredBinding,
+    }
+
+    /// Delivers a model confirmation that arrives after the turn finished and checks which
+    /// state the given boundary lets it update.
+    async fn assert_late_first_model_confirmation(boundary: Boundary) -> Result<()> {
         use crate::provider::test_support::ProviderTestExt;
-        #[derive(Clone, Copy)]
-        enum Boundary {
-            Current,
-            SuccessorTurn,
-            SuccessorExchange,
-            RetiredBinding,
-        }
-        for boundary in [
-            Boundary::Current,
-            Boundary::SuccessorTurn,
-            Boundary::SuccessorExchange,
-            Boundary::RetiredBinding,
-        ] {
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -1161,7 +1159,7 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_secs(3), fixture.close()).await??;
                 tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    broker.provider.session_close_owner(&address.scope.owner),
+                    broker.provider.session_close_owner(&address.scope.owner()),
                 )
                 .await??;
             }

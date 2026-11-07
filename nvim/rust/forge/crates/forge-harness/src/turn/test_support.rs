@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ScopeOwner;
 use crate::{
     exchange::{Exchange, ExchangeNode},
     provider::{InvocationScope, ProviderEvent, ThreadOwner, TurnAddress},
@@ -13,16 +14,18 @@ use serde::{Deserialize, Serialize};
 /// Create a fixture address with distinct checked normalized identities.
 pub(crate) fn address(exchange: &Exchange, turn_id: &str) -> TurnAddress {
     let scope = InvocationScope {
-        owner: ThreadOwner::new(
-            exchange.session_id.clone().into(),
-            forge_provider_api::agent::AgentId::new(exchange.agent_id.clone()).unwrap(),
-        )
-        .expect("fixture owner is registered"),
+        thread_id: forge_provider_api::ThreadId::from(
+            ThreadOwner::new(
+                exchange.session_id.clone().into(),
+                forge_provider_api::agent::AgentId::new(exchange.agent_id.clone()).unwrap(),
+            )
+            .expect("fixture owner is registered"),
+        ),
         exchange_id: exchange.id.clone().into(),
         invocation_id: format!("{}:invocation:{turn_id}", exchange.id).into(),
     };
     TurnAddress {
-        thread_id: scope.owner.thread_id(),
+        thread_id: scope.owner().thread_id(),
         turn_id: scope.turn_id().unwrap(),
         scope,
     }
@@ -223,8 +226,8 @@ pub(crate) struct TestTurn {
 impl TestTurn {
     pub(crate) fn new(id: String, address: TurnAddress, now_ms: i64) -> Self {
         let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
-            "id":address.scope.exchange_id, "session_id":address.scope.owner.session_id(),
-            "agent_id":address.scope.owner.agent_id(), "ordinal":1,
+            "id":address.scope.exchange_id, "session_id":address.scope.owner().session_id(),
+            "agent_id":address.scope.owner().agent_id(), "ordinal":1,
             "prompt":"Work", "state":"running", "created_at_ms":now_ms,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))
@@ -335,6 +338,39 @@ pub(crate) fn tool_value_mut<'value>(
             {
                 return tool;
             }
+        }
+    }
+    panic!("serialized commentary has no tool {id}");
+}
+
+/// Reopen one serialized tool as running, keeping its display row and native outcome consistent.
+pub(crate) fn reopen_tool_value(value: &mut serde_json::Value, id: &str) {
+    let entries = value["entry"].as_array_mut().expect("exchange entries");
+    for entry in entries {
+        if entry["kind"] != "commentary" {
+            continue;
+        }
+        for group in entry["commentary"]["tool"]
+            .as_array_mut()
+            .expect("commentary tools")
+        {
+            let store = &mut group["store"];
+            let Some(tool) = store["item"]
+                .as_object_mut()
+                .expect("tool store")
+                .get_mut(id)
+            else {
+                continue;
+            };
+            tool["status"] = serde_json::json!("running");
+            tool["state"] = serde_json::json!("running");
+            tool["failed"] = serde_json::json!(false);
+            tool["completed_at_ms"] = serde_json::Value::Null;
+            tool["completed_active_ms"] = serde_json::Value::Null;
+            let execution = &mut store["execution"][id];
+            execution["outcome"] = serde_json::Value::Null;
+            execution["final_snapshot"] = serde_json::Value::Null;
+            return;
         }
     }
     panic!("serialized commentary has no tool {id}");

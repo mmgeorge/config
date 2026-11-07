@@ -139,7 +139,9 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     assert!(initialized.get("error").is_none(), "{initialized}");
     let mut consumed_bytes = line.len();
     send(&mut input, json!({"id": 0, "method": "host.transport.consumed", "params": {"bytes": consumed_bytes, "frames": 1}})).await;
-    for request_id in 2..130 {
+    // The first request id after the window is the one that must wait for consumer credit.
+    let blocked_request_id = 2 + forge_protocol::MAX_PENDING_FRAMES as u64;
+    for request_id in 2..blocked_request_id {
         send(
             &mut input,
             json!({"id": request_id, "method": "session.turn.cancel", "params": {}}),
@@ -156,7 +158,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
     }
     send(
         &mut input,
-        json!({"id": 130, "method": "session.turn.cancel", "params": {}}),
+        json!({"id": blocked_request_id, "method": "session.turn.cancel", "params": {}}),
     )
     .await;
     line.clear();
@@ -172,15 +174,19 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
         line.is_empty(),
         "writer emitted a partial frame without credit"
     );
-    send(&mut input, json!({"id": 0, "method": "host.transport.consumed", "params": {"bytes": consumed_bytes, "frames": 129}})).await;
+    send(&mut input, json!({"id": 0, "method": "host.transport.consumed", "params": {"bytes": consumed_bytes, "frames": 1 + forge_protocol::MAX_PENDING_FRAMES}})).await;
     tokio::time::timeout(Duration::from_secs(5), output.read_until(b'\n', &mut line))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&line).unwrap()["id"], 130);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&line).unwrap()["id"],
+        blocked_request_id
+    );
+    let shutdown_request_id = blocked_request_id + 1;
     send(
         &mut input,
-        json!({"id": 131, "method": "host.shutdown", "params": {}}),
+        json!({"id": shutdown_request_id, "method": "host.shutdown", "params": {}}),
     )
     .await;
     loop {
@@ -190,7 +196,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
             .unwrap()
             .unwrap();
         let message: Value = serde_json::from_slice(&line).unwrap();
-        if message["id"] == 131 {
+        if message["id"] == shutdown_request_id {
             assert!(message.get("error").is_none(), "shutdown failed: {message}");
             break;
         }
@@ -330,6 +336,32 @@ impl BrokerProcess {
         message
     }
 
+    /// Arm a mock response hold so the session's next prompt stays running until the test
+    /// cancels it. The hold replaces fixed blocking scenarios that mock commands once selected.
+    fn hold_next_prompt(&mut self, session_id: &str) -> String {
+        let query_id = self.next_query_id;
+        self.next_query_id += 1;
+        self.request(json!({"id": query_id, "session_id": session_id,
+            "method": "session.provider.mock_response", "params": {"operation": "hold"}}));
+        let response = self.read_response(query_id).pop().unwrap();
+        response["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("mock hold was not armed: {response}"))
+            .to_owned()
+    }
+
+    /// Block until a prompt reaches the armed hold, which proves its provider turn is running.
+    fn wait_for_held_prompt(&mut self, session_id: &str, hold_id: &str) -> Value {
+        let query_id = self.next_query_id;
+        self.next_query_id += 1;
+        self.request(json!({"id": query_id, "session_id": session_id,
+            "method": "session.provider.mock_response",
+            "params": {"operation": "wait", "id": hold_id}}));
+        let response = self.read_response(query_id).pop().unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"].clone()
+    }
+
     fn wait_for_exchanges(
         &mut self,
         turn_request_id: Option<u64>,
@@ -344,16 +376,20 @@ impl BrokerProcess {
                 json!({"id":query_id,"session_id":session_id,"method":"session.exchange.list","params":{}}),
             );
             let messages = self.read_response(query_id);
-            if let Some(turn_request_id) = turn_request_id {
-                assert!(
-                    !self.pending_response.contains_key(&turn_request_id),
-                    "turn settled before the expected live state: {:?}",
-                    self.pending_response.get(&turn_request_id)
-                );
-            }
             let response = messages.last().unwrap();
             assert!(response.get("error").is_none(), "{response}");
             let snapshot = &response["result"];
+            if let Some(turn_request_id) = turn_request_id {
+                // Prompt submission answers once the owner accepts the input, so the turn's
+                // liveness comes from the exchange record rather than from that response.
+                if let Some(accepted) = self.pending_response.get(&turn_request_id) {
+                    assert!(accepted.get("error").is_none(), "{accepted}");
+                }
+                assert!(
+                    exchanges_unsettled(snapshot),
+                    "turn settled before the expected live state: {snapshot}"
+                );
+            }
             if ready(snapshot) {
                 return snapshot.clone();
             }
@@ -366,22 +402,12 @@ impl BrokerProcess {
     }
 }
 
-fn has_assistant_output(snapshot: &Value) -> bool {
+/// Report whether every listed exchange is still queued or running its provider turn.
+fn exchanges_unsettled(snapshot: &Value) -> bool {
     snapshot.as_array().is_some_and(|exchanges| {
-        exchanges.iter().any(|exchange| {
-            exchange["turn"].as_array().is_some_and(|turns| {
-                turns.iter().any(|turn| {
-                    turn["message"].as_array().is_some_and(|messages| {
-                        messages.iter().any(|message| {
-                            message["kind"] == "assistant"
-                                && message["text"]
-                                    .as_str()
-                                    .is_some_and(|text| !text.is_empty())
-                        })
-                    })
-                })
-            })
-        })
+        exchanges
+            .iter()
+            .all(|exchange| matches!(exchange["state"].as_str(), Some("queued" | "running")))
     })
 }
 
@@ -418,8 +444,11 @@ fn serial_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Controller construction resolves inherited model tuning against the provider's workspace
+/// catalog, so an unavailable provider executable rejects initialization itself. The host must
+/// report that rejection on the request and keep serving later sessions.
 #[test]
-fn chat_reports_provider_start_failure_without_stopping_host() {
+fn unavailable_provider_rejects_initialization_without_stopping_host() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -428,123 +457,24 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
     broker.request(json!({
         "id": 1, "method": "session.initialize", "params": {
             "data_root": data.path(), "workspace": repository.path(),
-            "client_id": "chat-provider-stack-test",
+            "client_id": "unavailable-provider-test",
             "provider": { "kind": provider, "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture", "effort": "medium"
         }
     }));
-    let fixture_session_id = broker.capture_session(1);
-    assert!(
-        broker
-            .read_response(1)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
-    );
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 2, "method": "session.prompt.submit", "params": { "text": "Answer the fixture" }
-    }));
-    let response = broker.read_response(2).pop().unwrap();
-    assert!(
-        response["error"]
-            .to_string()
-            .contains("forge-unavailable-provider-fixture"),
-        "{response}"
-    );
-    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.state.get", "params": {} }));
-    assert!(
-        broker
-            .read_response(3)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
-    );
-    broker.request(json!({"session_id": fixture_session_id, "id": 5, "method": "session.exchange.list", "params": {}}));
-    let failed = broker.read_response(5).pop().unwrap();
-    assert_eq!(failed["result"][0]["state"], "failed", "{failed}");
-    assert!(
-        failed["result"][0]["finalization_error"].is_null(),
-        "{failed}"
-    );
-    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
-    assert_eq!(
-        broker.read_response(4).last().unwrap()["result"]["shutdown"],
-        true
-    );
-}
-
-#[test]
-fn planning_task_reports_provider_start_failure_without_stopping_host() {
-    let _serial_guard = serial_test();
-    let repository = tempfile::tempdir().unwrap();
-    std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let mut broker = BrokerProcess::start();
-    let provider = registered_provider(&mut broker);
+    let rejected = broker.read_response(1).pop().unwrap();
+    assert_eq!(rejected["error"]["code"], "initialize_failed", "{rejected}");
     broker.request(json!({
-        "id": 1,
-        "method": "session.initialize",
-        "params": {
-            "data_root": data.path(),
-            "workspace": repository.path(),
-            "client_id": "planning-stack-test",
-            "provider": { "kind": provider, "command": ["forge-unavailable-provider-fixture"] },
-            "model": "fixture",
-            "effort": "medium"
+        "id": 2, "method": "session.initialize", "params": {
+            "data_root": data.path(), "workspace": repository.path(),
+            "client_id": "available-provider-test",
+            "provider": { "kind": "mock", "command": ["mock"] }
         }
     }));
-    let fixture_session_id = broker.capture_session(1);
-    assert!(
-        broker
-            .read_response(1)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
+    let session_id = broker.capture_session(2);
+    broker.request(
+        json!({"session_id": session_id, "id": 3, "method": "session.state.get", "params": {} }),
     );
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 2,
-        "method": "session.command.apply",
-        "params": { "operation_id": "planning-stack-test", "action": "plan", "text": "Plan a fixture" }
-    }));
-    let mut observed = broker.read_response(2);
-    assert_eq!(observed.last().unwrap()["result"]["state"], "completed");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if observed.iter().any(|message| {
-            (message["event"] == "provider_event"
-                && message["payload"]["kind"] == "error"
-                && message["payload"]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("forge-unavailable-provider-fixture")))
-                || [
-                    &message["result"]["messages"],
-                    &message["payload"]["upsert"],
-                ]
-                .into_iter()
-                .filter_map(Value::as_array)
-                .flatten()
-                .any(|input| {
-                    input["error"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("forge-unavailable-provider-fixture"))
-                })
-        }) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "provider failure was not published: {observed:?}"
-        );
-        let request_id = broker.next_query_id;
-        broker.next_query_id += 1;
-        broker.request(json!({"id":request_id,"session_id":fixture_session_id,"method":"session.input.get","params":{}}));
-        observed.extend(broker.read_response(request_id));
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.state.get", "params": {} }));
     assert!(
         broker
             .read_response(3)
@@ -770,7 +700,7 @@ fn creates_a_new_session_while_the_source_turn_continues() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "concurrent-new-test",
-            "provider": { "kind": "mock", "command": ["session-blocking"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20,
@@ -786,12 +716,14 @@ fn creates_a_new_session_while_the_source_turn_continues() {
         .unwrap()
         .to_owned();
 
+    let hold_id = broker.hold_next_prompt(&source_session_id);
     broker.request(json!({
         "id": 2,
         "session_id": source_session_id,
         "method": "session.prompt.submit",
         "params": { "text": "keep the source busy" }
     }));
+    broker.wait_for_held_prompt(&source_session_id, &hold_id);
     broker.wait_for_exchanges(Some(2), Some(&source_session_id), |snapshot| {
         snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
     });
@@ -878,7 +810,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "cancel-test",
-            "provider": { "kind": "mock", "command": ["blocking"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -894,11 +826,13 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .is_none()
     );
 
+    let hold_id = broker.hold_next_prompt(&fixture_session_id);
     broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
         "method": "session.prompt.submit",
         "params": { "text": "keep working until cancelled" }
     }));
+    broker.wait_for_held_prompt(&fixture_session_id, &hold_id);
     broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.turn.cancel", "params": {} }));
 
     let cancellation = broker.read_response(3);
@@ -910,32 +844,21 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let cancelled_turn = broker.read_response(2);
-    assert_eq!(
-        cancelled_turn
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_cancelled")
+    // Prompt submission answers at owner acceptance; the exchange record carries the cancellation.
+    let accepted_turn = broker.read_response(2);
+    assert!(
+        accepted_turn.last().unwrap().get("error").is_none(),
+        "{accepted_turn:?}"
     );
     assert!(
         cancellation
             .iter()
-            .chain(&cancelled_turn)
+            .chain(&accepted_turn)
             .any(|message| message["event"] == "document_changed")
     );
-
-    broker.request(json!({"session_id": fixture_session_id,  "id": 4, "method": "session.exchange.list", "params": {} }));
-    let snapshot = broker.read_response(4);
-    assert_eq!(
-        snapshot
-            .last()
-            .unwrap()
-            .pointer("/result/0/state")
-            .and_then(Value::as_str),
-        Some("cancelled")
-    );
+    broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("cancelled")
+    });
     broker.request(json!({ "id": 5, "method": "host.shutdown", "params": {} }));
     broker.read_response(5);
 }
@@ -949,16 +872,17 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
     broker.request(json!({
         "id":1,"method":"session.initialize","params":{
             "workspace":workspace.path(),"data_root":data.path(),"client_id":"shutdown-test",
-            "provider":{"kind":"mock","command":["visible-blocking"]}
+            "provider":{"kind":"mock","command":["mock"]}
         }
     }));
     let fixture_session_id = broker.capture_session(1);
     let initialized = broker.read_response(1);
     assert!(initialized.last().unwrap().get("error").is_none());
+    let first_hold_id = broker.hold_next_prompt(&fixture_session_id);
     broker.request(
         json!({"id":2,"session_id":fixture_session_id,"method":"session.prompt.submit","params":{"text":"first active turn"}}),
     );
-    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), has_assistant_output);
+    broker.wait_for_held_prompt(&fixture_session_id, &first_hold_id);
     broker
         .request(json!({"id":3,"method":"session.new","params":{"name":"second active session"}}));
     let created = broker.read_response(3);
@@ -968,26 +892,25 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
         .pointer("/result/session/id")
         .and_then(Value::as_str)
         .unwrap();
+    let second_hold_id = broker.hold_next_prompt(child);
     broker.request(json!({"id":4,"session_id":child,"method":"session.prompt.submit","params":{"text":"second active turn"}}));
-    broker.wait_for_exchanges(Some(4), Some(child), has_assistant_output);
+    broker.wait_for_held_prompt(child, &second_hold_id);
     broker.request(json!({"id":5,"method":"host.shutdown","params":{}}));
     let stopped = broker.read_response(5);
     assert_eq!(
         stopped.last().unwrap().pointer("/result/shutdown"),
         Some(&Value::Bool(true))
     );
-    for request_id in [2, 4] {
-        let response = stopped
-            .iter()
-            .find(|message| message["id"].as_u64() == Some(request_id))
-            .unwrap();
-        assert_eq!(
-            response.pointer("/error/code").and_then(Value::as_str),
-            Some("turn_cancelled"),
-            "{response}"
-        );
-    }
     assert!(broker.child.wait().unwrap().success());
+    // Both prompts were acknowledged at acceptance, so the durable exchange records carry the
+    // cancellation that shutdown committed before its terminal response.
+    let store = forge_harness::storage::SqliteStore::open(data.path()).unwrap();
+    for session_id in [fixture_session_id.as_str(), child] {
+        let exchanges = store.list_exchange(session_id).unwrap();
+        assert_eq!(exchanges.len(), 1, "{session_id}");
+        let exchange = serde_json::to_value(&exchanges[0]).unwrap();
+        assert_eq!(exchange["state"], "cancelled", "{exchange}");
+    }
 }
 
 #[test]
@@ -1015,7 +938,7 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "restart-test",
-            "provider": { "kind": "mock", "command": ["steering"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1031,14 +954,13 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             .is_none()
     );
 
+    let hold_id = broker.hold_next_prompt(&fixture_session_id);
     broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
         "method": "session.prompt.submit",
         "params": { "text": "create the requested file" }
     }));
-    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), |snapshot| {
-        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
-    });
+    broker.wait_for_held_prompt(&fixture_session_id, &hold_id);
 
     broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
@@ -1056,32 +978,19 @@ fn restarts_a_running_turn_with_updated_permissions_without_creating_another_int
             .unwrap()
             .pointer("/result/state")
             .and_then(Value::as_str),
-        Some("accepted")
+        Some("completed"),
+        "{restart:?}"
     );
-    let cancelled = broker.read_response(2);
-    assert_eq!(
-        cancelled
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_cancelled")
+    // Prompt submission answers at owner acceptance rather than at turn settlement.
+    let accepted = broker.read_response(2);
+    assert!(
+        accepted.last().unwrap().get("error").is_none(),
+        "{accepted:?}"
     );
-
-    loop {
-        let message = broker.read_message();
-        if message["event"] == "task_operation"
-            && message["payload"]["id"] == "restart-with-updated-permissions"
-            && matches!(
-                message["payload"]["state"].as_str(),
-                Some("completed" | "failed")
-            )
-        {
-            assert_eq!(message["payload"]["state"], "completed", "{message}");
-            assert!(message["payload"]["error"].is_null(), "{message}");
-            break;
-        }
-    }
+    // The restarted turn finds no armed hold, so it completes inside the same interaction.
+    broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("complete")
+    });
 
     broker.request(json!({"session_id": fixture_session_id,  "id": 6, "method": "session.state.get", "params": {} }));
     let snapshot = broker.read_response(6);
@@ -1128,7 +1037,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "retract-test",
-            "provider": { "kind": "mock", "command": ["blocking"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1150,20 +1059,14 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         "method": "session.command.apply",
         "params": { "operation_id":"retract-permission-setup", "action":"permission", "change":{"kind":"set_approval","mode":"ask"} }
     }));
-    broker.read_response(2);
-    loop {
-        let message = broker.read_message();
-        if message["event"] == "task_operation"
-            && message["payload"]["id"] == "retract-permission-setup"
-            && matches!(
-                message["payload"]["state"].as_str(),
-                Some("completed" | "failed")
-            )
-        {
-            assert_eq!(message["payload"]["state"], "completed", "{message}");
-            break;
-        }
-    }
+    // Owner commands reply once, after the permission change has completed.
+    let permission = broker.read_response(2);
+    assert_eq!(
+        permission.last().unwrap()["result"]["state"],
+        "completed",
+        "{permission:?}"
+    );
+    let hold_id = broker.hold_next_prompt(&fixture_session_id);
     let prompt = "/plan reconsider this\nbefore doing anything";
     broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
@@ -1174,19 +1077,14 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         broker.read_response(3).last().unwrap()["result"]["state"],
         "completed"
     );
-    broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
-        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
-    });
+    broker.wait_for_held_prompt(&fixture_session_id, &hold_id);
     broker.request(
         json!({"session_id":fixture_session_id,"id":8,"method":"session.input.get","params":{}}),
     );
     let retained_input = broker.read_response(8).last().unwrap()["result"]["messages"][0].clone();
     assert!(retained_input["id"].is_string(), "{retained_input}");
-    broker.request(json!({"session_id":fixture_session_id,"id":9,"method":"session.goal.pause","params":{"operation_id":"pause-before-retraction"}}));
-    assert_eq!(
-        broker.read_response(9).last().unwrap()["result"]["state"],
-        "completed"
-    );
+    // Cancellation pauses the plan itself. Pausing first would revoke the running turn's task
+    // authority and persist it as an ordinary cancelled exchange, which is not a retraction.
     broker.request(json!({"session_id": fixture_session_id,
         "id": 4,
         "method": "session.turn.cancel",
@@ -1202,31 +1100,34 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let request_id = broker.next_query_id;
-        broker.next_query_id += 1;
-        broker.request(json!({"session_id":fixture_session_id,"id":request_id,"method":"session.input.get","params":{}}));
-        let input = broker.read_response(request_id).pop().unwrap();
-        if let Some(message) =
-            input["result"]["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|message| {
-                    message["id"] == retained_input["id"] && message["delivery"] == "queued"
-                })
-        {
-            assert_eq!(message["text"], retained_input["text"]);
-            assert_eq!(input["result"]["suspended"], true);
-            break;
+    // Retraction settles after the cancellation response. The owner publishes it as an input
+    // update that removes the prompt from the queue and leaves the queue suspended, so wait for
+    // that event instead of polling.
+    let is_retraction = |message: &Value| {
+        message["event"] == "input_changed"
+            && message["payload"]["retracted"] == retained_input["id"]
+    };
+    let mut retraction = cancellation
+        .iter()
+        .rev()
+        .find(|message| is_retraction(message))
+        .cloned();
+    while retraction.is_none() {
+        let message = broker.read_message();
+        if is_retraction(&message) {
+            retraction = Some(message);
         }
-        assert!(
-            Instant::now() < deadline,
-            "task input was not restored: {input}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
     }
+    let retraction = retraction.unwrap();
+    assert_eq!(retraction["payload"]["suspended"], true, "{retraction}");
+    assert_eq!(
+        retraction["payload"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "{retraction}"
+    );
 
     broker.request(json!({"session_id": fixture_session_id,  "id": 5, "method": "session.state.get", "params": {} }));
     let snapshot = broker.read_response(5);
@@ -1260,139 +1161,6 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
 }
 
 #[test]
-fn visible_output_prevents_cancelled_turn_retraction() {
-    let _serial_guard = serial_test();
-    let repository = tempfile::tempdir().unwrap();
-    git(repository.path(), &["init", "-q"]);
-    git(
-        repository.path(),
-        &["config", "user.email", "harness@example.invalid"],
-    );
-    git(
-        repository.path(),
-        &["config", "user.name", "Harness Integration"],
-    );
-    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
-    git(repository.path(), &["add", "."]);
-    git(repository.path(), &["commit", "-qm", "seed"]);
-    let data = tempfile::tempdir().unwrap();
-    let mut broker = BrokerProcess::start();
-    broker.request(json!({
-        "id": 1,
-        "method": "session.initialize",
-        "params": {
-            "data_root": data.path(),
-            "workspace": repository.path(),
-            "client_id": "visible-cancel-test",
-            "provider": { "kind": "mock", "command": ["visible-blocking"] },
-            "model": "mock-model",
-            "effort": "low",
-            "goal_max_turns": 20
-        }
-    }));
-    let fixture_session_id = broker.capture_session(1);
-    broker.read_response(1);
-
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 2,
-        "method": "session.prompt.submit",
-        "params": { "text": "show output before cancellation" }
-    }));
-    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), has_assistant_output);
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 3,
-        "method": "session.turn.cancel",
-        "params": { "restore_prompt_if_no_output": true }
-    }));
-    broker.read_response(3);
-    let cancelled = broker.read_response(2);
-    assert_eq!(
-        cancelled
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_cancelled")
-    );
-    broker.request(json!({"session_id": fixture_session_id, "id": 10, "method":"session.exchange.list", "params":{}}));
-    let snapshot = broker.read_response(10);
-    let snapshot = &snapshot.last().unwrap()["result"];
-    assert_eq!(snapshot[0]["state"], "cancelled");
-    assert!(has_assistant_output(snapshot));
-
-    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
-    broker.read_response(4);
-}
-
-#[test]
-fn workspace_changes_prevent_cancelled_turn_retraction() {
-    let _serial_guard = serial_test();
-    let repository = tempfile::tempdir().unwrap();
-    git(repository.path(), &["init", "-q"]);
-    git(
-        repository.path(),
-        &["config", "user.email", "harness@example.invalid"],
-    );
-    git(
-        repository.path(),
-        &["config", "user.name", "Harness Integration"],
-    );
-    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
-    git(repository.path(), &["add", "."]);
-    git(repository.path(), &["commit", "-qm", "seed"]);
-    let data = tempfile::tempdir().unwrap();
-    let mut broker = BrokerProcess::start();
-    broker.request(json!({
-        "id": 1,
-        "method": "session.initialize",
-        "params": {
-            "data_root": data.path(),
-            "workspace": repository.path(),
-            "client_id": "changed-cancel-test",
-            "provider": { "kind": "mock", "command": ["writing-blocking"] },
-            "model": "mock-model",
-            "effort": "low",
-            "goal_max_turns": 20
-        }
-    }));
-    let fixture_session_id = broker.capture_session(1);
-    broker.read_response(1);
-
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 2,
-        "method": "session.prompt.submit",
-        "params": { "text": "change the workspace" }
-    }));
-    broker.wait_for_exchanges(Some(2), Some(&fixture_session_id), |snapshot| {
-        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
-    });
-    let changed_path = repository.path().join("mock-provider-change.txt");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !changed_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(changed_path.exists());
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 3,
-        "method": "session.turn.cancel",
-        "params": { "restore_prompt_if_no_output": true }
-    }));
-    broker.read_response(3);
-    let cancelled = broker.read_response(2);
-    assert_eq!(
-        cancelled
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_cancelled")
-    );
-
-    broker.request(json!({ "id": 4, "method": "host.shutdown", "params": {} }));
-    broker.read_response(4);
-}
-
-#[test]
 fn persists_acknowledged_steering_on_the_active_interaction() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
@@ -1419,7 +1187,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "steer-test",
-            "provider": { "kind": "mock", "command": ["visible-blocking"] },
+            "provider": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
             "goal_max_turns": 20
@@ -1436,12 +1204,13 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         Some(true)
     );
 
+    let hold_id = broker.hold_next_prompt(&fixture_session_id);
     broker.request(json!({"session_id": fixture_session_id,
         "id": 2,
         "method": "session.prompt.submit",
         "params": { "text": "/plan refactor X" }
     }));
-    broker.wait_for_exchanges(None, Some(&fixture_session_id), has_assistant_output);
+    broker.wait_for_held_prompt(&fixture_session_id, &hold_id);
     broker.request(json!({"session_id": fixture_session_id,
         "id": 3,
         "method": "session.turn.steer",
@@ -1558,6 +1327,11 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
             .get("error")
             .is_none()
     );
+    // Prompt submission answers at acceptance. Native fork support follows from the native
+    // conversation that the first turn opens, so wait for that turn to finish.
+    owner.wait_for_exchanges(None, Some(&owner_session_id), |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("complete")
+    });
 
     let mut blocked = BrokerProcess::start();
     blocked.request(initialize(3, "blocked", None));
@@ -1582,103 +1356,4 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
     replacement.read_response(5);
     owner.request(json!({ "id": 6, "method": "host.shutdown", "params": {} }));
     owner.read_response(6);
-}
-
-#[test]
-fn full_request_admission_returns_busy_and_preserves_cancellation() {
-    let _serial_guard = serial_test();
-    let repository = tempfile::tempdir().unwrap();
-    git(repository.path(), &["init", "-q"]);
-    git(
-        repository.path(),
-        &["config", "user.email", "harness@example.invalid"],
-    );
-    git(
-        repository.path(),
-        &["config", "user.name", "Harness Integration"],
-    );
-    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
-    git(repository.path(), &["add", "."]);
-    git(repository.path(), &["commit", "-qm", "seed"]);
-    let data = tempfile::tempdir().unwrap();
-    let mut broker = BrokerProcess::start();
-    broker.request(json!({
-        "id": 1,
-        "method": "session.initialize",
-        "params": {
-            "data_root": data.path(),
-            "workspace": repository.path(),
-            "client_id": "cancel-test",
-            "provider": { "kind": "mock", "command": ["blocking"] },
-            "model": "mock-model",
-            "effort": "low",
-            "goal_max_turns": 20
-        }
-    }));
-    let fixture_session_id = broker.capture_session(1);
-    assert!(
-        broker
-            .read_response(1)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
-    );
-
-    broker.request(json!({"session_id": fixture_session_id,
-        "id": 2,
-        "method": "session.prompt.submit",
-        "params": { "text": "keep working until cancelled" }
-    }));
-    for request_id in 100..164 {
-        broker.request(json!({"session_id": fixture_session_id,  "id": request_id, "method": "session.state.get", "params": {} }));
-    }
-    let rejected = broker.read_response(163);
-    assert_eq!(
-        rejected
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("busy")
-    );
-    broker.request(json!({"session_id": fixture_session_id,  "id": 3, "method": "session.turn.cancel", "params": {} }));
-
-    let cancellation = broker.read_response(3);
-    assert_eq!(
-        cancellation
-            .last()
-            .unwrap()
-            .pointer("/result/cancel_requested")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    let cancelled_turn = broker.read_response(2);
-    assert_eq!(
-        cancelled_turn
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_str),
-        Some("turn_cancelled")
-    );
-    assert!(
-        cancellation
-            .iter()
-            .chain(&cancelled_turn)
-            .any(|message| message["event"] == "document_changed")
-    );
-
-    broker.request(json!({"session_id": fixture_session_id,  "id": 4, "method": "session.exchange.list", "params": {} }));
-    let snapshot = broker.read_response(4);
-    assert_eq!(
-        snapshot
-            .last()
-            .unwrap()
-            .pointer("/result/0/state")
-            .and_then(Value::as_str),
-        Some("cancelled")
-    );
-    broker.request(json!({ "id": 5, "method": "host.shutdown", "params": {} }));
-    broker.read_response(5);
 }

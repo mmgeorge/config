@@ -1,6 +1,6 @@
 use super::super::{
     ExchangeAdmission, ExchangeState, PromptMode, Request, SessionUpdate, SqliteStore,
-    TurnCancelled, publication,
+    TurnRetracted, publication,
 };
 use super::test_support::{
     PreparationProbe, checkpoint_fixture, planning_question_broker, repository,
@@ -269,9 +269,11 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
         if completed {
             assert!(events.is_empty(), "completed exchange was republished");
         } else {
+            // The superseded exchange never started a provider turn, so admission closes it
+            // as cancelled rather than reporting completed work.
             assert_eq!(
                 broker.store.load_exchange(&previous.id)?.unwrap().state(),
-                ExchangeState::Complete
+                ExchangeState::Cancelled
             );
             assert!(!events.is_empty(), "required completion was not published");
         }
@@ -327,7 +329,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             }
             Ok::<_, anyhow::Error>(())
         };
-        let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (result, observed) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             tokio::join!(
                 broker.run_interaction(
                     "Visible before provider preparation".into(),
@@ -352,7 +354,19 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
                     Some(failure) if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime
                 )), "preparation lost its typed failure: {error:#}");
             }
-            "cancel" => assert!(result.unwrap_err().is::<TurnCancelled>()),
+            "cancel" => {
+                // Cancellation before dispatch leaves the submission never consumed, so the
+                // host retracts the output-free exchange instead of retaining it as cancelled.
+                let error = result.unwrap_err();
+                assert!(error.is::<TurnRetracted>(), "{error:#}");
+                assert!(!tool_ran.load(Ordering::SeqCst));
+                assert!(
+                    broker.store.list_exchange(&session_id)?.is_empty(),
+                    "retracted exchange remained in the transcript"
+                );
+                assert!(broker.exchange_runtime.is_none());
+                continue;
+            }
             _ => unreachable!(),
         }
         assert_eq!(tool_ran.load(Ordering::SeqCst), outcome == "complete");
@@ -364,10 +378,10 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         );
         assert_eq!(
             exchange[0].state(),
-            match outcome {
-                "complete" => ExchangeState::Complete,
-                "fail" => ExchangeState::Failed,
-                _ => ExchangeState::Cancelled,
+            if outcome == "complete" {
+                ExchangeState::Complete
+            } else {
+                ExchangeState::Failed
             }
         );
         assert!(broker.exchange_runtime.is_none());

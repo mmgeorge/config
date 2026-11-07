@@ -17,6 +17,7 @@ use crate::question::{
 };
 use crate::trace::TraceStore;
 
+/// Production limit on concurrently registered waits for one session owner.
 const MAX_WAITS: usize = 1024;
 const RETIREMENT_BUDGET: usize = 32;
 
@@ -155,6 +156,7 @@ impl QuestionWaitFailure {
 
 /// Own all production answer-destination registration and retirement transitions for one session.
 pub(super) struct QuestionWaits {
+    capacity: usize,
     state: WaitOwnerState,
     active: HashMap<WaitId, Registration>,
     observations: FuturesUnordered<BoxFuture<'static, Retirement>>,
@@ -166,7 +168,15 @@ pub(super) struct QuestionWaits {
 impl Default for QuestionWaits {
     /// Create an empty, bounded resource owner before admitting any waiting question tools.
     fn default() -> Self {
+        Self::with_capacity(MAX_WAITS)
+    }
+}
+
+impl QuestionWaits {
+    /// Create an empty owner that admits at most `capacity` concurrent waits.
+    pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
+            capacity,
             state: WaitOwnerState::Open,
             active: HashMap::new(),
             observations: FuturesUnordered::new(),
@@ -175,13 +185,11 @@ impl Default for QuestionWaits {
             retry_at: None,
         }
     }
-}
 
-impl QuestionWaits {
     /// Get whether another waiting destination can be installed at this owner update.
     /// Keep excess callbacks in the owner's staged queue until retirement frees capacity.
     pub(super) fn has_capacity(&self) -> bool {
-        self.active.len() < MAX_WAITS
+        self.active.len() < self.capacity
     }
 
     /// Publish and install one wait only after proving capacity and validating its captured scope.

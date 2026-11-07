@@ -16,6 +16,9 @@ client._host_set_launcher_for_test(function(_, options, on_exit)
       local request = vim.json.decode(encoded)
       if request.method == "host.initialize" then
         emitted(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
+      elseif request.method == "provider.registry.list" then
+        local registry = dofile("nvim/tests/forge/support/provider_catalog.lua").registry()
+        emitted(nil, vim.json.encode({ id = request.id, result = registry }) .. "\n")
       elseif request.method == "session.initialize" then
         emitted(nil, vim.json.encode({ id = request.id, result = { initialized = true } }) .. "\n")
       elseif request.method == "host.trace.configure" then

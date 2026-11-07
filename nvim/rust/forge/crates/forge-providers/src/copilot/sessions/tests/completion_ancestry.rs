@@ -77,7 +77,7 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
         let peer = RecoveryPeer::attach_with_turns(&runtime, "1.0.103", true).await;
         let client = runtime.client(".").await.unwrap();
         let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
-        let owner = forge_provider_api::ThreadOwner::root("ancestry-owner");
+        let owner = forge_provider_api::testing::root_thread("ancestry-owner");
         let session = recovery_session(&sessions, client.clone(), &owner).await;
         let turn = sessions.turn(&owner.clone()).await;
         let capability = crate::registry::descriptor(&crate::registry::select("copilot").unwrap())
@@ -109,7 +109,6 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
                 model: None,
                 capability: capability.clone(),
                 input: forge_provider_api::PromptInput::Text(format!("request {ordinal}")),
-                task: None,
                 recovered: Vec::new(),
                 instructions: String::new(),
                 repair_caution: None,
@@ -125,7 +124,7 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
             };
             let address = forge_provider_api::TurnAddress {
                 scope: scope.clone(),
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.thread_id.clone(),
                 turn_id: scope.turn_id().unwrap(),
             };
             let start = crate::copilot::test_turn::native_turn(sink.clone(), address).await;

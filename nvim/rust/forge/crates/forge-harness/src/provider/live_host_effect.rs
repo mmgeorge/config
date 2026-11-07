@@ -77,8 +77,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (sender, requests) = LiveHostEffectSender::channel();
         drop(requests);
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("session"), "exchange");
+        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
         let batch = HostEffectBatch::new(7, Default::default());
         let snapshot = vec![batch.clone()];
         let result = sender
@@ -100,7 +99,7 @@ mod tests {
             std::fs::write(&path, "old")?;
             std::fs::write(&path, "new")?;
             let scope =
-                InvocationScope::new(forge_provider_api::ThreadOwner::root("session"), "exchange");
+                InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
             let call = ToolCallId::new("committed-rename")?;
             let change = crate::tools::lsp::HostFileChange {
                 scope: scope.clone(),
@@ -153,8 +152,7 @@ mod tests {
     async fn live_effect_reply_requires_correlated_owner_commit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sender, mut requests) = LiveHostEffectSender::channel();
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("session"), "exchange");
+        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
         let call = ToolCallId::new("call")?;
         let batch = HostEffectBatch::new(7, Default::default());
         let sent = sender.commit(scope.clone(), call.clone(), batch);

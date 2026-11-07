@@ -73,6 +73,44 @@ impl SqliteStore {
         Ok(session)
     }
 
+    /// Clear an automatically derived session name only while it still equals `derived_name`.
+    ///
+    /// Ordinary session saves preserve the stored name, so retracting the first prompt must
+    /// clear it here. A rename committed after automatic naming keeps the user's name.
+    pub(crate) fn release_session_name(
+        &mut self,
+        session_id: &str,
+        client_id: &str,
+        derived_name: &str,
+    ) -> Result<HarnessSession> {
+        ensure!(
+            self.session_lock.contains_key(session_id),
+            "session naming requires runtime ownership"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let mut session = decode_current_session(&payload)?.context("session format changed")?;
+        ensure!(
+            session.lease_owner.as_deref() == Some(client_id),
+            "Harness session lease ownership changed"
+        );
+        if session.name == derived_name {
+            session.name.clear();
+            transaction.execute(
+                "UPDATE session_record SET payload=?2 WHERE id=?1",
+                params![session_id, encode_session(&session)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(session)
+    }
+
     /// Captures revocable metadata access without extending the runtime owner's lifetime.
     pub(crate) fn session_metadata_writer(
         &self,

@@ -536,6 +536,7 @@ impl super::events::EventObserver for ToolWatchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ScopeOwner;
     use forge_provider_api::{
         InspectableArguments, ItemId, ToolCompletion, ToolDescriptor, ToolOutcome,
     };
@@ -548,13 +549,15 @@ mod tests {
     /// Bind each tool fixture to its original admitted response cycle.
     fn address(id: &str) -> ToolAddress {
         let scope = super::super::InvocationScope {
-            owner: super::super::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(super::super::ThreadOwner::root(
+                "session",
+            )),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         };
         ToolAddress {
             turn: super::super::TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id().unwrap(),
                 scope,
             },

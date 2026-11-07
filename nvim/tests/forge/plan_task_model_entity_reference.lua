@@ -7,7 +7,6 @@ end
 local fixture_dir = vim.fn.tempname()
 local ok, failure = pcall(function()
   local task_model = require("forge.views.plan_review.task_model")
-  local entity_info = require("forge.views.plan_review.entity_info")
 
   vim.fn.mkdir(fixture_dir, "p")
   local working_path = vim.fs.joinpath(fixture_dir, "working.md")
@@ -205,30 +204,6 @@ local ok, failure = pcall(function()
       selection = "receiver",
     }
   ), "external receiver should resolve from the rendered external-entity anchor")
-
-  local review_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(review_buf, 0, -1, false, { rustdoc_line })
-  local review_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(review_win, review_buf)
-  vim.api.nvim_win_set_cursor(
-    review_win,
-    { 1, assert(rustdoc_line:find("geoparquet_metadata", 1, true)) - 1 }
-  )
-  local requested_target = nil
-  assert(entity_info.show_context(model, review_buf, review_win, {
-    source_line = 4,
-    plan_id = "plan",
-    expected_version = 3,
-    request = function(target)
-      requested_target = target
-    end,
-  }), "PlanReview ol should route an external callable to Rustdoc")
-  assert(vim.deep_equal(requested_target, {
-    json_path = "/flows/1/steps/0/edges/0",
-    selection = "callable",
-    plan_id = "plan",
-    expected_version = 3,
-  }), "PlanReview ol should request Rustdoc for the canonical external flow edge")
 end)
 
 vim.fn.delete(fixture_dir, "rf")

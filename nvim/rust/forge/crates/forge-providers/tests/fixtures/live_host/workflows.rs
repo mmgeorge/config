@@ -293,7 +293,7 @@ impl WorkflowService {
     /// Observe exact-binding terminals through the production presentation route.
     pub(super) async fn terminal_snapshot(
         &self,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory> {
         let snapshot = self
             .service
             .document(

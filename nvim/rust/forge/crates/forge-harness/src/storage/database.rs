@@ -90,10 +90,51 @@ impl DerefMut for HistoryConnection {
     }
 }
 
+/// Wait this long for a competing SQLite writer before reporting contention.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+thread_local! {
+    static BUSY_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restore the production busy timeout when a contention test releases its override.
+#[cfg(test)]
+pub(crate) struct BusyTimeoutOverride {
+    previous: Option<Duration>,
+}
+
+#[cfg(test)]
+impl Drop for BusyTimeoutOverride {
+    fn drop(&mut self) {
+        BUSY_TIMEOUT_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Make history handles opened on this thread report contention after `timeout`.
+///
+/// Contention tests use a zero timeout so a held external lock fails the write at once instead
+/// of waiting for the production timeout to elapse.
+#[cfg(test)]
+pub(crate) fn override_busy_timeout(timeout: Duration) -> BusyTimeoutOverride {
+    BusyTimeoutOverride {
+        previous: BUSY_TIMEOUT_OVERRIDE.with(|slot| slot.replace(Some(timeout))),
+    }
+}
+
+fn busy_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = BUSY_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    BUSY_TIMEOUT
+}
+
 /// Apply one contention and durability policy to every history handle.
 fn connection_open(root: &Path, flags: OpenFlags) -> Result<Connection, rusqlite::Error> {
     let connection = Connection::open_with_flags(super::state::database(root), flags)?;
-    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.busy_timeout(busy_timeout())?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)

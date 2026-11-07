@@ -1008,7 +1008,9 @@ local function host_start_process(callback)
 end
 
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
-function M.host_start(callback)
+---@param control_admission? boolean Control requests and internal initializers bypass the ordinary
+---  startup waiter limit, so queued ordinary requests can never lock out task control.
+function M.host_start(callback, control_admission)
   callback = protect_consumer(callback or function() end, "startup")
   local client = host_state()
   if history_clearing then callback(nil, "Forge history is being cleared", { code = "not_admitted" }) return end
@@ -1025,7 +1027,10 @@ function M.host_start(callback)
     return
   end
   if client.starting then
-    if #client.initialize_callback >= 64 then callback(nil, "Forge startup admission is full") return end
+    if #client.initialize_callback >= 64 and not control_admission then
+      callback(nil, "Forge startup admission is full", { code = "not_admitted" })
+      return
+    end
     client.initialize_callback[#client.initialize_callback + 1] = callback
     return
   end
@@ -1035,7 +1040,8 @@ end
 ---@param callback? ForgeCallback
 ---@param initialize_options? table
 ---@param startup? ForgeHarnessStartupTrace
-function M.session_initialize(callback, initialize_options, startup)
+---@param control_admission? boolean Bypass the ordinary startup waiter limit for task control.
+function M.session_initialize(callback, initialize_options, startup, control_admission)
   callback = protect_consumer(callback or function() end, "Harness startup")
   local client = host_state()
   local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
@@ -1068,7 +1074,10 @@ function M.session_initialize(callback, initialize_options, startup)
     return
   end
   if client[mode .. "_starting"] then
-    if #client[mode .. "_initialize_callback"] >= 64 then callback(nil, "Harness startup admission is full") return end
+    if #client[mode .. "_initialize_callback"] >= 64 and not control_admission then
+      callback(nil, "Harness startup admission is full", { code = "not_admitted" })
+      return
+    end
     client[mode .. "_initialize_callback"][#client[mode .. "_initialize_callback"] + 1] = function(result, failure, detail)
       if failure or mode == "runtime" or not initialize_options then
         callback(result, failure, detail)
@@ -1087,7 +1096,7 @@ function M.session_initialize(callback, initialize_options, startup)
       if registry_failure then session_finish_initialize(mode, callback, nil, registry_failure)
       else session_send_initialize(callback, initialize_options, startup) end
     end)
-  end)
+  end, true)
 end
 
 --- Resolve isolated generation launch settings from the loaded provider registry.
@@ -1260,10 +1269,11 @@ send_request = function(session_id, method, params, callback, sending, progress)
     queue_ready_request(client, id)
   end
   -- Readiness may issue prerequisite RPCs, so it must not reserve a transport slot.
+  local control_admission = contract.method_policy(method).admission == "control"
   if method == "session.initialize" or contract.method_policy(method).readiness == "host" then
-    M.host_start(ready)
+    M.host_start(ready, control_admission)
   else
-    M.session_initialize(ready, { services_only = true })
+    M.session_initialize(ready, { services_only = true }, nil, control_admission)
   end
   return id
 end

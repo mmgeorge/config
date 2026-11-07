@@ -96,11 +96,11 @@ impl ProviderRequest {
     }
 
     /// Resolve the independent runtime without changing the visible settings scope.
-    pub fn runtime_key(&self) -> Result<String, forge_provider_api::execution::ThreadOwnerError> {
+    pub fn runtime_key(&self) -> Result<String, crate::provider::ThreadOwnerError> {
         Ok(self.owner()?.runtime_key())
     }
     /// Validate the provider runtime key before admission or cancellation routing.
-    pub fn owner(&self) -> Result<ThreadOwner, forge_provider_api::execution::ThreadOwnerError> {
+    pub fn owner(&self) -> Result<ThreadOwner, crate::provider::ThreadOwnerError> {
         ThreadOwner::resolve(&self.execution_owner, &self.harness_session_id)
     }
 }

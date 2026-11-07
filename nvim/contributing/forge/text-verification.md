@@ -12,7 +12,7 @@ The current `en-US-bigram-4` model preserves recognized English and configured v
 
 ## Latency
 
-The [measurement file](../../rust/forge/crates/forge-text/evaluation/windows-latency.json) records 120 completed words at 20 words per second in a fresh editor. All 120 corrections applied and redrew, and cold initialization took 1,782 ms while typing stayed usable.
+The [measurement file](../../rust/forge/crates/forge-text/evaluation/windows-latency.json) records 120 completed words at 20 words per second in a fresh editor. All 120 corrections applied and redrew, and cold initialization took 1,782 ms while typing stayed usable. A paced benchmark fixture produced these numbers; it typed on a real-time cadence, so the suite no longer runs it, and `text_sustained_input` checks the same input without timing it.
 
 | Measurement | p95 (ms) | p99 (ms) |
 | --- | ---: | ---: |
@@ -23,10 +23,10 @@ Single-sentence contexts with 10, 100, 1,000, and 10,000 preceding words reached
 
 ## Fixtures
 
-Run each fixture from the repository root in a fresh Neovim. Native fixtures use the already-built host and never build it:
+Run fixtures through the Lua runner, which gives each one a fresh Neovim. Native fixtures use the already-built host and never build it:
 
 ```nu
-nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/text_rejection.lua
+nu .forge/checks/lua-tests.nu nvim/tests/forge/text_rejection.lua
 ```
 
 | Fixture | Behavior checked |
@@ -44,10 +44,10 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/text_rejecti
 | `text_lifecycle` | Navigation, owner disposal, macros, undo, and redo |
 | `text_completion` | Completion insertion followed by a typed delimiter |
 | `text_host` | Host initialization, wire decisions, and shutdown |
-| `text_latency` | Sustained input and longer contexts |
+| `text_sustained_input` | 120 consecutive corrections, and contexts up to 10,000 preceding words |
 | `harper_host`, `harper_scopes_host` | Harper diagnostics, fixes, coordinates, and a document past its 120 KB default cutoff |
 
-Rust tests run with `cargo test --profile dev --locked -p forge-text --lib <exact-test-name> -- --exact`. Harper changes need no native rebuild.
+Rust tests run with `cargo nextest run --cargo-profile dev --locked -p forge-text --lib -E 'test(=<exact-test-name>)'`. Harper changes need no native rebuild.
 
 ## Known limits
 

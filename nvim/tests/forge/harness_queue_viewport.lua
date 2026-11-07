@@ -28,9 +28,15 @@ local function await(predicate, message)
   }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
+local function drafts_pending()
+  for _, draft in ipairs(state.input.drafts) do
+    if draft.draft_state == "pending" then return true end
+  end
+  return false
+end
 local function settled()
   await(function()
-    return state.input and #state.input.pending == 0 and not state.input.refreshing
+    return state.input and not drafts_pending() and not state.input.refreshing
       and state.presentation and not state.presentation.syncing and not state.presentation.pending
       and not state.presentation.staging_inflight and not state.presentation.applying
       and vim.deep_equal(state.presentation.staging, state.presentation.applied_staging)
@@ -82,10 +88,17 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(view, vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)),
     "passive queue refresh moved a history reader")
   controller.submit()
+  -- Committing the edit is a host input mutation; the published queue releases its reservation.
+  await(function()
+    for _, entry in ipairs(state.queue) do if entry.reservation then return false end end
+    return true
+  end, "edit commit never released its reservation")
   settled()
   assert(not state.queue_edit and #state.queue == 2)
   controller.edit_queued(-1)
   controller.queue_submit()
+  -- Unqueueing is a host input mutation rather than a draft, so wait for the published queue.
+  await(function() return #state.queue == 1 end, "unqueue never reached the host queue")
   settled()
   assert(not state.queue_edit and #state.queue == 1 and text() == selected,
     "unqueue lost the complete message or removed another entry")

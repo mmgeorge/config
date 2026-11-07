@@ -1440,7 +1440,9 @@ mod tests {
         for frame in 0..occupied {
             sender.send(frame).unwrap();
         }
-        let text = "retained界\n".repeat(forge_protocol::MAX_FRAME_BYTES);
+        // Each repetition encodes to 13 JSON bytes, so this payload exceeds one frame and
+        // must travel as a multipart transfer without allocating far beyond that threshold.
+        let text = "retained界\n".repeat(forge_protocol::MAX_FRAME_BYTES / 12);
         let first = publications.publish(event(&text), Some(&sender))?;
         let mut delivery = PublicationDelivery::default();
         assert!(

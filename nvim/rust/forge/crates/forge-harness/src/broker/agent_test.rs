@@ -7,6 +7,7 @@ use super::test_support::{
     admit_child_fixture, check_fixture, child_address, child_completed, child_event, child_tool,
     completed_message, planning_question_broker, repository, settle_managed_children,
 };
+use crate::provider::ScopeOwner;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -291,16 +292,12 @@ fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result
         crate::provider::session_execution::OwnerObservation::Event(
             crate::provider::test_support::native_event(
                 forge_provider_api::EventScope::Binding {
-                    owner: target.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(target.clone()),
                 },
                 ProviderEvent::Thread {
                     thread_id: target.thread_id(),
                     event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
-                        forge_provider_api::terminal::TerminalSnapshot {
-                            supported: true,
-                            starting: false,
-                            terminal: Vec::new(),
-                        },
+                        forge_provider_api::terminal::TerminalInventory::observed(Vec::new()),
                     )),
                 },
             ),
@@ -342,7 +339,7 @@ fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result
     let diagnostic = crate::provider::session_execution::OwnerObservation::Event(
         crate::provider::test_support::native_event(
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             },
             ProviderEvent::Thread {
                 thread_id: owner.thread_id(),
@@ -997,7 +994,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
             .await?;
         let permission = broker.permission_coordinator.clone();
         let scope = crate::provider::InvocationScope {
-            owner: owner.clone(),
+            thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             exchange_id: admission.task.id.clone().into(),
             invocation_id: format!("fixture:{}", admission.task.id).into(),
         };
@@ -1017,7 +1014,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                         }],
                     },
                     Some(crate::provider::TurnAddress {
-                        thread_id: (scope).owner.thread_id(),
+                        thread_id: (scope).owner().thread_id(),
                         turn_id: (scope).turn_id().unwrap(),
                         scope,
                     }),
@@ -1025,7 +1022,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                 )
                 .await
         }));
-        let requested = tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv())
+        let requested = tokio::time::timeout(crate::hang_guard::HANG_GUARD, stream.recv())
             .await??
             .context("approval event missing")?;
         approval_streams.push(stream);
@@ -1566,7 +1563,7 @@ impl RoutingProvider {
 
                     captured.lock().unwrap().push(request.clone());
                     let ordinal = turns.fetch_add(1, Ordering::AcqRel);
-                    let root = request.scope.owner.is_root();
+                    let root = request.scope.owner().is_root();
                     let text = match &request.input {
                         forge_provider_api::PromptInput::Text(text) => text.clone(),
                         _ => String::new(),
@@ -1604,7 +1601,7 @@ impl RoutingProvider {
                     };
                     let scope = request.scope.clone();
                     let address = crate::provider::TurnAddress {
-                        thread_id: (scope.clone()).owner.thread_id(),
+                        thread_id: (scope.clone()).owner().thread_id(),
                         turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
                     };
@@ -1812,14 +1809,43 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let (_routing, routing_fixture) = routing_fixture(
+    // Each child shuts its adapter down when it settles, so every child gets a fresh adapter
+    // over the same routing behavior. The adapter rejects the follow-up before sending it, so
+    // the child turn fails without consuming input or invalidating its native binding.
+    let retained_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    broker.agent_provider_factory.register_builder(
         forge_providers::registry::nonselectable_id()
             .expect("registry supplies a nonselectable fixture identity"),
-        false,
-    )?;
-    broker
-        .agent_provider_factory
-        .register(routing_fixture.provider_handle());
+        Arc::new(move || {
+            let native = Arc::new(RoutingProvider {
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+                turn: std::sync::atomic::AtomicUsize::new(0),
+                request: Default::default(),
+                reject_steering: false,
+            });
+            let rejecting = native.fixture().with_pre_dispatch(|request| async move {
+                match &request.input {
+                    forge_provider_api::PromptInput::Text(text)
+                        if text.ends_with("CHILD_RESULT") =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(crate::provider::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                    )),
+                }
+            });
+            let session =
+                crate::provider::test_support::ProviderTestSession::from_native(rejecting)?;
+            let handle = session.provider_handle();
+            retained_sessions.lock().unwrap().push(session);
+            Ok(handle)
+        }),
+    );
     let admitted = broker
         .start_agent(json!({"profile":"worker","text":"CHILD_RESULT"}))
         .await?
@@ -1952,7 +1978,7 @@ impl ResultReceivingProvider {
                     }
                     let scope = request.scope.clone();
                     let address = crate::provider::TurnAddress {
-                        thread_id: (scope.clone()).owner.thread_id(),
+                        thread_id: (scope.clone()).owner().thread_id(),
                         turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
                     };
@@ -2029,7 +2055,7 @@ async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
         broker.provider = fixture.provider_handle();
         broker.agent_coordinator.set_enabled(true);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             broker.run_interaction(
                 "Research".into(),
                 PromptMode::Chat,
@@ -2195,6 +2221,28 @@ impl Default for SuspendedParentProvider {
     }
 }
 
+/// Give every child a fresh adapter over the shared fixture state, as production does, because a
+/// child shuts its adapter down when it settles.
+fn register_child_adapters(
+    broker: &mut HarnessBroker,
+    provider: &Arc<SuspendedParentProvider>,
+    root: Arc<crate::provider::Provider>,
+) {
+    let provider = provider.clone();
+    let retained = Arc::new(std::sync::Mutex::new(Vec::new()));
+    broker.agent_provider_factory.register_builder(
+        root.descriptor().kind,
+        Arc::new(move || {
+            let session = crate::provider::test_support::ProviderTestSession::from_native(
+                provider.fixture(),
+            )?;
+            let handle = session.provider_handle();
+            retained.lock().unwrap().push(session);
+            Ok(handle)
+        }),
+    );
+}
+
 impl SuspendedParentProvider {
     fn fixture(self: &Arc<Self>) -> Arc<crate::provider::test_support::EventFixtureProvider> {
         let mut capability = crate::provider::test_support::fixture_capability();
@@ -2218,7 +2266,7 @@ impl SuspendedParentProvider {
                         forge_provider_api::PromptInput::Text(text) => text.clone(),
                         _ => String::new(),
                     };
-                    let response = if request.scope.owner.is_root() {
+                    let response = if request.scope.owner().is_root() {
                         state.input.lock().unwrap().push(text.clone());
                         let ordinal = state.root_turn.fetch_add(1, Ordering::AcqRel);
                         if ordinal == 0 {
@@ -2245,14 +2293,25 @@ impl SuspendedParentProvider {
                         state.child_started.add_permits(1);
                         tokio::select! {
                             _ = state.child_release[index].acquire() => {},
-                            _ = cancelled.changed() => return Err(crate::provider::ProviderError::Cancelled),
+                            // A native interrupt reports a terminal outcome, as Codex does.
+                            _ = cancelled.changed() => {
+                                return Ok(forge_provider_api::TurnResult::new(
+                                    forge_provider_api::turn::TurnOutcome::Interrupted,
+                                    2,
+                                    None,
+                                    request.input_coverage(),
+                                    Vec::new(),
+                                    None,
+                                )
+                                .expect("fixture native coverage is valid"));
+                            }
                         }
                         format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
                     };
                     let scope = request.scope.clone();
 
                     let address = crate::provider::TurnAddress {
-                        thread_id: (scope.clone()).owner.thread_id(),
+                        thread_id: (scope.clone()).owner().thread_id(),
                         turn_id: (scope.clone()).turn_id().unwrap(),
                         scope: scope.clone(),
                     };
@@ -2287,9 +2346,19 @@ impl SuspendedParentProvider {
 }
 
 #[tokio::test]
-async fn suspended_parent_joins_children_and_user_input_wakes_without_native_steering() -> Result<()>
-{
-    for user_input in [false, true] {
+async fn suspended_parent_joins_children_before_resuming() -> Result<()> {
+    assert_suspended_parent_joins_children(false).await
+}
+
+#[tokio::test]
+async fn user_input_wakes_suspended_parent_without_native_steering() -> Result<()> {
+    assert_suspended_parent_joins_children(true).await
+}
+
+/// Suspends the parent behind two running children and checks that it resumes only after both
+/// settle, or earlier through user input that cannot use native steering.
+async fn assert_suspended_parent_joins_children(user_input: bool) -> Result<()> {
+    {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -2297,12 +2366,22 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
         let fixture =
             crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
         broker.provider = fixture.provider_handle();
-        broker
-            .agent_provider_factory
-            .register(fixture.provider_handle());
+        register_child_adapters(&mut broker, &provider, fixture.provider_handle());
         broker.agent_coordinator.set_enabled(true);
         let coordinator = broker.agent_coordinator.clone();
         let input = broker.parent_input.clone();
+        // Accepted steering must carry the journal receipt that production input always holds.
+        let correction = if user_input {
+            let catalog = broker.provider_catalog_request()?;
+            Some(broker.submission_store.prepare_input(
+                &catalog,
+                ProviderInput::from_text("USER_CORRECTION"),
+                broker.provider.descriptor().kind,
+                Some("user-correction".into()),
+            )?)
+        } else {
+            None
+        };
         let task = tokio::spawn(async move {
             let result = broker
                 .run_interaction(
@@ -2314,14 +2393,14 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
             (broker, result)
         });
         tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            crate::hang_guard::HANG_GUARD,
             provider.child_started.acquire_many(2),
         )
         .await??
         .forget();
         provider.root_started.acquire().await?.forget();
         provider.child_release[0].add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             while coordinator.active_count() != 1 {
                 tokio::task::yield_now().await;
             }
@@ -2332,14 +2411,18 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
             1,
             "first child resumed the idle parent before its sibling settled"
         );
-        if user_input {
+        if let Some(submission) = correction {
             tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                input.steer("USER_CORRECTION".into()),
+                crate::hang_guard::HANG_GUARD,
+                input.steer(crate::provider::SteeringInput::User {
+                    text: "USER_CORRECTION".into(),
+                    attachments: Vec::new(),
+                    submission: Some(submission),
+                }),
             )
             .await??;
             tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                crate::hang_guard::HANG_GUARD,
                 provider.root_started.acquire(),
             )
             .await??
@@ -2352,8 +2435,7 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
             );
         }
         provider.child_release[1].add_permits(1);
-        let (broker, result) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), task).await??;
+        let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
         let (_, events) = result?;
         let statuses = events
             .iter()
@@ -2397,78 +2479,308 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
 }
 
 #[tokio::test]
-async fn parent_cancellation_and_user_decision_prevent_child_continuation() -> Result<()> {
-    for user_decision in [false, true] {
-        let repository = repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let provider = Arc::new(SuspendedParentProvider::default());
-        provider.blocked.store(user_decision, Ordering::Release);
-        let fixture =
-            crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
-        broker.provider = fixture.provider_handle();
-        broker
-            .agent_provider_factory
-            .register(fixture.provider_handle());
-        broker.agent_coordinator.set_enabled(true);
-        let cancellation = broker.turn_cancellation();
-        let coordinator = broker.agent_coordinator.clone();
-        let task = tokio::spawn(async move {
-            let result = broker
-                .run_interaction(
-                    "Research both".into(),
-                    PromptMode::Chat,
-                    Some(ExchangeAdmission::chat("Research both".into())),
-                )
-                .await;
-            (broker, result)
-        });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            provider.child_started.acquire_many(2),
-        )
-        .await??
-        .forget();
-        provider.root_started.acquire().await?.forget();
-        let quiescence = if !user_decision {
-            let guard = coordinator.begin_quiescence();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                coordinator.sender().request(crate::agent::AgentRequest {
-                    operation_id: "cancel-children".into(),
-                    source: crate::agent::AgentSource::User,
-                    operation: crate::agent::AgentOperation::InterruptAll,
-                }),
+async fn parent_cancellation_prevents_child_continuation() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(SuspendedParentProvider::default());
+    let fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
+    register_child_adapters(&mut broker, &provider, fixture.provider_handle());
+    broker.agent_coordinator.set_enabled(true);
+    let cancellation = broker.turn_cancellation();
+    let coordinator = broker.agent_coordinator.clone();
+    let task = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "Research both".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Research both".into())),
             )
-            .await??;
-            assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
-            cancellation.request();
-            Some(guard)
-        } else {
-            None
-        };
-        let (mut broker, result) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), task).await??;
-        if user_decision {
-            result?;
-        } else {
-            let error = result.unwrap_err();
-            assert!(error.is::<TurnCancelled>(), "{error:#}");
+            .await;
+        (broker, result)
+    });
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        provider.child_started.acquire_many(2),
+    )
+    .await??
+    .forget();
+    provider.root_started.acquire().await?.forget();
+    let quiescence = coordinator.begin_quiescence();
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        coordinator.sender().request(crate::agent::AgentRequest {
+            operation_id: "cancel-children".into(),
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::InterruptAll,
+        }),
+    )
+    .await??;
+    assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
+    cancellation.request();
+    let (mut broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    let error = result.unwrap_err();
+    assert!(error.is::<TurnCancelled>(), "{error:#}");
+    provider.child_release[0].add_permits(1);
+    provider.child_release[1].add_permits(1);
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        while broker.agent_coordinator.active_count() != 0 {
+            broker.drain_agent_commands(None).await?;
+            tokio::task::yield_now().await;
         }
-        provider.child_release[0].add_permits(1);
-        provider.child_release[1].add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while broker.agent_coordinator.active_count() != 0 {
-                broker.drain_agent_commands(None).await?;
-                tokio::task::yield_now().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
+    assert!(!broker.parent_input.is_active());
+    assert_eq!(broker.agent_coordinator.unreported_result().len(), 2);
+    drop(quiescence);
+    Ok(())
+}
+
+/// A waiting question holds the parent's tool call, so children that settle meanwhile must not
+/// resume the parent. The answer releases the call and the parent then receives each child
+/// result exactly once.
+#[tokio::test]
+async fn user_decision_holds_parent_until_answered_before_delivering_child_results() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(SuspendedParentProvider::default());
+    provider.blocked.store(true, Ordering::Release);
+    let fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
+    register_child_adapters(&mut broker, &provider, fixture.provider_handle());
+    broker.agent_coordinator.set_enabled(true);
+    let coordinator = broker.agent_coordinator.clone();
+    let questions = broker.questions.clone();
+    let task = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "Research both".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Research both".into())),
+            )
+            .await;
+        (broker, result)
+    });
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        provider.child_started.acquire_many(2),
+    )
+    .await??
+    .forget();
+    provider.root_started.acquire().await?.forget();
+    provider.child_release[0].add_permits(1);
+    provider.child_release[1].add_permits(1);
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        while coordinator.active_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        provider.root_turn.load(Ordering::Acquire),
+        1,
+        "settled children resumed a parent that was waiting for the user"
+    );
+    assert!(
+        !task.is_finished(),
+        "parent finished while its question was unanswered"
+    );
+    let pending = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        loop {
+            let snapshot = questions.snapshot()?;
+            if let Some(question) = snapshot
+                .questions
+                .iter()
+                .find(|question| question.pending())
+            {
+                return Ok::<_, anyhow::Error>((question.id.clone(), question.content.revision));
             }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
-        assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
-        assert!(!broker.parent_input.is_active());
-        assert_eq!(broker.agent_coordinator.unreported_result().len(), 2);
-        drop(quiescence);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    questions.apply(crate::question::QuestionCommand {
+        operation_id: "answer-scope".into(),
+        question_id: pending.0,
+        revision: pending.1,
+        action: crate::question::QuestionAction::Answer {
+            answer: crate::question::QuestionAnswer::Other {
+                text: "Both".into(),
+            },
+        },
+    })?;
+    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    result?;
+    let inputs = provider.input.lock().unwrap();
+    for result in ["RESULT_ONE", "RESULT_TWO"] {
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.matches(result).count())
+                .sum::<usize>(),
+            1,
+            "{result} was not delivered to the parent exactly once"
+        );
     }
+    assert!(
+        broker
+            .store
+            .list_agent_task(&broker.session.id)?
+            .iter()
+            .all(|task| task.parent_reported)
+    );
+    Ok(())
+}
+
+/// Interrupting one child while its parent waits keeps the parent open until its sibling settles.
+#[tokio::test]
+async fn interrupted_child_does_not_finalize_parent_before_running_sibling_settles() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(SuspendedParentProvider::default());
+    let fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
+    register_child_adapters(&mut broker, &provider, fixture.provider_handle());
+    broker.agent_coordinator.set_enabled(true);
+    let coordinator = broker.agent_coordinator.clone();
+    let task = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "Research both".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Research both".into())),
+            )
+            .await;
+        (broker, result)
+    });
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        provider.child_started.acquire_many(2),
+    )
+    .await??
+    .forget();
+    provider.root_started.acquire().await?.forget();
+    let first_child = coordinator
+        .snapshot(None)
+        .into_iter()
+        .find(|(_, task)| {
+            task.as_ref()
+                .is_some_and(|task| task.message.ends_with("CHILD_ONE"))
+        })
+        .map(|(agent, _)| agent.id)
+        .context("first child was not admitted")?;
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        coordinator.sender().request(crate::agent::AgentRequest {
+            operation_id: "interrupt-first-child".into(),
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::Interrupt {
+                target: first_child.clone(),
+            },
+        }),
+    )
+    .await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        while coordinator.active_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(
+        !task.is_finished(),
+        "parent finalized before its sibling settled"
+    );
+    provider.child_release[0].add_permits(1);
+    provider.child_release[1].add_permits(1);
+    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    result?;
+    let tasks = broker.store.list_agent_task(&broker.session.id)?;
+    assert_eq!(tasks.len(), 2);
+    assert!(
+        tasks
+            .iter()
+            .any(|task| task.agent_id != first_child && task.state == ExchangeState::Complete),
+        "{tasks:?}"
+    );
+    let exchange = broker.store.list_exchange(&broker.session.id)?;
+    assert_eq!(exchange.len(), 1);
+    assert_eq!(exchange[0].state(), ExchangeState::Complete);
+    Ok(())
+}
+
+/// Count the reducer's deferred native-result reads retained in the local trace.
+fn native_ready_reads(broker_data: &std::path::Path, trace: &crate::trace::TraceStore) -> usize {
+    trace.flush().unwrap();
+    std::fs::read_to_string(
+        crate::storage::state::directory(broker_data).join("harness-trace.jsonl"),
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|line| line.contains("\"exchange.event.read\"") && line.contains("\"NativeReady\""))
+    .count()
+}
+
+/// A root result deferred by child quiescence stays parked until quiescence ends, then completes.
+/// Two workers keep a regressed hot reducer from starving this observer into a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiescence_parks_the_deferred_root_result_until_release() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(SuspendedParentProvider::default());
+    let fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
+    register_child_adapters(&mut broker, &provider, fixture.provider_handle());
+    broker.agent_coordinator.set_enabled(true);
+    broker.trace.configure(true)?;
+    let trace = broker.trace.clone();
+    let coordinator = broker.agent_coordinator.clone();
+    let quiescence = coordinator.begin_quiescence();
+    let task = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "Research both".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Research both".into())),
+            )
+            .await;
+        (broker, result)
+    });
+    provider.root_started.acquire().await?.forget();
+    let parked = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        loop {
+            let reads = native_ready_reads(data.path(), &trace);
+            if reads > 0 {
+                return reads;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        native_ready_reads(data.path(), &trace),
+        parked,
+        "the deferred root result was re-read while quiescence persisted"
+    );
+    assert!(!task.is_finished());
+    // Quiescence rejects the spawns, so release alone must let the parked root finalize.
+    drop(quiescence);
+    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    result?;
+    let exchange = broker.store.list_exchange(&broker.session.id)?;
+    assert_eq!(exchange.len(), 1);
+    assert_eq!(exchange[0].state(), ExchangeState::Complete);
     Ok(())
 }

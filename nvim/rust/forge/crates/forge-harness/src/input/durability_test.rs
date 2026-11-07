@@ -49,10 +49,10 @@ fn pending_task_input_rebinds_after_restart_without_losing_its_identity() -> Res
     message.purpose = InputPurpose::TaskEntry {
         revision: crate::task::TaskRevision::fresh(),
         id: id.clone(),
-        start: crate::exchange::TaskStart {
+        start: Some(crate::exchange::TaskStart {
             kind: crate::task::TaskKind::Plan,
             title: "Plan".into(),
-        },
+        }),
     };
     assert!(queue.reconcile_task_input(message.clone())?.is_some());
     assert!(queue.reconcile_task_input(message.clone())?.is_none());
@@ -63,10 +63,10 @@ fn pending_task_input_rebinds_after_restart_without_losing_its_identity() -> Res
     message.purpose = InputPurpose::TaskEntry {
         revision: revision.clone(),
         id,
-        start: crate::exchange::TaskStart {
+        start: Some(crate::exchange::TaskStart {
             kind: crate::task::TaskKind::Plan,
             title: "Plan".into(),
-        },
+        }),
     };
     queue.reconcile_task_input(message.clone())?;
     let restored = queue.snapshot()?;
@@ -99,10 +99,10 @@ fn task_input_reconciliation_preserves_uncertain_delivery() -> Result<()> {
     message.purpose = InputPurpose::TaskEntry {
         revision: crate::task::TaskRevision::fresh(),
         id: id.clone(),
-        start: crate::exchange::TaskStart {
+        start: Some(crate::exchange::TaskStart {
             kind: crate::task::TaskKind::Goal,
             title: "Goal".into(),
-        },
+        }),
     };
     queue.reconcile_task_input(message.clone())?;
     queue.claim(&message.id, 1, InputRoute::Turn)?.unwrap();
@@ -115,10 +115,10 @@ fn task_input_reconciliation_preserves_uncertain_delivery() -> Result<()> {
     message.purpose = InputPurpose::TaskEntry {
         revision: crate::task::TaskRevision::fresh(),
         id,
-        start: crate::exchange::TaskStart {
+        start: Some(crate::exchange::TaskStart {
             kind: crate::task::TaskKind::Goal,
             title: "Goal".into(),
-        },
+        }),
     };
     assert!(queue.reconcile_task_input(message)?.is_none());
     let retained = queue.snapshot()?;

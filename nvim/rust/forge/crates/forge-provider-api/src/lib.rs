@@ -27,11 +27,9 @@ pub mod progress;
 pub mod provider_session_id;
 pub mod request_identity;
 pub mod retained_operation;
-pub mod retained_task;
 pub mod retry;
 pub mod service_tier;
 pub mod session;
-pub mod skill;
 pub mod submission;
 pub mod terminal;
 pub mod testing;
@@ -40,7 +38,6 @@ pub mod trace;
 pub mod turn;
 pub mod turn_control;
 pub mod turn_result;
-pub mod turn_runner;
 pub mod turn_usage;
 pub mod usage;
 pub mod version;
@@ -61,7 +58,7 @@ pub use error::{
 };
 pub use event::*;
 pub use events::{
-    AdapterActivityWriter, NativeTurnStart, ProviderEventSink, ProviderEventStream,
+    AdapterActivityWriter, NativeTurnStart, ProviderEventSink, ProviderEventStream, TurnPublisher,
     TurnRegistrationReader,
 };
 pub use execution::*;
@@ -69,7 +66,7 @@ pub use generation::{ReasoningSelection, TextGenerationRequest, TextValidator};
 pub use identity::{IdentityError, ItemId, ModelCallId, ThreadId, TurnId, UsageReportId};
 pub use input::{
     FileAttachment, MessageInput, PromptInput, QuestionReply, QuestionReplyOption,
-    QuestionReplyResponse, TaskKind, TaskStart,
+    QuestionReplyResponse,
 };
 pub use lifecycle::{CompletionSnapshot, ObservationFailure, SubmissionId};
 pub use message::*;
@@ -90,7 +87,7 @@ pub use trace::{ProviderTrace, ProviderTraceEvent, ProviderTraceRecord};
 pub use turn_result::{CompletedTurn, CoveredInput, TurnResult, TurnResultError};
 pub use turn_usage::{TurnUsageReport, UsageReportError};
 
-pub use input::PromptMode;
+pub use input::ExecutionMode;
 
 pub mod completion;
 pub use completion::TurnMetrics;

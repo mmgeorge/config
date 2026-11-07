@@ -104,11 +104,12 @@ local function settle(count)
 end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { provider = kind, config_dir = data,
+  -- These peers advertise no native effort option, and an explicit effort without one is rejected.
+  require("forge").setup({ harness = { provider = kind, effort = "default", config_dir = data,
     providers = { [kind] = { command = { "node", peer, sent, lost and "lost" or "ok", skill, runtime_version }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10), table.concat(errors, " | "))
-  request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, isolation_mode = "elevated" } })
+  request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {} } })
   request("session.permission.set", { change = { kind = "enable_yolo" } })
   request("session.prompt.submit", { text = "FIRST_SUBMISSION_MARKER" }, lost)
   local first = settle(1)

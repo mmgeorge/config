@@ -77,62 +77,36 @@ impl HostProcess {
         }
     }
 
-    async fn start_turn(&mut self, workspace: &std::path::Path, data: &std::path::Path) {
+    /// Leave request 3 in flight on a hold that no prompt ever reaches. Prompt submission now
+    /// answers at owner acceptance, so a mock hold wait is the request that stays active until
+    /// the connection cancels it.
+    async fn start_blocked_request(&mut self, workspace: &std::path::Path, data: &std::path::Path) {
         self.send(json!({"id":2,"method":"session.initialize","params":{
             "workspace":workspace,"data_root":data,"client_id":"eof-test",
-            "provider":{"kind":"mock","command":["visible-blocking"]}
+            "provider":{"kind":"mock","command":["mock"]}
         }}))
         .await;
         let initialized = self.response(2).await;
         assert!(initialized.get("error").is_none(), "{initialized}");
         let session_id = initialized["result"]["session"]["id"].as_str().unwrap();
-        self.send(json!({"id":3,"session_id":session_id,"method":"session.prompt.submit","params":{"text":"remain active until connection closes"}})).await;
-        let mut changed = false;
-        let mut pending_query = None;
-        let mut next_query = 4;
+        self.send(json!({"id":4,"session_id":session_id,"method":"session.provider.mock_response","params":{"operation":"hold"}})).await;
+        let hold = self.response(4).await;
+        let hold_id = hold["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("mock hold was not armed: {hold}"))
+            .to_owned();
+        self.send(json!({"id":3,"session_id":session_id,"method":"session.provider.mock_response","params":{"operation":"wait","id":hold_id}})).await;
+        self.send(json!({"id":5,"session_id":session_id,"method":"session.state.get","params":{}}))
+            .await;
         loop {
             let message = self.read(true).await;
             assert_ne!(
                 message["id"].as_u64(),
                 Some(3),
-                "turn ended before EOF: {message}"
+                "blocked request ended before EOF: {message}"
             );
-            if message["event"] == "document_changed" {
-                changed = true;
-            }
-            if pending_query.is_some() && message["id"].as_u64() == pending_query {
-                pending_query = None;
-                assert!(message.get("error").is_none(), "{message}");
-                let running_with_output =
-                    message["result"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|exchange| {
-                            exchange["state"] == "running"
-                                && exchange["turn"].as_array().is_some_and(|turns| {
-                                    turns.iter().any(|turn| {
-                                        turn["message"].as_array().is_some_and(|messages| {
-                                            messages.iter().any(|message| {
-                                                message["kind"] == "assistant"
-                                                    && message["text"]
-                                                        .as_str()
-                                                        .is_some_and(|text| !text.is_empty())
-                                            })
-                                        })
-                                    })
-                                })
-                        });
-                if running_with_output {
-                    break;
-                }
-            }
-            if changed && pending_query.is_none() {
-                changed = false;
-                pending_query = Some(next_query);
-                self.send(json!({"id":next_query,"session_id":session_id,"method":"session.exchange.list","params":{}}))
-                    .await;
-                next_query += 1;
+            if message["id"].as_u64() == Some(5) {
+                break;
             }
         }
     }
@@ -171,7 +145,8 @@ async fn eof_cancels_active_producers_before_waiting_for_output_drainage() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut host = HostProcess::start().await;
-    host.start_turn(workspace.path(), data.path()).await;
+    host.start_blocked_request(workspace.path(), data.path())
+        .await;
     let (messages, status, error) = host.finish().await;
     assert!(status.success(), "{error}");
     let cancelled = messages
@@ -180,7 +155,8 @@ async fn eof_cancels_active_producers_before_waiting_for_output_drainage() {
         .unwrap();
     assert_eq!(
         cancelled.pointer("/error/code").and_then(Value::as_str),
-        Some("turn_cancelled")
+        Some("request_failed"),
+        "{cancelled}"
     );
 }
 
@@ -211,7 +187,8 @@ async fn duplicate_running_request_ids_close_the_connection_and_cancel_the_owner
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut host = HostProcess::start().await;
-    host.start_turn(workspace.path(), data.path()).await;
+    host.start_blocked_request(workspace.path(), data.path())
+        .await;
     host.send(json!({"id":3,"method":"session.state.get","params":{}}))
         .await;
     let (_, status, error) = host.finish().await;
@@ -227,7 +204,8 @@ async fn invalid_consumption_credit_cancels_and_joins_active_requests() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut host = HostProcess::start().await;
-    host.start_turn(workspace.path(), data.path()).await;
+    host.start_blocked_request(workspace.path(), data.path())
+        .await;
     host.send(
         json!({"id":0,"method":"host.transport.consumed","params":{"bytes":u64::MAX,"frames":u64::MAX}}),
     )
@@ -244,6 +222,7 @@ async fn invalid_consumption_credit_cancels_and_joins_active_requests() {
         .unwrap();
     assert_eq!(
         cancelled.pointer("/error/code").and_then(Value::as_str),
-        Some("turn_cancelled")
+        Some("request_failed"),
+        "{cancelled}"
     );
 }

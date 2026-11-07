@@ -4,7 +4,7 @@ local picker = require("forge.views.picker")
 
 local M = {}
 
----@alias ForgeCapabilityRestriction "permission_callbacks_only"|"unstructured_diffs"|"enterprise_terminal_policy"|"inherited_skills"|"checkpoint_required"|"settled_only"|{task_kinds:string[]}
+---@alias ForgeCapabilityRestriction "permission_callbacks_only"|"unconfined_reads"|"unstructured_diffs"|"enterprise_terminal_policy"|"inherited_skills"|"checkpoint_required"|"settled_only"
 ---@alias ForgeCapabilitySupport "supported"|"unsupported"|{limited:{restrictions:ForgeCapabilityRestriction[]}}
 
 ---@param support ForgeCapabilitySupport
@@ -14,6 +14,7 @@ local function support_text(support)
   assert(type(support) == "table" and type(support.limited) == "table", "invalid capability support")
   local labels = {
     permission_callbacks_only = "permission callbacks only",
+    unconfined_reads = "reads are not OS-confined",
     unstructured_diffs = "native edits may omit structured diffs",
     enterprise_terminal_policy = "enterprise terminal policy may bypass approval callbacks",
     inherited_skills = "inherited native skills remain available",
@@ -22,12 +23,8 @@ local function support_text(support)
   }
   local restrictions = {}
   for _, restriction in ipairs(support.limited.restrictions) do
-    if type(restriction) == "table" and type(restriction.task_kinds) == "table" then
-      restrictions[#restrictions + 1] = "tasks: " .. table.concat(restriction.task_kinds, ", ")
-    else
-      assert(labels[restriction], "invalid capability restriction")
-      restrictions[#restrictions + 1] = labels[restriction]
-    end
+    assert(labels[restriction], "invalid capability restriction")
+    restrictions[#restrictions + 1] = labels[restriction]
   end
   return "limited (" .. table.concat(restrictions, "; ") .. ")"
 end
@@ -40,20 +37,21 @@ function M.open(host, session_id)
       return
     end
     local option_list = {}
-    local revision = "Schema " .. tostring(manifest.revision) .. " · Effective " .. tostring(manifest.effective_revision)
+    local revision = "Schema " .. tostring(manifest.revision) .. " · Negotiated support revision "
+      .. tostring(manifest.effective_revision)
     option_list[#option_list + 1] = {
       id = "revision", label = "Capability revision", detail = revision,
-      columns = { "Capability revision", "", revision },
+      columns = { "Capability revision", "Metadata", revision },
     }
     if manifest.provider_version then
       option_list[#option_list + 1] = {
         id = "version", label = "Provider version", detail = manifest.provider_version,
-        columns = { "Provider version", "", manifest.provider_version },
+        columns = { "Provider version", "Metadata", manifest.provider_version },
       }
     end
     for index, notice in ipairs(manifest.notice or {}) do
       option_list[#option_list + 1] = { id = "notice-" .. index, label = "Resource unavailable", detail = notice,
-        columns = { "Resource unavailable", "", notice } }
+        columns = { "Resource unavailable", "Notice", notice } }
     end
     for _, capability in ipairs(manifest.capability or {}) do
       local detail = table.concat({ support_text(capability.support), capability.implementation,
@@ -73,6 +71,7 @@ function M.open(host, session_id)
         id = "capabilities",
         title = manifest.label .. " capabilities",
         column_headers = { "Capability", "Contract", "Support and outcome" },
+        wrap_column = 3,
         option_list = option_list,
         footer = "↑↓ select  / search  q close",
       } },

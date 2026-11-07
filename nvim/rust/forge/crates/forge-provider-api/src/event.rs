@@ -54,7 +54,7 @@ pub enum ThreadEvent {
     Error { error: ProviderFailure },
     IdentityResolved(ProviderSessionId),
     ContextUsage(crate::context::ContextUsage),
-    TerminalsUpdated(Result<crate::terminal::TerminalSnapshot, ProviderFailure>),
+    TerminalsUpdated(Result<crate::terminal::TerminalInventory, ProviderFailure>),
     CompactionUpdated(Box<crate::compaction::Compaction>),
 }
 

@@ -17,7 +17,8 @@ local function load_workspace_files(root, callback)
     callback(cache[root])
     return
   end
-  vim.system({ "git", "ls-files", "--cached", "--others", "--exclude-standard" }, {
+  -- `-z` lists paths verbatim; without it Git quotes non-ASCII names as octal escapes.
+  vim.system({ "git", "ls-files", "-z", "--cached", "--others", "--exclude-standard" }, {
     cwd = root,
     text = true,
     stdout = true,
@@ -25,7 +26,9 @@ local function load_workspace_files(root, callback)
   }, function(result)
     local files = {}
     if result.code == 0 then
-      for path in result.stdout:gmatch("[^\r\n]+") do files[#files + 1] = path:gsub("\\", "/") end
+      for _, path in ipairs(vim.split(result.stdout, "\0", { plain = true, trimempty = true })) do
+        files[#files + 1] = (path:gsub("\\", "/"))
+      end
     end
     cache[root] = files
     vim.schedule(function() callback(files) end)

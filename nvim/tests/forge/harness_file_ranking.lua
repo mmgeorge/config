@@ -62,7 +62,7 @@ local ok, failure = xpcall(function()
   vim.system = function(_, options, callback)
     assert(options.cwd == session.harness.session.workspace)
     vim.schedule(function()
-      callback({ code = 0, stdout = table.concat(candidate_paths, "\n") .. "\n", stderr = "" })
+      callback({ code = 0, stdout = table.concat(candidate_paths, "\0") .. "\0", stderr = "" })
     end)
   end
   source._clear_cache()

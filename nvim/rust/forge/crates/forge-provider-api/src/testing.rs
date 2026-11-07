@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{PromptMode, ProviderError, ThreadOwner, error::ProviderFailureKind};
+use crate::{ExecutionMode, ProviderError, ThreadId, error::ProviderFailureKind};
 
 /// Identify one response barrier without exposing the mock provider's queue state.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -58,7 +58,7 @@ impl std::error::Error for TestHoldIdError {}
 pub enum TestControlCommand {
     /// Hold the next matching prompt, optionally across owners of the same test provider.
     Hold {
-        mode: Option<PromptMode>,
+        mode: Option<ExecutionMode>,
         #[serde(default)]
         any_owner: bool,
     },
@@ -68,8 +68,13 @@ pub enum TestControlCommand {
     Release { id: TestHoldId },
     /// Cancel an armed or arrived response hold.
     Cancel { id: TestHoldId },
+    /// Cancel every hold the selected owner armed, as closing that owner's session does.
+    CancelOwner,
     /// Queue one provider-neutral normalized prompt sequence for the next owner prompt.
     Script { script: TestPromptScript },
+    /// Reject workspace model discovery so models are listed only from an open binding, as
+    /// ACP agents negotiate their catalogs per session.
+    RequireBindingModelCatalog,
 }
 
 /// Select native fixture content without treating reasoning as an assistant prose role.
@@ -142,9 +147,9 @@ pub struct PendingTestResponse {
     /// Identify the hold that owns this response.
     pub id: TestHoldId,
     /// Identify the normalized conversation that reached the barrier.
-    pub owner: ThreadOwner,
+    pub thread_id: ThreadId,
     /// Preserve the prompt's normalized execution mode.
-    pub mode: PromptMode,
+    pub mode: ExecutionMode,
     /// Preserve the normalized prompt text for test assertions.
     pub prompt: String,
 }
@@ -157,7 +162,9 @@ pub enum TestControlResult {
     Pending { response: PendingTestResponse },
     Released { id: TestHoldId },
     Cancelled { id: TestHoldId },
+    OwnerCancelled,
     Scripted,
+    Configured,
 }
 
 /// Control deterministic normalized test flows without exposing provider protocol details.
@@ -166,21 +173,30 @@ pub trait ProviderTestControl: Send + Sync {
     /// Arm, observe, release, or cancel one barrier owned by the selected test session.
     async fn dispatch(
         &self,
-        owner: &ThreadOwner,
+        thread_id: &ThreadId,
         command: TestControlCommand,
     ) -> Result<TestControlResult, ProviderError>;
 
     /// Hold this normalized prompt when a matching barrier is armed.
     async fn arrive(
         &self,
-        owner: &ThreadOwner,
-        mode: PromptMode,
+        thread_id: &ThreadId,
+        mode: ExecutionMode,
         prompt: String,
     ) -> Result<(), ProviderError>;
 
     /// Consume the next script queued for this owner, if any.
-    fn take_script(&self, owner: &ThreadOwner) -> Option<TestPromptScript>;
+    fn take_script(&self, thread_id: &ThreadId) -> Option<TestPromptScript>;
 
     /// Cancel barriers for one owner, or all owners during provider shutdown.
-    fn cancel_owner(&self, owner: Option<&ThreadOwner>);
+    fn cancel_thread(&self, thread_id: Option<&ThreadId>);
+}
+
+/// Model the host-issued root thread of the named test namespace.
+///
+/// Adapter fixtures stand in for the host, which alone issues root thread identities.
+pub fn root_thread(namespace: impl AsRef<str>) -> ThreadId {
+    let namespace = namespace.as_ref();
+    ThreadId::host(namespace, &format!("{namespace}:agent:primary"))
+        .expect("test namespaces are nonempty")
 }

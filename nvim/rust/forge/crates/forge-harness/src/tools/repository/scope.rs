@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -83,7 +84,7 @@ impl RepositoryToolScope {
         scope: &crate::provider::InvocationScope,
     ) -> Result<Arc<Self>> {
         ensure!(
-            scope.owner.session_id().as_str() == self.session,
+            scope.owner().session_id().as_str() == self.session,
             "native child repository scope crosses session"
         );
         let authority = self

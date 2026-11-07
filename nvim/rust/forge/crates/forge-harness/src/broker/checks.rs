@@ -194,57 +194,6 @@ impl CheckPreparationFailure {
 }
 
 impl HarnessBroker {
-    /// Revalidate automated proof before admitting any manual verification turn.
-    #[cfg(test)]
-    pub(crate) async fn refresh_verification_gate(&mut self) -> Result<()> {
-        let Some(task) = self.task_controller.current()? else {
-            return Ok(());
-        };
-        let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
-            return Ok(());
-        };
-        if execution.record.phase != crate::plan::PlanPhase::Verify
-            || execution.record.state != PlanExecutionState::Active
-        {
-            return Ok(());
-        }
-        let document = self.plan_file.read_submitted_document(
-            &self.session.id,
-            &execution.record.plan_id,
-            execution.record.revision,
-        )?;
-        let design = document
-            .design
-            .as_ref()
-            .context("accepted execution design is missing")?;
-        if self
-            .execution_checks_are_current(&execution.record, design)
-            .await?
-        {
-            return Ok(());
-        }
-        let source = match &task.turn {
-            Some(turn) => turn.id.clone(),
-            None => {
-                let exchange = self
-                    .store
-                    .latest_exchange(&self.session.id)?
-                    .context("verification source is missing")?;
-                crate::task::TaskTurnId {
-                    exchange_ordinal: exchange.ordinal,
-                    turn_ordinal: exchange.turn.len(),
-                }
-            }
-        };
-        self.task_controller.apply(
-            &mut self.store,
-            &task.permit(),
-            crate::task::TaskEvent::VerificationInputsChanged(source),
-            self.clock.now_ms(),
-        )?;
-        Ok(())
-    }
-
     /// Drive test fixtures through the same captured verification stages as the service.
     #[cfg(test)]
     pub(super) async fn run_checks(&mut self) -> Result<Vec<SessionEvent>> {

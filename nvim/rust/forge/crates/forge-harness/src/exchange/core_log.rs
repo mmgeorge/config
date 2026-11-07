@@ -478,7 +478,7 @@ mod tests {
     /// Session-only failure metadata survives persistence without inventing turn attribution.
     #[test]
     fn thread_error_metadata_preserves_scope_and_failure() {
-        let owner = forge_provider_api::ThreadOwner::root("thread-error-session");
+        let owner = crate::provider::ThreadOwner::root("thread-error-session");
         let thread_id = owner.thread_id();
         let failure = forge_provider_api::ProviderFailure::new(
             forge_provider_api::ProviderOperation::TurnStart,
@@ -492,16 +492,16 @@ mod tests {
             forge_provider_api::BindingId::new("thread-error-binding").unwrap(),
             forge_provider_api::EventSequence::default(),
             EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             },
             &event,
         );
         let loaded: super::CoreRecord =
             serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
         assert!(matches!(loaded, super::CoreRecord::ProviderEventConsumed {
-            scope: forge_provider_api::EventScope::Binding { owner: retained_owner },
+            scope: forge_provider_api::EventScope::Binding { thread_id: retained_owner },
             evidence: Some(super::CoreProviderEvidence::ThreadError { thread_id: retained_thread, error }), ..
-        } if retained_owner == owner && retained_thread == thread_id && error == failure));
+        } if retained_owner == owner.thread_id() && retained_thread == thread_id && error == failure));
     }
 
     use super::*;
@@ -513,8 +513,7 @@ mod tests {
         persist_test_session(root.path(), "session")?;
         let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
         let log = CoreEventLog::new(root.path().to_owned());
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("session"), "exchange");
+        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
         let binding = BindingId::new("binding")?;
         log.append(
             "session",

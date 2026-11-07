@@ -1,4 +1,5 @@
 //! Reusable normalized provider fixture with retained invocation collection.
+use crate::provider::{ScopeOwner, ThreadOwner};
 
 use forge_provider_api::retained_operation::{IdentityRegistry, Interruption, Store};
 use forge_provider_api::{
@@ -68,7 +69,7 @@ struct FixtureOperations {
     models: Store<QueryContext, Vec<ProviderModel>>,
     skills: Store<QueryContext, Vec<catalog::SkillDefinition>>,
     mcp: Store<McpQuery, Vec<McpDefinition>>,
-    terminals: Store<BindingId, terminal::TerminalSnapshot>,
+    terminals: Store<BindingId, terminal::TerminalInventory>,
     terminal_terminate: Store<(BindingId, terminal::TerminalId), ()>,
 }
 
@@ -632,7 +633,7 @@ impl EventFixtureProvider {
         &self,
         scope: &InvocationScope,
     ) -> Result<AdapterActivityWriter, ProviderError> {
-        self.event_sink(&scope.owner)
+        self.event_sink(&scope.owner())
             .await?
             .invocation_writer(scope)
             .map_err(Into::into)
@@ -737,7 +738,8 @@ impl EventFixtureProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        if owners.contains_key(&request.owner) {
+        let request_owner = request.owner();
+        if owners.contains_key(&request_owner) {
             return Err(fixture_error(
                 ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ExecutionActive,
@@ -759,12 +761,12 @@ impl EventFixtureProvider {
         let (sink, events) = events::channel(
             id.clone(),
             EventScope::Binding {
-                owner: request.owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(request.owner().clone()),
             },
         );
         let session = Arc::new(FixtureSession {
             binding: binding.clone(),
-            owner: request.owner.clone(),
+            owner: request.owner().clone(),
             sink,
             admission: Mutex::new(()),
             configuration: Mutex::new(request.configuration),
@@ -784,7 +786,7 @@ impl EventFixtureProvider {
         }
         opened.insert(context.id().clone(), id.clone());
         sessions.insert(id.clone(), session);
-        owners.insert(request.owner, id);
+        owners.insert(request_owner, id);
         Ok(OpenedSession {
             binding,
             capabilities: CapabilityManifest::from_descriptor(self.descriptor.clone()),
@@ -967,7 +969,7 @@ impl EventFixtureProvider {
         }
         Ok(TurnInterruptResult {
             operation_id: context.id().clone(),
-            thread_id: request.scope.owner.thread_id(),
+            thread_id: request.scope.owner().thread_id(),
             turn_id: request.scope.turn_id().map_err(|_| {
                 fixture_error(
                     ProviderOperation::TurnInterrupt,
@@ -1001,7 +1003,7 @@ impl EventFixtureProvider {
                 ProviderFailureKind::BindingInvalidated,
             ));
         }
-        if request.scope.owner != session.owner
+        if request.scope.owner() != session.owner
             || request.receipt.id() != &request.submission_id
             || request.receipt.attempt_id()? != request.attempt_id
             || !request.dispatch.matches(
@@ -1186,7 +1188,7 @@ impl EventFixtureProvider {
         }
         let state = session.state.lock().await;
         if state.active.as_ref() != Some(&request.scope.invocation_id)
-            || request.scope.owner != session.owner
+            || request.scope.owner() != session.owner
         {
             return Err(ProviderError::NotConsumed);
         }
@@ -1997,7 +1999,7 @@ impl Provider for EventFixtureProvider {
         &self,
         context: OperationContext,
         binding: &BindingId,
-    ) -> Result<terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<terminal::TerminalInventory, ProviderError> {
         self.operations
             .terminals
             .observe(
@@ -2141,7 +2143,6 @@ mod tests {
                 operation("open-before-repair"),
                 SessionRequest {
                     thread_id: (ThreadOwner::root("close-owner")).thread_id(),
-                    owner: ThreadOwner::root("close-owner"),
                     mode: SessionMode::Interactive,
                     workspace: ".".into(),
                     history: SessionHistory::Durable { resume: None },

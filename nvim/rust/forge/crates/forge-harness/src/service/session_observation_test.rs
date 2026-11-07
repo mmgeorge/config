@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ScopeOwner;
 use crate::provider::{
     Compaction, CompactionResult, CompactionState, EventScope, ProviderEvent, ThreadOwner,
 };
@@ -41,6 +42,8 @@ fn observation_provider(
             let foreground = foreground.clone();
             async move {
                 let Some(foreground) = foreground else {
+                    // Acknowledge the native turn start so the owner can complete the turn.
+                    start.observed(1).await?;
                     return Ok(crate::provider::test_support::native_result(
                         &request,
                         forge_provider_api::turn::TurnOutcome::Completed {
@@ -63,6 +66,80 @@ fn observation_provider(
     )
 }
 
+/// Open the root native binding through the owner's first prompt and wait for it to settle.
+///
+/// Interactive sessions open their native binding lazily at the first prompt, so a fixture
+/// that injects binding-scoped observations must first run real input through owner intake.
+/// The fixture's provider must complete that prompt without blocking.
+async fn open_root_binding_through_first_prompt(
+    controller: &Arc<SessionController>,
+    provider: &crate::provider::test_support::EventFixtureProvider,
+    owner: &ThreadOwner,
+    message_sink: &forge_protocol::outbound::MessageSender,
+) -> Result<()> {
+    open_root_binding_through_prompt(controller, provider, owner, message_sink, "binding-open")
+        .await
+}
+
+/// Submit one prompt through owner intake and wait until it completes with a live root binding.
+async fn open_root_binding_through_prompt(
+    controller: &Arc<SessionController>,
+    provider: &crate::provider::test_support::EventFixtureProvider,
+    owner: &ThreadOwner,
+    message_sink: &forge_protocol::outbound::MessageSender,
+    operation_id: &str,
+) -> Result<()> {
+    use crate::session::state_machine::SessionPhase;
+    controller.start_provider(message_sink).await;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        while !controller.provider_ready().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("provider did not become ready")?;
+    controller.attach_input(message_sink).await?;
+    let prior_exchange_count = controller.broker.lock().await.snapshot()?.exchange.len();
+    prompt::apply(
+        controller,
+        Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({"operation_id":operation_id,"text":"Open the native binding"}),
+        },
+        message_sink,
+    )
+    .await?;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        loop {
+            let settled = {
+                let broker = controller.broker.lock().await;
+                let snapshot = broker.snapshot()?;
+                matches!(snapshot.status, SessionPhase::Idle)
+                    && snapshot.exchange.len() == prior_exchange_count + 1
+                    && snapshot.exchange.last().is_some_and(|exchange| {
+                        exchange.state() == crate::exchange::ExchangeState::Complete
+                    })
+            };
+            if settled
+                && controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .is_empty()
+                && !controller.observer.session_events().has_pending()?
+                && provider.event_sink(owner).await.is_ok()
+            {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("first prompt did not open and settle the root native binding")?
+}
+
 /// Deliver the old failure before installing a fresh owner observation generation.
 #[tokio::test]
 async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<()> {
@@ -80,9 +157,10 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     let controller = SessionController::new(broker).await?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
+    open_root_binding_through_first_prompt(&controller, &provider, &owner, &message_sink).await?;
     let old = provider.event_sink(&owner).await?;
     old.fail(crate::provider::events::EventDeliveryError::Closed);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if controller
                 .session_event_task
@@ -98,19 +176,38 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     })
     .await
     .context("failed observation did not finish")?;
-    let frame = output.recv().await?.context("failure was not delivered")?;
-    let failure: Value = serde_json::from_slice(frame.bytes())?;
-    assert!(failure.to_string().contains("Session observation failed"));
+    // The first prompt published its own frames ahead of the observation failure.
+    loop {
+        let frame = output.recv().await?.context("failure was not delivered")?;
+        let event: Value = serde_json::from_slice(frame.bytes())?;
+        if event.to_string().contains("Session observation failed") {
+            break;
+        }
+    }
     controller.recover_session_events(&message_sink).await?;
+    // Observation loss retires the old binding; explicit new work opens its replacement.
+    open_root_binding_through_prompt(
+        &controller,
+        &provider,
+        &owner,
+        &message_sink,
+        "replacement-binding-open",
+    )
+    .await?;
     let replacement = provider.event_sink(&owner).await?;
     replacement
         .send_wait(session_test_diagnostic("new generation"))
         .await?;
-    let frame = tokio::time::timeout(Duration::from_secs(5), output.recv())
-        .await??
-        .context("replacement event missing")?;
-    let event: Value = serde_json::from_slice(frame.bytes())?;
-    assert!(event.to_string().contains("new generation"));
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        loop {
+            let frame = output.recv().await?.context("replacement event missing")?;
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            if event.to_string().contains("new generation") {
+                break Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
     assert!(
         old.send_wait(session_test_diagnostic("stale"))
             .await
@@ -182,8 +279,15 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             })),
         },
     })?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
+            // Working status can publish before deferred native open admits the invocation.
+            if !foreground.active.load(Ordering::Acquire)
+                || engine.active_invocation_snapshot()?.is_none()
+            {
+                tokio::task::yield_now().await;
+                continue;
+            }
             let broker = controller.broker.lock().await;
             if matches!(broker.snapshot()?.status, SessionPhase::Working { .. }) {
                 let status = presentation
@@ -220,15 +324,16 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     let before_loss = delivered.lock().unwrap().len();
 
     foreground.fail.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
-            if controller.coordinator.execution.available_permits() > 0
-                && controller
-                    .coordinator
-                    .submissions
-                    .snapshot()?
-                    .messages
-                    .is_empty()
+            // Observation loss fences foreground execution until explicit new work recovers
+            // the binding, so settlement shows through the drained input queue instead.
+            if controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty()
                 && delivered.lock().unwrap()[before_loss..]
                     .iter()
                     .any(|event| {
@@ -244,6 +349,11 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     })
     .await
     .context("observation loss did not settle input delivery")??;
+    assert_eq!(
+        controller.coordinator.execution.available_permits(),
+        0,
+        "failed observation left foreground execution open before recovery"
+    );
     let broker = controller.broker.lock().await;
     assert!(
         broker.input_submission.is_none(),
@@ -287,7 +397,10 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    for event in ["input.dispatch_finished", "input.forwarder_finished"] {
+    for event in [
+        "exchange.foreground.failure_settled",
+        "exchange.input.completed",
+    ] {
         assert!(
             records.iter().any(|record| record["event"] == event),
             "missing delivery postlude: {event}"
@@ -303,28 +416,34 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
     if let Some(task) = controller.input_task.lock().await.take() {
-        tokio::time::timeout(Duration::from_secs(5), task).await??;
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
     }
     let native_shutdown = crate::provider::operation::OperationControl::fresh(
         forge_provider_api::ProviderOperation::Shutdown,
     )?;
     provider.shutdown(native_shutdown.context()).await?;
-    if let Err(error) =
-        tokio::time::timeout(Duration::from_secs(5), controller.finish_session_events()).await?
+    if let Err(error) = tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        controller.finish_session_events(),
+    )
+    .await?
     {
         assert!(
-            matches!(
-                error.downcast_ref::<crate::provider::ProviderError>(),
+            // The collector wraps the native loss in its observation-commit error.
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::provider::ProviderError>(),
                 Some(crate::provider::ProviderError::Observation(
                     forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable
                 ))
-            ),
+            )),
             "unexpected observation collector failure: {error:#}"
         );
     }
     drop(controller);
     drop(sink);
-    reader.await??;
+    // The session owner keeps its own output handle until owner shutdown, so the reader
+    // cannot observe end-of-stream here; every assertion has already run.
+    reader.abort();
     Ok(())
 }
 
@@ -339,7 +458,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let session_id = broker.snapshot()?.session.id.clone();
     let owner = ThreadOwner::root(&session_id);
     let scope = EventScope::SessionOperation {
-        owner: owner.clone(),
+        thread_id: forge_provider_api::ThreadId::from(owner.clone()),
         operation_id: forge_provider_api::OperationId::new("observation-fixture")
             .expect("fixture operation identity is nonempty"),
     };
@@ -350,19 +469,24 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let controller = SessionController::new(broker).await?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
+    open_root_binding_through_first_prompt(&controller, &provider, &owner, &message_sink).await?;
     let broker_guard = controller.broker.lock().await;
-    let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES / 2;
+    // Ordering and non-blocking intake need only a few distinct observations; saturation of
+    // the intake bound is covered by the overflow test below.
+    let diagnostic_count = 16;
     // Keep the native session stream open after the producer finishes. Dropping
     // its last sender would be an unexpected disconnect, not a drained session.
     let provider_sink = provider.event_sink(&owner).await?;
     let session_sink = provider_sink.clone();
     let producer = tokio::spawn(async move {
+        let thread_id = scope.owner().thread_id();
         provider_sink
             .send_wait(forge_provider_api::AdapterActivity::Thread {
-                thread_id: scope.owner().thread_id(),
+                // The sink rejects a compaction whose thread differs from its envelope.
+                thread_id: thread_id.clone(),
                 event: forge_provider_api::ThreadEvent::CompactionUpdated(Box::new(Compaction {
                     id: "durable-observation".into(),
-                    thread_id: "native-observation".into(),
+                    thread_id: thread_id.as_str().into(),
                     state: CompactionState::Completed,
                     manual: false,
                     started_at_ms: Some(10),
@@ -382,17 +506,25 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
         }
         Ok::<_, crate::provider::ProviderError>(())
     });
-    tokio::time::timeout(Duration::from_secs(2), producer)
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, producer)
         .await
         .context("bounded provider intake waited for the held broker lock")???;
     assert!(controller.observer.session_events().has_pending()?);
-    assert!(
-        output.try_recv().is_err(),
-        "observations published before broker release"
-    );
+    // Publication delivery can still flush the first prompt's retained frames, which do not
+    // need the broker; only the fixture's own observations must wait for its release.
+    while let Ok(frame) = output.try_recv() {
+        let event: Value = serde_json::from_slice(frame.bytes())?;
+        let fixture_diagnostic = event["payload"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("observation-"));
+        assert!(
+            !fixture_diagnostic && !event.to_string().contains("\"durable-observation\""),
+            "observations published before broker release: {event}"
+        );
+    }
     drop(broker_guard);
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let mut expected_sequence = 0;
         while expected_sequence < diagnostic_count {
             let frame = output
@@ -459,6 +591,7 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     let controller = SessionController::new(broker).await?;
     let (output, _receiver) = forge_protocol::outbound::channel();
     controller.attach_session_events(&output).await?;
+    open_root_binding_through_first_prompt(&controller, &provider, &owner, &output).await?;
     let sink = provider.event_sink(&owner).await?;
     let guard = controller.broker.lock().await;
     for sequence in 0..(forge_protocol::MAX_PENDING_FRAMES * 2) {
@@ -471,7 +604,7 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         }
     }
     let inbox = controller.observer.session_events();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !inbox.is_closed() {
             tokio::task::yield_now().await;
         }
@@ -605,7 +738,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
             ] {
                 writer
                     .send_wait(AdapterActivity::Item {
-                        thread_id: scope.owner.thread_id(),
+                        thread_id: scope.owner().thread_id(),
                         turn_id: scope.turn_id().unwrap(),
                         item_id: ItemId::new("background-tool").unwrap(),
                         event,
@@ -647,10 +780,13 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
                 )),
             },
         })?;
-    let exchange_id = tokio::time::timeout(Duration::from_secs(5), async {
+    let exchange_id = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let scope = recorded.lock().unwrap().clone();
+            // The owner commits its settlement ticket through the broker after the exchange
+            // reaches Complete; shutdown must not start while that commit is still pending.
             if let Some(scope) = scope
+                && controller.coordinator.execution.available_permits() > 0
                 && SqliteStore::read_only(&data_root)?
                     .load_exchange(scope.exchange_id.as_str())?
                     .is_some_and(|exchange| {
@@ -677,7 +813,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         shutdown_controller.broker.lock().await.release_lease()?;
         Ok::<_, anyhow::Error>(())
     });
-    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+    let observed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !controller.observer.session_events().has_pending()? {
             tokio::task::yield_now().await;
         }
@@ -690,10 +826,11 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         anyhow::bail!("shutdown finished without publishing terminal evidence");
     }
     observed.context("shutdown did not publish terminal evidence")??;
-    assert!(
-        !shutdown.is_finished(),
-        "shutdown released its owner before queued evidence drained"
-    );
+    if shutdown.is_finished() {
+        drop(broker_guard);
+        let outcome = shutdown.await.context("shutdown worker failed")?;
+        anyhow::bail!("shutdown released its owner before queued evidence drained: {outcome:?}");
+    }
     assert!(
         SqliteStore::read_only(&data_root)?
             .load_session(&session_id)?
@@ -702,7 +839,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
             .is_some()
     );
     drop(broker_guard);
-    tokio::time::timeout(Duration::from_secs(2), shutdown).await???;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, shutdown).await???;
 
     let store = SqliteStore::read_only(&data_root)?;
     let saved = store.load_exchange(&exchange_id)?.unwrap();
@@ -750,7 +887,11 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     )?;
     provider.shutdown(native_shutdown.context()).await?;
     execution.close().await?;
-    tokio::time::timeout(Duration::from_secs(2), controller.finish_session_events()).await??;
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        controller.finish_session_events(),
+    )
+    .await??;
     assert!(controller.session_event_task.lock().await.is_none());
     Ok(())
 }
@@ -772,15 +913,23 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
     let controller = SessionController::new(broker).await?;
     let (messages, _blocked_output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&messages).await?;
+    open_root_binding_through_first_prompt(&controller, &provider, &owner, &messages).await?;
+    // The unread first-prompt frames already hold part of the normal lane; fill the rest.
     for index in 0..forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS {
-        messages.send(index)?;
+        if messages.send(index).is_err() {
+            break;
+        }
     }
+    assert!(
+        messages.send(0).is_err(),
+        "fixture did not saturate the obsolete client's normal lane"
+    );
     let old_inbox = controller.observer.session_events();
     provider
         .event_sink(&owner)
         .await?
         .fail(crate::provider::events::EventDeliveryError::Closed);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if controller
                 .session_event_task
@@ -809,7 +958,7 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
         "observation diagnostic was not retained before listener completion"
     );
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller.recover_session_events(&messages),
     )
     .await??;

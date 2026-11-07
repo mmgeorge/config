@@ -1,6 +1,6 @@
 # Building and testing Forge
 
-A passing test proves nothing about the editor if Neovim launches an older executable. This guide covers building the executable Neovim runs, and choosing the Rust checks that prove a change. For editor fixtures, see [Editor tests](editor-tests.md). For what to run in a specific area, see [Verification by area](verification-by-area.md).
+A passing test proves nothing about the editor if Neovim launches an older executable. This guide covers building the executable Neovim runs, choosing the Rust checks that prove a change, and running the Lua tests. For editor fixtures, see [Editor tests](editor-tests.md). For what to run in a specific area, see [Verification by area](verification-by-area.md).
 
 Documentation-only changes need link checks, not a Rust rebuild.
 
@@ -46,21 +46,39 @@ Use `cargo build --release --locked --bin forge` only for an explicit release or
 
 ## Rust tests
 
+Rust tests run under [cargo-nextest](https://nexte.st/), installed once with `cargo install cargo-nextest --locked`. Nextest runs each test in its own process, which lets it terminate one stuck test without losing the rest of the run. Nextest reserves `--profile` for its own profiles, so pass the Cargo profile as `--cargo-profile dev`.
+
 Check the affected target first, then run the narrowest test that proves the change:
 
 ```nu
 cargo check --profile dev --locked -p forge-harness --lib
-cargo test --profile dev --locked -p forge-harness --lib plan::
-cargo test --profile dev --locked -p forge-diff --lib declaration_calls::tests
+cargo nextest run --cargo-profile dev --locked -p forge-harness --lib plan::
+cargo nextest run --cargo-profile dev --locked -p forge-diff --lib declaration_calls::tests
 ```
+
+A positional filter selects tests whose names contain it. Select one test exactly with a filter expression, such as `-E 'test(=plan::tests::accepts_revision)'`. Nextest does not run doctests; run `cargo test --doc -p <package>` when a change touches one.
+
+Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after five seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it. Waits a test expects to complete use the crate's `hang_guard::HANG_GUARD`, which fires just before termination so the failure names the stuck step.
 
 Add `--all-targets` to the check only when changed test or executable targets need it. Broaden to the workspace only when shared interfaces require it, and keep Cargo-heavy jobs serial. Record the command, deadline, exit status, and failing assertion or diagnostic.
 
 TypeScript projects run their existing type-check command first, such as `npm run typecheck`, with the project's package manager.
 
-The `rust-test` check uses the repository callback `nvim/tools/checks/rust.nu`, with `package`, `test`, `executable`, `files`, and `full` inputs. Explicit package and test inputs skip package lookup and test listing. Stable Rust's test runner has no per-test timeout, so deadline tests that do not need real time use Tokio's paused clock.
+The `rust-test` check uses the repository callback `nvim/tools/checks/rust.nu`, with `package`, `test`, `executable`, `files`, and `full` inputs. Explicit package and test inputs skip package lookup and test listing. The callback runs nextest, so the five-second termination applies to Harness checks too. Deadline tests use Tokio's paused clock rather than the real one.
 
 Test fixtures must use the current public check configuration. Task-specific enablement belongs in admission overrides, and scoped shell helpers must declare `input: true`.
+
+## Lua tests
+
+Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run exact fixtures, a suite, or the default selection of every fixture except the live-provider suite:
+
+```nu
+nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua
+nu .forge/checks/lua-tests.nu --suite walkthrough
+nu .forge/checks/lua-tests.nu
+```
+
+The five-second limit has no per-fixture exceptions. A fixture that needs longer waits on real time or hangs, so fix it with an injected clock, a mocked `vim.uv` timer, or a deterministic signal, or remove it. [Editor tests](editor-tests.md) covers suites, parameterized fixtures, and output.
 
 ## Live provider tests
 
@@ -69,7 +87,7 @@ Tests that need installed or authenticated provider CLIs live in the internal `l
 After authorizing external requests and checking a case's prerequisites, run only that case:
 
 ```nu
-cargo test --profile dev --locked -p forge-harness --lib live_provider::<module::test_name> -- --ignored --exact
+cargo nextest run --cargo-profile dev --locked -p forge-harness --lib --run-ignored only -E 'test(=live_provider::<module::test_name>)' --profile live
 ```
 
 Never enable ignored cases in routine project checks.

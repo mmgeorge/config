@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -352,7 +353,7 @@ impl HostInvocation {
         let children = self.observed_tools.lock().await;
         for (id, child) in children.iter() {
             if turn.is_some_and(|turn| turn != id)
-                || thread.is_some_and(|thread| thread != &child.scope.owner.thread_id())
+                || thread.is_some_and(|thread| thread != &child.scope.owner().thread_id())
             {
                 continue;
             }

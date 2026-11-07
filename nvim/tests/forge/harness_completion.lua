@@ -65,7 +65,7 @@ local ok, failure = xpcall(function()
   vim.system = function(command, options, callback)
     assert(command[1] == "git" and command[2] == "ls-files")
     assert(options.cwd == "fixture-workspace")
-    vim.schedule(function() callback({ code = 0, stdout = "src/main.rs\n", stderr = "" }) end)
+    vim.schedule(function() callback({ code = 0, stdout = "src/main.rs\0", stderr = "" }) end)
   end
 
   local commands = require(source_config.providers.harness_commands.module).new()

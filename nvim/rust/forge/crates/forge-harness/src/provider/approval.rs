@@ -11,6 +11,7 @@ use crate::permissions::matcher::{
 };
 use crate::permissions::shell;
 use crate::permissions::store::PermissionStore;
+use crate::provider::ScopeOwner;
 use crate::provider::events::{HarnessEventSink, HostEvent};
 use crate::provider::host_event::*;
 use crate::session::{ApprovalMode, InputTimeout, ResolutionSource};
@@ -149,7 +150,7 @@ impl PermissionCoordinator {
             .skill_by_owner
             .lock()
             .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?
-            .get(&scope.owner)
+            .get(&scope.owner())
             .cloned();
         Ok(PermissionInheritance { directory, skills })
     }
@@ -173,16 +174,16 @@ impl PermissionCoordinator {
             .lock()
             .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
         anyhow::ensure!(
-            !directories.contains_key(scope) && !skills.contains_key(&scope.owner),
+            !directories.contains_key(scope) && !skills.contains_key(&scope.owner()),
             "native child policy already has an independent owner"
         );
         directories.insert(scope.clone(), policy.clone());
         let skills = captured.skills.as_ref().map(|access| {
-            skills.insert(scope.owner.clone(), access.clone());
+            skills.insert(scope.owner().clone(), access.clone());
             crate::skill::SkillExecution {
                 observer: Arc::new(Mutex::new(crate::skill::SkillObserver::new(access.clone()))),
                 access: access.clone(),
-                owner: scope.owner.clone(),
+                owner: scope.owner().clone(),
                 coordinator: self.clone(),
             }
         });
@@ -228,7 +229,7 @@ impl PermissionCoordinator {
         scope: &crate::provider::InvocationScope,
     ) -> Result<DirectoryExecution> {
         anyhow::ensure!(
-            request.owner()? == scope.owner,
+            request.owner()? == scope.owner(),
             "directory policy belongs to a different invocation owner"
         );
         let policy = Arc::new(DirectoryPolicy {
@@ -545,9 +546,9 @@ impl PermissionCoordinator {
                 .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
             let access = address
                 .as_ref()
-                .map(|address| &address.scope.owner)
+                .map(|address| address.scope.owner())
                 .or_else(|| event_sink.map(|sink| sink.scope().owner()))
-                .and_then(|owner| scopes.get(owner).cloned());
+                .and_then(|owner| scopes.get(&owner).cloned());
             drop(scopes);
             if let Some(access) = access {
                 let mut granted = Vec::new();
@@ -659,7 +660,7 @@ impl PermissionCoordinator {
         }
         let execution_owner = address
             .as_ref()
-            .map(|address| address.scope.owner.clone())
+            .map(|address| address.scope.owner().clone())
             .or_else(|| event_sink.map(|sink| sink.scope().owner().clone()));
         let mut view = approval_view(&request, &evaluation);
         if let Some(policy) = &directory_policy {
@@ -768,7 +769,7 @@ impl PermissionCoordinator {
     ) -> Result<ApprovalResolution> {
         let view = ApprovalRequestView {
             id: Uuid::new_v4().to_string(),
-            execution_owner: Some(scope.owner.clone()),
+            execution_owner: Some(scope.owner().clone()),
             exchange_id: Some(scope.exchange_id.to_string()),
             turn_id: None,
             provider: None,
@@ -1366,7 +1367,7 @@ impl PermissionCoordinator {
         event_sink: Option<&HarnessEventSink>,
         pending: &PendingApproval,
         selected: &[(String, ApprovalChoice)],
-        committed_directory_grants: &[forge_provider_api::access::DirectoryGrant],
+        committed_directory_grants: &[crate::permissions::directory::DirectoryGrant],
         timed_out: bool,
     ) -> Result<()> {
         if let Some(sink) = event_sink {
@@ -1724,7 +1725,7 @@ fn permission_request(
         None => ApprovalScope::Thread {
             thread_id: view
                 .execution_owner
-                .as_ref()
+                .clone()
                 .or_else(|| sink.map(|sink| sink.scope().owner()))
                 .context("approval has no original owner")?
                 .thread_id(),
@@ -1847,7 +1848,7 @@ mod test {
 
     fn scope() -> InvocationScope {
         InvocationScope {
-            owner: ThreadOwner::root("approval"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("approval")),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
@@ -2063,7 +2064,7 @@ mod test {
         };
         let address = Some(TurnAddress {
             scope: InvocationScope {
-                owner: request.owner()?,
+                thread_id: forge_provider_api::ThreadId::from(request.owner()?),
                 ..scope()
             },
             thread_id: forge_provider_api::ThreadId::new("native").unwrap(),
@@ -2360,7 +2361,7 @@ mod test {
         };
         let address = Some(TurnAddress {
             scope: InvocationScope {
-                owner: request.owner()?,
+                thread_id: forge_provider_api::ThreadId::from(request.owner()?),
                 ..scope()
             },
             thread_id: forge_provider_api::ThreadId::new("native").unwrap(),
@@ -2474,7 +2475,7 @@ mod test {
         };
         let address = Some(TurnAddress {
             scope: InvocationScope {
-                owner: request.owner()?,
+                thread_id: forge_provider_api::ThreadId::from(request.owner()?),
                 ..scope()
             },
             thread_id: forge_provider_api::ThreadId::new("provider").unwrap(),
@@ -2779,8 +2780,10 @@ mod test {
         for session in ["expired", "waiting"] {
             let owner = crate::provider::ThreadOwner::root(session);
             let coordinator = coordinator.clone();
-            let (sink, stream) =
-                crate::provider::events::channel(InvocationScope { owner, ..scope() });
+            let (sink, stream) = crate::provider::events::channel(InvocationScope {
+                thread_id: owner.thread_id(),
+                ..scope()
+            });
             streams.push(stream);
             tasks.push(tokio::spawn(async move {
                 coordinator
@@ -2814,7 +2817,7 @@ mod test {
             .iter()
             .find(|view| {
                 *view.execution_owner.as_ref().unwrap().session_id()
-                    == forge_provider_api::SessionId::from("expired")
+                    == crate::provider::SessionId::from("expired")
             })
             .unwrap();
         let original_deadline = original.deadline.as_ref().unwrap().expires_at_ms;
@@ -2937,8 +2940,10 @@ mod test {
                 forge_provider_api::AgentId::new(agent_id).unwrap(),
             )
             .expect("registered session and agent identities are nonempty");
-            let (sink, mut stream) =
-                crate::provider::events::channel(InvocationScope { owner, ..scope() });
+            let (sink, mut stream) = crate::provider::events::channel(InvocationScope {
+                thread_id: owner.thread_id(),
+                ..scope()
+            });
             let waiting_sink = sink.clone();
             waiter.push(tokio::spawn(async move {
                 coordinator
@@ -3397,7 +3402,7 @@ mod test {
         );
         assert!(owned.turn_id.is_none());
         let snapshot = coordinator.pending_presentations().unwrap();
-        assert_eq!(snapshot[0].execution_owner, scope().owner);
+        assert_eq!(snapshot[0].execution_owner, scope().owner());
         assert_eq!(snapshot[0].request.request_id.as_str(), view.id);
         coordinator
             .resolve(

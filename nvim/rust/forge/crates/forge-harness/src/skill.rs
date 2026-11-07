@@ -382,7 +382,18 @@ fn script_path(invocation: &CommandInvocation) -> Option<&str> {
     (valid && !path.starts_with('-')).then_some(path)
 }
 
-pub use forge_provider_api::skill::SkillRead;
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+/// Retains a confirmed selected-skill read and its originating provider tool.
+pub struct SkillRead {
+    /// Identifies the selected catalog definition, independently of profile aliases.
+    pub resource_id: String,
+    /// Names the skill displayed in the timeline.
+    pub name: String,
+    /// Opens the canonical skill definition after runtime profiles are removed.
+    pub path: String,
+    /// Identifies the provider tool within its owning turn.
+    pub tool_id: String,
+}
 
 struct SkillEventObserver(Arc<Mutex<SkillObserver>>);
 

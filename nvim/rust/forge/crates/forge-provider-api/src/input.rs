@@ -103,48 +103,17 @@ pub struct FileAttachment {
     pub context: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// Select the provider-neutral execution posture for one admitted prompt.
+///
+/// Harness workflows such as plans, goals, and reviews are host intent: Harness renders them
+/// into the prompt's instructions and tool set. This option carries only the one behavior a
+/// native runtime can apply on its own, a read-only planning posture.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-/// Identifies the workflow independently of its permission boundary.
-pub enum TaskKind {
-    /// Creates a reviewable design.
-    Plan,
-    /// Implements an accepted design through its verification gates.
-    Execute,
-    /// Continues toward an explicit objective.
-    Goal,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskStart {
-    pub kind: TaskKind,
-    pub title: String,
-}
-
-impl TaskStart {
-    pub fn heading(&self) -> String {
-        let label = match self.kind {
-            TaskKind::Goal => "Goal",
-            TaskKind::Plan => "Plan",
-            TaskKind::Execute => "Execution",
-        };
-        format!("{label} started: {}", self.title)
-    }
-}
-
-/// Represents the broker intent for one admitted prompt.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptMode {
-    /// Run a persistent tool-free generation request.
-    Background,
-    Chat,
-    Plan,
-    PlanDiscussion,
-    /// Answer an anchored review question in a fork without plan mutations.
-    PlanQuestion,
-    ExecutePlan,
-    GoalContinuation,
-    RequestChanges,
+pub enum ExecutionMode {
+    /// Run with the provider's ordinary execution posture.
+    #[default]
+    Default,
+    /// Prefer the provider's native planning posture when it offers one.
+    Planning,
 }

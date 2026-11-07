@@ -19,6 +19,8 @@ pub mod command;
 pub(crate) mod declaration;
 pub mod exchange;
 pub mod goal;
+#[cfg(test)]
+pub(crate) mod hang_guard;
 pub(crate) mod input;
 mod limits;
 pub mod permissions;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ScopeOwner;
 use crate::provider::submission::{SubmissionState, SubmissionStore};
 use crate::provider::{PromptMode, ProviderError, ProviderInput, ServiceTier};
 use crate::session::ApprovalMode;
@@ -190,7 +191,15 @@ async fn publish_background_terminal(
         return Ok(());
     };
     if matches!(finish, BackgroundFinish::PriorTask) {
+        // Native events carry only thread and turn identities, and the bridge resolves their
+        // host scope from the turn registry. A prior task therefore differs by its own
+        // invocation, whose turn this child's binding never admitted.
         observed.scope.exchange_id = "prior-child-task".into();
+        observed.scope.invocation_id = "prior-child-invocation".into();
+        observed.address.turn.turn_id = observed
+            .scope
+            .turn_id()
+            .expect("fixture invocation identity is a valid turn identity");
         observed.address.turn.scope = observed.scope.clone();
     }
     let sink = provider.invocation_sink(&observed.scope).await?;
@@ -229,13 +238,15 @@ async fn reject_foreign_background_scope(
     let Some(observed) = pending.lock().unwrap().take() else {
         return Ok(());
     };
-    let session_sink = provider.event_sink(&observed.scope.owner).await?;
+    let session_sink = provider.event_sink(&observed.scope.owner()).await?;
     let mut foreign = observed.scope;
-    foreign.owner = ThreadOwner::new(
-        foreign.owner.session_id().clone(),
-        forge_provider_api::AgentId::new("foreign-child").unwrap(),
-    )
-    .expect("fixture identities are nonempty");
+    foreign.thread_id = forge_provider_api::ThreadId::from(
+        ThreadOwner::new(
+            foreign.owner().session_id().clone(),
+            forge_provider_api::AgentId::new("foreign-child").unwrap(),
+        )
+        .expect("fixture identities are nonempty"),
+    );
     session_sink.invocation_writer(&foreign)?;
     Err(fixture_provider_error(
         forge_provider_api::ProviderFailureKind::Protocol,
@@ -315,7 +326,7 @@ async fn collect_background_child(
     // while the child runtime idles, so deadline fixtures expire without real waits.
     let mut revision = coordinator.subscribe();
     let running = tokio::spawn(runtime.run());
-    let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let events = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let mut events = Vec::new();
         loop {
             match coordinator.try_receive() {
@@ -326,7 +337,7 @@ async fn collect_background_child(
                 }) => {
                     assert_eq!(event_owner, owner);
                     assert_eq!(task_id, "child-task");
-                    assert_eq!(event.scope().owner(), &owner);
+                    assert_eq!(event.scope().owner(), owner);
                     if let Some(invocation) = event.scope().invocation() {
                         assert_eq!(invocation.exchange_id.as_str(), "child-task");
                     }
@@ -666,7 +677,7 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
                 } => {
                     assert_eq!(owner, expected_owner);
                     assert_eq!(task_id, "child-task");
-                    assert_eq!(event.scope().owner(), &expected_owner);
+                    assert_eq!(event.scope().owner(), expected_owner);
                     if let Some(invocation) = event.scope().invocation() {
                         assert_eq!(invocation.exchange_id.as_str(), "child-task");
                     }
@@ -849,7 +860,7 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
     };
     assert!(output.is_err());
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].scope.owner, owner);
+    assert_eq!(changes[0].scope.owner(), owner);
     assert_eq!(changes[0].scope.exchange_id.as_str(), "child-task");
     assert_eq!(changes[0].call_id.as_str(), "committed-call");
     assert!(changes[0].native_item_id.is_none());

@@ -3,7 +3,7 @@ use super::session::AcpSessionState;
 use super::{AcpConnection, AcpConnectionError, AcpLaunch};
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::catalog::{McpDefinition, McpStatus};
-use forge_provider_api::{PromptMode, ProviderCapability, ProviderError, ProviderModel};
+use forge_provider_api::{ExecutionMode, ProviderCapability, ProviderError, ProviderModel};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,11 +17,11 @@ pub(super) fn configuration_with_tool_endpoint(
     let servers = configuration["mcpServers"]
         .as_array_mut()
         .ok_or_else(|| acp_failure(forge_provider_api::ProviderFailureKind::Protocol))?;
-    servers.retain(|server| server["name"] != "forge-harness-control");
+    servers.retain(|server| server["name"] != super::permission::HOST_TOOL_SERVER);
     if let Some(endpoint) = endpoint {
         servers.insert(0, json!({
             "type":"http",
-            "name":"forge-harness-control",
+            "name":super::permission::HOST_TOOL_SERVER,
             "url":endpoint.url.clone(),
             "headers":endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>(),
         }));
@@ -88,7 +88,7 @@ impl AcpConversation {
         let result: Result<(String, Value, Value, InstructionDelivery)> = async {
         let initialized = transport.request("initialize", json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
-            "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
+            "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
         validate_initialization(&requirement, &initialized)?;
         ensure!(
             initialized
@@ -100,7 +100,7 @@ impl AcpConversation {
         let mut servers = Vec::new();
         if let Some(endpoint) = &options.control_endpoint {
             let headers = endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>();
-            servers.push(json!({"type":"http","name":"forge-harness-control","url":endpoint.url,"headers":headers}));
+            servers.push(json!({"type":"http","name":super::permission::HOST_TOOL_SERVER,"url":endpoint.url,"headers":headers}));
         }
         let mut parameter = json!({"cwd":options.workspace,"mcpServers":servers});
         let instructions = if initialized.pointer("/agentCapabilities/sessionCapabilities/systemPrompt").is_some_and(Value::is_object) {
@@ -277,11 +277,11 @@ impl AcpConversation {
                 .and_then(|servers| {
                     servers
                         .iter()
-                        .find(|server| server["name"] == "forge-harness-control")
+                        .find(|server| server["name"] == super::permission::HOST_TOOL_SERVER)
                 });
             let desired = endpoint.map(|endpoint| json!({
                 "type":"http",
-                "name":"forge-harness-control",
+                "name":super::permission::HOST_TOOL_SERVER,
                 "url":endpoint.url.clone(),
                 "headers":endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>(),
             }));
@@ -360,7 +360,7 @@ impl AcpConversation {
             .and_then(|servers| {
                 servers
                     .iter()
-                    .find(|server| server["name"] == "forge-harness-control")
+                    .find(|server| server["name"] == super::permission::HOST_TOOL_SERVER)
             })
             .cloned();
         let mut servers = servers;
@@ -569,7 +569,7 @@ impl AcpConversation {
     }
 
     /// Apply native model, reasoning, and plan mode settings.
-    pub async fn configure(&self, model: &str, effort: &str, mode: PromptMode) -> Result<()> {
+    pub async fn configure(&self, model: &str, effort: &str, mode: ExecutionMode) -> Result<()> {
         let catalog = self.state.catalog().await.clone();
         if model != "default" && !model.is_empty() {
             if let Some(option) = find_option(&catalog, "model") {
@@ -616,10 +616,7 @@ impl AcpConversation {
         let modes = catalog
             .pointer("/modes/availableModes")
             .and_then(Value::as_array);
-        let planning = matches!(
-            mode,
-            PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion
-        );
+        let planning = mode == ExecutionMode::Planning;
         let plan_mode = if planning {
             ["plan", "architect"]
                 .into_iter()
@@ -666,15 +663,7 @@ impl AcpConversation {
     pub(super) async fn initial_model(&self) -> forge_provider_api::ModelSelection {
         let catalog = self.state.catalog().await;
         forge_provider_api::ModelSelection {
-            model: catalog
-                .pointer("/models/currentModelId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    find_option(&catalog, "model")
-                        .and_then(|option| option["currentValue"].as_str())
-                        .map(str::to_owned)
-                }),
+            model: current_model_id(&catalog).map(str::to_owned),
             reasoning: find_option(&catalog, "thought_level")
                 .or_else(|| find_option(&catalog, "effort"))
                 .and_then(|option| option["currentValue"].as_str())
@@ -695,6 +684,7 @@ impl AcpConversation {
             .or_else(|| {
                 find_option(&catalog, "model").and_then(|option| option["options"].as_array())
             });
+        let current_model = current_model_id(&catalog);
         let mut result = Vec::new();
         for model in model_list.into_iter().flatten() {
             let Some(id) = model["modelId"]
@@ -728,14 +718,21 @@ impl AcpConversation {
                     .as_str()
                     .or_else(|| model["name"].as_str())
                     .map(str::to_owned),
-                is_default: catalog
-                    .pointer("/models/currentModelId")
-                    .and_then(Value::as_str)
-                    == Some(id),
+                is_default: current_model == Some(id),
             });
         }
         Ok(result)
     }
+}
+
+/// Read the session's selected model from the legacy model state or the newer `model` config option.
+pub(super) fn current_model_id(catalog: &Value) -> Option<&str> {
+    catalog
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            find_option(catalog, "model").and_then(|option| option["currentValue"].as_str())
+        })
 }
 
 /// Create the adapter-owned requirement shared by setup and native session initialization.

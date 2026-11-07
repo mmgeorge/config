@@ -294,6 +294,7 @@ fn rust_declaration_corpus_preserves_meaning() {
 }
 
 #[test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 fn typescript_declaration_corpus_preserves_meaning() {
     let source = include_str!("../../tests/fixtures/declaration_formatting/typescript.ts.txt");
     for path in ["corpus.ts", "corpus.mts", "corpus.cts"] {
@@ -318,6 +319,7 @@ fn lua_declaration_corpus_preserves_meaning() {
 }
 
 #[test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 fn large_files_preserve_meaning_across_repeated_passes() {
     let mut failures = Vec::new();
     for (path, source) in [

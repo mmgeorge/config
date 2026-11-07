@@ -4143,6 +4143,8 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
+        // The trace writer runs on its own thread, so read only after its accepted writes finish.
+        store.flush().unwrap();
         let recorded = std::fs::read_to_string(store.status().path).unwrap();
         assert!(recorded.contains("\"event\":\"plan.review.file_order\""));
         assert!(recorded.contains("\"count\":2"));

@@ -151,6 +151,9 @@ pub struct ExchangeInput {
     pub id: String,
     pub text: String,
     pub created_at_ms: i64,
+    /// The provider submission that delivered this input, which its native echo carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<forge_provider_api::SubmissionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

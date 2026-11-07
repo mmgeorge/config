@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 /// Disposable-state contract shared by databases, journals, plans, and captured files.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// Pin one executable's state version until its final storage user releases it.
 #[derive(Clone)]
@@ -109,6 +109,9 @@ pub fn clear(root: &Path) -> Result<ClearReport> {
                         file.path(),
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
                     )?;
+                    // A live database owner retains the version; waiting on SQLite's busy
+                    // handler would only stall cleanup before reporting the same retention.
+                    connection.busy_timeout(std::time::Duration::ZERO)?;
                     connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
                     connection.execute_batch("BEGIN EXCLUSIVE")?;
                     connections.push(connection);

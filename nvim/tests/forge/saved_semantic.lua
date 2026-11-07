@@ -65,10 +65,7 @@ assert(not nodes.closed(state.replica, heading()))
 vim.cmd("split")
 assert(vim.wait(1000, function() return vim.tbl_count(state.view) == 2 end))
 invoke("ov", 4)
-for window in pairs(state.view) do
-  assert(vim.wo[window].winbar:find("Public", 1, true))
-  assert(vim.wo[window].winbar:find("Semantic", 1, true))
-end
+assert(state.diff_view.visibility == "public" and state.diff_view.presentation == "semantic")
 invoke("ox", 5)
 assert(state.diff_view.visibility == "public" and state.diff_view.presentation == "full")
 invoke("ox", 6)

@@ -140,7 +140,7 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         .await
         .expect("Copilot terminal status timed out")
         .unwrap();
-    assert!(terminals.supported);
+    assert!(terminals.complete);
     assert!(terminals.terminal.is_empty());
     provider.shutdown().await.unwrap();
 }

@@ -10,7 +10,7 @@ vim.fn.writefile({ vim.json.encode({ checks = {
   ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "exit 7", label = "Verify", category = "test" } },
   ["optional"] = { trigger = { auto = false }, action = { command = "print optional", label = "Optional", category = "test" } },
   ["waiting"] = { trigger = { auto = false }, action = { command = "sleep 30sec", label = "Waiting", category = "test" } },
-  ["handoff"] = { trigger = { auto = false }, action = { command = "sleep 200ms; print complete", label = "Handoff", category = "test" } }
+  ["handoff"] = { trigger = { auto = false }, action = { command = "loop { if ('handoff.release' | path exists) { break }; sleep 10ms }; rm handoff.release; print complete", label = "Handoff", category = "test" } }
 } }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 -- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
@@ -119,6 +119,8 @@ local succeeded, failure = xpcall(function()
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })
     controller.queue_submit()
     assert(#state.queue == 1, "check completion queue lost its pending message")
+    -- The handoff check blocks until released, so the prompt is queued while it is still running.
+    vim.fn.writefile({ "release" }, workspace .. "/handoff.release")
     assert(vim.wait(15000, function()
       return not require("forge.views.harness.activity").busy(state) and not state.prompt_submission and #state.queue == 0
     end, 10), "normal check completion did not drain its queue: " .. tostring(state.execution_notice))

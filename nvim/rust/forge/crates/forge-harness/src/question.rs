@@ -2160,6 +2160,9 @@ mod tests {
     }
 
     /// Recover pending answers from canonical discussion without interpreting old wire envelopes.
+    ///
+    /// Saved input queues are disposable session state and are never migrated; only the question
+    /// store rebuilds a structured reply from its own history.
     #[test]
     fn legacy_outbox_preserves_question_state_and_rebuilds_structured_reply() -> Result<()> {
         let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
@@ -2195,81 +2198,6 @@ mod tests {
         let migrated = controller.outbox()?.remove(0);
         assert_eq!(migrated.reply, original.reply);
         assert_eq!(migrated.text, "Explain the alternatives");
-        let submissions = crate::provider::submission::SubmissionStore::open(
-            root.path(),
-            std::sync::Arc::new(crate::trace::TraceStore::open(root.path())?),
-        )?;
-        let queue = crate::input::SessionInputQueue::open(root.path(), "session", &submissions)?;
-        let operation: crate::input::InputOperation = serde_json::from_value(serde_json::json!({
-            "id":"question-admission", "control_revision":0, "after_control":null,
-            "action":{"kind":"submit", "message":{
-                "id":original.id, "revision":0, "text":original.text,
-                "purpose":{"kind":"question", "question_id":original.question_id,
-                    "task_id":null, "message_kind":original.kind, "reply":original.reply},
-                "attachments":[], "config":null, "intent":"queue", "delivery":"queued",
-                "route":null, "reservation":null, "submission_id":null, "error":null
-            }}
-        }))?;
-        assert!(queue.apply(operation)?.error.is_none());
-        drop(queue);
-        {
-            let connection =
-                rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
-            let snapshot: String = connection.query_row(
-                "SELECT payload FROM input_session WHERE session_id='session'",
-                [],
-                |row| row.get(0),
-            )?;
-            let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot)?;
-            snapshot["messages"][0]["purpose"]
-                .as_object_mut()
-                .unwrap()
-                .remove("reply");
-            snapshot["messages"][0]["text"] = serde_json::json!("private-native-envelope-canary");
-            connection.execute(
-                "UPDATE input_session SET payload=?1 WHERE session_id='session'",
-                [serde_json::to_string(&snapshot)?],
-            )?;
-            let (request, receipt): (String, String) = connection.query_row(
-                "SELECT request,payload FROM input_operation WHERE id='question-admission'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let mut request: serde_json::Value = serde_json::from_str(&request)?;
-            request["action"]["message"]["purpose"]
-                .as_object_mut()
-                .unwrap()
-                .remove("reply");
-            request["action"]["message"]["text"] =
-                serde_json::json!("private-native-envelope-canary");
-            let mut receipt: serde_json::Value = serde_json::from_str(&receipt)?;
-            receipt["upsert"][0]["purpose"]
-                .as_object_mut()
-                .unwrap()
-                .remove("reply");
-            receipt["upsert"][0]["text"] = serde_json::json!("private-native-envelope-canary");
-            connection.execute(
-                "UPDATE input_operation SET request=?1,payload=?2 WHERE id='question-admission'",
-                params![
-                    serde_json::to_string(&request)?,
-                    serde_json::to_string(&receipt)?
-                ],
-            )?;
-        }
-        // Admission has already removed the outbox in production; history must be sufficient.
-        controller.admitted(&original.id)?;
-        let queue = crate::input::SessionInputQueue::open(root.path(), "session", &submissions)?;
-        let snapshot = queue.snapshot()?;
-        assert_eq!(snapshot.messages[0].text, "Explain the alternatives");
-        let crate::input::InputPurpose::Question { reply, .. } = &snapshot.messages[0].purpose
-        else {
-            panic!("restored question purpose changed");
-        };
-        assert_eq!(reply, &original.reply);
-        let receipt = queue
-            .operation("question-admission")?
-            .expect("admission receipt remains available");
-        assert_eq!(receipt.upsert[0].text, "Explain the alternatives");
         controller.connection.lock().unwrap().execute(
             "UPDATE session_question_state SET format_version=99 WHERE session_id='session'",
             [],
@@ -2669,11 +2597,14 @@ mod tests {
                 .snapshot()?
                 .required_pending_in_exchange("exchange")
         );
-        assert!(controller.outbox()?.iter().any(|message| {
-            message
-                .text
-                .contains("Other required questions remain unanswered")
-        }));
+        // The structured reply carries the remaining-required flag; each adapter renders it.
+        assert!(controller.outbox()?.iter().any(|message| matches!(
+            &message.reply.response,
+            forge_provider_api::QuestionReplyResponse::Answer {
+                required_questions_remain: true,
+                ..
+            }
+        )));
         controller.apply(command(
             &ids[1],
             "withdraw",

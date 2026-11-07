@@ -12,6 +12,7 @@ use std::{fs, io::Read};
 use support::git;
 
 #[tokio::test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 async fn native_builtin_conversion_matches_git_object_identity() {
     let case = [
         ("", b"plain\n".as_slice()),

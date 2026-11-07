@@ -116,6 +116,47 @@ function M.viewport(session, window)
   end)
 end
 
+--- Sibling positions computed during the current render-markdown parse, keyed by node identity.
+local sibling_position = {}
+
+--- Makes render-markdown's list-item numbering linear in the list length.
+--- `Node:sibling_count` walks every preceding sibling for each item it numbers, so one parse of a
+--- long list costs O(n²) Tree-sitter steps on the editor thread, and a sibling chain that revisits
+--- a node never terminates. Both blocked the event loop while the transcript re-rendered. This
+--- override memoizes each walked position for the current parse and stops at a revisited node.
+local function install_linear_sibling_count()
+  local Node = require("render-markdown.lib.node")
+  if Node.forge_linear_sibling_count then return end
+  Node.forge_linear_sibling_count = true
+  ---@param target string
+  ---@param level? integer
+  ---@return integer
+  function Node:sibling_count(target, level)
+    local scope = target .. ":" .. tostring(level)
+    local walked, visited = {}, {}
+    local base = 0
+    local node = self.node ---@type TSNode?
+    while node and node:type() == target
+      and (level == nil or self:create(node):level(false) == level) do
+      local key = scope .. ":" .. node:id()
+      local known = sibling_position[key]
+      if known then
+        base = known
+        break
+      end
+      if visited[key] then break end
+      visited[key] = true
+      walked[#walked + 1] = key
+      node = node:prev_sibling()
+    end
+    for offset = #walked, 1, -1 do
+      base = base + 1
+      sibling_position[walked[offset]] = base
+    end
+    return base
+  end
+end
+
 --- Removes render-markdown extmarks that fall outside designated markdown ranges.
 ---@param buf integer Target buffer number.
 ---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
@@ -189,6 +230,8 @@ function M.render(buf, win, range_list)
     local function handler(base)
       return { parse = function(context)
         return perf.trace("harness", "ui.markdown.parse", { buf = context.buf }, function()
+          -- Node identities are only stable within one parse of the tree.
+          sibling_position = {}
           local marks = base.parse(context)
           local ranges = layout_ranges[context.buf]
           if not ranges then return marks end
@@ -237,6 +280,7 @@ function M.render(buf, win, range_list)
     end
     if not layout_handlers then
       install_final_replacement_anchor()
+      install_linear_sibling_count()
       local state = require("render-markdown.state")
       for _, language in ipairs({ "markdown", "latex" }) do
         state.custom_handlers[language] = handler(state.custom_handlers[language]

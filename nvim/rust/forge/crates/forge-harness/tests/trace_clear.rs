@@ -28,6 +28,8 @@ fn clearing_one_session_removes_rotations_without_affecting_other_sessions() {
     );
 
     trace.record("session-a", "after", json!({}));
+    // Recording only enqueues; the flush barrier makes the writer thread publish it.
+    trace.flush().unwrap();
     assert!(std::fs::read_to_string(&path).unwrap().contains("after"));
     trace.configure(false).unwrap();
     assert!(!trace.clear_session("session-a").unwrap().enabled);

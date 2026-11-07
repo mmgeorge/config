@@ -44,6 +44,9 @@ local function option(id)
     for _, field in ipairs(row.fields or {}) do if field.id == id then return field end end
   end
 end
+-- The settings picker renders only the rows its window fits; the default 24-line
+-- headless screen hides the Background section below Main and Ask.
+vim.o.lines = 60
 require("forge").open_harness()
 wait(function() return state.ready and state.session end, "Harness did not start")
 local before = { model = state.session.model, effort = state.session.effort, service_tier = state.session.service_tier }
@@ -73,7 +76,7 @@ end
 local generated
 generator.ensure(workspace, { ref = "HEAD", force = true }, function(result) generated = result end)
 wait(function() return generated ~= nil end, "Generation did not read saved settings")
-assert(generated.state == "ready" and generated.model == "mock-model · thinking medium", vim.inspect(generated))
+assert(generated.state == "ready" and generated.model == "mock-model · thinking medium · fast", vim.inspect(generated))
 client.generation_request = original_generation_request
 picker.close(false)
 client.host_stop()

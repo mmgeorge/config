@@ -1,4 +1,5 @@
 //! Result-oriented test observers over the production session submission contract.
+use crate::provider::ScopeOwner;
 
 use forge_harness as harness;
 
@@ -154,7 +155,7 @@ impl ProviderTestSession {
             Some(sink) => sink.invocation_scope()?.clone(),
             None => InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string()),
         };
-        if scope.owner != owner {
+        if scope.owner() != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
                     forge_provider_api::ProviderOperation::TurnStart,
@@ -325,7 +326,7 @@ impl ProviderTestSession {
             Some(sink) => sink.invocation_scope()?.clone(),
             None => InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string()),
         };
-        if scope.owner != owner {
+        if scope.owner() != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
                     forge_provider_api::ProviderOperation::TurnStart,

@@ -375,17 +375,19 @@ fn provider_exchange_lookup_requires_the_complete_turn_owner() -> Result<()> {
             .is_none()
     );
     unrelated = address.clone();
-    unrelated.scope.owner = crate::provider::ThreadOwner::root("foreign-session");
+    unrelated.scope.thread_id =
+        forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root("foreign-session"));
     assert!(
         store
             .load_provider_exchange("session", &unrelated)?
             .is_none()
     );
     unrelated = address.clone();
-    unrelated.scope.owner = crate::provider::ThreadOwner::new(
-        "session".into(),
-        forge_provider_api::AgentId::new("child")?,
-    )?;
+    unrelated.scope.thread_id =
+        forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::new(
+            "session".into(),
+            forge_provider_api::AgentId::new("child")?,
+        )?);
     assert!(
         store
             .load_provider_exchange("session", &unrelated)?

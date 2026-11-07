@@ -1074,6 +1074,7 @@ end
 ---@field id string
 ---@field ordinal integer
 ---@field prompt string
+---@field origin? table
 ---@field state "complete"|"failed"|"cancelled"
 ---@field checkpoint_before string
 
@@ -1142,9 +1143,18 @@ local function confirm_restore_preview(preview, interaction)
         end
         return
       end
-      if interaction then restore_composer_prompt(interaction.prompt or "") end
+      if interaction then M.restore_rolled_back_prompt(interaction) end
     end)
   end)
+end
+
+---Return a rolled-back exchange's input to the composer when the user wrote it. A task start or
+---continuation carries Harness-authored instructions, which the user never typed and the next
+---task transition regenerates, so the composer stays untouched for those exchanges.
+---@param interaction ForgeRollbackInteraction
+function M.restore_rolled_back_prompt(interaction)
+  if require("forge.render.harness.interaction_tree").host_authored_notice(interaction) then return end
+  restore_composer_prompt(interaction.prompt or "")
 end
 
 ---@param interaction ForgeRollbackInteraction
@@ -1183,7 +1193,7 @@ local function confirm_rollback(interaction, latest_exchange_id)
         or client.host_get_generation() ~= generation or state.restore_applying ~= operation then return end
       state.restore_applying = nil
       if not applied then return end
-      restore_composer_prompt(interaction.prompt or "")
+      M.restore_rolled_back_prompt(interaction)
     end)
   end)
 end
@@ -1211,7 +1221,8 @@ local function open_exchange_undo_picker(recovery)
       if rollback_state[interaction.state]
         and interaction.disposition == "current"
       then
-        local prompt = vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
+        local host_notice = require("forge.render.harness.interaction_tree").host_authored_notice(interaction)
+        local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
         option_list[#option_list + 1] = {
           id = interaction.id,
           label = "Exchange " .. tostring(interaction.ordinal),
@@ -1436,13 +1447,24 @@ local function finish_queue_edit(state, text, unqueue)
   if state.presentation then state.presentation.follow_tail() end
 end
 
+---Explain why no session is attached: a recorded startup failure, or startup still running.
+---@param state table
+---@param title string
+function M.report_uninitialized(state, title)
+  if state.start_failure then
+    notifications.error("Harness failed to start: " .. state.start_failure .. ". Reopen Harness to retry.", title)
+  else
+    notifications.warn("Harness is still initializing", title)
+  end
+end
+
 ---Keep unowned startup drafts out of session history and the input pipeline.
 ---@param state ForgeHarnessPresentationState
 ---@return boolean
 local function admit_composer_input(state)
   if state.host_error then notifications.error(state.execution_notice, "ForgeHarness") return false end
   if not state.session or type(state.session.id) ~= "string" or state.session.id == "" then
-    notifications.warn("Harness is still initializing", "ForgeHarness")
+    M.report_uninitialized(state, "ForgeHarness")
     return false
   end
   if state.switching_provider then return false end
@@ -1481,6 +1503,11 @@ function M.submit()
       if kind == "execute" then task_control.plans(state, picker_host(state), true, M.task_transition)
       else restore_composer_prompt("/" .. kind .. " ") end
     end)
+    return
+  end
+  if text == "/goal" then
+    restore_composer_prompt("/goal ")
+    notifications.warn("Describe the goal after /goal", "ForgeHarness")
     return
   end
   if text == "/plan accept on" or text == "/plan accept off" then
@@ -2116,8 +2143,10 @@ end
 function M.resolve_runtime_model()
   local state = harness_state()
   local provider = state.session and state.session.provider
+  -- This warms the model cache on attach. Providers such as Claude Code list models only from
+  -- an open binding, so an unavailable catalog here is expected; pickers fetch again on demand
+  -- and report their own failures.
   require("forge.views.harness.provider_catalog").models(true, function(model_list, request_error)
-    if request_error then notifications.error("Failed to resolve Harness model: " .. request_error, "ForgeHarness") end
     if request_error then return end
     state.model_provider = provider
     state.model_list = vim.deepcopy(model_list or {})
@@ -2137,7 +2166,7 @@ function M.task_transition(action, submitted_text, completed, method)
     if #selected > 0 then action.attachments = selected end
   end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
-  if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
+  if not state.session then M.report_uninitialized(state, "Harness task") return end
   task_control.transition(state, action, M.render, function(failure)
     if completed then completed(not failure) end
     if harness_state() == state then M.render() end
@@ -2162,7 +2191,8 @@ configure_now = function(next_config, completed)
       if completed then completed(false) end
       return
     end
-    if failure then report_configuration_error(failure) end
+    -- The winbar rejection describes the latest settings attempt, so an accepted change retires it.
+    if failure then report_configuration_error(failure) else state.configuration_error = nil end
     if completed then completed(not failure) end
     if harness_state() == state then M.render() end
   end)

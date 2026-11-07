@@ -6,9 +6,17 @@ use std::sync::Arc;
 
 /// Build a real persisted execution gate without an external model or platform-specific command.
 async fn workflow_gate_fixture() -> Result<(tempfile::TempDir, tempfile::TempDir, HarnessBroker)> {
+    workflow_gate_fixture_with_commands(vec!["exit 0".into()]).await
+}
+
+/// Build the gate with an explicit check command list. An empty list records a run without
+/// spawning a shell, for tests that exercise gate state rather than command execution.
+async fn workflow_gate_fixture_with_commands(
+    commands: Vec<String>,
+) -> Result<(tempfile::TempDir, tempfile::TempDir, HarnessBroker)> {
     let workspace = repository();
     let data = tempfile::tempdir()?;
-    let broker = check_fixture(workspace.path(), data.path(), vec!["exit 0".into()], true).await;
+    let broker = check_fixture(workspace.path(), data.path(), commands, true).await;
     Ok((workspace, data, broker))
 }
 
@@ -174,81 +182,14 @@ async fn workflow_check_preparation_errors_enter_resolution() -> Result<()> {
     Ok(())
 }
 
-/// Replace stale Verify provider work with one durable local gate before another model admission.
-#[tokio::test]
-async fn workflow_verification_revalidates_before_provider_admission() -> Result<()> {
-    let (workspace, _data, mut broker) = workflow_gate_fixture().await?;
-    broker.run_checks().await?;
-    let task = broker.task_controller.current()?.unwrap();
-    let source = crate::task::TaskTurnId {
-        exchange_ordinal: 1,
-        turn_ordinal: 0,
-    };
-    broker.task_controller.reserve_continuation(
-        &mut broker.store,
-        &task.permit(),
-        source,
-        "Verify accepted manual behavior".into(),
-        "Manual action remains".into(),
-        3,
-    )?;
-    let original = broker.task_controller.current()?.unwrap();
-    broker.refresh_verification_gate().await?;
-    assert_eq!(
-        broker.task_controller.current()?.unwrap().revision,
-        original.revision
-    );
-    std::fs::write(workspace.path().join("helper.rs"), "fn helper() {}\n")?;
-    broker.refresh_verification_gate().await?;
-    let changed = broker.task_controller.current()?.unwrap();
-    assert_eq!(changed.id, original.id);
-    assert_eq!(changed.phase(), crate::task::TaskPhase::Check);
-    let work = changed
-        .turn
-        .as_ref()
-        .unwrap()
-        .continuation
-        .as_ref()
-        .unwrap();
-    assert!(work.work.is_checks());
-    assert_eq!(work.delivery, crate::task::TaskInputDelivery::Pending);
-    assert!(original.permit().validate(Some(&changed)).is_err());
-    let work_id = work.id.clone();
-    broker.refresh_verification_gate().await?;
-    assert_eq!(
-        broker
-            .task_controller
-            .current()?
-            .unwrap()
-            .turn
-            .as_ref()
-            .unwrap()
-            .continuation
-            .as_ref()
-            .unwrap()
-            .id,
-        work_id
-    );
-    broker.run_task_checks().await?;
-    assert_eq!(
-        broker.task_controller.current()?.unwrap().phase(),
-        crate::task::TaskPhase::Verify
-    );
-    assert_eq!(broker.active_goal()?.continuation.turn_count, 0);
-    Ok(())
-}
-
-/// Exercise every execution edge against real committed state and reject the complement atomically.
-#[tokio::test]
-async fn workflow_execution_transition_matrix_preserves_the_gate_graph() -> Result<()> {
+/// Exercise every execution edge out of one original phase against real committed state and
+/// reject the complement atomically. Each original phase runs as its own test because every
+/// one builds a fresh Git-backed gate fixture.
+async fn assert_transitions_from(original: crate::plan::PlanPhase) -> Result<()> {
     use crate::plan::PlanPhase;
-    for original in [
-        PlanPhase::Implement,
-        PlanPhase::Checking,
-        PlanPhase::Resolve,
-        PlanPhase::Verify,
-    ] {
-        let (_workspace, _data, mut broker) = workflow_gate_fixture().await?;
+    {
+        let (_workspace, _data, mut broker) =
+            workflow_gate_fixture_with_commands(Vec::new()).await?;
         broker.run_checks().await?;
         let checked = broker.current_execution()?.unwrap();
         for target in [
@@ -308,6 +249,26 @@ async fn workflow_execution_transition_matrix_preserves_the_gate_graph() -> Resu
         }
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn workflow_execution_transitions_from_implement_preserve_the_gate_graph() -> Result<()> {
+    assert_transitions_from(crate::plan::PlanPhase::Implement).await
+}
+
+#[tokio::test]
+async fn workflow_execution_transitions_from_checking_preserve_the_gate_graph() -> Result<()> {
+    assert_transitions_from(crate::plan::PlanPhase::Checking).await
+}
+
+#[tokio::test]
+async fn workflow_execution_transitions_from_resolve_preserve_the_gate_graph() -> Result<()> {
+    assert_transitions_from(crate::plan::PlanPhase::Resolve).await
+}
+
+#[tokio::test]
+async fn workflow_execution_transitions_from_verify_preserve_the_gate_graph() -> Result<()> {
+    assert_transitions_from(crate::plan::PlanPhase::Verify).await
 }
 
 /// Reject persisted gate payloads that omit the facts required by their phase variants.
@@ -373,10 +334,11 @@ async fn workflow_goal_progress_uses_workspace_content_without_a_check_phase() -
 }
 
 /// Route unchanged repairs directly to Verify and require fresh checks after a source repair.
-#[tokio::test]
-async fn workflow_resolution_reuses_only_current_passing_checks() -> Result<()> {
-    for changed in [false, true] {
-        let (workspace, _data, mut broker) = workflow_gate_fixture().await?;
+/// Each workspace variant runs as its own test because each builds a fresh Git-backed fixture.
+async fn assert_resolution_routing(changed: bool) -> Result<()> {
+    {
+        let (workspace, _data, mut broker) =
+            workflow_gate_fixture_with_commands(Vec::new()).await?;
         broker.run_checks().await?;
         let mut record = broker.current_execution()?.unwrap();
         assert_eq!(record.phase, crate::plan::PlanPhase::Verify);
@@ -445,6 +407,16 @@ async fn workflow_resolution_reuses_only_current_passing_checks() -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn workflow_resolution_reuses_checks_when_the_workspace_is_unchanged() -> Result<()> {
+    assert_resolution_routing(false).await
+}
+
+#[tokio::test]
+async fn workflow_resolution_reruns_checks_after_a_source_repair() -> Result<()> {
+    assert_resolution_routing(true).await
 }
 
 /// A control captured before a later exchange update must not commit stale evidence.

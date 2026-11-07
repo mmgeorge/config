@@ -3,6 +3,8 @@ local commands = require("forge.document_commands")
 local buffer = require("forge.buffer")
 local config = require("forge.infra.config")
 vim.o.columns = 160
+-- Headless Neovim resizes the window layout only on the next layout change.
+vim.cmd("wincmd =")
 config.setup({ keymaps = { status = { stage = "gs", ignore = false, open = { "go", "gO" } } } })
 local source = vim.api.nvim_get_current_buf()
 local window = vim.api.nvim_get_current_win()
@@ -49,6 +51,7 @@ review.close()
 assert(vim.wo[window].winbar == "original header")
 vim.api.nvim_set_current_win(window)
 vim.o.columns = 100
+vim.cmd("wincmd =")
 local pr_handler = {}
 for _, id in ipairs({ "browse", "review", "comment", "delete", "open", "reply", "sync", "close" }) do
   pr_handler[id] = function() end
@@ -57,10 +60,9 @@ local pr = commands.attach(replica, {
   view = "pr", title = "PR #7", narrow_title = "< #7", keymaps = { open = "o" }, handler = pr_handler,
 })
 local pr_hint = text(window)
-assert(pr_hint:sub(1, #"< #7<Tab> toggle") == "< #7<Tab> toggle", "narrow PR header spacing changed: " .. pr_hint)
-assert(pr_hint:find("R reply", 1, true), "narrow PR header omitted reply: " .. pr_hint)
-assert(pr_hint:find("o open | R reply", 1, true), "narrow PR header changed open/reply order: " .. pr_hint)
-assert(pr_hint:find("close", 1, true) and pr_hint:find("help", 1, true), "narrow PR header lost essential shortcuts: " .. pr_hint)
+assert(pr_hint:sub(1, #"< #7 <Tab> toggle") == "< #7 <Tab> toggle", "narrow PR header spacing changed: " .. pr_hint)
+assert(pr_hint:find("o open | q close | ? help", 1, true), "narrow PR header lost essential shortcuts: " .. pr_hint)
+assert(vim.fn.strdisplaywidth(pr_hint) <= 100, "narrow PR header overflowed its window: " .. pr_hint)
 pr.close()
 assert(vim.wo[window].winbar == "original header")
 buffer.close(replica)

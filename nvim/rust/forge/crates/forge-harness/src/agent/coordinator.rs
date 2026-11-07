@@ -659,7 +659,7 @@ impl AgentCoordinator {
     }
 
     pub fn owns(&self, owner: &ThreadOwner) -> bool {
-        *owner.session_id() == forge_provider_api::SessionId::from(self.session_id.as_str())
+        *owner.session_id() == crate::provider::SessionId::from(self.session_id.as_str())
     }
 
     pub fn activity(&self) -> watch::Receiver<u64> {
@@ -1159,6 +1159,62 @@ impl AgentCoordinator {
         self.activity
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
+    }
+
+    /// Restore every stored child task before validating continuation policies.
+    ///
+    /// A policy names the child's latest stopped task, which storage may list after the child's
+    /// earlier tasks, so validation waits until the whole set is present. A policy whose task is
+    /// missing or never collected is disposable evidence from an interrupted host; it is reset to
+    /// `Ready` and returned so the caller persists the repair instead of failing startup.
+    pub fn restore(
+        &self,
+        agents: impl IntoIterator<Item = Agent>,
+        tasks: impl IntoIterator<Item = AgentTask>,
+    ) -> Result<Vec<Agent>> {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let mut owners = HashMap::new();
+        for agent in agents {
+            ensure!(
+                agent.session_id == self.session_id,
+                "child state crosses root ownership"
+            );
+            owners.insert(agent.id.clone(), agent);
+        }
+        for task in tasks {
+            ensure!(
+                task.session_id == self.session_id && owners.contains_key(&task.agent_id),
+                "stored task has no owning child"
+            );
+            state.task_by_id.insert(task.id.clone(), task);
+        }
+        let mut repaired = Vec::new();
+        for agent in owners.values_mut() {
+            if let AgentContinuationPolicy::RequiresAuthorization { task_id } = &agent.continuation
+                && !state
+                    .task_by_id
+                    .get(task_id.as_str())
+                    .is_some_and(|stopped| {
+                        stopped.agent_id == agent.id && stopped.completed_at_ms.is_some()
+                    })
+            {
+                agent.continuation = AgentContinuationPolicy::Ready;
+                repaired.push(agent.clone());
+            }
+        }
+        let owned: std::collections::HashSet<_> = state
+            .task_by_id
+            .values()
+            .map(|task| task.agent_id.clone())
+            .collect();
+        for (id, agent) in owners {
+            if owned.contains(&id) {
+                state.agent_by_id.insert(id, agent);
+            }
+        }
+        self.activity
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(repaired)
     }
 
     /// Identifies a retained process cleanup obligation after its task has ended.

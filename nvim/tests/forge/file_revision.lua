@@ -285,9 +285,11 @@ local function run()
         metadata = { target = {}, decoration = {}, editable_region = {}, visible_decoration = {} } } } } })
   end)
 
-  forge.open()
-  local status_buf = vim.api.nvim_get_current_buf()
-  wait_for(function() return buffer_contains(status_buf, "Unstaged changes (2)") end, "status did not render")
+  local status_state = forge.open()
+  wait_for(function()
+    return status_state.replica and buffer_contains(status_state.replica.buffer, "Unstaged changes (2)")
+  end, "status did not render")
+  local status_buf = status_state.replica.buffer
   -- ── open on an unstaged deleted line lands in the index revision ───────────
   trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "a.txt +1 -1"))
   wait_for(function() return buffer_contains(status_buf, "old a.txt") end, "a.txt hunk did not expand")

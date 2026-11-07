@@ -42,8 +42,8 @@ for _, grammar in ipairs(grammar_manifest.grammar or {}) do
     grammar_bytes = grammar_bytes + #(file_text(path))
   end
 end
-assert_true(vim.tbl_count(grammar_name) == 3, "expected WGSL, CUE, and LaTeX as the only local grammars")
-for _, name in ipairs({ "wgsl", "cue", "latex" }) do
+assert_true(vim.tbl_count(grammar_name) == 4, "expected WGSL, CUE, LaTeX, and algorithm as the only local grammars")
+for _, name in ipairs({ "wgsl", "cue", "latex", "algorithm" }) do
   assert_true(grammar_name[name], "missing local grammar exception: " .. name)
 end
 

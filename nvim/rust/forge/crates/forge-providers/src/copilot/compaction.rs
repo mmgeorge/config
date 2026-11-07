@@ -134,7 +134,7 @@ impl CompactionMonitor {
                     let mut state = subscription_state.state.lock().await;
                     let update = super::decode::decode_compaction(
                         &event,
-                        sink.scope().owner().thread_id().as_str(),
+                        sink.scope().thread_id().clone().as_str(),
                         state.get(event_thread),
                     );
                     let mut update = match update {
@@ -142,7 +142,7 @@ impl CompactionMonitor {
                         Err(_error) => {
                             drop(state);
                             let warning = AdapterActivity::Warning(forge_provider_api::ProviderWarning {
-                                scope: forge_provider_api::WarningScope::Thread { thread_id: sink.scope().owner().thread_id() },
+                                scope: forge_provider_api::WarningScope::Thread { thread_id: sink.scope().thread_id().clone() },
                                 kind: forge_provider_api::ProviderWarningKind::IncompleteCompactionMetadata,
                                 message: SanitizedMessage::new("Provider compaction event could not be normalized").expect("static warning is nonempty"),
                             });
@@ -160,7 +160,7 @@ impl CompactionMonitor {
                     if let Err(error) = sink
                         .activity_writer()
                         .send_wait(AdapterActivity::Thread {
-                            thread_id: sink.scope().owner().thread_id(),
+                            thread_id: sink.scope().thread_id().clone(),
                             event: forge_provider_api::ThreadEvent::CompactionUpdated(Box::new(
                                 update,
                             )),
@@ -308,7 +308,7 @@ mod tests {
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("compaction-failure").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: forge_provider_api::ThreadOwner::root("compaction-failure"),
+                thread_id: forge_provider_api::testing::root_thread("compaction-failure"),
             },
         );
         let mut monitor = CompactionMonitor::from_stream(
@@ -328,11 +328,11 @@ mod tests {
     #[tokio::test]
     async fn background_compaction_publishes_one_normalized_thread_identity() -> anyhow::Result<()>
     {
-        let owner = forge_provider_api::ThreadOwner::root("compaction-owner");
+        let owner = forge_provider_api::testing::root_thread("compaction-owner");
         let (sink, mut events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("compaction-native").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let (send, receive) = tokio::sync::mpsc::channel(1);
@@ -358,7 +358,7 @@ mod tests {
                 thread_id,
                 event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
             } => {
-                assert_eq!(thread_id, owner.thread_id());
+                assert_eq!(thread_id, owner.clone());
                 assert_eq!(compaction.thread_id, thread_id.as_str());
                 assert_eq!(compaction.result.model.as_deref(), Some("summary-model"));
             }
@@ -374,7 +374,7 @@ mod tests {
         let (sink, _stream) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("compaction-observer").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: forge_provider_api::ThreadOwner::root("session"),
+                thread_id: forge_provider_api::testing::root_thread("session"),
             },
         );
         let subscription = CompactionSubscription::new(sink);

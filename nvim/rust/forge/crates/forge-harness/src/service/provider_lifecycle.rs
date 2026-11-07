@@ -273,7 +273,7 @@ impl SessionController {
                 );
                 // Retain the diagnostic before a nonblocking offer; observer collection never waits on stale UI capacity.
                 controller.publications.publish(SessionEvent { session_id, event: "provider_event".into(),
-                        payload: json!({"kind":"error", "text":format!("Session observation failed: {error:#}")}) }, messages.as_ref())
+                        payload: json!({"kind":"error", "text":format!("Session observation failed: {}", crate::storage::error_message(error))}) }, messages.as_ref())
                         .context("retain provider observation failure")?;
             }
             result

@@ -411,7 +411,7 @@ async fn publish_session_error(
     }
     writer
         .send_wait(super::error::session_error(
-            writer.scope().owner().thread_id(),
+            writer.scope().thread_id().clone(),
             &event.data,
         ))
         .await?;
@@ -430,7 +430,7 @@ fn native_failure(
 mod tests {
     use super::*;
     use forge_provider_api::{
-        BindingId, InvocationScope, ItemCompletion, ItemEvent, ProviderEvent, ThreadOwner,
+        BindingId, InvocationScope, ItemCompletion, ItemEvent, ProviderEvent,
     };
     use github_copilot_sdk::Client;
     use serde_json::json;
@@ -450,7 +450,8 @@ mod tests {
         Arc<Mutex<TurnContext>>,
         forge_provider_api::ProviderEventStream,
     ) {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), label);
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), label);
         let (sink, stream) =
             forge_provider_api::events::channel(BindingId::new("intake").unwrap(), scope.clone());
         let sink = sink.activity_writer();
@@ -502,12 +503,12 @@ mod tests {
     async fn unbound_session_error_publishes_without_starting_a_turn() -> anyhow::Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (intake, sender) = fixture().await;
-            let owner = ThreadOwner::root("idle-error");
-            let (sink, mut events) = forge_provider_api::events::channel(BindingId::new("idle-error")?, forge_provider_api::EventScope::Binding { owner: owner.clone() });
+            let owner = forge_provider_api::testing::root_thread("idle-error");
+            let (sink, mut events) = forge_provider_api::events::channel(BindingId::new("idle-error")?, forge_provider_api::EventScope::Binding { thread_id: owner.clone() });
             sender.send(event("idle-error", "session.error", json!({"errorType":"query","statusCode":503,"message":"private-native-failure"}))).await?;
             intake.bind(sink.activity_writer()).await?;
             let observed = events.recv().await?.unwrap().event;
-            assert!(matches!(&observed, ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::Error { .. } } if thread_id == &owner.thread_id()));
+            assert!(matches!(&observed, ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::Error { .. } } if thread_id == &owner.clone()));
             assert!(!serde_json::to_string(&observed)?.contains("private-native-failure"));
             assert!(events.try_next()?.is_none());
             assert!(intake.failure.borrow().is_none());

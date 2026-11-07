@@ -1,7 +1,7 @@
 //! Host policy notifications kept outside native provider observations.
 use super::approval_view::ApprovalCommand;
+use crate::permissions::directory::DirectoryGrant;
 use crate::session::InputDeadline;
-use forge_provider_api::access::DirectoryGrant;
 use forge_provider_api::permissions::PermissionTarget;
 use forge_provider_api::{
     ItemId, OperationId, ProviderFailure, SanitizedMessage, ThreadId, TurnId,
@@ -35,7 +35,7 @@ pub enum HostEvent {
         thread_id: ThreadId,
         turn_id: TurnId,
         item_id: ItemId,
-        read: Vec<forge_provider_api::skill::SkillRead>,
+        read: Vec<crate::skill::SkillRead>,
     },
     /// Publish the manifest negotiated by a successful binding open or configuration.
     ///
@@ -427,7 +427,7 @@ pub enum PermissionApprovalEvent {
 /// Replace optional retry state with explicit transitions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum RetryEvent {
-    Scheduled(forge_provider_api::retry::ProviderRetry),
+    Scheduled(crate::provider::retry::ProviderRetry),
     Cleared,
 }
 /// Track the parent wait independently of child turn outcomes.

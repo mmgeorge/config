@@ -2,7 +2,7 @@ use super::{AcpHandler, AcpKind, session::AcpSessionState};
 use async_trait::async_trait;
 use forge_provider_api::events;
 use forge_provider_api::permissions::{PermissionRequest, PermissionResponse, ProviderPermissions};
-use forge_provider_api::{InvocationScope, ProviderError, ThreadOwner};
+use forge_provider_api::{InvocationScope, ProviderError};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +36,10 @@ async fn activate(
 ) {
     let state = Arc::new(AcpSessionState::new_native(kind));
     let permission = Arc::new(FixturePermissions::default());
-    let scope = InvocationScope::new(ThreadOwner::root("fixture"), "exchange");
+    let scope = InvocationScope::new(
+        forge_provider_api::testing::root_thread("fixture"),
+        "exchange",
+    );
     let binding = forge_provider_api::BindingId::new("fixture-binding").unwrap();
     let (sink, stream) = events::channel(binding, scope.clone());
     state
@@ -137,9 +140,9 @@ async fn native_permission_callback_receives_a_normalized_target_and_once_choice
 #[tokio::test]
 async fn native_compaction_updates_keep_summary_and_operation_scope() {
     let state = Arc::new(AcpSessionState::new_native(AcpKind::Claude));
-    let owner = ThreadOwner::root("fixture");
+    let owner = forge_provider_api::testing::root_thread("fixture");
     let scope = forge_provider_api::EventScope::SessionOperation {
-        owner,
+        thread_id: owner,
         operation_id: forge_provider_api::OperationId::new("compact-fixture").unwrap(),
     };
     let binding = forge_provider_api::BindingId::new("fixture-binding").unwrap();
@@ -160,7 +163,7 @@ async fn native_compaction_updates_keep_summary_and_operation_scope() {
     }
     state.finish_compaction().await;
     let events = drain(&mut stream);
-    assert!(events.iter().all(|event| matches!(event, forge_provider_api::ProviderEvent::Thread { thread_id, .. } if thread_id == &scope.owner().thread_id())));
+    assert!(events.iter().all(|event| matches!(event, forge_provider_api::ProviderEvent::Thread { thread_id, .. } if thread_id == &scope.thread_id().clone())));
     assert!(events.iter().any(|event| matches!(event,
         forge_provider_api::ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::CompactionUpdated(update) }
             if update.thread_id == thread_id.as_str() && update.result.summary_content.as_deref() == Some("kept summary") && update.manual)));
@@ -427,6 +430,66 @@ async fn pending_tool_refines_descriptor_without_starting_execution_or_duplicati
     );
 }
 
+/// A tool that completes without reporting `in_progress` still executed, so it gets a start.
+///
+/// Claude reports its own tools (ToolSearch) as `pending` and then `completed`. Without a start,
+/// Harness has no execution time and renders the duration column as an unknown placeholder.
+#[tokio::test]
+async fn tool_completed_from_pending_reports_its_execution_start() {
+    use forge_provider_api::*;
+    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    for (tool, terminal) in [
+        ("searched", "completed"),
+        ("refused", "failed"),
+        ("blocked", "cancelled"),
+    ] {
+        for update in [
+            json!({"sessionUpdate":"tool_call", "toolCallId":tool, "title":"ToolSearch", "kind":"other", "status":"pending"}),
+            json!({"sessionUpdate":"tool_call_update", "toolCallId":tool, "status":terminal}),
+        ] {
+            state
+                .notification(
+                    "session/update",
+                    json!({"sessionId":"root", "update":update}),
+                )
+                .await
+                .unwrap();
+        }
+        let events = drain(&mut stream);
+        let started = events.iter().position(|event| {
+            matches!(
+                event,
+                ProviderEvent::Item {
+                    event: ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted
+                    },
+                    ..
+                }
+            )
+        });
+        let completed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProviderEvent::Item {
+                        event: ItemEvent::Completed(_),
+                        ..
+                    }
+                )
+            })
+            .expect("terminal tool status must complete its item");
+        if terminal == "cancelled" {
+            assert!(started.is_none(), "a cancelled pending tool never executed");
+        } else {
+            assert!(
+                started.is_some_and(|started| started < completed),
+                "{terminal} tool must start before it completes"
+            );
+        }
+    }
+}
+
 /// ACP thoughts remain reasoning items while repeated chunks retain their original item identity.
 #[tokio::test]
 async fn reasoning_and_prose_chunks_keep_distinct_items_and_interrupted_content() {
@@ -502,11 +565,11 @@ async fn reasoning_and_prose_chunks_keep_distinct_items_and_interrupted_content(
 async fn child_items_keep_original_turn_after_root_completion_and_successor() {
     use forge_provider_api::*;
     let state = AcpSessionState::new_native(AcpKind::Claude);
-    let owner = ThreadOwner::root("child-fixture");
+    let owner = forge_provider_api::testing::root_thread("child-fixture");
     let (sink, mut stream) = events::channel(
         BindingId::new("children").unwrap(),
         EventScope::Binding {
-            owner: owner.clone(),
+            thread_id: owner.clone(),
         },
     );
     let first = InvocationScope::new(owner.clone(), "first");
@@ -623,11 +686,11 @@ async fn child_items_keep_original_turn_after_root_completion_and_successor() {
 async fn idle_thread_metadata_does_not_invent_a_turn_or_ignore_malformed_compaction() {
     use forge_provider_api::*;
     let state = AcpSessionState::new_native(AcpKind::Claude);
-    let owner = ThreadOwner::root("idle-fixture");
+    let owner = forge_provider_api::testing::root_thread("idle-fixture");
     let (sink, mut stream) = events::channel(
         BindingId::new("idle").unwrap(),
         EventScope::Binding {
-            owner: owner.clone(),
+            thread_id: owner.clone(),
         },
     );
     let manifest = capability::CapabilityManifest::from_descriptor(
@@ -653,7 +716,7 @@ async fn idle_thread_metadata_does_not_invent_a_turn_or_ignore_malformed_compact
         .await
         .unwrap();
     let events = drain(&mut stream);
-    assert!(events.iter().any(|event| matches!(event, ProviderEvent::Thread { thread_id, event: ThreadEvent::ContextUsage(_) } if thread_id == &owner.thread_id())));
+    assert!(events.iter().any(|event| matches!(event, ProviderEvent::Thread { thread_id, event: ThreadEvent::ContextUsage(_) } if thread_id == &owner.clone())));
     assert!(events.iter().any(|event| matches!(
         event,
         ProviderEvent::Provider {
@@ -675,11 +738,11 @@ async fn idle_thread_metadata_does_not_invent_a_turn_or_ignore_malformed_compact
 async fn unmapped_session_updates_warn_once_unless_documented_metadata() {
     use forge_provider_api::*;
     let state = AcpSessionState::new_native(AcpKind::Claude);
-    let owner = ThreadOwner::root("unmapped-fixture");
+    let owner = forge_provider_api::testing::root_thread("unmapped-fixture");
     let (sink, mut stream) = events::channel(
         BindingId::new("unmapped").unwrap(),
         EventScope::Binding {
-            owner: owner.clone(),
+            thread_id: owner.clone(),
         },
     );
     let manifest = capability::CapabilityManifest::from_descriptor(
@@ -716,10 +779,71 @@ async fn unmapped_session_updates_warn_once_unless_documented_metadata() {
     assert_eq!(
         warnings,
         [(
-            owner.thread_id(),
+            owner.clone(),
             "ACP agent reported session update `future_update`, which Forge does not apply"
                 .to_owned()
         )]
+    );
+}
+
+/// Agent notices (such as an MCP server that failed to start) are warnings, never answer text,
+/// and a repeated notice is surfaced once.
+#[tokio::test]
+async fn agent_notices_become_warnings_instead_of_answer_text() {
+    use forge_provider_api::*;
+    let state = AcpSessionState::new_native(AcpKind::Claude);
+    let owner = forge_provider_api::testing::root_thread("notice-fixture");
+    let (sink, mut stream) = events::channel(
+        BindingId::new("notice").unwrap(),
+        EventScope::Binding {
+            thread_id: owner.clone(),
+        },
+    );
+    let manifest = capability::CapabilityManifest::from_descriptor(
+        crate::registry::descriptor(&AcpKind::Claude.id()).unwrap(),
+    );
+    state.install_capabilities("root", sink, manifest).await;
+    // Claude repeats an unchanged startup notice with every turn; it surfaces once per binding.
+    for _ in 0..2 {
+        state
+            .notification(
+                "session/update",
+                json!({"sessionId":"root", "update":{
+                    "sessionUpdate":"notice", "severity":"warning",
+                    "title":"MCP server \"terminal-mcp\" failed to start",
+                    "description":"Its tools are unavailable in this session. Run /mcp for the error."
+                }}),
+            )
+            .await
+            .unwrap();
+    }
+    let events = drain(&mut stream);
+    let notices = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Provider {
+                event:
+                    ProviderConnectionEvent::Warning(ProviderWarning {
+                        kind: ProviderWarningKind::NativeNotice { .. },
+                        scope: WarningScope::Thread { thread_id },
+                        message,
+                    }),
+            } => Some((thread_id.clone(), message.as_str().to_owned())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notices,
+        [(
+            owner,
+            "MCP server \"terminal-mcp\" failed to start: Its tools are unavailable in this session. Run /mcp for the error."
+                .to_owned()
+        )]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Turn { .. }))
     );
 }
 
@@ -765,11 +889,11 @@ async fn child_permission_authority_survives_parent_collection_with_original_sco
     use forge_provider_api::*;
     let state = Arc::new(AcpSessionState::new_native(AcpKind::Claude));
     let permissions = Arc::new(ChildFixturePermissions::default());
-    let owner = ThreadOwner::root("permission-fixture");
+    let owner = forge_provider_api::testing::root_thread("permission-fixture");
     let scope = InvocationScope::new(owner.clone(), "parent");
     let (sink, mut stream) = events::channel(
         BindingId::new("permission-child").unwrap(),
-        EventScope::Binding { owner },
+        EventScope::Binding { thread_id: owner },
     );
     state
         .begin_native(
@@ -820,7 +944,7 @@ async fn child_permission_authority_survives_parent_collection_with_original_sco
         .iter()
         .position(|event| {
             matches!(event, ProviderEvent::Turn {
-        thread_id, event: TurnEvent::Started(_), .. } if thread_id != &scope.owner.thread_id())
+        thread_id, event: TurnEvent::Started(_), .. } if thread_id != &scope.thread_id.clone())
         })
         .unwrap();
     assert!(relation < native_start);
@@ -842,7 +966,7 @@ async fn child_permission_authority_survives_parent_collection_with_original_sco
     assert_eq!(response["outcome"]["optionId"], "allow");
     let retained = permissions.observed.lock().unwrap().clone().unwrap();
     assert_eq!(retained.0, scope);
-    assert_ne!(retained.1.thread_id, scope.owner.thread_id());
+    assert_ne!(retained.1.thread_id, scope.thread_id.clone());
     state.notification("session/update", json!({"sessionId":"root", "update":{
         "sessionUpdate":"subagent_state_update", "subagentSessionId":"child", "state":"completed"
     }})).await.unwrap();
@@ -1062,7 +1186,10 @@ async fn child_context_and_plan_preserve_thread_scope_and_processing_boundary() 
             _ => None,
         })
         .unwrap();
-    assert_ne!(child_thread, ThreadOwner::root("fixture").thread_id());
+    assert_ne!(
+        child_thread,
+        forge_provider_api::testing::root_thread("fixture").clone()
+    );
     assert!(
         !metadata
             .iter()

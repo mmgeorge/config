@@ -56,6 +56,18 @@ end
 assert(#warnings == 36)
 for _, warning in ipairs(warnings) do assert(warning == "Harness is still initializing") end
 
+-- A recorded startup failure replaces the "still initializing" warning with its cause.
+local startup_errors = {}
+local raise = require("forge.infra.notifications").error
+require("forge.infra.notifications").error = function(message) startup_errors[#startup_errors + 1] = message end
+state.session, state.start_failure = nil, "child continuation policy points to an unknown task"
+compose("/allow")
+controller.submit()
+assert(#warnings == 36 and #startup_errors == 1, "startup failure fell back to the initializing warning")
+assert(startup_errors[1]:find("Harness failed to start: child continuation policy", 1, true), startup_errors[1])
+state.start_failure = nil
+require("forge.infra.notifications").error = raise
+
 -- Ownership, rather than the legacy ready marker, releases the same draft for one explicit submission.
 state.session = { id = "initialized-owner", provider = "mock" }
 state.presentation = {

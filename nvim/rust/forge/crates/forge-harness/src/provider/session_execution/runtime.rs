@@ -1,4 +1,5 @@
 //! Own session intake independently of submissions and scoped result waiters.
+use crate::provider::ScopeOwner;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -259,11 +260,24 @@ impl SessionExecutionRegistry {
             .map_err(RegistryError::RetainedWork)?;
         let _gate = self.gate.write().await;
         let old = self.slot(&owner)?;
-        let engine = old
-            .engine
-            .get()
-            .cloned()
-            .ok_or_else(|| protocol("execution owner has not been opened"))?;
+        let Some(engine) = old.engine.get().cloned() else {
+            // Native open is deferred to the first prompt, so a failure before that
+            // prompt fences only the observer. No binding exists to close; install a
+            // fresh observer and leave the native open to the next `owner` call.
+            if !old.observer.ready_for_replacement()? {
+                return Err(protocol("old execution observations have not been consumed").into());
+            }
+            old.observer.retire_background().await?;
+            let observer = Arc::new(super::SessionObservationInbox::default());
+            self.owners
+                .lock()
+                .map_err(|_| protocol("execution registry poisoned"))?
+                .insert(
+                    owner.clone(),
+                    Arc::new(OwnerExecution::new(&owner, observer.clone())),
+                );
+            return Ok(observer);
+        };
         if engine.is_healthy().await {
             return Err(protocol("healthy execution owner cannot be replaced").into());
         }
@@ -1299,7 +1313,7 @@ impl SessionExecution {
         scope: InvocationScope,
         submission: Arc<crate::provider::submission::Submission>,
     ) -> Result<(), ProviderError> {
-        if scope.owner != self.owner || !self.healthy.load(Ordering::Acquire) {
+        if scope.owner() != self.owner || !self.healthy.load(Ordering::Acquire) {
             return Err(protocol("prepared reservation has no live owner"));
         }
         let record = submission
@@ -1339,7 +1353,8 @@ impl SessionExecution {
         &self,
         collection: ExchangeCollection,
     ) -> Result<(), ProviderError> {
-        if collection.scope.owner != self.owner || !self.commands.same_channel(&collection.commands)
+        if collection.scope.owner() != self.owner
+            || !self.commands.same_channel(&collection.commands)
         {
             return Err(protocol(
                 "configuration replacement belongs to another owner",
@@ -1367,7 +1382,7 @@ impl SessionExecution {
         &self,
         scope: InvocationScope,
     ) -> Result<ExchangeCollection, ProviderError> {
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Err(protocol("exchange cancellation belongs to another owner"));
         }
         let (reply, response) = oneshot::channel();
@@ -1384,7 +1399,7 @@ impl SessionExecution {
         &self,
         scope: &InvocationScope,
     ) -> Result<bool, ProviderError> {
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Ok(false);
         }
         self.admitted
@@ -1421,7 +1436,7 @@ impl SessionExecution {
     /// Cancel exact host admission or await its native settlement without selecting a successor.
     #[cfg(test)]
     pub(crate) async fn cancel(&self, scope: InvocationScope) -> Result<(), ProviderError> {
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Err(protocol("cancellation belongs to another owner"));
         }
         let (reply, response) = oneshot::channel();
@@ -1452,7 +1467,7 @@ impl SessionExecution {
         &self,
         scope: &InvocationScope,
     ) -> Result<bool, ProviderError> {
-        if scope.owner != self.owner || !self.healthy.load(Ordering::Acquire) {
+        if scope.owner() != self.owner || !self.healthy.load(Ordering::Acquire) {
             return Err(protocol("invocation observation has no live owner"));
         }
         let active = self
@@ -1779,6 +1794,15 @@ impl SessionExecution {
                     ),
                 }
             }
+            // A cancellation collection that finished after the loop stopped has queued its
+            // result behind the closed driver. Answer its waiter with that typed result instead
+            // of dropping the reply, which would surface as a lost-reply protocol error.
+            receive.close();
+            while let Ok(command) = receive.try_recv() {
+                if let Command::CancellationFinished { result, reply, .. } = command {
+                    reply.complete(result);
+                }
+            }
             driver.idle.close(
                 (!driver.failed).then_some(driver.retiring.unwrap_or(OwnerCloseReason::Shutdown)),
             );
@@ -1918,7 +1942,7 @@ impl SessionExecution {
     > {
         let (sink, stream) =
             crate::provider::events::channel(crate::provider::EventScope::Binding {
-                owner: self.owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
             });
         let (reply, response) = oneshot::channel();
         self.commands
@@ -1974,7 +1998,7 @@ impl SessionExecution {
         scope: InvocationScope,
         input: crate::provider::SteeringInput,
     ) -> Result<(), ProviderError> {
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Err(protocol("steering belongs to another execution owner"));
         }
         let submission = input
@@ -2040,15 +2064,17 @@ impl SessionExecution {
     ) -> Result<ContinuationAttempt, ProviderError> {
         let supplied = sink.invocation_scope()?;
         if !self.commands.same_channel(&ticket.commands)
-            || supplied.owner != ticket.scope.owner
+            || supplied.owner() != ticket.scope.owner()
             || supplied.exchange_id != ticket.scope.exchange_id
         {
             return Err(protocol(
                 "continuation ticket belongs to another invocation or generation",
             ));
         }
-        let scope =
-            InvocationScope::new(ticket.scope.owner.clone(), ticket.scope.exchange_id.clone());
+        let scope = InvocationScope::new(
+            ticket.scope.owner().clone(),
+            ticket.scope.exchange_id.clone(),
+        );
         let sink = sink.successor_invocation_sink(&scope)?;
         // A successor has a new receipt and scope; the predecessor's handoff cannot authorize it.
         request.dispatch = super::super::DispatchTracker::default();
@@ -2083,7 +2109,7 @@ impl SessionExecution {
         stale: Option<oneshot::Sender<ProviderRequest>>,
     ) -> Result<NativeReady, ProviderError> {
         let scope = sink.invocation_scope()?.clone();
-        if request.owner()? != self.owner || scope.owner != self.owner {
+        if request.owner()? != self.owner || scope.owner() != self.owner {
             return Err(protocol("execution request belongs to another owner"));
         }
         let id = {
@@ -2177,7 +2203,7 @@ impl Driver {
                 forge_provider_api::ProviderFailureKind::WrongInvocation,
             ))
         };
-        if scope.owner != self.owner || self.failed {
+        if scope.owner() != self.owner || self.failed {
             return Err(invalid());
         }
         let record = reservation
@@ -2286,7 +2312,7 @@ impl Driver {
             } => {
                 if native.is_some()
                     || scope != change.scope
-                    || scope.owner.session_id() != self.owner.session_id()
+                    || scope.owner().session_id() != self.owner.session_id()
                     || !self
                         .provider
                         .observed_scope(&scope)
@@ -2307,7 +2333,7 @@ impl Driver {
                 receipt,
                 presentation,
             } => {
-                if native.is_some() || scope.owner != self.owner || !self.state.contains(&scope) {
+                if native.is_some() || scope.owner() != self.owner || !self.state.contains(&scope) {
                     self.fail_observation(ObservationFailure::OwnershipConflict);
                     return;
                 }
@@ -2317,7 +2343,7 @@ impl Driver {
         };
         let category = event_category(&event);
         let scope = event.scope().clone();
-        if scope.owner() != &self.owner {
+        if scope.owner() != self.owner {
             let registered_host = matches!(&event, HarnessEvent::Host { .. })
                 && scope
                     .invocation()
@@ -2343,7 +2369,7 @@ impl Driver {
         if identity_first
             && scope
                 .invocation()
-                .is_some_and(|scope| scope.owner == self.owner && !self.state.contains(scope))
+                .is_some_and(|scope| scope.owner() == self.owner && !self.state.contains(scope))
         {
             self.fail_observation(ObservationFailure::OwnershipConflict);
             return;
@@ -2419,7 +2445,7 @@ impl Driver {
         let Some(scope) = scope.invocation() else {
             return Ok(());
         };
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Ok(());
         }
         if !self.state.contains(scope) {
@@ -2443,7 +2469,7 @@ impl Driver {
             | TurnEvent::ModelResolved(_)
             | TurnEvent::Usage(_)
             | TurnEvent::ChecklistUpdated(_) => {
-                if &scope.owner.thread_id() != thread_id
+                if &scope.owner().thread_id() != thread_id
                     || scope.turn_id().ok().as_ref() != Some(turn_id)
                 {
                     return Err(ObservationFailure::OwnershipConflict);
@@ -2586,7 +2612,7 @@ impl Driver {
                     });
                 let latest = self.latest_reservations.get(&scope.exchange_id) == Some(&scope);
                 if self.failed
-                    || scope.owner != self.owner
+                    || scope.owner() != self.owner
                     || !admitted
                     || !previous_collected
                     || !current_fence
@@ -2644,7 +2670,7 @@ impl Driver {
                     .state
                     .active_scope()
                     .filter(|active| {
-                        active.owner == scope.owner && active.exchange_id == scope.exchange_id
+                        active.owner() == scope.owner() && active.exchange_id == scope.exchange_id
                     })
                     .cloned()
                     .unwrap_or(fence);
@@ -2697,7 +2723,7 @@ impl Driver {
                 let _ = reply.send(result);
             }
             Command::Cancel { scope, reply } => {
-                if self.failed || scope.owner != self.owner {
+                if self.failed || scope.owner() != self.owner {
                     reply.complete(Err(protocol("cancellation has no live owner")));
                     return;
                 }
@@ -2972,7 +2998,7 @@ impl Driver {
                             ))),
                             Ok(_) => {
                                 let result = provider
-                                    .turn_steer(&scope.owner, scope.clone(), input)
+                                    .turn_steer(&scope.owner(), scope.clone(), input)
                                     .await;
                                 if dispatch_authority
                                     .as_ref()
@@ -3174,7 +3200,7 @@ impl Driver {
                     return;
                 }
                 if let Some((previous_scope, revision, effects_revision, nonce)) = continuation {
-                    if scope.owner != previous_scope.owner
+                    if scope.owner() != previous_scope.owner()
                         || scope.exchange_id != previous_scope.exchange_id
                         || scope.invocation_id == previous_scope.invocation_id
                     {
@@ -3583,7 +3609,7 @@ impl Driver {
     fn event(&mut self, event: HarnessEvent) {
         // Validate original ownership before changing root lifecycle state.
         let event_scope = event.scope().clone();
-        if event_scope.owner() != &self.owner {
+        if event_scope.owner() != self.owner {
             let registered_host = matches!(&event, HarnessEvent::Host { .. })
                 && event_scope
                     .invocation()
@@ -3818,7 +3844,7 @@ impl Driver {
         if !matches!(
             record.delivery,
             crate::provider::submission::SubmissionState::Accepted { .. }
-        ) || record.request.owner().ok().as_ref() != Some(&scope.owner)
+        ) || record.request.owner().ok().as_ref() != Some(&scope.owner())
             || self
                 .state
                 .validate_acceptance(&scope, receipt.receipt_id(), &record.attempt_id)
@@ -3864,7 +3890,7 @@ impl Driver {
             }
             SessionObserver::Stream(idle) => {
                 let scope = observation.scope();
-                let bound = if scope.owner() == &self.owner {
+                let bound = if scope.owner() == self.owner {
                     idle.bind_scope(scope)
                 } else {
                     match &observation {
@@ -4055,7 +4081,7 @@ impl Driver {
                     &invocation.native_metadata,
                     &forge_provider_api::TurnAddress {
                         scope: invocation.scope.clone(),
-                        thread_id: invocation.scope.owner.thread_id(),
+                        thread_id: invocation.scope.owner().thread_id(),
                         turn_id: invocation
                             .scope
                             .turn_id()
@@ -4191,7 +4217,7 @@ impl Driver {
             self.cleanup_failure = Some(report.clone());
             self.idle.diagnostic(HarnessEvent::Host {
                 scope: crate::provider::EventScope::Binding {
-                    owner: self.owner.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
                 },
                 event: crate::provider::HostEvent::Failure {
                     failure: forge_provider_api::ProviderFailure::new(
@@ -4530,7 +4556,7 @@ mod tests {
                         sequence: forge_provider_api::EventSequence::new(1),
                     },
                     scope: forge_provider_api::EventScope::Binding {
-                        owner: owner.clone(),
+                        thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                     },
                     event: Box::new(NativeEvent::Thread {
                         thread_id: owner.thread_id(),
@@ -5366,7 +5392,7 @@ mod tests {
         assert!(!driver.invocations.contains_key(&scope.invocation_id));
         assert!(driver.state.active_scope().is_none());
         driver.state.admit(
-            InvocationScope::new(scope.owner.clone(), "next-explicit-request"),
+            InvocationScope::new(scope.owner().clone(), "next-explicit-request"),
             SubmissionId::try_from("next-input".to_owned())?,
             forge_provider_api::DeliveryAttemptId::new("next-attempt")?,
         )?;

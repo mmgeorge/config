@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InvocationScope, ProviderSessionId, SubmissionId, ThreadOwner};
+use crate::{InvocationScope, ProviderSessionId, SubmissionId};
 
 /// Identify one adapter-issued live binding generation independently of durable history.
 /// Each open, including resume, allocates a fresh ID. Retired IDs never authorize work on
@@ -132,8 +132,8 @@ pub enum ForkSource {
 /// Prepare durable target history without creating a live host callback binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkTarget {
-    /// Independent host owner reserved for the staged target history.
-    pub owner: ThreadOwner,
+    /// Independent host conversation reserved for the staged target history.
+    pub thread_id: crate::ThreadId,
     /// Workspace resolving the target's admitted resources.
     pub workspace: String,
     /// Complete resolved defaults for the target; never a patch to the source.
@@ -151,8 +151,6 @@ pub struct ForkTarget {
 pub struct SessionRequest {
     /// Identify the host conversation before any native history is opened.
     pub thread_id: crate::ThreadId,
-    /// Own the live conversation and its callbacks.
-    pub owner: ThreadOwner,
     /// Distinguish persistent interactive, Background, and delegated conversations.
     pub mode: SessionMode,
     /// Select the workspace used to resolve admitted resources.
@@ -174,9 +172,9 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
-    /// Reject a host thread identity that belongs to another registered owner.
+    /// Reject a thread identity the host could not have issued.
     pub fn validate_thread_owner(&self) -> Result<(), crate::ProviderError> {
-        if self.thread_id != self.owner.thread_id() {
+        if self.thread_id.host_parts().is_err() {
             return Err(crate::ProviderFailure::new(
                 crate::ProviderOperation::ThreadOpen,
                 crate::ProviderFailureKind::WrongInvocation,
@@ -195,7 +193,7 @@ impl SessionRequest {
 impl PartialEq for SessionRequest {
     /// Compare the complete open request including immutable resource and diagnostic authority identities.
     fn eq(&self, other: &Self) -> bool {
-        self.owner == other.owner
+        self.thread_id == other.thread_id
             && self.mode == other.mode
             && self.workspace == other.workspace
             && self.history == other.history
@@ -490,12 +488,10 @@ pub struct PromptRequest {
     pub turn_id: crate::TurnId,
     /// Identify the admitted execution scope.
     pub scope: InvocationScope,
-    /// Preserve the user-visible execution mode for this invocation.
-    pub mode: crate::input::PromptMode,
+    /// Select the provider-neutral execution posture for this invocation.
+    pub execution: crate::input::ExecutionMode,
     /// Apply the current choices even when a live native binding is reused.
     pub configuration: InvocationConfiguration,
-    /// Preserve normalized task intent, when this invocation starts a task.
-    pub task: Option<crate::input::TaskStart>,
     /// Authorize exactly these tools for this invocation, independently of cached native schemas.
     /// Providers with mutable catalogs advertise this subset; immutable catalogs may retain the
     /// session's registration superset but must reject every call absent from this list.
@@ -548,7 +544,7 @@ impl PromptRequest {
 
     /// Reject normalized turn identities that do not belong to the admitted host scope.
     pub fn validate_turn_identity(&self) -> Result<(), crate::ProviderError> {
-        if self.thread_id != self.scope.owner.thread_id()
+        if self.thread_id != self.scope.thread_id
             || self.scope.turn_id().as_ref() != Ok(&self.turn_id)
         {
             return Err(crate::ProviderFailure::new(
@@ -572,9 +568,8 @@ impl PartialEq for PromptRequest {
         self.thread_id == other.thread_id
             && self.turn_id == other.turn_id
             && self.scope == other.scope
-            && self.mode == other.mode
+            && self.execution == other.execution
             && self.configuration == other.configuration
-            && self.task == other.task
             && self.tools == other.tools
             && self.tool_endpoint == other.tool_endpoint
             && same_lease(&self.resource_lease, &other.resource_lease)
@@ -620,8 +615,6 @@ pub struct SteeringRequest {
     pub input: crate::input::PromptInput,
     /// Preserve files admitted with this independently journaled input.
     pub attachments: Vec<crate::input::FileAttachment>,
-    /// Preserve task entry semantics independently of its rendered text.
-    pub task: Option<crate::input::TaskStart>,
 }
 
 impl SteeringRequest {
@@ -638,7 +631,6 @@ impl PartialEq for SteeringRequest {
             && self.delivery == other.delivery
             && self.input == other.input
             && self.attachments == other.attachments
-            && self.task == other.task
     }
 }
 impl Eq for SteeringRequest {}

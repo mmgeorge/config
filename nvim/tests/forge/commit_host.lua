@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local commit = require("forge.integrations.commit")
 local ai_commit = require("forge.integrations.ai_commit")
 local git_write = require("forge.git.write")

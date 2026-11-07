@@ -576,6 +576,17 @@ impl InputReceipts {
         Ok(())
     }
 
+    /// Report whether acceptance of this receipt also acknowledges task entry or continuation
+    /// input, which changes task state that clients read from the session snapshot.
+    pub(super) fn carries_task_input(&self, id: &SubmissionId) -> bool {
+        self.pending.get(id).is_some_and(|tracked| {
+            matches!(
+                tracked.purpose,
+                InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
+            )
+        })
+    }
+
     /// Revalidate durable acceptance independently of notification ordering.
     fn observe_one(
         &mut self,

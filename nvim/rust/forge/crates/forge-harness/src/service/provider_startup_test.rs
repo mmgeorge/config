@@ -1,11 +1,12 @@
 use super::*;
+use crate::provider::ScopeOwner;
 use crate::provider::test_support::ProviderTestSession;
 use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
     events::{self, ProviderEventSink},
     provider::Provider,
     session::{BindingId, InputAcceptance, PromptRequest, SessionBinding, SessionRequest},
-    terminal::TerminalSnapshot,
+    terminal::TerminalInventory,
 };
 use std::{
     collections::HashMap,
@@ -92,7 +93,7 @@ impl Provider for StartupProvider {
             startup_failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown)
         })?;
         let scope = forge_provider_api::EventScope::Binding {
-            owner: request.owner.clone(),
+            thread_id: forge_provider_api::ThreadId::from(request.owner().clone()),
         };
         let (sink, stream) = events::channel(binding_id.clone(), scope);
         self.sinks.lock().await.insert(binding_id.clone(), sink);
@@ -185,12 +186,11 @@ impl Provider for StartupProvider {
         &self,
         context: forge_provider_api::OperationContext,
         _: &BindingId,
-    ) -> std::result::Result<TerminalSnapshot, ProviderError> {
+    ) -> std::result::Result<TerminalInventory, ProviderError> {
         context.check_admission(ProviderOperation::TerminalList)?;
-        Ok(TerminalSnapshot {
-            supported: true,
-            starting: self.starting.load(Ordering::Acquire),
+        Ok(TerminalInventory {
             terminal: Vec::new(),
+            complete: !(self.starting.load(Ordering::Acquire)),
         })
     }
 }
@@ -498,7 +498,7 @@ async fn first_input_retains_history_reported_only_by_open_result() -> Result<()
         Ok::<(), anyhow::Error>(())
     });
     controller.start_provider(&sink).await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !controller.provider_ready().await {
             tokio::task::yield_now().await;
         }
@@ -520,7 +520,7 @@ async fn first_input_retains_history_reported_only_by_open_result() -> Result<()
     )
     .await?;
     let session = controller.observer.session_id().to_owned();
-    let retained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let retained = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(history) = SqliteStore::read_only(&controller.data_root)?
                 .load_session(&session)?

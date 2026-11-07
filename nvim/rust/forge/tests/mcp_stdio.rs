@@ -113,7 +113,7 @@ async fn large_requests_and_results_preserve_complete_content_and_request_order(
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"x".repeat(1024 * 1024)}}});
+    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"x".repeat(forge_protocol::MAX_FRAME_BYTES)}}});
     let mut encoded = serde_json::to_vec(&request).unwrap();
     encoded.push(b'\n');
     assert!(encoded.len() > forge_protocol::MAX_FRAME_BYTES);

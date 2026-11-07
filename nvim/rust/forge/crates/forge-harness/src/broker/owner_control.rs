@@ -300,6 +300,15 @@ impl HarnessBroker {
         self.retracted_exchange_id.as_deref() == Some(exchange.as_str())
     }
 
+    /// Get whether a collected exchange remains finalizing with no task left to resume it.
+    pub(crate) fn owner_has_orphaned_finalization(&self) -> Result<bool> {
+        Ok(self.task_controller.current()?.is_none()
+            && self
+                .store
+                .exchange_in_state(&self.session.id, ExchangeState::Finalizing)?
+                .is_some())
+    }
+
     /// Close the exchange that task-control collection parked once no task remains to resume it.
     ///
     /// Task controls collect through reconfiguration, which parks the selected exchange and

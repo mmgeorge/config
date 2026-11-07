@@ -60,7 +60,7 @@ local ok, failure = xpcall(function()
   key("<Tab>")
   await(function()
     for _, text in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)) do
-      if text:find("Source1.render", 1, true) then return true end
+      if text:find("impl Source1 {", 1, true) then return true end
     end
   end, "structural context")
   audit()

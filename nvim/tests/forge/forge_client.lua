@@ -53,8 +53,10 @@ local ok, failure = xpcall(function()
       end
     end)
   end
-  assert(rejected == 10 and completed == 10)
-  assert(vim.tbl_count(client._client.pending) == 60)
+  -- While the build runs, the launching request plus 64 waiters fill startup admission; the rest
+  -- fail as not admitted so callers may retry them safely.
+  assert(rejected == 5 and completed == 5, vim.inspect({ rejected = rejected, completed = completed }))
+  assert(vim.tbl_count(client._client.pending) == 65)
   local control_completed = 0
   for _, method in ipairs({ "session.command.apply", "session.command.operation.get", "session.health.get" }) do
     client.request({ session_id = "admission", method = method, params = {} }, function(_, request_error)
@@ -62,7 +64,7 @@ local ok, failure = xpcall(function()
       control_completed = control_completed + 1
     end)
   end
-  assert(vim.tbl_count(client._client.pending) == 63, "ordinary requests consumed task control capacity")
+  assert(vim.tbl_count(client._client.pending) == 68, "ordinary requests consumed task control capacity")
   client.host_stop()
   assert(control_completed == 3)
   assert(completed == 70, "stopping the host failed or duplicated a queued request")
@@ -123,6 +125,7 @@ local ok, failure = xpcall(function()
         end
         local result = {}
         if request.method == "host.initialize" then result.protocol_version = require("forge.protocol").VERSION
+        elseif request.method == "provider.registry.list" then result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry()
         elseif request.method == "session.initialize" then result.session = { id = "admission" } end
         options.stdout(nil, vim.json.encode({ id = request.id, result = result }) .. "\n")
       end,

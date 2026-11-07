@@ -86,6 +86,7 @@ impl TaskCommandRun {
                 Command::Task(TaskCommand::SetAutoAccept(_) | TaskCommand::EditPlan(_))
             ),
             TaskStage::Collecting(_)
+            | TaskStage::SettlingFinalization { .. }
             | TaskStage::PreparingCreation { .. }
             | TaskStage::PreparingExecution { .. } => true,
             TaskStage::PreparingOperation { .. } | TaskStage::Commit(_) => {
@@ -285,13 +286,15 @@ impl TaskCommandRun {
                 prepared = task => TaskCommandEvent::OperationPrepared(prepared.unwrap_or_else(|_| Err(rejected(TaskCommandFailure::PreparationUnavailable)))),
                 _ = tokio::time::sleep_until(*deadline) => TaskCommandEvent::PreparationDeadline,
             },
-            TaskStage::Collecting(_) => TaskCommandEvent::Transition(
-                self.transition
-                    .as_mut()
-                    .expect("task collection retains its transition")
-                    .next(foreground.clone())
-                    .await,
-            ),
+            TaskStage::Collecting(_) | TaskStage::SettlingFinalization { .. } => {
+                TaskCommandEvent::Transition(
+                    self.transition
+                        .as_mut()
+                        .expect("task collection retains its transition")
+                        .next(foreground.clone())
+                        .await,
+                )
+            }
             TaskStage::Commit(_) => TaskCommandEvent::Commit,
             // A ready semaphore acquisition does not imply that the owner released all prior work.
             TaskStage::AcquiringDelivery(_) if delivery == TaskDeliveryGate::Waiting => {
@@ -393,6 +396,21 @@ impl TaskCommandRun {
                         Ok(TaskCommandProgress::Waiting {
                             events,
                             input: input.map(|input| *input),
+                        })
+                    }
+                    TransitionProgress::Finished {
+                        outcome: TransitionOutcome::Cancelled(_),
+                        events,
+                    } if matches!(self.stage, TaskStage::SettlingFinalization { .. }) => {
+                        let TaskStage::SettlingFinalization { outcome } =
+                            std::mem::replace(&mut self.stage, TaskStage::Consumed)
+                        else {
+                            unreachable!("finalization settlement retains its committed outcome")
+                        };
+                        self.transition.take();
+                        Ok(TaskCommandProgress::Finished {
+                            outcome: Ok(*outcome),
+                            events,
                         })
                     }
                     TransitionProgress::Finished {
@@ -644,19 +662,42 @@ impl TaskCommandRun {
                         .map_err(OperationFailure::Domain)?;
                 }
                 services.input.changed.notify_one();
+                // Parked collection defers the final checkpoint to the next admission. A finite
+                // control that removed the task schedules none, so the collected exchange would
+                // stay finalizing (and its transcript "Saving exchange") until unrelated work.
+                // Settle it through ordinary cancellation settlement before reporting completion.
+                let settle = |task: &mut Self, outcome: TaskCommandOutcome, events| {
+                    if !broker
+                        .owner_has_orphaned_finalization()
+                        .map_err(OperationFailure::Domain)?
+                    {
+                        return Ok(TaskCommandProgress::Finished {
+                            outcome: Ok(outcome),
+                            events,
+                        });
+                    }
+                    task.transition = Some(ExchangeTransition::start(
+                        task.command.record.request.id.clone(),
+                        TransitionIntent::Cancel(super::command::CancelledInputPolicy::Retain),
+                        services,
+                        None,
+                        None,
+                    ));
+                    task.stage = TaskStage::SettlingFinalization {
+                        outcome: Box::new(outcome),
+                    };
+                    Ok(TaskCommandProgress::Waiting {
+                        events,
+                        input: None,
+                    })
+                };
                 match committed {
-                    TaskCommitResult::Complete(outcome) => Ok(TaskCommandProgress::Finished {
-                        outcome: Ok(outcome),
-                        events: closed,
-                    }),
+                    TaskCommitResult::Complete(outcome) => settle(self, outcome, closed),
                     TaskCommitResult::ScheduleInput(committed) => {
                         self.checkpoint = Some(committed.clone());
                         match committed {
                             TaskCommandCheckpoint::Control { outcome } => {
-                                Ok(TaskCommandProgress::Finished {
-                                    outcome: Ok(*outcome),
-                                    events: closed,
-                                })
+                                settle(self, *outcome, closed)
                             }
                             TaskCommandCheckpoint::InputPending { .. }
                             | TaskCommandCheckpoint::WorkflowInputPending { .. } => {
@@ -769,6 +810,7 @@ impl TaskCommandRun {
             }
             TaskStage::Preflight
             | TaskStage::Collecting(_)
+            | TaskStage::SettlingFinalization { .. }
             | TaskStage::Commit(_)
             | TaskStage::AwaitingInput(_)
             | TaskStage::AwaitingDispatch { .. }
@@ -1559,6 +1601,10 @@ enum TaskStage {
     },
     Collecting(TaskCollection),
     Commit(TaskCommit),
+    /// Settle the exchange a finite control left finalizing, then report the committed outcome.
+    SettlingFinalization {
+        outcome: Box<TaskCommandOutcome>,
+    },
     AcquiringDelivery(JoinHandle<Result<TaskDeliveryCapabilities, CommandFailure>>),
     AwaitingInput(InputRevision),
     AwaitingDispatch {

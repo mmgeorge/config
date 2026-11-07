@@ -145,11 +145,18 @@ local ok, failure = xpcall(function()
   owner.observe_sections()
   assert(#pending == 1)
   delivery = table.remove(pending, 1)
-  delivery.callback(nil, "section exceeds the 16 MiB loaded-body limit")
+  -- The host rejects an oversized page with a typed error; a failure without detail is an
+  -- unknown outcome that the presentation retries.
+  delivery.callback(nil, "section exceeds the 16 MiB loaded-body limit", { code = "invalid_request" })
   local failed_pages = page_count()
   for _ = 1, 20 do owner.observe_sections() end
   assert(page_count() == failed_pages and #pending == 0, "failed page cascaded into automatic retries")
-  assert(#notices == 1, table.concat(notices, "\n"))
+  -- A failed section reports inline on its heading rather than through a notification.
+  assert(#notices == 0, table.concat(notices, "\n"))
+  local failure_marks = vim.api.nvim_buf_get_extmarks(transcript,
+    vim.api.nvim_create_namespace("ForgeHarnessLoading" .. transcript), 0, -1, { details = true })
+  assert(#failure_marks == 1 and failure_marks[1][4].virt_text[1][1]:find("Section unavailable", 1, true),
+    "failed page did not mark its section unavailable")
   owner.set_section("file", true, false)
   assert(vim.wait(1000, settled, 1), "explicit retry was blocked")
 end, debug.traceback)

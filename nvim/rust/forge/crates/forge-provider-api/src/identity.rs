@@ -68,6 +68,61 @@ identity!(
     ThreadId,
     "Identify a host-registered provider conversation."
 );
+impl ThreadId {
+    /// Derive the thread identity of an observed child agent of `self`.
+    ///
+    /// The host issues every root thread identity and resolves its own ownership from it.
+    /// A child shares its parent's host namespace, so adapters mint child threads through this
+    /// derivation instead of inventing identities the host cannot attribute. The result is
+    /// stable for one parent namespace and agent, and distinct across agents.
+    pub fn child(&self, agent_id: &crate::AgentId) -> Result<Self, IdentityError> {
+        let encoded = self
+            .0
+            .strip_prefix(HOST_THREAD_PREFIX)
+            .ok_or(IdentityError)?;
+        let (namespace, _): (String, String) =
+            serde_json::from_str(encoded).map_err(|_| IdentityError)?;
+        Self::host(&namespace, agent_id.as_str())
+    }
+
+    /// Encode a host thread identity from its namespace and agent identity.
+    ///
+    /// The host's ownership registry is the only producer of root identities; adapter test
+    /// fixtures use it to model a host-issued root.
+    pub fn host(namespace: &str, agent_id: &str) -> Result<Self, IdentityError> {
+        if namespace.trim().is_empty() || agent_id.trim().is_empty() {
+            return Err(IdentityError);
+        }
+        let encoded = serde_json::to_string(&(namespace, agent_id))
+            .expect("two string identities always have a JSON representation");
+        Self::new(format!("{HOST_THREAD_PREFIX}{encoded}"))
+    }
+
+    /// Report whether two host thread identities belong to one host namespace.
+    pub fn shares_namespace(&self, other: &Self) -> bool {
+        matches!(
+            (self.host_parts(), other.host_parts()),
+            (Ok((left, _)), Ok((right, _))) if left == right
+        )
+    }
+
+    /// Decode the host namespace and agent identity of a host-encoded thread identity.
+    pub fn host_parts(&self) -> Result<(String, String), IdentityError> {
+        let encoded = self
+            .0
+            .strip_prefix(HOST_THREAD_PREFIX)
+            .ok_or(IdentityError)?;
+        let (namespace, agent_id): (String, String) =
+            serde_json::from_str(encoded).map_err(|_| IdentityError)?;
+        if namespace.trim().is_empty() || agent_id.trim().is_empty() {
+            return Err(IdentityError);
+        }
+        Ok((namespace, agent_id))
+    }
+}
+
+const HOST_THREAD_PREFIX: &str = "thread:";
+
 identity!(
     TurnId,
     "Identify one host-admitted response cycle within a thread."

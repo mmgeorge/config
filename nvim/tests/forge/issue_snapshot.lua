@@ -2,7 +2,7 @@ vim.loader.enable(false)
 local snapshot = require("github.issue_snapshot")
 local index = require("github.issue_index")
 local cache = require("github.repo_cache")
-local root = vim.fs.joinpath(vim.fn.getcwd(), ".forge-issue-snapshot-test-" .. tostring(vim.uv.hrtime()))
+local root = vim.fn.tempname()
 vim.fn.mkdir(root, "p")
 local owned_root = vim.uv.fs_realpath(root)
 local repo = "owner/repo"
@@ -158,7 +158,7 @@ end, debug.traceback)
 vim.uv.fs_open = original_open
 vim.uv.fs_read, vim.uv.fs_close = original_read, original_close
 snapshot.clear()
-index._host_reset_for_test()
+index._reset_for_test()
 cache.set_data_dir_for_test(nil)
 vim.notify = original_notify
 if owned_root and vim.uv.fs_realpath(root) == owned_root then vim.fn.delete(root, "rf") end

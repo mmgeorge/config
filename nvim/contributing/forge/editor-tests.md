@@ -13,9 +13,11 @@ Host fixtures need a built executable. See [Building and testing](building-and-t
 | `lua-test-live-integration` | Fixtures that use installed provider CLIs | Real, and may make model requests |
 | `lua-benchmark` | Benchmarks | Varies |
 
-Ordinary `lua-test` and its `all` selection exclude both integration suites and benchmarks. The registry rejects a live fixture submitted to the mock check. Run the live check only after checking credentials and each fixture's prerequisites. Its fixtures include `forge-providers/tests/fixtures/skill_reads_host.lua`, `forge-providers/tests/fixtures/activity_host.lua`, and `harness_provider_switch_host.lua`.
+The `lua-test` check runs the ordinary suite, which excludes both integration suites and benchmarks; its default `affected` selection maps changed source paths to the feature suites that cover them. The registry rejects a live fixture submitted to the mock check. Run the live check only after checking credentials and each fixture's prerequisites. Its fixtures include `forge-providers/tests/fixtures/skill_reads_host.lua`, `forge-providers/tests/fixtures/activity_host.lua`, and `harness_provider_switch_host.lua`.
 
 ## Run a fixture
+
+`.forge/checks/lua-tests.nu` is the only way to run Lua fixtures, both inside Harness, where every Lua check calls it, and outside. Each fixture runs in its own fresh Neovim, `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" -l <fixture>`, from the repository root. The runner runs fixtures in parallel, by default on a sixth of the logical CPUs, because host fixtures contend for process launches and `git`, and kills the whole process tree of any fixture still running after five seconds, including the Forge host it launched. A killed fixture fails as a timeout, and a fixture that prints success but stays alive therefore fails too.
 
 Inside Harness, select a fixture through its check:
 
@@ -26,20 +28,22 @@ check_run({"check":"lua-test-mock-integration","inputs":{"files":["nvim/tests/fo
 
 Use `inputs:{"suite":"walkthrough"}` only when a whole feature needs coverage. Omitting `files` from an integration check selects its whole suite.
 
-Outside Harness, `nvim/tools/run_tests.nu` runs each fixture in a child process and enforces a deadline, so a fixture that prints success but stays alive fails:
+Outside Harness, call the runner directly. Without paths it runs every fixture except the live-provider suite:
 
 ```nu
-nu nvim/tools/run_tests.nu --minimal plan_check_selection
-nu nvim/tools/run_tests.nu --minimal --timeout 60sec harness_settings
+nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua
+nu .forge/checks/lua-tests.nu --suite mock-integration --jobs 4
+nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/walkthrough.lua
+nu .forge/checks/lua-tests.nu
 ```
 
-To run a fixture by hand, start a fresh Neovim and enforce your own deadline:
+The runner prints each fixture's result and duration as it finishes, then the slowest fixtures and a pass and fail count, and exits nonzero when any fixture fails. `--list` prints the selection without running it. Every fixture must finish within the five-second limit, and there are no per-fixture exceptions. A fixture that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed. The runner's `disabled_fixture_list` names the fixtures excluded from default selections because launch and sequencing overhead alone exceeds the limit, and [disabled slow tests](../../tests/forge/plans/disabled-slow-tests.md) records each one's measured duration. A fixture that takes a scenario name through `arg[1]`, such as `plan_review_question_response_host.lua`, is listed once per scenario as `<path>::<scenario>`; the runner discovers the scenarios from the fixture's `{ name = "...", run = ... }` rows and passes the name as `arg[1]`.
+
+Parameterized fixtures for languages and providers need the setup in [Verification by area](verification-by-area.md), and the runner rejects them without it. Pass that setup as Lua with `--lua`, which each fixture runs before it loads:
 
 ```nu
-nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_selection.lua
+nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_plan_behavior = true" nvim/tests/forge/plan_review_calls_host.lua
 ```
-
-Parameterized fixtures for languages and providers need the setup in [Verification by area](verification-by-area.md), and fail without it.
 
 ## Launch the host executable
 

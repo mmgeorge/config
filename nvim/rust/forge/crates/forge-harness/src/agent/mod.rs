@@ -9,6 +9,7 @@ mod observed;
 mod profile;
 mod provider;
 mod registry;
+pub mod report;
 mod runtime;
 mod selection;
 mod task;

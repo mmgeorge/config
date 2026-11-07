@@ -46,7 +46,7 @@ local function query(tool, arguments)
   local marker = "rename-completed-" .. sequence
   request("session.provider.mock_response", { operation = "script", script = { steps = {
     { kind = "tool_call", name = tool, arguments = arguments },
-    { kind = "message", role = "response", text = marker },
+    { kind = "message", content = "response", text = marker },
   }, terminal = "completed" } })
   request("session.prompt.submit", { text = "Run " .. tool .. " " .. vim.json.encode(arguments) })
   assert(vim.wait(75000, function()

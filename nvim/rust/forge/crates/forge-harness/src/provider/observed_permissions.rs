@@ -1,5 +1,6 @@
 //! Retain native-child policy independently of its delegating foreground lifetime.
 use super::HostSession;
+use crate::provider::ScopeOwner;
 use forge_provider_api::{BindingId, ProviderError};
 use std::sync::{Arc, Weak};
 
@@ -68,7 +69,7 @@ impl ObservedPermissionAuthority {
                 return Err(rejected());
             }
             chain.push(ownership.observed_child(
-                &parent.owner.thread_id(),
+                &parent.owner().thread_id(),
                 &parent.turn_id().map_err(|_| rejected())?,
             )?);
         }

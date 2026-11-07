@@ -2,13 +2,20 @@ use super::*;
 
 /// Create an unfinished, persisted source without introducing a native provider protocol into these tests.
 pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
+    fixture_with_question_wait_capacity(None).await
+}
+
+/// Create the question fixture, optionally replacing the owner's production wait capacity.
+pub(super) async fn fixture_with_question_wait_capacity(
+    question_wait_capacity: Option<usize>,
+) -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
     let root = tempfile::tempdir()?;
-    let controller = SessionController::new(HarnessBroker::initialize(serde_json::from_value(
-        json!({
-            "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"question-owner-events",
-            "provider":{"kind":"mock","command":[]},
-        }),
-    )?)?).await?;
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"question-owner-events",
+        "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    broker.question_wait_capacity_for_test = question_wait_capacity;
+    let controller = SessionController::new(broker).await?;
     let session = controller.observer.session_id();
     let exchange = crate::exchange::Exchange {
         finalization_error: None,
@@ -87,13 +94,19 @@ pub(super) fn creation(
 async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and_answer()
 -> Result<()> {
     let (_root, controller, exchange) = fixture().await?;
-    let executor = crate::tools::ControlToolExecutor::new(context(&controller, &exchange));
+    let mut context = context(&controller, &exchange);
+    // Owner intake authenticates tool-created questions against a live native invocation,
+    // which this fixture never starts. The local question controller exercises the same
+    // publication barrier, revision, and answer delivery without that admission proof;
+    // authenticated owner routing is covered by live session tests.
+    context.question_events = None;
+    let executor = crate::tools::ControlToolExecutor::new(context);
     let broker = controller.broker.lock().await;
     let (barrier, published) = tokio::sync::oneshot::channel();
     let mut waiting = Box::pin(executor.execute_with_barrier(crate::tools::ControlToolInvocation { call_id: None,
         task_permit: None, name: "question_ask".into(), arguments: json!({"wait":true,"questions":[{"header":"Scope","question":"Which scope?","options":[]}]}),
     }, Some(barrier)));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         tokio::select! {
             result = waiting.as_mut() => Err(anyhow::anyhow!("waiting question settled before an answer: {}", result.is_ok())),
             ready = published => ready.context("question publication barrier was lost"),
@@ -106,7 +119,7 @@ async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and
         crate::question::QuestionDelivery::ToolResult
     );
     {
-        let revised = tokio::time::timeout(Duration::from_secs(2), executor.execute(crate::tools::ControlToolInvocation { call_id: None,
+        let revised = tokio::time::timeout( crate::hang_guard::HANG_GUARD, executor.execute(crate::tools::ControlToolInvocation { call_id: None,
             task_permit: None, name: "question_revise".into(), arguments: json!({"question_id":question.id,"revision":1,"draft":{"header":"Scope","question":"Which project scope?","options":[]}}),
         })).await??;
         assert!(revised.result.is_ok());
@@ -133,7 +146,7 @@ async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and
             },
         )?)
         .await?;
-    let outcome = tokio::time::timeout(Duration::from_secs(2), waiting.as_mut()).await??;
+    let outcome = tokio::time::timeout(crate::hang_guard::HANG_GUARD, waiting.as_mut()).await??;
     let answer: Value = serde_json::from_str(&outcome.result?.message)?;
     assert_eq!(
         answer["answers"][0]["resolution"]["answer"]["text"],
@@ -170,14 +183,14 @@ async fn cancelled_question_wait_retains_its_tool_outcome_until_publication() ->
         name: "question_ask".into(),
         arguments: json!({"wait":true,"questions":[{"header":"Scope","question":"Which scope?","options":[]}]}),
     }, Some(barrier)));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         tokio::select! {
             result = waiting.as_mut() => anyhow::bail!("wait returned before cancellation: {result:?}"),
             ready = published => ready.context("question publication barrier was lost"),
         }
     }).await??;
     executor.cancel();
-    let outcome = tokio::time::timeout(Duration::from_secs(2), waiting).await??;
+    let outcome = tokio::time::timeout(crate::hang_guard::HANG_GUARD, waiting).await??;
     assert!(
         outcome
             .result
@@ -188,7 +201,7 @@ async fn cancelled_question_wait_retains_its_tool_outcome_until_publication() ->
     let mut collected = Box::pin(executor.finish());
     assert!(futures_util::poll!(collected.as_mut()).is_pending());
     drop(outcome);
-    tokio::time::timeout(Duration::from_secs(2), collected).await?;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, collected).await?;
     drop(broker);
     controller.finish_exchange_owner().await?;
     Ok(())
@@ -213,7 +226,7 @@ async fn queued_question_creation_rejects_revoked_taskless_authority() -> Result
         2,
     )?;
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), requested).await?,
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, requested).await?,
         Err(crate::exchange::QuestionEventError::Authority(_))
     ));
     assert!(controller.questions.snapshot()?.questions.is_empty());

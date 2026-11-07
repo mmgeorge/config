@@ -377,7 +377,7 @@ M.defaults = {
       focus_input = "go",
       submit_input = "<C-s>",
       clear_input = "<C-c>",
-      close = "q",
+      close = { "q", "<Esc>" },
     },
   },
 }

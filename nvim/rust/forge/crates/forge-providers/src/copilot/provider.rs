@@ -93,7 +93,7 @@ struct Operations {
     >,
     terminals: forge_provider_api::retained_operation::Store<
         BindingId,
-        forge_provider_api::terminal::TerminalSnapshot,
+        forge_provider_api::terminal::TerminalInventory,
     >,
     terminate: forge_provider_api::retained_operation::Store<
         (BindingId, forge_provider_api::terminal::TerminalId),
@@ -221,7 +221,7 @@ enum InterruptedResource {
         scope: forge_provider_api::InvocationScope,
     },
     Opening {
-        owner: forge_provider_api::ThreadOwner,
+        owner: forge_provider_api::ThreadId,
         operation: forge_provider_api::OperationId,
     },
 }
@@ -1307,7 +1307,7 @@ impl NativeCallbackRouter for CallbackRouter {
 struct BindingState {
     binding: SessionBinding,
     open_operation: forge_provider_api::OperationId,
-    owner: forge_provider_api::ThreadOwner,
+    owner: forge_provider_api::ThreadId,
     session: RwLock<Arc<CopilotSession>>,
     request: Mutex<SessionRequest>,
     sink: ProviderEventSink,
@@ -1694,7 +1694,7 @@ pub struct CopilotProvider {
     runtime_root: PathBuf,
     profiles: Arc<std::sync::Mutex<Vec<ProfileSlot>>>,
     bindings: Arc<Mutex<HashMap<BindingId, Arc<BindingState>>>>,
-    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadOwner, BindingId>>>,
+    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadId, BindingId>>>,
     initialization_lock: Arc<Mutex<()>>,
     shutdown_lock: Arc<Mutex<()>>,
     operations: Arc<Operations>,
@@ -1821,7 +1821,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         let admission =
             super::operation::Admission::new(context.clone(), ProviderOperation::ThreadOpen);
         let resource = InterruptedResource::Opening {
-            owner: request.owner.clone(),
+            owner: request.thread_id.clone(),
             operation: context.id().clone(),
         };
         let provider = self.clone();
@@ -2206,7 +2206,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         &self,
         context: OperationContext,
         binding: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         let resource = InterruptedResource::Observe;
         let payload = binding.clone();
         let provider = self.clone();
@@ -2695,7 +2695,7 @@ impl CopilotProvider {
     async fn terminals(
         &self,
         binding: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         super::operation::check()?;
         let state = self
             .binding(binding, ProviderOperation::TerminalList)
@@ -2771,7 +2771,7 @@ impl CopilotProvider {
                 ProviderFailureKind::Rejected,
             ));
         }
-        if request.owner.session_id().as_str().is_empty() || request.workspace.trim().is_empty() {
+        if request.thread_id.as_str().trim().is_empty() || request.workspace.trim().is_empty() {
             return Err(failure(
                 ProviderOperation::ThreadOpen,
                 ProviderFailureKind::Rejected,
@@ -2788,7 +2788,7 @@ impl CopilotProvider {
                 })?;
         }
         self.collect_failed_runtime().await?;
-        if self.owners.lock().await.contains_key(&request.owner) {
+        if self.owners.lock().await.contains_key(&request.thread_id) {
             return Err(failure(
                 ProviderOperation::ThreadOpen,
                 ProviderFailureKind::ResourceConflict,
@@ -2811,11 +2811,11 @@ impl CopilotProvider {
                 }
             }
         }
-        let runtime_key = request.owner.clone();
+        let runtime_key = request.thread_id.clone();
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
-            owner: request.owner.clone(),
+            thread_id: request.thread_id.clone(),
         };
         let (sink, stream) = events::channel(binding_id.clone(), session_scope);
         self.sessions
@@ -2826,7 +2826,7 @@ impl CopilotProvider {
             let router: Arc<dyn NativeCallbackRouter> = callbacks.clone();
             let shell = Arc::new(super::shell_session::ShellSession::new(
                 Arc::downgrade(&router),
-                request.owner.clone(),
+                request.thread_id.clone(),
                 sink.clone(),
             ));
             shell.set_cleanup_runtime(self.runtime.cleanup_runtime());
@@ -2895,8 +2895,8 @@ impl CopilotProvider {
         let permissions: Arc<dyn ProviderPermissions> = callbacks.clone();
         let provider_tools: Arc<dyn ProviderTools> = callbacks.clone();
         let selection = SessionSelection {
-            execution_owner: request.owner.clone(),
-            correlation_id: request.owner.session_id().to_string(),
+            execution_owner: request.thread_id.clone(),
+            correlation_id: request.thread_id.to_string(),
             session_id: request
                 .history
                 .resume_id()
@@ -2963,7 +2963,7 @@ impl CopilotProvider {
         let state = Arc::new(BindingState {
             binding: binding.clone(),
             open_operation: super::operation::id()?,
-            owner: request.owner.clone(),
+            owner: request.thread_id.clone(),
             session: RwLock::new(session),
             request: Mutex::new(request.clone()),
             sink,
@@ -3003,7 +3003,10 @@ impl CopilotProvider {
             })
             .await
             .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime))?;
-        self.owners.lock().await.insert(request.owner, binding_id);
+        self.owners
+            .lock()
+            .await
+            .insert(request.thread_id, binding_id);
         if self.closed.load(Ordering::Acquire) {
             self.close_binding(&binding.id).await?;
             return Err(ProviderError::Failure(
@@ -3290,8 +3293,8 @@ impl CopilotProvider {
         let permissions: Arc<dyn ProviderPermissions> = state.callbacks.clone();
         let provider_tools: Arc<dyn ProviderTools> = state.callbacks.clone();
         let selection = SessionSelection {
-            execution_owner: next_request.owner.clone(),
-            correlation_id: next_request.owner.session_id().to_string(),
+            execution_owner: next_request.thread_id.clone(),
+            correlation_id: next_request.thread_id.to_string(),
             session_id: next_request
                 .history
                 .resume_id()
@@ -3438,7 +3441,7 @@ impl CopilotProvider {
                 .sink
                 .activity_writer()
                 .send_wait(forge_provider_api::AdapterActivity::Thread {
-                    thread_id: state.owner.thread_id(),
+                    thread_id: state.owner.clone(),
                     event: forge_provider_api::ThreadEvent::IdentityResolved(native_id),
                 })
                 .await
@@ -3514,7 +3517,7 @@ impl CopilotProvider {
                 ),
             ));
         }
-        if request.scope.owner != state.owner {
+        if request.scope.thread_id != state.owner {
             return Err(failure(
                 ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
@@ -3589,10 +3592,7 @@ impl CopilotProvider {
                         format!("Answer to the question {:?}: {answer}", reply.question)
                     }
                 };
-                match request.task {
-                    Some(task) => format!("{}\n\n{prompt}", task.heading()),
-                    None => prompt,
-                }
+                prompt
             },
             attachments: request.attachments,
         };
@@ -3851,7 +3851,7 @@ impl CopilotProvider {
         let receipt = || -> Result<TurnInterruptResult, ProviderError> {
             Ok(TurnInterruptResult {
                 operation_id: operation.context.id().clone(),
-                thread_id: request.scope.owner.thread_id(),
+                thread_id: request.scope.thread_id.clone(),
                 turn_id: request.scope.turn_id().map_err(|_| {
                     failure(
                         ProviderOperation::TurnInterrupt,
@@ -4063,7 +4063,7 @@ impl CopilotProvider {
         let state = self
             .binding(binding, ProviderOperation::ThreadCompact)
             .await?;
-        if !matches!(&request.scope, forge_provider_api::EventScope::SessionOperation { owner, .. } if owner == &state.owner)
+        if !matches!(&request.scope, forge_provider_api::EventScope::SessionOperation { thread_id, .. } if thread_id == &state.owner)
         {
             return Err(failure(
                 ProviderOperation::ThreadCompact,
@@ -4396,7 +4396,7 @@ impl CopilotProvider {
             .iter()
             .map(|tool| tool.name.to_owned())
             .collect::<HashSet<_>>();
-        if request.scope.owner != state.owner
+        if request.scope.thread_id != state.owner
             || request.receipt.id().as_str() != request.submission_id.as_str()
             || request.receipt.attempt_id().map_err(|_| {
                 failure(
@@ -4529,7 +4529,6 @@ impl CopilotProvider {
             model: selected_model,
             capability: self.descriptor().capability,
             input: request.input,
-            task: request.task,
             recovered: request.recovered_inputs,
             instructions: request.instructions,
             repair_caution,
@@ -4605,7 +4604,7 @@ impl CopilotProvider {
         });
         let address = forge_provider_api::TurnAddress {
             scope: collect_scope.clone(),
-            thread_id: collect_scope.owner.thread_id(),
+            thread_id: collect_scope.thread_id.clone(),
             turn_id: collect_scope.turn_id().map_err(|_| {
                 failure(
                     ProviderOperation::TurnStart,
@@ -4912,7 +4911,7 @@ pub(super) fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -
 fn accepted_message_ids(
     submission_id: &forge_provider_api::SubmissionId,
     attempt_id: &forge_provider_api::DeliveryAttemptId,
-    owner: &forge_provider_api::ThreadOwner,
+    owner: &forge_provider_api::ThreadId,
     session_id: &str,
     accepted_receipts: &[RecoveryToken],
 ) -> Result<std::collections::HashSet<String>, ProviderError> {
@@ -4947,13 +4946,13 @@ mod callback_tests {
     #[tokio::test]
     async fn unobserved_shell_call_is_released_by_cancellation() {
         let router = Arc::new(CallbackRouter::default());
-        let owner = forge_provider_api::ThreadOwner::root("missing-shell-start");
+        let owner = forge_provider_api::testing::root_thread("missing-shell-start");
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "invocation");
         install(&router, &scope).await;
         let (sink, _events) = events::channel(
             BindingId::new("missing-shell-start").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let callbacks: Arc<dyn NativeCallbackRouter> = router.clone();
@@ -4975,7 +4974,7 @@ mod callback_tests {
     async fn unobserved_shell_call_rejects_already_cancelled_authority() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("pre-cancelled-shell"),
+            forge_provider_api::testing::root_thread("pre-cancelled-shell"),
             "invocation",
         );
         install(&router, &scope).await;
@@ -5120,7 +5119,7 @@ mod callback_tests {
     async fn identity_free_hook_requires_unambiguous_root_authority() {
         let router = CallbackRouter::default();
         let parent = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("unattributed-hook"),
+            forge_provider_api::testing::root_thread("unattributed-hook"),
             "parent",
         );
         install(&router, &parent).await;
@@ -5129,15 +5128,14 @@ mod callback_tests {
             .await
             .expect("root-only hook has exact authority");
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::new(
-                parent.owner.session_id().clone(),
-                forge_provider_api::agent::AgentId::new("child").unwrap(),
-            )
-            .unwrap(),
+            parent
+                .thread_id
+                .child(&forge_provider_api::agent::AgentId::new("child").unwrap())
+                .unwrap(),
             parent.exchange_id.clone(),
         );
         let child = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -5194,20 +5192,19 @@ mod callback_tests {
     async fn native_child_host_tool_uses_its_original_child_executor_after_root_retirement() {
         let router = CallbackRouter::default();
         let parent = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("child-host-tool"),
+            forge_provider_api::testing::root_thread("child-host-tool"),
             "parent",
         );
         install(&router, &parent).await;
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::new(
-                parent.owner.session_id().clone(),
-                forge_provider_api::agent::AgentId::new("child").unwrap(),
-            )
-            .unwrap(),
+            parent
+                .thread_id
+                .child(&forge_provider_api::agent::AgentId::new("child").unwrap())
+                .unwrap(),
             parent.exchange_id.clone(),
         );
         let child = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -5248,20 +5245,19 @@ mod callback_tests {
     async fn native_child_permission_waits_for_exact_published_owner_without_parent_fallback() {
         let router = CallbackRouter::default();
         let parent = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("child-permission"),
+            forge_provider_api::testing::root_thread("child-permission"),
             "parent",
         );
         let generation = install(&router, &parent).await;
         let child_scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::new(
-                parent.owner.session_id().clone(),
-                forge_provider_api::agent::AgentId::new("observed-child").unwrap(),
-            )
-            .unwrap(),
+            parent
+                .thread_id
+                .child(&forge_provider_api::agent::AgentId::new("observed-child").unwrap())
+                .unwrap(),
             parent.exchange_id.clone(),
         );
         let child = TurnAddress {
-            thread_id: child_scope.owner.thread_id(),
+            thread_id: child_scope.thread_id.clone(),
             turn_id: child_scope.turn_id().unwrap(),
             scope: child_scope,
         };
@@ -5368,7 +5364,7 @@ mod callback_tests {
     #[tokio::test]
     async fn no_tool_exchange_collection_preserves_following_tool_authority() {
         let router = CallbackRouter::default();
-        let owner = forge_provider_api::ThreadOwner::root("callbacks");
+        let owner = forge_provider_api::testing::root_thread("callbacks");
         let first = forge_provider_api::InvocationScope::new(owner.clone(), "no-tools");
         let generation = install(&router, &first).await;
         router.finish_foreground_scope(&first, generation).await;
@@ -5393,7 +5389,7 @@ mod callback_tests {
     async fn tool_completion_retains_live_foreground_callbacks() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("callbacks"),
+            forge_provider_api::testing::root_thread("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
@@ -5413,7 +5409,7 @@ mod callback_tests {
     async fn settled_callbacks_live_until_the_last_native_call_finishes() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("callbacks"),
+            forge_provider_api::testing::root_thread("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
@@ -5429,7 +5425,7 @@ mod callback_tests {
     #[tokio::test]
     async fn reused_native_call_id_keeps_replacement_scope_after_late_original_release() {
         let router = CallbackRouter::default();
-        let owner = forge_provider_api::ThreadOwner::root("reused-call");
+        let owner = forge_provider_api::testing::root_thread("reused-call");
         let original = forge_provider_api::InvocationScope::new(owner.clone(), "original");
         let replacement = forge_provider_api::InvocationScope::new(owner, "replacement");
         let generation = install(&router, &original).await;
@@ -5464,7 +5460,7 @@ mod callback_tests {
     async fn old_callback_completion_does_not_retire_a_new_generation() {
         let router = CallbackRouter::default();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("callbacks"),
+            forge_provider_api::testing::root_thread("callbacks"),
             "exchange",
         );
         let generation = install(&router, &scope).await;
@@ -5480,7 +5476,7 @@ mod callback_tests {
     #[tokio::test]
     async fn cancelled_native_calls_do_not_block_the_next_invocation() {
         let router = CallbackRouter::default();
-        let owner = forge_provider_api::ThreadOwner::root("callbacks");
+        let owner = forge_provider_api::testing::root_thread("callbacks");
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "cancelled");
         install(&router, &scope).await;
         let mut callbacks = router.callbacks(&scope).await.unwrap();
@@ -5557,7 +5553,7 @@ mod callback_tests {
     async fn callback_revocation_collects_admitted_work_and_blocks_late_effects() {
         let router = Arc::new(CallbackRouter::default());
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("revocation"),
+            forge_provider_api::testing::root_thread("revocation"),
             "invocation",
         );
         install(&router, &scope).await;
@@ -5596,7 +5592,7 @@ mod callback_tests {
     async fn foreground_collection_preserves_pending_independent_child_callback() {
         let router = CallbackRouter::default();
         let parent = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("child-collection"),
+            forge_provider_api::testing::root_thread("child-collection"),
             "parent",
         );
         install(&router, &parent).await;
@@ -5607,15 +5603,14 @@ mod callback_tests {
         });
         router.install(callbacks).await.unwrap();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::new(
-                parent.owner.session_id().clone(),
-                forge_provider_api::agent::AgentId::new("child").unwrap(),
-            )
-            .unwrap(),
+            parent
+                .thread_id
+                .child(&forge_provider_api::agent::AgentId::new("child").unwrap())
+                .unwrap(),
             parent.exchange_id.clone(),
         );
         let child = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -5700,16 +5695,16 @@ mod recovery_receipt_tests {
 
     #[test]
     fn prior_receipts_reserve_only_other_submissions_in_the_same_session() {
-        let owner = forge_provider_api::ThreadOwner::root("recovery-owner");
+        let owner = forge_provider_api::testing::root_thread("recovery-owner");
         let current_attempt =
             forge_provider_api::DeliveryAttemptId::new("current-attempt").unwrap();
         let current =
             forge_provider_api::SubmissionId::try_from("current-submission".to_owned()).unwrap();
         let prior =
             forge_provider_api::SubmissionId::try_from("prior-submission".to_owned()).unwrap();
-        let other_owner = forge_provider_api::ThreadOwner::root("other-owner");
+        let other_owner = forge_provider_api::testing::root_thread("other-owner");
         let receipt = |submission_id: forge_provider_api::SubmissionId,
-                       owner: forge_provider_api::ThreadOwner,
+                       owner: forge_provider_api::ThreadId,
                        session: &str,
                        message: &str| {
             super::super::prompt::accepted_recovery_token(
@@ -5981,19 +5976,18 @@ mod retained_recovery_tests {
         );
         let authority = Arc::new(super::callback_tests::Authority);
         PromptRequest {
-            thread_id: (scope).owner.thread_id(),
+            thread_id: (scope).thread_id.clone(),
             turn_id: (scope)
                 .turn_id()
                 .expect("admitted scope has a nonempty host turn identity"),
 
             scope,
-            mode: forge_provider_api::PromptMode::Chat,
+            execution: forge_provider_api::ExecutionMode::Default,
             configuration: forge_provider_api::session::InvocationConfiguration {
                 model: configuration.model,
                 access: configuration.access,
                 approval: configuration.approval,
             },
-            task: None,
             tools: Vec::new(),
             tool_endpoint: None,
             resource_lease: None,
@@ -6049,7 +6043,7 @@ mod retained_recovery_tests {
                 let expected = match index {
                     0 => { state.closing.store(true, Ordering::Release); ProviderFailureKind::BindingClosed }
                     1 => { state.unsafe_history.store(true, Ordering::Release); ProviderFailureKind::BindingInvalidated }
-                    2 => { request.scope.owner = forge_provider_api::ThreadOwner::root("foreign"); ProviderFailureKind::WrongInvocation }
+                    2 => { request.scope.thread_id = forge_provider_api::testing::root_thread("foreign"); ProviderFailureKind::WrongInvocation }
                     3 => { request.submission_id = forge_provider_api::SubmissionId::try_from("different-input").unwrap(); ProviderFailureKind::WrongInvocation }
                     4 => { request.attempt_id = forge_provider_api::DeliveryAttemptId::new("different-attempt").unwrap(); ProviderFailureKind::WrongInvocation }
                     5 => {
@@ -6067,14 +6061,14 @@ mod retained_recovery_tests {
                 state.closing.store(false, Ordering::Release); state.unsafe_history.store(false, Ordering::Release);
                 if let Some(active) = state.active.lock().await.take() { active.task.abort(); let _ = active.task.await; }
             }
-            let steering = SteeringRequest { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "inactive"), delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("never steer".into()), attachments: Vec::new(), task: None };
+            let steering = SteeringRequest { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "inactive"), delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("never steer".into()), attachments: Vec::new(), };
             assert!(matches!(provider.turn_steer(context("inactive-steer"), &opened.binding.id, steering.clone()).await, Err(ProviderError::NotConsumed)));
             state.closing.store(true, Ordering::Release);
             assert_admission_failure(provider.turn_steer(context("closed-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingClosed);
             state.closing.store(false, Ordering::Release); state.unsafe_history.store(true, Ordering::Release);
             assert_admission_failure(provider.turn_steer(context("invalid-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingInvalidated);
             state.unsafe_history.store(false, Ordering::Release);
-            let mut foreign = steering.clone(); foreign.scope.owner = forge_provider_api::ThreadOwner::root("foreign");
+            let mut foreign = steering.clone(); foreign.scope.thread_id = forge_provider_api::testing::root_thread("foreign");
             assert_admission_failure(provider.turn_steer(context("foreign-steer"), &opened.binding.id, foreign).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
             *state.active.lock().await = Some(ActiveExecution { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "other-active"), task: tokio::spawn(std::future::pending::<Result<(), ProviderError>>()) });
             assert_admission_failure(provider.turn_steer(context("wrong-scope-steer"), &opened.binding.id, steering).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
@@ -6083,7 +6077,7 @@ mod retained_recovery_tests {
             let closed_scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "collected");
             let closed_receipt = Arc::new(QueuedReceipt { id: forge_provider_api::SubmissionId::try_from("closed-input").unwrap(), attempt: forge_provider_api::DeliveryAttemptId::new("closed-attempt").unwrap(), sending: AtomicU64::new(0) });
             let closed_prompt = queued_request(&opened.binding.id, closed_scope.clone(), configuration.clone(), closed_receipt.clone());
-            let closed_steer = SteeringRequest { scope: closed_scope, delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("cannot reopen".into()), attachments: Vec::new(), task: None };
+            let closed_steer = SteeringRequest { scope: closed_scope, delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("cannot reopen".into()), attachments: Vec::new(), };
             let late_submit = provider.turn_start(context("collected-submit"), &opened.binding.id, closed_prompt).await.expect_err("collected binding admitted input");
             let late_steer = provider.turn_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.expect_err("collected binding admitted steering");
             for (operation, cause) in [(ProviderOperation::TurnStart, late_submit), (ProviderOperation::TurnSteer, late_steer)] {
@@ -6184,6 +6178,83 @@ mod retained_recovery_tests {
             let requests = peer.collected().await;
             assert!(!requests.iter().any(|request| matches!(request["method"].as_str(), Some("session.send" | "session.abort"))));
         }).await.expect("pre-start operation collection timed out");
+    }
+
+    /// Interrupting input Copilot still queues settles on the native abort, which carries no idle.
+    ///
+    /// Copilot holds a sent message while a foreground MCP load is in flight. Aborting then emits
+    /// only `abort`, so a turn that waited for an idle would stay running until its host deadline.
+    #[tokio::test]
+    async fn queued_input_settles_cancelled_on_an_abort_without_idle() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                AbortAcknowledgement::Success,
+                None,
+                HelperBehavior::QueuedUntilAbort,
+            )
+            .await;
+            let binding = opened.binding.id;
+            let mut events = opened.events;
+            let state = provider
+                .binding(&binding, ProviderOperation::TurnStart)
+                .await
+                .unwrap();
+            let scope =
+                forge_provider_api::InvocationScope::new(state.owner.clone(), "queued-input");
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "queued-input".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("queued-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(
+                &binding,
+                scope.clone(),
+                state.request.lock().await.configuration.clone(),
+                receipt.clone(),
+            );
+            let turn = provider.turn_start(context("queued-submit"), &binding, request);
+            tokio::pin!(turn);
+            while receipt.accepted.load(Ordering::Acquire) == 0 {
+                tokio::select! {
+                    result = turn.as_mut() => panic!("queued input settled before abort: {result:?}"),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+            let (started, interrupted) = tokio::join!(
+                turn,
+                provider.turn_interrupt(context("queued-cancel"), &binding, CancelRequest { scope })
+            );
+            assert!(matches!(started, Err(ProviderError::Cancelled)), "{started:?}");
+            assert!(
+                matches!(interrupted, Ok(_) | Err(ProviderError::Cancelled)),
+                "{interrupted:?}"
+            );
+            while let Some(event) = events.try_next().unwrap() {
+                assert!(
+                    !matches!(
+                        &event.event,
+                        ProviderEvent::Provider {
+                            event: forge_provider_api::ProviderConnectionEvent::Warning(_)
+                        } | ProviderEvent::Turn { .. }
+                            | ProviderEvent::Item { .. }
+                    ),
+                    "a discarded queued input published native activity"
+                );
+            }
+            provider
+                .thread_close(context("queued-close"), &binding)
+                .await
+                .unwrap();
+            provider
+                .shutdown(context("queued-shutdown"))
+                .await
+                .unwrap();
+            peer.collected().await;
+        })
+        .await
+        .expect("an abort of queued input left the turn running");
     }
 
     /// Accepted input interrupted before positive start remains accepted without a fabricated turn.
@@ -6346,7 +6417,7 @@ mod retained_recovery_tests {
                 } = &event.event
                 {
                     assert_eq!(turn_id, &scope.turn_id().unwrap());
-                    assert_eq!(thread_id, &scope.owner.thread_id());
+                    assert_eq!(thread_id, &scope.thread_id.clone());
                     assert!(matches!(
                         completed.result().outcome(),
                         forge_provider_api::turn::TurnOutcome::Completed {
@@ -6419,8 +6490,8 @@ mod retained_recovery_tests {
             while let Some(bound) = events.try_next().unwrap() {
                 if let ProviderEvent::Turn { thread_id, turn_id, event } = bound.event {
                     match event {
-                        forge_provider_api::TurnEvent::Started(_) if thread_id != original.owner.thread_id() => {
-                            let scope = state.callbacks.observed_agents.read().await.keys().find(|scope| scope.owner.thread_id() == thread_id).unwrap().clone();
+                        forge_provider_api::TurnEvent::Started(_) if thread_id != original.thread_id.clone() => {
+                            let scope = state.callbacks.observed_agents.read().await.keys().find(|scope| scope.thread_id.clone() == thread_id).unwrap().clone();
                             child_address = Some(TurnAddress { scope, thread_id, turn_id });
                         }
                         forge_provider_api::TurnEvent::Completed(_) => {
@@ -6580,9 +6651,10 @@ mod retained_recovery_tests {
                 .thread_open(
                     context("empty-native-default"),
                     SessionRequest {
-                        thread_id: (forge_provider_api::ThreadOwner::root("empty-native-default"))
-                            .thread_id(),
-                        owner: forge_provider_api::ThreadOwner::root("empty-native-default"),
+                        thread_id: (forge_provider_api::testing::root_thread(
+                            "empty-native-default",
+                        ))
+                        .clone(),
                         mode: forge_provider_api::SessionMode::Interactive,
                         workspace: root.path().to_string_lossy().into_owned(),
                         history: SessionHistory::Durable { resume: None },
@@ -6662,8 +6734,8 @@ mod retained_recovery_tests {
             let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
             provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
             let opened = provider.thread_open(context("persistent-background"), SessionRequest {
-                thread_id: (forge_provider_api::ThreadOwner::root("persistent-background")).thread_id(),
-owner: forge_provider_api::ThreadOwner::root("persistent-background"), mode: forge_provider_api::SessionMode::Background,
+                thread_id: (forge_provider_api::testing::root_thread("persistent-background")).clone(),
+mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
                 configuration: SessionConfiguration { model: ModelSelection::default(),
                     access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
@@ -6709,9 +6781,9 @@ owner: forge_provider_api::ThreadOwner::root("persistent-background"), mode: for
             let root = tempfile::tempdir().unwrap();
             let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
             provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
-            let owner = forge_provider_api::ThreadOwner::root("starting-mcp");
+            let owner = forge_provider_api::testing::root_thread("starting-mcp");
             let opened = provider.thread_open(context("starting-mcp"), SessionRequest {
-                thread_id: owner.thread_id(), owner, mode: forge_provider_api::SessionMode::Background,
+                thread_id: owner.clone(), mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
                 configuration: SessionConfiguration { model: ModelSelection::default(),
                     access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
@@ -6734,6 +6806,170 @@ owner: forge_provider_api::ThreadOwner::root("persistent-background"), mode: for
             provider.shutdown(context("starting-mcp-shutdown")).await.unwrap();
             assert!(peer.collected().await.iter().all(|request| request["method"] != "session.mcp.listTools"));
         }).await.expect("opening waited on a starting MCP server");
+    }
+
+    /// A selected MCP server whose native startup never settles cannot consume the open deadline.
+    ///
+    /// The fixture never answers `session.mcp.startServer`, as Copilot behaves while a server
+    /// hangs during startup. The paused clock lets the ten-second open deadline elapse without
+    /// real waiting, so an open that still awaited startup would time out.
+    #[tokio::test(start_paused = true)]
+    async fn binding_opens_while_a_selected_mcp_server_startup_hangs() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (reader, writer, peer) = super::super::test_peer::streams(|request| {
+                let result = match request["method"].as_str().unwrap() {
+                    "status.get" => json!({"version":"1.0.103"}),
+                    "models.list" => json!({"models":[{"id":"auto","name":"Auto","capabilities":{}}]}),
+                    "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
+                    "session.skills.list" => json!({"skills":[]}),
+                    "session.skills.reload" | "session.tasks.refresh" | "session.mcp.reload"
+                    | "session.mcp.reloadWithConfig" => json!({}),
+                    "session.tasks.list" => json!({"tasks":[]}),
+                    "session.mcp.listTools" | "session.mcp.startServer" => return Vec::new(),
+                    "session.create" => {
+                        json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                    }
+                    "session.options.update" => json!({"success":true}),
+                    "session.detach" => json!({"success":true}),
+                    _ => json!({}),
+                };
+                vec![super::super::test_peer::response(request, result)]
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
+            provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
+            let owner = forge_provider_api::testing::root_thread("hanging-mcp");
+            let opened = provider.thread_open(context("hanging-mcp"), SessionRequest {
+                thread_id: owner.clone(), mode: forge_provider_api::SessionMode::Background,
+                workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
+                configuration: SessionConfiguration { model: ModelSelection::default(),
+                    access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
+                    approval: forge_provider_api::approval::ApprovalMode::Ask,
+                    resources: forge_provider_api::ResourceSelection {
+                        skills: Vec::new(),
+                        mcp: vec![forge_provider_api::McpLaunch {
+                            name: "slow".into(),
+                            transport: forge_provider_api::McpTransport::Stdio {
+                                command: "slow-server".into(), arguments: Vec::new(), environment: Default::default(),
+                            },
+                            timeout: None, working_directory: None,
+                            tools: Some(forge_provider_api::McpToolSelection::All),
+                        }],
+                    } },
+                resource_lease: None, tools: Vec::new(), tool_endpoint: None,
+                system_instructions: String::new(), trace: Arc::new(NullTrace),
+            }).await.expect("a hanging MCP startup must not fail the binding");
+            provider.thread_close(context("hanging-mcp-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("hanging-mcp-shutdown")).await.unwrap();
+            assert!(peer.collected().await.iter().all(|request| request["method"] != "session.mcp.listTools"));
+        }).await.expect("opening waited on a hanging MCP server startup");
+    }
+
+    /// Hung MCP startups cannot hold the first prompt behind Copilot's foreground MCP load.
+    ///
+    /// Copilot holds a queued turn until its in-flight MCP load settles, and
+    /// `session.mcp.moveLoadingToBackground` releases only a turn already waiting. The fixture
+    /// never answers any `session.mcp.startServer` and starts the turn only when a release follows
+    /// the accepted send, so the prompt completes only if startup dispatched every server and the
+    /// accepted input released the load.
+    #[tokio::test]
+    async fn accepted_input_releases_a_hung_mcp_load() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let server_count = 6;
+            let mut started = 0;
+            let mut queued: Option<Value> = None;
+            let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
+                let notification = |id: &str, parent: Value, kind: &str, data: Value| {
+                    json!({"jsonrpc":"2.0","method":"session.event",
+                        "params":{"sessionId":request["params"]["sessionId"],"event":{"id":id,"parentId":parent,
+                            "type":kind,"timestamp":"2026-11-07T00:00:00Z","data":data}}})
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "status.get" => json!({"version":"1.0.103"}),
+                    "models.list" => json!({"models":[{"id":"auto","name":"Auto","capabilities":{}}]}),
+                    "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
+                    "session.skills.list" => json!({"skills":[]}),
+                    "session.skills.reload" | "session.tasks.refresh" | "session.mcp.reload"
+                    | "session.mcp.reloadWithConfig" => json!({}),
+                    "session.tasks.list" => json!({"tasks":[]}),
+                    "session.mcp.listTools" => return Vec::new(),
+                    "session.mcp.startServer" => {
+                        started += 1;
+                        return Vec::new();
+                    }
+                    "session.send" => {
+                        queued = Some(request.clone());
+                        json!({"messageId":"queued-input"})
+                    }
+                    "session.mcp.moveLoadingToBackground" => {
+                        // A release before any turn waits moves nothing, as Copilot reports.
+                        let Some(send) = queued.take() else {
+                            return vec![super::super::test_peer::response(request, json!({"movedToBackground":false}))];
+                        };
+                        assert_eq!(started, server_count, "a server start was withheld behind another");
+                        return vec![
+                            super::super::test_peer::response(request, json!({"movedToBackground":true})),
+                            notification("released-user", Value::Null, "user.message",
+                                json!({"messageId":"queued-input","turnId":"0","content":send["params"]["prompt"]})),
+                            notification("released-start", json!("released-user"), "assistant.turn_start", json!({"turnId":"0"})),
+                            notification("released-answer", json!("released-start"), "assistant.message",
+                                json!({"messageId":"answer","content":"released","phase":"final_answer"})),
+                            notification("released-end", json!("released-answer"), "assistant.turn_end", json!({"turnId":"0"})),
+                            notification("released-idle", json!("released-end"), "session.idle", json!({})),
+                        ];
+                    }
+                    "session.create" => {
+                        json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                    }
+                    "session.plan.readSqlTodosWithDependencies" => json!({"rows":[],"dependencies":[]}),
+                    "session.eventLog.tail" => json!({"cursor":"before-input"}),
+                    "session.eventLog.read" => {
+                        json!({"cursor":"anchor", "cursorStatus":"ok", "hasMore":false, "events":[]})
+                    }
+                    "session.options.update" | "session.detach" => json!({"success":true}),
+                    _ => json!({}),
+                };
+                vec![super::super::test_peer::response(request, result)]
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
+            provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
+            let owner = forge_provider_api::testing::root_thread("released-mcp");
+            let opened = provider.thread_open(context("released-mcp"), SessionRequest {
+                thread_id: owner.clone(), mode: forge_provider_api::SessionMode::Interactive,
+                workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
+                configuration: SessionConfiguration { model: ModelSelection::default(),
+                    access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
+                    approval: forge_provider_api::approval::ApprovalMode::Deny,
+                    resources: forge_provider_api::ResourceSelection {
+                        skills: Vec::new(),
+                        mcp: (0..server_count).map(|ordinal| forge_provider_api::McpLaunch {
+                            name: format!("hung-{ordinal}"),
+                            transport: forge_provider_api::McpTransport::Stdio {
+                                command: "hung-server".into(), arguments: Vec::new(), environment: Default::default(),
+                            },
+                            timeout: None, working_directory: None,
+                            tools: Some(forge_provider_api::McpToolSelection::All),
+                        }).collect(),
+                    } },
+                resource_lease: None, tools: Vec::new(), tool_endpoint: None,
+                system_instructions: String::new(), trace: Arc::new(NullTrace),
+            }).await.expect("hung MCP startups must not fail the binding");
+            let binding = opened.binding.id;
+            let state = provider.binding(&binding, ProviderOperation::TurnStart).await.unwrap();
+            let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "released-input");
+            let receipt = Arc::new(AcceptedReceipt {
+                id: "released-input".try_into().unwrap(),
+                attempt: forge_provider_api::DeliveryAttemptId::new("released-attempt").unwrap(),
+                accepted: AtomicU64::new(0),
+            });
+            let request = queued_request(&binding, scope, state.request.lock().await.configuration.clone(), receipt);
+            provider.turn_start(context("released-submit"), &binding, request).await
+                .expect("the accepted prompt stayed queued behind the MCP load");
+            provider.thread_close(context("released-mcp-close"), &binding).await.unwrap();
+            provider.shutdown(context("released-mcp-shutdown")).await.unwrap();
+            peer.collected().await;
+        }).await.expect("hung MCP startup held the accepted prompt");
     }
 
     /// Shared text generation's sandbox request is enforced by zero native authority, not tool sandbox support.
@@ -6777,8 +7013,8 @@ owner: forge_provider_api::ThreadOwner::root("persistent-background"), mode: for
             };
             assert!(provider.descriptor().capability.validate_access(&access).is_err(), "fixture must exercise the ordinary native-tool sandbox restriction");
             let opened = provider.thread_open(context("shared-isolated-open"), SessionRequest {
-                thread_id: (forge_provider_api::ThreadOwner::root("shared-isolated")).thread_id(),
-owner: forge_provider_api::ThreadOwner::root("shared-isolated"), mode: forge_provider_api::SessionMode::Background,
+                thread_id: (forge_provider_api::testing::root_thread("shared-isolated")).clone(),
+mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                 configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: Default::default() },
                 resource_lease: None, tools: Vec::new(), tool_endpoint: None,
@@ -6829,8 +7065,8 @@ owner: forge_provider_api::ThreadOwner::root("shared-isolated"), mode: forge_pro
                 provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
                 let access = forge_provider_api::access::AccessPolicy { write_access: forge_provider_api::access::WriteScope::Off, ..Default::default() };
                 let result = provider.thread_open(context("isolated-open"), SessionRequest {
-                    thread_id: (forge_provider_api::ThreadOwner::root("isolated-confirmation")).thread_id(),
-owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: forge_provider_api::SessionMode::Background,
+                    thread_id: (forge_provider_api::testing::root_thread("isolated-confirmation")).clone(),
+mode: forge_provider_api::SessionMode::Background,
                     workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                     configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: forge_provider_api::ResourceSelection::default() },
                     resource_lease: None, tools: Vec::new(), tool_endpoint: None, system_instructions: String::new(), trace: Arc::new(NullTrace),
@@ -6859,6 +7095,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
         CompleteTurn,
         IndependentChild,
         AcceptedBeforeStart,
+        QueuedUntilAbort,
         PauseRejected,
         ModelApplied,
         ModelDeferred,
@@ -7017,6 +7254,10 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
                     }
                     return frames;
                 }
+                // Copilot queues the message behind a foreground MCP load and never consumes it.
+                "session.send" if matches!(helper_behavior, HelperBehavior::QueuedUntilAbort) => {
+                    json!({"messageId":"queued-input"})
+                }
                 "session.plan.readSqlTodosWithDependencies" => json!({"rows":[],"dependencies":[]}),
                 "session.eventLog.tail" => json!({"cursor":"before-input"}),
                 "session.eventLog.read" => {
@@ -7088,6 +7329,16 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
                     if let Some(aborted) = aborted.take() {
                         let _ = aborted.send(());
                     }
+                    if matches!(helper_behavior, HelperBehavior::QueuedUntilAbort) {
+                        // Aborting a queued message discards it and reports only `abort`.
+                        return vec![
+                            super::super::test_peer::response(request, json!({"success":true})),
+                            json!({"jsonrpc":"2.0","method":"session.event",
+                                "params":{"sessionId":request["params"]["sessionId"],"event":{
+                                    "id":"queued-abort","parentId":Value::Null,"type":"abort",
+                                    "timestamp":"2026-11-07T00:00:00Z","data":{"reason":"user_initiated"}}}}),
+                        ];
+                    }
                     match abort_acknowledgement {
                         AbortAcknowledgement::Success => json!({"success":true}),
                         AbortAcknowledgement::Rejected => {
@@ -7119,9 +7370,8 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
             .thread_open(
                 context("open"),
                 SessionRequest {
-                    thread_id: (forge_provider_api::ThreadOwner::root("lifecycle-fixture"))
-                        .thread_id(),
-                    owner: forge_provider_api::ThreadOwner::root("lifecycle-fixture"),
+                    thread_id: (forge_provider_api::testing::root_thread("lifecycle-fixture"))
+                        .clone(),
                     mode: forge_provider_api::SessionMode::Interactive,
                     workspace: root.path().to_string_lossy().into_owned(),
                     history: SessionHistory::Durable { resume: None },
@@ -7458,7 +7708,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
             let task = tokio::spawn(async move {
                 let guard = task_state.turn.activate(None, None).unwrap(); let _ = ready.send(());
                 aborted.await.unwrap();
-                let address = forge_provider_api::TurnAddress { scope: task_scope.clone(), thread_id: task_scope.owner.thread_id(), turn_id: task_scope.turn_id().unwrap() };
+                let address = forge_provider_api::TurnAddress { scope: task_scope.clone(), thread_id: task_scope.thread_id.clone(), turn_id: task_scope.turn_id().unwrap() };
                 let runner = crate::turn_runner::RetainedTurn::spawn(Arc::new(FixtureCompletedDriver), task_state.sink.clone(), address).unwrap();
                 let completed = runner.join().await;
                 task_state.settlements.lock().await.insert(task_scope.clone(), completed);
@@ -7646,8 +7896,8 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
                 .await
                 .unwrap();
             let mut request = first_state.request.lock().await.clone();
-            request.owner = forge_provider_api::ThreadOwner::root("second-owner");
-            request.thread_id = request.owner.thread_id();
+            request.thread_id = forge_provider_api::testing::root_thread("second-owner");
+            request.thread_id = request.thread_id.clone();
             let second = provider
                 .thread_open(context("second-open"), request)
                 .await
@@ -7683,9 +7933,9 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
             let (requested, request_seen) = tokio::sync::oneshot::channel();
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(true)), None, AbortAcknowledgement::Success, Some((release.clone(), requested))).await;
             let state = provider.binding(&opened.binding.id, ProviderOperation::TerminalTerminate).await.unwrap();
-            let mut snapshot = forge_provider_api::terminal::TerminalSnapshot { supported: true, starting: false, terminal: vec![forge_provider_api::terminal::BackgroundTerminal {
+            let mut snapshot = forge_provider_api::terminal::TerminalInventory::observed(vec![forge_provider_api::terminal::BackgroundTerminal {
                 id: forge_provider_api::terminal::TerminalId::new("background-shell").unwrap(), command: "fixture".into(),
-            }] };
+            }]);
             state.terminals.lock().await.issue(&mut snapshot).unwrap();
             let terminal = snapshot.terminal[0].id.clone();
             let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
@@ -7715,7 +7965,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
     fn retained_retraction_rejects_changed_request_and_preserves_uncertainty() {
         let request = InputRetractRequest {
             scope: forge_provider_api::InvocationScope::new(
-                forge_provider_api::ThreadOwner::root("owner"),
+                forge_provider_api::testing::root_thread("owner"),
                 "invocation",
             ),
             submission_id: forge_provider_api::SubmissionId::try_from("submission").unwrap(),
@@ -7740,7 +7990,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
         );
         let mut scope = request.clone();
         scope.scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("owner"),
+            forge_provider_api::testing::root_thread("owner"),
             "other-invocation",
         );
         let mut input = request.clone();
@@ -7764,7 +8014,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
         let request = SessionForkRequest {
             source: ForkSource::Binding(BindingId::new("source").unwrap()),
             target: forge_provider_api::session::ForkTarget {
-                owner: forge_provider_api::ThreadOwner::root("target"),
+                thread_id: forge_provider_api::testing::root_thread("target"),
                 workspace: root.path().to_string_lossy().into_owned(),
                 configuration: SessionConfiguration {
                     model: ModelSelection::default(),
@@ -7793,7 +8043,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
         let mut source = request.clone();
         source.source = ForkSource::Binding(BindingId::new("different-source").unwrap());
         let mut target = request.clone();
-        target.target.owner = forge_provider_api::ThreadOwner::root("different-target");
+        target.target.thread_id = forge_provider_api::testing::root_thread("different-target");
         let mut configuration = request;
         configuration.target.configuration.model.model = Some("different-model".into());
         for changed in [source, target, configuration] {
@@ -7828,7 +8078,7 @@ owner: forge_provider_api::ThreadOwner::root("isolated-confirmation"), mode: for
                 let submission = forge_provider_api::SubmissionId::try_from("submission").unwrap();
                 let attempt = forge_provider_api::DeliveryAttemptId::new("attempt").unwrap();
                 let token = super::super::prompt::sending_recovery_token(
-                    forge_provider_api::ThreadOwner::root("owner"), submission.clone(), attempt.clone(),
+                    forge_provider_api::testing::root_thread("owner"), submission.clone(), attempt.clone(),
                     super::super::prompt::NativeDeliveryBoundary {
                         session_id: "native-session".into(), cursor: "old-process-cursor".into(), anchor: Some("before".into()),
                     },

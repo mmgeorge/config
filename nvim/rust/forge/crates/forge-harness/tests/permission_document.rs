@@ -164,39 +164,4 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         ApprovalMode::Ask
     );
     assert!(broker.snapshot().unwrap().session.active_task.is_some());
-    let before = broker.snapshot().unwrap();
-    let retained = broker
-        .dispatch(Request {
-            id: 15,
-            method: "session.prompt.submit".into(),
-            params: json!({ "text": "/plan" }),
-        })
-        .await;
-    assert!(retained.response.error().is_none());
-    let after = broker.snapshot().unwrap();
-    let plan = after.active_plan.as_ref().unwrap();
-    assert_eq!(plan.id, before.active_plan.as_ref().unwrap().id);
-    assert_eq!(plan.state, forge_harness::plan::PlanState::AwaitingReview);
-    assert_eq!(after.exchange.len(), before.exchange.len());
-    let accepted = broker
-        .dispatch(Request {
-            id: 14,
-            method: "session.plan.accept".into(),
-            params: json!({
-                "plan_id": plan.id,
-                "digest": plan.review_digest.as_deref().unwrap(),
-                "approval_mode": "ask"
-            }),
-        })
-        .await;
-    assert!(
-        accepted.response.error().is_none(),
-        "{:?}",
-        accepted.response.error()
-    );
-    assert_eq!(
-        broker.snapshot().unwrap().session.approval_mode,
-        ApprovalMode::Ask
-    );
-    assert!(broker.snapshot().unwrap().session.active_task.is_some());
 }

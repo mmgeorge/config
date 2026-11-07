@@ -94,7 +94,7 @@ local succeeded, failure = xpcall(function()
   assert(#request("session.exchange.list") == 0, "removed setup operation created an exchange")
   toggle_editing(true)
   request("session.configure", { shell = "nushell" })
-  save({ definition("failure", "exit 7"), definition("dependent", "'unexpected' | save unexpected.txt", { "failure" }), definition("independent", "sleep 200ms; print 'independent output'") })
+  save({ definition("failure", "exit 7"), definition("dependent", "'unexpected' | save unexpected.txt", { "failure" }), definition("independent", "print 'independent output'") })
   assert(not pcall(request, "session.check.run"), "retired manual-run RPC must be rejected")
   assert(not pcall(request, "session.check.cancel", { run_id = "retired-request" }),
     "retired check-cancel RPC must be rejected")
@@ -146,9 +146,18 @@ local succeeded, failure = xpcall(function()
     return request("session.check.status", { run_id = cancelled_id }).state == "interrupted"
   end, 20), "cancelled check did not retain its interrupted state")
   assert(vim.fn.filereadable(workspace .. "/cancelled-orphan.txt") == 0)
-  save({ definition("shutdown", "sleep 2sec; 'orphan' | save shutdown-orphan.txt") })
+  -- The check publishes its process ID and then blocks, so shutdown is proven by that process
+  -- exiting rather than by outwaiting a timer.
+  save({ definition("shutdown", "$nu.pid | save shutdown-check.pid; sleep 1min; 'orphan' | save shutdown-orphan.txt") })
   local shutdown_id = check_tool.start(request, { check = "shutdown", all = true }).run_id
   assert(request("session.check.status", { run_id = shutdown_id }).state == "running")
+  local shutdown_pid
+  assert(vim.wait(10000, function()
+    local pid_path = workspace .. "/shutdown-check.pid"
+    if vim.fn.filereadable(pid_path) == 0 then return false end
+    shutdown_pid = tonumber((vim.fn.readfile(pid_path)[1] or ""):match("%d+") or "")
+    return shutdown_pid ~= nil
+  end, 10), "shutdown check did not start")
   local session_id = state.session.id
   require("forge.views.harness.workspace").release(state)
   assert(state.presentation.close())
@@ -165,8 +174,8 @@ local succeeded, failure = xpcall(function()
   assert(#restored.lifecycle == event_count, "reopening must preserve event identities without replay")
   assert(restored.commands[3].state == "passed")
   assert(request("session.check.status", { run_id = shutdown_id }).state == "interrupted", "shutdown must retain interrupted checks")
-  vim.wait(2300, function() return false end, 50)
-  assert(vim.fn.filereadable(workspace .. "/shutdown-orphan.txt") == 0, "shutdown left a check process running")
+  assert(vim.wait(5000, function() return vim.uv.kill(shutdown_pid, 0) ~= 0 end, 10), "shutdown left a check process running")
+  assert(vim.fn.filereadable(workspace .. "/shutdown-orphan.txt") == 0, "shutdown check reached its orphaned write")
   vim.fn.delete(workspace .. "/.forge.json")
   request("session.prompt.submit", { text = "/plan add test coverage" })
   assert(vim.wait(10000, function()

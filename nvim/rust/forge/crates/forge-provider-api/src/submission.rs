@@ -332,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_is_scoped_and_survives_dropped_waiters() {
         let binding = crate::BindingId::new("binding").unwrap();
-        let scope = crate::InvocationScope::new(crate::ThreadOwner::root("session"), "exchange");
+        let scope = crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange");
         let submission = crate::SubmissionId::try_from("input").unwrap();
         let (reporter, mut observer) = super::DispatchReporter::channel(
             binding.clone(),
@@ -376,7 +376,7 @@ mod tests {
     async fn dispatch_reporter_loss_is_not_confirmation() {
         let (reporter, mut observer) = super::DispatchReporter::channel(
             crate::BindingId::new("binding").unwrap(),
-            crate::InvocationScope::new(crate::ThreadOwner::root("session"), "exchange"),
+            crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange"),
             crate::SubmissionId::try_from("input").unwrap(),
             crate::DeliveryAttemptId::new("attempt").unwrap(),
         );
@@ -390,7 +390,7 @@ mod tests {
         let tracker = super::DispatchTracker::default();
         let mut observer = tracker.observer();
         let binding = crate::BindingId::new("binding").unwrap();
-        let scope = crate::InvocationScope::new(crate::ThreadOwner::root("session"), "exchange");
+        let scope = crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange");
         let submission = crate::SubmissionId::try_from("input").unwrap();
         let stale = tracker
             .track_input(
@@ -424,7 +424,7 @@ mod tests {
     async fn cached_dispatch_identity_does_not_retain_progress_sender() {
         let (reporter, mut observer) = super::DispatchReporter::channel(
             crate::BindingId::new("weak-dispatch").unwrap(),
-            crate::InvocationScope::new(crate::ThreadOwner::root("session"), "exchange"),
+            crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange"),
             crate::SubmissionId::try_from("input").unwrap(),
             crate::DeliveryAttemptId::new("attempt").unwrap(),
         );

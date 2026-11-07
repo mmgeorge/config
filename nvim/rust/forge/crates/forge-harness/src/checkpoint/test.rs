@@ -705,11 +705,13 @@ async fn completed_capture_releases_scopes_but_retains_its_receipt_until_collect
             capture.run(&objects, cancellation)
         })
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // The guard only bounds a hung capture; Git subprocesses under a loaded test run can take
+    // several seconds to finish.
+    tokio::time::timeout(Duration::from_secs(30), async {
         while repositories.writes.state(operation)
             != Some(OperationState::Finished(OperationCompletion::Completed))
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
@@ -1243,6 +1245,35 @@ async fn dropping_queued_checkpoint_restore_releases_its_receipt_and_input_charg
     assert_eq!(repositories.writes.usage().input_bytes, 0);
 }
 
+/// Restoring away a created file removes the directories it emptied, as Git checkout does, while
+/// a directory that still holds other content survives.
+#[test]
+fn restore_removes_directories_emptied_by_deleting_created_files() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(repository.path());
+    fs::create_dir_all(repository.path().join("kept")).unwrap();
+    fs::write(repository.path().join("kept/existing.txt"), "kept\n").unwrap();
+    let before = checkpoint
+        .capture_native(&store.objects, "session", 1, || Ok(()))
+        .unwrap();
+    fs::create_dir_all(repository.path().join("created/nested/deep")).unwrap();
+    fs::write(
+        repository.path().join("created/nested/deep/new.txt"),
+        "new\n",
+    )
+    .unwrap();
+    fs::write(repository.path().join("kept/new.txt"), "new\n").unwrap();
+    let after = checkpoint
+        .capture_native(&store.objects, "session", 2, || Ok(()))
+        .unwrap();
+    checkpoint.restore(&store.objects, &after, &before).unwrap();
+    assert!(!repository.path().join("created").exists());
+    assert!(!repository.path().join("kept/new.txt").exists());
+    assert!(repository.path().join("kept/existing.txt").exists());
+}
+
 #[test]
 fn rejects_checkpoint_records_from_a_different_worktree() {
     let repository = repository();
@@ -1573,8 +1604,10 @@ async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_ch
     );
 }
 
+/// Capture excludes NUL-content files, so the diff omits them, while non-UTF-8 text keeps a
+/// header with an explicit unavailable notice.
 #[tokio::test]
-async fn checkpoint_diff_distinguishes_binary_content_from_unsupported_encoding() {
+async fn checkpoint_diff_omits_excluded_binary_content_and_reports_unsupported_encoding() {
     let engine = DiffEngine::new(forge_diff::cache::CacheLimits::default(), 4);
     let reads = BlockingReadPool::new(4).unwrap();
     let repository = repository();
@@ -1604,7 +1637,8 @@ async fn checkpoint_diff_distinguishes_binary_content_from_unsupported_encoding(
     let diff = checkpoint_diff(&store.objects, &reads, &engine, &before, &after)
         .await
         .unwrap();
-    assert!(diff.contains("Binary files a/binary.dat and b/binary.dat differ"));
+    assert!(after.excluded.contains("binary.dat"));
+    assert!(!diff.contains("binary.dat"));
     assert!(diff.contains("diff --git a/encoded.txt b/encoded.txt\nDiff unavailable: checkpoint source is not valid UTF-8"));
     assert!(!diff.contains('\0'));
 }

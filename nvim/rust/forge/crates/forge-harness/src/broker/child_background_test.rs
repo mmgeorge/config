@@ -1,5 +1,6 @@
 use super::super::ExchangeState;
 use super::test_support::{planning_question_broker, repository};
+use crate::provider::ScopeOwner;
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::sync::Arc;
@@ -184,7 +185,7 @@ async fn assert_managed_child_background_completion(
     let mut changed = broker.agent_coordinator.subscribe();
     let mut events = Vec::new();
     // Reduce runtime commands in production order while retaining the completion boundary.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         loop {
             while let Some(command) = broker.agent_coordinator.try_receive() {
                 match command {
@@ -220,8 +221,8 @@ async fn assert_managed_child_background_completion(
                             ChildBackgroundCompletion::Natural => crate::turn::ToolState::Completed,
                         };
                         assert_eq!(tool.id, "original-background-tool");
-                        assert_eq!(turn.provider().scope.owner, owner);
-                        assert_eq!(turn.provider().thread_id, turn.provider().scope.owner.thread_id());
+                        assert_eq!(turn.provider().scope.owner(), owner);
+                        assert_eq!(turn.provider().thread_id, turn.provider().scope.owner().thread_id());
                         assert_eq!(tool.state(), expected);
                         let (bytes, _) = broker.store.tool_output_bytes(
                             &task_id,

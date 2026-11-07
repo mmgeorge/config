@@ -37,16 +37,16 @@ def main [] {
       )
     } else if $name == "lua-test" {
       $definition.action = (
-        $action | upsert command ["nu" "--no-config-file" "--stdin" "nvim/tools/checks/lua.nu" "affected" "--timeout" "30sec"]
+        $action | upsert command ["nu" "--no-config-file" "--stdin" ".forge/checks/lua-tests.nu" "check" "affected"]
         | upsert input true | upsert inputs ($action.inputs? | default $file_inputs)
       )
     } else if ($action.command | describe) == "string" and ($action.command | str contains ".forge/checks/lua-tests.nu") {
-      let parsed = $action.command | parse --regex 'lua-tests\.nu (?<suite>[a-z-]+) --all --timeout (?<timeout>[0-9]+sec)'
+      let parsed = $action.command | parse --regex 'lua-tests\.nu (?<suite>[a-z-]+) --all'
       if ($parsed | length) != 1 { error make {msg: $"Cannot translate Lua check ($name)"} }
       let selected = $parsed | first
       $definition.action = (
         $action | upsert command [
-          "nu" "--no-config-file" "--stdin" "nvim/tools/checks/lua.nu" $selected.suite "--full" "--timeout" $selected.timeout
+          "nu" "--no-config-file" "--stdin" ".forge/checks/lua-tests.nu" "check" $selected.suite "--full"
         ] | upsert input true | upsert inputs $file_inputs
       )
     } else if $action.package_manager? != null {

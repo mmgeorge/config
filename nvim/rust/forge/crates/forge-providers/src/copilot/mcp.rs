@@ -1,23 +1,21 @@
 use anyhow::{Context, Result};
-use forge_provider_api::trace::ProviderTrace;
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use github_copilot_sdk::rpc::{McpDisableRequest, McpStartServerRequest};
 use github_copilot_sdk::session_events::McpServerStatus;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Start selected servers independently and retain failures for catalog inspection.
-/// Failure to enforce the selected server set still rejects the session.
-pub async fn start(
+/// Disable every enabled server outside the selected set before the binding is exposed.
+///
+/// These are bounded native configuration calls, so they run under the open deadline; failure to
+/// enforce the selected server set rejects the session.
+pub async fn exclude_unselected(
     session: &Arc<super::handle::CopilotSession>,
     launch: &[(String, serde_json::Map<String, Value>)],
-    _trace: &dyn ProviderTrace,
-    _harness_session_id: &str,
-) -> Result<HashMap<String, String>> {
+) -> Result<()> {
     let session = &session.inner;
-    // Timed-out starts may remain active natively; exclude unselected servers before launching them.
-    let selected = super::operation::wait(async {
+    super::operation::wait(async {
         let loaded = session
             .rpc()
             .mcp()
@@ -56,41 +54,72 @@ pub async fn start(
     })
     .await
     .context("Copilot MCP selection verification timed out")
-    .and_then(|result| result);
-    selected?;
-    // Start selected servers independently without extending another server's deadline.
-    let request = launch
+    .and_then(|result| result)
+}
+
+/// Put every selected server's start request on the wire, then settle them in the returned future.
+///
+/// Native startup waits for each server's handshake, which a slow or hung server can hold for the
+/// runtime's own startup bound. Callers therefore settle the returned future after the binding
+/// opens, outside any host operation deadline; until it settles, the catalog reports the servers'
+/// live native status.
+///
+/// The SDK commits a request frame on its first poll, so this synchronous pass sends every start
+/// before the binding can accept input: a hung server cannot delay another server's start, and
+/// Copilot's foreground load already exists when accepted input releases it through
+/// [`super::handle::CopilotSession::release_mcp_loading`].
+pub fn start_selected(
+    binding: Arc<super::handle::CopilotSession>,
+    launch: Vec<(String, serde_json::Map<String, Value>)>,
+) -> impl std::future::Future<Output = Result<HashMap<String, String>>> + Send + 'static {
+    let mut startup = launch
         .iter()
         .map(|(name, payload)| launch_request(name, &Value::Object(payload.clone())))
-        .collect::<Vec<_>>();
-    let mut startup = stream::iter(request)
-        .map(|request| async move {
-            let name = request.server_name.clone();
-            let result = super::operation::wait(session.rpc().mcp().start_server(request))
-                .await
-                .context("Copilot MCP startup timed out")
-                .and_then(|result| result.context("Copilot MCP startup failed"));
-            (name, result)
+        .map(|request| {
+            let session = binding.inner.clone();
+            async move {
+                let name = request.server_name.clone();
+                // The first poll runs inside the open operation, whose deadline must not bound a
+                // startup the native runtime already bounds; the request is awaited unwrapped.
+                let result = session
+                    .rpc()
+                    .mcp()
+                    .start_server(request)
+                    .await
+                    .context("Copilot MCP startup failed");
+                (name, result)
+            }
         })
-        .buffer_unordered(4);
+        .collect::<stream::FuturesUnordered<_>>();
+    let mut settled = Vec::new();
+    while let Some(Some(result)) = startup.next().now_or_never() {
+        settled.push(result);
+    }
+    async move {
+        settled.extend(startup.collect::<Vec<_>>().await);
+        settle_selected(&binding, &launch, settled).await
+    }
+}
+
+/// Combine startup results with the verified native status of every selected server.
+async fn settle_selected(
+    binding: &Arc<super::handle::CopilotSession>,
+    launch: &[(String, serde_json::Map<String, Value>)],
+    settled: Vec<(String, Result<()>)>,
+) -> Result<HashMap<String, String>> {
+    let session = &binding.inner;
     let mut failure = HashMap::new();
-    while let Some((name, result)) = startup.next().await {
+    for (name, result) in settled {
         if result.is_err() {
             failure.insert(name, "MCP server startup failed".to_owned());
         }
     }
-    // Recheck exclusion before exposing native status for the selected servers.
+    // Startup can re-enable servers natively; enforce the selected set again before reading status.
+    exclude_unselected(binding, launch).await?;
     let verified = super::operation::wait(session.rpc().mcp().list_configured())
         .await
         .context("Copilot MCP status inspection timed out")?
         .context("inspect Copilot MCP status")?;
-    anyhow::ensure!(
-        verified
-            .servers
-            .iter()
-            .all(|server| !server.enabled || launch.iter().any(|(name, _)| name == &server.name)),
-        "Copilot retained an unselected enabled MCP server after startup"
-    );
     for (name, _) in launch {
         match verified.servers.iter().find(|server| &server.name == name) {
             Some(server) if server.enabled && server.live.status == McpServerStatus::Connected => {

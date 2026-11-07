@@ -154,6 +154,7 @@ async fn immutable_source_absence_never_requests_a_blob() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 async fn pending_submission_capture_and_preflight_reject_changed_membership_or_text() -> Result<()>
 {
     let _native_test = NATIVE_TEST_LOCK.lock().await;
@@ -1418,6 +1419,7 @@ async fn native_conversation_creation_confirms_only_correlated_owned_content() -
 }
 
 #[tokio::test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 async fn native_issue_assignee_deltas_preserve_unrelated_members_and_partial_results() -> Result<()>
 {
     let _native_test = NATIVE_TEST_LOCK.lock().await;

@@ -165,8 +165,8 @@ mod tests {
     fn large_publication_roundtrips_complete_metadata_and_removes_intermediate_output() -> Result<()>
     {
         let root = tempfile::Builder::new()
-            .prefix(".forge-metadata-")
-            .tempdir_in(std::env::current_dir()?)?;
+            .prefix("forge-metadata-")
+            .tempdir()?;
         let directory = root.path().join("github.com/repos/owner/repo");
         let _lease = RepositoryLease::metadata(&directory)?;
         let store = MetadataStore::new(

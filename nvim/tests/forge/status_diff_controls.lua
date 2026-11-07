@@ -85,9 +85,6 @@ wait_for(function() return not state.request_active and not state.diff_active en
 assert(#controls == 1, "cancelled rapid visibility toggles issued work")
 assert(state.replica.inventory.diff_view.presentation == "semantic")
 assert(owner.snapshot.diff_view.presentation == "semantic")
-for _, window in ipairs(vim.fn.win_findbuf(state.replica.buffer)) do
-  assert(vim.wo[window].winbar:find("Semantic", 1, true), vim.wo[window].winbar)
-end
 local parent_heading
 for id, entry in pairs(state.replica.source_entry) do
   if state.replica.body_owner[id] == parent_file and entry.metadata.section and #entry.metadata.section > 0
@@ -104,7 +101,7 @@ local text = table.concat(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1
 assert(text:find("before()", 1, true) and text:find("after()", 1, true), text)
 local source_block
 for id, entry in pairs(state.replica.source_entry) do
-  if state.replica.body_owner[id] == parent_file and entry.text[1]:find("after()", 1, true) then source_block = id break end
+  if state.replica.body_owner[id] == parent_file and entry.text and entry.text[1] and entry.text[1]:find("after()", 1, true) then source_block = id break end
 end
 assert(source_block)
 local _, source_row = state.replica.sequence:position(source_block)

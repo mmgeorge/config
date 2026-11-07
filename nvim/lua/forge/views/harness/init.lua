@@ -81,11 +81,15 @@ local function finish_start(state, result, start_error, error_detail, callback)
     if callback and callback.on_error then
       callback.on_error(start_error)
     else
-      notifications.error(start_error, "ForgeHarness")
+      -- Keep the failure as state: a transient notification alone leaves every later command
+      -- reporting that Harness is still initializing.
+      state.start_failure = start_error
+      notifications.error("Harness failed to start: " .. start_error, "ForgeHarness")
       controller.render()
     end
     return
   end
+  state.start_failure = nil
   if startup then startup.mark("snapshot.apply.begin") end
   apply_snapshot(state, result, callback and callback.open_mode)
   if startup then startup.mark("snapshot.apply.end") end

@@ -32,7 +32,7 @@ async fn question_input_owner_admits_headlessly_without_waiting_for_legacy_locks
             },
         })?;
     let message = controller.questions.outbox()?[0].clone();
-    let receipt = tokio::time::timeout(Duration::from_secs(2), async {
+    let receipt = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let receipt = controller
                 .coordinator
@@ -104,7 +104,7 @@ async fn question_input_acknowledgment_retry_reuses_immutable_receipt_and_public
         rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("CREATE TRIGGER reject_question_ack BEFORE UPDATE ON session_question_state WHEN json_array_length(json_extract(OLD.payload,'$.outbox')) > json_array_length(json_extract(NEW.payload,'$.outbox')) BEGIN SELECT RAISE(ABORT,'injected question acknowledgment failure'); END;")?;
-    let receipt = tokio::time::timeout(Duration::from_secs(2), async {
+    let receipt = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(receipt) = controller
                 .coordinator
@@ -124,7 +124,7 @@ async fn question_input_acknowledgment_retry_reuses_immutable_receipt_and_public
         .suspend(true, Some("intervening-control"))?;
     assert!(controller.coordinator.submissions.snapshot()?.revision > receipt.revision);
     connection.execute_batch("DROP TRIGGER reject_question_ack;")?;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !controller.questions.outbox()?.is_empty() {
             tokio::task::yield_now().await;
         }
@@ -276,7 +276,7 @@ async fn task_creation_without_transport_retains_publications_and_confirms_dispa
             crate::task::TaskKind::Execute => unreachable!("execution requires reviewed evidence"),
         };
         let completed = tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             controller
                 .exchange_owner
                 .execute_command(Command::Task(command)),
@@ -288,7 +288,7 @@ async fn task_creation_without_transport_retains_publications_and_confirms_dispa
             anyhow::bail!("headless startup did not confirm dispatch");
         };
         tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             script.dispatch(&session, MockResponseCommand::Wait { id: hold }),
         )
         .await??;
@@ -307,7 +307,7 @@ async fn task_creation_without_transport_retains_publications_and_confirms_dispa
         assert!(retained > 0);
         assert_eq!(offered, 0);
         tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             controller
                 .exchange_owner
                 .execute_command(Command::CancelExchange(CancelExchangeRequest {
@@ -502,7 +502,7 @@ async fn waiting_plan_attachment_completes_without_dispatch_and_preserves_decisi
         input_control: InputControl::AtExecution,
     };
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller
             .exchange_owner
             .execute_identified(request.clone(), sink.clone()),
@@ -532,7 +532,7 @@ async fn waiting_plan_attachment_completes_without_dispatch_and_preserves_decisi
         serde_json::to_value(&plan.elicitation)?
     );
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller
             .exchange_owner
             .execute_command(Command::Input(InputCommand::ResumeDelivery)),
@@ -543,7 +543,7 @@ async fn waiting_plan_attachment_completes_without_dispatch_and_preserves_decisi
         .list_session_event(controller.observer.session_id())?
         .len();
     let confirmed = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller.exchange_owner.execute_identified(
             CommandRequest {
                 id: CommandId::new("confirm-current-waiting-plan")?,
@@ -633,7 +633,7 @@ async fn task_policy_commits_with_control_and_execution_held_without_replaying_l
         input_control: InputControl::AtExecution,
     };
     let committed = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller
             .exchange_owner
             .execute_identified(request.clone(), sink.clone()),
@@ -766,7 +766,7 @@ async fn task_controls_replay_original_target_after_clear_without_nested_admissi
     };
     let (sink, _output) = forge_protocol::outbound::channel();
     let paused = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller
             .exchange_owner
             .execute_identified(request.clone(), sink.clone()),
@@ -778,7 +778,7 @@ async fn task_controls_replay_original_target_after_clear_without_nested_admissi
     ));
     let current = controller.task_controller.current()?.unwrap();
     let clear = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         controller
             .exchange_owner
             .execute_command(Command::Task(TaskCommand::Clear(TaskSelection::capture(
@@ -832,7 +832,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
     let mut readiness = Box::pin(controller.exchange_owner.input_ready(sink.clone()));
     assert!(futures_util::poll!(readiness.as_mut()).is_pending());
     drop(readiness);
-    let first = tokio::time::timeout(Duration::from_secs(5), active.receive())
+    let first = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
         .await?
         .context("dropped readiness waiter cancelled its admitted send")?;
     assert_eq!(first.text, "First immediate input");
@@ -841,7 +841,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
         .as_ref()
         .context("first input has no receipt")?
         .clone();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let changed = controller.coordinator.submissions.changed.notified();
             match controller.exchange_owner.input_ready(sink.clone()).await? {
@@ -854,7 +854,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
         }
     })
     .await??;
-    let second = tokio::time::timeout(Duration::from_secs(5), active.receive())
+    let second = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
         .await?
         .context("second immediate input was not handed off")?;
     assert_eq!(second.text, "Second immediate input");
@@ -874,7 +874,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
     first_receipt.sending(None)?;
     first_receipt.accepted(None)?;
     first.complete(Ok(())).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let changed = controller.coordinator.submissions.changed.notified();
             let queue = controller.coordinator.submissions.snapshot()?;
@@ -956,7 +956,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
         ));
         assert!(futures_util::poll!(offered.as_mut()).is_pending());
         drop(offered);
-        let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+        let command = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
             .await
             .with_context(|| format!("{change:?}: receive original steering"))?
             .context("owned steering was not delivered")?;
@@ -969,10 +969,12 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
             receipt.record()?.input_message_id.as_deref(),
             Some(input_id)
         );
-        let handoff =
-            tokio::time::timeout(Duration::from_secs(5), ordering.clone().acquire_owned())
-                .await
-                .with_context(|| format!("{change:?}: release original handoff ordering"))??;
+        let handoff = tokio::time::timeout(
+            crate::hang_guard::HANG_GUARD,
+            ordering.clone().acquire_owned(),
+        )
+        .await
+        .with_context(|| format!("{change:?}: release original handoff ordering"))??;
         assert_eq!(
             receipt.record()?.delivery,
             crate::provider::submission::SubmissionState::Prepared
@@ -980,7 +982,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
         drop(handoff);
         receipt.sending(None)?;
         receipt.accepted(None)?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = controller.coordinator.submissions.changed.notified();
                 if controller
@@ -1007,7 +1009,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
             ControlChange::Cancellation => controller.cancellation.request_native_cancel(),
         }
         command.complete(Ok(())).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = controller.coordinator.submissions.changed.notified();
                 let snapshot = controller.coordinator.submissions.snapshot()?;
@@ -1053,7 +1055,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
                 )
                 .await?
         );
-        let reused = tokio::time::timeout(Duration::from_secs(5), active.receive())
+        let reused = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
             .await
             .with_context(|| format!("{change:?}: receive successor steering"))?
             .context("receipt settlement fenced subsequent steering")?;
@@ -1074,7 +1076,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
             )
             .await?;
         reused.complete(Ok(())).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = controller.coordinator.submissions.changed.notified();
                 let snapshot = controller.coordinator.submissions.snapshot()?;
@@ -1270,10 +1272,10 @@ async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()>
         crate::input::InputPurpose::TaskEntry {
             revision: task.revision.clone(),
             id: id.clone(),
-            start: crate::exchange::TaskStart {
+            start: Some(crate::exchange::TaskStart {
                 kind: task.kind(),
                 title: task.title().into(),
-            },
+            }),
         },
     )
     .await?;
@@ -1387,7 +1389,7 @@ async fn owner_retains_uncertain_receipts_and_does_not_lose_ready_siblings() -> 
     );
     first_receipt.accepted(None).context("first accepted")?;
     second_receipt.accepted(None).context("second accepted")?;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let notified = controller.coordinator.submissions.changed.notified();
             if controller
@@ -1566,7 +1568,7 @@ async fn input_owner_commits_queued_settings_before_local_completion() -> Result
             )
             .await?
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let notified = controller.coordinator.submissions.changed.notified();
             if controller
@@ -1633,7 +1635,7 @@ async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()
             .join("provider-submissions.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let receipt = tokio::time::timeout(Duration::from_secs(10), async {
+    let receipt = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let notified = controller.coordinator.submissions.changed.notified();
             let id = connection
@@ -1662,7 +1664,7 @@ async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()
     .await??;
     assert_eq!(receipt.request.model, "mock-model");
     assert_eq!(receipt.request.effort, "high");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let notified = controller.coordinator.submissions.changed.notified();
             if controller
@@ -1709,7 +1711,7 @@ async fn queued_compaction_preflight_does_not_fence_later_commands() -> Result<(
             )
             .await?
     );
-    let code = tokio::time::timeout(Duration::from_secs(3), async {
+    let code = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let frame = output
                 .recv()
@@ -1905,12 +1907,18 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
     let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?).await?;
     let session_id = controller.observer.session_id().to_owned();
     let (sink, mut output) = forge_protocol::outbound::channel();
+    // Typed input commands resolve each attachment before acknowledgment, so the fixture
+    // imports a real retained file with a non-ASCII name instead of an untyped placeholder.
+    let source = fixture.path().join("資料.txt");
+    std::fs::write(&source, "retained notes")?;
+    let attachment =
+        crate::attachment::Attachment::import(&controller.data_root, &source)?.selection(1)?;
     for (request_id, message_id) in [(1, "first"), (2, "second")] {
         controller.input_request(Request {
             id: request_id, method: "session.input.apply".into(),
             params: json!({"id":format!("submit-{message_id}"), "action":{"kind":"submit","message":{
-                "id":message_id,"text":format!("draft {message_id}"),"intent":"queue",
-                "attachments":[{"id":"attachment","name":"資料.txt"}],"config":{"model":"mock"}
+                "id":message_id,"text":format!("{} draft {message_id}", attachment.label),"intent":"queue",
+                "attachments":[attachment],"config":{"model":"mock"}
             }}}),
         }, RuntimeMethod::SessionInputApply, &sink).await?;
         loop {
@@ -1926,6 +1934,7 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
         }
     }
     let before = controller.coordinator.submissions.snapshot()?;
+    controller.finish_exchange_owner().await?;
     drop(controller);
     let mut reopened = initialize;
     reopened.session_id = Some(session_id);
@@ -1968,6 +1977,7 @@ async fn interrupted_session_deletion_retries_queue_cleanup() -> Result<()> {
     controller.coordinator.submissions.apply(serde_json::from_value(json!({
         "id":"queued-before-deletion", "action":{"kind":"submit","message":{"id":"delete-message","text":"retained","intent":"queue"}}
     }))?)?;
+    controller.finish_exchange_owner().await?;
     drop(controller);
     let mut store = SqliteStore::open(&root)?;
     assert!(
@@ -2010,6 +2020,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
             .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
     )?;
+    controller.finish_exchange_owner().await?;
     drop(controller);
     let mut resumed = initialize;
     resumed.session_id = Some(session_id);

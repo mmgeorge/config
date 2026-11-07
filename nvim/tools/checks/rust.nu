@@ -77,8 +77,10 @@ def main [action: string] {
     } else if $action == "clippy" {
       ["clippy" "--profile" "dev" "--locked"] | append $scope | append $target | append ["--" "-D" "warnings"]
     } else {
-      ["test" "--profile" "dev" "--locked"] | append $scope | append $target | append (
-        if $test == "" { [] } else { ["--" $test "--exact"] }
+      # Nextest owns `--profile` for its own settings (`.config/nextest.toml`), so the Cargo
+      # profile goes through `--cargo-profile`.
+      ["nextest" "run" "--cargo-profile" "dev" "--locked"] | append $scope | append $target | append (
+        if $test == "" { [] } else { ["-E" $"test\(=($test)\)"] }
       )
     }
     let started = date now
@@ -89,8 +91,9 @@ def main [action: string] {
       | complete
     )
     let elapsed = ((date now) - $started) / 1ms | into int
-    let ran = $test == "" or ($result.stdout | lines | any {|line|
-      ($line | str trim) == $"test ($test) ... ok"
+    let ran = $test == "" or (($result.stdout + $result.stderr) | lines | any {|line|
+      let trimmed = $line | str trim
+      ($trimmed | str starts-with "PASS ") and ($trimmed | str ends-with $" ($test)")
     })
     let passed = $result.exit_code == 0 and $ran
     if not $ran {

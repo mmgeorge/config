@@ -396,7 +396,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let path = root.path().join("receipt.json");
         let scope = InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("checks-test"),
+            crate::provider::ThreadOwner::root("checks-test"),
             "exchange",
         );
         let call_id = ToolCallId::new("call-1")?;
@@ -449,11 +449,11 @@ mod tests {
             Arc::new(crate::trace::TraceStore::open(root.path())?),
         )?;
         let scope = InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("checks-test"),
+            crate::provider::ThreadOwner::root("checks-test"),
             "exchange",
         );
         let replacement = InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("checks-test"),
+            crate::provider::ThreadOwner::root("checks-test"),
             "exchange",
         );
         let mut runs = CheckOwnerRuns::new(runner);

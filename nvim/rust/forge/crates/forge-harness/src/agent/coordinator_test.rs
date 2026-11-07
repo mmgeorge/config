@@ -580,7 +580,7 @@ async fn requests_are_callable_without_holding_receiver_lock_across_await() {
     let sender = coordinator.sender();
     let (request, _) = request("operation", "review");
     let pending = tokio::spawn(async move { sender.request(request).await });
-    tokio::time::timeout(std::time::Duration::from_secs(1), revision.changed())
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, revision.changed())
         .await
         .unwrap()
         .unwrap();
@@ -828,4 +828,57 @@ async fn task_capacity_backpressure_preserves_interrupt_and_waiting_request() {
         .send(Ok(serde_json::json!({"admitted":true})))
         .unwrap();
     assert_eq!(overflow.await.unwrap()["admitted"], true);
+}
+
+/// Startup restores a child whose policy names a later task than the first one storage lists.
+#[test]
+fn restore_validates_continuation_policy_after_all_tasks_load() {
+    let source = AgentCoordinator::new("root".into());
+    let work = admit(&source, "first", "review");
+    let mut agent = work.agent.clone();
+    let mut earlier = work.task.clone();
+    earlier.state = crate::exchange::ExchangeState::Complete;
+    earlier.completed_at_ms = Some(3);
+    let mut later = earlier.clone();
+    later.id = "later-stopped-task".into();
+    later.operation_id = "later-operation".into();
+    later.ordinal += 1;
+    later.state = crate::exchange::ExchangeState::Cancelled;
+    later.completed_at_ms = Some(5);
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: later.id.clone().into(),
+    };
+    let restored = AgentCoordinator::new("root".into());
+    let repaired = restored
+        .restore([agent.clone()], [earlier, later])
+        .expect("listing order must not decide policy validity");
+    assert!(repaired.is_empty());
+    assert_eq!(
+        restored.resolve(&agent.id).unwrap().continuation,
+        agent.continuation
+    );
+}
+
+/// A policy naming a task that no longer exists is disposable and resets instead of failing startup.
+#[test]
+fn restore_repairs_continuation_policy_for_a_missing_task() {
+    let source = AgentCoordinator::new("root".into());
+    let work = admit(&source, "first", "review");
+    let mut agent = work.agent.clone();
+    let mut task = work.task.clone();
+    task.completed_at_ms = Some(3);
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: "deleted-task".to_owned().into(),
+    };
+    let restored = AgentCoordinator::new("root".into());
+    let repaired = restored.restore([agent.clone()], [task]).unwrap();
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(
+        repaired[0].continuation,
+        super::AgentContinuationPolicy::Ready
+    );
+    assert_eq!(
+        restored.resolve(&agent.id).unwrap().continuation,
+        super::AgentContinuationPolicy::Ready
+    );
 }

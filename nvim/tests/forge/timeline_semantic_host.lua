@@ -74,22 +74,26 @@ local success, failure = xpcall(function()
   git({ "add", "source.rs" })
   git({ "commit", "-qm", "fixture" })
   vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "writing-blocking" } } } } })
+  require("forge").setup({ harness = { provider = "mock" } })
   local initialized, initialization_failure
   client.session_initialize(function(value, problem) initialized, initialization_failure = value, problem end)
   wait(function() return initialized or initialization_failure end, "Harness initialization did not settle")
   assert(not initialization_failure, initialization_failure)
   session_id = initialized.session.id
+  -- Hold the response so the worktree changes while the turn is active, before cancellation
+  -- captures the checkpoint after it.
+  local held = dofile(origin .. "/nvim/tests/forge/support/mock_provider.lua").hold(session_id, "chat")
   local completed, prompt_failure
   client.request({ method = "session.prompt.submit", session_id = session_id, params = { text = "Capture timeline changes" } },
     function(_, problem) completed, prompt_failure = true, problem end)
-  wait(function() return vim.fn.filereadable(workspace .. "/mock-provider-change.txt") == 1 end, "mock provider did not start")
+  held:wait()
   source("updated", "new_private")
+  -- Submission resolves on admission; the turn itself ends through cancellation.
+  assert(completed and not prompt_failure, prompt_failure)
   request("session.turn.cancel")
-  wait(function() return completed end, "captured exchange did not finalize")
-  assert(prompt_failure and prompt_failure:find("cancel", 1, true), prompt_failure)
   local history = request("session.exchange.list")
-  assert(#history == 1 and history[1].checkpoint_before and history[1].checkpoint_after)
+  assert(#history == 1 and history[1].state == "cancelled", vim.inspect(history[1] and history[1].state))
+  assert(history[1].checkpoint_before and history[1].checkpoint_after, "cancelled exchange lacks its checkpoints")
   source("later_worktree", "later_private")
   local transcript = vim.api.nvim_create_buf(false, true)
   local composer = vim.api.nvim_create_buf(false, true)

@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::{future::Future, sync::Arc};
 
 use anyhow::{Context, Result};
@@ -232,7 +233,7 @@ impl AgentRuntime {
                 | OwnerObservation::HostFileChange { .. }
         ) && event_scope.owner().session_id() == owner.session_id();
         anyhow::ensure!(
-            event_scope.owner() == owner || native_child,
+            event_scope.owner() == *owner || native_child,
             "provider event crosses child execution ownership"
         );
         anyhow::ensure!(
@@ -301,7 +302,7 @@ impl ChildObservation {
                 event: forge_provider_api::TurnEvent::Completed(completed),
                 ..
             } = boxed_native_event.as_ref()
-            && scope.owner() == &self.owner
+            && scope.owner() == self.owner
         {
             self.native_outcome = Some(completed.result().outcome());
         }

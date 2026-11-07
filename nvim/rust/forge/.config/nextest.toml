@@ -1,0 +1,15 @@
+# Every Forge test must be deterministic and nearly instant. A test still running after five
+# seconds is terminated and reported as a failure, so a hang or a real-clock wait fails fast
+# instead of stalling the run. Do not add per-test exceptions: fix the slow test or remove it.
+[profile.default]
+slow-timeout = { period = "5s", terminate-after = 1 }
+# Report every failure in one run rather than stopping at the first.
+fail-fast = false
+# Many tests spawn git and host processes; running more at once than this starves them past the
+# five-second limit on a 24-thread machine, so parallelism is capped rather than the limit raised.
+test-threads = 8
+
+# Ignored live-provider cases make real, authorized requests to installed provider CLIs, so they
+# cannot meet the deterministic bound. Select this profile only for those cases.
+[profile.live]
+slow-timeout = { period = "60s", terminate-after = 10 }

@@ -59,6 +59,7 @@ local ok, failure = xpcall(function()
   git({ "commit", "--quiet", "-m", "Empty row fixture" })
   vim.fn.writefile({ "function foo()", "  return 2", "end" }, fixture .. "/sample.lua")
   vim.fn.chdir(fixture)
+  require("forge").setup({ about_auto_generate = false })
   state = require("forge.views.commands").open()
   assert(vim.wait(10000, settled, 10), "native Status did not settle: " .. table.concat(notices, "\n"))
   local buffer = state.replica.buffer
@@ -69,8 +70,10 @@ local ok, failure = xpcall(function()
   end
   assert(file_row, "native Status omitted file header: " .. table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, true), "\n"))
   moved(file_row)
-  if vim.fn.foldclosed(file_row) ~= -1 then mapping("<Tab>").callback() end
-  assert(vim.wait(10000, settled, 10), "native diff demand did not settle")
+  mapping("<Tab>").callback()
+  assert(vim.wait(10000, function()
+    return settled() and table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, true), "\n"):find("@@", 1, true)
+  end, 10), "native diff demand did not settle")
   local empty_row, code_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, true)) do
     if gutter.bounds(state.replica, row) then

@@ -207,7 +207,43 @@ pub trait SessionStore {
     fn delete_session(&mut self, session_id: &str) -> Result<()>;
 }
 
-pub use forge_provider_api::{approval::ApprovalMode, context::ContextUsage};
+pub use forge_provider_api::approval::ApprovalMode;
+
+/// Retain the session's latest context window with Harness's derived remaining capacity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub size: u64,
+    /// Percent of the window beyond the provider's reserved overhead that remains unused.
+    pub remaining_percent: u8,
+}
+
+impl ContextUsage {
+    /// Derive the remaining capacity from one provider context report.
+    pub fn from_report(report: &forge_provider_api::context::ContextUsage) -> Option<Self> {
+        let effective_size = report.size.checked_sub(report.reserved)?;
+        if effective_size == 0 {
+            return None;
+        }
+        let effective_used = report.used.saturating_sub(report.reserved);
+        let remaining = effective_size.saturating_sub(effective_used);
+        let remaining_percent = ((remaining as f64 / effective_size as f64) * 100.0)
+            .clamp(0.0, 100.0)
+            .round() as u8;
+        Some(Self {
+            used: report.used,
+            size: report.size,
+            remaining_percent,
+        })
+    }
+
+    /// Derive usage for a window that reserves no native overhead.
+    pub fn reported(used: u64, size: u64) -> Option<Self> {
+        Self::from_report(&forge_provider_api::context::ContextUsage::reported(
+            used, size,
+        )?)
+    }
+}
 
 #[cfg(test)]
 mod context_usage_test {
@@ -215,11 +251,15 @@ mod context_usage_test {
 
     #[test]
     fn normalizes_context_against_the_reserved_baseline() {
-        let usage = ContextUsage::with_baseline(275_000, 353_000, 12_000)
-            .expect("valid usage with reserved context");
+        let report =
+            forge_provider_api::context::ContextUsage::with_reserved(275_000, 353_000, 12_000)
+                .expect("valid usage with reserved context");
+        let usage = ContextUsage::from_report(&report).expect("derivable usage");
         assert_eq!(usage.remaining_percent, 23);
         assert_eq!(usage.size, 353_000);
-        assert!(ContextUsage::with_baseline(1, 12_000, 12_000).is_none());
+        assert!(
+            forge_provider_api::context::ContextUsage::with_reserved(1, 12_000, 12_000).is_none()
+        );
     }
 
     #[test]

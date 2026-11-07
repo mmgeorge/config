@@ -9,7 +9,5 @@ pub(crate) enum TaskEvent {
     ExecutionBaselineCaptured(String),
     GoalWorkspaceObserved(String),
     CheckPreparationFailed(String),
-    #[cfg(test)]
-    VerificationInputsChanged(super::TaskTurnId),
     EntryPreparationFinished,
 }

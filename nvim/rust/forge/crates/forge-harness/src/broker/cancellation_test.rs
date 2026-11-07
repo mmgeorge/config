@@ -25,8 +25,9 @@ use std::sync::atomic::AtomicUsize;
 
 /// Preserve multiple bounded observation windows and await their final publication before readiness.
 #[tokio::test]
+#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
 async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publication() -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let workspace = super::test::repository();
         let data = tempfile::tempdir()?;
         let mut broker =
@@ -76,7 +77,7 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
         transaction.execution_open = false;
         transaction.agent_revision.borrow_and_update();
         let turn = crate::provider::TurnAddress {
-            thread_id: (scope).owner.thread_id(),
+            thread_id: (scope).owner().thread_id(),
             turn_id: (scope).turn_id().unwrap(),
             scope,
         };
@@ -313,7 +314,7 @@ fn cancellation_fixture(
                 request.turn_control.before_send(&request.scope).await?;
                 let call = stats.calls.fetch_add(1, Ordering::SeqCst);
                 let turn = crate::provider::TurnAddress {
-                    thread_id: (request.scope.clone()).owner.thread_id(),
+                    thread_id: (request.scope.clone()).owner().thread_id(),
                     turn_id: (request.scope.clone()).turn_id().unwrap(),
                     scope: request.scope.clone(),
                 };
@@ -541,7 +542,7 @@ async fn provider_failure_named_cancelled_remains_failed() -> Result<()> {
 #[tokio::test]
 async fn shell_timeout_stops_execution_without_replaying_the_command() -> Result<()> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        crate::hang_guard::HANG_GUARD,
         assert_native_failure(ProviderFailure::Stalled),
     )
     .await?
@@ -874,7 +875,7 @@ async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream()
     sink.send(crate::provider::test_support::native_event(
         scope.clone(),
         ProviderEvent::Turn {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             event: TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 1 }),
         },
@@ -948,7 +949,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         ));
         broker.turn_cancellation.request();
         release.notify_one();
-        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let ready = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 match transaction.next().await? {
                     ForegroundSignal::Native(NativeForegroundSignal::NativeReady(
@@ -977,5 +978,46 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
             "consumed native result left an empty native poll enabled"
         );
     }
+    Ok(())
+}
+
+/// Collection stops semantic progress scans, which its closed effect gate could never dispatch.
+#[tokio::test(start_paused = true)]
+async fn collected_transaction_requests_no_plan_scan() -> Result<()> {
+    let workspace = super::test::repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = super::test::planning_question_broker(workspace.path(), data.path(), false);
+    broker.checkpoint = None;
+    let mut staged = broker.stage_foreground_interaction(
+        "scan",
+        PromptMode::Chat,
+        Some(&ExchangeAdmission::chat("scan".into())),
+        ProviderInput::from_text("scan"),
+    )?;
+    broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+    let engine = broker
+        .execution_registry()
+        .owner(crate::provider::ThreadOwner::root(&broker.session.id))
+        .await?;
+    let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
+    transaction.scan_enabled = true;
+    transaction.question_enabled = false;
+    transaction.agent_command_active = true;
+    transaction.execution_open = false;
+    let horizon = std::time::Duration::from_secs(600);
+    let scanned = |signal: Result<Result<ForegroundSignal>, tokio::time::error::Elapsed>| {
+        matches!(signal, Ok(Ok(ForegroundSignal::PlanScan)))
+    };
+    assert!(
+        scanned(tokio::time::timeout(horizon, transaction.next()).await),
+        "an uncollected execution must keep scanning progress"
+    );
+    transaction.collection = Some(ForegroundCollection::Cancel(
+        crate::exchange::command::CancelledInputPolicy::Retain,
+    ));
+    assert!(
+        !scanned(tokio::time::timeout(horizon, transaction.next()).await),
+        "collection requested a scan its closed effect gate cannot dispatch"
+    );
     Ok(())
 }

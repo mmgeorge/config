@@ -55,4 +55,4 @@ client.request({
 end)
 ```
 
-The caller must use the discriminator declared on [PermissionChange](native-schemas.md#permissionchange). The [permission integration fixture](../../../tests/forge/harness_access_host.lua) and [settings fixture](../../../tests/forge/harness_settings.lua) exercise these flows with explicit ownership.
+The caller must use the discriminator declared on [PermissionChange](native-schemas.md#permissionchange). The [settings fixture](../../../tests/forge/harness_settings.lua) exercises these flows with explicit ownership.

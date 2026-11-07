@@ -248,6 +248,7 @@ impl TaskAuthority {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::provider::ScopeOwner;
     use crate::task::{Task, TaskChange};
 
     /// Share the persisted baseline receipt across parent collection while retaining the child's original task fence.
@@ -267,7 +268,7 @@ mod test {
             "exchange",
         );
         let child_address = forge_provider_api::TurnAddress {
-            thread_id: child_scope.owner.thread_id(),
+            thread_id: child_scope.owner().thread_id(),
             turn_id: child_scope.turn_id()?,
             scope: child_scope.clone(),
         };
@@ -278,9 +279,9 @@ mod test {
             vec![(
                 public_agent.clone(),
                 forge_provider_api::agent::AgentDescription {
-                    parent_agent_id: Some(parent_scope.owner.agent_id().clone()),
+                    parent_agent_id: Some(parent_scope.owner().agent_id().clone()),
                     delegation: Some(forge_provider_api::agent::AgentDelegation {
-                        parent_thread_id: parent_scope.owner.thread_id(),
+                        parent_thread_id: parent_scope.owner().thread_id(),
                         parent_turn_id: parent_scope.turn_id()?,
                         parent_item_id: None,
                     }),

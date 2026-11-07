@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 mod collect;
 mod fixture;
 pub(crate) use collect::{ProviderTestExt, ProviderTestSession};
@@ -91,7 +92,7 @@ pub(crate) async fn wait_gate(gate: &tokio::sync::Semaphore) -> Result<(), super
 pub(crate) fn address(scope: &InvocationScope) -> TurnAddress {
     TurnAddress {
         scope: scope.clone(),
-        thread_id: scope.owner.thread_id(),
+        thread_id: scope.owner().thread_id(),
         turn_id: scope
             .turn_id()
             .expect("fixture invocation identity is nonempty"),
@@ -237,7 +238,7 @@ pub(crate) fn completed_turn(
                 .expect("generated fixture binding is nonempty");
             let (sink, mut stream) = forge_provider_api::events::channel(binding, scope.clone());
             let address = TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id().map_err(|_| {
                     super::ProviderError::Observation(
                         forge_provider_api::ObservationFailure::OwnershipConflict,

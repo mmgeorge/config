@@ -6,7 +6,6 @@ use forge_protocol::message::Request;
 use forge_protocol::outbound::MessageSender;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Keep real owner admission and held generic provider work under deterministic test control.
 pub(super) struct OwnerTransitionFixture {
@@ -19,8 +18,6 @@ pub(super) struct OwnerTransitionFixture {
     pub(super) sink: MessageSender,
     pub(super) reader: tokio::task::JoinHandle<Result<()>>,
     pub(super) original: String,
-    /// Identifies the mock hold that keeps the original root invocation running.
-    pub(super) root_hold_id: String,
 }
 
 /// Start one held root invocation without using retired restart or cancellation flags.
@@ -66,7 +63,7 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
     service.dispatch(Some(session.clone()), Request { id: 2, method: "session.input.apply".into(),
         params: json!({"id":"original-owner-input","action":{"kind":"submit","message":{"id":"original-owner-input","text":"Keep this transcript through configuration","intent":"auto","attachments":[]}}}) }, &sink).await?;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         script.dispatch(
             &session,
             MockResponseCommand::Wait {
@@ -93,7 +90,6 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
         sink,
         reader,
         original,
-        root_hold_id: hold["id"].as_str().unwrap().into(),
     })
 }
 

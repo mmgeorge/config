@@ -25,15 +25,22 @@ local ok, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "inspect @completion" })
   vim.api.nvim_win_set_cursor(0, { 1, #"inspect @completion" })
   source._clear_cache()
-  vim.system = function(_, options, callback)
+  local unicode_path = "docs/résumé.md"
+  vim.system = function(command, options, callback)
     assert(options.cwd == root, "file discovery used Neovim cwd instead of the workspace")
-    vim.schedule(function() callback({ code = 0, stdout = path .. "\n", stderr = "" }) end)
+    -- Without `-z`, Git quotes non-ASCII paths as octal escapes such as "r\303\251sum\303\251".
+    assert(vim.tbl_contains(command, "-z"), "file discovery requested quoted Git paths")
+    vim.schedule(function()
+      callback({ code = 0, stdout = path .. "\0" .. unicode_path .. "\0", stderr = "" })
+    end)
   end
   local result
   source.new():get_completions({}, function(value) result = value end)
   assert(vim.wait(1000, function() return result ~= nil end), "file completion timed out")
   local completion = result.items[1]
   assert(completion.label == "@" .. path)
+  assert(vim.iter(result.items):any(function(item) return item.label == "@" .. unicode_path end),
+    "a non-ASCII workspace path was not offered verbatim")
   assert(completion.filterText == "@" .. path)
   completion.source_id = "harness_files"
   completion.source_name = "Workspace files"

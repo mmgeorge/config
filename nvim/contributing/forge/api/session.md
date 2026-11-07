@@ -1021,7 +1021,7 @@ Run the chosen provider authentication method.
 
 ### Contract
 
-Requires `method` (provider authentication method string). Returns `{ "authenticated": true }` after the selected provider's authentication flow completes. It uses this session's captured catalog request, may launch interactive/provider authentication work, and invalidates cached MCP discovery afterward. Unsupported methods, cancellation, provider failures, and missing credentials are errors. It does not submit a user prompt or grant unrelated command permissions.
+Requires `method` (provider authentication method string). Returns `{ "authenticated": true }` after the selected provider's authentication flow completes. It uses this session's captured catalog request, may launch interactive/provider authentication work, and invalidates cached MCP discovery afterward. It requires idle execution and no pending cleanup, and rejects either condition before contacting the provider. Unsupported methods, cancellation, provider failures, and missing credentials are errors. It does not submit a user prompt or grant unrelated command permissions.
 
 ## `session.provider.capabilities.get`
 
@@ -1101,7 +1101,7 @@ Inspect the installed provider integration.
 
 ### Contract
 
-Calls the selected provider's inspection operation and returns normalized `runtime.kind` (`available`, `missing`, `incompatible`, or `unavailable`), `origin` (`configured` or `managed`), independent `versions.provider` and `versions.adapter` observations, and `authentication` choices. Version observations are `known` with a version, `not_reported`, or `failed` with a normalized failure category. Authentication carries an opaque method ID, label, description, and either a provider-managed interaction or a terminal launch specification. Probe failure does not hide otherwise available authentication methods. It never installs software or sends model input. The operation requires idle execution and no pending cleanup, and invalidates MCP discovery after success. Unsupported providers and active work return typed errors; unavailable runtimes return their typed status.
+Calls the selected provider's inspection operation and returns normalized `runtime.kind` (`available`, `missing`, `incompatible`, or `unavailable`), `origin` (`configured` or `managed`), independent `versions.provider` and `versions.adapter` observations, and `authentication` choices. Version observations are `known` with a version, `not_reported`, or `failed` with a normalized failure category. Authentication carries an opaque method ID, label, description, and either a provider-managed interaction or a terminal launch specification. Probe failure does not hide otherwise available authentication methods. It never installs software or sends model input. Because inspection changes no native state, it runs alongside active work and pending cleanup and leaves MCP discovery intact. Unsupported providers return typed errors; unavailable runtimes return their typed status.
 
 ## `session.provider.skill.list`
 
@@ -1250,7 +1250,7 @@ Read the current session snapshot.
 
 ### Contract
 
-No parameter fields. Returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot), including the session, current task/plan, capabilities, approval/question state, runtime epoch, and monotonic snapshot/timeline revisions. The skipped native `exchange` and `timeline` fields are not part of this result. Reads current in-memory admission state without starting a provider turn or taking another session's lease. No request progress is emitted. Reject snapshots from an older epoch or lower revision before updating the buffer.
+No parameter fields. Returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot), including the session, current task/plan, capabilities, approval/question state, runtime epoch, and monotonic snapshot/timeline revisions. The skipped native `exchange` and `timeline` fields are not part of this result. Reads current in-memory admission state without starting a provider turn or taking another session's lease. While a running turn holds the session broker, the session owner answers from committed state and the last published runtime metadata instead of waiting for the turn to finish. No request progress is emitted. Reject snapshots from an older epoch or lower revision before updating the buffer.
 
 ## `session.task.get`
 

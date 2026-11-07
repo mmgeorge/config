@@ -246,7 +246,17 @@ mod test {
     }
 }
 
-pub use forge_provider_api::input::TaskKind;
+/// Identifies the workflow independently of its permission boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// Creates a reviewable design.
+    Plan,
+    /// Implements an accepted design through its verification gates.
+    Execute,
+    /// Continues toward an explicit objective.
+    Goal,
+}
 
 #[cfg(test)]
 mod integration_test;

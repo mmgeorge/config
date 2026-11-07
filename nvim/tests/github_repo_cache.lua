@@ -4,7 +4,7 @@ local cache = require("github.repo_cache")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
 local host_client = require("forge.client")
-local original_request_host = host_client.request_host
+local original_request = host_client.request
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -281,8 +281,9 @@ local function run()
 
   local deletion_callback
   local deletion_params
-  host_client.request_host = function(method, params, callback)
-    assert_true(method == "github.issues", "cache deletion bypassed the issue service")
+  host_client.request = function(message, callback)
+    local params = message.params
+    assert_true(message.method == "github.issue.list", "cache deletion bypassed the issue service")
     assert_true(params.request.operation == "delete_cache", "cache deletion sent the wrong operation")
     deletion_callback = callback
     deletion_params = params
@@ -331,7 +332,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
-host_client.request_host = original_request_host
+host_client.request = original_request
 github_gh.reset_backend()
 issue_index._reset_for_test()
 cache.set_data_dir_for_test(nil)

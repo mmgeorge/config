@@ -80,7 +80,7 @@ impl ReconnectError {
 
 /// Capture state and its bounded retained-publication prefix in one owner update.
 pub(super) fn capture(
-    broker: &crate::broker::HarnessBroker,
+    snapshot: impl FnOnce() -> anyhow::Result<crate::broker::BrokerSnapshot>,
     services: &OwnerServices,
     cursor: Option<PublicationSequence>,
     limit: NonZeroU16,
@@ -88,7 +88,7 @@ pub(super) fn capture(
     execution_available: bool,
 ) -> Result<ReconnectSnapshot, ReconnectError> {
     let lease = services.publications.begin_reconciliation()?;
-    let snapshot = broker.snapshot().map_err(ReconnectError::Snapshot)?;
+    let snapshot = snapshot().map_err(ReconnectError::Snapshot)?;
     let input = services
         .input
         .snapshot()

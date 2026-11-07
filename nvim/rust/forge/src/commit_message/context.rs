@@ -300,11 +300,17 @@ pub async fn collect(
         } else {
             "Generate a conventional commit message for these changes.\n\n"
         };
+        // The background wrapper surrounds the excerpt after truncation, so the default budget
+        // reserves its bytes too; otherwise the wrapped prompt overruns `MAX_INPUT_BYTES`.
+        let background_wrapper_bytes = background.as_ref().map_or(0, |background| {
+            background_comparison_prompt(background, "").len()
+        });
         let limit = request.max_bytes.unwrap_or_else(|| {
             excerpt::MAX_INPUT_BYTES.saturating_sub(
                 forge_harness::provider::BACKGROUND_SYSTEM_MESSAGE.len()
                     + TextGeneration::CommitMessage.background_input("").len()
-                    + header.len(),
+                    + header.len()
+                    + background_wrapper_bytes,
             )
         });
         Some(format!(
@@ -314,8 +320,7 @@ pub async fn collect(
     };
     let prompt = if let Some(background) = &background {
         background.verify(store).await?;
-        prompt.map(|diff| format!("Current comparison at HEAD {} on {}. Earlier requests and generated drafts are history, not current changes, and a prior draft does not mean a commit happened.\n\nLast 10 reachable commits (examples of style and terminology only):\n{}\nCurrent changes:\n{}",
-            background.head.as_deref().unwrap_or("unborn"), background.branch.as_deref().unwrap_or("detached HEAD"), background.history, diff))
+        prompt.map(|diff| background_comparison_prompt(background, &diff))
     } else {
         prompt
     };
@@ -325,6 +330,21 @@ pub async fn collect(
         source_requests,
         diff_pairs,
     })
+}
+
+/// Frames the current changes with the comparison point and recent history the model may borrow
+/// style from.
+fn background_comparison_prompt(
+    background: &forge_harness::background::BackgroundContext,
+    diff: &str,
+) -> String {
+    format!(
+        "Current comparison at HEAD {} on {}. Earlier requests and generated drafts are history, not current changes, and a prior draft does not mean a commit happened.\n\nLast 10 reachable commits (examples of style and terminology only):\n{}\nCurrent changes:\n{}",
+        background.head.as_deref().unwrap_or("unborn"),
+        background.branch.as_deref().unwrap_or("detached HEAD"),
+        background.history,
+        diff
+    )
 }
 
 pub(super) fn generation_was_superseded(failure: &anyhow::Error) -> bool {

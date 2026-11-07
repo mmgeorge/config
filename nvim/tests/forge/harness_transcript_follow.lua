@@ -251,6 +251,27 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_win_get_cursor(second_window)[1] == vim.api.nvim_buf_line_count(transcript),
     "live following omitted the sibling transcript window")
 
+  -- A permission review opened over the composer mid-stream takes focus; the tail must keep following.
+  vim.api.nvim_win_set_cursor(window, { 12, 4 })
+  vim.api.nvim_set_current_win(composer_window)
+  local popup = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, { relative = "editor",
+    row = 1, col = 1, width = 20, height = 2, style = "minimal" })
+  completion_blocks[3].text = { "Tool finished", "Permission requested", string.rep("detail ", 20) .. "end" }
+  refresh()
+  assert(vim.api.nvim_get_current_win() == popup, "live following stole focus from the permission popup")
+  assert(vim.api.nvim_win_get_cursor(window)[1] == vim.api.nvim_buf_line_count(transcript),
+    "a focused popup over the composer stopped live following")
+  vim.api.nvim_win_close(popup, true)
+  vim.api.nvim_set_current_win(window)
+  vim.api.nvim_win_set_cursor(window, { 12, 4 })
+  popup = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, { relative = "editor",
+    row = 1, col = 1, width = 20, height = 2, style = "minimal" })
+  completion_blocks[3].text[2] = "Permission granted"
+  refresh()
+  expect_position(window, { 12, 4 }, "a popup opened from transcript history pulled the reader to the tail")
+  vim.api.nvim_win_close(popup, true)
+  vim.api.nvim_set_current_win(composer_window)
+
   begin_response("short", { "First response line", "Last response line" })
   expect_position(window, { 12, 4 }, "streaming response moved history")
   finish_response()
@@ -311,6 +332,31 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(window, { 12, 4 })
   refresh()
   expect_position(window, { 12, 4 }, "repeated long completion replayed reveal")
+
+  -- Steering consumed after a long answer starts a new reply; completion must reveal that reply
+  -- from its steering row rather than return the reader to the original prompt.
+  begin_response("steered", long_response)
+  local steering_row = #line_list + 1 + 1 + #long_response + 1
+  table.insert(completion_blocks, { id = "steered:steering", text = { "Steering: make it short" }, metadata = {
+    target = {}, decoration = {}, editable_region = {},
+    node = { id = "steered:steering", kind = "message", lifecycle = "settled", display = "full",
+      default_display = "full", generation = 1, more = false, content_revision = 1,
+      loaded_rows = 1, loaded_bytes = 23, order = 2 },
+    layout = { indent = 2, marker = { text = "*", capture = "ForgeHarnessPrompt" } },
+  } })
+  table.insert(completion_blocks, { id = "steered:reply", text = { "Short reply" }, metadata = {
+    target = {}, decoration = {}, editable_region = {},
+    node = { id = "steered:reply", kind = "message", lifecycle = "settled", display = "full",
+      default_display = "full", generation = 1, more = false, content_revision = 1,
+      loaded_rows = 1, loaded_bytes = 11, order = 3 },
+    layout = { indent = 2, marker = { text = "*", capture = "ForgeHarnessResponse" } },
+  } })
+  finish_response()
+  vim.cmd("redraw")
+  vim.api.nvim_win_call(window, function()
+    assert(vim.fn.line("w0") <= steering_row and vim.fn.line("w$") == vim.api.nvim_buf_line_count(transcript),
+      "steered completion hid the reply to the steering: " .. vim.inspect(vim.fn.winsaveview()))
+  end)
 
   begin_response("too-tall", { string.rep("wrapped response ", vim.api.nvim_win_get_width(window) * height) })
   finish_response()

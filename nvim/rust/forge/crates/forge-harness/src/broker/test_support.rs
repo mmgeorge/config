@@ -167,7 +167,7 @@ pub(super) async fn settle_managed_children(
 ) -> Result<Vec<SessionEvent>> {
     let mut revision = broker.agent_coordinator.subscribe();
     let mut event = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             event.extend(broker.drain_agent_commands(None).await?);
             if broker.agent_coordinator.active_count() == 0 {
@@ -407,7 +407,7 @@ pub(super) fn child_address(
     task_id: &str,
 ) -> crate::provider::TurnAddress {
     crate::provider::test_support::address(&crate::provider::InvocationScope {
-        owner: owner.clone(),
+        thread_id: forge_provider_api::ThreadId::from(owner.clone()),
         exchange_id: task_id.into(),
         invocation_id: format!("fixture:{task_id}").into(),
     })
@@ -479,7 +479,7 @@ impl HarnessBroker {
     ) -> Result<()> {
         use crate::provider::test_support::FixtureBatch;
         let scope = crate::provider::InvocationScope {
-            owner: owner.clone(),
+            thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             exchange_id: task_id.into(),
             invocation_id: format!("fixture:{task_id}").into(),
         };

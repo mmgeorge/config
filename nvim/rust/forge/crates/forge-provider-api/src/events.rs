@@ -7,25 +7,11 @@ use super::{
     TextUpdate,
 };
 
-/// Own connection delivery while the shared retained runner owns terminal publication.
+/// Own connection delivery for one provider binding.
 ///
-/// Native adapters cannot obtain a terminal publisher from a connection sink.
-///
-/// ```compile_fail
-/// use forge_provider_api::{ProviderEventSink, TurnAddress};
-/// fn publish(sink: ProviderEventSink, address: TurnAddress) {
-///     let publisher = sink.turn_publisher(address);
-/// }
-/// ```
-///
-/// Observed child turns use the same retained runner boundary.
-///
-/// ```compile_fail
-/// use forge_provider_api::{ProviderEventSink, TurnAddress};
-/// fn publish(sink: ProviderEventSink, address: TurnAddress) {
-///     let publisher = sink.observed_turn_publisher(address);
-/// }
-/// ```
+/// Terminal turn publication goes through a [`TurnPublisher`] claimed from this sink. The sink
+/// grants at most one publisher per turn, so the retained runner in `forge-providers` that claims
+/// it becomes the turn's only lifecycle authority and a second claim fails at runtime.
 #[derive(Clone)]
 pub struct ProviderEventSink {
     binding_id: BindingId,
@@ -298,7 +284,7 @@ impl ProviderEventSink {
                     expected: Box::new(self.scope.clone()),
                     received: Box::new(invocation.clone().into()),
                 })?;
-        if original.owner != invocation.owner
+        if original.thread_id != invocation.thread_id
             || original.exchange_id != invocation.exchange_id
             || original.invocation_id == invocation.invocation_id
         {
@@ -316,7 +302,7 @@ impl ProviderEventSink {
     /// Bind an owner-wide session publisher to an original event scope.
     pub fn bind_scope(&self, received: EventScope) -> Result<Self, EventDeliveryError> {
         if !matches!(self.scope, EventScope::Binding { .. })
-            || self.scope.owner() != received.owner()
+            || self.scope.thread_id() != received.thread_id()
         {
             return Err(EventDeliveryError::OwnershipMismatch {
                 expected: Box::new(self.scope.clone()),
@@ -399,14 +385,16 @@ impl ProviderEventSink {
         AdapterActivityWriter { sink: self.clone() }
     }
 
-    /// Create the retained runner's lifecycle publication authority for an admitted host turn.
-    pub(crate) fn turn_publisher(
+    /// Claim the sole lifecycle publication authority for an admitted host turn.
+    ///
+    /// Each turn can be claimed once, so the runtime's retained runner is its only publisher.
+    pub fn turn_publisher(
         &self,
         address: crate::TurnAddress,
     ) -> Result<TurnPublisher, ProviderError> {
-        if address.thread_id != address.scope.owner.thread_id()
+        if address.thread_id != address.scope.thread_id
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
-            || self.scope.owner() != &address.scope.owner
+            || self.scope.thread_id() != &address.scope.thread_id
         {
             return Err(crate::ProviderFailure::new(
                 crate::ProviderOperation::TurnStart,
@@ -452,7 +440,7 @@ impl ProviderEventSink {
     }
 
     /// Create lifecycle authority for a positively correlated native child with independent collection ownership.
-    pub(crate) fn observed_turn_publisher(
+    pub fn observed_turn_publisher(
         &self,
         address: crate::TurnAddress,
     ) -> Result<TurnPublisher, ProviderError> {
@@ -520,7 +508,7 @@ impl ProviderEventSink {
                 crate::ObservationFailure::UnexpectedExecution,
             ));
         }
-        if thread.is_some_and(|thread| thread != &self.scope.owner().thread_id())
+        if thread.is_some_and(|thread| thread != self.scope.thread_id())
             || turn.is_some_and(|turn| {
                 self.scope
                     .invocation()
@@ -808,9 +796,16 @@ impl ProviderEventSink {
     /// Publish a bounded envelope synchronously while preserving the same sequence protocol.
     fn send_immediate(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
         let event = self.envelope(event)?;
-        self.sender
-            .send(&event)
-            .map_err(EventDeliveryError::queue)?;
+        self.sender.send(&event).map_err(|error| {
+            // A full outbound queue loses this event. `queue` maps `WouldBlock` to the
+            // receiver's `Empty`, which readers treat as an idle stream, so the
+            // producer classifies exhausted capacity as observation overflow.
+            if error.kind() == io::ErrorKind::WouldBlock {
+                EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow)
+            } else {
+                EventDeliveryError::queue(error)
+            }
+        })?;
         self.published
             .store(event.sequence.get(), std::sync::atomic::Ordering::Release);
         Ok(())
@@ -1217,21 +1212,14 @@ impl TurnRegistrationReader {
         crate::EventSequence::new(self.published.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// Get an exact registered thread's owner without selecting an active or visible turn.
-    pub fn thread_owner(&self, thread_id: &crate::ThreadId) -> Option<crate::ThreadOwner> {
-        let ownership = self
-            .ownership
+    /// Report whether a registered turn names this thread, without selecting any turn.
+    pub fn thread_registered(&self, thread_id: &crate::ThreadId) -> bool {
+        self.ownership
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut owners = ownership
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .registered_turns
             .values()
-            .filter(|address| &address.thread_id == thread_id)
-            .map(|address| &address.scope.owner);
-        let original = owners.next()?;
-        owners
-            .all(|owner| owner == original)
-            .then(|| original.clone())
+            .any(|address| &address.thread_id == thread_id)
     }
 
     /// Get a definitive no-start operation error retained after successful native collection.
@@ -1357,8 +1345,11 @@ impl AdapterActivityWriter {
         &self,
         address: crate::TurnAddress,
     ) -> Result<Self, EventDeliveryError> {
-        if address.scope.owner.session_id() != self.sink.scope.owner().session_id()
-            || address.thread_id != address.scope.owner.thread_id()
+        if !address
+            .scope
+            .thread_id
+            .shares_namespace(self.sink.scope.thread_id())
+            || address.thread_id != address.scope.thread_id
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
         {
             return Err(EventDeliveryError::Observation(
@@ -1437,8 +1428,8 @@ impl AdapterActivityWriter {
     }
 }
 
-/// Own lifecycle publication for one retained shared turn runner.
-pub(crate) struct TurnPublisher {
+/// Own lifecycle publication for one claimed turn on behalf of the provider runtime's runner.
+pub struct TurnPublisher {
     sink: ProviderEventSink,
     address: crate::TurnAddress,
     started: std::sync::Arc<tokio::sync::Mutex<Option<i64>>>,
@@ -1458,7 +1449,7 @@ pub struct NativeTurnStart {
 
 impl TurnPublisher {
     /// Create the adapter's restricted positive-start capability.
-    pub(crate) fn start_handle(&self) -> NativeTurnStart {
+    pub fn start_handle(&self) -> NativeTurnStart {
         NativeTurnStart {
             sink: self.sink.clone(),
             address: self.address.clone(),
@@ -1468,11 +1459,11 @@ impl TurnPublisher {
         }
     }
     /// Check whether positively attributed native work began.
-    pub(crate) async fn has_started(&self) -> bool {
+    pub async fn has_started(&self) -> bool {
         self.observed.load(std::sync::atomic::Ordering::Acquire)
     }
     /// Seal foreground activity at the native boundary before resource collection can wait.
-    pub(crate) async fn native_ended(&self) {
+    pub async fn native_ended(&self) {
         let _delivery = self.sink.delivery.lock().await;
         self.sink
             .ownership
@@ -1483,7 +1474,7 @@ impl TurnPublisher {
     }
 
     /// Publish one collected native result without changing its outcome.
-    pub(crate) async fn completed(
+    pub async fn completed(
         self,
         result: crate::TurnResult,
         collected_at_ms: i64,
@@ -1516,7 +1507,7 @@ impl TurnPublisher {
         Ok(completed)
     }
     /// Retain a collected no-start operation error without constructing native turn completion.
-    pub(crate) fn not_started(self, error: ProviderError) {
+    pub fn not_started(self, error: ProviderError) {
         if self.observed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -1539,7 +1530,7 @@ impl TurnPublisher {
     }
 
     /// Fence the original connection while preserving the operation's first failure.
-    pub(crate) async fn unavailable(&self, failure: crate::ProviderFailure) {
+    pub async fn unavailable(&self, failure: crate::ProviderFailure) {
         self.sink.unavailable(failure).await;
     }
 }
@@ -1620,13 +1611,13 @@ impl NativeTurnStart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterActivity, ThreadOwner, TurnAddress, TurnEvent, TurnMetadataEvent};
+    use crate::{AdapterActivity, TurnAddress, TurnEvent, TurnMetadataEvent};
 
     /// Create one exact host registration before native dispatch.
     fn fixture() -> (ProviderEventSink, ProviderEventStream, TurnAddress) {
-        let scope = InvocationScope::new(ThreadOwner::root("owner"), "exchange");
+        let scope = InvocationScope::new(crate::testing::root_thread("owner"), "exchange");
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope: scope.clone(),
         };
@@ -1788,7 +1779,7 @@ mod tests {
             .send_wait(activity(address.turn_id))
             .await
             .unwrap();
-        let successor = InvocationScope::new(address.scope.owner.clone(), "successor");
+        let successor = InvocationScope::new(address.scope.thread_id.clone(), "successor");
         let sibling = ProviderEventSink {
             scope: successor.clone().into(),
             ..sink.clone()
@@ -2063,14 +2054,14 @@ mod tests {
     #[test]
     fn child_registration_is_original_and_rejects_reassignment() {
         let (sink, stream, address) = fixture();
-        let child_owner = ThreadOwner::new(
-            address.scope.owner.session_id().clone(),
-            crate::AgentId::new("child").unwrap(),
-        )
-        .unwrap();
+        let child_owner = address
+            .scope
+            .thread_id
+            .child(&crate::AgentId::new("child").unwrap())
+            .unwrap();
         let scope = InvocationScope::new(child_owner, "child-exchange");
         let child = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };

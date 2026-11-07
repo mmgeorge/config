@@ -332,6 +332,9 @@ pub fn pointer_string(value: &Value, pointer_list: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Tokens Codex reserves inside each model context window for its own instructions and tools.
+const CODEX_RESERVED_CONTEXT_TOKENS: u64 = 12_000;
+
 pub fn context_usage(params: &Value) -> Option<ContextUsage> {
     if let Some(token_usage) = params
         .get("tokenUsage")
@@ -345,7 +348,8 @@ pub fn context_usage(params: &Value) -> Option<ContextUsage> {
             .get("modelContextWindow")
             .or_else(|| token_usage.get("model_context_window"))
             .and_then(Value::as_u64)?;
-        return ContextUsage::with_baseline(used, size, 12_000);
+        // Codex keeps a fixed instruction and tool baseline inside every model window.
+        return ContextUsage::with_reserved(used, size, CODEX_RESERVED_CONTEXT_TOKENS);
     }
     let update = params.get("update").unwrap_or(params);
     let used = update.get("used").and_then(Value::as_u64)?;

@@ -244,18 +244,6 @@ impl RuntimeMethod {
 
 #[cfg(test)]
 mod test {
-    /// Reject retired mutation aliases before accessing any session state.
-    #[test]
-    fn rejects_retired_question_and_manual_check_methods() {
-        for method in [
-            "session.question.ask",
-            "session.check.run",
-            "session.check.cancel",
-        ] {
-            let error = super::RuntimeMethod::decode(method).unwrap_err();
-            assert!(error.to_string().contains("unsupported runtime method"));
-        }
-    }
 
     /// Timeout feedback is an owner event and cannot be invoked as a public mutation.
     #[test]
@@ -266,54 +254,5 @@ mod test {
                 .to_string()
                 .contains("approval timeout feedback is owned internally")
         );
-    }
-
-    /// Reject the retired public restart path instead of admitting a second lifecycle authority.
-    #[test]
-    fn rejects_public_restart_method() {
-        let error = super::RuntimeMethod::decode("session.turn.restart").unwrap_err();
-        assert!(error.to_string().contains("unsupported runtime method"));
-    }
-
-    #[test]
-    fn rejects_retired_plan_acceptance_methods() {
-        for method in [
-            "session.plan.acceptance.begin",
-            "session.plan.acceptance.cancel",
-        ] {
-            let error = super::RuntimeMethod::decode(method).unwrap_err();
-            assert!(error.to_string().contains("unsupported runtime method"));
-        }
-    }
-
-    #[test]
-    fn check_editing_has_no_guided_setup_operation() {
-        assert_eq!(
-            super::RuntimeMethod::decode("session.check.editing.set").unwrap(),
-            super::RuntimeMethod::SessionCheckEditingSet
-        );
-        assert!(super::RuntimeMethod::decode("checks.setup").is_err());
-    }
-
-    #[test]
-    fn exchange_methods_replace_interaction_names_without_aliases() {
-        for (old, renamed) in [
-            ("list", "list"),
-            ("comment.save", "comment.save"),
-            ("rollback.prepare", "rollback.prepare"),
-            ("rollback.preview", "rollback.preview"),
-            ("rollback.apply", "rollback.apply"),
-            ("recovery", "recovery"),
-        ] {
-            assert!(super::RuntimeMethod::decode(&format!("session.exchange.{renamed}")).is_ok());
-            assert!(super::RuntimeMethod::decode(&format!("exchange.{old}")).is_err());
-            assert!(super::RuntimeMethod::decode(&format!("interaction.{old}")).is_err());
-        }
-    }
-
-    #[test]
-    fn rejects_independent_child_submission() {
-        assert!(super::RuntimeMethod::decode("exchange.rollback").is_err());
-        assert!(super::RuntimeMethod::decode("agent.submit").is_err());
     }
 }

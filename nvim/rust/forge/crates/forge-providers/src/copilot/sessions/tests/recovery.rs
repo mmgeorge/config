@@ -14,12 +14,12 @@ async fn terminal_monitor_shutdown_cancels_pending_query_without_stopping_health
         let peer = RecoveryPeer::attach(&runtime, "1.0.103").await;
         let client = runtime.client(".").await.unwrap();
         let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
-        let owner = forge_provider_api::ThreadOwner::root("terminal-owner");
+        let owner = forge_provider_api::testing::root_thread("terminal-owner");
         let _session = recovery_session(&sessions, client.clone(), &owner).await;
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-fixture").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         sessions
@@ -77,7 +77,7 @@ async fn failed_mcp_configuration_collects_provisional_session_without_dead_deta
                 .acquire(
                     async move { Ok((client, None)) },
                     SessionSelection {
-                        execution_owner: forge_provider_api::ThreadOwner::root("config-owner"),
+                        execution_owner: forge_provider_api::testing::root_thread("config-owner"),
 
                         correlation_id: "config-owner".into(),
                         session_id: None,
@@ -130,7 +130,7 @@ async fn failed_mcp_configuration_collects_provisional_session_without_dead_deta
                 .provisional
                 .lock()
                 .unwrap()
-                .contains_key(&forge_provider_api::ThreadOwner::root("config-owner"))
+                .contains_key(&forge_provider_api::testing::root_thread("config-owner"))
         );
         assert!(profile_path.exists());
         peer.stop.send(()).unwrap();
@@ -180,11 +180,11 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
         let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
         let mut owned = Vec::new();
         for id in ["idle-owner", "active-owner", "catalog-owner"] {
-            let owner = forge_provider_api::ThreadOwner::root(id);
+            let owner = forge_provider_api::testing::root_thread(id);
             let (sink, stream) = forge_provider_api::events::channel(
                 forge_provider_api::BindingId::new("recovery-owner").unwrap(),
                 forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: owner.clone(),
                 },
             );
             if id != "catalog-owner" {
@@ -208,7 +208,7 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
         old.stop.send(()).unwrap();
         old.task.await.unwrap();
         for (owner, _, stream) in &mut owned {
-            if owner.session_id().as_str() == "catalog-owner" {
+            if *owner == forge_provider_api::testing::root_thread("catalog-owner") {
                 continue;
             }
             loop {
@@ -267,9 +267,9 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
         assert!(
             sessions
                 .bind_generation(
-                    &forge_provider_api::ThreadOwner::root("late-old-binding"),
+                    &forge_provider_api::testing::root_thread("late-old-binding"),
                     client.generation.clone(),
-                    forge_provider_api::ThreadOwner::root("late-old-binding")
+                    forge_provider_api::testing::root_thread("late-old-binding")
                 )
                 .await
                 .is_err()
@@ -294,7 +294,7 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
         let new_client = runtime.client(".").await.unwrap();
         client.fail_generation(forge_provider_api::lifecycle::ObservationFailure::Overflow);
         new_client.ensure_healthy().unwrap();
-        let new_owner = forge_provider_api::ThreadOwner::root("new-owner");
+        let new_owner = forge_provider_api::testing::root_thread("new-owner");
         let session = recovery_session(&sessions, new_client, &new_owner).await;
         assert_eq!(
             replacement

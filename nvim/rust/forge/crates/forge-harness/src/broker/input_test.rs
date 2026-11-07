@@ -6,6 +6,7 @@ use super::super::{
     SqliteStore, TimelineEntry, publication,
 };
 use super::test_support::{completed_message, planning_question_broker, repository};
+use crate::provider::ScopeOwner;
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::sync::Arc;
@@ -87,7 +88,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     }));
     assert!(transaction.accepts_steering());
     transaction.native.authorize_submission();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if matches!(
                 transaction.next().await?,
@@ -105,7 +106,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     assert!(futures_util::FutureExt::now_or_never(transaction.next()).is_none());
     drop(flight);
     assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), transaction.next()).await??,
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, transaction.next()).await??,
         ForegroundSignal::Native(NativeForegroundSignal::NativeReady(_))
     ));
     transaction.acknowledge_native_result();
@@ -233,8 +234,8 @@ async fn apply_task_start_fixture(
         "Complete startup work.\nVerify the result.",
     )?;
     let presentation = crate::provider::session_execution::InputPresentation::TaskStarted {
-        start: forge_provider_api::input::TaskStart {
-            kind: forge_provider_api::input::TaskKind::Goal,
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
             title: "Reduce startup time".into(),
         },
         prompt: "Complete startup work.\nVerify the result.".into(),
@@ -335,7 +336,7 @@ async fn owned_foreground_applies_events_and_rejects_foreign_scope() -> Result<(
         crate::provider::test_support::native_event(
             scope.clone(),
             ProviderEvent::Item {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id().unwrap(),
                 item_id: forge_provider_api::ItemId::new("foreground-message").unwrap(),
                 event: forge_provider_api::ItemEvent::Started(
@@ -351,7 +352,7 @@ async fn owned_foreground_applies_events_and_rejects_foreign_scope() -> Result<(
             },
         )
     };
-    let foreign = crate::provider::InvocationScope::new(scope.owner.clone(), "another-exchange");
+    let foreign = crate::provider::InvocationScope::new(scope.owner().clone(), "another-exchange");
     assert!(
         broker
             .apply_owned_foreground(&mut transaction, event(foreign))
@@ -405,8 +406,8 @@ async fn task_start_updates_live_presentation_before_the_turn_finishes() -> Resu
         "Complete startup work.\nVerify the result.",
     )?;
     let presentation = crate::provider::session_execution::InputPresentation::TaskStarted {
-        start: forge_provider_api::input::TaskStart {
-            kind: forge_provider_api::input::TaskKind::Goal,
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
             title: "Reduce startup time".into(),
         },
         prompt: "Complete startup work.\nVerify the result.".into(),
@@ -490,7 +491,7 @@ impl BoundarySteeringProvider {
 }
 
 async fn await_boundary_barrier(semaphore: &tokio::sync::Semaphore, name: &str) -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(3), semaphore.acquire())
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, semaphore.acquire())
         .await
         .with_context(|| format!("boundary fixture timed out waiting for {name}"))??
         .forget();
@@ -540,13 +541,13 @@ impl BoundarySteeringProvider {
                     input.lock().unwrap().push(text.clone());
                     let continuation = text == "boundary correction";
                     let address = crate::provider::TurnAddress {
-                        thread_id: (request.scope.clone()).owner.thread_id(),
+                        thread_id: (request.scope.clone()).owner().thread_id(),
                         turn_id: (request.scope.clone()).turn_id().unwrap(),
                         scope: request.scope.clone(),
                     };
                     sink.send_wait(crate::provider::test_support::activity(
                         ProviderEvent::Thread {
-                            thread_id: (request.scope.clone()).owner.thread_id(),
+                            thread_id: (request.scope.clone()).owner().thread_id(),
                             event: forge_provider_api::ThreadEvent::IdentityResolved(
                                 "boundary-history"
                                     .to_owned()
@@ -679,10 +680,9 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     tokio::pin!(pending);
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
     provider.initial_release.add_permits(1);
-    let (_broker, result) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), running).await??;
+    let (_broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running).await??;
     assert!(result.is_err());
-    let rejected = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+    let rejected = tokio::time::timeout(crate::hang_guard::HANG_GUARD, pending)
         .await?
         .unwrap_err();
     assert!(matches!(
@@ -708,7 +708,7 @@ async fn accepted_steering_survives_response_failure() -> Result<()> {
 #[tokio::test]
 async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Result<()> {
     for accept_before_cancel in [false, true] {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -755,18 +755,18 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                 .await?;
             if accept_before_cancel {
                 provider.continuation_accept.add_permits(1);
-                tokio::time::timeout(std::time::Duration::from_secs(3), &mut steering)
+                tokio::time::timeout(crate::hang_guard::HANG_GUARD, &mut steering)
                     .await
                     .context("boundary fixture timed out waiting for continuation acceptance")??;
             }
             cancellation.request();
-            let (broker, result) = tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running)
                 .await
                 .context("boundary fixture timed out collecting cancelled invocation")??;
             assert!(result.is_err());
             if !accept_before_cancel {
                 assert!(
-                    tokio::time::timeout(std::time::Duration::from_secs(3), steering)
+                    tokio::time::timeout(crate::hang_guard::HANG_GUARD, steering)
                         .await
                         .context("boundary fixture timed out resolving unaccepted input")?
                         .is_err(),
@@ -800,7 +800,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
 }
 
 async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -843,11 +843,11 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         assert!(futures_util::poll!(steering.as_mut()).is_pending(),
             "a continuation was acknowledged while its journal still allowed requeueing");
         provider.continuation_accept.add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(3), steering).await.context("boundary fixture timed out waiting for continuation acceptance")??;
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, steering).await.context("boundary fixture timed out waiting for continuation acceptance")??;
         assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { .. }));
         assert!(!running.is_finished(), "steering acknowledgement waited for the full provider response");
         provider.continuation_release.add_permits(1);
-        let (broker, result) = tokio::time::timeout(std::time::Duration::from_secs(3), running).await.context("boundary fixture timed out collecting continuation")??;
+        let (broker, result) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, running).await.context("boundary fixture timed out collecting continuation")??;
         if fail_response { assert!(result.is_err()); } else { result?; }
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1, "steering created a second exchange");
@@ -956,7 +956,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
         tokio::time::timeout(std::time::Duration::from_secs(1), steering.as_mut()).await;
     cancellation.request();
     provider.inner.initial_release.add_permits(1);
-    let _cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+    let _cancelled = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running)
         .await
         .context("steering fixture execution did not collect after cancellation")??;
 

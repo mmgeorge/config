@@ -248,11 +248,11 @@ impl Fixture {
             release_permission: watch::channel(false).0,
         });
         let router: Arc<dyn NativeCallbackRouter> = callbacks.clone();
-        let owner = ThreadOwner::root("shell-fixture");
+        let owner = forge_provider_api::testing::root_thread("shell-fixture");
         let (sink, events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("shell-fixture").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let shell = Arc::new(ShellSession::new(Arc::downgrade(&router), owner, sink));

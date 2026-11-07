@@ -372,8 +372,8 @@ impl HarnessBroker {
         }
         transaction.attached_results.clear();
         self.store.save_exchange(&transaction.state.interaction)?;
-        let decision = self.requires_explicit_continuation(&transaction.state.interaction)?
-            || question_override.is_some()
+        let stopped_child = self.requires_explicit_continuation(&transaction.state.interaction)?;
+        let user_decision = question_override.is_some()
             || output.plan_question.is_some()
             || output.question_withdrawal.is_some()
             || output.plan_submit.is_some()
@@ -384,30 +384,48 @@ impl HarnessBroker {
             .provider_session_id
             .clone()
             .or(transaction.request.provider_session_id.clone());
-        if !decision && transaction.collection.is_none() {
-            while let Some(input) = transaction.steering.active.try_receive() {
-                transaction.steering.deferred.push_back(input);
+        // A child stop that requires authorization suppresses automatic continuation, but running
+        // siblings still own the exchange: finalizing now would capture an unsettled tree.
+        if !user_decision && transaction.collection.is_none() {
+            if !stopped_child {
+                while let Some(input) = transaction.steering.active.try_receive() {
+                    transaction.steering.deferred.push_back(input);
+                }
             }
             if self.agent_coordinator.is_quiescing() {
+                // Quiescence release bumps the agent revision, which unparks this result.
                 transaction.pending_native_ready = Some(Ok(output));
+                transaction.native_ready_parked = true;
                 return Ok(ForegroundAction::Wait);
             }
             let unresolved = self
                 .agent_coordinator
                 .has_unresolved_task(&transaction.state.interaction.id);
-            let results = if transaction.steering.deferred.is_empty() {
+            // A stopped child leaves its report unreported until user authorization, so only
+            // still-running children keep this exchange waiting.
+            let waiting_for_children = if stopped_child {
+                self.agent_coordinator
+                    .has_active_task(&transaction.state.interaction.id)
+            } else {
+                unresolved
+            };
+            let results = if stopped_child {
+                Vec::new()
+            } else if transaction.steering.deferred.is_empty() {
                 self.agent_coordinator
                     .pending_result(&transaction.state.interaction.id)
             } else {
                 self.agent_coordinator.unreported_result()
             };
-            let child_continuation = transaction.steering.deferred.is_empty()
+            let resume_input = !stopped_child && !transaction.steering.deferred.is_empty();
+            let child_continuation = !stopped_child
+                && transaction.steering.deferred.is_empty()
                 && unresolved
                 && !self
                     .agent_coordinator
                     .has_active_task(&transaction.state.interaction.id)
                 && !results.is_empty();
-            if (!transaction.steering.deferred.is_empty() || child_continuation || !unresolved)
+            if (resume_input || child_continuation || !waiting_for_children)
                 && self
                     .active_wait_projection
                     .as_ref()
@@ -420,7 +438,7 @@ impl HarnessBroker {
                     delivery,
                 )));
             }
-            if !transaction.steering.deferred.is_empty() || child_continuation {
+            if resume_input || child_continuation {
                 let messages = results
                     .iter()
                     .map(|task| self.agent_result_message(task))
@@ -448,7 +466,8 @@ impl HarnessBroker {
                 } else {
                     (
                         ProviderInput::from_text(format!(
-                            "Continue this same unfinished request using the child messages below. Synthesize the results and complete the original request when its required work is settled.\n\n{messages}"
+                            "{} Synthesize the results and complete the original request when its required work is settled.\n\n{messages}",
+                            crate::agent::report::CHILD_CONTINUATION_PREAMBLE
                         )),
                         None,
                     )
@@ -472,8 +491,9 @@ impl HarnessBroker {
                 transaction.attached_results = results;
                 return Ok(ForegroundAction::Wait);
             }
-            if unresolved {
+            if waiting_for_children {
                 transaction.pending_native_ready = Some(Ok(output));
+                transaction.native_ready_parked = true;
                 let agent_count = self.agent_coordinator.active_count();
                 let prior = self
                     .active_wait_projection

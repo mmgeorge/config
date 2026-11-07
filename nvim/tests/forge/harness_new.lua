@@ -65,6 +65,12 @@ local function fake_launcher(_, options, _)
     if request.method == "host.transport.consumed" then return end
     if request.method == "host.initialize" then
       emit(options, { id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
+    elseif request.method == "provider.registry.list" then
+      emit(options, { id = request.id, result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry() })
+    elseif request.method == "text.initialize" then
+      emit(options, { id = request.id, result = {} })
+    elseif request.method == "session.input.get" then
+      emit(options, { id = request.id, result = { revision = 0, messages = {} } })
     elseif request.method == "session.initialize" then
       initialize_count = initialize_count + 1
       initialize_request = request
@@ -73,7 +79,7 @@ local function fake_launcher(_, options, _)
     elseif request.method == "session.new" then
       session_new_count = session_new_count + 1
       if request.params.name == "fail" then
-        emit(options, { id = request.id, error = { message = "mock new-session failure" } })
+        emit(options, { id = request.id, error = { code = "request_failed", message = "mock new-session failure" } })
       else
         emit(options, { id = request.id, result = snapshot(request.params.name) })
       end
@@ -102,12 +108,12 @@ local test_success, failure = pcall(function()
   assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
     "cold ForgeHarnessNew should create exactly one timeline tab")
   assert_true(vim.wait(1000, function()
-    return session.harness.session and session.harness.session.id == "session-1"
-  end, 10), "cold ForgeHarnessNew should initialize the requested session")
+    return session.harness.session and session.harness.session.id == "session-2"
+  end, 10), "cold ForgeHarnessNew should open the session that session.new created")
   assert_equals(initialize_count, 1, "cold ForgeHarnessNew should initialize one broker")
-  assert_equals(session_new_count, 0, "cold ForgeHarnessNew should not create an orphan session after initialization")
-  assert_equals(initialize_request.params.new_session_name, "",
-    "cold ForgeHarnessNew should explicitly request a fresh unnamed session")
+  assert_equals(session_new_count, 1, "cold ForgeHarnessNew should create its fresh session through session.new")
+  assert_equals(initialize_request.params.new_session_name, nil,
+    "cold startup should restore the broker without naming a session; session.new owns creation")
 
   local cold_tab = session.harness.timeline_tab
   require("forge.views.harness").new_session("warm start")
@@ -117,7 +123,7 @@ local test_success, failure = pcall(function()
     return session.harness.session and session.harness.session.name == "warm start"
   end, 10), "warm ForgeHarnessNew should complete through session.new")
   assert_equals(initialize_count, 1, "warm ForgeHarnessNew should reuse the running broker")
-  assert_equals(session_new_count, 1, "warm ForgeHarnessNew should create one broker session")
+  assert_equals(session_new_count, 2, "warm ForgeHarnessNew should create one broker session")
   assert_true(vim.api.nvim_tabpage_is_valid(cold_tab), "warm ForgeHarnessNew should preserve the prior timeline tab")
 
   vim.cmd("tabclose!")
@@ -129,7 +135,7 @@ local test_success, failure = pcall(function()
   assert_true(vim.wait(1000, function()
     return session.harness.session and session.harness.session.name == "after close"
   end, 10), "ForgeHarnessNew should remain usable after every timeline closes")
-  assert_equals(session_new_count, 2, "ForgeHarnessNew after tab closure should reuse the running broker")
+  assert_equals(session_new_count, 3, "ForgeHarnessNew after tab closure should reuse the running broker")
 
   local successful_tab = session.harness.timeline_tab
   require("forge.views.harness").new_session("fail")

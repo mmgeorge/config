@@ -19,12 +19,18 @@ local ok,failure=xpcall(function()
       text_correction={enabled=true,wordlist=shared_dictionary},
       harper={enabled=true,cmd={executable,'--stdio'},settings={linters={SpellCheck=true}}},
     })
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use teh spelling.','ok that is the way.'})
+    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use recieve spelling.','ok that is the way.'})
+    -- Harper also reports grammar rules and its own vocabulary gaps, so the dictionary contract
+    -- tracks only the spelling diagnostic on the misspelled word.
+    function spelling_flagged()
+      for _,diagnostic in ipairs(vim.diagnostic.get(0)) do
+        if diagnostic.lnum==0 and diagnostic.col==4 and diagnostic.code=='SpellCheck' then return true end
+      end
+      return false
+    end
   ]],{executable})
   assert(vim.wait(10000,function()
-    return fixture.exec([[for _,diagnostic in ipairs(vim.diagnostic.get(0)) do
-      if diagnostic.lnum==0 and diagnostic.col==4 then return true end
-    end return false]])
+    return fixture.exec('return spelling_flagged()')
   end,10),'Harper did not flag the unknown spelling: '..vim.inspect(fixture.exec([[
     return {diagnostics=vim.diagnostic.get(0),errors=text_errors,
       clients=vim.tbl_map(function(client) return {name=client.name,initialized=client.initialized} end,
@@ -38,7 +44,7 @@ local ok,failure=xpcall(function()
     assert(client.settings['harper-ls'].userDictPath~=shared_dictionary,'Harper must not rewrite source comments')
     client:request('textDocument/codeAction',{
       textDocument=vim.lsp.util.make_text_document_params(),
-      range={start={line=0,character=4},['end']={line=0,character=7}},
+      range={start={line=0,character=4},['end']={line=0,character=11}},
       context={diagnostics={}},
     },function(error,actions) shared_actions=actions;shared_action_error=error end,0)
   ]])
@@ -64,33 +70,37 @@ local ok,failure=xpcall(function()
     return fixture.exec([[
       local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
       return client and client.settings['harper-ls'].userDictPath~=previous_dictionary
-        and #vim.diagnostic.get(0)==0
+        and not spelling_flagged()
     ]])
-  end,10),'Shared dictionary did not refresh Harper against unsaved text')
+  end,10),'Shared dictionary did not refresh Harper against unsaved text: '..vim.inspect(fixture.exec([[
+    local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
+    return {previous=previous_dictionary,current=client and client.settings['harper-ls'].userDictPath,
+      diagnostics=vim.diagnostic.get(0),errors=text_errors}
+  ]])))
   fixture.exec([[
     local saved=vim.fn.readfile(shared_dictionary)
     assert(saved[1]=='# Version-controlled vocabulary')
-    assert(vim.tbl_contains(saved,'teh'),vim.inspect(saved))
+    assert(vim.tbl_contains(saved,'recieve'),vim.inspect(saved))
     vim.api.nvim_buf_set_lines(0,0,-1,false,{''})
     vim.api.nvim_win_set_cursor(0,{1,0})
   ]])
-  fixture.type('iUse teh ')
-  fixture.wait('Use teh ')
+  fixture.type('iUse recieve ')
+  fixture.wait('Use recieve ')
   fixture.type('<Esc>')
   fixture.exec([[
     vim.fn.writefile({'repo'},shared_dictionary)
     vim.api.nvim_exec_autocmds('BufWritePost',{pattern=shared_dictionary})
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use teh spelling.'})
+    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use recieve spelling.'})
     vim.api.nvim_win_set_cursor(0,{1,0})
   ]])
-  assert(vim.wait(5000,function() return fixture.exec('return #vim.diagnostic.get(0)>0') end,10),
+  assert(vim.wait(5000,function() return fixture.exec('return spelling_flagged()') end,10),
     'Removing an accepted word did not refresh Harper')
   fixture.exec([[
     vim.api.nvim_buf_set_lines(0,0,-1,false,{''})
     vim.api.nvim_win_set_cursor(0,{1,0})
   ]])
-  fixture.type('iUse teh ')
-  fixture.wait('Use the ')
+  fixture.type('iUse recieve ')
+  fixture.wait('Use receive ')
   fixture.exec([[for _,client in ipairs(vim.lsp.get_clients({name='harper_ls'})) do client:stop() end]])
   local errors=fixture.exec('return text_errors')
   assert(#errors==0,vim.inspect(errors))

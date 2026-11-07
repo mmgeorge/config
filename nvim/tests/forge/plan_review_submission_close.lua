@@ -38,7 +38,7 @@ local controller = require("forge.views.plan_review.native_controller")
 local comments = require("forge.draft_comments")
 
 local function open_review()
-  local plan = { id = "plan", review_digest = "canonical", working_path = vim.fn.tempname() .. ".md" }
+  local plan = { id = "plan", state = "awaiting_review", review_digest = "canonical", working_path = vim.fn.tempname() .. ".md" }
   controller.open(plan)
   local review = harness.plan_review
   local request = pending[#pending]

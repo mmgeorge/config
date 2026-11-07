@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 mod continuation_policy;
 mod observed_agents;
 use crate::provider::session_execution::{InputPresentation, OwnerObservation};
@@ -640,6 +641,9 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) question_stop_pending: bool,
     pub(crate) question_override: Option<ProviderCompletion>,
     pub(crate) pending_native_ready: Option<Result<ProviderCompletion, ProviderError>>,
+    /// Holds a deferred root result while unsettled children own the exchange. Only child
+    /// activity, user input, or collection re-exposes it; immediate re-exposure spun the owner.
+    pub(crate) native_ready_parked: bool,
     pub(crate) retraction_boundary: Option<(
         crate::provider::InvocationScope,
         forge_provider_api::CheckpointId,
@@ -685,6 +689,8 @@ pub(crate) enum ForegroundSignal {
     AgentChanged,
     AgentDelivery(Box<(crate::agent::AgentTask, Result<()>)>),
     AgentResultDelivered {
+        /// Defers native completion until the owner records this delivery's acknowledgement.
+        flight: SteeringDeliveryGuard,
         task: Box<crate::agent::AgentTask>,
         result: Result<()>,
     },
@@ -1054,6 +1060,9 @@ pub(crate) enum ForegroundJob {
         response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
     },
     AgentResult {
+        /// Keeps native completion behind a child-result steer whose acceptance is unapplied,
+        /// so finalization cannot deliver the same report again as a continuation.
+        flight: SteeringDeliveryGuard,
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         scope: crate::provider::InvocationScope,
         task: Box<crate::agent::AgentTask>,
@@ -1273,7 +1282,7 @@ impl ForegroundJob {
                 trace,
                 scope,
             } => {
-                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner().session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_close_started", "cause":format!("{original:#}"),
                 }));
                 // Scoped collection keeps the observation stream open until the interrupted
@@ -1284,7 +1293,7 @@ impl ForegroundJob {
                 } else {
                     engine.close().await
                 };
-                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner().session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_closed", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 while let Some(result) = native.join_next().await {
@@ -1297,7 +1306,7 @@ impl ForegroundJob {
                         ));
                     }
                 }
-                trace.record(scope.owner.session_id().as_str(), "foreground.cleanup", json!({
+                trace.record(scope.owner().session_id().as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"native_joined", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 Ok(ForegroundSignal::CleanupCompleted { original, cleanup })
@@ -1413,7 +1422,7 @@ impl ForegroundJob {
             } => {
                 let result = async {
                     let provider_session_id = provider
-                        .retained_session_id(&scope.owner)
+                        .retained_session_id(&scope.owner())
                         .await
                         .or(fallback);
                     engine
@@ -1465,6 +1474,7 @@ impl ForegroundJob {
                 })
             }
             Self::AgentResult {
+                flight,
                 engine,
                 scope,
                 task,
@@ -1474,7 +1484,11 @@ impl ForegroundJob {
                     .steer(scope, crate::provider::SteeringInput::AgentResult(message))
                     .await
                     .map_err(anyhow::Error::from);
-                Ok(ForegroundSignal::AgentResultDelivered { task, result })
+                Ok(ForegroundSignal::AgentResultDelivered {
+                    flight,
+                    task,
+                    result,
+                })
             }
             Self::AgentCancelApprovals {
                 coordinator,
@@ -1689,6 +1703,7 @@ impl ForegroundTransaction {
                 && !self.question_stop_pending
                 && self.steering.pending_deliveries.is_empty()
                 && self.pending_native_ready.is_some()
+                && !(self.native_ready_parked && self.collection.is_none())
             {
                 // A bounded staging window is not the entire accepted observation prefix.
                 // Recheck both upstream owners before exposing a deferred native result.
@@ -1728,14 +1743,22 @@ impl ForegroundTransaction {
                         None => std::future::pending().await,
                     }
                 } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
-                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() && self.pending_native_ready.is_none() => {
-                    return Ok(ForegroundSignal::UserInput(input.context("parent input receiver closed")?));
+                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() && (self.pending_native_ready.is_none() || self.native_ready_parked) => {
+                    let input = input.context("parent input receiver closed")?;
+                    if self.native_ready_parked {
+                        // New user input resumes a parent that waits for its children.
+                        self.steering.deferred.push_back(input);
+                        self.native_ready_parked = false;
+                        continue;
+                    }
+                    return Ok(ForegroundSignal::UserInput(input));
                 }
                 delivery = self.user_delivery.join_next(), if !self.user_delivery.is_empty() => {
                     return Ok(ForegroundSignal::UserDelivery(delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?));
                 }
                 changed = self.agent_revision.changed(), if !self.agent_command_active => {
                     changed.context("agent coordinator closed during root execution")?;
+                    self.native_ready_parked = false;
                     return Ok(ForegroundSignal::AgentChanged);
                 }
                 delivery = self.result_delivery.join_next(), if !self.result_delivery.is_empty() => {
@@ -1748,7 +1771,7 @@ impl ForegroundTransaction {
                 review = async {
                     match &mut self.pending_revision { Some((_, wait)) => wait.receiver.recv().await, None => std::future::pending().await }
                 }, if !self.revision_job_active => return Ok(ForegroundSignal::RevisionReview(review.context("revision review request lane closed")?)),
-                _ = self.scan_interval.tick(), if self.scan_enabled && self.pending_revision.is_none() => return Ok(ForegroundSignal::PlanScan),
+                _ = self.scan_interval.tick(), if self.scan_enabled && self.pending_revision.is_none() && self.collection.is_none() => return Ok(ForegroundSignal::PlanScan),
                 native = async {
                     if self.collection.is_some() { self.native.next_collected().await } else { self.native.next().await }
                 }, if self.native_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => {
@@ -2267,6 +2290,9 @@ pub struct HarnessBroker {
     question_discussion: bool,
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
+    /// Replace the session owner's wait capacity so fixtures reach saturation with a few waits.
+    #[cfg(test)]
+    pub(crate) question_wait_capacity_for_test: Option<usize>,
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
@@ -2635,7 +2661,7 @@ impl HarnessBroker {
         session = store
             .load_session(&session.id)?
             .context("session disappeared during recovery")?;
-        let agent_registry = load_agent_registry(&store, &session.id)?;
+        let mut agent_registry = load_agent_registry(&store, &session.id)?;
         startup_timing.insert(
             "session_recovered_ms",
             startup_started.elapsed().as_secs_f64() * 1000.0,
@@ -2645,12 +2671,13 @@ impl HarnessBroker {
         runtime
             .lsp
             .set_enabled(&session.id, shared.desired.lsp_tools.unwrap_or(false));
-        for task in store.list_agent_task(&session.id)? {
-            let agent = agent_registry
-                .get(&task.agent_id)
-                .cloned()
-                .context("stored task has no owning child")?;
-            agent_coordinator.retain(agent, task)?;
+        let repaired = agent_coordinator.restore(
+            store.list_agent_run(&session.id)?,
+            store.list_agent_task(&session.id)?,
+        )?;
+        for agent in repaired {
+            store.save_agent_run(&agent)?;
+            agent_registry.insert(agent);
         }
         let mut agent_provider_factory = crate::agent::AgentProviderFactory::new(
             request.provider.clone(),
@@ -2732,6 +2759,8 @@ impl HarnessBroker {
             question_model: None,
             question_discussion: false,
             question_events: None,
+            #[cfg(test)]
+            question_wait_capacity_for_test: None,
             questions,
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
@@ -2912,7 +2941,7 @@ impl HarnessBroker {
             question_discussion: self.question_discussion,
             task_controller: Some(self.task_controller.clone()),
             task_start: match &self.input_purpose {
-                crate::input::InputPurpose::TaskEntry { start, .. } => Some(start.clone()),
+                crate::input::InputPurpose::TaskEntry { start, .. } => start.clone(),
                 _ => None,
             },
             task_authority_progress: None,
@@ -3720,12 +3749,6 @@ impl HarnessBroker {
         Ok(())
     }
 
-    /// Drive a test's pending local verification through production check stages.
-    #[cfg(test)]
-    pub(crate) async fn run_task_checks(&mut self) -> Result<Vec<SessionEvent>> {
-        self.run_checks().await
-    }
-
     fn current_task_is_plan(&self) -> Result<bool> {
         Ok(matches!(
             self.task_prompt_mode()?,
@@ -4000,7 +4023,7 @@ impl HarnessBroker {
                             approval.execution_owner.as_ref().is_some_and(|owner| {
                                 owner.agent_id().as_str() == agent.id.as_str()
                                     && *owner.session_id()
-                                        == forge_provider_api::SessionId::from(
+                                        == crate::provider::SessionId::from(
                                             self.session.id.as_str(),
                                         )
                             })
@@ -4397,7 +4420,7 @@ impl HarnessBroker {
     ) -> Result<Option<(crate::provider::ThreadOwner, String, anyhow::Error)>> {
         let owner = admission.owner().clone();
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str()),
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str()),
             "child execution belongs to another session"
         );
         let prepared = (|| -> Result<_> {
@@ -4655,7 +4678,7 @@ impl HarnessBroker {
                 presentation,
             } => {
                 anyhow::ensure!(
-                    scope.owner == owner && scope.exchange_id.as_str() == task_id,
+                    scope.owner() == owner && scope.exchange_id.as_str() == task_id,
                     "child receipt crosses original task"
                 );
                 let mut exchange = self
@@ -4683,7 +4706,7 @@ impl HarnessBroker {
         };
 
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
                 && !owner.is_root(),
             "child event crosses execution ownership"
         );
@@ -4696,14 +4719,11 @@ impl HarnessBroker {
         {
             return self.apply_agent_lifecycle(source, scope, agent_id, event);
         }
-        if observation.scope().owner() != &owner {
+        if observation.scope().owner() != owner {
             return self.apply_observed_child(&observation);
         }
         let scope = observation.scope();
-        anyhow::ensure!(
-            scope.owner() == &owner,
-            "child event crosses original owner"
-        );
+        anyhow::ensure!(scope.owner() == owner, "child event crosses original owner");
         if let HarnessEvent::Native { event, .. } = &observation {
             match event.as_ref() {
                 ProviderEvent::Thread { thread_id, .. }
@@ -4904,7 +4924,7 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
                 && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
@@ -4940,7 +4960,7 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
                 && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
@@ -4977,7 +4997,7 @@ impl HarnessBroker {
                 .context("child completion exchange missing")?
         };
         for change in &host_file_changes {
-            if change.scope.owner == owner {
+            if change.scope.owner() == owner {
                 exchange.record_host_file_change(change)?;
             } else {
                 self.record_observed_host_file_change(None, change)?;
@@ -4985,7 +5005,7 @@ impl HarnessBroker {
         }
         if let Ok(completion) = &output {
             for change in &completion.host_file_changes {
-                if change.scope.owner == owner {
+                if change.scope.owner() == owner {
                     exchange.record_host_file_change(change)?;
                 } else {
                     self.record_observed_host_file_change(None, change)?;
@@ -6091,7 +6111,9 @@ impl HarnessBroker {
                                 .expect("host diagnostic is nonempty"),
                             severity: publication::DiagnosticSeverity::Warning,
                             scope: crate::provider::EventScope::Binding {
-                                owner: crate::provider::ThreadOwner::root(&self.session.id),
+                                thread_id: forge_provider_api::ThreadId::from(
+                                    crate::provider::ThreadOwner::root(&self.session.id),
+                                ),
                             },
                             native_scope: forge_provider_api::WarningScope::Provider,
                         },
@@ -6301,7 +6323,8 @@ impl HarnessBroker {
     fn agent_result_message(&self, task: &crate::agent::AgentTask) -> Result<String> {
         let agent = self.agent_coordinator.resolve(&task.agent_id)?;
         Ok(format!(
-            "Harness child result. This is a report from a child agent, not a new user request.\n{}",
+            "{}\n{}",
+            crate::agent::report::CHILD_RESULT_PREAMBLE,
             serde_json::to_string(&json!({
                 "agent":agent.task_path,"task_id":task.id,"status":task.state,
                 "response":task.final_response,"error":task.error,
@@ -6359,7 +6382,9 @@ impl HarnessBroker {
                             .expect("host diagnostic is nonempty"),
                         severity: publication::DiagnosticSeverity::Warning,
                         scope: crate::provider::EventScope::Binding {
-                            owner: crate::provider::ThreadOwner::root(&self.session.id),
+                            thread_id: forge_provider_api::ThreadId::from(
+                                crate::provider::ThreadOwner::root(&self.session.id),
+                            ),
                         },
                         native_scope: forge_provider_api::WarningScope::Provider,
                     },
@@ -6591,7 +6616,7 @@ impl HarnessBroker {
         scope: crate::provider::InvocationScope,
     ) -> Result<OwnedForegroundTransaction> {
         anyhow::ensure!(
-            scope.owner == crate::provider::ThreadOwner::root(&self.session.id)
+            scope.owner() == crate::provider::ThreadOwner::root(&self.session.id)
                 && scope.exchange_id
                     == forge_provider_api::ExchangeId::from(interaction.id.as_str()),
             "foreground transaction crosses execution ownership"
@@ -6624,12 +6649,12 @@ impl HarnessBroker {
         transaction: &mut OwnedForegroundTransaction,
         provider_event: HarnessEvent,
     ) -> Result<(AppliedProviderEvent, Vec<SessionEvent>)> {
-        if provider_event.scope().owner() != &transaction.scope.owner {
+        if provider_event.scope().owner() != transaction.scope.owner() {
             return Ok((self.apply_observed_child(&provider_event)?, Vec::new()));
         }
         anyhow::ensure!(
-            transaction.scope.owner == crate::provider::ThreadOwner::root(&self.session.id)
-                && provider_event.scope().owner() == &transaction.scope.owner,
+            transaction.scope.owner() == crate::provider::ThreadOwner::root(&self.session.id)
+                && provider_event.scope().owner() == transaction.scope.owner(),
             "foreground event crosses execution ownership"
         );
         if let Some(scope) = provider_event.scope().invocation() {
@@ -6695,7 +6720,7 @@ impl HarnessBroker {
             }
         };
 
-        if observation.scope().owner() != &transaction.state.scope.owner {
+        if observation.scope().owner() != transaction.state.scope.owner() {
             let applied = self.apply_observed_child(&observation)?;
             return self.prepare_provider_delivery(applied);
         }
@@ -6703,7 +6728,7 @@ impl HarnessBroker {
             && scope != &transaction.state.scope
         {
             anyhow::ensure!(
-                scope.owner == transaction.state.scope.owner
+                scope.owner() == transaction.state.scope.owner()
                     && scope.exchange_id == transaction.state.scope.exchange_id
                     && transaction.engine.admitted_invocation(scope)?,
                 "foreground successor has no owner-issued invocation admission"
@@ -6801,7 +6826,7 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
                 && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion crosses execution ownership"
         );
@@ -6856,7 +6881,7 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion disappeared")?;
         anyhow::ensure!(
-            *owner.session_id() == forge_provider_api::SessionId::from(self.session.id.as_str())
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
                 && task.agent_id.as_str() == owner.agent_id().as_str(),
             "child completion owner changed during approval cancellation"
         );
@@ -6994,6 +7019,7 @@ impl HarnessBroker {
             );
             let message = self.agent_result_message(&task)?;
             return Ok(ForegroundAction::Effect(ForegroundJob::AgentResult {
+                flight: transaction.steering.pending_deliveries.retain(),
                 engine: transaction.engine.clone(),
                 scope: transaction.state.scope.clone(),
                 task: Box::new(task),
@@ -7136,8 +7162,10 @@ impl HarnessBroker {
             }
             return self.prepare_foreground_agent_result(transaction);
         };
-        // Schedule another drain after this owned command has been staged.
+        // Schedule another drain after this owned command has been staged. The revision watch
+        // coalesces sends, so a burst of commands would otherwise wake this owner only once.
         self.agent_coordinator.notify_activity();
+        transaction.agent_revision.mark_changed();
         let action = match command {
             crate::agent::AgentCommand::Event {
                 owner,
@@ -7393,7 +7421,7 @@ impl HarnessBroker {
                         approval.execution_owner.as_ref().is_some_and(|owner| {
                             owner.agent_id().as_str() == agent.id.as_str()
                                 && *owner.session_id()
-                                    == forge_provider_api::SessionId::from(self.session.id.as_str())
+                                    == crate::provider::SessionId::from(self.session.id.as_str())
                         })
                     });
                 Ok(serde_json::to_value(crate::agent::AgentActivity::capture(
@@ -7484,7 +7512,7 @@ impl HarnessBroker {
             if let Some((owner, registry)) = &captured {
                 anyhow::ensure!(
                     *owner.session_id()
-                        == forge_provider_api::SessionId::from(self.session.id.as_str())
+                        == crate::provider::SessionId::from(self.session.id.as_str())
                         && owner.agent_id().as_str() == agent.id.as_str()
                         && self
                             .child_execution_by_agent
@@ -7706,7 +7734,7 @@ impl HarnessBroker {
                 } = item;
                 anyhow::ensure!(
                     *owner.session_id()
-                        == forge_provider_api::SessionId::from(self.session.id.as_str())
+                        == crate::provider::SessionId::from(self.session.id.as_str())
                         && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
                     "interrupted child authority changed during cleanup"
                 );
@@ -8166,7 +8194,7 @@ impl HarnessBroker {
         transaction: &mut OwnedForegroundTransaction,
     ) -> Result<Exchange> {
         anyhow::ensure!(
-            transaction.scope.owner == crate::provider::ThreadOwner::root(&self.session.id),
+            transaction.scope.owner() == crate::provider::ThreadOwner::root(&self.session.id),
             "foreground transaction crosses execution ownership"
         );
         anyhow::ensure!(
@@ -8251,12 +8279,12 @@ impl HarnessBroker {
         _events: &mut Vec<SessionEvent>,
     ) -> Result<AppliedProviderEvent> {
         let scope = observation.scope();
-        if scope.owner() != &crate::provider::ThreadOwner::root(&self.session.id) {
+        if scope.owner() != crate::provider::ThreadOwner::root(&self.session.id) {
             return self.apply_observed_child(&observation);
         }
 
         anyhow::ensure!(
-            scope.owner() == &crate::provider::ThreadOwner::root(&self.session.id),
+            scope.owner() == crate::provider::ThreadOwner::root(&self.session.id),
             "root event crosses original owner"
         );
         if let Some(invocation) = scope.invocation() {
@@ -8288,7 +8316,7 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         None,
                     )? == crate::provider::NativeBindingStatus::Active
                     {
@@ -8302,13 +8330,13 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         Some(thread_id),
                     )? == crate::provider::NativeBindingStatus::RetiredKnown
                     {
                         return Ok(AppliedProviderEvent::None);
                     }
-                    self.retain_session_identity(scope.owner(), id)?;
+                    self.retain_session_identity(&scope.owner(), id)?;
                     Ok(AppliedProviderEvent::None)
                 }
                 ProviderEvent::Thread {
@@ -8331,13 +8359,13 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         Some(thread_id),
                     )? == crate::provider::NativeBindingStatus::RetiredKnown
                     {
                         return Ok(AppliedProviderEvent::None);
                     }
-                    self.session.context_usage = Some(usage.clone());
+                    self.session.context_usage = crate::session::ContextUsage::from_report(usage);
                     self.context_usage_fresh = true;
                     self.apply_exchange_content(runtime, interaction, observation)
                 }
@@ -8411,7 +8439,7 @@ impl HarnessBroker {
     /// Persist directory grants and prepare the resulting session update.
     fn apply_directory_access(
         &mut self,
-        grants: Vec<forge_provider_api::access::DirectoryGrant>,
+        grants: Vec<crate::permissions::directory::DirectoryGrant>,
     ) -> Result<SessionUpdate> {
         for grant in grants {
             let directories = match grant.operation {
@@ -8461,10 +8489,10 @@ impl HarnessBroker {
         manifest: &forge_provider_api::CapabilityManifest,
         history: Option<&forge_provider_api::ProviderSessionId>,
     ) -> Result<()> {
-        if scope.owner() == &crate::provider::ThreadOwner::root(&self.session.id)
+        if scope.owner() == crate::provider::ThreadOwner::root(&self.session.id)
             && self
                 .provider
-                .binding_source_status(binding_id, scope.owner(), None)?
+                .binding_source_status(binding_id, &scope.owner(), None)?
                 == crate::provider::NativeBindingStatus::Active
         {
             self.apply_effective_capabilities(manifest.clone())?;
@@ -8473,7 +8501,7 @@ impl HarnessBroker {
             if let Some(history) = history
                 && self.session.provider_session_id.as_deref() != Some(history.as_str())
             {
-                self.retain_session_identity(scope.owner(), history)?;
+                self.retain_session_identity(&scope.owner(), history)?;
             }
         }
         Ok(())
@@ -8516,7 +8544,7 @@ impl HarnessBroker {
         capability.ultrafast_mode = supports(CapabilityId::UltrafastMode);
         capability.os_sandbox = supports(CapabilityId::OsSandbox);
         capability.background_terminals = supports(CapabilityId::BackgroundTerminals);
-        capability.permission_control = supports(CapabilityId::ApprovalRules);
+        capability.permission_control = supports(CapabilityId::PermissionCallbacks);
         capability.compaction.lifecycle = supports(CapabilityId::CompactionLifecycle);
         capability.compaction.background = supports(CapabilityId::BackgroundCompaction);
         capability.compaction.summary = supports(CapabilityId::CompactionSummary);
@@ -8605,7 +8633,7 @@ impl HarnessBroker {
         let observation = HarnessEvent::Host {
             scope: scope.clone().into(),
             event: HostEvent::ChildWait {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id()?,
                 event,
             },
@@ -8684,9 +8712,10 @@ impl HarnessBroker {
                 .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned()),
         );
         let mut effects = Vec::new();
-        runtime.retraction_eligibility.consume();
         let now_ms = self.clock.now_ms();
         match acknowledgement {
+            // A task entry is the exchange's own prompt, so its acceptance is not provider
+            // activity and an output-free cancellation may still retract it.
             InputPresentation::TaskStarted { start, prompt } => {
                 let input_id = input_id
                     .as_ref()
@@ -8743,6 +8772,8 @@ impl HarnessBroker {
                 )?);
             }
             InputPresentation::Steering { text } => {
+                // Accepted steering joins the native history, so retraction is no longer safe.
+                runtime.retraction_eligibility.consume();
                 if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
                                 matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
                                 return Ok(AppliedProviderEvent::Effects(effects));
@@ -8751,6 +8782,7 @@ impl HarnessBroker {
                 runtime.active_wait = None;
                 interaction.append_acknowledged_input(
                     input_id.clone(),
+                    Some(receipt.receipt_id().clone()),
                     crate::exchange::InputIntent::Steering,
                     text.clone(),
                     now_ms,
@@ -8791,8 +8823,8 @@ impl HarnessBroker {
     ) -> Result<()> {
         anyhow::ensure!(
             scope.exchange_id.as_str() == interaction.id
-                && scope.owner.session_id().as_str() == interaction.session_id
-                && scope.owner.agent_id().as_str() == interaction.agent_id,
+                && scope.owner().session_id().as_str() == interaction.session_id
+                && scope.owner().agent_id().as_str() == interaction.agent_id,
             "accepted input crosses original ownership"
         );
         self.acknowledge_user_child_reports(scope, receipt)?;
@@ -8804,7 +8836,7 @@ impl HarnessBroker {
         match presentation {
             InputPresentation::Steering { text } => {
                 if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
-                    interaction.append_acknowledged_input(Some(id), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
+                    interaction.append_acknowledged_input(Some(id), Some(receipt.receipt_id().clone()), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
                 }
             }
             InputPresentation::TaskStarted { start, prompt } => {
@@ -8889,11 +8921,15 @@ impl HarnessBroker {
             && interaction.turn.last().is_some_and(|turn| {
                 &turn.provider().thread_id == thread_id && &turn.provider().turn_id == turn_id
             }) {
-            self.session.resolved_model = interaction
+            // A started turn reports its model later; keep the last confirmed model until then.
+            // Configuration changes that select another model clear the confirmation themselves.
+            if let Some(model) = interaction
                 .turn
                 .last()
                 .and_then(|turn| turn.resolved_model())
-                .map(|model| model.model_id.as_str().to_owned());
+            {
+                self.session.resolved_model = Some(model.model_id.as_str().to_owned());
+            }
             self.save_session()?;
             Some(SessionUpdate::Runtime {
                 session_id: self.session.id.clone(),
@@ -10554,7 +10590,7 @@ impl HarnessBroker {
             observation.scope().owner().session_id().as_str() == self.session.id,
             "session observation crosses original ownership"
         );
-        if observation.scope().owner() != &crate::provider::ThreadOwner::root(&self.session.id)
+        if observation.scope().owner() != crate::provider::ThreadOwner::root(&self.session.id)
             || matches!(
                 &observation,
                 HarnessEvent::Native {
@@ -10605,7 +10641,7 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         None,
                     )? == crate::provider::NativeBindingStatus::Active
                     {
@@ -10619,13 +10655,13 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         Some(thread_id),
                     )? == crate::provider::NativeBindingStatus::RetiredKnown
                     {
                         return Ok(Vec::new());
                     }
-                    self.session.context_usage = Some(usage.clone());
+                    self.session.context_usage = crate::session::ContextUsage::from_report(usage);
                     self.context_usage_fresh = true;
                     self.save_session()?;
                 }
@@ -10635,13 +10671,13 @@ impl HarnessBroker {
                 } => {
                     if self.provider.binding_source_status(
                         &source.binding_id,
-                        scope.owner(),
+                        &scope.owner(),
                         Some(thread_id),
                     )? == crate::provider::NativeBindingStatus::RetiredKnown
                     {
                         return Ok(Vec::new());
                     }
-                    self.retain_session_identity(scope.owner(), id)?;
+                    self.retain_session_identity(&scope.owner(), id)?;
                     return Ok(Vec::new());
                 }
                 ProviderEvent::Thread {
@@ -10702,14 +10738,14 @@ impl HarnessBroker {
                             });
                     let current_binding = self
                         .provider
-                        .binding_source_status(&source.binding_id, scope.owner(), Some(thread_id))
+                        .binding_source_status(&source.binding_id, &scope.owner(), Some(thread_id))
                         .is_ok_and(|status| status == crate::provider::NativeBindingStatus::Active);
                     if current_root && current_binding {
-                        self.session.resolved_model = owner
-                            .turn
-                            .last()
-                            .and_then(|turn| turn.resolved_model())
-                            .map(|model| model.model_id.as_str().to_owned());
+                        if let Some(model) =
+                            owner.turn.last().and_then(|turn| turn.resolved_model())
+                        {
+                            self.session.resolved_model = Some(model.model_id.as_str().to_owned());
+                        }
                         self.save_session()?;
                         updates.push(self.event(
                             "provider_event",
@@ -10848,13 +10884,17 @@ impl HarnessBroker {
     /// transcript no longer contains. A name that differs from the derived one was chosen by the
     /// user or a later exchange and stays.
     pub(crate) fn release_automatic_session_name(&mut self, retracted_prompt: &str) -> Result<()> {
+        let derived_name = automatic_session_name(retracted_prompt);
         if self.session.name.is_empty()
-            || self.session.name != automatic_session_name(retracted_prompt)
+            || self.session.name != derived_name
             || !self.store.list_exchange(&self.session.id)?.is_empty()
         {
             return Ok(());
         }
-        self.session.name.clear();
+        self.session.name = self
+            .store
+            .release_session_name(&self.session.id, &self.client_id, &derived_name)?
+            .name;
         self.save_session()
     }
 

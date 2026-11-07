@@ -1,4 +1,8 @@
 vim.loader.enable(false)
+local data = vim.fn.stdpath("data")
+vim.opt.runtimepath:append(data .. "/site")
+vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
 vim.cmd("runtime plugin/render-markdown.lua")
 
 local source = {

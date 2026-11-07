@@ -31,6 +31,7 @@ local notices = {}
 local original_write = require("forge.git.write").execute
 local original_forge_open_pr = forge.open_pr
 local original_request = require("forge.client").request
+local original_generation_config = require("forge.client").generation_config
 local creation_draft
 local creation_capture
 local opened_pull_request
@@ -91,6 +92,7 @@ end
 open_pr._set_state_path_for_test(state_path)
 reset()
 forge.setup({ pr_buffer_name = "ForgePRTest", harness = { provider = "fixture_beta" } })
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 gh.set_provider({
   system_async = function(command, _, cb)
     local key = command_key(command)
@@ -187,6 +189,10 @@ end
 require("forge.client").request = function(request, callback)
   native_request(request.method, request.params, callback)
 end
+-- The fixture registry is already installed, so resolve generation settings without a host.
+require("forge.client").generation_config = function(callback, selection)
+  callback(require("forge.client").generation_get_config(selection))
+end
 require("github.pr_creation")._set_runner_for_test(native_request)
 require("github.mutation")._set_runner_for_test(native_request)
 forge.open_pr = function(pr, options)
@@ -241,6 +247,7 @@ end
 local function cleanup()
   require("forge.git.write").execute = original_write
   require("forge.client").request = original_request
+  require("forge.client").generation_config = original_generation_config
   require("github.pr_creation")._set_runner_for_test(nil)
   require("github.mutation")._set_runner_for_test(nil)
   forge.open_pr = original_forge_open_pr

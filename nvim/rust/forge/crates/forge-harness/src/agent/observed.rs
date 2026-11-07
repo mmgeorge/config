@@ -1,4 +1,5 @@
 //! Persist provider-observed children without granting managed task authority.
+use crate::provider::ScopeOwner;
 
 use crate::exchange::{Exchange, ExchangeOrigin, ExchangeOutcome};
 use crate::provider::events::NativeEventSource;
@@ -189,7 +190,7 @@ impl ObservedAgent {
                     *other != index
                         && candidate.key.binding_id == child.key.binding_id
                         && child.parent_agent_id.as_ref().map_or_else(
-                            || candidate.owner.as_ref() == Some(&child.parent_scope.owner),
+                            || candidate.owner.as_ref() == Some(&child.parent_scope.owner()),
                             |parent| &candidate.key.agent_id == parent,
                         )
                 })
@@ -307,7 +308,7 @@ impl ObservedAgent {
         let (thread_id, turn_id) = match event {
             ProviderEvent::Thread { thread_id, event } => {
                 if next.thread_id.as_ref() != Some(thread_id)
-                    || next.owner.as_ref() != Some(scope.owner())
+                    || next.owner.as_ref() != Some(&scope.owner())
                 {
                     return Err(ObservedAgentError::Ownership);
                 }
@@ -415,7 +416,7 @@ impl ObservedAgent {
     ) -> Result<bool, ObservedAgentError> {
         let mut next = self.clone();
         next.associate(association)?;
-        if next.owner.as_ref() != Some(scope.owner()) {
+        if next.owner.as_ref() != Some(&scope.owner()) {
             return Err(ObservedAgentError::Ownership);
         }
         if let Some(invocation) = scope.invocation() {
@@ -452,7 +453,7 @@ impl ObservedAgent {
         let mut next = self.clone();
         next.associate(association)?;
         if association.turn() != Some(&effect.scope)
-            || next.owner.as_ref() != Some(&effect.scope.owner)
+            || next.owner.as_ref() != Some(&effect.scope.owner())
         {
             return Err(ObservedAgentError::Ownership);
         }
@@ -524,7 +525,7 @@ impl ObservedAgent {
             return Err(ObservedAgentError::Ownership);
         }
         if let Some(delegation) = &self.description.delegation
-            && (delegation.parent_thread_id != self.parent_scope.owner.thread_id()
+            && (delegation.parent_thread_id != self.parent_scope.owner().thread_id()
                 || delegation.parent_turn_id
                     != self
                         .parent_scope
@@ -542,8 +543,8 @@ impl ObservedAgent {
             return Err(ObservedAgentError::Ownership);
         }
         if let Some(owner) = &self.owner
-            && (owner.session_id() != self.parent_scope.owner.session_id()
-                || owner == &self.parent_scope.owner
+            && (owner.session_id() != self.parent_scope.owner().session_id()
+                || owner == &self.parent_scope.owner()
                 || self.thread_id.as_ref() != Some(&owner.thread_id()))
         {
             return Err(ObservedAgentError::Ownership);
@@ -564,7 +565,7 @@ impl ObservedAgent {
                 .windows(2)
                 .any(|events| events[0].sequence >= events[1].sequence)
             || self.host_events.iter().any(|event| {
-                self.owner.as_ref() != Some(event.scope.owner())
+                self.owner.as_ref() != Some(&event.scope.owner())
                     || event
                         .scope
                         .invocation()
@@ -574,7 +575,7 @@ impl ObservedAgent {
             return Err(ObservedAgentError::Ownership);
         }
         if self.pending_file_changes.iter().any(|effect| {
-            self.owner.as_ref() != Some(&effect.scope.owner)
+            self.owner.as_ref() != Some(&effect.scope.owner())
                 || effect.scope.exchange_id != self.parent_scope.exchange_id
         }) {
             return Err(ObservedAgentError::Ownership);
@@ -598,14 +599,14 @@ impl ObservedAgent {
         }
         for exchange in &self.exchanges {
             if exchange.origin != ExchangeOrigin::NativeAgent
-                || exchange.session_id != self.parent_scope.owner.session_id().as_str()
+                || exchange.session_id != self.parent_scope.owner().session_id().as_str()
                 || self
                     .owner
                     .as_ref()
                     .is_none_or(|owner| exchange.agent_id != owner.agent_id().as_str())
                 || exchange.turn.iter().any(|turn| {
                     self.thread_id.as_ref() != Some(&turn.provider().thread_id)
-                        || self.owner.as_ref() != Some(&turn.provider().scope.owner)
+                        || self.owner.as_ref() != Some(&turn.provider().scope.owner())
                         || turn.provider().scope.exchange_id != self.parent_scope.exchange_id
                 })
             {
@@ -875,30 +876,30 @@ mod tests {
     /// Register public native identity separately from the positively learned child execution owner.
     fn fixture() -> (ObservedAgentAssociation, TurnAddress, AgentDescription) {
         let parent = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "parent-exchange".into(),
             invocation_id: "parent-turn".into(),
         };
         let public = AgentId::new("native-child").unwrap();
         let child_owner = ThreadOwner::new(
-            parent.owner.session_id().clone(),
+            parent.owner().session_id().clone(),
             AgentId::new("host-child-owner").unwrap(),
         )
         .unwrap();
         let scope = InvocationScope {
-            owner: child_owner,
+            thread_id: forge_provider_api::ThreadId::from(child_owner),
             exchange_id: parent.exchange_id.clone(),
             invocation_id: "child-turn".into(),
         };
         let child = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
         let description = AgentDescription {
-            parent_agent_id: Some(parent.owner.agent_id().clone()),
+            parent_agent_id: Some(parent.owner().agent_id().clone()),
             delegation: Some(AgentDelegation {
-                parent_thread_id: parent.owner.thread_id(),
+                parent_thread_id: parent.owner().thread_id(),
                 parent_turn_id: parent.turn_id().unwrap(),
                 parent_item_id: None,
             }),
@@ -1135,16 +1136,16 @@ mod tests {
     #[test]
     fn summary_only_nested_agents_keep_explicit_hierarchy_and_reject_cycles() {
         let root = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "parent".into(),
             invocation_id: "root-turn".into(),
         };
         let parent_id = AgentId::new("native-parent").unwrap();
         let nested_id = AgentId::new("nested").unwrap();
         let parent = AgentDescription {
-            parent_agent_id: Some(root.owner.agent_id().clone()),
+            parent_agent_id: Some(root.owner().agent_id().clone()),
             delegation: Some(AgentDelegation {
-                parent_thread_id: root.owner.thread_id(),
+                parent_thread_id: root.owner().thread_id(),
                 parent_turn_id: root.turn_id().unwrap(),
                 parent_item_id: None,
             }),

@@ -1491,8 +1491,16 @@ impl HarnessBroker {
                 ForegroundJob::ClarificationPublication(delivery),
             ));
         }
+        // Only this exchange's own stopped turn interrupts it. A stopped descendant still blocks
+        // automatic continuation above, but the parent itself completed its work.
+        let own_turn_stopped = transaction
+            .state
+            .interaction
+            .turn
+            .last()
+            .is_some_and(|turn| turn.requires_explicit_continuation());
         let outcome = match &finalization.outcome {
-            Ok(_) if native_stopped => crate::exchange::ExchangeOutcome::Interrupted,
+            Ok(_) if own_turn_stopped => crate::exchange::ExchangeOutcome::Interrupted,
             Ok(_) => crate::exchange::ExchangeOutcome::Complete,
             Err(ProviderError::Cancelled) => crate::exchange::ExchangeOutcome::Cancelled,
             Err(_) => crate::exchange::ExchangeOutcome::Failed,
@@ -1883,6 +1891,12 @@ impl HarnessBroker {
                 .as_ref()
                 .is_none_or(|batches| batches.is_empty())
         {
+            return self.finish_goal_effects(finalization);
+        }
+        // A configuration restart interrupts this turn and replays it after the change applies.
+        // The interrupted attempt is not a model turn, so it neither spends the continuation
+        // budget nor reserves a continuation of its own.
+        if finalization.collection == Some(ForegroundCollection::Restart) {
             return self.finish_goal_effects(finalization);
         }
         let snapshot = self.questions.snapshot()?;

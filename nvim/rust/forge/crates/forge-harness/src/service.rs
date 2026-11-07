@@ -986,6 +986,11 @@ impl HarnessService {
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.exchange_owner.close().await;
+                    if let Some(control) = controller.provider_handle().mock_response_control() {
+                        control
+                            .cancel_session(controller.observer.session_id())
+                            .await?;
+                    }
                 }
                 for controller in &controllers {
                     let session = controller.observer.session_id();
@@ -1300,15 +1305,16 @@ impl SessionController {
                 .is_none()
     }
 
-    async fn background_terminals(&self) -> Result<crate::provider::terminal::TerminalSnapshot> {
-        let pending = || crate::provider::terminal::TerminalSnapshot {
-            supported: true,
-            starting: self
-                .provider_startup_error
-                .lock()
-                .expect("provider startup state poisoned")
-                .is_none(),
-            terminal: Vec::new(),
+    async fn background_terminals(
+        &self,
+    ) -> Result<crate::provider::terminal_status::BackgroundTerminalStatus> {
+        let pending = || {
+            crate::provider::terminal_status::BackgroundTerminalStatus::pending_startup(
+                self.provider_startup_error
+                    .lock()
+                    .expect("provider startup state poisoned")
+                    .is_none(),
+            )
         };
         if !self.provider_ready().await {
             return Ok(pending());
@@ -1339,7 +1345,7 @@ impl SessionController {
         {
             return Ok(pending());
         }
-        Ok(result??)
+        Ok(crate::provider::terminal_status::BackgroundTerminalStatus::from_inventory(result??))
     }
 
     /// Build one independently serialized controller from a durable broker session.
@@ -1360,6 +1366,11 @@ impl SessionController {
             &catalog_request.harness_session_id,
         )?;
         broker.question_events = Some(exchange_owner.question_events());
+        #[cfg(test)]
+        let exchange_driver = match broker.question_wait_capacity_for_test {
+            Some(capacity) => exchange_driver.with_question_wait_capacity(capacity),
+            None => exchange_driver,
+        };
         let publications = Arc::new(crate::exchange::SessionPublications::open(
             &broker.data_root,
             &catalog_request.harness_session_id,
@@ -2110,16 +2121,19 @@ async fn route_request(
         return Ok(());
     }
     if method == RuntimeMethod::SessionProviderCapabilitiesGet {
+        let provider = controller.provider_handle();
         let manifest = tokio::time::timeout(
             Duration::from_secs(30),
-            controller
-                .provider_handle()
-                .capabilities(controller.catalog_request.read().await.clone()),
+            provider.capabilities(controller.catalog_request.read().await.clone()),
         )
         .await
         .context("capability discovery exceeded 30 seconds")??;
+        let menu = crate::provider::capability_menu::CapabilityMenu::compose(
+            provider.descriptor().label,
+            manifest,
+        );
         message_sink
-            .send_response(Response::success(request.id, manifest)?)
+            .send_response(Response::success(request.id, menu)?)
             .await?;
         return Ok(());
     }
@@ -2422,6 +2436,14 @@ async fn start_session_fork(
     while let Some(result) = task.try_join_next() {
         result.context("Harness provider fork task failed")?;
     }
+    // Native fork rejects a thread whose children still execute, and the optimistic child
+    // session would otherwise inherit their live rows with no runtime left to settle them.
+    if let Some(source) = registry.controller_by_id.read().await.get(&session_id) {
+        anyhow::ensure!(
+            source.agent_coordinator.active_count() == 0,
+            "cannot fork while child agents are running; wait for them to finish or interrupt them"
+        );
+    }
     let provider = registry.runtime.provider_handle();
     let descriptor = provider.descriptor();
     let preparation = prepare_provider_fork(
@@ -2615,18 +2637,27 @@ async fn delete_session(
 
 /// Reject deletion while any local execution, input, child, or check still owns session work.
 fn require_idle_deletion(controller: &SessionController) -> Result<()> {
+    // A closed semaphore means a failed collection fenced the session, not that work is running.
+    let blocked = |error: tokio::sync::TryAcquireError, work: &str| match error {
+        tokio::sync::TryAcquireError::NoPermits => {
+            anyhow::anyhow!("cannot delete a session with active {work}")
+        }
+        tokio::sync::TryAcquireError::Closed => anyhow::anyhow!(
+            "cannot delete this session because its last execution could not be confirmed stopped; restart Harness and delete it again"
+        ),
+    };
     let _control = controller
         .coordinator
         .control
         .clone()
         .try_acquire_owned()
-        .context("cannot delete a session with active control work")?;
+        .map_err(|error| blocked(error, "control work"))?;
     let _execution = controller
         .coordinator
         .execution
         .clone()
         .try_acquire_owned()
-        .context("cannot delete a session with active execution")?;
+        .map_err(|error| blocked(error, "execution"))?;
     ensure!(
         controller
             .coordinator

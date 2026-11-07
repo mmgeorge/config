@@ -551,7 +551,7 @@ impl HarnessBroker {
         let observed = self.store.list_observed_agents(&self.session.id)?;
         let root_bindings: std::collections::HashSet<_> = observed
             .iter()
-            .filter(|agent| agent.parent_scope().owner.is_root())
+            .filter(|agent| agent.parent_scope().owner().is_root())
             .map(|agent| agent.key().binding_id().clone())
             .collect();
         let blocked = observed.iter().any(|agent| {
@@ -681,7 +681,9 @@ impl HarnessBroker {
                                 .expect("host diagnostic is nonempty"),
                             severity: super::publication::DiagnosticSeverity::Warning,
                             scope: crate::provider::EventScope::Binding {
-                                owner: crate::provider::ThreadOwner::root(&self.session.id),
+                                thread_id: forge_provider_api::ThreadId::from(
+                                    crate::provider::ThreadOwner::root(&self.session.id),
+                                ),
                             },
                             native_scope: forge_provider_api::WarningScope::Provider,
                         },
@@ -2274,15 +2276,26 @@ mod owned_tests {
         RetiredBinding,
     }
 
-    /// Persist ordered identity before inbox delivery, while rejecting foreign histories and retired receipts.
+    /// Persist ordered identity before inbox delivery.
     #[tokio::test]
-    async fn configuration_identity_receipt_preserves_ordered_history_and_rejects_stale_authority()
-    -> Result<()> {
-        for boundary in [
-            IdentityReceiptBoundary::InboxPending,
-            IdentityReceiptBoundary::ForeignHistory,
-            IdentityReceiptBoundary::RetiredBinding,
-        ] {
+    async fn configuration_identity_receipt_preserves_ordered_history() -> Result<()> {
+        assert_identity_receipt_boundary(IdentityReceiptBoundary::InboxPending).await
+    }
+
+    /// Reject a receipt whose history differs from the history the host already holds.
+    #[tokio::test]
+    async fn configuration_identity_receipt_rejects_foreign_history() -> Result<()> {
+        assert_identity_receipt_boundary(IdentityReceiptBoundary::ForeignHistory).await
+    }
+
+    /// Reject a receipt from a binding that was retired before the host commit.
+    #[tokio::test]
+    async fn configuration_identity_receipt_rejects_retired_binding() -> Result<()> {
+        assert_identity_receipt_boundary(IdentityReceiptBoundary::RetiredBinding).await
+    }
+
+    async fn assert_identity_receipt_boundary(boundary: IdentityReceiptBoundary) -> Result<()> {
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -2876,7 +2889,7 @@ mod owned_tests {
             .send_wait(forge_provider_api::AdapterActivity::Thread {
                 thread_id: owner.thread_id(),
                 event: forge_provider_api::ThreadEvent::ContextUsage(
-                    crate::session::ContextUsage::reported(900, 1000).unwrap(),
+                    forge_provider_api::context::ContextUsage::reported(900, 1000).unwrap(),
                 ),
             })
             .await?;
@@ -2924,7 +2937,7 @@ mod owned_tests {
             .send_wait(forge_provider_api::AdapterActivity::Thread {
                 thread_id: owner.thread_id(),
                 event: forge_provider_api::ThreadEvent::ContextUsage(
-                    crate::session::ContextUsage::reported(10, 2000).unwrap(),
+                    forge_provider_api::context::ContextUsage::reported(10, 2000).unwrap(),
                 ),
             })
             .await?;

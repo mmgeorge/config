@@ -785,9 +785,40 @@ async fn every_owner_retains_pending_steering_and_idle_observation() -> Result<(
 
 /// Loss or cancellation of one owner cannot settle peer owners or replay their inputs.
 #[tokio::test]
-async fn every_owner_isolates_pending_control_cancellation_and_loss() -> Result<()> {
-    for target in 0..3 {
-        for lost in [false, true] {
+async fn conversation_root_isolates_pending_control_cancellation() -> Result<()> {
+    assert_owner_isolates_pending_control(0, false).await
+}
+
+#[tokio::test]
+async fn conversation_root_isolates_pending_control_loss() -> Result<()> {
+    assert_owner_isolates_pending_control(0, true).await
+}
+
+#[tokio::test]
+async fn managed_child_isolates_pending_control_cancellation() -> Result<()> {
+    assert_owner_isolates_pending_control(1, false).await
+}
+
+#[tokio::test]
+async fn managed_child_isolates_pending_control_loss() -> Result<()> {
+    assert_owner_isolates_pending_control(1, true).await
+}
+
+#[tokio::test]
+async fn background_session_isolates_pending_control_cancellation() -> Result<()> {
+    assert_owner_isolates_pending_control(2, false).await
+}
+
+#[tokio::test]
+async fn background_session_isolates_pending_control_loss() -> Result<()> {
+    assert_owner_isolates_pending_control(2, true).await
+}
+
+/// Starts one run per owner, then loses or cancels the owner at `target` while it has pending
+/// steering and checks the peers neither settle nor replay their inputs.
+async fn assert_owner_isolates_pending_control(target: usize, lost: bool) -> Result<()> {
+    {
+        {
             let mut fixture = Fixture::new()?;
             let mut active = Vec::new();
             for owner in owners() {

@@ -87,7 +87,9 @@ pub enum InputPurpose {
     TaskEntry {
         revision: crate::task::TaskRevision,
         id: crate::task::TaskInputId,
-        start: crate::exchange::TaskStart,
+        /// Announce the task only on its first entry; a resumed entry continues the same task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<crate::exchange::TaskStart>,
     },
     TaskContinuation {
         revision: crate::task::TaskRevision,
@@ -419,7 +421,7 @@ impl SessionInputQueue {
     }
 
     /// Remove queued task inputs whose task authority can never become current again.
-    /// Only undelivered, unreserved revisions are removed; delivery state owns every other message.
+    /// Only unreserved revisions outside delivery are removed; see [`task_input_retirable`].
     pub(crate) fn retire_task_input(
         &self,
         retired: &[(String, u64)],
@@ -434,7 +436,7 @@ impl SessionInputQueue {
             let remove = matches!(
                 message.purpose,
                 InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
-            ) && message.delivery() == InputDelivery::Queued
+            ) && task_input_retirable(message)
                 && message.reservation().is_none()
                 && retired
                     .iter()
@@ -1092,3 +1094,14 @@ mod tests;
 #[cfg(test)]
 #[path = "input/durability_test.rs"]
 mod durability_test;
+
+/// Report whether task input sits outside native delivery, so retiring its task authority can
+/// remove it. Queued input never reached the provider, and failed input ended without acceptance;
+/// a failed task input whose revision is retired can never be retried under its own authority.
+/// Delivering, unknown, and accepted input stay owned by their delivery receipts.
+pub(crate) fn task_input_retirable(message: &InputMessage) -> bool {
+    matches!(
+        message.delivery(),
+        InputDelivery::Queued | InputDelivery::Failed
+    )
+}

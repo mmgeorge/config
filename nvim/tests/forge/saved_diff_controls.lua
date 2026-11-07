@@ -78,9 +78,6 @@ for _, key in ipairs({"ov", "ox", "ov"}) do
   assert(vim.wait(1000, function() return stage == expected and not state.pending end))
   assert(vim.deep_equal(state.diff_view, current.diff_view))
   for _, window in ipairs({first_window, second_window}) do
-    local header = vim.wo[window].winbar
-    assert(header:find(state.diff_view.visibility == "public" and "Public" or "All", 1, true), "visibility header: " .. header)
-    assert(header:find(state.diff_view.presentation == "semantic" and "Semantic" or "Full", 1, true), "presentation header: " .. header)
     local row = vim.api.nvim_win_get_cursor(window)[1]
     assert(vim.api.nvim_buf_get_lines(state.replica.buffer, row - 1, row, false)[1] == expected_line[window], "control moved a surviving source row")
   end

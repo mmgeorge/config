@@ -47,7 +47,7 @@ async fn plan_answers_commit_under_owner_and_replay_original_publication() -> Re
     let broker = controller.broker.lock().await;
     let events = controller.exchange_owner.question_events();
     let first = tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         events.answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(
             request.clone(),
         )?),

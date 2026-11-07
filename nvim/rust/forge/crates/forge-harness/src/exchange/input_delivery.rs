@@ -695,11 +695,18 @@ impl InputDeliveryRun {
                         })?,
                     });
                     let steering = match &message.purpose {
-                        crate::input::InputPurpose::TaskEntry { start, .. } => {
-                            crate::provider::SteeringInput::TaskEntry {
-                                start: start.clone(),
+                        crate::input::InputPurpose::TaskEntry {
+                            start: Some(start), ..
+                        } => crate::provider::SteeringInput::TaskEntry {
+                            start: start.clone(),
+                            text: message.text,
+                            submission: submission.clone(),
+                        },
+                        crate::input::InputPurpose::TaskEntry { start: None, .. } => {
+                            crate::provider::SteeringInput::User {
                                 text: message.text,
-                                submission: submission.clone(),
+                                attachments: Vec::new(),
+                                submission: Some(submission.clone()),
                             }
                         }
                         crate::input::InputPurpose::Clarification { .. }

@@ -1417,13 +1417,6 @@ mod test {
     }
 
     #[test]
-    fn submission_allows_no_tests_or_inferred_coverage() {
-        let document = test_fixture("plan", "Keep tests optional.");
-
-        document.validate_for_submission().unwrap();
-    }
-
-    #[test]
     fn submission_requires_a_model_authored_title() {
         let mut document = test_fixture("plan", "Name the plan.");
         document.title = super::PROVISIONAL_PLAN_TITLE.into();

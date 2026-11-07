@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -407,7 +408,7 @@ impl LspScope {
         scope: &crate::provider::InvocationScope,
     ) -> Result<Arc<Self>> {
         ensure!(
-            scope.owner.session_id().as_str() == self.session,
+            scope.owner().session_id().as_str() == self.session,
             "native child editor scope crosses session"
         );
         let protected_path = self
@@ -796,7 +797,7 @@ mod tests {
             "interaction",
         );
         let address = forge_provider_api::TurnAddress {
-            thread_id: child_scope.owner.thread_id(),
+            thread_id: child_scope.owner().thread_id(),
             turn_id: child_scope.turn_id()?,
             scope: child_scope.clone(),
         };
@@ -807,9 +808,9 @@ mod tests {
             vec![(
                 agent.clone(),
                 forge_provider_api::agent::AgentDescription {
-                    parent_agent_id: Some(parent_scope.owner.agent_id().clone()),
+                    parent_agent_id: Some(parent_scope.owner().agent_id().clone()),
                     delegation: Some(forge_provider_api::agent::AgentDelegation {
-                        parent_thread_id: parent_scope.owner.thread_id(),
+                        parent_thread_id: parent_scope.owner().thread_id(),
                         parent_turn_id: parent_scope.turn_id()?,
                         parent_item_id: None,
                     }),

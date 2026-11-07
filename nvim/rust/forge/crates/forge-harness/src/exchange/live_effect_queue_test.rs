@@ -1,6 +1,7 @@
 use super::*;
+use crate::provider::ThreadOwner;
 use crate::provider::{HostEffectBatch, InvocationScope, LiveHostEffectSender, ProviderError};
-use forge_provider_api::{ThreadOwner, control::ToolCallId};
+use forge_provider_api::control::ToolCallId;
 
 /// Closing admission resolves queued callbacks without handing any mutation to the owner.
 #[tokio::test]

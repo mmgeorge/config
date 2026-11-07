@@ -11,6 +11,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+/// Virtual-time bound for cancellation progress, which the owner publishes ten seconds after the
+/// cancel starts. Paused-clock tests auto-advance, so this bound costs no real time; it must exceed
+/// the ten-second progress interval, unlike the shorter real-time `HANG_GUARD`.
+const PENDING_PROGRESS_DEADLINE: Duration = Duration::from_secs(11);
+
+/// Virtual-time bound for an overdue cancel to fail after its progress report. The owner's
+/// thirty-second cancellation budget ends twenty seconds after the ten-second progress report.
+const OVERDUE_RESULT_DEADLINE: Duration = Duration::from_secs(25);
+
 /// Select the native boundary held by a cancellation scenario.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CollectionBoundary {
@@ -286,14 +295,14 @@ async fn slow_collection_fixture(
     .await?;
     match boundary {
         CollectionBoundary::Preparing | CollectionBoundary::PreparingThenActive => {
-            tokio::time::timeout(Duration::from_secs(5), preparation.recv())
+            tokio::time::timeout(crate::hang_guard::HANG_GUARD, preparation.recv())
                 .await?
                 .context("first input never reached pre-acceptance preparation")?;
         }
         CollectionBoundary::Active
         | CollectionBoundary::ActiveAfterUserEcho
         | CollectionBoundary::ActiveInTool => {
-            tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            tokio::time::timeout(crate::hang_guard::HANG_GUARD, starts.recv())
                 .await?
                 .context("first input never emitted its native start observation")?;
         }
@@ -374,7 +383,7 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
             params: json!({"operation_id":"resume-after-preaccept-cancel","input_id":"resumed-turn-after-preaccept","text":"Resume after early cancellation"}),
         }, &fixture.sink).await?;
         // The output-free first prompt is retracted rather than retained as a cancelled exchange.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 if fixture.events.lock().expect("fixture events poisoned").iter()
@@ -383,10 +392,10 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
                 changed.await;
             }
         }).await.context("pre-acceptance cancellation did not retract its output-free prompt")?;
-        tokio::time::timeout(Duration::from_secs(5), fixture.starts.recv())
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, fixture.starts.recv())
             .await.context("resumed input never emitted native Started")?
             .context("native start observation channel closed")?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 if fixture.engine.active_invocation_scope()?.is_some() { break; }
@@ -401,19 +410,19 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
             method: "session.prompt.submit".into(),
             params: json!({"operation_id":"steer-after-preaccept-cancel","input_id":"accepted-steering-after-preaccept","text":"Steer the resumed native execution"}),
         }, &fixture.sink).await?;
-        let receipt_id = tokio::time::timeout(Duration::from_secs(5), fixture.steering_receipts.recv())
+        let receipt_id = tokio::time::timeout( crate::hang_guard::HANG_GUARD, fixture.steering_receipts.recv())
             .await.context("fresh input never reached native steering")?
             .context("fixture steering receipt channel closed")?;
         let receipt = fixture.controller.broker.lock().await.submission_store
             .submission(receipt_id.as_str())?;
         let mut accepted = receipt.acceptance();
-        tokio::time::timeout(Duration::from_secs(5), accepted.wait_for(|accepted| *accepted))
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, accepted.wait_for(|accepted| *accepted))
             .await.context("fresh input never reached accepted steering before active cancellation")??;
         let record = receipt.record()?;
         ensure!(record.input_message_id.as_deref() == Some("accepted-steering-after-preaccept")
             && matches!(record.delivery, crate::provider::submission::SubmissionState::Accepted { .. }),
             "native steering did not durably accept the selected fresh input");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 let routes_observed = {
@@ -441,11 +450,11 @@ async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_nex
             method: "session.prompt.submit".into(),
             params: json!({"operation_id":"after-two-cancellations","text":"Prompt after both cancellations"}),
         }, &fixture.sink).await?;
-        let input = tokio::time::timeout(Duration::from_secs(5), fixture.dispatches.recv())
+        let input = tokio::time::timeout( crate::hang_guard::HANG_GUARD, fixture.dispatches.recv())
             .await.context("following prompt was not dispatched")?;
         ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
             if text == "Prompt after both cancellations"));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 let completed = fixture.events.lock().expect("fixture events poisoned")
@@ -477,7 +486,7 @@ async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> R
         slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveAfterUserEcho).await?;
     let scenario = async {
         // The echo precedes the fixture's start signal, so wait until the broker applied it.
-        let exchange_id = tokio::time::timeout(Duration::from_secs(5), async {
+        let exchange_id = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 let echoed = SqliteStore::read_only(&fixture.controller.data_root)?
@@ -501,7 +510,7 @@ async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> R
         .await
         .context("provider user-message echo was never applied")??;
         tokio::time::timeout(
-            Duration::from_secs(10),
+            crate::hang_guard::HANG_GUARD,
             fixture
                 .controller
                 .exchange_owner
@@ -523,7 +532,7 @@ async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> R
                 .map(|(_, event)| event["payload"].clone())
                 .collect::<Vec<_>>()
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 if input_updates()
@@ -569,7 +578,7 @@ async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> R
             &fixture.sink,
         )
         .await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 match fixture.dispatches.recv().await {
                     Some(forge_provider_api::input::PromptInput::Text(text))
@@ -599,7 +608,7 @@ async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result
     let mut fixture =
         slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveInTool).await?;
     let scenario = async {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let changed = fixture.events_changed.notified();
                 if fixture
@@ -641,7 +650,7 @@ async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result
             &fixture.sink,
         )
         .await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 match fixture.dispatches.recv().await {
                     Some(forge_provider_api::input::PromptInput::Text(text))
@@ -783,7 +792,7 @@ async fn owner_cancel_then_model_change_cancels_exchange_and_commits_model() -> 
             })?,
             fixture.sink.clone(),
         );
-        let (cancellation, model) = tokio::time::timeout(Duration::from_secs(10), async {
+        let (cancellation, model) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             tokio::join!(cancellation, model)
         })
         .await
@@ -845,7 +854,7 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
     let mut fixture = slow_collection_fixture(Duration::from_secs(40), boundary).await?;
     let scenario = async {
         if boundary == CollectionBoundary::Active {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
                 while fixture.engine.active_invocation_scope()?.is_none() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
@@ -864,7 +873,7 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
                 input_control: InputControl::AtExecution,
             }, sink).await
         });
-        let pending = tokio::time::timeout(Duration::from_secs(11), async {
+        let pending = tokio::time::timeout(PENDING_PROGRESS_DEADLINE, async {
             loop {
                 let pending = fixture.events.lock().expect("fixture events poisoned")
                     .iter().find(|(_, event)| event["event"] == "provider_event"
@@ -880,7 +889,7 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
         ensure!(pending.1["payload"]["data"]["state"] == "pending");
         ensure!(pending.1["payload"]["text"] == "Cancellation still pending");
         ensure!(!cancellation.is_finished(), "pending progress completed the command");
-        let overdue = tokio::time::timeout(Duration::from_secs(25), cancellation)
+        let overdue = tokio::time::timeout(OVERDUE_RESULT_DEADLINE, cancellation)
             .await.context("overdue cancel never reported a result")??;
         ensure!(matches!(overdue,
             Err(ExecuteCommandError::Failed(CommandFailure::CollectionTimedOut))
@@ -906,7 +915,7 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
             method: "session.prompt.submit".into(),
             params: json!({"operation_id":"after-overdue-cancel","text":"Prompt after late settlement"}),
         }, &fixture.sink).await?;
-        let input = tokio::time::timeout(Duration::from_secs(5), fixture.dispatches.recv())
+        let input = tokio::time::timeout( crate::hang_guard::HANG_GUARD, fixture.dispatches.recv())
             .await.context("late settlement did not reopen input")?;
         ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
             if text == "Prompt after late settlement"));
@@ -924,7 +933,7 @@ async fn owner_cancel_control_acquisition_timeout_collects_original_before_reuse
     };
     let mut fixture = slow_collection_fixture(Duration::ZERO, CollectionBoundary::Active).await?;
     let scenario = async {
-        let original = tokio::time::timeout(Duration::from_secs(5), async {
+        let original = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 if let Some(scope) = fixture.engine.active_invocation_scope()? {
                     break Ok::<_, anyhow::Error>(scope);
@@ -950,7 +959,7 @@ async fn owner_cancel_control_acquisition_timeout_collects_original_before_reuse
                 input_control: InputControl::AtExecution,
             }, sink).await
         });
-        tokio::time::timeout(Duration::from_secs(11), async {
+        tokio::time::timeout(PENDING_PROGRESS_DEADLINE, async {
             loop {
                 let pending = fixture.events.lock().expect("fixture events poisoned").iter()
                     .any(|(_, event)| event["event"] == "provider_event"
@@ -969,7 +978,7 @@ async fn owner_cancel_control_acquisition_timeout_collects_original_before_reuse
         ensure!(matches!(fixture.dispatches.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
             "queued input dispatched while cancellation was waiting for control");
 
-        let overdue = tokio::time::timeout(Duration::from_secs(25), cancellation)
+        let overdue = tokio::time::timeout(OVERDUE_RESULT_DEADLINE, cancellation)
             .await.context("control acquisition restarted the cancellation budget")??;
         ensure!(matches!(overdue, Err(ExecuteCommandError::Failed(CommandFailure::CollectionTimedOut))));
         ensure!(started.elapsed() >= Duration::from_secs(30) && started.elapsed() < Duration::from_secs(31));
@@ -980,7 +989,7 @@ async fn owner_cancel_control_acquisition_timeout_collects_original_before_reuse
         ensure!(fixture.controller.coordinator.execution.available_permits() == 0,
             "control timeout released a binding with retained execution");
         drop(held);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             while fixture.engine.active_invocation_scope()?.is_some()
                 || fixture.controller.coordinator.execution.available_permits() == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -995,7 +1004,7 @@ async fn owner_cancel_control_acquisition_timeout_collects_original_before_reuse
         ensure!(matches!(fixture.dispatches.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
             "late cleanup automatically dispatched the retained successor");
         fixture.controller.exchange_owner.execute_command(Command::Input(InputCommand::ResumeDelivery)).await?;
-        let input = tokio::time::timeout(Duration::from_secs(5), fixture.dispatches.recv()).await?;
+        let input = tokio::time::timeout( crate::hang_guard::HANG_GUARD, fixture.dispatches.recv()).await?;
         ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
             if text == "Queued successor before cancellation"));
         ensure!(fixture.collection_count.load(Ordering::Acquire) == 1,

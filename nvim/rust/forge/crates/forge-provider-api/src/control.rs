@@ -118,14 +118,16 @@ mod tests {
                 panic!("observed child execution must never fall back to root execution")
             }
         }
-        let parent = crate::InvocationScope::new(crate::ThreadOwner::root("session"), "parent");
+        let parent = crate::InvocationScope::new(crate::testing::root_thread("session"), "parent");
         let child_scope = crate::InvocationScope::new(
-            crate::ThreadOwner::new("session".into(), crate::AgentId::new("child").unwrap())
+            parent
+                .thread_id
+                .child(&crate::AgentId::new("child").unwrap())
                 .unwrap(),
             "child-turn",
         );
         let child = crate::TurnAddress {
-            thread_id: child_scope.owner.thread_id(),
+            thread_id: child_scope.thread_id.clone(),
             turn_id: child_scope.turn_id().unwrap(),
             scope: child_scope,
         };

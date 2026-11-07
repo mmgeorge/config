@@ -275,13 +275,17 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
     let native = crate::trace::inspection_record(&json!({
         "event":"fixture-beta.session.event",
         "payload":{"type":"operation.finished","data":{
-            "tool_call_id":"call","success":true,"arguments":"credential","reasoningText":"private"
+            "tool_id":"call","tool_call_id":"native-call","success":true,
+            "arguments":"credential","reasoningText":"private"
         }}
     }));
     assert_eq!(native["payload"]["type"], "operation.finished");
-    assert_eq!(native["payload"]["data"]["tool_call_id"], "call");
+    // Inspection keeps the normalized tool identity, not a provider's native field name.
+    assert_eq!(native["payload"]["data"]["tool_id"], "call");
+    assert!(native["payload"]["data"].get("tool_call_id").is_none());
     assert_eq!(native["payload"]["data"]["success"], true);
     assert!(!native.to_string().contains("credential") && !native.to_string().contains("private"));
+    // The trace writer bounds public metadata text to 256 bytes at a character boundary.
     let method = "diagnostic".repeat(300);
     fixture
         .scope
@@ -297,7 +301,7 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .any(|record| record["payload"]["method"] == method)
+            .any(|record| record["payload"]["method"] == method[..256])
     );
     assert!(
         fixture

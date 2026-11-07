@@ -11,6 +11,8 @@ client.request = function(request_specification, callback)
   local method = request_specification.method
   local params = request_specification.params or {}
 
+  -- Comment buffers attach text correction; leaving its requests pending keeps it out of this fixture.
+  if vim.startswith(method, "text.") then return end
   callback = encode_delivery(callback)
   assert(method == "session.document" or method == "session.plan.changes.request")
   pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
@@ -108,10 +110,15 @@ local ok, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { "callback capture" })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
   pending[6].callback({ submitted = true })
+  -- Explicit operations run in FIFO order: the save queued before the callback keeps its capture,
+  -- and the callback's save follows with the newer typing.
   assert(#pending == 7, "completion callback dispatched overlapping explicit operations")
-  assert(pending[7].params.annotation[1].source.body == "callback capture",
-    "completion callback did not replace the older queued capture")
+  assert(pending[7].params.annotation[1].source.body == "typing after submit",
+    "queued save recaptured typing that followed it")
   pending[7].callback({ saved = true })
+  assert(#pending == 8 and pending[8].params.annotation[1].source.body == "callback capture",
+    "completion callback save did not follow the queued save")
+  pending[8].callback({ saved = true })
   assert(not vim.bo[native_buffer].modified)
 end, debug.traceback)
 client.request = original_request

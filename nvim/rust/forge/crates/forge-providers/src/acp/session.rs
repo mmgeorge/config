@@ -56,6 +56,8 @@ pub struct AcpSessionState {
     message: Mutex<HashMap<TurnAddress, Vec<AcpMessage>>>,
     usage_owner: Mutex<HashMap<UsageReportId, TurnAddress>>,
     unsupported_updates: Mutex<HashSet<String>>,
+    /// Notice text already surfaced on this binding; agents repeat startup notices every turn.
+    reported_notices: Mutex<HashSet<String>>,
 }
 
 /// Capture immutable callback routing for the admitted provider turn.
@@ -156,6 +158,7 @@ impl AcpSessionState {
             message: Mutex::new(HashMap::new()),
             usage_owner: Mutex::new(HashMap::new()),
             unsupported_updates: Mutex::new(HashSet::new()),
+            reported_notices: Mutex::new(HashSet::new()),
         }
     }
 
@@ -246,18 +249,48 @@ impl AcpSessionState {
         &self,
         observed_at_ms: i64,
     ) -> Result<(), ProviderError> {
-        let start = {
+        let (start, first) = {
             let mut active = self.active.write().await;
             let active = active
                 .as_mut()
                 .ok_or_else(|| provider_failure(ProviderFailureKind::WrongInvocation))?;
+            let first = !active.execution_started;
             active.execution_started = true;
-            active.native_start.clone()
+            (active.native_start.clone(), first)
         };
         if let Some(start) = start {
             start.observed(observed_at_ms).await?;
         }
+        if first {
+            self.publish_resolved_model(observed_at_ms).await?;
+        }
         Ok(())
+    }
+
+    /// Confirm the session's selected native model once the root turn has started.
+    ///
+    /// ACP reports no per-turn model, so the session's current model selection is the model
+    /// that runs the turn. Without this confirmation Harness keeps the model "unconfirmed".
+    async fn publish_resolved_model(&self, observed_at_ms: i64) -> Result<(), ProviderError> {
+        let Some(root) = self.children.lock().await.root_address() else {
+            return Ok(());
+        };
+        let catalog = self.catalog().await;
+        let Some(model_id) = super::conversation::current_model_id(&catalog)
+            .and_then(|model| ModelId::new(model.to_owned()).ok())
+        else {
+            return Ok(());
+        };
+        // `emit` can observe the native start, which publishes this confirmation.
+        Box::pin(self.emit(AdapterActivity::Turn {
+            thread_id: root.thread_id,
+            turn_id: root.turn_id,
+            event: TurnMetadataEvent::ModelResolved(ResolvedModel {
+                model_id,
+                observed_at_ms,
+            }),
+        }))
+        .await
     }
 
     /// Publish activity through the callback's original invocation ownership.
@@ -594,10 +627,11 @@ impl AcpSessionState {
         if text.is_empty() {
             return Ok(());
         }
-        let turn = self
-            .address(session_id)
-            .await
-            .context("ACP message has no known turn")?;
+        // Text from a session no `subagent_spawned` announced, or whose child already finished, has
+        // no owner to attribute it to. Dropping it keeps one stray chunk from failing the root turn.
+        let Some(turn) = self.address(session_id).await else {
+            return Ok(());
+        };
         let event = {
             let mut messages = self.message.lock().await;
             let messages = messages.entry(turn.clone()).or_default();
@@ -1450,9 +1484,12 @@ impl AcpSessionState {
                     ))
                     .await?;
                 }
-                if update["status"] == "in_progress"
-                    && self.started_tool.lock().await.insert(native_key.clone())
-                {
+                // A tool that succeeded or failed executed even when it skipped `in_progress`
+                // (Claude reports its own tools as `pending` then `completed`); without a start,
+                // Harness cannot measure it. Denied and cancelled tools never ran.
+                let executed = update["status"] == "in_progress"
+                    || matches!(status, ToolStatus::Succeeded | ToolStatus::Failed);
+                if executed && self.started_tool.lock().await.insert(native_key.clone()) {
                     self.emit(item_activity(
                         &turn,
                         &item_id,
@@ -1539,7 +1576,7 @@ impl AcpSessionState {
                 if !self.is_root(session_id).await {
                     return Ok(());
                 }
-                let thread_id = self.event_scope().await?.owner().thread_id();
+                let thread_id = self.event_scope().await?.thread_id().clone();
                 if let Some(mut compaction) = normalize_compaction(update, thread_id.as_str()) {
                     compaction.manual |= self.operation.read().await.is_some();
                     let mut compaction_map = self.compaction.lock().await;
@@ -1553,7 +1590,7 @@ impl AcpSessionState {
                     compaction_map.insert(compaction.id.clone(), compaction.clone());
                     drop(compaction_map);
                     self.emit(AdapterActivity::Thread {
-                        thread_id: self.event_scope().await?.owner().thread_id(),
+                        thread_id: self.event_scope().await?.thread_id().clone(),
                         event: ThreadEvent::CompactionUpdated(Box::new(compaction)),
                     })
                     .await?;
@@ -1587,7 +1624,7 @@ impl AcpSessionState {
                         let compaction = compaction.clone();
                         drop(compaction_map);
                         self.emit(AdapterActivity::Thread {
-                            thread_id: self.event_scope().await?.owner().thread_id(),
+                            thread_id: self.event_scope().await?.thread_id().clone(),
                             event: ThreadEvent::CompactionUpdated(Box::new(compaction)),
                         })
                         .await?;
@@ -1597,7 +1634,7 @@ impl AcpSessionState {
             "usage_update" => {
                 let root = self.is_root(session_id).await;
                 let thread_id = if root {
-                    self.event_scope().await?.owner().thread_id()
+                    self.event_scope().await?.thread_id().clone()
                 } else {
                     self.children
                         .lock()
@@ -1627,8 +1664,51 @@ impl AcpSessionState {
             // Harness already retains the accepted user input, so an echoed user chunk must not
             // create a second native user item.
             "current_mode_update" | "session_info_update" | "user_message_chunk" => {}
+            // Advertising `session.notices` makes agents send status such as MCP startup
+            // failures as notices instead of bold text inside the assistant's answer.
+            "notice" => self.notice(session_id, update).await?,
             other => self.unsupported_update(session_id, other).await?,
         }
+        Ok(())
+    }
+
+    /// Resolve the thread that owns a warning from one native session, defaulting to the root.
+    async fn warning_thread(&self, session_id: &str) -> Result<ThreadId> {
+        let root_thread = self.event_scope().await?.thread_id().clone();
+        Ok(if self.is_root(session_id).await {
+            root_thread
+        } else {
+            self.children
+                .lock()
+                .await
+                .address(session_id, true)
+                .map_or(root_thread, |address| address.thread_id)
+        })
+    }
+
+    /// Surface an agent notice as a nonfatal warning at its originating thread.
+    async fn notice(&self, session_id: &str, update: &Value) -> Result<()> {
+        let title = update["title"].as_str().unwrap_or_default().trim();
+        let description = update["description"].as_str().unwrap_or_default().trim();
+        let text = match (title.is_empty(), description.is_empty()) {
+            (false, false) => format!("{title}: {description}"),
+            (false, true) => title.to_owned(),
+            (true, false) => description.to_owned(),
+            (true, true) => return Ok(()),
+        };
+        // Claude re-sends an unchanged MCP startup failure with every turn.
+        if !self.reported_notices.lock().await.insert(text.clone()) {
+            return Ok(());
+        }
+        let thread_id = self.warning_thread(session_id).await?;
+        self.emit(AdapterActivity::Warning(ProviderWarning {
+            scope: WarningScope::Thread { thread_id },
+            kind: ProviderWarningKind::NativeNotice {
+                category: forge_provider_api::ProviderFailureKind::Unknown,
+            },
+            message: SanitizedMessage::new(text).context("ACP notice message is empty")?,
+        }))
+        .await?;
         Ok(())
     }
 
@@ -1647,16 +1727,7 @@ impl AcpSessionState {
         {
             return Ok(());
         }
-        let root_thread = self.event_scope().await?.owner().thread_id();
-        let thread_id = if self.is_root(session_id).await {
-            root_thread
-        } else {
-            self.children
-                .lock()
-                .await
-                .address(session_id, true)
-                .map_or(root_thread, |address| address.thread_id)
-        };
+        let thread_id = self.warning_thread(session_id).await?;
         self.emit(AdapterActivity::Warning(ProviderWarning {
             scope: WarningScope::Thread { thread_id },
             kind: ProviderWarningKind::UnsupportedNativeEvent,
@@ -2048,7 +2119,7 @@ mod tests {
         let (sink, mut stream) = events::channel(
             BindingId::new("revoked-capability")?,
             EventScope::Binding {
-                owner: ThreadOwner::root("host"),
+                thread_id: forge_provider_api::testing::root_thread("host"),
             },
         );
         let mut manifest = forge_provider_api::capability::CapabilityManifest::from_descriptor(
@@ -2096,7 +2167,7 @@ mod tests {
         let (sink, mut stream) = events::channel(
             BindingId::new("effort-category")?,
             EventScope::Binding {
-                owner: ThreadOwner::root("host"),
+                thread_id: forge_provider_api::testing::root_thread("host"),
             },
         );
         let mut manifest = CapabilityManifest::from_descriptor(
@@ -2160,7 +2231,10 @@ mod tests {
         let permission = Arc::new(PendingPermission {
             started: tokio::sync::Notify::new(),
         });
-        let scope = InvocationScope::new(ThreadOwner::root("host"), "cancelled");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("host"),
+            "cancelled",
+        );
         let (sink, _stream) = events::channel(BindingId::new("binding")?, scope.clone());
         state
             .begin_native("native", sink, permission.clone())
@@ -2180,7 +2254,7 @@ mod tests {
         state
             .finish(forge_provider_api::turn::TurnOutcome::Interrupted)
             .await?;
-        let successor = InvocationScope::new(scope.owner.clone(), "successor");
+        let successor = InvocationScope::new(scope.thread_id.clone(), "successor");
         let (sink, _stream) = events::channel(BindingId::new("successor-binding")?, successor);
         state.begin_native("native", sink, permission).await?;
         state.revoke_invocation_callbacks(&scope).await;
@@ -2203,17 +2277,16 @@ mod tests {
     -> Result<()> {
         for active in [false, true] {
             let state = AcpSessionState::new_native(ProviderKind::Claude);
-            let owner = ThreadOwner::root("capability-host");
+            let owner = forge_provider_api::testing::root_thread("capability-host");
             let (sink, mut stream) = events::channel(
                 BindingId::new("capability-binding")?,
                 EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: owner.clone(),
                 },
             );
             let mut manifest = forge_provider_api::capability::CapabilityManifest::from_descriptor(
                 crate::registry::descriptor(&ProviderKind::Claude.id()).unwrap(),
             );
-            manifest.task_steering = vec![TaskKind::Plan, TaskKind::Execute];
             manifest
                 .capability
                 .iter_mut()
@@ -2251,7 +2324,6 @@ mod tests {
                 panic!("catalog change must publish effective capabilities");
             };
             assert_eq!(capabilities.effective_revision, 1);
-            assert!(!capabilities.task_steering.contains(&TaskKind::Goal));
             assert!(
                 capabilities
                     .capability
@@ -2283,7 +2355,7 @@ mod tests {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let (sink, _stream) = events::channel(
             BindingId::new("binding")?,
-            InvocationScope::new(ThreadOwner::root("host"), "exchange"),
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "exchange"),
         );
         state.begin("native", sink).await?;
         state.notification("session/update", json!({"sessionId":"native","update":{
@@ -2308,7 +2380,7 @@ mod tests {
         );
         let (next_sink, _next_stream) = events::channel(
             BindingId::new("next-binding")?,
-            InvocationScope::new(ThreadOwner::root("host"), "next"),
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "next"),
         );
         state.begin("native", next_sink).await?;
         assert!(state.tool.lock().await.is_empty());
@@ -2329,7 +2401,10 @@ mod tests {
     async fn retained_history_reload_does_not_republish_old_transcript_or_tools() -> Result<()> {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let binding = BindingId::new("history-reload-binding".to_owned())?;
-        let scope = InvocationScope::new(ThreadOwner::root("host"), "original-exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("host"),
+            "original-exchange",
+        );
         let (sink, mut stream) = events::channel(binding, scope);
         state.begin("native", sink).await?;
         state
@@ -2372,11 +2447,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_from_an_unannounced_session_is_dropped_without_failing_the_turn() -> Result<()>
+    {
+        let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
+        let (sink, mut stream) = events::channel(
+            BindingId::new("unannounced-binding")?,
+            InvocationScope::new(
+                forge_provider_api::testing::root_thread("host"),
+                "unannounced-exchange",
+            ),
+        );
+        state.begin("native", sink).await?;
+        while stream.try_next()?.is_some() {}
+
+        state
+            .handle_notification(
+                "session/update",
+                json!({"sessionId":"unannounced","update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"text":"stray text"}
+                }}),
+            )
+            .await?;
+
+        assert!(stream.try_next()?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_tool_output_is_not_reused_as_denial_or_failure_diagnostic() -> Result<()> {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let (sink, mut stream) = events::channel(
             BindingId::new("tool-diagnostic-binding")?,
-            InvocationScope::new(ThreadOwner::root("host"), "tool-diagnostic-exchange"),
+            InvocationScope::new(
+                forge_provider_api::testing::root_thread("host"),
+                "tool-diagnostic-exchange",
+            ),
         );
         state.begin("native", sink).await?;
 

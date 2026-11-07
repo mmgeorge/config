@@ -56,7 +56,9 @@ function M.request(source, current, receive)
     if not client then finish(nil, nil, failure) return end
     local source_rows = rows(contents)
     if buffer and vim.api.nvim_buf_is_loaded(buffer) then
-      if vim.bo[buffer].modified or not vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), source_rows) then
+      -- A hidden buffer retained by an earlier lookup may predate the file the plan captured.
+      if not source_buffer.adopt_disk_rows(buffer, source_rows) and (vim.bo[buffer].modified
+        or not vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), source_rows)) then
         finish(nil, nil, "Source buffer differs from the captured plan") return
       end
     else

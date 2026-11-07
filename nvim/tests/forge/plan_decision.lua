@@ -1,6 +1,6 @@
 local function mapping_callback(buffer, mode, key)
   for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(buffer, mode)) do
-    if mapping.lhs == key then return mapping.callback end
+    if vim.keycode(mapping.lhs) == vim.keycode(key) then return mapping.callback end
   end
 end
 

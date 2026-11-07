@@ -16,6 +16,29 @@ local client = require("forge.client")
 client._host_set_launcher_for_test(vim.system)
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
+local session_id
+local function request(method, params)
+  local settled, value, failure
+  client.request({ method = method, params = params or {}, session_id = session_id }, function(result, request_error)
+    value, failure, settled = result, request_error, true
+  end)
+  assert(vim.wait(10000, function() return settled end, 10), method .. " timeout")
+  assert(not failure, method .. ": " .. tostring(failure))
+  return value
+end
+-- session.prompt.submit settles at admission, so a turn's outcome is read from its exchange record.
+local function exchange_state(prompt)
+  for _, exchange in ipairs(request("session.exchange.list") or {}) do
+    if exchange.prompt == prompt then return exchange.state end
+  end
+end
+local function await_cancelled(prompt, message)
+  local observed
+  assert(vim.wait(10000, function()
+    observed = exchange_state(prompt)
+    return observed == "cancelled"
+  end, 10), message .. ": " .. tostring(observed))
+end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
   require("forge").setup({ harness = { provider = "mock", providers = { mock = { command = { "blocking" } } } } })
@@ -25,37 +48,27 @@ local success, failure = xpcall(function()
     opened = snapshot
   end)
   assert(vim.wait(10000, function() return opened ~= nil end, 10), "host initialization stalled")
+  session_id = opened.session.id
   local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
-  local held = mock.hold(opened.session.id, "chat")
-  local finished, rejected, cancelled, completion_error, completion_detail
-  client.request({ method = "session.prompt.submit", params = { text = "Wait for interruption" }, session_id = opened.session.id }, function(_, request_error, detail)
-    completion_error, completion_detail = request_error, detail
-    finished = true
-  end)
+  local held = mock.hold(session_id, "chat")
+  request("session.prompt.submit", { text = "Wait for interruption" })
   assert(held:wait().prompt == "Wait for interruption")
-  client.request({ method = "session.prompt.submit", params = { text = "Must not reset cancellation" }, session_id = opened.session.id }, function(_, request_error)
-    assert(request_error and request_error:find("execution request is already running", 1, true), request_error)
-    rejected = true
-  end)
-  assert(vim.wait(5000, function() return rejected end, 10), "overlapping request was not rejected")
-  client.request({ method = "session.turn.cancel", params = {}, session_id = opened.session.id }, function(result, request_error)
-    assert(not request_error, request_error)
-    cancelled = result.cancel_requested
-  end)
-  assert(vim.wait(10000, function() return finished and cancelled end, 10), "cancellation failed to settle")
-  assert(completion_error and completion_detail.code == "turn_cancelled", vim.inspect({ completion_error, completion_detail }))
+  assert(request("session.turn.cancel").cancel_requested, "cancellation of a held turn was not requested")
+  await_cancelled("Wait for interruption", "held turn did not settle as cancelled")
 
-  finished, cancelled, completion_error, completion_detail = false, false, nil, nil
-  client.request({ method = "session.prompt.submit", params = { text = "Cancel immediately after admission" }, session_id = opened.session.id }, function(_, request_error, detail)
-    completion_error, completion_detail = request_error, detail
-    finished = true
-  end)
-  client.request({ method = "session.turn.cancel", params = {}, session_id = opened.session.id }, function(result, request_error)
-    assert(not request_error, request_error)
-    cancelled = result.cancel_requested
-  end)
-  assert(vim.wait(10000, function() return finished and cancelled end, 10), "early cancellation was lost")
-  assert(completion_error and completion_detail.code == "turn_cancelled", vim.inspect({ completion_error, completion_detail }))
+  -- Cancelling before the admitted input starts a turn suspends the queue and keeps the message.
+  request("session.prompt.submit", { text = "Cancel immediately after admission" })
+  assert(request("session.turn.cancel").cancel_requested, "early cancellation was not requested")
+  local input
+  assert(vim.wait(10000, function()
+    input = request("session.input.get")
+    return input.suspended == true
+  end, 10), "early cancellation did not suspend the queue: " .. vim.inspect(input))
+  local retained = vim.tbl_filter(function(message)
+    return message.text == "Cancel immediately after admission" and message.delivery == "queued"
+  end, input.messages or {})
+  assert(#retained == 1, "early cancellation lost the admitted message: " .. vim.inspect(input))
+  assert(exchange_state("Cancel immediately after admission") == nil, "early cancellation still started a turn")
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 client.host_stop()

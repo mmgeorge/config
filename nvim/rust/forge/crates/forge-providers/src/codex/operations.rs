@@ -7,7 +7,7 @@ use forge_provider_api::{
     SteeringRequestIdentity, SubmissionEvidence, TurnInterruptResult,
     catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition, WorkspaceContext},
     retained_operation::{IdentityRegistry, Store},
-    terminal::{TerminalId, TerminalSnapshot},
+    terminal::{TerminalId, TerminalInventory},
 };
 use std::{
     future::Future,
@@ -54,7 +54,7 @@ pub(super) struct Records {
     /// Retain configured or observed MCP query results.
     pub(super) mcp: Store<McpQuery, Vec<McpDefinition>>,
     /// Retain binding-scoped shell status observations.
-    pub(super) terminals: Store<BindingId, TerminalSnapshot>,
+    pub(super) terminals: Store<BindingId, TerminalInventory>,
     /// Retain exact shell termination disposition independently of foreground work.
     pub(super) terminate: Store<(BindingId, TerminalId), ()>,
 }

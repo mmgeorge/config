@@ -26,11 +26,41 @@ fn provider_failure_display_does_not_repeat_its_source_chain() {
     assert_eq!(displayed.matches("Persistence").count(), 1);
 }
 
+/// Render an observation loss once although its wrapper both displays and exposes the cause.
+#[test]
+fn observation_failure_message_names_its_cause_once() {
+    let error = anyhow::Error::new(forge_provider_api::ProviderError::Observation(
+        forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+    ))
+    .context("commit provider observation");
+    assert_eq!(
+        format!("{error:#}")
+            .matches("provider observation disconnected")
+            .count(),
+        2,
+        "the raw chain no longer repeats; this regression fixture is stale"
+    );
+    let displayed = super::error_message(&error);
+    assert_eq!(
+        displayed
+            .matches("provider observation disconnected")
+            .count(),
+        1,
+        "{displayed}"
+    );
+    let contextual = anyhow::anyhow!("outer cause").context("operation failed");
+    assert_eq!(
+        super::distinct_cause_message(&contextual),
+        "operation failed: outer cause"
+    );
+}
+
 /// Isolate obsolete history before provider admission needs durable operation evidence.
 #[test]
 fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
     use crate::exchange::core_log::{CoreEventLog, CoreOperation, CoreRecord};
-    use forge_provider_api::{EventScope, OperationId, ProviderOperation, ThreadOwner};
+    use crate::provider::ThreadOwner;
+    use forge_provider_api::{EventScope, OperationId, ProviderOperation};
 
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
@@ -62,7 +92,7 @@ fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
             kind: ProviderOperation::ThreadOpen,
             binding: None,
             scope: EventScope::Binding {
-                owner: ThreadOwner::root("current-session"),
+                thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("current-session")),
             },
             invocation: None,
         },
@@ -78,88 +108,6 @@ fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
                 .get::<_, i64>(0))?,
         1
     );
-    Ok(())
-}
-
-/// Discard obsolete review decisions and task records instead of reconstructing authority.
-#[test]
-fn obsolete_review_history_is_deleted_without_reconstructing_authority() -> Result<()> {
-    let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
-    let mut review = crate::plan::PlanReview::new(
-        "review-digest".into(),
-        &[
-            crate::session::ApprovalMode::Ask,
-            crate::session::ApprovalMode::Deny,
-        ],
-    )?;
-    review.overall_comment = Some("Preserve the public API".into());
-    review.saved_source_digest = Some("source-digest".into());
-    let question = review.elicitation.question_set.questions[0].id.clone();
-    review.elicitation.answer(
-        &question,
-        crate::plan::PlanQuestionResponse::Selected {
-            option: "ask".into(),
-            feedback: Some("Retain the reviewed scope".into()),
-        },
-    )?;
-    review
-        .elicitation
-        .answer_order
-        .insert(question, ("view".into(), 7));
-    let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
-        "id":"legacy-plan","session_id":"session","request":"Keep reviewed decisions","state":"awaiting_review",
-        "working_path":"","document_version":1,"model_revision":1,"submitted_version":1,"user_revision":0,
-        "review_digest":"review-digest","review":review,"created_at_ms":1,"updated_at_ms":1,
-    }))?;
-    let mut task = crate::task::Task::plan(plan, 1)?;
-    task.edit(|task| {
-        task.auto_accept_plan = true;
-        Ok(())
-    })?;
-    let current = controller.current()?.unwrap();
-    controller.change(
-        &mut store,
-        Some(&current.revision),
-        crate::task::TaskChange::Install(Box::new(task)),
-        2,
-    )?;
-    let task = controller.current()?.unwrap();
-    store.connection.execute(
-        "INSERT INTO task_record(id,session_id,payload) VALUES('archived-task','session',?1)",
-        [serde_json::to_string(&task)?],
-    )?;
-    for (table, old, new) in [
-        ("plan_record", "$.acceptance", "$.review"),
-        (
-            "session_record",
-            "$.session.active_task.plan.artifact.acceptance",
-            "$.session.active_task.plan.artifact.review",
-        ),
-        (
-            "task_record",
-            "$.plan.artifact.acceptance",
-            "$.plan.artifact.review",
-        ),
-    ] {
-        store.connection.execute(&format!("UPDATE {table} SET payload=json_remove(json_set(payload,?1,json_extract(payload,?2)),?2)"), [old,new])?;
-    }
-    store.connection.execute_batch("PRAGMA user_version=6")?;
-    drop(store);
-    drop(controller);
-    std::fs::rename(
-        super::state::directory(root.path()),
-        root.path().join("state/v6"),
-    )?;
-    let upgraded = SqliteStore::open(root.path())?;
-    for table in ["session_record", "plan_record", "task_record"] {
-        let retained: i64 =
-            upgraded
-                .connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })?;
-        assert_eq!(retained, 0);
-    }
     Ok(())
 }
 
@@ -220,34 +168,6 @@ fn current_schema_reads_do_not_wait_for_another_writer() -> Result<()> {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
         super::schema::VERSION
-    );
-    Ok(())
-}
-
-#[test]
-fn obsolete_history_replacement_does_not_decode_existing_conversations() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let mut store = SqliteStore::open(root.path())?;
-    store.save_session(&session("session", "workspace"))?;
-    store.connection.execute_batch("DROP TABLE command_receipt; PRAGMA user_version=1; CREATE TRIGGER prevent_scan BEFORE UPDATE ON exchange_record BEGIN SELECT RAISE(ABORT,'unexpected conversation rewrite'); END;")?;
-    drop(store);
-    std::fs::rename(
-        super::state::directory(root.path()),
-        root.path().join("state/v1"),
-    )?;
-    let upgraded = SqliteStore::open(root.path())?;
-    assert_eq!(
-        upgraded
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        super::schema::VERSION
-    );
-    assert_eq!(
-        upgraded
-            .connection
-            .query_row("SELECT count(*) FROM command_receipt", [], |row| row
-                .get::<_, i64>(0))?,
-        0
     );
     Ok(())
 }

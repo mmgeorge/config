@@ -167,6 +167,12 @@ local ok, failure = pcall(function()
   choose("")
   assert(not approval.is_open(), "cancel must close without saving staged choices")
 
+  host.resolve = function() error("closing must not approve or reject the tool") end
+  for _, key in ipairs({ "q", "<Esc>" }) do
+    approval.open(request, host)
+    invoke(key)
+    assert(not approval.is_open(), key .. " must close the permission review like other Forge popups")
+  end
   host.resolve = function() error("interrupt must not approve or reject the tool") end
   approval.open(request, host)
   local previous_closed = closed

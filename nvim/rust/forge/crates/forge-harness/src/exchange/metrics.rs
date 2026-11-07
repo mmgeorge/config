@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -328,7 +329,7 @@ impl ExchangeMetrics {
 
     /// Reject mismatched typed relationships before changing retained measurements.
     fn validate_address(&self, address: &TurnAddress) -> Result<(), UsageReportError> {
-        if address.thread_id != address.scope.owner.thread_id()
+        if address.thread_id != address.scope.owner().thread_id()
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
             || self.reports.iter().any(|sample| {
                 sample.address.turn_id == address.turn_id && sample.address != *address
@@ -633,7 +634,7 @@ mod test {
         );
         scope.invocation_id = turn.into();
         TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         }

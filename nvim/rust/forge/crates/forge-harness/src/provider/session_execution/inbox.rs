@@ -691,6 +691,7 @@ fn inbox_poisoned(_component: &'static str) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::ScopeOwner;
     /// Keep aborted-but-running workers owned when a background collection waiter is cancelled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_background_collection_retains_unjoined_workers() {
@@ -797,7 +798,9 @@ mod tests {
     fn bounded_draining_preserves_large_observation_stream() -> Result<()> {
         let inbox = SessionObservationInbox::default();
         let scope = crate::provider::EventScope::Binding {
-            owner: crate::provider::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                "session",
+            )),
         };
         let mut observed = Vec::new();
         let count = forge_protocol::MAX_PENDING_FRAMES * 4;
@@ -843,7 +846,9 @@ mod tests {
         let event = |index| {
             notice(
                 crate::provider::EventScope::Binding {
-                    owner: crate::provider::ThreadOwner::root("session"),
+                    thread_id: forge_provider_api::ThreadId::from(
+                        crate::provider::ThreadOwner::root("session"),
+                    ),
                 },
                 format!("frame-{index:03}: α🦀"),
             )
@@ -960,11 +965,11 @@ mod tests {
                 crate::provider::ThreadOwner::root("session"),
                 "exchange",
             );
-            let engine = registry.owner(scope.owner.clone()).await?;
+            let engine = registry.owner(scope.owner().clone()).await?;
             let input = crate::provider::ProviderRequest {
                 dispatch: forge_provider_api::submission::DispatchTracker::default(),
-                execution_owner: Some(scope.owner.clone()),
-                harness_session_id: scope.owner.session_id().to_string(),
+                execution_owner: Some(scope.owner().clone()),
+                harness_session_id: scope.owner().session_id().to_string(),
                 workspace: directory.path().to_string_lossy().into_owned(),
                 input: crate::provider::ProviderInput::from_text("timeout fixture"),
                 mode: crate::provider::PromptMode::Chat,
@@ -982,7 +987,7 @@ mod tests {
             };
             let turn = crate::provider::TurnAddress {
                 scope: scope.clone(),
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id()?,
             };
             let (sink, _events) = crate::provider::events::channel(scope.clone());
@@ -1209,7 +1214,7 @@ mod tests {
         let second_scope = crate::provider::InvocationScope::new(owner, "second");
         let address = crate::provider::ToolAddress {
             turn: crate::provider::TurnAddress {
-                thread_id: first_scope.owner.thread_id().clone(),
+                thread_id: first_scope.owner().thread_id().clone(),
                 turn_id: first_scope.turn_id()?,
                 scope: first_scope.clone(),
             },
@@ -1251,7 +1256,7 @@ mod tests {
         ))?;
         let later = crate::provider::ToolAddress {
             turn: crate::provider::TurnAddress {
-                thread_id: second_scope.owner.thread_id().clone(),
+                thread_id: second_scope.owner().thread_id().clone(),
                 turn_id: second_scope.turn_id()?,
                 scope: second_scope,
             },
@@ -1282,7 +1287,7 @@ mod tests {
         let first = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(timeout)?);
         let tool = crate::provider::ToolAddress {
             turn: crate::provider::TurnAddress {
-                thread_id: first_scope.owner.thread_id().clone(),
+                thread_id: first_scope.owner().thread_id().clone(),
                 turn_id: first_scope.turn_id()?,
                 scope: first_scope.clone(),
             },
@@ -1345,7 +1350,9 @@ mod tests {
             inbox
                 .push(notice(
                     crate::provider::EventScope::Binding {
-                        owner: crate::provider::ThreadOwner::root("session"),
+                        thread_id: forge_provider_api::ThreadId::from(
+                            crate::provider::ThreadOwner::root("session")
+                        ),
                     },
                     forge_provider_api::SanitizedMessage::new("stale")
                         .expect("fixture diagnostic is nonempty")
@@ -1362,7 +1369,9 @@ mod tests {
         let inbox = SessionObservationInbox::default();
         let event = notice(
             crate::provider::EventScope::Binding {
-                owner: crate::provider::ThreadOwner::root("session"),
+                thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                    "session",
+                )),
             },
             forge_provider_api::SanitizedMessage::new("before failure")
                 .expect("fixture diagnostic is nonempty")

@@ -164,6 +164,7 @@ impl DisplayProjection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ScopeOwner;
 
     /// Create checked source identities containing separators to exercise collision safety.
     fn fixture_address(turn_id: &str, item_id: &str) -> ToolAddress {
@@ -173,7 +174,7 @@ mod tests {
         );
         ToolAddress {
             turn: crate::provider::TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: forge_provider_api::TurnId::new(turn_id).unwrap(),
                 scope,
             },

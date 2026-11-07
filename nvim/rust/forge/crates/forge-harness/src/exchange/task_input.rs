@@ -39,7 +39,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 .snapshot()?
                 .messages
                 .iter()
-                .filter(|message| message.delivery() == InputDelivery::Queued)
+                .filter(|message| crate::input::task_input_retirable(message))
                 .filter(|message| task_input_retired(task.as_ref(), &message.purpose))
                 .map(|message| (message.id.clone(), message.revision))
                 .collect();
@@ -71,10 +71,10 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                     InputPurpose::TaskEntry {
                         revision: task.revision.clone(),
                         id: entry.id.clone(),
-                        start: crate::exchange::TaskStart {
+                        start: (!entry.resumed).then(|| crate::exchange::TaskStart {
                             kind: task.kind(),
                             title: task.title().into(),
-                        },
+                        }),
                     },
                 )
             } else if let Some((turn, continuation)) = task

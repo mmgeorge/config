@@ -4,6 +4,7 @@ use crate::agent::{
     AgentSource, AgentTask, ObservedAgent, ObservedAgentAvailability, ObservedAgentState,
 };
 use crate::exchange::{Exchange, ExchangeState};
+use crate::provider::ScopeOwner;
 use crate::storage::SqliteStore;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -26,7 +27,7 @@ impl HarnessBroker {
             return Ok(());
         }
         anyhow::ensure!(
-            record.request.owner()? == scope.owner && scope.owner.is_root(),
+            record.request.owner()? == scope.owner() && scope.owner().is_root(),
             "user child report receipt crosses original owner"
         );
         let tasks = self.store.list_agent_task(&self.session.id)?;
@@ -172,7 +173,7 @@ mod tests {
         parent.start_turn(second, 3)?;
         let child_scope = crate::provider::InvocationScope::new(
             crate::provider::ThreadOwner::new(
-                first.scope.owner.session_id().clone(),
+                first.scope.owner().session_id().clone(),
                 forge_provider_api::AgentId::new("observed-child-owner")?,
             )?,
             parent.id.clone(),
@@ -180,7 +181,7 @@ mod tests {
         let child_turn = crate::provider::test_support::address(&child_scope);
         let public = forge_provider_api::AgentId::new("native-child-run")?;
         let description = AgentDescription {
-            parent_agent_id: Some(first.scope.owner.agent_id().clone()),
+            parent_agent_id: Some(first.scope.owner().agent_id().clone()),
             delegation: Some(AgentDelegation {
                 parent_thread_id: first.thread_id.clone(),
                 parent_turn_id: first.turn_id.clone(),

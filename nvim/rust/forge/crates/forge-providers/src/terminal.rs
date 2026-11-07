@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalSnapshot};
+use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalInventory};
 use serde_json::Value;
 
 /// Normalize a provider inventory while excluding agents and completed shell tasks.
-pub fn parse_snapshot(value: &Value, copilot: bool) -> Result<TerminalSnapshot> {
+pub fn parse_snapshot(value: &Value, copilot: bool) -> Result<TerminalInventory> {
     let rows = value
         .get(if copilot { "tasks" } else { "data" })
         .and_then(Value::as_array)
@@ -46,11 +46,7 @@ pub fn parse_snapshot(value: &Value, copilot: bool) -> Result<TerminalSnapshot> 
             });
         }
     }
-    Ok(TerminalSnapshot {
-        supported: true,
-        starting: false,
-        terminal,
-    })
+    Ok(TerminalInventory::observed(terminal))
 }
 
 #[cfg(test)]

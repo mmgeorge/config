@@ -1,14 +1,33 @@
 use serde::{Deserialize, Serialize};
 
-/// Provider-owned shell processes whose lifetime is independent of a Harness exchange.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-pub struct TerminalSnapshot {
-    /// Whether this adapter implements terminal inventory for the exact binding.
-    pub supported: bool,
-    /// The provider session is initializing or applying resource configuration.
-    pub starting: bool,
-    /// Currently observed independently owned shells; an empty list contains no live shells.
+/// Provider-owned shells whose lifetime is independent of a Harness exchange.
+///
+/// A provider without terminal inventory reports `UnsupportedCapability` instead of an
+/// inventory, so unsupported, opening, empty, and failed reads stay distinguishable.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct TerminalInventory {
+    /// Shells observed so far; an empty complete inventory holds no live shells.
     pub terminal: Vec<BackgroundTerminal>,
+    /// Whether every native inventory source for the binding has reported.
+    pub complete: bool,
+}
+
+impl TerminalInventory {
+    /// Report a complete inventory of the observed shells.
+    pub fn observed(terminal: Vec<BackgroundTerminal>) -> Self {
+        Self {
+            terminal,
+            complete: true,
+        }
+    }
+
+    /// Report an inventory whose native sources have not all reported yet.
+    pub fn opening() -> Self {
+        Self {
+            terminal: Vec::new(),
+            complete: false,
+        }
+    }
 }
 
 /// A live shell identity and its display command, scoped to one provider session.

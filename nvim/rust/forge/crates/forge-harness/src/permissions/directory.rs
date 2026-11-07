@@ -228,7 +228,14 @@ pub(crate) fn resolve_path(path: &Path, workspace: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-pub use forge_provider_api::access::{DirectoryGrant, DirectoryOperation};
+pub use forge_provider_api::access::DirectoryOperation;
+
+/// Persist one saved host directory grant together with the operation it authorizes.
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct DirectoryGrant {
+    pub operation: DirectoryOperation,
+    pub path: String,
+}
 
 #[cfg(test)]
 mod test {

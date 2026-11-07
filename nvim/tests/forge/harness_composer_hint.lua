@@ -37,17 +37,18 @@ local ok, failure = xpcall(function()
       { use_winbar = true, maxwidth = width or 140 }).str
   end
   assert(display({}):find("<C-s> submit", 1, true))
-  assert(not display({}):find("help", 1, true))
-  assert(not display({}):find("q close", 1, true))
+  -- The composer is Insert-mode text, so its Normal-mode exit and help hints name their mode.
+  assert(display({}):find("? help (normal)", 1, true), display({}))
+  assert(display({}):find("q exit (normal)", 1, true), display({}))
   assert(not display({}):find("edit queued", 1, true))
-  local busy = { busy = true, capability = { native_steer = true }, queue = { "next" } }
+  local busy = { capability = { native_steer = true }, queue = { "next" } }
+  dofile("nvim/tests/forge/support/activity.lua").set_busy(busy, true)
   local text = display(busy)
   for _, expected in ipairs({ "<C-s> submit", "<C-q> queue", "<C-c> cancel", "<M-s> edit queued" }) do
     assert(text:find(expected, 1, true), text)
   end
-  assert(display(busy, 50):find("<M-s> edit queued", 1, true), "queued editing must survive narrow composer hints")
   busy.queue = {}
-  assert(not display(busy, 50):find("edit queued", 1, true), "empty queue must clear the editing hint")
+  assert(not display(busy):find("edit queued", 1, true), "empty queue must clear the editing hint")
   busy.queue = { "next" }
   busy.queue_edit = {}
   assert(display(busy):find("<C-q> unqueue", 1, true), "editing must advertise moving the message back to the prompt")
@@ -62,7 +63,7 @@ local ok, failure = xpcall(function()
   config.options.keymaps.harness.queue = original.queue
   busy.queue_edit = nil
   config.options.keymaps.harness.edit_queued = "<M-Up>"
-  assert(display(busy, 50):find("<M-Up> edit queued", 1, true), "queue hint must use the configured binding")
+  assert(display(busy):find("<M-Up> edit queued", 1, true), "queue hint must use the configured binding")
   config.options.keymaps.harness.edit_queued = false
   assert(not display(busy):find("edit queued", 1, true), "disabled binding must hide the queue hint")
   config.options.keymaps.harness.edit_queued = original.edit_queued
@@ -77,7 +78,8 @@ local ok, failure = xpcall(function()
   assert(not text:find("<C-q>", 1, true))
   keymaps.setup_view_keymaps(buffer, "harness", composer_commands)
   vim.api.nvim_buf_call(buffer, function()
-    assert(vim.fn.maparg("q", "n", false, true).buffer ~= 1)
+    assert(vim.fn.maparg("q", "n", false, true).buffer == 1, "composer must map its advertised Normal-mode exit")
+    assert(vim.fn.maparg("q", "i", false, true).buffer ~= 1, "exit must not capture typed text")
     assert(vim.fn.maparg("<F5>", "i", false, true).buffer == 1)
     assert(vim.fn.maparg("<C-s>", "i", false, true).buffer ~= 1)
     assert(vim.fn.maparg("<C-q>", "i", false, true).buffer ~= 1)

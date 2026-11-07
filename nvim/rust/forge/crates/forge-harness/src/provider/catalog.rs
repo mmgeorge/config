@@ -20,12 +20,12 @@ pub struct ProviderCatalogRequest {
 
 impl ProviderCatalogRequest {
     /// Get the runtime key owned by the published session snapshot.
-    pub fn runtime_key(&self) -> Result<String, forge_provider_api::ThreadOwnerError> {
+    pub fn runtime_key(&self) -> Result<String, crate::provider::ThreadOwnerError> {
         Ok(self.owner()?.runtime_key())
     }
 
     /// Resolve the exact host owner without changing the visible preference scope.
-    pub fn owner(&self) -> Result<super::ThreadOwner, forge_provider_api::ThreadOwnerError> {
+    pub fn owner(&self) -> Result<super::ThreadOwner, crate::provider::ThreadOwnerError> {
         super::ThreadOwner::resolve(&self.execution_owner, &self.harness_session_id)
     }
 }

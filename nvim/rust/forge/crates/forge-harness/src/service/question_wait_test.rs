@@ -1,4 +1,4 @@
-use super::question_event_test::{context, creation, fixture};
+use super::question_event_test::{context, creation, fixture, fixture_with_question_wait_capacity};
 use super::*;
 
 /// Commit a decision through production owner intake without running a native provider turn.
@@ -31,7 +31,7 @@ async fn await_input(
     controller: &SessionController,
     message: &str,
 ) -> Result<crate::input::InputUpdate> {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(receipt) = controller
                 .coordinator
@@ -168,7 +168,7 @@ async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_c
         rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("CREATE TRIGGER reject_wait_observation BEFORE UPDATE ON session_question_state WHEN json_array_length(json_extract(NEW.payload,'$.observed_tool_messages')) > json_array_length(json_extract(OLD.payload,'$.observed_tool_messages')) BEGIN SELECT RAISE(ABORT,'injected wait retirement failure'); END;")?;
-    let outcome = tokio::time::timeout(Duration::from_secs(3), wait.answers())
+    let outcome = tokio::time::timeout(crate::hang_guard::HANG_GUARD, wait.answers())
         .await
         .context("persistent retirement failure left the response observer blocked")?;
     assert!(matches!(
@@ -190,7 +190,7 @@ async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_c
         .trace
         .session_status(controller.observer.session_id())
         .path;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let trace = controller.trace.clone();
             let path = path.clone();
@@ -215,7 +215,7 @@ async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_c
             .is_empty()
     );
     connection.execute_batch("DROP TRIGGER reject_wait_observation;")?;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let payload: String = connection.query_row(
                 "SELECT payload FROM session_question_state WHERE session_id=?1",
@@ -269,7 +269,11 @@ async fn owner_close_seals_live_question_waits_and_preserves_answer_history() ->
         .await?;
     let question = wait.question_ids()[0].clone();
     answer(&controller, &question, "answer-before-close").await?;
-    tokio::time::timeout(Duration::from_secs(3), controller.finish_exchange_owner()).await??;
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        controller.finish_exchange_owner(),
+    )
+    .await??;
     assert!(matches!(
         wait.answers().await,
         Err(crate::question::QuestionWaitError::OwnerClosed)
@@ -292,8 +296,10 @@ async fn owner_close_seals_live_question_waits_and_preserves_answer_history() ->
 /// Queue excess wait admission while answers and shutdown retain their control paths.
 #[tokio::test]
 async fn question_wait_capacity_backpressures_without_blocking_answers_or_close() -> Result<()> {
-    const WAIT_CAPACITY: usize = 1024;
-    let (_root, controller, exchange) = fixture().await?;
+    // A small injected capacity reaches saturation without registering the production limit.
+    const WAIT_CAPACITY: usize = 2;
+    let (_root, controller, exchange) =
+        fixture_with_question_wait_capacity(Some(WAIT_CAPACITY)).await?;
     let context = context(&controller, &exchange);
     let events = controller.exchange_owner.question_events();
     let create = |operation: String| -> Result<crate::exchange::QuestionCreation> {
@@ -337,14 +343,14 @@ async fn question_wait_capacity_backpressures_without_blocking_answers_or_close(
     let first = waits.remove(0);
     let question = first.question_ids()[0].clone();
     tokio::time::timeout(
-        Duration::from_secs(3),
+        crate::hang_guard::HANG_GUARD,
         answer(&controller, &question, "capacity-answer"),
     )
     .await
     .context("full wait capacity blocked a user answer")??;
-    let answers = tokio::time::timeout(Duration::from_secs(3), first.answers()).await??;
+    let answers = tokio::time::timeout(crate::hang_guard::HANG_GUARD, first.answers()).await??;
     assert_eq!(answers.len(), 1);
-    let admitted = tokio::time::timeout(Duration::from_secs(3), overflow)
+    let admitted = tokio::time::timeout(crate::hang_guard::HANG_GUARD, overflow)
         .await
         .context("retiring one wait did not admit the retained overflow request")??;
     assert_eq!(admitted.question_ids().len(), 1);
@@ -365,9 +371,12 @@ async fn question_wait_capacity_backpressures_without_blocking_answers_or_close(
         )?)
         .await?;
     assert!(futures_util::poll!(closing.as_mut()).is_pending());
-    tokio::time::timeout(Duration::from_secs(10), controller.finish_exchange_owner())
-        .await
-        .context("staged wait admission blocked owner shutdown")??;
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        controller.finish_exchange_owner(),
+    )
+    .await
+    .context("staged wait admission blocked owner shutdown")??;
     assert!(matches!(
         closing.await,
         Err(crate::exchange::QuestionEventError::OwnerClosed
@@ -420,7 +429,7 @@ async fn observed_shared_wait_prevents_an_abandoned_guard_from_queuing_duplicate
         .trace
         .session_status(controller.observer.session_id())
         .path;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let trace = controller.trace.clone();
             let path = path.clone();

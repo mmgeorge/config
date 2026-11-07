@@ -24,7 +24,7 @@ vim.fn.mkdir(data, "p")
 local hold = vim.g.forge_check_activity_hold or 0
 vim.fn.writefile({ vim.json.encode({ checks = {
   ["activity"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c",
-      ("sleep %dms; print 'retained check output'"):format(hold + 1200)  }, label = "Activity fixture", directory = ".", category = "test", after = {} } },
+      "loop { if ('activity.release' | path exists) { break }; sleep 10ms }; print 'retained check output'"  }, label = "Activity fixture", directory = ".", category = "test", after = {} } },
   ["rust-stream"] = { trigger = { auto = false }, action = {
     command = { "nu", "--no-config-file", "--stdin", original_directory .. "/nvim/tools/checks/rust.nu", "test" },
     label = "Rust streaming fixture", category = "test", input = true, after = {},
@@ -121,6 +121,8 @@ local succeeded, failure = xpcall(function()
   assert(not running:find("retained check output", 1, true), "running status exposed check output")
   assert_status_split()
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
+  -- The activity check blocks until released, so the running state is observed without a timer.
+  vim.fn.writefile({ "release" }, workspace .. "/activity.release")
   local result
   assert(vim.wait(10000, function()
     result = request("session.check.status", { run_id = run_id })
@@ -288,14 +290,14 @@ local succeeded, failure = xpcall(function()
   local streaming_id = check_tool.start(request, { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
   assert(vim.wait(30000, function()
     answer_permissions()
-    return presentation_text():find("    running 1 test", 1, true) ~= nil
+    return presentation_text():find("Starting 1 test across 1 binary", 1, true) ~= nil
   end, 10), "Rust callback buffered output until exit: " .. presentation_text())
   local active_rust = request("session.check.status", { run_id = streaming_id })
   assert(active_rust.state == "running", "streaming evidence arrived only after Cargo finished")
   local live_text = presentation_text()
   assert(live_text:find("Rust streaming fixture", 1, true), live_text)
   assert(not live_text:find("Compiling stream-fixture", 1, true), "status retained earlier output lines")
-  local _, live_lines = live_text:gsub("    running 1 test", "")
+  local _, live_lines = live_text:gsub("Starting 1 test across 1 binary", "")
   assert(live_lines == 1, "status must show exactly one latest output line")
   assert_status_split()
   vim.fn.writefile({ "release" }, rust_root .. "/release-check")
@@ -307,10 +309,10 @@ local succeeded, failure = xpcall(function()
   assert(rust_result.state == "passed", vim.inspect(rust_result))
   local report = rust_command(rust_result).report.result[1]
   assert(report.output:find("Compiling stream-fixture", 1, true), "report lost stderr")
-  assert(report.output:find("test streaming ... ok", 1, true), "report lost stdout")
+  assert(report.output:find("PASS %[[^\n]- streaming"), "report lost the nextest result line")
   assert(vim.wait(3000, function()
     return presentation_text():find("Checks running", 1, true) == nil
-      and presentation_text():find("running 1 test", 1, true) == nil
+      and presentation_text():find("Starting 1 test across 1 binary", 1, true) == nil
   end, 10), "completed Rust output did not collapse")
   for _, exact_test in ipairs({ "failure", "missing" }) do
     local failed_id = check_tool.start(request, { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id

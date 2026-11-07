@@ -299,7 +299,10 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
             .eq(prompt.split_whitespace()),
         "reopened transcript must preserve every saved prompt word"
     );
-    assert!(serde_json::to_vec(&document).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
+    assert!(
+        serde_json::to_vec(&document).unwrap().len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES,
+        "the reopened history must exceed one snapshot transfer part"
+    );
     let subsequent = host
         .request(
             4,
@@ -1597,6 +1600,13 @@ async fn commit_editor_options_and_progress_receipts_use_the_copied_host_fixture
         }),
         "missing bounded commit progress receipt: {:#?}",
         host.progress
+            .iter()
+            .map(|event| (
+                event["event"].clone(),
+                event["payload"]["kind"].clone(),
+                event["payload"]["data"].clone()
+            ))
+            .collect::<Vec<_>>()
     );
     let operation_id = submitted["result"]["operation_id"]
         .as_u64()
@@ -1825,6 +1835,15 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
     assert!(opened["result"].get("composer").is_none(), "{opened}");
     let transcript_revision = opened["result"]["transcript"]["revision"].clone();
     let complete_text = format!("{}complete tail", "complete λ\n".repeat(6000));
+    let armed = host
+        .request_for(
+            session_id,
+            10,
+            "session.provider.mock_response",
+            json!({"operation":"hold"}),
+        )
+        .await;
+    let hold_id = armed["result"]["id"].as_str().unwrap().to_owned();
     let submitted_large = host
         .request_for(
             session_id,
@@ -1835,6 +1854,17 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         )
         .await;
     assert!(submitted_large.get("error").is_none(), "{submitted_large}");
+    // Prompt submission answers at owner acceptance. The transcript gains the prompt once the
+    // provider turn starts, so wait for the armed hold instead of polling.
+    let waited = host
+        .request_for(
+            session_id,
+            11,
+            "session.provider.mock_response",
+            json!({"operation":"wait","id":hold_id}),
+        )
+        .await;
+    assert!(waited.get("error").is_none(), "{waited}");
     let synchronized = host
         .request_for(
             session_id,
@@ -1852,15 +1882,22 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         "{synchronized}"
     );
     let submitted = host
-        .request_for(session_id,
+        .request_for(
+            session_id,
             21,
             "session.prompt.submit",
             json!({
-                "mode":"chat", "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":2}
+                "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":2}
             }),
         )
         .await;
     assert!(submitted.get("error").is_none(), "{submitted}");
+    // The admission event follows the owner's acceptance on the same ordered stream as the
+    // response. A later request response proves the stream has delivered it.
+    let flushed = host
+        .request_for(session_id, 23, "session.state.get", json!({}))
+        .await;
+    assert!(flushed.get("error").is_none(), "{flushed}");
     assert!(
         host.progress
             .iter()

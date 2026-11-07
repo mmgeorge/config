@@ -15,6 +15,16 @@ function Reveal.new(composer_window)
   return setmetatable({ settled = false, composer_window = composer_window }, Reveal)
 end
 
+---Report whether focus is in the composer or in a popup entered from it, such as a permission
+---review, so a popup that takes focus mid-stream does not stop the transcript from following.
+---@return boolean
+function Reveal:composer_focused()
+  local current = vim.api.nvim_get_current_win()
+  if current == self.composer_window then return true end
+  if vim.api.nvim_win_get_config(current).relative == "" then return false end
+  return self.composer_window ~= nil and vim.fn.win_getid(vim.fn.winnr("#")) == self.composer_window
+end
+
 ---Follow live progress from the composer and reveal completed exchanges outside transcript focus.
 ---@param document table Committed native transcript replica.
 ---@param views table<integer, table> Attached transcript windows.
@@ -35,9 +45,15 @@ function Reveal:publish(document, views, reset)
         live = node.lifecycle == "live"
       elseif exchange and marker and marker ~= vim.NIL and marker.capture == "ForgeHarnessPrompt" then
         local _, row = document.sequence:position(block.id)
-        prompt_row = row
+        prompt_row = prompt_row or row
         break
-      elseif not exchange and node.kind == "message" and marker and marker ~= vim.NIL
+      elseif not exchange and not prompt_row and marker and marker ~= vim.NIL
+        and marker.capture == "ForgeHarnessPrompt" then
+        -- Steering consumed mid-exchange starts the reply the reader is waiting for, so the
+        -- newest steering row, not the exchange's original prompt, anchors the reveal.
+        local _, row = document.sequence:position(block.id)
+        prompt_row = row
+      elseif not exchange and not prompt_row and node.kind == "message" and marker and marker ~= vim.NIL
         and marker.capture == "ForgeHarnessResponse" then
         local _, row = document.sequence:position(block.id)
         response_row = row
@@ -46,8 +62,7 @@ function Reveal:publish(document, views, reset)
     end
   end
   local completed = exchange and settled and (self.exchange ~= exchange or not self.settled)
-  local follow = live and self.revision ~= document.revision
-    and vim.api.nvim_get_current_win() == self.composer_window
+  local follow = live and self.revision ~= document.revision and self:composer_focused()
   self.exchange, self.settled = exchange, settled == true
   self.revision = document.revision
   if reset or not follow and (not completed or not response_row or not complete_response) then return end

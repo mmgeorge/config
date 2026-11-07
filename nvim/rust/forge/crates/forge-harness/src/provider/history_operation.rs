@@ -1,4 +1,5 @@
 //! Retain immutable history requests and their original cancellation authority together.
+use crate::provider::ScopeOwner;
 
 use std::{
     collections::HashMap,
@@ -6,9 +7,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::provider::ThreadOwner;
 use forge_provider_api::{
     BindingId, Compaction, CompactionRequest, EventScope, OperationId, ProviderError,
-    ProviderFailure, ProviderFailureKind, ProviderOperation, SessionForkRequest, ThreadOwner,
+    ProviderFailure, ProviderFailureKind, ProviderOperation, SessionForkRequest,
 };
 use tokio::sync::OnceCell;
 
@@ -115,7 +117,7 @@ impl HistoryOperations {
             ProviderOperation::ThreadFork,
             &context,
             EventScope::SessionOperation {
-                owner: request.target.owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(request.target.owner().clone()),
                 operation_id: context.id().clone(),
             },
             None,
@@ -145,7 +147,7 @@ impl HistoryOperations {
                 Ok::<_, ProviderError>(PreparedCompaction {
                     request: CompactionRequest {
                         scope: EventScope::SessionOperation {
-                            owner: target.owner.clone(),
+                            thread_id: forge_provider_api::ThreadId::from(target.owner.clone()),
                             operation_id: context.id().clone(),
                         },
                     },

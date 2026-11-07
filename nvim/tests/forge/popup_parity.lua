@@ -95,7 +95,10 @@ renderer.present_context(replica, { pr = { state = "none" }, about = { state = "
 assert(replica.status == "Applied" and editor.dirty, "background About invalidated the Issues edit")
 snapshot.revision = 1
 assert(renderer.apply_snapshot(replica, snapshot).kind == "Applied")
-assert(replica.block["status:context:issues"].text[1] == "Issues: #12 #34", "refresh overwrote the Issues draft")
+-- Replica blocks keep layout only; the buffer holds their text.
+local _, refreshed_issue_row = replica.root:position("status:context:issues")
+assert(vim.api.nvim_buf_get_lines(replica.buffer, refreshed_issue_row, refreshed_issue_row + 1, false)[1] == "Issues: #12 #34",
+  "refresh overwrote the Issues draft")
 vim.cmd("write")
 assert(saved == "Issues: #12 #34")
 complete(false)

@@ -1115,7 +1115,7 @@ mod revision_policy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn execution_requests_keep_their_task_permit_across_queue_waits() -> Result<()> {
+    async fn execution_requests_keep_their_exact_task_permit_across_queue_waits() -> Result<()> {
         let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let record: PlanExecutionRecord = serde_json::from_value(json!({
             "id":"execution","session_id":"session","plan_id":"plan",
@@ -1170,6 +1170,20 @@ mod revision_policy_tests {
         assert!(stale.is::<crate::task::StaleTask>());
         request.response.send(Err(stale)).unwrap();
         assert!(pending.await.unwrap_err().is::<crate::task::StaleTask>());
+        // Control mutations require the exact `TaskPermit` revision, so the control captured
+        // before pause is fenced, while a control for the resumed dispatch proceeds.
+        assert!(
+            control
+                .send(ExecutionOperation::Inspect)
+                .await
+                .unwrap_err()
+                .is::<crate::task::StaleTask>()
+        );
+        assert!(receiver.try_recv().is_err());
+        let control = ExecutionControlSender {
+            task_permit: resumed.permit(),
+            ..control
+        };
         let mut pending = Box::pin(control.send(ExecutionOperation::Inspect));
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
         let request = receiver.recv().await.unwrap();

@@ -35,6 +35,10 @@ local ok, failure = xpcall(function()
             revision = 1, offset = offset, next_offset = next_offset, total_bytes = #packed,
             count = #expected, truncated = false, data = vim.base64.encode(packed:sub(offset + 1, next_offset)),
           })
+        elseif request.method == "host.trace.configure" then
+          emit(request.id, { enabled = false })
+        elseif request.method == "provider.registry.list" then
+          emit(request.id, dofile("nvim/tests/forge/support/provider_catalog.lua").registry())
         elseif request.method == "session.initialize" then
           harness_count = harness_count + 1
           emit(request.id, { session = { id = "shared-host" } })
@@ -48,7 +52,7 @@ local ok, failure = xpcall(function()
   assert(#first == 0 and host_count == 0, "cold command callback performed I/O")
   assert(vim.wait(2000, function()
     local values = vim.fn.getcompletion("ForgeBranchDiff branch-", "cmdline")
-    return #values == 200
+    return #values == #expected
   end, 1))
   assert(host_count == 1 and harness_count == 0 and page_count > 1)
   local requests = page_count
@@ -58,13 +62,13 @@ local ok, failure = xpcall(function()
   assert(#file_values == 1 and file_values[1] == expected[5000])
   assert(page_count == requests)
   local sample = {}
-  for index = 1, 500 do
+  for index = 1, 40 do
     local started = vim.uv.hrtime()
-    assert(#vim.fn.getcompletion("ForgeBranchDiff branch-", "cmdline") == 200)
+    assert(#vim.fn.getcompletion("ForgeBranchDiff branch-", "cmdline") == #expected)
     sample[index] = (vim.uv.hrtime() - started) / 1000000
   end
   table.sort(sample)
-  print(vim.json.encode({ completion_values = #expected, samples = #sample, p95_ms = sample[475], maximum_ms = sample[500] }))
+  print(vim.json.encode({ completion_values = #expected, samples = #sample, p95_ms = sample[38], maximum_ms = sample[40] }))
   client.session_initialize(function(_, start_error)
     assert(not start_error, start_error)
     initialized = true

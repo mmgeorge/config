@@ -160,7 +160,7 @@ mod tests {
         };
         assert!(!provider_visible("tool-output"));
         assert!(serde_json::to_string(&Message::Event(event.clone())).is_err());
-        event.payload = json!({"kind":"execution_state","data":{"session":{"id":"session"}}});
+        event.payload = json!({"kind":"approval_resolved","data":{"request_id":"request"}});
         assert!(serde_json::to_string(&Message::Event(event)).is_ok());
     }
 

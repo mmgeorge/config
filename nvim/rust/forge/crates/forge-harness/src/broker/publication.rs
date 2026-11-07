@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -90,7 +91,7 @@ pub enum SessionUpdate {
     ChecksChanged,
     /// Publish adapter-owned terminal inventory independently of foreground work.
     Terminals {
-        snapshot: forge_provider_api::terminal::TerminalSnapshot,
+        inventory: forge_provider_api::terminal::TerminalInventory,
     },
     ExecutionState {
         snapshot: Box<super::BrokerSnapshot>,
@@ -243,8 +244,8 @@ impl SessionUpdate {
                             error,
                         ),
                     }),
-                    ThreadEvent::TerminalsUpdated(Ok(snapshot)) => Some(Self::Terminals {
-                        snapshot: snapshot.clone(),
+                    ThreadEvent::TerminalsUpdated(Ok(inventory)) => Some(Self::Terminals {
+                        inventory: inventory.clone(),
                     }),
                     ThreadEvent::TerminalsUpdated(Err(error)) => Some(Self::Diagnostic {
                         diagnostic: DiagnosticView::failure(
@@ -255,9 +256,10 @@ impl SessionUpdate {
                             error,
                         ),
                     }),
-                    ThreadEvent::ContextUsage(usage) => Some(Self::ContextUsage {
-                        usage: usage.clone(),
-                    }),
+                    ThreadEvent::ContextUsage(report) => {
+                        crate::session::ContextUsage::from_report(report)
+                            .map(|usage| Self::ContextUsage { usage })
+                    }
                     ThreadEvent::IdentityResolved(_) | ThreadEvent::CompactionUpdated(_) => None,
                 },
                 ProviderEvent::Turn {
@@ -338,9 +340,15 @@ fn approval_payload(
 pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json::Error> {
     let (kind, text, data) = match update {
         SessionUpdate::ChecksChanged => ("checks_changed", None, json!({})),
-        SessionUpdate::Terminals { snapshot } => {
-            ("terminals_changed", None, serde_json::to_value(snapshot)?)
-        }
+        SessionUpdate::Terminals { inventory } => (
+            "terminals_changed",
+            None,
+            serde_json::to_value(
+                crate::provider::terminal_status::BackgroundTerminalStatus::from_inventory(
+                    inventory.clone(),
+                ),
+            )?,
+        ),
         SessionUpdate::ExecutionState { snapshot } => {
             ("execution_state", None, json!({"snapshot":snapshot}))
         }
@@ -607,10 +615,10 @@ mod tests {
     /// Thread error presentation does not claim turn failure or connection unavailability.
     #[test]
     fn thread_error_presentation_retains_nonterminal_category() {
-        let owner = forge_provider_api::ThreadOwner::root("thread-error");
+        let owner = crate::provider::ThreadOwner::root("thread-error");
         let event = crate::provider::test_support::native_event(
             crate::provider::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             },
             ProviderEvent::Thread {
                 thread_id: owner.thread_id(),
@@ -638,7 +646,9 @@ mod tests {
                     .expect("fixture diagnostic is nonempty"),
                 severity: DiagnosticSeverity::Warning,
                 scope: crate::provider::EventScope::Binding {
-                    owner: crate::provider::ThreadOwner::root("publication-fixture"),
+                    thread_id: forge_provider_api::ThreadId::from(
+                        crate::provider::ThreadOwner::root("publication-fixture"),
+                    ),
                 },
                 native_scope: forge_provider_api::WarningScope::Provider,
             },

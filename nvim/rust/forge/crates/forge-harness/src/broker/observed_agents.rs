@@ -1,5 +1,6 @@
 //! Route provider-observed children through their own proven histories.
 use super::{AppliedProviderEvent, HarnessBroker, SessionUpdate};
+use crate::provider::ScopeOwner;
 use crate::provider::{EventScope, HarnessEvent, NativeEventSource, ObservedAgentAssociation};
 use anyhow::{Context, Result};
 use forge_provider_api::ProviderEvent;
@@ -121,14 +122,14 @@ impl HarnessBroker {
         change: &crate::tools::lsp::HostFileChange,
     ) -> Result<()> {
         anyhow::ensure!(
-            change.scope.owner.session_id().as_str() == self.session.id,
+            change.scope.owner().session_id().as_str() == self.session.id,
             "native child host file effect crosses host session ownership"
         );
         let records = self.store.list_observed_agents(&self.session.id)?;
         let mut matches = records.iter().filter(|record| {
             binding.is_none_or(|binding| record.key().binding_id() == binding)
-                && (record.owner() == Some(&change.scope.owner)
-                    || record.thread_id() == Some(&change.scope.owner.thread_id()))
+                && (record.owner() == Some(&change.scope.owner())
+                    || record.thread_id() == Some(&change.scope.owner().thread_id()))
                 && record.parent_scope().exchange_id == change.scope.exchange_id
         });
         let record = matches
@@ -238,8 +239,8 @@ impl HarnessBroker {
                     .context("observed child host policy has no original invocation")?;
                 let records = self.store.list_observed_agents(&self.session.id)?;
                 let mut matches = records.iter().filter(|record| {
-                    (record.owner() == Some(&invocation.owner)
-                        || record.thread_id() == Some(&invocation.owner.thread_id()))
+                    (record.owner() == Some(&invocation.owner())
+                        || record.thread_id() == Some(&invocation.owner().thread_id()))
                         && record.parent_scope().exchange_id == invocation.exchange_id
                 });
                 let record = matches

@@ -40,11 +40,13 @@ pub use catalog::{
     CatalogCapability, McpDefinition, McpStatus, McpToolDefinition, ProviderCatalogRequest,
     ProviderInput, ResourceScope, SkillDefinition,
 };
+mod thread_owner;
 pub use execution::{
-    AgentId, EventScope, ExchangeId, InvocationId, InvocationScope, SessionId, TaskId, ThreadOwner,
-    ToolAddress, TurnAddress, TurnEvent,
+    AgentId, EventScope, ExchangeId, InvocationId, InvocationScope, ScopeOwner, SessionId, TaskId,
+    ThreadOwner, ThreadOwnerError, ToolAddress, TurnAddress, TurnEvent,
 };
 pub use forge_provider_api::terminal;
+pub mod terminal_status;
 pub use forge_provider_api::usage;
 pub use steering::SteeringInput;
 pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane, SteeringTarget};
@@ -61,6 +63,7 @@ mod tool_status;
 pub(crate) mod tool_timeout;
 pub use tool_status::{TextUpdate, ToolDiagnostic, ToolOutcome, ToolStatus};
 mod capability;
+pub mod capability_menu;
 mod provider_trace;
 pub use capability::{CapabilityManifest, UnsupportedCapability};
 
@@ -69,6 +72,7 @@ pub use forge_provider_api::model::*;
 pub use forge_provider_api::error::ProviderError;
 pub use forge_provider_api::event::*;
 
-pub use forge_provider_api::PromptMode;
+mod prompt_mode;
+pub use prompt_mode::PromptMode;
 
 pub use forge_provider_api::completion::TurnMetrics;

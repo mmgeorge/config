@@ -32,7 +32,7 @@ impl AcpChildren {
     /// Create routing for an admitted root turn.
     pub fn new(root: String, scope: InvocationScope) -> Self {
         let root_turn = Some(TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope
                 .turn_id()
                 .expect("an admitted invocation has a nonempty identity"),
@@ -113,14 +113,11 @@ impl AcpChildren {
                     ancestor = &child.parent;
                 }
                 let agent_id = AgentId::new(uuid::Uuid::new_v4().to_string())?;
-                let owner = ThreadOwner::new(
-                    parent_address.scope.owner.session_id().clone(),
-                    agent_id.clone(),
-                )?;
+                let owner = parent_address.scope.thread_id.child(&agent_id)?;
                 let child_scope =
                     InvocationScope::new(owner.clone(), parent_address.scope.exchange_id.clone());
                 let address = TurnAddress {
-                    thread_id: owner.thread_id(),
+                    thread_id: owner.clone(),
                     turn_id: child_scope.turn_id()?,
                     scope: child_scope,
                 };
@@ -306,7 +303,8 @@ mod test {
     /// A root prompt successor cannot reassign an independently running child's items.
     #[test]
     fn child_owner_survives_parent_completion_and_successor_prompt() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("host"), "exchange");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "exchange");
         let mut children = AcpChildren::new("root".into(), scope);
         let observed = children
             .lifecycle(
@@ -322,7 +320,7 @@ mod test {
         let child = observed.address;
         children.begin(
             "root".into(),
-            InvocationScope::new(ThreadOwner::root("host"), "next"),
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "next"),
         );
         assert_eq!(children.address("child", false), Some(child.clone()));
         let finish = children
@@ -344,7 +342,7 @@ mod test {
     fn child_parent_conflict_is_rejected() -> Result<()> {
         let mut children = AcpChildren::new(
             "root".into(),
-            InvocationScope::new(ThreadOwner::root("host"), "exchange"),
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "exchange"),
         );
         children.lifecycle(
             "root",
@@ -360,7 +358,7 @@ mod test {
     -> Result<()> {
         let mut children = AcpChildren::new(
             "root".into(),
-            InvocationScope::new(ThreadOwner::root("host"), "first"),
+            InvocationScope::new(forge_provider_api::testing::root_thread("host"), "first"),
         );
         let spawn = json!({"sessionUpdate":"subagent_spawned", "subagentSessionId":"child", "name":"First"});
         let original = children.lifecycle("root", &spawn)?.unwrap();
@@ -376,7 +374,10 @@ mod test {
         assert!(children.lifecycle("root", &json!({"sessionUpdate":"subagent_state_update", "subagentSessionId":"child", "state":"failed"})).is_err());
         children.begin(
             "root".into(),
-            InvocationScope::new(ThreadOwner::root("host"), "successor"),
+            InvocationScope::new(
+                forge_provider_api::testing::root_thread("host"),
+                "successor",
+            ),
         );
         assert!(children.lifecycle("root", &spawn).is_err());
         assert_eq!(children.address("child", true), Some(original.address));

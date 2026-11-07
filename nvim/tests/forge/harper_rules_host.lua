@@ -93,7 +93,7 @@ local success, failure = xpcall(function()
     local harper = require("forge.text.harper")
     local client = vim.lsp.get_clients({ bufnr = buffer, name = "harper_ls" })[1]
     harper.detach(buffer)
-    client:stop(true)
+    client:stop()
     harper.attach(buffer, { kind = "markdown", root = ... })
   ]], { root .. "/first" })
   assert(vim.wait(5000, function()

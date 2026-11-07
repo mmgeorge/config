@@ -46,7 +46,7 @@ pub struct ApprovalChoice {
 pub struct ApprovalRequestView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_owner: Option<forge_provider_api::ThreadOwner>,
+    pub execution_owner: Option<crate::provider::ThreadOwner>,
     pub exchange_id: Option<String>,
     pub turn_id: Option<forge_provider_api::TurnId>,
     pub provider: Option<forge_provider_api::ProviderId>,

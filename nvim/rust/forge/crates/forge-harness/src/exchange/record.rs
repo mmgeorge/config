@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::Delegation;
 use crate::plan::PlanElicitation;
+use crate::provider::ScopeOwner;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -402,14 +403,14 @@ impl Exchange {
             "observed exchange identity is incomplete"
         );
         anyhow::ensure!(
-            address.thread_id == address.scope.owner.thread_id()
+            address.thread_id == address.scope.owner().thread_id()
                 && address.turn_id == address.scope.turn_id()?,
             "observed turn identity disagrees with original owner"
         );
         let mut exchange = Self {
             id: id.clone(),
-            session_id: address.scope.owner.session_id().as_str().to_owned(),
-            agent_id: address.scope.owner.agent_id().as_str().to_owned(),
+            session_id: address.scope.owner().session_id().as_str().to_owned(),
+            agent_id: address.scope.owner().agent_id().as_str().to_owned(),
             ordinal,
             prompt: String::new(),
             origin: crate::exchange::ExchangeOrigin::NativeAgent,
@@ -587,8 +588,8 @@ impl Exchange {
         scope.invocation().is_some_and(|scope| {
             (scope.exchange_id.as_str() == self.id
                 || self.turn.iter().any(|turn| &turn.provider().scope == scope))
-                && scope.owner.session_id().as_str() == self.session_id
-                && scope.owner.agent_id().as_str() == self.agent_id
+                && scope.owner().session_id().as_str() == self.session_id
+                && scope.owner().agent_id().as_str() == self.agent_id
         })
     }
 
@@ -753,20 +754,51 @@ impl Exchange {
                 } else {
                     self.turn[index].record_item_message(item_id, event)?;
                 }
-                for item in self.turn[index].items()[item_count..].iter().cloned() {
+                // Harness authors task-start and continuation input, and its notice row stands in
+                // for that text; the provider's echo of it must not render as a user prompt.
+                let host_input = matches!(
+                    self.origin,
+                    super::ExchangeOrigin::TaskStarted { .. }
+                        | super::ExchangeOrigin::TaskContinuation { .. }
+                )
+                .then(|| self.prompt.trim().to_owned())
+                .filter(|prompt| !prompt.is_empty());
+                let admitted_items = self.turn[index].items()[item_count..].to_vec();
+                for item in admitted_items {
                     let item_id = match &item {
                         crate::turn::TurnItem::Message { id }
                         | crate::turn::TurnItem::Tool { id } => id,
                     };
                     // A native user message that echoes a Forge submission repeats the prompt the
                     // broker already rendered for that admitted action, so it stays turn evidence
-                    // without a transcript node. Native input from another client keeps its row.
-                    if let crate::turn::TurnItem::Message { id } = &item
-                        && self.turn[index]
+                    // without a transcript node. Harness-authored child reports carry no submission, so
+                    // their echo is recognized by its shared preamble instead, and task input by the
+                    // exchange prompt it repeats. Other native input, such as text from another
+                    // client, keeps its row.
+                    let echo = match &item {
+                        crate::turn::TurnItem::Message { id } => self.turn[index]
                             .messages()
                             .iter()
-                            .any(|message| message.id() == id && message.submission_id().is_some())
-                    {
+                            .find(|message| {
+                                message.id() == id
+                                    && message.kind() == crate::turn::MessageKind::User
+                                    && (message.submission_id().is_some()
+                                        || crate::agent::report::is_child_report_echo(
+                                            message.text(),
+                                        )
+                                        || host_input
+                                            .as_deref()
+                                            .is_some_and(|prompt| message.text().contains(prompt)))
+                            })
+                            .map(|message| message.submission_id().cloned()),
+                        crate::turn::TurnItem::Tool { .. } => None,
+                    };
+                    if let Some(submission) = echo {
+                        // A provider may consume steering after acknowledgement, for example once
+                        // its current model call ends, so the echo marks where the input applies.
+                        if let Some(submission) = submission {
+                            self.move_input_to_tail(&submission);
+                        }
                         continue;
                     }
                     self.node_list.push(ExchangeNode::TurnContent {
@@ -932,14 +964,14 @@ impl Exchange {
                     .turn
                     .iter()
                     .any(|turn| turn.provider().scope == address.scope))
-                && *address.scope.owner.session_id()
-                    == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && address.scope.owner.agent_id().as_str() == self.agent_id
+                && *address.scope.owner().session_id()
+                    == crate::provider::SessionId::from(self.session_id.as_str())
+                && address.scope.owner().agent_id().as_str() == self.agent_id
                 && !address.scope.invocation_id.as_str().is_empty(),
             "provider invocation does not belong to this exchange"
         );
         anyhow::ensure!(
-            address.thread_id == address.scope.owner.thread_id()
+            address.thread_id == address.scope.owner().thread_id()
                 && address.turn_id == address.scope.turn_id()?,
             "native turn identity disagrees with original owner"
         );
@@ -989,9 +1021,9 @@ impl Exchange {
         );
         anyhow::ensure!(
             scope.exchange_id == forge_provider_api::ExchangeId::from(self.id.as_str())
-                && *scope.owner.session_id()
-                    == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && scope.owner.agent_id().as_str() == self.agent_id
+                && *scope.owner().session_id()
+                    == crate::provider::SessionId::from(self.session_id.as_str())
+                && scope.owner().agent_id().as_str() == self.agent_id
                 && self
                     .turn
                     .last()
@@ -1344,24 +1376,38 @@ impl Exchange {
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
-        self.record_input(InputAppend::User, None, intent, text, None, now_ms)
+        self.record_input(InputAppend::User, None, None, intent, text, None, now_ms)
     }
 
     /// Retain accepted native input while its original exchange is still settling.
+    ///
+    /// The submission identifies the input's native echo, which moves the row to the point where
+    /// the provider consumed it when that differs from acknowledgement.
     pub(crate) fn append_acknowledged_input(
         &mut self,
         id: Option<String>,
+        submission_id: Option<forge_provider_api::SubmissionId>,
         intent: InputIntent,
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
-        self.record_input(InputAppend::Acknowledged, id, intent, text, None, now_ms)
+        self.record_input(
+            InputAppend::Acknowledged,
+            id,
+            submission_id,
+            intent,
+            text,
+            None,
+            now_ms,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_input(
         &mut self,
         admission: InputAppend,
         id: Option<String>,
+        submission_id: Option<forge_provider_api::SubmissionId>,
         intent: InputIntent,
         text: String,
         question: Option<QuestionInput>,
@@ -1409,12 +1455,25 @@ impl Exchange {
             id: id.unwrap_or_else(|| format!("{}:input:{prompt_ordinal}", self.id)),
             text,
             created_at_ms: now_ms,
+            submission_id,
         };
         self.node_list.push(ExchangeNode::ExchangeInput {
             prompt: prompt.clone(),
         });
         self.reconcile_entries()?;
         Ok(prompt)
+    }
+
+    /// Move the acknowledged input a native echo identifies to the current timeline tail.
+    fn move_input_to_tail(&mut self, submission: &forge_provider_api::SubmissionId) {
+        let Some(position) = self.node_list.iter().position(|node| {
+            matches!(node, ExchangeNode::ExchangeInput { prompt }
+                if prompt.submission_id.as_ref() == Some(submission))
+        }) else {
+            return;
+        };
+        let node = self.node_list.remove(position);
+        self.node_list.push(node);
     }
 
     /// Admit question feedback with a durable target before the provider can produce a reply.
@@ -1436,6 +1495,7 @@ impl Exchange {
         );
         self.record_input(
             InputAppend::User,
+            None,
             None,
             intent,
             text,
@@ -2345,6 +2405,7 @@ mod test {
         let prompt = exchange
             .append_acknowledged_input(
                 Some("late-steering".into()),
+                None,
                 InputIntent::Steering,
                 "accepted".into(),
                 40,
@@ -2364,6 +2425,7 @@ mod test {
             exchange
                 .append_acknowledged_input(
                     Some("late-steering".into()),
+                    None,
                     InputIntent::Steering,
                     "accepted".into(),
                     70,
@@ -2375,6 +2437,7 @@ mod test {
             exchange
                 .append_acknowledged_input(
                     Some("after-terminal".into()),
+                    None,
                     InputIntent::Steering,
                     "late".into(),
                     70,
@@ -2790,20 +2853,24 @@ mod test {
 #[cfg(test)]
 mod observed_tests {
     use super::*;
+    use crate::provider::ThreadOwner;
     use forge_provider_api::{
         AgentId, AgentMessageStart, EventScope, InvocationScope, ItemEvent, ItemId, ItemStart,
-        MessageClassification, ProviderEvent, ThreadOwner, TurnAddress,
+        MessageClassification, ProviderEvent, TurnAddress,
     };
 
     #[test]
     fn observed_child_retains_original_scope_without_a_user_submission() -> anyhow::Result<()> {
         let scope = InvocationScope {
-            owner: ThreadOwner::new("session".into(), AgentId::new("native-child")?)?,
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::new(
+                "session".into(),
+                AgentId::new("native-child")?,
+            )?),
             exchange_id: "parent-exchange".into(),
             invocation_id: "child-invocation".into(),
         };
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id()?,
             scope: scope.clone(),
         };

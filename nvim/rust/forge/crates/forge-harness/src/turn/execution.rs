@@ -1,6 +1,7 @@
 #[cfg(test)]
 use super::MessageDelivery;
 use super::{Message, MessageKind, MessageState, TurnItem};
+use crate::provider::ScopeOwner;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -628,7 +629,7 @@ impl TryFrom<TurnWire> for Turn {
             item,
             current_message,
         } = wire;
-        if provider.thread_id != provider.scope.owner.thread_id()
+        if provider.thread_id != provider.scope.owner().thread_id()
             || provider.scope.turn_id().ok().as_ref() != Some(&provider.turn_id)
         {
             return Err(TurnLoadError::Owner);
@@ -786,12 +787,14 @@ mod tests {
     /// Allocate normalized host identities before each native fixture begins.
     fn address() -> TurnAddress {
         let scope = crate::provider::InvocationScope {
-            owner: crate::provider::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                "session",
+            )),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         };
         TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         }
@@ -1351,17 +1354,18 @@ mod tests {
 #[cfg(test)]
 mod model_tests {
     use super::*;
-    use forge_provider_api::{InvocationScope, ModelId, ResolvedModel, ThreadOwner};
+    use crate::provider::ThreadOwner;
+    use forge_provider_api::{InvocationScope, ModelId, ResolvedModel};
 
     #[test]
     fn confirmed_model_stays_with_original_turn_and_survives_reload() -> Result<()> {
         let scope = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         };
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id()?,
             scope,
         };
@@ -1407,12 +1411,12 @@ mod model_tests {
     -> Result<()> {
         use forge_provider_api::{ItemEvent, ItemId, ItemStart, ReasoningKind, ReasoningStart};
         let scope = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "exchange".into(),
             invocation_id: "items".into(),
         };
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id()?,
             scope,
         };

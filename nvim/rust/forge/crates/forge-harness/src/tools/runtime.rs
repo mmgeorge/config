@@ -28,7 +28,7 @@ pub struct ControlTurnContext {
     pub(crate) task_generation: Option<u64>,
     pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
     pub(crate) permission_required: bool,
-    pub(crate) task_start: Option<forge_provider_api::input::TaskStart>,
+    pub(crate) task_start: Option<crate::exchange::TaskStart>,
     pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
@@ -523,6 +523,7 @@ impl ControlToolRuntime {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::provider::ScopeOwner;
 
     /// Preserve explicit rejection when native lifecycle evidence reaches the host.
     #[test]
@@ -549,7 +550,7 @@ mod test {
             "exchange",
         );
         let address = forge_provider_api::TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -586,7 +587,7 @@ mod test {
             "exchange",
         );
         let address = forge_provider_api::TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -615,7 +616,7 @@ mod test {
             "exchange",
         );
         let address = forge_provider_api::TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -750,7 +751,7 @@ mod test {
     use serde_json::json;
 
     #[tokio::test]
-    async fn goal_controls_follow_live_session_authority_and_reject_stale_results() {
+    async fn goal_controls_follow_bound_session_authority_and_reject_stale_results() {
         use crate::task::{SessionTaskController, Task, TaskChange};
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let initial = controller.current().unwrap().unwrap();
@@ -780,6 +781,16 @@ mod test {
             )
             .unwrap()
             .unwrap();
+        // Callback authority is the task snapshot captured when the turn binds, so a turn bound
+        // before the goal existed cannot complete it; a turn bound after installation can.
+        let stale = runtime
+            .invoke(invocation("goal_complete"))
+            .await
+            .unwrap_err();
+        assert!(format!("{stale:?}").contains("StaleTask"), "{stale:?}");
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.bind_test_task_controller(controller.clone());
+        let mut runtime = ControlToolRuntime::new(context);
         let accepted = runtime
             .invoke(invocation("goal_complete"))
             .await

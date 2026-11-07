@@ -1,31 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+/// Report the native context window: tokens in use, total capacity, and the fixed native
+/// overhead inside that capacity that a conversation can never reclaim.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContextUsage {
     pub used: u64,
     pub size: u64,
-    pub remaining_percent: u8,
+    pub reserved: u64,
 }
 
 impl ContextUsage {
+    /// Report usage for a window with no reserved native overhead.
     pub fn reported(used: u64, size: u64) -> Option<Self> {
-        Self::with_baseline(used, size, 0)
+        Self::with_reserved(used, size, 0)
     }
 
-    pub fn with_baseline(used: u64, size: u64, baseline: u64) -> Option<Self> {
-        let effective_size = size.checked_sub(baseline)?;
-        if effective_size == 0 {
-            return None;
-        }
-        let effective_used = used.saturating_sub(baseline);
-        let remaining = effective_size.saturating_sub(effective_used);
-        let remaining_percent = ((remaining as f64 / effective_size as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as u8;
-        Some(Self {
+    /// Report usage whose window keeps `reserved` tokens for native instructions and tools.
+    /// Rejects a window with no capacity beyond that reservation.
+    pub fn with_reserved(used: u64, size: u64, reserved: u64) -> Option<Self> {
+        (size > reserved).then_some(Self {
             used,
             size,
-            remaining_percent,
+            reserved,
         })
     }
 }

@@ -274,10 +274,12 @@ impl HarnessBroker {
         };
         let action = match signal {
             ForegroundSignal::Native(NativeForegroundSignal::ProviderEvent(observation)) => {
-                let delivery = self.apply_foreground_observation(transaction, observation)?;
-                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
-                    delivery,
-                )))
+                // Apply through the merged queue so queued session events with earlier native
+                // sequences are not overtaken by this sink event.
+                transaction
+                    .pending_session_observations
+                    .push_back(observation);
+                self.apply_foreground_session_observations(transaction)
             }
             ForegroundSignal::Native(NativeForegroundSignal::Cancelled)
                 if transaction.collection.is_some() =>
@@ -319,8 +321,15 @@ impl HarnessBroker {
                 let (task, result) = *delivery;
                 self.apply_foreground_agent_result(transaction, task, result)
             }
-            ForegroundSignal::AgentResultDelivered { task, result } => {
-                self.apply_foreground_agent_result(transaction, *task, result)
+            ForegroundSignal::AgentResultDelivered {
+                flight,
+                task,
+                result,
+            } => {
+                // Release the deferred native result only after acknowledgement is recorded.
+                let applied = self.apply_foreground_agent_result(transaction, *task, result);
+                drop(flight);
+                applied
             }
             ForegroundSignal::AgentApprovalsCancelled { completion, result } => {
                 self.apply_foreground_agent_completion(transaction, *completion, result)
@@ -363,6 +372,11 @@ impl HarnessBroker {
             #[cfg(test)]
             ForegroundSignal::RevisionChecksUpdated { response, result } => {
                 Ok(self.apply_foreground_revision_checks(transaction, response, *result))
+            }
+            // A scan is ordinary work that collection's closed effect gate keeps staged. Finalization
+            // would then wait on a result that only arrives once the collecting command times out.
+            ForegroundSignal::PlanScan if transaction.collection.is_some() => {
+                Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::PlanScan => Ok(ForegroundAction::Effect(
                 self.prepare_foreground_scan(transaction)?,
@@ -582,9 +596,7 @@ impl HarnessBroker {
         &mut self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
-        if transaction.pending_session_observations.is_empty() {
-            self.collect_foreground_observations(transaction)?;
-        }
+        self.collect_foreground_observations(transaction)?;
         while let Some(observation) = transaction.pending_session_observations.pop_front() {
             if observation.scope().invocation().is_some_and(|scope| {
                 scope.exchange_id

@@ -210,12 +210,6 @@ pub enum DirectoryOperation {
     Write,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DirectoryGrant {
-    pub operation: DirectoryOperation,
-    pub path: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,6 +13,9 @@ client._host_set_launcher_for_test(function(_, options, on_exit)
         options.stdout(nil, vim.json.encode({ id = request.id, result = {
           protocol_version = require("forge.protocol").VERSION,
         } }) .. "\n")
+      elseif request.method == "provider.registry.list" then
+        options.stdout(nil, vim.json.encode({ id = request.id,
+          result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry() }) .. "\n")
       elseif request.method == "session.initialize" then
         initialized = true
       elseif request.method == "host.shutdown" then

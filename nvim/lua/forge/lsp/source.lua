@@ -38,6 +38,21 @@ function M.release(buffer)
   end, 60000)
 end
 
+---Replace a retained hidden source buffer's text with rows read from disk. Buffers the editor owns,
+---modified buffers, and buffers shown in a window are never changed.
+---@param buffer integer
+---@param rows string[]
+---@return boolean adopted Whether the buffer is retained hidden source that now matches `rows`.
+function M.adopt_disk_rows(buffer, rows)
+  local lease = leases[buffer]
+  if not lease or not lease.owned or vim.bo[buffer].modified or #vim.fn.win_findbuf(buffer) > 0 then return false end
+  if not vim.deep_equal(rows, vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) then
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, rows)
+    vim.bo[buffer].modified = false
+  end
+  return true
+end
+
 ---Refresh retained hidden source from disk without replacing editor-owned changes.
 ---@param buffer integer
 ---@param receive fun(failure: string?)
@@ -50,13 +65,7 @@ function M.refresh(buffer, receive)
     if not failure and (not vim.api.nvim_buf_is_valid(buffer) or vim.api.nvim_buf_get_changedtick(buffer) ~= tick) then
       failure = "source_changed: retained source changed while refreshing"
     end
-    if not failure and not vim.bo[buffer].modified and #vim.fn.win_findbuf(buffer) == 0 then
-      local rows = M.rows(contents)
-      if not vim.deep_equal(rows, vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) then
-        vim.api.nvim_buf_set_lines(buffer, 0, -1, false, rows)
-        vim.bo[buffer].modified = false
-      end
-    end
+    if not failure then M.adopt_disk_rows(buffer, M.rows(contents)) end
     M.release(buffer)
     receive(failure)
   end)

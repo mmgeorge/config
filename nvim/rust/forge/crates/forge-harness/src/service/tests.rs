@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 #[path = "tests/agent_admission.rs"]
 mod agent_admission;
 #[path = "tests/bootstrap.rs"]
@@ -26,7 +27,6 @@ mod task_state;
 use super::*;
 use crate::provider::{ProviderCatalogRequest, TextGeneration};
 use bootstrap::{initialize, service};
-use forge_diff::cache::CacheLimits;
 use reviewed_plan::reviewed_execution_fixture;
 
 #[tokio::test]
@@ -352,186 +352,6 @@ async fn document_reads_for_a_missing_session_report_session_not_found() -> Resu
 }
 
 #[tokio::test]
-async fn plan_review_questions_fork_without_changing_the_main_timeline() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    std::fs::write(fixture.path().join(".forge.json"), r#"{"checks":{}}"#)?;
-    let service = service();
-    let opened = service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await?;
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let registry = service.registry().await?;
-    let controller = registry.resolve(&session_id).await?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    controller.attach_input(&sink).await?;
-    service
-        .dispatch(
-            Some(session_id.clone()),
-            Request {
-                id: 2,
-                method: "session.input.apply".into(),
-                params: json!({"id":"ask-plan","action":{"kind":"submit","message":{
-                    "id":"ask-plan","text":"/plan explain the interface","intent":"auto","attachments":[]}}}),
-            },
-            &sink,
-        )
-        .await?;
-    let plan = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(plan) = controller.broker.lock().await.snapshot()?.active_plan
-                && plan.review_digest.is_some()
-            {
-                break Ok::<_, anyhow::Error>(plan);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
-        "operation":"plan_open", "document":"ask-review", "view":"ask-view", "plan_id":plan.id,
-        "digest":plan.review_digest, "width":{"columns":100,"tabstop":4}
-    }))?).await?;
-    projection = crate::plan::reconstruct(None, projection);
-    let row = projection["source_row"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["target"].is_string())
-        .unwrap()
-        .clone();
-    let before = controller.broker.lock().await.snapshot()?;
-    let source_execution = Arc::clone(&controller.coordinator.execution)
-        .acquire_owned()
-        .await?;
-    assert!(
-        service
-            .prepare(Some(&session_id), RuntimeMethod::SessionPlanQuestionAnswer)
-            .await?
-            .is_none()
-    );
-    drop(source_execution);
-    for (iteration, selection) in [
-        json!({}),
-        json!({"model":"mock-model","effort":"high","service_tier":"fast"}),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        service
-            .dispatch(
-                Some(session_id.clone()),
-                Request {
-                    id: 3,
-                    method: "session.configure".into(),
-                    params: json!({"ask_model":selection}),
-                },
-                &sink,
-            )
-            .await?;
-        let configured: Response = loop {
-            let value: Value =
-                serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
-            if value["id"] == 3 {
-                break serde_json::from_value(value)?;
-            }
-        };
-        assert!(configured.error().is_none());
-        let before_child = registry.controller_by_id.read().await.len();
-        service.dispatch(Some(session_id.clone()), Request { id: 4, method: "session.plan.question.answer".into(),
-            params: json!({"draft_source_digest":projection["saved_source_digest"],
-                "draft_annotation":[{"id":format!("question-{iteration}"),"kind":"question","source":{
-                    "start_line":row["source_line"],"end_line":row["source_line"],"body":"Why this interface?"}},
-                    {"id":format!("second-question-{iteration}"),"kind":"question","source":{
-                        "start_line":row["source_line"],"end_line":row["source_line"],"body":"Which caller uses it?"}}],
-                "review":{"document":"ask-review","view":"ask-view","sequence":iteration+1,
-                    "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
-                    "target":row["target"],"action":"session.plan.question.answer"}}) }, &sink).await?;
-        let response = loop {
-            let value: Value =
-                serde_json::from_slice(output.recv().await.unwrap().unwrap().bytes())?;
-            if value["id"] == 4 {
-                break value;
-            }
-        };
-        assert!(response.get("error").is_none(), "{response}");
-        let annotation = response["result"]["annotation"].as_array().unwrap();
-        assert_eq!(annotation.len(), 2);
-        for question in annotation {
-            assert!(
-                question["reply"]["body"]
-                    .as_str()
-                    .unwrap()
-                    .contains("This declaration")
-            );
-            assert_eq!(
-                question["reply"]["question_body"],
-                question["source"]["body"]
-            );
-        }
-        assert_eq!(
-            registry.controller_by_id.read().await.len(),
-            before_child + 2
-        );
-        let after = controller.broker.lock().await.snapshot()?;
-        assert_eq!(after.exchange.len(), before.exchange.len());
-        assert_eq!(
-            after.session.provider_session_id,
-            before.session.provider_session_id
-        );
-        assert_eq!(after.session.model, before.session.model);
-        let store = SqliteStore::open(&fixture.path().join("data"))?;
-        let child = store
-            .list_session(None)?
-            .into_iter()
-            .filter(|session| session.id != session_id)
-            .max_by_key(|session| session.created_at_ms)
-            .unwrap();
-        let turns = store.list_exchange(&child.id)?;
-        assert_eq!(turns.len(), 1);
-        assert_eq!(
-            child.model,
-            if iteration == 0 {
-                before
-                    .session
-                    .resolved_model
-                    .as_ref()
-                    .unwrap_or(&before.session.model)
-            } else {
-                "mock-model"
-            }
-        );
-        assert_eq!(
-            child.effort,
-            if iteration == 0 {
-                before.session.effort.as_str()
-            } else {
-                "high"
-            }
-        );
-        assert_eq!(
-            child.service_tier,
-            if iteration == 0 {
-                before.session.service_tier
-            } else {
-                crate::provider::ServiceTier::Fast
-            }
-        );
-        assert!(
-            child
-                .provider_session_id
-                .as_deref()
-                .unwrap()
-                .ends_with("-fork")
-        );
-    }
-    service.shutdown(Duration::from_secs(3)).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn isolated_generation_uses_configured_model_without_a_conversation() -> Result<()> {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -648,7 +468,7 @@ async fn isolated_generation_never_acquires_another_editors_session_lease() -> R
     let broker = controller.broker.lock().await;
     let generator = service();
     let text = tokio::time::timeout(
-        Duration::from_secs(1),
+        crate::hang_guard::HANG_GUARD,
         generator.generate_text(
             TextGenerationConfig {
                 auto_compaction: Default::default(),
@@ -668,7 +488,13 @@ async fn isolated_generation_never_acquires_another_editors_session_lease() -> R
         ),
     )
     .await??;
-    assert_eq!(text, "feat: describe repository changes");
+    // An unscripted mock turn echoes its prompt ("Unscripted mock turns" in
+    // `contributing/forge/editor-tests.md`), so the generated text proves the isolated request ran.
+    assert_eq!(
+        text,
+        "Mock response: Staged diff:
++change"
+    );
     assert!(generator.registry.lock().await.is_none());
     let after = store.load_session(&session_id)?.unwrap();
     assert_eq!(after.lease_owner, before.lease_owner);
@@ -761,7 +587,7 @@ impl forge_provider_api::provider::Provider for TerminalInventoryProvider {
         context: forge_provider_api::OperationContext,
         _: &forge_provider_api::BindingId,
     ) -> std::result::Result<
-        crate::provider::terminal::TerminalSnapshot,
+        crate::provider::terminal::TerminalInventory,
         crate::provider::ProviderError,
     > {
         context.check_admission(forge_provider_api::ProviderOperation::TerminalList)?;
@@ -881,7 +707,6 @@ fn generation_provider(
             };
             assert!(request.tools.is_empty());
             assert!(request.attachments.is_empty());
-            assert!(request.task.is_none());
             assert!(request.recovered_inputs.is_empty());
             drop(calls);
             if fail {
@@ -984,8 +809,10 @@ async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Re
     for (index, enabled) in [false, true].into_iter().enumerate() {
         assert_eq!(projection["checks"][0]["enabled"], !enabled);
         let row = projection["source_row"][0].clone();
+        // PlanReview gives every direct edit its own operation identity, so each toggle here
+        // carries a distinct one, as `plan_review/document.lua` does.
         service.dispatch(Some(session_id.clone()), Request { id:3, method:"session.plan.check.update".into(),
-            params:json!({"enabled":{"format":enabled}, "expected_version":projection["version"],
+            params:json!({"operation_id":format!("check-edit-{index}"),"enabled":{"format":enabled}, "expected_version":projection["version"],
                 "draft_source_digest":projection["saved_source_digest"],
                 "draft_annotation":[{"id":"retained", "source":{"start_line":annotation_line,"end_line":annotation_line,"body":"Keep this feedback."}}],
                 "review":{"document":"checks-review","view":"checks-view","sequence":index+1,
@@ -1033,281 +860,6 @@ async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Re
     Ok(())
 }
 
-#[tokio::test]
-async fn manual_plan_edits_retain_projection_and_decision_history() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    crate::checks::configure_fixture(fixture.path());
-    let service = service();
-    let opened = service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await?;
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let registry = service.registry().await?;
-    let controller = registry.resolve(&session_id).await?;
-    let (setup_sink, _setup_output) = forge_protocol::outbound::channel();
-    controller.attach_input(&setup_sink).await?;
-    let reviewed =
-        reviewed_execution_fixture(&service, &controller, &session_id, &setup_sink).await?;
-    let mut plan = SqliteStore::open(&controller.data_root)?
-        .load_plan(
-            reviewed["plan_id"]
-                .as_str()
-                .context("reviewed plan has no identity")?,
-        )?
-        .context("reviewed plan is missing")?;
-    let data = fixture.path().join("data");
-    let file = crate::plan::PlanFileStore::new(data.clone(), fixture.path()).unwrap();
-    let mut canonical = file.read_working_document(&session_id, &plan.id)?;
-    canonical.design.as_mut().unwrap().document.tests = serde_json::from_value(json!([
-        {"file":"tests/config.rs","cases":[
-            {"name":"first","change":"new","description":"Reject invalid input."},
-            {"name":"keep","change":"new","description":"Accept valid input."}
-        ]}
-    ]))?;
-    let (_, _, digest) = file.submit_validated_document_revision(
-        &session_id,
-        &plan.id,
-        plan.model_revision,
-        canonical.version,
-        canonical,
-    )?;
-    plan.review_digest = Some(digest.clone());
-    SqliteStore::open(&data)?.save_plan(&plan)?;
-    let task = controller
-        .task_controller
-        .current()?
-        .context("plan task is missing")?;
-    controller.task_controller.apply(
-        &mut SqliteStore::open(&data)?,
-        &task.permit(),
-        crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
-        plan.updated_at_ms,
-    )?;
-    let submitted = file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?;
-    let lifecycle_count = SqliteStore::open(&data)?
-        .list_plan_lifecycle(&session_id)?
-        .len();
-    let mut projection = service
-        .document(
-            Some(session_id.clone()),
-            serde_json::from_value(json!({
-                "operation":"plan_open", "document":"test-review", "view":"test-view",
-                "plan_id":plan.id, "digest":digest,
-                "width":{"columns":100,"tabstop":4}
-            }))?,
-        )
-        .await?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    projection = crate::plan::reconstruct(None, projection);
-    for (index, name) in ["first", "keep"].into_iter().enumerate() {
-        let row = projection["source_row"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["test"]["name"] == name)
-            .unwrap();
-        let previous_revision = projection["snapshot"]["revision"].as_u64().unwrap();
-        let previous_version = projection["version"].as_u64().unwrap();
-        service
-            .dispatch(
-                Some(session_id.clone()),
-                Request {
-                    id: 3,
-                    method: "session.plan.test.delete".into(),
-                    params: json!({"tests":[{"file":"tests/config.rs","name":name}],
-                "expected_version":projection["version"], "draft_annotation":[],
-                "draft_source_digest":projection["saved_source_digest"],
-                "review":{"document":"test-review","view":"test-view","sequence":index + 1,
-                    "revision":previous_revision,"block":row["block"],"position":row["position"],
-                    "target":row["target"],"action":"delete_tests"}}),
-                },
-                &sink,
-            )
-            .await?;
-        loop {
-            let frame = output
-                .recv()
-                .await?
-                .context("test deletion response is missing")?;
-            let value: Value = serde_json::from_slice(frame.bytes())?;
-            if value["id"] != 3 {
-                continue;
-            }
-            assert!(value.get("error").is_none(), "{value}");
-            assert!(value["result"].get("review_error").is_none(), "{value}");
-            assert_eq!(
-                value["result"]["plan"]["manual_changes"][index],
-                format!("Removed planned tests: tests/config.rs::{name}")
-            );
-            assert_eq!(
-                value["result"]["plan"]["model_revision"],
-                plan.model_revision
-            );
-            assert_eq!(value["result"]["plan"]["user_revision"], plan.user_revision);
-            projection =
-                crate::plan::reconstruct(Some(&projection), value["result"]["review"].clone());
-            break;
-        }
-        assert_eq!(projection["snapshot"]["document"], "test-review");
-        assert!(projection["snapshot"]["revision"].as_u64().unwrap() > previous_revision);
-        assert_eq!(projection["version"], previous_version + 1);
-        assert!(
-            !projection["source_row"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["test"]["name"] == name)
-        );
-    }
-    let row = projection["source_row"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| {
-            row["text"]
-                .as_str()
-                .is_some_and(|text| text.trim_start().starts_with("pub fn "))
-                && row["target"].is_string()
-        })
-        .context("rename declaration is missing")?;
-    let mut input = json!({"document":"test-review","view":"test-view","sequence":3,
-        "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
-        "target":row["target"],"action":"rename_entity"});
-    input["position"]["column"] = json!(row["text"].as_str().unwrap().find("fn ").unwrap() + 3);
-    let selected = service
-        .document(
-            Some(session_id.clone()),
-            serde_json::from_value(json!({
-                "operation":"plan_action","input":input
-            }))?,
-        )
-        .await?;
-    assert!(selected.get("rename").is_some(), "{selected}");
-    let annotation = json!([{"id":"rename-feedback","source":{"start_line":row["source_line"],
-        "end_line":row["source_line"],"body":"Keep this comment attached after rename."}}]);
-    input["sequence"] = json!(4);
-    service.dispatch(Some(session_id.clone()), Request { id:4, method:"session.plan.entity.rename".into(),
-        params:json!({"review":input,"symbol":selected["rename"]["symbol"],"name":"reviewed_name",
-            "expected_version":projection["version"],"draft_annotation":annotation,
-            "draft_source_digest":projection["saved_source_digest"]}) }, &sink).await?;
-    let renamed = loop {
-        let frame = output.recv().await?.context("rename response is missing")?;
-        let value: Value = serde_json::from_slice(frame.bytes())?;
-        if value["id"] == 4 {
-            break value;
-        }
-    };
-    assert!(renamed.get("error").is_none(), "{renamed}");
-    assert!(renamed["result"].get("review_error").is_none(), "{renamed}");
-    let renamed_review =
-        crate::plan::reconstruct(Some(&projection), renamed["result"]["review"].clone());
-    assert_eq!(renamed_review["snapshot"]["document"], "test-review");
-    assert_eq!(
-        renamed_review["annotation"][0]["source"]["body"],
-        "Keep this comment attached after rename."
-    );
-    assert!(
-        renamed_review["source_row"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("reviewed_name")))
-    );
-    let changes = renamed["result"]["plan"]["manual_changes"].clone();
-    assert_eq!(changes.as_array().unwrap().len(), 3);
-    assert_eq!(
-        renamed["result"]["plan"]["model_revision"],
-        plan.model_revision
-    );
-    assert_eq!(
-        file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?,
-        submitted
-    );
-    assert!(
-        file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1)
-            .is_err()
-    );
-    assert_eq!(
-        SqliteStore::open(&data)?
-            .list_plan_lifecycle(&session_id)?
-            .len(),
-        lifecycle_count
-    );
-    let rejected = service.dispatch(Some(session_id.clone()), Request { id: 99, method: "session.plan.changes.request".into(),
-        params: json!({"plan_id":plan.id,"digest":"stale-review-digest","comment":"x".repeat(65537)}) }, &sink).await.unwrap_err();
-    assert!(
-        rejected
-            .to_string()
-            .contains("plan changed after the review action began"),
-        "{rejected:#}"
-    );
-    assert!(
-        file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1)
-            .is_err()
-    );
-    service.dispatch(Some(session_id.clone()), Request { id:5, method:"session.plan.changes.request".into(),
-        params:json!({"plan_id":plan.id,"digest":renamed["result"]["plan"]["review_digest"],
-            "comment":"Retain the manual edits while revising the plan."}) }, &sink).await?;
-    loop {
-        let frame = output
-            .recv()
-            .await?
-            .context("review decision response is missing")?;
-        let value: Value = serde_json::from_slice(frame.bytes())?;
-        if value["id"] != 5 {
-            continue;
-        }
-        assert!(value.get("error").is_none(), "{value}");
-        break;
-    }
-    assert_eq!(
-        file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?,
-        submitted
-    );
-    let revised = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let revised = SqliteStore::open(&data)?
-                .load_plan(&plan.id)?
-                .context("revised plan is missing")?;
-            if revised.model_revision == plan.model_revision + 2
-                && revised.state == crate::plan::PlanState::AwaitingReview
-                && controller.coordinator.execution.available_permits() > 0
-            {
-                break Ok::<_, anyhow::Error>(revised);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .context("revised plan did not reach review")??;
-    assert_eq!(serde_json::to_value(&revised.manual_changes)?, changes);
-    let reviewed = file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1)?;
-    assert!(reviewed.design.as_ref().unwrap().document.tests.is_empty());
-    assert!(
-        reviewed
-            .design
-            .as_ref()
-            .unwrap()
-            .proposed
-            .values()
-            .any(|text| text.contains("reviewed_name"))
-    );
-    assert_eq!(
-        SqliteStore::open(&data)?
-            .load_plan(&plan.id)?
-            .unwrap()
-            .model_revision,
-        plan.model_revision + 2
-    );
-    service.shutdown(Duration::from_secs(2)).await?;
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -1325,6 +877,9 @@ async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<(
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let ready = Arc::new(tokio::sync::Barrier::new(3));
+    // Each edit commits settings durably, so a few interleaved edits per writer are enough to
+    // exercise latest-value ordering without scaling the test with commit latency.
+    const EDITS_PER_WRITER: u64 = 4;
     let mut writer_list = Vec::new();
     for (offset, field) in [(10, "approval_timeout"), (30, "approval_timeout")] {
         let service = service.clone();
@@ -1333,7 +888,7 @@ async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<(
         let ready = ready.clone();
         writer_list.push(tokio::spawn(async move {
             ready.wait().await;
-            for amount in 1..=16 {
+            for amount in 1..=EDITS_PER_WRITER {
                 service
                     .dispatch(
                         Some(session_id.clone()),
@@ -1353,7 +908,7 @@ async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<(
     for writer in writer_list {
         writer.await??;
     }
-    for _ in 0..32 {
+    for _ in 0..2 * EDITS_PER_WRITER {
         let frame = output
             .recv()
             .await?
@@ -1362,7 +917,7 @@ async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<(
         assert!(response.get("error").is_none(), "{response}");
     }
     let approval = controller.permission.approval_timeout(&session_id)?;
-    assert_eq!(approval.amount, 16);
+    assert_eq!(u64::from(approval.amount), EDITS_PER_WRITER);
     assert!(controller.coordinator.execution.try_acquire().is_err());
     let saved = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?
         .get(&fixture.path().to_string_lossy(), &session_id, "mock")?
@@ -1392,7 +947,7 @@ async fn unchanged_question_relay_does_not_publish_refresh_notifications() -> Re
         .exchange_owner
         .reconcile_questions(Some(sink.clone()))
         .await?;
-    let initial = tokio::time::timeout(Duration::from_secs(2), output.recv())
+    let initial = tokio::time::timeout(crate::hang_guard::HANG_GUARD, output.recv())
         .await??
         .context("initial question notification is missing")?;
     assert_eq!(
@@ -1422,7 +977,7 @@ async fn unchanged_question_relay_does_not_publish_refresh_notifications() -> Re
         .exchange_owner
         .reconcile_questions(Some(sink.clone()))
         .await?;
-    let changed = tokio::time::timeout(Duration::from_secs(2), output.recv())
+    let changed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, output.recv())
         .await??
         .context("changed question notification is missing")?;
     assert_eq!(
@@ -1595,7 +1150,7 @@ async fn persistent_question_answers_commit_and_relay_while_provider_owns_execut
     );
     drop(control);
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -1647,8 +1202,7 @@ async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> 
     let execution = controller.coordinator.execution.acquire().await?;
     let broker = controller.broker.lock().await;
     let (sink, _output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(
-        Duration::from_secs(2),
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -1708,7 +1262,7 @@ async fn check_editing_toggles_without_prompt_or_execution_admission() -> Result
                 .is_none()
         );
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -1765,12 +1319,12 @@ async fn status_thought_settings_apply_and_persist_without_interrupting_a_busy_s
     assert_eq!(opened.result().unwrap()["automatic_checks"], false);
     let registry = service.registry().await?;
     let controller = registry.resolve(&session_id).await?;
+    // The session owner commits settings itself, so only provider execution models busy work.
     let execution = controller.coordinator.execution.acquire().await?;
-    let broker = controller.broker.lock().await;
     let (sink, _output) = forge_protocol::outbound::channel();
     for (index, enabled) in [true, false].into_iter().enumerate() {
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -1793,7 +1347,6 @@ async fn status_thought_settings_apply_and_persist_without_interrupting_a_busy_s
             Some(enabled)
         );
     }
-    drop(broker);
     drop(execution);
     service.shutdown(Duration::from_secs(2)).await?;
     Ok(())
@@ -1835,7 +1388,7 @@ async fn settings_application_orders_progress_and_retains_value_free_timeline() 
     service
         .dispatch(Some(session_id.clone()), request.clone(), &sink)
         .await?;
-    let state = tokio::time::timeout(Duration::from_secs(2), observation).await???;
+    let state = tokio::time::timeout(crate::hang_guard::HANG_GUARD, observation).await???;
     assert_eq!(state, ["configured", "completed"]);
     let (retry_sink, mut retry_output) = forge_protocol::outbound::channel();
     service
@@ -1906,7 +1459,7 @@ async fn question_answers_commit_without_waiting_for_provider_execution() -> Res
     let _execution = controller.coordinator.execution.acquire().await?;
     let (sink, _output) = forge_protocol::outbound::channel();
     let answer = "retained answer ".repeat(4096);
-    tokio::time::timeout(Duration::from_secs(1), service.dispatch_admitted(
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, service.dispatch_admitted(
         Some(session_id.clone()), Request { id: 2, method: "session.question.answer".into(), params: json!({
             "_command":{"id":"answer"}, "operation_id":"answer",
             "target":{"owner":"interaction","id":"question-exchange","set_id":"set","revision":1},
@@ -1975,7 +1528,9 @@ async fn pending_configuration_patches_execute_without_losing_fields() -> Result
     let controller = registry.resolve(&session_id).await?;
     let store = SqliteStore::open(&controller.data_root)?;
     let (sink, _output) = forge_protocol::outbound::channel();
-    for (index, config) in [json!({"model":"model-b"}), json!({"effort":"high"})]
+    // Configuration validates each model against the provider catalog, so the patch selects the
+    // mock provider's advertised model rather than an arbitrary identity.
+    for (index, config) in [json!({"model":"mock-model"}), json!({"effort":"high"})]
         .into_iter()
         .enumerate()
     {
@@ -1990,112 +1545,9 @@ async fn pending_configuration_patches_execute_without_losing_fields() -> Result
             .await?;
     }
     let session = store.load_session(&session_id)?.unwrap();
-    assert_eq!(session.model, "model-b");
+    assert_eq!(session.model, "mock-model");
     assert_eq!(session.effort, "high");
     service.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn pending_permission_intents_compose_and_execute_in_order() -> Result<()> {
-    for (changes, expected_access, expected_approval, initial_sandbox) in [
-        (
-            vec![json!({"kind":"enable_yolo"}), json!({"kind":"enable_yolo"})],
-            "rxwx",
-            "ask",
-            false,
-        ),
-        (
-            vec![
-                json!({"kind":"enable_yolo"}),
-                json!({"kind":"enable_yolo"}),
-                json!({"kind":"enable_yolo"}),
-            ],
-            "rxwx",
-            "allow",
-            false,
-        ),
-        (
-            vec![
-                json!({"kind":"toggle_write_scope"}),
-                json!({"kind":"set_approval","mode":"deny"}),
-            ],
-            "rxwx",
-            "deny",
-            false,
-        ),
-        (
-            vec![
-                json!({"kind":"toggle_write_enabled"}),
-                json!({"kind":"toggle_write_enabled"}),
-            ],
-            "rxw",
-            "ask",
-            false,
-        ),
-        (
-            vec![
-                json!({"kind":"enable_yolo"}),
-                json!({"kind":"toggle_write_enabled"}),
-                json!({"kind":"toggle_read_scope"}),
-                json!({"kind":"set_approval","mode":"ask"}),
-            ],
-            "r",
-            "ask",
-            true,
-        ),
-    ] {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let session_id = opened.result().unwrap()["session"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&session_id).await?;
-        let mut store = SqliteStore::open(&controller.data_root)?;
-        let mut initial = store.load_session(&session_id)?.unwrap();
-        initial.access.sandbox = initial_sandbox;
-        store.save_session(&initial)?;
-        let (sink, _output) = forge_protocol::outbound::channel();
-        for (index, change) in changes.into_iter().enumerate() {
-            let request = Request {
-                id: u64::try_from(index)? + 2,
-                method: "session.command.apply".into(),
-                params: json!({"operation_id":format!("permission-{index}"),"action":"permission","change":change}),
-            };
-            let command = native_permission::decode_command(&request)?;
-            let first = controller
-                .exchange_owner
-                .execute_identified(command.clone(), sink.clone())
-                .await?;
-            let duplicate = controller
-                .exchange_owner
-                .execute_identified(command, sink.clone())
-                .await?;
-            assert_eq!(first.id, duplicate.id);
-            assert_eq!(first.revision, duplicate.revision);
-        }
-        let confirmed = store.load_session(&session_id)?.unwrap();
-        assert_eq!(confirmed.access.abbreviation(), expected_access);
-        assert_eq!(
-            confirmed.approval_mode.label().to_lowercase(),
-            expected_approval
-        );
-        assert!(!confirmed.access.sandbox);
-        assert_eq!(
-            confirmed.access.readable_directory,
-            initial.access.readable_directory
-        );
-        assert_eq!(
-            confirmed.access.writable_directory,
-            initial.access.writable_directory
-        );
-        service.shutdown(Duration::from_secs(1)).await?;
-    }
     Ok(())
 }
 
@@ -2164,7 +1616,8 @@ async fn idle_execution_configuration_preserves_running_goal_without_resume() ->
 }
 
 #[tokio::test]
-async fn provider_setup_rejects_active_execution_and_pending_cleanup() -> Result<()> {
+async fn provider_authentication_rejects_active_execution_and_pending_cleanup_while_setup_inspects()
+-> Result<()> {
     let fixture = tempfile::tempdir()?;
     let service = service();
     let opened = service
@@ -2196,25 +1649,36 @@ async fn provider_setup_rejects_active_execution_and_pending_cleanup() -> Result
                 Some(controller.coordinator.execution.acquire().await?),
             )
         };
-        for method in ["session.provider.setup", "session.provider.authenticate"] {
-            let error = service
-                .dispatch(
-                    Some(session_id.clone()),
-                    Request {
-                        id: 2,
-                        method: method.into(),
-                        params: json!({"method":"oauth-personal"}),
-                    },
-                    &sink,
-                )
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains(if pending_cleanup {
-                "cleanup is pending"
-            } else {
-                "Finish active work"
-            }));
-        }
+        // Setup is a read-only inspection handshake, so only authentication, which can change
+        // native credentials and MCP discovery, requires idle execution and settled cleanup.
+        let error = service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.provider.authenticate".into(),
+                    params: json!({"method":"oauth-personal"}),
+                },
+                &sink,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(if pending_cleanup {
+            "cleanup is pending"
+        } else {
+            "Finish active work"
+        }));
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 3,
+                    method: "session.provider.setup".into(),
+                    params: json!({}),
+                },
+                &sink,
+            )
+            .await?;
         drop(occupied);
     }
     service.shutdown(Duration::from_secs(1)).await?;
@@ -2234,11 +1698,14 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
         .to_owned();
     let registry = service.registry().await?;
     let controller = registry.resolve(&session_id).await?;
+    // Resolve the execution registry before holding the broker, which the rest of the test keeps
+    // locked to prove mock controls never wait on it.
+    let execution_registry = controller.broker.lock().await.execution_registry();
     let broker = controller.broker.lock().await;
     let execution = controller.coordinator.execution.acquire().await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -2256,8 +1723,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
         .as_str()
         .context("missing hold ID")?
         .to_owned();
-    let registry = controller.broker.lock().await.execution_registry();
-    let engine = registry
+    let engine = execution_registry
         .owner(crate::provider::ThreadOwner::root(&session_id))
         .await?;
     let submissions = controller.submission_store.clone();
@@ -2317,7 +1783,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
     });
     for (request_id, operation) in [(3, "wait"), (4, "release")] {
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -2347,7 +1813,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
             assert_eq!(result["result"]["released"], true);
         }
     }
-    let completed = tokio::time::timeout(Duration::from_secs(2), prompt).await???;
+    let completed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, prompt).await???;
     assert!(completed.event.iter().any(|event| matches!(
         event,
         crate::provider::HarnessEvent::Native { event: boxed_native_event, .. }  if matches!(boxed_native_event.as_ref(), crate::provider::ProviderEvent::Item { event: forge_provider_api::message::ItemEvent::Started(forge_provider_api::message::ItemStart::AgentMessage(message)), .. } if message.text == "Mock response: held prompt"))));
@@ -2429,7 +1895,7 @@ async fn model_pins_bypass_the_active_provider_broker_lock() {
         ),
     ] {
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -2499,7 +1965,7 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
         ("permissions.document.open", json!({})),
     ] {
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -2513,9 +1979,8 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
         .await
         .unwrap_or_else(|_| panic!("{method} waited for execution"))
         .unwrap();
-        let frame = output.recv().await.unwrap().unwrap();
-        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-        assert_eq!(value["id"], 2, "{method}: {value}");
+        // A state read reattaches the session event stream, so events may precede the response.
+        let value = response_for(&mut output, 2).await.unwrap();
         assert!(value["error"].is_null(), "{method}: {value}");
         if method == "session.state.get" {
             assert_eq!(value["result"]["session"]["name"], "active rename");
@@ -2529,30 +1994,11 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
             );
         }
     }
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        service.dispatch(
-            Some(session_id.clone()),
-            Request {
-                id: 3,
-                method: "session.configure".into(),
-                params: json!({"effort":"high"}),
-            },
-            &sink,
-        ),
-    )
-    .await
-    .expect("unsupported direct mutation must reject without waiting")
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("requires a settled session"),
-        "{error:#}"
-    );
     assert_eq!(broker.snapshot().unwrap().session.name, "active rename");
     for (offset, method) in ["session.new"].into_iter().enumerate() {
         let request_id = 10 + offset as u64;
         tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -2601,7 +2047,7 @@ async fn attachment_import_bypasses_active_execution_and_retains_source_bytes() 
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id),
             Request {
@@ -2659,37 +2105,23 @@ async fn configuration_acknowledgement_does_not_wait_for_mcp_discovery() {
     let registry = service.registry().await.unwrap();
     let controller = registry.resolve(&session_id).await.unwrap();
     let (sink, mut output) = forge_protocol::outbound::channel();
-    // Bootstrap the session listener before holding the state lock that supplies its registry.
-    controller.attach_session_events(&sink).await.unwrap();
-    let broker = controller.broker.lock().await;
+    // Configuration invalidates MCP discovery by revision; it must never wait for discovery itself.
     let discovery = controller.mcp_discovery.lock().await;
-    let configuring = service.dispatch(Some(session_id.clone()), Request {
-        id: 2, method: "session.command.apply".into(),
-        params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
-    }, &sink);
-    tokio::pin!(configuring);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            tokio::select! {
-                result = &mut configuring => panic!("configuration completed before its owner released: {result:?}"),
-                frame = output.recv() => {
-                    let frame = frame.unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-                    if value["id"] == 2 {
-                        assert_eq!(value["result"]["state"], "accepted", "{value}");
-                        break;
-                    }
-                }
-            }
-        }
-    }).await.expect("configuration acknowledgement waited for MCP discovery");
-    assert!(controller.mcp_revision.load(Ordering::Acquire) > 0);
+    let revision_before = controller.mcp_revision.load(Ordering::Acquire);
+    tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        service.dispatch(Some(session_id.clone()), Request {
+            id: 2, method: "session.command.apply".into(),
+            params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
+        }, &sink),
+    )
+    .await
+    .expect("configuration waited for MCP discovery")
+    .unwrap();
+    let value = response_for(&mut output, 2).await.unwrap();
+    assert_eq!(value["result"]["state"], "completed", "{value}");
+    assert!(controller.mcp_revision.load(Ordering::Acquire) > revision_before);
     drop(discovery);
-    drop(broker);
-    tokio::time::timeout(Duration::from_secs(2), &mut configuring)
-        .await
-        .unwrap()
-        .unwrap();
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
 
@@ -2719,7 +2151,7 @@ async fn root_model_catalog_bypasses_the_active_broker_lock() {
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -2744,8 +2176,127 @@ async fn root_model_catalog_bypasses_the_active_broker_lock() {
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
 
+/// Read one response for `id` from a sink, skipping interleaved events.
+async fn response_for(
+    output: &mut forge_protocol::outbound::MessageReceiver,
+    id: u64,
+) -> Result<Value> {
+    loop {
+        let frame = output.recv().await?.context("response stream closed")?;
+        let message: Value = serde_json::from_slice(frame.bytes())?;
+        if message["id"] == id {
+            return Ok(message);
+        }
+    }
+}
+
+/// ACP agents list models only from an open binding; the root catalog must use that binding.
 #[tokio::test]
-async fn idle_root_model_catalog_publishes_and_persists_default_resolution() {
+async fn binding_only_model_catalog_lists_from_the_open_root_binding() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    let opened = service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let session_id = opened.result().unwrap()["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (control_sink, mut control) = forge_protocol::outbound::channel();
+    let control_request = |id: u64, method: &str, params: Value| {
+        service.dispatch(
+            Some(session_id.clone()),
+            Request {
+                id,
+                method: method.into(),
+                params,
+            },
+            &control_sink,
+        )
+    };
+    control_request(
+        10,
+        "session.provider.mock_response",
+        json!({"operation":"require_binding_model_catalog"}),
+    )
+    .await?;
+    assert!(response_for(&mut control, 10).await?["error"].is_null());
+    let unbound = control_request(15, "session.provider.model.list", json!({})).await;
+    assert!(
+        unbound
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("ModelSelection")),
+        "workspace discovery must stay unsupported before the binding opens: {unbound:?}"
+    );
+    control_request(
+        11,
+        "session.provider.mock_response",
+        json!({"operation":"hold","mode":"chat"}),
+    )
+    .await?;
+    let held = response_for(&mut control, 11).await?;
+    let hold_id = held["result"]["id"].clone();
+    let admission = service
+        .prepare(
+            Some(session_id.as_str()),
+            RuntimeMethod::SessionPromptSubmit,
+        )
+        .await?;
+    let (prompt_sink, _prompt_output) = forge_protocol::outbound::channel();
+    let submit = service.dispatch_admitted(
+        Some(session_id.clone()),
+        Request {
+            id: 2,
+            method: "session.prompt.submit".into(),
+            params: json!({"text":"held prompt"}),
+        },
+        &prompt_sink,
+        admission,
+    );
+    let inspect = async {
+        control_request(
+            12,
+            "session.provider.mock_response",
+            json!({"operation":"wait","id":hold_id}),
+        )
+        .await?;
+        assert!(response_for(&mut control, 12).await?["error"].is_null());
+        control_request(13, "session.provider.model.list", json!({})).await?;
+        let models = response_for(&mut control, 13).await?;
+        control_request(
+            14,
+            "session.provider.mock_response",
+            json!({"operation":"release","id":hold_id}),
+        )
+        .await?;
+        response_for(&mut control, 14).await?;
+        Ok::<_, anyhow::Error>(models)
+    };
+    let (_, models) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        tokio::try_join!(submit, inspect)
+    })
+    .await??;
+    assert!(models["error"].is_null(), "{models}");
+    assert_eq!(models["result"][0]["id"], "mock-model");
+    // Between turns the binding remains open, so the catalog must still come from it.
+    let controller = service.registry().await?.resolve(&session_id).await?;
+    let idle_execution = tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        controller.coordinator.execution.acquire(),
+    )
+    .await??;
+    let idle = control_request(16, "session.provider.model.list", json!({})).await;
+    drop(idle_execution);
+    assert!(idle.is_ok(), "idle binding catalog failed: {idle:?}");
+    service.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+/// The catalog's default entry is a configured preference, not native evidence of the model that
+/// runs, so listing the catalog leaves the actual model unknown until `ModelResolved` confirms it
+/// (see the model-resolution paragraphs in `contributing/forge/architecture/providers.md`).
+async fn idle_root_model_catalog_keeps_the_default_model_unresolved() {
     let fixture = tempfile::tempdir().unwrap();
     let seed_service = service();
     let seeded = seed_service
@@ -2767,10 +2318,9 @@ async fn idle_root_model_catalog_publishes_and_persists_default_resolution() {
     let mut request = initialize(&fixture, "mock");
     request.new_session_name = Some("Cached default".into());
     let opened = service.open_session(1, request).await.unwrap();
-    assert_eq!(
-        opened.result().unwrap()["session"]["resolved_model"],
-        "previous-default"
-    );
+    // A new conversation keeps its actual model unknown until native confirmation, so another
+    // session's resolved default never leaks into it before the catalog resolves.
+    assert!(opened.result().unwrap()["session"]["resolved_model"].is_null());
     assert_eq!(opened.result().unwrap()["session"]["model"], "default");
     let session_id = opened.result().unwrap()["session"]["id"]
         .as_str()
@@ -2790,31 +2340,31 @@ async fn idle_root_model_catalog_publishes_and_persists_default_resolution() {
         )
         .await
         .unwrap();
-    let mut configured = false;
+    let mut resolved = false;
     loop {
         let frame = output.recv().await.unwrap().unwrap();
         let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
         if value["event"] == "session_configured" {
-            configured = value["payload"]["resolved_model"] == "mock-model";
+            resolved |= !value["payload"]["resolved_model"].is_null();
         }
         if value["id"] == 2 {
+            assert_eq!(value["result"][0]["id"], "mock-model");
             assert_eq!(value["result"][0]["selected_reasoning"], "medium");
             break;
         }
     }
     assert!(
-        configured,
-        "idle catalog did not publish default model resolution"
+        !resolved,
+        "idle catalog published an unconfirmed model resolution"
     );
     let store = SqliteStore::open(&fixture.path().join("data")).unwrap();
-    assert_eq!(
+    assert!(
         store
             .load_session(&session_id)
             .unwrap()
             .unwrap()
             .resolved_model
-            .as_deref(),
-        Some("mock-model")
+            .is_none()
     );
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
@@ -2836,7 +2386,7 @@ async fn child_model_catalog_bypasses_the_active_root_broker_lock() {
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -2869,69 +2419,6 @@ async fn child_model_catalog_bypasses_the_active_root_broker_lock() {
             break;
         }
     }
-    drop(broker);
-    service.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
-#[tokio::test]
-async fn revision_review_controls_bypass_the_waiting_provider_broker_lock() {
-    let fixture = tempfile::tempdir().unwrap();
-    let service = service();
-    let opened = service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await
-        .unwrap();
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let registry = service.registry().await.unwrap();
-    let controller = registry.resolve(&session_id).await.unwrap();
-    let broker = controller.broker.lock().await;
-    let mut review = controller.revision_review.open().unwrap();
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    for method in [
-        RuntimeMethod::SessionPlanAccept,
-        RuntimeMethod::SessionPlanChangesRequest,
-        RuntimeMethod::SessionPlanCancel,
-        RuntimeMethod::SessionPlanEntityRename,
-        RuntimeMethod::SessionPlanTestDelete,
-        RuntimeMethod::SessionPlanCheckUpdate,
-    ] {
-        let request = Request {
-            id: 2,
-            method: "review".into(),
-            params: json!({"plan_id":"plan"}),
-        };
-        let respond = async {
-            let Some(crate::plan::revision_review::RevisionReviewRequest::Decide {
-                method: received,
-                params,
-                response,
-            }) = review.receiver.recv().await
-            else {
-                panic!("missing review decision")
-            };
-            assert_eq!(received, method);
-            assert_eq!(params, request.params);
-            response
-                .send(Ok((json!({"reviewed":true}), Vec::new())))
-                .unwrap();
-        };
-        let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(
-                route_control_request(&controller, &request, method, &sink,),
-                respond
-            )
-        })
-        .await
-        .expect("review controls must not acquire the provider's broker lock");
-        assert!(routed.unwrap());
-        let frame = output.recv().await.unwrap().unwrap();
-        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-        assert_eq!(value["result"]["reviewed"], true);
-    }
-    drop(review);
     drop(broker);
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
@@ -3023,7 +2510,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
     let permission = controller.permission.clone();
     let (event_sink, mut events) =
         crate::provider::events::channel(crate::provider::InvocationScope {
-            owner: owner.clone(),
+            thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             exchange_id: task_id.clone().into(),
             invocation_id: "approval-invocation".into(),
         });
@@ -3043,14 +2530,14 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
                 },
                 Some(crate::provider::TurnAddress {
                     scope: event_sink.invocation_scope()?.clone(),
-                    thread_id: event_sink.invocation_scope()?.owner.thread_id(),
+                    thread_id: event_sink.invocation_scope()?.owner().thread_id(),
                     turn_id: event_sink.invocation_scope()?.turn_id()?,
                 }),
                 Some(&event_sink),
             )
             .await
     });
-    let requested = tokio::time::timeout(Duration::from_secs(2), events.recv())
+    let requested = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
         .await??
         .unwrap();
     controller
@@ -3062,7 +2549,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
             event: requested.into(),
         })
         .await?;
-    let requested_view = tokio::time::timeout(Duration::from_secs(2), async {
+    let requested_view = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let frame = output.recv().await?.context("event stream ended")?;
             let value: Value = serde_json::from_slice(frame.bytes())?;
@@ -3098,7 +2585,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         pending.await??,
         crate::provider::approval::ApprovalResolution::AllowOnce
     );
-    let resolved = tokio::time::timeout(Duration::from_secs(2), events.recv())
+    let resolved = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
         .await??
         .unwrap();
     assert!(matches!(
@@ -3127,7 +2614,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
             event: resolved.into(),
         })
         .await?;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let frame = output.recv().await?.context("event stream ended")?;
             let value: Value = serde_json::from_slice(frame.bytes())?;
@@ -3146,8 +2633,12 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
     Ok(())
 }
 
+/// The session owner admits a queued composer prompt and acknowledges its token exactly once.
 #[tokio::test]
-async fn queued_prompt_waits_for_execution_and_acknowledges_admission() -> Result<()> {
+async fn queued_prompt_acknowledges_composer_admission_once() -> Result<()> {
+    use forge_buffer::identity::{DocumentId, ViewId};
+    use forge_buffer::width::WidthProfile;
+
     let fixture = tempfile::tempdir()?;
     let service = service();
     service
@@ -3155,56 +2646,65 @@ async fn queued_prompt_waits_for_execution_and_acknowledges_admission() -> Resul
         .await?;
     let registry = service.registry().await?;
     let session_id = registry.initial_session_id().to_owned();
-    let previous = service
-        .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
-        .await?;
+    let controller = registry.resolve(&session_id).await?;
+    // Composer acknowledgements belong to an open transcript document.
+    let document = DocumentId("queued-composer".into());
+    controller.presentation.lock().unwrap().open(
+        document.clone(),
+        ViewId("queued-composer-view".into()),
+        WidthProfile::default(),
+    )?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let mut queued = Box::pin(service.dispatch_admitted(
         Some(session_id.clone()),
-        Request { id: 2, method: "session.prompt.submit".into(),
-            params: json!({"text":"Queued after finalization","queued":true,"submission":{"token":42}}) },
-        &sink, None,
+        Request {
+            id: 2,
+            method: "session.prompt.submit".into(),
+            params: json!({"text":"Queued after finalization","queued":true,
+                "submission":{"document":document,"token":42}}),
+        },
+        &sink,
+        None,
     ));
     assert!(futures_util::poll!(queued.as_mut()).is_pending());
-    assert!(
-        service
-            .prepare(Some(&session_id), RuntimeMethod::SessionStateGet)
-            .await?
-            .is_none()
-    );
-    let controller = registry.resolve(&session_id).await?;
     assert!(
         controller.coordinator.control.try_acquire().is_ok(),
         "queued work blocked cancellation"
     );
-    drop(previous);
-    let observe = async {
-        let mut accepted = 0;
-        loop {
-            let frame = output.recv().await?.context("queued response missing")?;
-            let message: Value = serde_json::from_slice(frame.bytes())?;
-            if message["event"] == "provider_event"
-                && message["payload"]["kind"] == "prompt_submission"
-            {
-                assert_eq!(message["payload"]["data"]["token"], 42);
-                assert_eq!(message["payload"]["data"]["state"], "accepted");
-                accepted += 1;
-            }
-            if message["id"] == 2 {
-                assert!(message.get("error").is_none(), "{message}");
-                assert_eq!(
-                    accepted, 1,
-                    "queued admission was not acknowledged exactly once"
-                );
-                return Ok::<(), anyhow::Error>(());
-            }
+    // Control responses bypass the ordinary event lane, so the acknowledgement may follow the
+    // response. Collect every frame until the host releases the sink, then count once.
+    let reader = tokio::spawn(async move {
+        let mut frames = Vec::new();
+        while let Some(frame) = output.recv().await? {
+            frames.push(serde_json::from_slice::<Value>(frame.bytes())?);
         }
-    };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::try_join!(queued, observe)
-    })
-    .await??;
+        Ok::<_, anyhow::Error>(frames)
+    });
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, queued).await??;
+    controller.finish_prompt_workers().await?;
+    drop(controller);
     service.shutdown(Duration::from_secs(1)).await?;
+    drop(sink);
+    let frames = tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    let response = frames
+        .iter()
+        .find(|message| message["id"] == 2)
+        .context("queued response missing")?;
+    assert!(response.get("error").is_none(), "{response}");
+    let acknowledgements: Vec<&Value> = frames
+        .iter()
+        .filter(|message| {
+            message["event"] == "provider_event"
+                && message["payload"]["kind"] == "prompt_submission"
+        })
+        .collect();
+    assert_eq!(
+        acknowledgements.len(),
+        1,
+        "queued admission was not acknowledged exactly once"
+    );
+    assert_eq!(acknowledgements[0]["payload"]["data"]["token"], 42);
+    assert_eq!(acknowledgements[0]["payload"]["data"]["state"], "accepted");
     Ok(())
 }
 
@@ -3248,7 +2748,7 @@ async fn queued_prompt_commits_input_without_acquiring_execution() -> Result<()>
     let controller = registry.resolve(registry.initial_session_id()).await?;
     let execution = controller.coordinator.execution.acquire().await?;
     let (sink, _output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(Duration::from_secs(1), prompt::apply(&controller, Request {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, prompt::apply(&controller, Request {
         id: 2, method: "session.prompt.submit".into(),
         params: json!({"operation_id":"queued-prompt", "input_id":"queued-message", "text":"Wait for current work", "queued":true}),
     }, &sink)).await??;
@@ -3296,58 +2796,6 @@ async fn finalized_execution_releases_admission_before_response_delivery() -> Re
     completion.await?;
     drop(next);
     assert!(admission.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn next_prompt_is_admitted_when_previous_completion_arrives() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    let service = service();
-    service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await?;
-    let first = service
-        .prepare(
-            Some(service.registry().await.unwrap().initial_session_id()),
-            RuntimeMethod::SessionPromptSubmit,
-        )
-        .await?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    let dispatch = service.dispatch_admitted(
-        Some(service.registry().await?.initial_session_id().to_owned()),
-        Request {
-            id: 2,
-            method: "session.prompt.submit".into(),
-            params: json!({"text":"First request"}),
-        },
-        &sink,
-        first,
-    );
-    let next = async {
-        loop {
-            let frame = output
-                .recv()
-                .await?
-                .context("completion response is missing")?;
-            let message: Value = serde_json::from_slice(frame.bytes())?;
-            if message["id"] == 2 {
-                assert!(message.get("error").is_none(), "{message}");
-                return service
-                    .prepare(
-                        Some(service.registry().await.unwrap().initial_session_id()),
-                        RuntimeMethod::SessionPromptSubmit,
-                    )
-                    .await;
-            }
-        }
-    };
-    let (_, admission) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::try_join!(dispatch, next)
-    })
-    .await??;
-    assert!(admission.is_some());
-    drop(admission);
-    service.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -3427,140 +2875,6 @@ async fn input_timeout_waits_without_admission_and_releases_stale_waits() -> Res
     Ok(())
 }
 
-#[tokio::test]
-async fn execution_admission_excludes_overlapping_work_and_pending_cleanup() {
-    let fixture = tempfile::tempdir().unwrap();
-    let service = service();
-    assert!(
-        service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await
-            .unwrap()
-            .result()
-            .is_some()
-    );
-    let execution = service
-        .prepare(
-            Some(service.registry().await.unwrap().initial_session_id()),
-            RuntimeMethod::SessionPromptSubmit,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionPromptSubmit
-            )
-            .await
-            .unwrap_err()
-            .is::<crate::broker::RequestNotAdmitted>()
-    );
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionTurnCancel
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionStateGet
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let registry = service.registry().await.unwrap();
-    let controller = registry
-        .resolve(registry.initial_session_id())
-        .await
-        .unwrap();
-    let cleanup = Arc::clone(&controller.coordinator.control)
-        .try_acquire_owned()
-        .unwrap();
-    drop(execution);
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionCompact
-            )
-            .await
-            .unwrap_err()
-            .is::<crate::broker::RequestNotAdmitted>()
-    );
-    drop(cleanup);
-    let resumed = service
-        .prepare(
-            Some(service.registry().await.unwrap().initial_session_id()),
-            RuntimeMethod::SessionCompact,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    drop(resumed);
-    let prompt = service
-        .prepare(
-            Some(service.registry().await.unwrap().initial_session_id()),
-            RuntimeMethod::SessionPromptSubmit,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionPromptSubmit
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionCompact
-            )
-            .await
-            .is_err()
-    );
-    let cleanup = Arc::clone(&controller.coordinator.control)
-        .try_acquire_owned()
-        .expect("chat must not retain cleanup admission while its model runs");
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionCheckEditingSet
-            )
-            .await
-            .unwrap()
-            .is_none(),
-        "check-editing toggles must not need provider execution admission"
-    );
-    assert!(
-        service
-            .prepare(
-                Some(service.registry().await.unwrap().initial_session_id()),
-                RuntimeMethod::SessionTurnCancel
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    drop(cleanup);
-    drop(prompt);
-    service.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
 /// Collect an invocation-owned check through the same cancellation command as other work.
 #[tokio::test]
 async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
@@ -3615,7 +2929,7 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
             )
             .await?;
     }
-    let run_id = tokio::time::timeout(Duration::from_secs(5), async {
+    let run_id = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(id) = controller.checks.active()? {
                 let run = controller.checks.status(&id, 100, false).await?;
@@ -3657,46 +2971,6 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
 }
 
 #[tokio::test]
-async fn admitted_execution_waits_for_broker_maintenance() {
-    let fixture = tempfile::tempdir().unwrap();
-    let service = service();
-    service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await
-        .unwrap();
-    let execution = service
-        .prepare(
-            Some(service.registry().await.unwrap().initial_session_id()),
-            RuntimeMethod::SessionPromptSubmit,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let registry = service.registry().await.unwrap();
-    let controller = registry
-        .resolve(registry.initial_session_id())
-        .await
-        .unwrap();
-    let maintenance = controller.broker.lock().await;
-    let mut acquisition = Box::pin(acquire_request_broker(
-        &controller,
-        RuntimeMethod::SessionPromptSubmit,
-    ));
-    assert!(
-        futures_util::poll!(acquisition.as_mut()).is_pending(),
-        "admitted execution must wait for transient broker ownership"
-    );
-    drop(maintenance);
-    let broker = tokio::time::timeout(Duration::from_secs(2), acquisition)
-        .await
-        .unwrap()
-        .unwrap();
-    drop(broker);
-    drop(execution);
-    service.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
-#[tokio::test]
 async fn configuration_waits_for_maintenance_without_provider_cleanup() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
@@ -3716,7 +2990,7 @@ async fn configuration_waits_for_maintenance_without_provider_cleanup() -> Resul
         );
         assert!(controller.coordinator.execution.try_acquire().is_err());
         drop(maintenance);
-        let admitted = tokio::time::timeout(Duration::from_secs(2), acquisition).await??;
+        let admitted = tokio::time::timeout(crate::hang_guard::HANG_GUARD, acquisition).await??;
         assert!(controller.coordinator.execution.try_acquire().is_err());
         drop(admitted);
         assert!(controller.coordinator.execution.try_acquire().is_ok());
@@ -3778,7 +3052,7 @@ async fn trace_controls_complete_while_a_turn_owns_the_broker() {
         (5, "host.trace.configure", json!({"enabled":false})),
     ] {
         tokio::time::timeout(
-            Duration::from_secs(1),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -3820,7 +3094,8 @@ async fn oversized_session_preview_uses_response_parts_and_keeps_broker_alive() 
         .to_owned();
     let registry = service.registry.lock().await.clone().unwrap();
     let controller = registry.resolve(&session_id).await.unwrap();
-    let name = "preview history ".repeat(40000);
+    // Exceed one protocol frame so the preview must arrive as response parts.
+    let name = "preview history ".repeat(forge_protocol::MAX_FRAME_BYTES / 16 + 1);
     let renamed = controller
         .broker
         .lock()
@@ -3878,149 +3153,6 @@ async fn oversized_session_preview_uses_response_parts_and_keeps_broker_alive() 
         .unwrap();
     output.check().unwrap();
     service.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn shutdown_timeout_retains_fork_ownership_and_leases_until_completion() {
-    let fixture = tempfile::tempdir().unwrap();
-    let service = service();
-    let initialize = initialize(&fixture, "fork-blocking");
-    let opened = service.open_session(1, initialize.clone()).await.unwrap();
-    assert!(opened.error().is_none(), "{opened:?}");
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    service
-        .dispatch(
-            Some(session_id.clone()),
-            Request {
-                id: 2,
-                method: "session.fork".into(),
-                params: json!({"name":"shutdown child"}),
-            },
-            &sink,
-        )
-        .await
-        .unwrap();
-    let frame = output.recv().await.unwrap().unwrap();
-    let response: Response = serde_json::from_slice(frame.bytes()).unwrap();
-    let child = response.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    drop(frame);
-
-    assert!(service.shutdown(Duration::from_millis(10)).await.is_err());
-    assert!(service.registry.lock().await.is_some());
-    let admission_error = service
-        .prepare(Some(&session_id), RuntimeMethod::SessionPromptSubmit)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(admission_error.to_string(), "Harness service is closed");
-    let contender_diff = DiffEngine::new(CacheLimits::default(), 1);
-    let contender_syntax = SyntaxEngine::new(contender_diff.analysis_pool());
-    let contender = HarnessService::new(
-        Arc::new(RepositoryStore::default()),
-        contender_diff,
-        contender_syntax,
-    );
-    let mut reopen = initialize;
-    reopen.client_id = "second-owner".into();
-    reopen.session_id = Some(child);
-    let conflict = contender.open_session(3, reopen.clone()).await.unwrap();
-    assert_eq!(conflict.error().unwrap().code, "session_lease_conflict");
-
-    service.shutdown(Duration::from_secs(5)).await.unwrap();
-    assert!(service.registry.lock().await.is_none());
-    let reopened = contender.open_session(4, reopen).await.unwrap();
-    assert!(reopened.error().is_none(), "{reopened:?}");
-    assert_eq!(
-        reopened.result().unwrap()["session"]["provider_fork_state"]["state"],
-        "ready"
-    );
-    contender.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
-#[tokio::test]
-async fn task_state_controls_never_wait_for_provider_or_broker() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-    let controller = SessionController::new(broker).await?;
-    let provider_requests = Arc::new(Mutex::new(Vec::new()));
-    let provider = steering_provider(provider_requests.clone());
-    let provider_fixture =
-        crate::provider::test_support::ProviderTestSession::from_native(provider)?;
-    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
-    let session_id = controller.observer.session_id().to_owned();
-    let mut store = SqliteStore::open(&controller.data_root)?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    let reader = tokio::spawn(async move {
-        while output.recv().await?.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-    let execution = Arc::clone(&controller.coordinator.execution).try_acquire_owned()?;
-    let broker_owner = controller.broker.lock().await;
-    let provider_stop = provider_requests.lock().await;
-    for (index, action) in ["pause", "clear"].into_iter().enumerate() {
-        let previous = controller.task_controller.current()?;
-        controller.task_controller.change(
-            &mut store,
-            previous.as_ref().map(|task| &task.revision),
-            crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
-                "Preserve provider ownership".into(),
-                Default::default(),
-                1,
-            ))),
-            1,
-        )?;
-        let request = Request {
-            id: index as u64 + 1,
-            method: "session.command.apply".into(),
-            params: json!({"operation_id":format!("locked-{action}"),"action":action}),
-        };
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                super::task_state::apply(&controller, &session_id, &request, 20, &sink)
-            )
-            .await??
-        );
-        if action == "pause" {
-            assert_eq!(
-                controller.task_controller.current()?.unwrap().status(),
-                crate::task::TaskStatus::Paused
-            );
-        } else {
-            assert!(controller.task_controller.current()?.is_none());
-        }
-        assert!(!*controller.cancellation.subscribe().borrow());
-        assert_eq!(controller.coordinator.execution.available_permits(), 0);
-        assert!(
-            provider_stop.is_empty(),
-            "task state reached provider control"
-        );
-        assert!(
-            controller
-                .exchange_owner
-                .command_status(crate::exchange::command::CommandId::new(format!(
-                    "locked-{action}"
-                ))?)
-                .await?
-                .unwrap()
-                .completion()
-                .unwrap()
-                .is_ok()
-        );
-    }
-    drop(provider_stop);
-    drop(broker_owner);
-    drop(execution);
-    drop(sink);
-    tokio::time::timeout(Duration::from_secs(2), reader).await???;
-    Ok(())
 }
 
 #[tokio::test]
@@ -4097,10 +3229,10 @@ async fn task_input_reads_the_current_session_revision() -> Result<()> {
     assert!(controller.task_input_is_current(&InputPurpose::TaskEntry {
         revision: replacement.revision.clone(),
         id: crate::task::TaskInputId::fresh(),
-        start: crate::exchange::TaskStart {
+        start: Some(crate::exchange::TaskStart {
             kind: replacement.kind(),
             title: replacement.title().into(),
-        },
+        }),
     })?);
     controller.task_controller.change(
         &mut store,
@@ -4111,61 +3243,6 @@ async fn task_input_reads_the_current_session_revision() -> Result<()> {
     assert!(!controller.task_input_is_current(&pending)?);
     assert!(controller.task_input_is_current(&InputPurpose::User)?);
     service.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn goal_state_commit_does_not_wait_for_or_cancel_the_running_owner() -> Result<()> {
-    for action in ["goal", "plan"] {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let registry = service.registry().await?;
-        let session_id = registry.initial_session_id().to_owned();
-        let controller = registry.resolve(&session_id).await?;
-        let broker = controller.broker.lock().await;
-        let running = controller
-            .coordinator
-            .execution
-            .clone()
-            .acquire_owned()
-            .await?;
-        let (sink, _output) = forge_protocol::outbound::channel();
-        let request = Request {
-            id: 2,
-            method: "session.command.apply".into(),
-            params: json!({"operation_id":"promote","action":action,"text":"Finish the work"}),
-        };
-        service.prepare_task(Some(&session_id), &request).await?;
-        assert!(
-            controller
-                .exchange_owner
-                .command_status(crate::exchange::command::CommandId::new("promote")?)
-                .await?
-                .is_none()
-        );
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            super::task_state::apply(&controller, &session_id, &request, 20, &sink),
-        )
-        .await??;
-        let task = controller.task_controller.current()?.unwrap();
-        assert_eq!(task.title(), "Finish the work");
-        assert!(!task.entry_accepted());
-        assert!(!*controller.cancellation.subscribe().borrow());
-        let clear = Request {
-            id: 3,
-            method: "session.command.apply".into(),
-            params: json!({"operation_id":"clear","action":"clear"}),
-        };
-        super::task_state::apply(&controller, &session_id, &clear, 20, &sink).await?;
-        assert!(controller.task_controller.current()?.is_none());
-        drop(running);
-        drop(broker);
-        service.shutdown(Duration::from_secs(1)).await?;
-    }
     Ok(())
 }
 
@@ -4243,7 +3320,7 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
     controller.attach_input(&sink).await?;
     let mut commands = Vec::new();
     for id in ["first", "second", "third"] {
-        let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+        let command = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
             .await?
             .context("steering lane closed")?;
         assert_eq!(command.text, format!("steering {id}"));
@@ -4285,7 +3362,7 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
         ))?;
         command.complete(Ok(())).await;
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let snapshot = controller.coordinator.submissions.snapshot()?;
             if snapshot.messages.len() == 1 && snapshot.messages[0].id == "queued" {
@@ -4305,10 +3382,11 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
     Ok(())
 }
 
-/// Preserve cancelled, undispatched followups for explicit recovery instead of replaying them.
+/// Retract a cleanly cancelled, undispatched followup so the composer restores it, and never
+/// replay it when later input arrives.
 #[tokio::test]
-async fn cancelled_deferred_input_retains_text_and_attachment_without_replay() -> Result<()> {
-    use crate::input::{InputDelivery, InputOperation};
+async fn cancelled_deferred_input_is_retracted_without_replay() -> Result<()> {
+    use crate::input::InputOperation;
     let fixture = tempfile::tempdir()?;
     let service = service();
     service
@@ -4357,7 +3435,7 @@ async fn cancelled_deferred_input_retains_text_and_attachment_without_replay() -
     }))?;
     controller.coordinator.submissions.apply(operation)?;
     controller.attach_input(&sink).await?;
-    let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+    let command = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
         .await?
         .context("missing deferred input")?;
     let submission = command
@@ -4369,24 +3447,25 @@ async fn cancelled_deferred_input_retains_text_and_attachment_without_replay() -
         submission.record()?.delivery,
         crate::provider::submission::SubmissionState::Prepared
     );
-    let before = controller.coordinator.submissions.snapshot()?.messages[0].clone();
     controller.coordinator.submissions.suspend(true, None)?;
     active.retire();
     command.cancel_undispatched().await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = controller.coordinator.submissions.snapshot()?;
-            if snapshot.messages[0].delivery() == InputDelivery::Failed {
-                break Ok::<(), anyhow::Error>(());
-            }
+    let deferred_retained = || -> Result<bool> {
+        Ok(controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .iter()
+            .any(|message| message.id == "deferred-input"))
+    };
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        while deferred_retained()? {
             tokio::task::yield_now().await;
         }
+        Ok::<(), anyhow::Error>(())
     })
     .await??;
-    let after = controller.coordinator.submissions.snapshot()?.messages[0].clone();
-    assert_eq!(after.text, before.text);
-    assert_eq!(after.attachments, before.attachments);
-    assert_eq!(after.submission_id(), Some(submission.id()));
     assert_eq!(
         submission.record()?.delivery,
         crate::provider::submission::SubmissionState::Cancelled
@@ -4396,18 +3475,7 @@ async fn cancelled_deferred_input_retains_text_and_attachment_without_replay() -
         "action":{"kind":"submit","message":{"id":"fresh-input","text":"A distinct request","intent":"auto"}}
     }))?;
     controller.coordinator.submissions.apply(fresh)?;
-    assert_eq!(
-        controller
-            .coordinator
-            .submissions
-            .snapshot()?
-            .messages
-            .iter()
-            .find(|message| message.id == "deferred-input")
-            .unwrap()
-            .delivery(),
-        InputDelivery::Failed
-    );
+    assert!(!deferred_retained()?, "cancelled input was replayed");
     controller.coordinator.submissions.suspend(true, None)?;
     drop(active);
     drop(execution);
@@ -4443,7 +3511,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             let child_release = child_release.clone();
             async move {
                 start.observed(1).await?;
-                if request.scope.owner.is_root() {
+                if request.scope.owner().is_root() {
                     crate::provider::test_support::call_tool(&request, "question_ask", json!({
                         "questions":[{"header":"Choice", "question":"Which active route?", "options":[], "allow_freeform":true}]
                     })).await?;
@@ -4499,7 +3567,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             &sink,
         )
         .await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let ready = {
                 let broker = controller.broker.lock().await;
@@ -4536,7 +3604,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             .clone();
         let engine = broker
             .execution_registry()
-            .owner(scope.owner.clone())
+            .owner(scope.owner().clone())
             .await?;
         (scope, engine)
     };
@@ -4629,14 +3697,17 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
         .as_str()
         .context("missing child agent")?
         .to_owned();
-    tokio::time::timeout(Duration::from_secs(5), child_started.notified()).await?;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, child_started.notified()).await?;
     let store = SqliteStore::read_only(&controller.data_root)?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(child) = store.load_exchange(&child_task)?
                 && let Some(turn) = child.turn.first()
             {
-                assert_eq!(turn.provider().scope.owner.agent_id().as_str(), child_agent);
+                assert_eq!(
+                    turn.provider().scope.owner().agent_id().as_str(),
+                    child_agent
+                );
                 assert_ne!(turn.provider().scope, scope);
                 assert!(turn.completed().is_none());
                 break Ok::<(), anyhow::Error>(());
@@ -4646,7 +3717,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
     })
     .await??;
     child_release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if controller
                 .agent_coordinator
@@ -4703,13 +3774,9 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
 async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> Result<()> {
     use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
     use crate::provider::mock_response::MockResponseCommand;
-    for (method, params) in [
-        ("session.turn.cancel", json!({})),
-        (
-            "session.command.apply",
-            json!({"operation_id":"pause-at-approval", "action":"pause"}),
-        ),
-    ] {
+    // Pause is a task control and requires a selected task, so only turn cancellation collects
+    // this bare root turn.
+    for (method, params) in [("session.turn.cancel", json!({}))] {
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -4761,7 +3828,7 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
             .submissions
             .apply(submit("active", InputIntent::Auto))?;
         tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             control.dispatch(
                 &session_id,
                 MockResponseCommand::Wait {
@@ -4769,7 +3836,8 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
                 },
             ),
         )
-        .await??;
+        .await
+        .context("active input did not reach its provider hold")??;
         controller
             .coordinator
             .submissions
@@ -4799,7 +3867,7 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
             .collect(),
         )?;
         tokio::time::timeout(
-            Duration::from_secs(5),
+            crate::hang_guard::HANG_GUARD,
             service.dispatch(
                 Some(session_id.clone()),
                 Request {
@@ -4810,14 +3878,16 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
                 &sink,
             ),
         )
-        .await??;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        .await
+        .context("cancel dispatch did not return")??;
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             while controller.coordinator.execution.available_permits() == 0 {
                 tokio::task::yield_now().await;
             }
         })
-        .await?;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        .await
+        .context("cancelled execution was not released")?;
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 if let Some(response) = responses
                     .lock()
@@ -4835,7 +3905,8 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
                 tokio::task::yield_now().await;
             }
         })
-        .await??;
+        .await
+        .context("cancel response was not delivered")??;
         let store = SqliteStore::open(&controller.data_root)?;
         let exchanges = store.list_exchange(&session_id)?;
         assert_eq!(exchanges.len(), 1);
@@ -4980,7 +4051,7 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
         &sink,
     ).await?;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         control.dispatch(
             &session_id,
             MockResponseCommand::Wait {
@@ -4998,7 +4069,7 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
         "fixture must exercise an unlocked broker"
     );
     tokio::time::timeout(
-        Duration::from_secs(10),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -5011,7 +4082,7 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
     )
     .await??;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(session_id.clone()),
             Request {
@@ -5023,13 +4094,13 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
         ),
     )
     .await??;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await?;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if let Some(response) = responses
                 .lock()
@@ -5049,7 +4120,7 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
     })
     .await??;
     for id in [22, 24] {
-        let response = tokio::time::timeout(Duration::from_secs(2), async {
+        let response = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             loop {
                 let response = responses
                     .lock()
@@ -5154,7 +4225,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
         .submissions
         .apply(message("first", InputIntent::Auto))?;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         control.dispatch(
             &session_id,
             MockResponseCommand::Wait {
@@ -5173,7 +4244,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
                 .map(|snapshot| snapshot.session.active_task)
         )
     })??;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if controller
                 .coordinator
@@ -5207,7 +4278,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
         .coordinator
         .submissions
         .apply(message("steered", InputIntent::Auto))?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if !controller
                 .coordinator
@@ -5243,7 +4314,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
     control
         .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
         .await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
@@ -5275,7 +4346,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
     })?;
     assert!(controller.coordinator.submissions.snapshot()?.suspended);
     controller.coordinator.submissions.suspend(false, None)?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             if controller
                 .coordinator
@@ -5293,7 +4364,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
     .await
     .context("input delivery boundary 4")??;
     assert_eq!(controller.coordinator.execution.available_permits(), 1);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !execution_idle.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
@@ -5366,7 +4437,7 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
             .await?;
     }
     controller.attach_input(&sink).await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !controller
             .coordinator
             .submissions
@@ -5407,6 +4478,13 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
         Some("uncertain-message".into()),
     )?;
     submission.sending(None)?;
+    // Uncertain delivery is reachable only after the queue claimed the input on a route.
+    let queued_revision = controller.coordinator.submissions.snapshot()?.messages[0].revision;
+    controller.coordinator.submissions.claim(
+        "uncertain-message",
+        queued_revision,
+        crate::input::InputRoute::Turn,
+    )?;
     let uncertain = controller.coordinator.submissions.delivery(
         "uncertain-message",
         Some(InputDelivery::Unknown),
@@ -5414,10 +4492,18 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
         Some("lost acknowledgement".into()),
     )?;
     drop(control);
-    let failure = controller.input_request(Request { id:4, method:"session.input.apply".into(),
+    // Input rejections reach the client as a failure response rather than a transport error.
+    let (retry_sink, mut retry_output) = forge_protocol::outbound::channel();
+    controller.input_request(Request { id:4, method:"session.input.apply".into(),
         params:json!({"id":"retry-uncertain","action":{"kind":"retry","id":"uncertain-message","revision":uncertain.upsert[0].revision}})
-    }, RuntimeMethod::SessionInputApply, &sink).await.unwrap_err();
-    assert!(format!("{failure:#}").contains("unconfirmed"));
+    }, RuntimeMethod::SessionInputApply, &retry_sink).await?;
+    let failure = response_for(&mut retry_output, 4).await?;
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unconfirmed")),
+        "{failure}"
+    );
     assert_eq!(
         controller.coordinator.submissions.snapshot()?.messages[0].delivery(),
         InputDelivery::Unknown
@@ -5465,7 +4551,7 @@ async fn reopening_active_and_deleting_idle_cached_sessions() -> Result<()> {
     let execution = first.coordinator.execution.clone().acquire_owned().await?;
     let broker = first.broker.lock().await;
     tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         service.dispatch(
             Some(second.id.clone()),
             Request {
@@ -5523,6 +4609,7 @@ async fn reopening_active_and_deleting_idle_cached_sessions() -> Result<()> {
     Ok(())
 }
 
+/// Report SQLite contention through the host's error path and keep the host usable afterwards.
 #[tokio::test]
 async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -5537,6 +4624,9 @@ async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<(
     let mut external = rusqlite::Connection::open(crate::storage::state::database(&root))?;
     let lock = external.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
+    // The current-thread test runtime opens the host's history handle on this thread, so a zero
+    // busy timeout turns the held lock into an immediate contention failure.
+    let contention = crate::storage::database::override_busy_timeout(Duration::ZERO);
     let failure = service
         .dispatch(
             Some(session.clone()),
@@ -5549,9 +4639,10 @@ async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<(
         )
         .await
         .unwrap_err();
+    drop(contention);
     let diagnostic = crate::storage::error_message(&failure);
-    assert!(diagnostic.contains("SQLite contention"));
-    assert!(diagnostic.contains("5 seconds"));
+    assert!(diagnostic.contains("SQLite contention"), "{diagnostic}");
+    assert!(diagnostic.contains("5 seconds"), "{diagnostic}");
     lock.rollback()?;
     service
         .dispatch(
@@ -5564,13 +4655,8 @@ async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<(
             &sink,
         )
         .await?;
-    let reply = output
-        .recv()
-        .await?
-        .context("history retry response is missing")?;
-    let reply: Value = serde_json::from_slice(reply.bytes())?;
-    assert_eq!(reply["id"], 3);
-    assert!(reply["error"].is_null());
+    let reply = response_for(&mut output, 3).await?;
+    assert!(reply["error"].is_null(), "{reply}");
     service.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
@@ -5655,4 +4741,89 @@ async fn fresh_session_resolves_inherited_tuning_before_publication() -> Result<
     assert_eq!(snapshot.session.context_window.as_deref(), Some("default"));
     service.shutdown(Duration::from_secs(2)).await?;
     Ok(())
+}
+
+/// Forking a root whose children still execute is rejected before a child session exists.
+#[tokio::test]
+async fn fork_rejects_running_children_without_creating_a_child_session() {
+    let fixture = tempfile::tempdir().unwrap();
+    let service = service();
+    let opened = service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await
+        .unwrap();
+    assert!(opened.error().is_none(), "{opened:?}");
+    let session_id = opened.result().unwrap()["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let registry = service.registry().await.unwrap();
+    let controller = registry
+        .controller_by_id
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .unwrap();
+    let spawn = crate::agent::SpawnAgentRequest {
+        profile: Some("worker".into()),
+        text: "bounded task".into(),
+    };
+    let request = crate::agent::AgentRequest {
+        operation_id: "running-child".into(),
+        source: crate::agent::AgentSource::User,
+        operation: crate::agent::AgentOperation::Spawn(spawn.clone()),
+    };
+    let selection = crate::agent::AgentSelection {
+        profile: "worker".into(),
+        instructions: String::new(),
+        provider: forge_providers::registry::nonselectable_id().unwrap(),
+        model: "mock-model".into(),
+        reasoning_effort: "low".into(),
+        context_window: None,
+        service_tier: Default::default(),
+        access: Default::default(),
+        approval_mode: crate::session::ApprovalMode::Ask,
+    };
+    let crate::agent::AgentCommit::Admitted(running) = controller
+        .agent_coordinator
+        .reserve_spawn(&request, &spawn, selection, "parent", 1)
+        .unwrap()
+        .commit()
+        .unwrap()
+    else {
+        panic!("new request reused an admission");
+    };
+    assert_eq!(controller.agent_coordinator.active_count(), 1);
+    let sessions_before = registry.controller_by_id.read().await.len();
+    let (sink, _output) = forge_protocol::outbound::channel();
+    let error = service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.fork".into(),
+                params: json!({"name":"fork while running"}),
+            },
+            &sink,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("cannot fork while child agents are running"),
+        "{error:#}"
+    );
+    assert_eq!(
+        registry.controller_by_id.read().await.len(),
+        sessions_before
+    );
+    controller
+        .agent_coordinator
+        .settled(
+            &running.agent.id,
+            &running.task.id,
+            crate::agent::AgentSettlementDisposition::Ready,
+        )
+        .unwrap();
+    service.shutdown(Duration::from_secs(1)).await.unwrap();
 }

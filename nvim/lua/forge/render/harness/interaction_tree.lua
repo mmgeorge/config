@@ -685,6 +685,19 @@ local function withdrawal_text(node)
   return table.concat(lines, "\n")
 end
 
+---Name the notice that replaces a Harness-authored exchange prompt, or nil for user-authored input.
+---@param interaction table Interaction descriptor with an optional `origin`.
+---@return string?
+function M.host_authored_notice(interaction)
+  local origin = interaction.origin or { kind = "user" }
+  if origin.kind == "task_started" then
+    local label = ({ goal = "Goal", plan = "Plan", execute = "Execution" })[origin.start.kind]
+    return label .. " started: " .. origin.start.title
+  elseif origin.kind == "task_continuation" then
+    return origin.reason
+  end
+end
+
 --- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
 ---@param result table Target render collection table.
 ---@param interaction table Interaction descriptor table.
@@ -692,14 +705,11 @@ end
 ---@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
-  local origin = interaction.origin or { kind = "user" }
-  if origin.kind == "task_started" then
-    local label = ({ goal = "Goal", plan = "Plan", execute = "Execution" })[origin.start.kind]
-    append_wrapped(result, label .. " started: " .. origin.start.title, "◇ ", "  ", "Comment", options.content_width)
-    append_wrapped(result, interaction.prompt, "  ", "  ", "Normal", options.content_width)
-  elseif origin.kind == "task_continuation" then
-    append_wrapped(result, origin.reason, "◇ ", "  ", "Comment", options.content_width)
-    append_wrapped(result, interaction.prompt, "  ", "  ", "Normal", options.content_width)
+  -- A task start or continuation sends Harness-authored workflow instructions to the provider.
+  -- The notice carries the user's own task text, so the instruction body stays out of the transcript.
+  local host_notice = M.host_authored_notice(interaction)
+  if host_notice then
+    append_wrapped(result, host_notice, "◇ ", "  ", "Comment", options.content_width)
   elseif not interaction.hide_prompt then
     local prompt_line = #result.lines + 1
     append_wrapped(result, interaction.prompt, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)

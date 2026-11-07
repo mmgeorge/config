@@ -525,8 +525,8 @@ impl From<crate::lifecycle::LifecycleError> for ProviderError {
     }
 }
 
-impl From<crate::execution::ThreadOwnerError> for ProviderError {
-    fn from(_error: crate::execution::ThreadOwnerError) -> Self {
+impl From<crate::identity::IdentityError> for ProviderError {
+    fn from(_error: crate::identity::IdentityError) -> Self {
         Self::Contract(crate::lifecycle::LifecycleError::OwnershipMismatch)
     }
 }

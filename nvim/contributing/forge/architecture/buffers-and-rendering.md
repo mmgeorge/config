@@ -22,7 +22,8 @@ The replica's `before_commit` and `after_commit` callbacks run at that same boun
 
 Harness applies presentation-level navigation after successful transcript and
 status publication. New live-exchange revisions follow the tail while the owning
-composer is focused. When focus is outside the transcript, a newly completed
+composer is focused, or while a floating popup entered from the composer, such as a
+permission review, holds focus. When focus is outside the transcript, a newly completed
 exchange aligns to the bottom if its prompt through tail fits, or places its
 prompt at the top otherwise. Both decisions use current focus and geometry, never
 a saved cursor or viewport. See [Timeline](timeline.md#transcript-window-and-pickers).

@@ -1,4 +1,5 @@
 //! Compose temporary text work from the ordinary provider lifecycle.
+use crate::provider::ScopeOwner;
 
 use crate::provider::operation::OperationControl;
 use forge_provider_api::{
@@ -308,7 +309,7 @@ async fn generate(
         write_access: api::access::WriteScope::Off,
         ..Default::default()
     };
-    let owner = api::ThreadOwner::root(format!("utility-{}", uuid::Uuid::new_v4()));
+    let owner = crate::provider::ThreadOwner::root(format!("utility-{}", uuid::Uuid::new_v4()));
     let scope = api::InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string());
     let open_operation = OperationControl::fresh(ProviderOperation::ThreadOpen)?;
     let opened = observe_operation(
@@ -320,7 +321,6 @@ async fn generate(
             open_operation.context(),
             api::SessionRequest {
                 thread_id: owner.thread_id(),
-                owner,
                 mode: api::SessionMode::Background,
                 workspace: request.workspace,
                 history: api::SessionHistory::IsolatedText(api::IsolatedTextPolicy::new()),
@@ -360,19 +360,18 @@ async fn generate(
     );
     let callbacks = Arc::new(IsolatedCallbacks);
     let prompt = api::PromptRequest {
-        thread_id: (scope.clone()).owner.thread_id(),
+        thread_id: (scope.clone()).owner().thread_id(),
         turn_id: (scope.clone())
             .turn_id()
             .expect("admitted scope has a nonempty host turn identity"),
 
         scope: scope.clone(),
-        mode: api::PromptMode::Chat,
+        execution: api::ExecutionMode::Default,
         configuration: api::InvocationConfiguration {
             model,
             access,
             approval: api::approval::ApprovalMode::Deny,
         },
-        task: None,
         tools: Vec::new(),
         tool_endpoint: None,
         resource_lease: None,
@@ -497,7 +496,7 @@ async fn collect(
     let mut thread_errors = Vec::new();
     let mut messages = HashMap::<api::ItemId, IsolatedMessage>::new();
     let mut order = Vec::new();
-    let thread_id = scope.owner.thread_id();
+    let thread_id = scope.owner().thread_id();
     let turn_id = scope.turn_id().map_err(|_| {
         failure(
             ProviderOperation::TurnStart,

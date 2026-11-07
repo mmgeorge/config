@@ -55,10 +55,13 @@ local success, failure = xpcall(function()
   plan = changed.plan
   local acceptance = request("session.plan.accept", { plan_id = plan.id, digest = plan.review_digest,
     operation_id = "example-acceptance" })
-  assert(acceptance.active_elicitation and acceptance.active_elicitation ~= vim.NIL)
-  assert(acceptance.command_result.outcome.result.disposition == "awaiting_input")
+  local accepted = acceptance.command_result.outcome.result
+  assert(accepted.disposition == "awaiting_input" and accepted.question_set, "acceptance did not raise review questions")
   local retained = request("session.state.get")
-  assert(vim.deep_equal(retained.active_elicitation, acceptance.active_elicitation), "reading review state discarded questions")
+  local elicitation = retained.active_elicitation ~= vim.NIL and retained.active_elicitation.elicitation
+  assert(elicitation and elicitation.question_set.id == accepted.question_set.id
+    and elicitation.revision == accepted.question_set.revision and #elicitation.question_set.questions > 0,
+    "reading review state discarded questions")
   plan = retained.active_plan
   local revision = plan.model_revision
   request("session.plan.changes.request", { plan_id = plan.id, digest = plan.review_digest,

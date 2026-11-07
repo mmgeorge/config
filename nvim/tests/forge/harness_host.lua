@@ -38,7 +38,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { prompt })
   controller.submit()
   local pending_response = held_response:wait()
-  assert(pending_response.prompt == prompt and pending_response.mode == "chat",
+  assert(pending_response.prompt == prompt and pending_response.mode == "default",
     "mock response hold captured a different request")
   assert(not table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
     :find("Mock response:", 1, true), "mock provider responded before explicit release")

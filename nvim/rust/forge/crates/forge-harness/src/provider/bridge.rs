@@ -1,8 +1,10 @@
+use crate::provider::ScopeOwner;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use crate::provider::ThreadOwner;
 use forge_provider_api::{
-    BindingId, ProviderError, ProviderEvent, ThreadOwner,
+    BindingId, ProviderError, ProviderEvent,
     error::{ProviderFailure, ProviderFailureKind, ProviderOperation},
     events::{EventDeliveryError, ProviderEventStream},
     provider::Provider as NativeProvider,
@@ -559,7 +561,6 @@ impl ProviderBridge {
                     };
                 let opening_request = SessionRequest {
                     thread_id: (owner.clone()).thread_id(),
-                    owner: owner.clone(),
                     mode: if request.mode == super::PromptMode::Background {
                         SessionMode::Background
                     } else if owner.is_root() {
@@ -699,7 +700,7 @@ impl ProviderBridge {
             .sender
             .send(Ok(ProviderObservation::host(super::HarnessEvent::Host {
                 scope: forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                 },
                 event: super::HostEvent::CapabilitiesNegotiated {
                     binding_id: binding.id.clone(),
@@ -830,7 +831,7 @@ impl ProviderBridge {
                 ProviderFailureKind::Rejected,
             ))
         })?;
-        if owner != scope.owner {
+        if owner != scope.owner() {
             return Err(forge_provider_api::lifecycle::LifecycleError::OwnershipMismatch.into());
         }
         let submission = request
@@ -948,7 +949,7 @@ impl ProviderBridge {
                 })?;
         }
         let tools = crate::tools::ControlToolRegistry
-            .definition_list_for_context(Some(&context), scope.owner.is_root());
+            .definition_list_for_context(Some(&context), scope.owner().is_root());
         let permissions = Arc::new(
             crate::permissions::provider::ProviderPermissionContext::new(self.permissions.clone()),
         );
@@ -1052,18 +1053,17 @@ impl ProviderBridge {
                 tools,
                 tool_endpoint: Some(tool_endpoint),
                 resource_lease: Some(lease),
-                thread_id: (scope).owner.thread_id(),
+                thread_id: (scope).owner().thread_id(),
                 turn_id: (scope)
                     .turn_id()
                     .expect("admitted scope has a nonempty host turn identity"),
 
                 scope,
-                mode: request.mode,
-                task: context.task_start.clone(),
+                execution: request.mode.execution(),
                 attempt_id,
                 submission_id,
                 dispatch,
-                input,
+                input: crate::exchange::TaskStart::render_input(context.task_start.as_ref(), input),
                 recovered_inputs,
                 instructions,
                 attachments: prepared_attachments,
@@ -1145,7 +1145,7 @@ impl ProviderBridge {
                 ProviderFailureKind::Rejected,
             ));
         }
-        if owner != &scope.owner {
+        if owner != &scope.owner() {
             return Err(forge_provider_api::lifecycle::LifecycleError::OwnershipMismatch.into());
         }
         let session = self
@@ -1214,9 +1214,8 @@ impl ProviderBridge {
             forge_provider_api::SteeringRequest {
                 scope,
                 delivery,
-                input: normalized,
+                input: crate::exchange::TaskStart::render_input(input.task_start(), normalized),
                 attachments,
-                task: input.task_start().cloned(),
             },
         ))
     }
@@ -1430,7 +1429,7 @@ impl ProviderBridge {
             ProviderOperation::ThreadConfigure,
             &context,
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             },
             Some(bound.binding.id.clone()),
             self.native
@@ -1476,7 +1475,7 @@ impl ProviderBridge {
         host.sender
             .send(Ok(ProviderObservation::host(super::HarnessEvent::Host {
                 scope: forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                 },
                 event: super::HostEvent::CapabilitiesNegotiated {
                     binding_id: bound.binding.id.clone(),
@@ -1579,7 +1578,9 @@ impl ProviderBridge {
             })?;
         self.core_events.operations().register(
             context.id().clone(),
-            forge_provider_api::EventScope::Binding { owner },
+            forge_provider_api::EventScope::Binding {
+                thread_id: owner.thread_id(),
+            },
             Some(binding.clone()),
         )
     }
@@ -1637,7 +1638,7 @@ impl ProviderBridge {
     pub async fn terminal_list(
         &self,
         request: super::ProviderCatalogRequest,
-    ) -> Result<super::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<super::terminal::TerminalInventory, ProviderError> {
         self.ensure_admission(ProviderOperation::TerminalList)?;
         let owner = request.owner().map_err(|_| {
             failure(
@@ -1654,11 +1655,7 @@ impl ProviderBridge {
             .get(&owner)
             .is_some_and(|host| host.initialized.get().is_none());
         if unopened {
-            return Ok(super::terminal::TerminalSnapshot {
-                supported: true,
-                starting: false,
-                terminal: Vec::new(),
-            });
+            return Ok(super::terminal::TerminalInventory::observed(Vec::new()));
         }
         let (binding, permit) = self
             .observe_binding(ProviderOperation::TerminalList, &owner)
@@ -1746,6 +1743,15 @@ impl ProviderBridge {
         history: &str,
     ) -> Result<String, ProviderError> {
         self.ensure_admission(ProviderOperation::ThreadOpen)?;
+        // Negotiation can withdraw isolated generation (for example an unaudited runtime
+        // version); opening a temporary session would only fail later with cleanup noise.
+        let manifest = self.capabilities(request.clone()).await?;
+        if !manifest.supports(forge_provider_api::capability::CapabilityId::IsolatedGeneration) {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::TextGeneration,
+            )
+            .into());
+        }
         self.utility
             .generate(
                 self.native.clone(),
@@ -1891,7 +1897,7 @@ impl ProviderBridge {
             .sessions
             .lock()
             .await
-            .get(&scope.owner)
+            .get(&scope.owner())
             .cloned()
             .ok_or_else(|| {
                 failure(
@@ -1938,7 +1944,7 @@ impl ProviderBridge {
         match (native, host_collection) {
             (Ok(settlement), Ok(())) => {
                 if settlement.operation_id != *context.id()
-                    || settlement.thread_id != scope.owner.thread_id()
+                    || settlement.thread_id != scope.owner().thread_id()
                     || settlement.turn_id
                         != scope.turn_id().map_err(|_| {
                             ProviderError::Observation(
@@ -1950,7 +1956,7 @@ impl ProviderBridge {
                         forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
                     ));
                 }
-                self.wait_watermark(&scope.owner, settlement.watermark)
+                self.wait_watermark(&scope.owner(), settlement.watermark)
                     .await?;
                 Ok(settlement)
             }
@@ -1988,7 +1994,7 @@ impl ProviderBridge {
         scope: &forge_provider_api::InvocationScope,
         collection: OperationControl,
     ) -> Result<(), ProviderError> {
-        let host = self.sessions.lock().await.get(&scope.owner).cloned();
+        let host = self.sessions.lock().await.get(&scope.owner()).cloned();
         let Some(host) = host else {
             return Ok(());
         };
@@ -2022,10 +2028,10 @@ impl ProviderBridge {
             {
                 Ok(settlement)
                     if settlement.operation_id == *collection.context().id()
-                        && settlement.thread_id == scope.owner.thread_id()
+                        && settlement.thread_id == scope.owner().thread_id()
                         && scope.turn_id().is_ok_and(|turn| settlement.turn_id == turn) =>
                 {
-                    self.wait_watermark(&scope.owner, settlement.watermark)
+                    self.wait_watermark(&scope.owner(), settlement.watermark)
                         .await
                 }
                 Ok(_) => Err(ProviderError::Observation(
@@ -2044,7 +2050,7 @@ impl ProviderBridge {
             Ok(())
         };
         let collection = self.collect_host_effects(scope).await;
-        self.trace.record(scope.owner.session_id().as_str(), "provider.preparation.collected", serde_json::json!({
+        self.trace.record(scope.owner().session_id().as_str(), "provider.preparation.collected", serde_json::json!({
             "scope":scope,
             "native_requested":matches!(native_input, super::host_invocation::NativeInputAdmission::Requested),
             "native_collected":result.is_ok(), "host_collected":collection.is_ok(),
@@ -2064,7 +2070,7 @@ impl ProviderBridge {
         &self,
         scope: &forge_provider_api::InvocationScope,
     ) -> Result<(), ProviderError> {
-        let Some(host) = self.sessions.lock().await.get(&scope.owner).cloned() else {
+        let Some(host) = self.sessions.lock().await.get(&scope.owner()).cloned() else {
             return Ok(());
         };
         let invocation = host
@@ -2337,7 +2343,7 @@ impl ProviderBridge {
                         ProviderOperation::ThreadClose,
                         &context,
                         forge_provider_api::EventScope::Binding {
-                            owner: owner.clone(),
+                            thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                         },
                         Some(native.binding.id.clone()),
                         self.native
@@ -2535,7 +2541,7 @@ impl ProviderBridge {
             let proof = registration
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .observed_child(&scope.owner.thread_id(), &turn);
+                .observed_child(&scope.owner().thread_id(), &turn);
             if let Ok(proof) = proof
                 && proof.turn() == Some(scope)
             {
@@ -2705,7 +2711,7 @@ impl ProviderBridge {
             .sessions
             .lock()
             .await
-            .get(&scope.owner)
+            .get(&scope.owner())
             .cloned()
             .ok_or_else(rejected)?;
         let invocation = host
@@ -2727,7 +2733,7 @@ impl ProviderBridge {
             .registered_turn(&turn)
             .ok_or_else(rejected)?;
         if address.scope != *scope
-            || address.thread_id != scope.owner.thread_id()
+            || address.thread_id != scope.owner().thread_id()
             || address.turn_id != turn
         {
             return Err(rejected());
@@ -2776,7 +2782,7 @@ impl ProviderBridge {
             None => Default::default(),
         };
         let target = forge_provider_api::ForkTarget {
-            owner,
+            thread_id: owner.thread_id(),
             workspace: request.source.workspace.clone(),
             configuration: forge_provider_api::SessionConfiguration {
                 model: model_selection(&request.source),
@@ -3034,14 +3040,18 @@ async fn relay_events(
                 let thread_owner = match &observation.event {
                     ProviderEvent::Thread { thread_id, .. } => events
                         .registrations()
-                        .thread_owner(thread_id)
+                        .thread_registered(thread_id)
+                        .then(|| ThreadOwner::from_thread_id(thread_id).ok())
+                        .flatten()
                         .map(|owner| (thread_id.clone(), owner)),
                     ProviderEvent::Provider {
                         event: forge_provider_api::ProviderConnectionEvent::Warning(warning),
                     } => match &warning.scope {
                         forge_provider_api::WarningScope::Thread { thread_id } => events
                             .registrations()
-                            .thread_owner(thread_id)
+                            .thread_registered(thread_id)
+                            .then(|| ThreadOwner::from_thread_id(thread_id).ok())
+                            .flatten()
                             .map(|owner| (thread_id.clone(), owner)),
                         forge_provider_api::WarningScope::Provider
                         | forge_provider_api::WarningScope::Turn { .. }
@@ -3156,7 +3166,7 @@ async fn relay_events(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .observed_child(
-                                &child.owner.thread_id(),
+                                &child.owner().thread_id(),
                                 &child
                                     .turn_id()
                                     .map_err(|_| EventDeliveryError::InvalidTransportData)?,

@@ -107,8 +107,8 @@ async fn commit_generation_replaces_incompatible_operation_storage() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
-async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
+/// Create a fixture directory holding an empty repository and a state directory.
+fn background_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("repository");
     std::fs::create_dir(&root)?;
@@ -116,6 +116,12 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     git(&root, &["init", "-q", "-b", "main"]);
     git(&root, &["config", "user.name", "Fixture"]);
     git(&root, &["config", "user.email", "fixture@example.test"]);
+    Ok((fixture, root, data))
+}
+
+#[tokio::test]
+async fn background_reuses_session_across_restarts_and_concurrent_requests() -> Result<()> {
+    let (_fixture, root, data) = background_fixture()?;
     let first_manager = manager();
     let empty = first_manager
         .timeline(serde_json::json!({"data_root":data,"workspace":root}))
@@ -150,7 +156,24 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         "concurrent requests created different conversations"
     );
     first_manager.shutdown().await?;
+    let store = SqliteStore::open(&data)?;
+    assert_eq!(store.list_exchange(&first.session_id)?.len(), 5);
+    assert!(
+        store
+            .load_session(&first.session_id)?
+            .context("session missing")?
+            .provider_session_id
+            .is_some()
+    );
+    Ok(())
+}
 
+#[tokio::test]
+async fn background_resume_marks_interrupted_compaction_unconfirmed() -> Result<()> {
+    let (_fixture, root, data) = background_fixture()?;
+    let first_manager = manager();
+    let first = generate(&first_manager, &root, &data).await?;
+    first_manager.shutdown().await?;
     drop(first_manager);
     {
         let mut store = SqliteStore::open(&data)?;
@@ -182,7 +205,19 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     );
     let events = SqliteStore::open(&data)?.list_session_event(&first.session_id)?;
     assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Unconfirmed)));
+    Ok(())
+}
 
+#[tokio::test]
+async fn background_rotates_session_on_branch_switch_and_history_rewrite() -> Result<()> {
+    let (_fixture, root, data) = background_fixture()?;
+    git(
+        &root,
+        &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
+    );
+    let first_manager = manager();
+    let first = generate(&first_manager, &root, &data).await?;
+    first_manager.shutdown().await?;
     git(&root, &["switch", "-q", "-c", "feature"]);
     let resumed_manager = manager();
     let branch = generate(&resumed_manager, &root, &data).await?;
@@ -203,15 +238,6 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     let rewritten = generate(&resumed_manager, &root, &data).await?;
     resumed_manager.shutdown().await?;
     assert_ne!(branch.session_id, rewritten.session_id);
-    let store = SqliteStore::open(&data)?;
-    assert_eq!(store.list_exchange(&first.session_id)?.len(), 6);
-    assert!(
-        store
-            .load_session(&first.session_id)?
-            .context("session missing")?
-            .provider_session_id
-            .is_some()
-    );
     Ok(())
 }
 

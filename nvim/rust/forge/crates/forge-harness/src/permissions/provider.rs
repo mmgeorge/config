@@ -1,4 +1,5 @@
 use super::matcher::PermissionRequest;
+use crate::provider::ScopeOwner;
 use crate::provider::approval::{
     ApprovalAuthority, ApprovalResolution, PermissionCoordinator, protected_target,
 };
@@ -142,10 +143,10 @@ impl ProviderPermissionContext {
             .and_then(|sink| sink.scope().invocation())
             .ok_or_else(rejected)?;
         if parent != association.parent()
-            || parent.owner == address.scope.owner
-            || parent.owner.session_id() != address.scope.owner.session_id()
+            || parent.owner() == address.scope.owner()
+            || parent.owner().session_id() != address.scope.owner().session_id()
             || sink.scope().invocation() != Some(&address.scope)
-            || address.thread_id != address.scope.owner.thread_id()
+            || address.thread_id != address.scope.owner().thread_id()
         {
             return Err(rejected());
         }
@@ -159,7 +160,7 @@ impl ProviderPermissionContext {
                     error,
                 )
             })?;
-        state.owner = Some(address.scope.owner.clone());
+        state.owner = Some(address.scope.owner().clone());
         state.execution_kind = crate::provider::ApprovalExecutionKind::NativeObserved;
         state.event_sink = Some(sink);
         Ok(Arc::new(Self {
@@ -511,7 +512,7 @@ impl ProviderPermissionContext {
         let resolution = tokio::select! {
             resolution = &mut approval => resolution,
             _ = async { let _ = retired.wait_for(|retired| *retired).await; } => {
-                let _ = self.coordinator.cancel_owner(&scope.owner, event_sink.as_ref()).await;
+                let _ = self.coordinator.cancel_owner(&scope.owner(), event_sink.as_ref()).await;
                 return deny("Provider session observation was retired while approval was pending.");
             }
         };

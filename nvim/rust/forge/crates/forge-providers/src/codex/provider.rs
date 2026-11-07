@@ -38,7 +38,7 @@ pub struct CodexProvider {
     runtime_root: PathBuf,
     runtime: Arc<CodexRuntime>,
     bindings: Arc<Mutex<HashMap<BindingId, Arc<CodexBinding>>>>,
-    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadOwner, BindingId>>>,
+    owners: Arc<Mutex<HashMap<forge_provider_api::ThreadId, BindingId>>>,
     catalog: Arc<Mutex<Option<CatalogConnection>>>,
     catalog_version: Arc<Mutex<forge_provider_api::VersionObservation>>,
     discovery: Arc<Mutex<Vec<Arc<NativeRpc>>>>,
@@ -230,7 +230,7 @@ impl CodexProvider {
             ));
         }
         if request.workspace.trim().is_empty()
-            || self.owners.lock().await.contains_key(&request.owner)
+            || self.owners.lock().await.contains_key(&request.thread_id)
         {
             return Err(failure(
                 ProviderOperation::ThreadOpen,
@@ -260,7 +260,7 @@ impl CodexProvider {
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
-            owner: request.owner.clone(),
+            thread_id: request.thread_id.clone(),
         };
         let (sink, stream) = events::channel(binding_id.clone(), session_scope);
 
@@ -465,7 +465,7 @@ impl CodexProvider {
             .ok();
         let capabilities = negotiated_capabilities(reported, auth_status.as_ref());
         let mut normalization = CodexNormalization::default();
-        normalization.admit_thread(session_id.as_str(), &request.owner)?;
+        normalization.admit_thread(session_id.as_str(), &request.thread_id)?;
         let retained = Arc::new(CodexBinding {
             binding: binding.clone(),
             history: std::sync::Mutex::new(if request.history.resume_id().is_none() {
@@ -479,7 +479,7 @@ impl CodexProvider {
                 .context
                 .id()
                 .clone(),
-            owner: request.owner.clone(),
+            owner: request.thread_id.clone(),
             workspace: request.workspace,
             model: Mutex::new(request.configuration.model.clone()),
             native_confirmation: Mutex::new(native_model_confirmation(&result)?),
@@ -533,7 +533,10 @@ impl CodexProvider {
             let _ = start.send(());
         }
         self.pending.lock().await.remove(&binding_id);
-        self.owners.lock().await.insert(request.owner, binding_id);
+        self.owners
+            .lock()
+            .await
+            .insert(request.thread_id, binding_id);
         Ok(binding)
     }
 
@@ -553,7 +556,7 @@ impl CodexProvider {
                 ProviderFailureKind::ResourceConflict,
             ));
         }
-        if request.scope.owner != session.owner
+        if request.scope.thread_id != session.owner
             || request.receipt.id() != &request.submission_id
             || request.receipt.attempt_id()? != request.attempt_id
             || !request.dispatch.matches(
@@ -635,11 +638,6 @@ impl CodexProvider {
             .collect::<Vec<_>>();
         if !recovered_text.is_empty() {
             prompt = forge_provider_api::input::recovered_text(&prompt, &recovered_text);
-        }
-        if let Some(task) = &request.task
-            && !task.title.is_empty()
-        {
-            prompt = format!("{}\n\n{prompt}", task.heading());
         }
         let mut attachments = request
             .recovered_inputs
@@ -1178,7 +1176,7 @@ impl CodexProvider {
                 .sink
                 .activity_writer()
                 .send_wait(AdapterActivity::Thread {
-                    thread_id: session.owner.thread_id(),
+                    thread_id: session.owner.clone(),
                     event: forge_provider_api::ThreadEvent::IdentityResolved(next_history),
                 })
                 .await
@@ -1365,7 +1363,7 @@ impl CodexProvider {
     ) -> Result<SteeringAcceptance, ProviderError> {
         let session = self.binding(binding).await?;
         session.check_input_admission(ProviderOperation::TurnSteer)?;
-        if request.scope.owner != session.owner {
+        if request.scope.thread_id != session.owner {
             return Err(failure(
                 ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
@@ -1428,12 +1426,7 @@ impl CodexProvider {
                 return Err(record_receipt_failure(receipt.clone(), error).await);
             }
         }
-        let mut prompt = input_text(&request.input);
-        if let Some(task) = &request.task
-            && !task.title.is_empty()
-        {
-            prompt = format!("{}\n\n{prompt}", task.heading());
-        }
+        let prompt = input_text(&request.input);
         let expected_turn_id = session
             .active
             .lock()
@@ -1637,7 +1630,7 @@ impl CodexProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        if request.scope.owner() != &session.owner {
+        if request.scope.thread_id() != &session.owner {
             return Err(failure(
                 ProviderOperation::ThreadCompact,
                 ProviderFailureKind::WrongInvocation,
@@ -2337,7 +2330,7 @@ impl CodexProvider {
     async fn read_terminals(
         &self,
         binding: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         let session = self.binding(binding).await?;
         read_binding_terminals(&session).await
     }
@@ -3347,7 +3340,7 @@ impl Provider for CodexProvider {
         &self,
         context: OperationContext,
         binding: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         let native =
             super::operations::NativeContext::new(context.clone(), ProviderOperation::TerminalList);
         let payload = binding.clone();
@@ -3806,7 +3799,7 @@ struct CodexBinding {
     history: std::sync::Mutex<NativeHistory>,
     native_tools: Vec<forge_provider_api::control::ControlToolDefinition>,
     opened_by: forge_provider_api::OperationId,
-    owner: forge_provider_api::ThreadOwner,
+    owner: forge_provider_api::ThreadId,
     workspace: String,
     model: Mutex<ModelSelection>,
     native_confirmation: Mutex<Option<forge_provider_api::ResolvedModel>>,
@@ -4231,7 +4224,7 @@ async fn collect_invocation(
     let result = result.map(|completed| CollectedInvocation {
         address: forge_provider_api::TurnAddress {
             scope: scope.clone(),
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope
                 .turn_id()
                 .expect("admitted invocation has checked turn identity"),
@@ -4424,20 +4417,12 @@ fn codex_capabilities() -> forge_provider_api::capability::CapabilityManifest {
         )
         .expect("registered Codex descriptor"),
     );
-    capabilities.task_steering = vec![
-        forge_provider_api::input::TaskKind::Goal,
-        forge_provider_api::input::TaskKind::Plan,
-        forge_provider_api::input::TaskKind::Execute,
-    ];
-    if let Some(recap) = capabilities
-        .capability
-        .iter_mut()
-        .find(|capability| capability.id == forge_provider_api::capability::CapabilityId::Recap)
-    {
-        recap.support = forge_provider_api::capability::Support::Unsupported;
-        recap.reason =
-            "Isolated text requires an audited runtime and native-exportable credentials.".into();
-    }
+    // Isolated text requires an audited runtime and native-exportable credentials, which
+    // only negotiation can prove.
+    capabilities.set_support(
+        forge_provider_api::capability::CapabilityId::IsolatedGeneration,
+        forge_provider_api::capability::Support::Unsupported,
+    );
     capabilities
 }
 
@@ -4455,15 +4440,11 @@ fn negotiated_capabilities(
                 Some("apikey" | "chatgpt" | "chatgptAuthTokens")
             )
     });
-    if version == Some("0.164.0")
-        && exportable
-        && let Some(recap) = capabilities
-            .capability
-            .iter_mut()
-            .find(|capability| capability.id == forge_provider_api::capability::CapabilityId::Recap)
-    {
-        recap.support = forge_provider_api::capability::Support::Supported;
-        recap.reason = "Isolated temporary history excludes inherited instructions and all native or host tools.".into();
+    if version == Some("0.164.0") && exportable {
+        capabilities.set_support(
+            forge_provider_api::capability::CapabilityId::IsolatedGeneration,
+            forge_provider_api::capability::Support::Supported,
+        );
     }
     capabilities
 }
@@ -4511,7 +4492,7 @@ async fn collect_settled_execution(session: &Arc<CodexBinding>) -> Result<(), Pr
 /// Read one binding inventory under the same admission guard used by configuration changes.
 async fn read_binding_terminals(
     session: &Arc<CodexBinding>,
-) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
     // Rollback fences are provisional while the lifecycle owner holds admission.
     // Observe the resulting binding, never that intermediate fenced state.
     let _admission = session.admission.lock().await;
@@ -4577,11 +4558,9 @@ async fn read_binding_terminals(
             }
             cursor = Some(next.to_owned());
         }
-        Ok(forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
+        Ok(forge_provider_api::terminal::TerminalInventory::observed(
             terminal,
-        })
+        ))
     }
     .await
 }
@@ -4609,7 +4588,7 @@ fn start_terminal_observer(session: &Arc<CodexBinding>) -> tokio::task::JoinHand
                             .sink
                             .activity_writer()
                             .send_wait(AdapterActivity::Thread {
-                                thread_id: session.owner.thread_id(),
+                                thread_id: session.owner.clone(),
                                 event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
                                     snapshot.clone(),
                                 )),
@@ -4642,7 +4621,7 @@ fn start_terminal_observer(session: &Arc<CodexBinding>) -> tokio::task::JoinHand
                         .sink
                         .activity_writer()
                         .send_wait(AdapterActivity::Thread {
-                            thread_id: session.owner.thread_id(),
+                            thread_id: session.owner.clone(),
                             event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(failure)),
                         })
                         .await
@@ -4809,7 +4788,7 @@ async fn observe_compaction(
                 AdapterActivity::Thread {
                     event: forge_provider_api::ThreadEvent::CompactionUpdated(update),
                     ..
-                } if update.thread_id == session.owner.thread_id().as_str()
+                } if update.thread_id == session.owner.clone().as_str()
                     && update.state != forge_provider_api::compaction::CompactionState::Running =>
                 {
                     completed = Some(update.as_ref().clone());
@@ -4819,7 +4798,7 @@ async fn observe_compaction(
                 AdapterActivity::Thread {
                     thread_id,
                     event: forge_provider_api::ThreadEvent::Error { error },
-                } if thread_id == &session.owner.thread_id() => {
+                } if thread_id == &session.owner.clone() => {
                     completed = Some(failed_compaction(session, operation_id, error));
                 }
                 _ => {}
@@ -4840,7 +4819,7 @@ fn failed_compaction(
 ) -> forge_provider_api::Compaction {
     forge_provider_api::Compaction {
         id: operation_id.as_str().to_owned(),
-        thread_id: session.owner.thread_id().as_str().to_owned(),
+        thread_id: session.owner.clone().as_str().to_owned(),
         state: forge_provider_api::compaction::CompactionState::Failed,
         manual: true,
         started_at_ms: None,
@@ -6415,16 +6394,16 @@ mod continuation_tests {
         let socket = accept.await.unwrap();
         let provider =
             CodexProvider::new(vec!["unused-fixture-command".into()], PathBuf::new()).unwrap();
-        let owner = request().scope.owner;
+        let owner = request().scope.thread_id;
         let binding = SessionBinding {
-            thread_id: owner.thread_id(),
+            thread_id: owner.clone(),
             id: BindingId::new("compaction-binding").unwrap(),
             provider_session_id: Some("compaction-thread".try_into().unwrap()),
         };
         let (sink, stream) = events::channel(
             binding.id.clone(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let session = Arc::new(CodexBinding {
@@ -6764,7 +6743,7 @@ mod continuation_tests {
                 session.sink.clone(),
                 forge_provider_api::TurnAddress {
                     scope: scope.clone(),
-                    thread_id: scope.owner.thread_id(),
+                    thread_id: scope.thread_id.clone(),
                     turn_id: scope.turn_id().unwrap(),
                 },
             )
@@ -6793,7 +6772,7 @@ mod continuation_tests {
             });
             let compact = |operation: &OperationContext| forge_provider_api::CompactionRequest {
                 scope: forge_provider_api::EventScope::SessionOperation {
-                    owner: session.owner.clone(), operation_id: operation.id().clone(),
+                    thread_id: session.owner.clone(), operation_id: operation.id().clone(),
                 },
             };
             let operation = context();
@@ -6859,7 +6838,7 @@ mod continuation_tests {
             let operation = context();
             let request = forge_provider_api::CompactionRequest {
                 scope: forge_provider_api::EventScope::SessionOperation {
-                    owner: session.owner.clone(),
+                    thread_id: session.owner.clone(),
                     operation_id: operation.id().clone(),
                 },
             };
@@ -6906,7 +6885,7 @@ mod continuation_tests {
             let operation = context();
             let request = forge_provider_api::CompactionRequest {
                 scope: forge_provider_api::EventScope::SessionOperation {
-                    owner: session.owner.clone(),
+                    thread_id: session.owner.clone(),
                     operation_id: operation.id().clone(),
                 },
             };
@@ -6955,7 +6934,7 @@ mod continuation_tests {
         .unwrap();
         let request = forge_provider_api::CompactionRequest {
             scope: forge_provider_api::EventScope::SessionOperation {
-                owner: session.owner.clone(),
+                thread_id: session.owner.clone(),
                 operation_id: operation.id().clone(),
             },
         };
@@ -7013,8 +6992,8 @@ mod continuation_tests {
             let (sibling_provider, mut sibling, _sibling_events, sibling_wire) = compaction_fixture().await;
             sibling_provider.bindings.lock().await.remove(&sibling.binding.id);
             let sibling_id = BindingId::new("sibling-binding").unwrap();
-            let sibling_owner = forge_provider_api::ThreadOwner::root("sibling-owner");
-            let (sink, _sibling_output) = events::channel(sibling_id.clone(), forge_provider_api::EventScope::Binding { owner: sibling_owner.clone() });
+            let sibling_owner = forge_provider_api::testing::root_thread("sibling-owner");
+            let (sink, _sibling_output) = events::channel(sibling_id.clone(), forge_provider_api::EventScope::Binding { thread_id: sibling_owner.clone() });
             let sibling_mut = Arc::get_mut(&mut sibling).expect("unregistered fixture binding has one owner");
             sibling_mut.binding.id = sibling_id.clone();
             sibling_mut.binding.provider_session_id = Some("sibling-thread".try_into().unwrap());
@@ -7044,7 +7023,7 @@ mod continuation_tests {
             });
             let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
             let operation = OperationContext::new(forge_provider_api::OperationId::new("cancel-unacknowledged-compaction").unwrap(), std::time::Duration::from_secs(5), cancellation).unwrap();
-            let request = forge_provider_api::CompactionRequest { scope: forge_provider_api::EventScope::SessionOperation { owner: session.owner.clone(), operation_id: operation.id().clone() } };
+            let request = forge_provider_api::CompactionRequest { scope: forge_provider_api::EventScope::SessionOperation { thread_id: session.owner.clone(), operation_id: operation.id().clone() } };
             let compacting_provider = provider.clone(); let binding = session.binding.id.clone(); let compacting_binding = binding.clone();
             let compacting = tokio::spawn(async move { compacting_provider.thread_compact(operation, &compacting_binding, request).await });
             started.await.unwrap(); source.cancel();
@@ -7072,7 +7051,7 @@ mod continuation_tests {
                 &session.binding.id,
                 forge_provider_api::CompactionRequest {
                     scope: forge_provider_api::EventScope::SessionOperation {
-                        owner: session.owner.clone(),
+                        thread_id: session.owner.clone(),
                         operation_id: forge_provider_api::OperationId::new("substituted-operation")
                             .unwrap(),
                     },
@@ -7125,7 +7104,7 @@ mod continuation_tests {
                 &session.binding.id,
                 forge_provider_api::CompactionRequest {
                     scope: forge_provider_api::EventScope::SessionOperation {
-                        owner: session.owner.clone(),
+                        thread_id: session.owner.clone(),
                         operation_id: operation.id().clone(),
                     },
                 },
@@ -7156,7 +7135,7 @@ mod continuation_tests {
             let operation = context();
             let compact = forge_provider_api::CompactionRequest {
                 scope: forge_provider_api::EventScope::SessionOperation {
-                    owner: session.owner.clone(),
+                    thread_id: session.owner.clone(),
                     operation_id: operation.id().clone(),
                 },
             };
@@ -7170,7 +7149,7 @@ mod continuation_tests {
             let fork = forge_provider_api::SessionForkRequest {
                 source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()),
                 target: forge_provider_api::ForkTarget {
-                    owner: forge_provider_api::ThreadOwner::root("revoked-fork-target"),
+                    thread_id: forge_provider_api::testing::root_thread("revoked-fork-target"),
                     workspace: "workspace".into(),
                     configuration: session.configuration.lock().await.clone(),
                     system_instructions: String::new(),
@@ -7223,8 +7202,7 @@ mod continuation_tests {
         let (provider, session, _events, _socket) = compaction_fixture().await;
         session.fenced.store(true, Ordering::Release);
         let request = |owner| SessionRequest {
-            thread_id: (forge_provider_api::ThreadOwner::root(owner)).thread_id(),
-            owner: forge_provider_api::ThreadOwner::root(owner),
+            thread_id: (forge_provider_api::testing::root_thread(owner)).clone(),
             mode: forge_provider_api::SessionMode::Interactive,
             workspace: "workspace".into(),
             history: forge_provider_api::SessionHistory::Durable {
@@ -7417,8 +7395,7 @@ mod continuation_tests {
         cases.push((isolation, ProviderFeature::IsolationMode));
         for (configuration, expected) in cases {
             let request = SessionRequest {
-                thread_id: (forge_provider_api::ThreadOwner::root("invalid-open")).thread_id(),
-                owner: forge_provider_api::ThreadOwner::root("invalid-open"),
+                thread_id: (forge_provider_api::testing::root_thread("invalid-open")).clone(),
                 mode: forge_provider_api::SessionMode::Interactive,
                 workspace: directory.path().to_string_lossy().into_owned(),
                 history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -7438,7 +7415,7 @@ mod continuation_tests {
             assert!(
                 matches!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest {
                 source: forge_provider_api::ForkSource::Checkpoint { provider_session_id: "unknown".try_into().unwrap(), checkpoint: forge_provider_api::CheckpointId::new("checkpoint").unwrap() },
-                target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("invalid-fork"),
+                target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("invalid-fork"),
                     workspace: directory.path().to_string_lossy().into_owned(), system_instructions: String::new(), configuration: configuration.clone() },
             }).await, Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
             );
@@ -7487,9 +7464,8 @@ mod continuation_tests {
             .thread_open(
                 context(),
                 SessionRequest {
-                    thread_id: (forge_provider_api::ThreadOwner::root("profile-rejection"))
-                        .thread_id(),
-                    owner: forge_provider_api::ThreadOwner::root("profile-rejection"),
+                    thread_id: (forge_provider_api::testing::root_thread("profile-rejection"))
+                        .clone(),
                     mode: forge_provider_api::SessionMode::Interactive,
                     workspace: "workspace".into(),
                     history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -7689,7 +7665,7 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let operation = context(); let operation_id = operation.id().clone();
-            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: "fork instructions".into() } };
+            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: "fork instructions".into() } };
             let (waiting, waited) = tokio::sync::oneshot::channel(); let (release, released) = tokio::sync::oneshot::channel();
             let wire = tokio::spawn(async move {
                 for (method, result) in [
@@ -7730,7 +7706,7 @@ mod continuation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let operation = context(); let operation_id = operation.id().clone();
-            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
+            let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
             let wire = tokio::spawn(async move {
                 for (method, reply) in [
                     ("model/list", json!({"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]}})),
@@ -7760,7 +7736,7 @@ mod continuation_tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let (provider, session, _events, mut socket) = compaction_fixture().await;
                 let operation = context(); let operation_id = operation.id().clone();
-                let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
+                let request = forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("fork-owner"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } };
                 let wire = tokio::spawn(async move {
                     for (method, result) in [
                         ("model/list", json!({"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[]}]})),
@@ -7790,7 +7766,7 @@ mod continuation_tests {
         let request = forge_provider_api::SessionForkRequest {
             source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()),
             target: forge_provider_api::ForkTarget {
-                owner: forge_provider_api::ThreadOwner::root("target"),
+                thread_id: forge_provider_api::testing::root_thread("target"),
                 workspace: "workspace".into(),
                 configuration: session.configuration.lock().await.clone(),
                 system_instructions: "supplied instructions".into(),
@@ -7835,8 +7811,8 @@ mod continuation_tests {
             let mut changed_request = request.clone();
             match changed {
                 0 => {
-                    changed_request.target.owner =
-                        forge_provider_api::ThreadOwner::root("substituted")
+                    changed_request.target.thread_id =
+                        forge_provider_api::testing::root_thread("substituted")
                 }
                 1 => {
                     changed_request.source = forge_provider_api::ForkSource::Checkpoint {
@@ -7914,7 +7890,7 @@ mod continuation_tests {
             let submitting = tokio::spawn(async move { submitting_provider.turn_start(context(), &submitting_binding, input).await });
             observed.wait().await.unwrap();
             let settled = provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope }).await.unwrap();
-            assert_eq!(settled.thread_id, session.owner.thread_id());
+            assert_eq!(settled.thread_id, session.owner.clone());
             assert!(session.active.lock().await.is_none());
             submitting.await.unwrap().unwrap();
             release_ack.send(()).unwrap();
@@ -7983,7 +7959,7 @@ mod continuation_tests {
             }
             release_ack.send(()).unwrap();
             let settled = interrupting.await.unwrap().unwrap();
-            assert_eq!(settled.thread_id, session.owner.thread_id());
+            assert_eq!(settled.thread_id, session.owner.clone());
             assert!(session.settlements.lock().await.get(&scope).is_some_and(|settlement| matches!(settlement, Ok(settlement) if matches!(settlement.completed.result().outcome(), TurnOutcome::Interrupted))));
             assert!(session.active.lock().await.is_none());
             assert!(!session.is_fenced());
@@ -8065,7 +8041,7 @@ mod continuation_tests {
                 let mut successor = request(); successor.scope = forge_provider_api::InvocationScope::new(session.owner.clone(), "successor-exchange"); successor.turn_id = successor.scope.turn_id().unwrap(); let successor_scope = successor.scope.clone();
                 successor.dispatch = forge_provider_api::submission::DispatchReporter::channel(binding.clone(), successor.scope.clone(), successor.submission_id.clone(), successor.attempt_id.clone()).0;
                 provider.turn_start(context(), &binding, successor).await.unwrap();
-                assert_eq!(provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope: successor_scope }).await.unwrap().thread_id, session.owner.thread_id());
+                assert_eq!(provider.turn_interrupt(context(), &binding, forge_provider_api::CancelRequest { scope: successor_scope }).await.unwrap().thread_id, session.owner.clone());
                 stop_background_reader(&session).await.unwrap(); session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
             }).await.unwrap();
         }
@@ -8084,7 +8060,7 @@ mod continuation_tests {
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":steer["id"],"error":{"code":-32600,"message":"native turn no longer running"}}).to_string().into())).await.unwrap();
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
             });
-            let request = SteeringRequest { scope, delivery: forge_provider_api::SteeringDelivery::Journaled { receipt: input.receipt.clone() }, input: PromptInput::Text("late steering".into()), attachments: Vec::new(), task: None };
+            let request = SteeringRequest { scope, delivery: forge_provider_api::SteeringDelivery::Journaled { receipt: input.receipt.clone() }, input: PromptInput::Text("late steering".into()), attachments: Vec::new(), };
             let error = provider.turn_steer(context(), &session.binding.id, request).await.unwrap_err();
             assert!(matches!(error, ProviderError::PreparationFailed(cause) if matches!(cause.as_ref(), ProviderError::Failure(failure) if failure.operation() == ProviderOperation::TurnSteer && failure.kind() == ProviderFailureKind::Rejected && failure.phase() == forge_provider_api::ProviderPhase::Observation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)));
             assert!(!session.is_fenced()); session.active.lock().await.take(); session.rpc.lock().await.close().await.unwrap(); wire.await.unwrap();
@@ -8261,7 +8237,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             *session.active.lock().await = Some(ActiveExecution { scope: successor_scope.clone(), native_turn_id: "successor-turn".into(), turn_updates: watch::channel(Some("successor-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: successor, cancel, task: Some(worker.clone()) });
             let settled = provider.turn_interrupt(context(), &session.binding.id, forge_provider_api::CancelRequest { scope: scope.clone() }).await.unwrap();
             assert_eq!(settled.watermark, retained.watermark);
-            assert_eq!(settled.thread_id, session.owner.thread_id());
+            assert_eq!(settled.thread_id, session.owner.clone());
             assert!(cancelled.try_recv().is_err());
             assert_eq!(session.active.lock().await.as_ref().unwrap().scope, successor_scope);
             release.send(()).unwrap(); worker.join().await.unwrap();
@@ -8626,7 +8602,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             child: &forge_provider_api::TurnAddress,
         ) -> Result<(), ProviderError> {
             assert_eq!(parent, &self.parent);
-            assert!(!child.scope.owner.is_root());
+            assert_ne!(child.scope.thread_id, parent.thread_id);
             Ok(())
         }
         async fn authorize_observed_child(
@@ -8636,7 +8612,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             _: PermissionRequest,
         ) -> PermissionResponse {
             assert_eq!(parent, &self.parent);
-            assert!(!child.scope.owner.is_root());
+            assert_ne!(child.scope.thread_id, parent.thread_id);
             PermissionResponse::Allow
         }
     }
@@ -8656,7 +8632,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             _: ToolCall,
         ) -> Result<String, ProviderError> {
             assert_eq!(parent, &self.parent);
-            assert!(!child.scope.owner.is_root());
+            assert_ne!(child.scope.thread_id, parent.thread_id);
             self.entered.notify_one();
             self.release.acquire().await.unwrap().forget();
             Ok("original child callback".into())
@@ -8724,7 +8700,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(children.len() == 1 && children[0].native_result().await.is_none());
             stop_background_reader(&session).await.unwrap();
             let mut successor=request.clone();
-            successor.scope=forge_provider_api::InvocationScope::new(request.scope.owner.clone(),"successor");
+            successor.scope=forge_provider_api::InvocationScope::new(request.scope.thread_id.clone(),"successor");
             successor.turn_id=successor.scope.turn_id().unwrap();
             let successor_address=session.normalization.lock().await.admit_turn("compaction-thread","successor",&successor.scope).unwrap();
             let (_next_cancel, next_cancelled) = mpsc::unbounded_channel();
@@ -8992,7 +8968,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             )
             .await
             .unwrap();
-        assert_eq!(settled.thread_id, session.owner.thread_id());
+        assert_eq!(settled.thread_id, session.owner.clone());
         assert!(session.active.lock().await.is_none());
         session.rpc.lock().await.close().await.unwrap();
     }
@@ -9138,7 +9114,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(matches!(&*session.close_failure.lock().await, Some(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Transport));
             session.fenced.store(false, Ordering::Release);
             assert!(session.is_fenced());
-            assert!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { owner: forge_provider_api::ThreadOwner::root("blocked-fork"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } }).await.is_err());
+            assert!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("blocked-fork"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } }).await.is_err());
             let _ = stop_background_reader(&session).await;
             let _ = session.rpc.lock().await.close().await;
         }).await.unwrap();
@@ -9187,7 +9163,6 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             delivery: forge_provider_api::SteeringDelivery::Context,
             input: PromptInput::Text("late context".into()),
             attachments: Vec::new(),
-            task: None,
         };
         let error = provider
             .turn_steer(context(), &session.binding.id, request)
@@ -9249,14 +9224,16 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
 
     /// New runtimes and nonexportable credentials cannot advertise the audited optional utility workflow.
     #[test]
-    fn recap_capability_requires_audited_version_and_native_exportable_authentication() {
+    fn isolated_generation_capability_requires_audited_version_and_native_exportable_authentication()
+     {
         let supported = json!({"requiresOpenaiAuth":true,"authMethod":"chatgpt"});
         let find = |manifest: forge_provider_api::capability::CapabilityManifest| {
             manifest
                 .capability
                 .into_iter()
                 .find(|capability| {
-                    capability.id == forge_provider_api::capability::CapabilityId::Recap
+                    capability.id
+                        == forge_provider_api::capability::CapabilityId::IsolatedGeneration
                 })
                 .unwrap()
                 .support
@@ -9688,7 +9665,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert_eq!(response["result"]["success"], true);
             assert_eq!(*authority.calls.lock().unwrap(), ["before","authorize","call"]);
             let mut successor = request.clone();
-            successor.scope = forge_provider_api::InvocationScope::new(request.scope.owner.clone(), "successor");
+            successor.scope = forge_provider_api::InvocationScope::new(request.scope.thread_id.clone(), "successor");
             for (active, envelope) in [(&successor, message.clone()), (&request, json!({"id":11,"method":"item/tool/call","params":{"callId":"original-child-call","tool":"lsp_rename","arguments":{}}}))] {
                 handle_native_request(&session, active, &envelope).await.unwrap();
                 let denied: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -9825,7 +9802,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     fn request() -> PromptRequest {
         let authority = Arc::new(FixtureAuthority);
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("continuation-test"),
+            forge_provider_api::testing::root_thread("continuation-test"),
             "invocation",
         );
         let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
@@ -9836,16 +9813,15 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         );
         PromptRequest {
             dispatch,
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
-            mode: forge_provider_api::input::PromptMode::Chat,
+            execution: forge_provider_api::ExecutionMode::Default,
             configuration: InvocationConfiguration {
                 model: ModelSelection::default(),
                 access: AccessPolicy::default(),
                 approval: ApprovalMode::Ask,
             },
-            task: None,
             tools: Vec::new(),
             tool_endpoint: None,
             resource_lease: None,

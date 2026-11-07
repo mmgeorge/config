@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::sync::{Arc, Mutex};
 
 use forge_provider_api::{
@@ -89,14 +90,16 @@ impl SessionOpening {
         let Some((operation, request)) = pending else {
             return Ok(None);
         };
-        let owner = request.owner.clone();
+        let owner = request.owner().clone();
         let result = super::operation::observe_owned(
             trace,
             core,
             ProviderOperation::ThreadOpen,
             &operation,
             super::operation::OperationTarget {
-                scope: forge_provider_api::EventScope::Binding { owner },
+                scope: forge_provider_api::EventScope::Binding {
+                    thread_id: owner.thread_id(),
+                },
                 binding: None,
             },
             super::operation::ObservationPurpose::RetainedCleanup,
@@ -133,14 +136,16 @@ impl SessionOpening {
         collection: Arc<super::bridge::BindingCollection>,
     ) -> Result<OpenedSession, ProviderError> {
         let (operation, request, purpose) = self.begin(request)?;
-        let owner = request.owner.clone();
+        let owner = request.owner().clone();
         let result = super::operation::observe_owned(
             trace,
             core,
             ProviderOperation::ThreadOpen,
             &operation,
             super::operation::OperationTarget {
-                scope: forge_provider_api::EventScope::Binding { owner },
+                scope: forge_provider_api::EventScope::Binding {
+                    thread_id: owner.thread_id(),
+                },
                 binding: None,
             },
             purpose,

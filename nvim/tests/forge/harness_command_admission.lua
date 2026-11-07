@@ -90,6 +90,13 @@ for _, enabled in ipairs({ true, false }) do
   assert(routed, "plan acceptance policy was sent as a new planning request")
 end
 controller.task_transition = task_transition
+local goal_request_count = #requests
+vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/goal" })
+controller.submit()
+assert(#requests == goal_request_count, "a bare /goal was sent instead of asking for the goal text")
+assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "/goal ")
+assert(#warnings == 1 and warnings[1]:find("/goal", 1, true))
+warnings = {}
 dofile("nvim/tests/forge/support/activity.lua").set_busy(state, true)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan" })
 controller.submit()

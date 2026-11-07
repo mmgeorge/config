@@ -297,6 +297,12 @@ impl RestoreJournal {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         let root = Path::new(&self.preview.workspace);
+        let managed: std::collections::HashSet<PathBuf> = self
+            .preview
+            .path
+            .iter()
+            .map(|change| checked_path(root, &change.path))
+            .collect::<Result<_>>()?;
         for position in 0..self.preview.path.len() {
             check()?;
             let change = &self.preview.path[position];
@@ -313,6 +319,9 @@ impl RestoreJournal {
                     change.path
                 );
                 write_file(objects, root, &change.path, change.after.as_ref())?;
+                if change.after.is_none() {
+                    remove_emptied_parents(root, &checked_path(root, &change.path)?, &managed)?;
+                }
             }
             self.applied = position + 1;
             self.save(objects)?;
@@ -482,6 +491,38 @@ fn read_actual(
     }))
 }
 
+/// Remove the directories between `root` and a deleted file that the deletion left empty.
+///
+/// Checkpoints record files, not directories, so a directory created only to hold a restored-away
+/// file is not part of the target state. Like Git checkout, the walk stops at the first ancestor
+/// that still holds an entry, and it never removes `root` or a path this restore itself manages,
+/// such as a directory that another change turns back into a file.
+fn remove_emptied_parents(
+    root: &Path,
+    removed: &Path,
+    managed: &std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    let mut directory = removed.parent();
+    while let Some(current) = directory {
+        if current == root || !current.starts_with(root) || managed.contains(current) {
+            break;
+        }
+        match fs::remove_dir(current) {
+            Ok(()) => directory = current.parent(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn write_file(
     objects: &ObjectStore,
     root: &Path,
@@ -526,7 +567,7 @@ fn write_file(
             }
         }
     } else if fs::symlink_metadata(&path).is_ok() {
-        fs::remove_file(path)?;
+        fs::remove_file(&path)?;
     }
     Ok(())
 }

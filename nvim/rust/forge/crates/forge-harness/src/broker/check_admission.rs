@@ -340,7 +340,9 @@ impl HarnessBroker {
                         .expect("host diagnostic is nonempty"),
                     severity: super::publication::DiagnosticSeverity::Warning,
                     scope: crate::provider::EventScope::Binding {
-                        owner: crate::provider::ThreadOwner::root(&self.session.id),
+                        thread_id: forge_provider_api::ThreadId::from(
+                            crate::provider::ThreadOwner::root(&self.session.id),
+                        ),
                     },
                     native_scope: forge_provider_api::WarningScope::Provider,
                 },

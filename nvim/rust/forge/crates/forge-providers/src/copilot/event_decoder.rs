@@ -84,6 +84,8 @@ pub struct CopilotEventDecoder {
     pending_model: HashMap<String, String>,
     children: HashMap<String, forge_provider_api::InvocationScope>,
     child_events: HashMap<String, forge_provider_api::InvocationScope>,
+    /// Observed agent identity of each child thread this decoder minted.
+    child_agents: HashMap<forge_provider_api::ThreadId, forge_provider_api::agent::AgentId>,
     callbacks: Option<std::sync::Arc<dyn super::provider::NativeCallbackRouter>>,
     turn_owner: Option<forge_provider_api::ProviderEventSink>,
     unsupported_events: HashSet<String>,
@@ -111,6 +113,7 @@ impl CopilotEventDecoder {
             turn_owner: None,
             children: HashMap::new(),
             child_events: HashMap::new(),
+            child_agents: HashMap::new(),
             unsupported_events: HashSet::new(),
         }
     }
@@ -248,6 +251,56 @@ impl CopilotEventDecoder {
             })
     }
 
+    /// Publish the point where Copilot consumed accepted steering input inside the running turn.
+    ///
+    /// Copilot can hold steering until the current model call ends, so the input's acknowledgement
+    /// is not where the model read it. Only input consumed after the root turn started is
+    /// published; the turn's own prompt precedes that start and is already the exchange prompt.
+    pub async fn consumed_input(
+        &mut self,
+        event: &SessionEvent,
+        submission_id: forge_provider_api::SubmissionId,
+        sink: &AdapterActivityWriter,
+    ) -> Result<(), ProviderError> {
+        let Some(thread) = self.root_thread.clone() else {
+            return Ok(());
+        };
+        if self.turn.get(&thread).is_none_or(|turn| turn.settled) {
+            return Ok(());
+        }
+        let text = event
+            .data
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Self::protocol("Copilot user message omitted content"))?;
+        let address = ItemAddress {
+            turn: self.address(&thread)?,
+            item_id: allocated_item_id(),
+            reasoning: false,
+        };
+        sink.send_wait(
+            address
+                .clone()
+                .activity(ItemEvent::Started(ItemStart::UserMessage(
+                    forge_provider_api::UserMessageStart {
+                        text: text.to_owned(),
+                        submission_id: Some(submission_id),
+                    },
+                ))),
+        )
+        .await?;
+        sink.send_wait(
+            address.activity(ItemEvent::Completed(ItemCompletion::UserMessage(
+                MessageCompletion {
+                    text: text.into(),
+                    outcome: MessageOutcome::Completed,
+                },
+            ))),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Warn once per binding about a native notification type this adapter does not apply.
     async fn unsupported(
         &mut self,
@@ -260,7 +313,7 @@ impl CopilotEventDecoder {
         sink.send_wait(AdapterActivity::Warning(
             forge_provider_api::ProviderWarning {
                 scope: forge_provider_api::WarningScope::Thread {
-                    thread_id: sink.scope().owner().thread_id(),
+                    thread_id: sink.scope().thread_id().clone(),
                 },
                 kind: forge_provider_api::ProviderWarningKind::UnsupportedNativeEvent,
                 message: SanitizedMessage::new(format!(
@@ -282,7 +335,7 @@ impl CopilotEventDecoder {
         sink.send_wait(AdapterActivity::Warning(
             forge_provider_api::ProviderWarning {
                 scope: forge_provider_api::WarningScope::Thread {
-                    thread_id: sink.scope().owner().thread_id(),
+                    thread_id: sink.scope().thread_id().clone(),
                 },
                 kind: forge_provider_api::ProviderWarningKind::NativeNotice { category: kind },
                 message: SanitizedMessage::new("Provider reported incomplete metadata")
@@ -334,7 +387,7 @@ impl CopilotEventDecoder {
                     .ok_or_else(|| Self::protocol("session error refers to an unknown child"))?;
                 sink.register_observed_turn(TurnAddress {
                     scope: scope.clone(),
-                    thread_id: scope.owner.thread_id(),
+                    thread_id: scope.thread_id.clone(),
                     turn_id: scope
                         .turn_id()
                         .map_err(|_| Self::protocol("invalid child turn"))?,
@@ -344,7 +397,7 @@ impl CopilotEventDecoder {
             };
             error_writer
                 .send_wait(super::error::session_error(
-                    error_writer.scope().owner().thread_id(),
+                    error_writer.scope().thread_id().clone(),
                     &event.data,
                 ))
                 .await?;
@@ -395,7 +448,7 @@ impl CopilotEventDecoder {
                 .ok_or_else(|| Self::protocol("child content has no observed delegation"))?
                 .clone();
             let address = TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.thread_id.clone(),
                 turn_id: scope
                     .turn_id()
                     .map_err(|_| Self::protocol("invalid child turn"))?,
@@ -450,7 +503,7 @@ impl CopilotEventDecoder {
                         self.root_thread = Some(thread.clone());
                         TurnAddress {
                             scope: self.scope.clone(),
-                            thread_id: self.scope.owner.thread_id(),
+                            thread_id: self.scope.thread_id.clone(),
                             turn_id: self.scope.turn_id().map_err(|_| {
                                 Self::protocol("Copilot host turn identity is invalid")
                             })?,
@@ -461,7 +514,7 @@ impl CopilotEventDecoder {
                         })?;
                         TurnAddress {
                             scope: child.clone(),
-                            thread_id: child.owner.thread_id(),
+                            thread_id: child.thread_id.clone(),
                             turn_id: child
                                 .turn_id()
                                 .map_err(|_| Self::protocol("invalid child turn"))?,
@@ -606,7 +659,7 @@ impl CopilotEventDecoder {
                 {
                     output.set_context_usage(usage.clone());
                     sink.send_wait(AdapterActivity::Thread {
-                        thread_id: self.scope.owner.thread_id(),
+                        thread_id: self.scope.thread_id.clone(),
                         event: ThreadEvent::ContextUsage(usage),
                     })
                     .await?;
@@ -685,7 +738,7 @@ impl CopilotEventDecoder {
                     .observe_native_child(
                         &self.scope,
                         TurnAddress {
-                            thread_id: scope.owner.thread_id(),
+                            thread_id: scope.thread_id.clone(),
                             turn_id: scope
                                 .turn_id()
                                 .map_err(|_| Self::protocol("invalid child turn"))?,
@@ -742,7 +795,7 @@ impl CopilotEventDecoder {
                     .observe_native_child(
                         &self.scope,
                         TurnAddress {
-                            thread_id: scope.owner.thread_id(),
+                            thread_id: scope.thread_id.clone(),
                             turn_id: scope
                                 .turn_id()
                                 .map_err(|_| Self::protocol("invalid child turn"))?,
@@ -858,12 +911,15 @@ impl CopilotEventDecoder {
             None => self.scope.clone(),
         };
         if event.event_type == "subagent.started" && !self.children.contains_key(&native_id) {
-            let owner = forge_provider_api::ThreadOwner::new(
-                self.scope.owner.session_id().clone(),
+            let agent_id =
                 forge_provider_api::agent::AgentId::new(uuid::Uuid::new_v4().to_string())
-                    .map_err(|_| Self::protocol("invalid child identity"))?,
-            )
-            .map_err(|_| Self::protocol("invalid observed child owner"))?;
+                    .map_err(|_| Self::protocol("invalid child identity"))?;
+            let owner = self
+                .scope
+                .thread_id
+                .child(&agent_id)
+                .map_err(|_| Self::protocol("invalid observed child owner"))?;
+            self.child_agents.insert(owner.clone(), agent_id);
             self.children.insert(
                 native_id.clone(),
                 InvocationScope::new(owner, self.scope.exchange_id.clone()),
@@ -887,26 +943,31 @@ impl CopilotEventDecoder {
             self.children.insert(call_id, child.clone());
         }
         self.child_events.insert(event.id.clone(), child.clone());
-        let agent_id = forge_provider_api::agent::AgentId::new(child.owner.agent_id().as_str())
-            .map_err(|_| Self::protocol("invalid child identity"))?;
+        let agent_id = self
+            .child_agents
+            .get(&child.thread_id)
+            .cloned()
+            .ok_or_else(|| Self::protocol("invalid child identity"))?;
         let parent_agent_id = if parent_scope == self.scope {
             None
         } else {
             Some(
-                forge_provider_api::agent::AgentId::new(parent_scope.owner.agent_id().as_str())
-                    .map_err(|_| Self::protocol("invalid parent agent"))?,
+                self.child_agents
+                    .get(&parent_scope.thread_id)
+                    .cloned()
+                    .ok_or_else(|| Self::protocol("invalid parent agent"))?,
             )
         };
         let agent = forge_provider_api::AgentDescription {
             parent_agent_id,
             delegation: Some(forge_provider_api::AgentDelegation {
-                parent_thread_id: parent_scope.owner.thread_id(),
+                parent_thread_id: parent_scope.thread_id.clone(),
                 parent_turn_id: parent_scope
                     .turn_id()
                     .map_err(|_| Self::protocol("invalid parent turn"))?,
                 parent_item_id: None,
             }),
-            thread_id: Some(child.owner.thread_id()),
+            thread_id: Some(child.thread_id.clone()),
             definition: super::decode::string_field(&event.data, &["agentName"]),
             nickname: super::decode::string_field(
                 &event.data,
@@ -1273,7 +1334,7 @@ impl CopilotEventDecoder {
                 sink.send_wait(AdapterActivity::Warning(
                     forge_provider_api::ProviderWarning {
                         scope: forge_provider_api::WarningScope::Thread {
-                            thread_id: sink.scope().owner().thread_id(),
+                            thread_id: sink.scope().thread_id().clone(),
                         },
                         kind: forge_provider_api::ProviderWarningKind::NativeNotice {
                             category: ProviderFailureKind::Protocol,
@@ -1361,7 +1422,7 @@ impl CopilotEventDecoder {
                     sink.send_wait(AdapterActivity::Warning(
                         forge_provider_api::ProviderWarning {
                             scope: forge_provider_api::WarningScope::Thread {
-                                thread_id: sink.scope().owner().thread_id(),
+                                thread_id: sink.scope().thread_id().clone(),
                             },
                             kind: forge_provider_api::ProviderWarningKind::NativeNotice {
                                 category: ProviderFailureKind::Protocol,
@@ -1443,7 +1504,7 @@ impl CopilotEventDecoder {
         } else {
             &self.scope
         };
-        let thread_id = scope.owner.thread_id();
+        let thread_id = scope.thread_id.clone();
         let update = super::decode::decode_compaction(
             event,
             thread_id.as_str(),
@@ -1513,7 +1574,7 @@ impl CopilotEventDecoder {
             None => {}
         }
         if self.tool.values().any(|tool| {
-            !tool.finished && tool.address.turn.thread_id == self.scope.owner.thread_id()
+            !tool.finished && tool.address.turn.thread_id == self.scope.thread_id.clone()
         }) {
             return Err(Self::protocol(
                 "Copilot became idle before completing a foreground tool",
@@ -1591,7 +1652,7 @@ impl CopilotEventDecoder {
                 .await?;
         }
         for tool in self.tool.values_mut().filter(|tool| {
-            !tool.finished && tool.address.turn.thread_id == self.scope.owner.thread_id()
+            !tool.finished && tool.address.turn.thread_id == self.scope.thread_id.clone()
         }) {
             sink.send_wait(
                 tool.address
@@ -1740,6 +1801,10 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
         | "assistant.turn_retry"
         | "permission.requested"
         | "permission.completed"
+        // The SDK tool handler owns host tool execution; these notifications only announce
+        // its start and the result the handler already returned.
+        | "external_tool.requested"
+        | "external_tool.completed"
         | "pending_messages.modified" => UnmappedDisposition::OwnedElsewhere,
         "session.start"
         | "session.resume"
@@ -1771,6 +1836,7 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
         | "session.managed_settings_resolved"
         | "session.remote_steerable_changed"
         | "session.auto_mode_resolved"
+        | "session.usage_record"
         | "session.auto_tier_recommendation"
         | "session.indexed_search"
         | "session.completion_receipt"
@@ -1803,14 +1869,18 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
         | "tool_search.activated"
         | "assistant.intent"
         | "assistant.server_tool_progress"
-        | "model.call_start"
-        | "model.call_finished"
-        | "model.call_final_result"
         | "sandbox.decision"
         | "subagent.selected"
         | "subagent.deselected"
         | "subagent.configured"
-        | "ui.ephemeral_query" => UnmappedDisposition::NoNormalizedMeaning,
+        | "ui.ephemeral_query"
+        // The retained prompt owner settles on abort; a running turn's aborted idle follows it.
+        | "abort"
+        // An interrupted agent reports its terminal outcome through its aborted idle.
+        | "agent.interrupted" => UnmappedDisposition::NoNormalizedMeaning,
+        // `model.*` is the runtime's model-call telemetry; `assistant.*` and `session.error`
+        // carry the same turns, content, usage, and failures that Forge normalizes.
+        telemetry if telemetry.starts_with("model.") => UnmappedDisposition::NoNormalizedMeaning,
         _ => UnmappedDisposition::Unsupported,
     }
 }
@@ -1818,7 +1888,7 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::{BindingId, ProviderEvent, ThreadOwner, TurnEvent};
+    use forge_provider_api::{BindingId, ProviderEvent, TurnEvent};
 
     /// Construct a native SDK envelope without a live provider request.
     fn event(id: &str, kind: &str, contents: Value) -> SessionEvent {
@@ -1833,9 +1903,12 @@ mod tests {
         forge_provider_api::ProviderEventStream,
         super::super::test_turn::NativeTurnFixture,
     ) {
-        let scope = InvocationScope::new(ThreadOwner::root("decoder"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("decoder"),
+            "exchange",
+        );
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope: scope.clone(),
         };
@@ -2050,7 +2123,7 @@ mod tests {
             decoder.decode(&native, &mut output, &sink).await?;
             let observation = stream.try_next()?.unwrap().event;
             assert!(
-                matches!(&observation, ProviderEvent::Thread { thread_id, event: ThreadEvent::Error { .. } } if thread_id == &decoder.scope.owner.thread_id())
+                matches!(&observation, ProviderEvent::Thread { thread_id, event: ThreadEvent::Error { .. } } if thread_id == &decoder.scope.thread_id.clone())
             );
             assert!(!serde_json::to_string(&observation)?.contains("private-native-payload"));
             assert!(stream.try_next()?.is_none());
@@ -2209,7 +2282,7 @@ mod tests {
         assert!(final_seen);
         assert_ne!(
             child_thread.as_ref(),
-            Some(&decoder.scope.owner.thread_id())
+            Some(&decoder.scope.thread_id.clone())
         );
         let mut foreign = child;
         foreign.id = "foreign".into();
@@ -2256,7 +2329,7 @@ mod tests {
         let address = decoder
             .callback_address(&tool)
             .expect("published tool has exact ownership");
-        assert_ne!(address.scope.owner, decoder.scope.owner);
+        assert_ne!(address.scope.thread_id, decoder.scope.thread_id);
         assert_eq!(address.scope, decoder.children["child"]);
         assert!(stream.try_next()?.is_some());
 
@@ -2380,7 +2453,7 @@ mod tests {
         );
         child.agent_id = Some("child".into());
         decoder.decode(&child, &mut output, &sink).await?;
-        let expected = decoder.children["child"].owner.thread_id();
+        let expected = decoder.children["child"].thread_id.clone();
         let mut warning = false;
         while let Some(bound) = stream.try_next()? {
             if let ProviderEvent::Provider {
@@ -2472,6 +2545,64 @@ mod tests {
     }
 
     /// Unmapped native notifications are admitted by explicit policy or reported once per type.
+    /// Steering Copilot holds until a model call ends is published where the model consumed it.
+    ///
+    /// In the observed order the root turn ends one native turn, consumes queued steering as a new
+    /// `user.message`, and answers it in the same host turn. Without a consumed-input item the
+    /// host can only place the steering at acknowledgement, before the earlier answer.
+    #[tokio::test]
+    async fn consumed_steering_publishes_a_user_item_inside_the_root_turn() -> anyhow::Result<()> {
+        let (mut decoder, mut output, sink, mut stream, start) = fixture().await;
+        start.start.observed(1).await?;
+        let submission = forge_provider_api::SubmissionId::try_from("steering-submission")?;
+        let steering = event(
+            "steering-user",
+            "user.message",
+            serde_json::json!({"messageId":"steering-message","content":"Reply with BETA."}),
+        );
+        while stream.try_next()?.is_some() {}
+        decoder
+            .consumed_input(&steering, submission.clone(), &sink)
+            .await?;
+        assert!(
+            stream.try_next()?.is_none(),
+            "input before the root turn started duplicated the exchange prompt"
+        );
+        decoder
+            .decode(
+                &event(
+                    "root",
+                    "assistant.turn_start",
+                    serde_json::json!({"turnId":"0"}),
+                ),
+                &mut output,
+                &sink,
+            )
+            .await?;
+        while stream.try_next()?.is_some() {}
+        decoder
+            .consumed_input(&steering, submission.clone(), &sink)
+            .await?;
+        let mut started = None;
+        let mut completed = false;
+        while let Some(bound) = stream.try_next()? {
+            if let ProviderEvent::Item { event, .. } = bound.event {
+                match event {
+                    forge_provider_api::ItemEvent::Started(ItemStart::UserMessage(user)) => {
+                        started = Some(user);
+                    }
+                    forge_provider_api::ItemEvent::Completed(_) => completed = true,
+                    _ => {}
+                }
+            }
+        }
+        let started = started.expect("consumed steering published no user item");
+        assert_eq!(started.text, "Reply with BETA.");
+        assert_eq!(started.submission_id, Some(submission));
+        assert!(completed, "consumed steering left its user item open");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unmapped_native_events_warn_once_unless_documented_irrelevant() -> anyhow::Result<()> {
         let (mut decoder, mut output, sink, mut stream, start) = fixture().await;
@@ -2489,6 +2620,15 @@ mod tests {
             .await?;
         for (id, kind) in [
             ("title", "session.title_changed"),
+            ("abort", "abort"),
+            ("model-turn-ended", "model.turn_ended"),
+            ("model-turn-failed", "model.turn_failed"),
+            ("model-telemetry", "model.telemetry"),
+            ("model-snapshot", "model.messages_snapshot"),
+            ("agent-interrupted", "agent.interrupted"),
+            ("external-tool", "external_tool.requested"),
+            ("external-tool-done", "external_tool.completed"),
+            ("usage-record", "session.usage_record"),
             ("warning-1", "session.warning"),
             ("warning-2", "session.warning"),
             ("future", "session.future_sdk_event"),

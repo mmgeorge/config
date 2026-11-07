@@ -50,12 +50,14 @@ M._admission_pending = false
 -- ─── fake editor command ────────────────────────────────────────────────────
 
 --- Config root holding this module, so the `--clean` headless editor can
---- `require` it (it has no user runtimepath otherwise).
+--- `require` it (it has no user runtimepath otherwise). The source path is relative when
+--- the runtimepath entry is, and Git starts the editor in the repository, so resolve it
+--- to an absolute path at load time, while the working directory still matches it.
+local module_source = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"):gsub("\\", "/")
 local function runtimepath_root()
-  local source = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
   -- Strip /lua/forge/... to the config root holding lua/, depth-agnostic so the
   -- module can move within the plugin without breaking the headless editor's require path.
-  return (source:gsub("/lua/forge/.*$", ""))
+  return (module_source:gsub("/lua/forge/.*$", ""))
 end
 
 --- The GIT_EDITOR command: a headless nvim that runs M.client(). Mirrors

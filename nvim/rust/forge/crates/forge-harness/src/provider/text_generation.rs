@@ -175,6 +175,7 @@ pub(crate) fn validate(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ScopeOwner;
     use forge_provider_api::generation::lowest_effort;
 
     #[test]
@@ -274,14 +275,16 @@ mod tests {
     #[test]
     fn history_keeps_visible_message_order_and_excludes_reasoning_and_reverted_work() {
         let scope = crate::provider::InvocationScope {
-            owner: crate::provider::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                "session",
+            )),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         };
         let mut turn = crate::turn::Turn::new(
             "turn".into(),
             crate::provider::TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id().unwrap(),
                 scope,
             },

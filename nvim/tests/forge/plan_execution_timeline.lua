@@ -142,6 +142,23 @@ local ok, failure = pcall(function()
   exchange.node_list[1].result = { outcome = "passed", summary = "Eight tests passed.", findings = {} }
   local passed = renderer.build({ { kind = "exchange", exchange = exchange } }, { expanded = {} })
   assert(table.concat(passed.lines, "\n"):find("◇ Verification passed · Eight tests passed.", 1, true))
+
+  -- Host-authored task prompts carry workflow instructions for the provider, not user text, so the
+  -- transcript shows only the notice that names the task or the reason it continued.
+  for _, origin in ipairs({
+    { kind = "task_started", start = { kind = "execute", title = "Ship the parser" } },
+    { kind = "task_continuation", reason = "The task was resumed" },
+  }) do
+    local host_authored = renderer.build({ { kind = "exchange", exchange = {
+      id = "host-authored", state = "complete", origin = origin,
+      prompt = "Start the Execute task for this accepted plan. Execution ID: internal",
+      node_list = {}, turn = {},
+    } } }, { expanded = {} })
+    local host_text = table.concat(host_authored.lines, "\n")
+    assert(host_text:find(origin.reason or "Execution started: Ship the parser", 1, true), host_text)
+    assert(not host_text:find("Execution ID: internal", 1, true),
+      "a host-authored task prompt rendered as transcript text: " .. host_text)
+  end
 end)
 
 if not ok then

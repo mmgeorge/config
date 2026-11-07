@@ -11,7 +11,7 @@ pub(super) enum TerminalSource {
 
 /// Serialize complete binding inventories instead of letting independent readers replace each other.
 pub(super) struct TerminalPublisher {
-    owner: forge_provider_api::ThreadOwner,
+    owner: forge_provider_api::ThreadId,
     sink: forge_provider_api::ProviderEventSink,
     state: std::sync::Mutex<PublishedInventories>,
     publication: tokio::sync::Mutex<()>,
@@ -20,7 +20,7 @@ pub(super) struct TerminalPublisher {
 impl TerminalPublisher {
     /// Create an empty binding inventory before either native reader is attached.
     pub(super) fn new(
-        owner: forge_provider_api::ThreadOwner,
+        owner: forge_provider_api::ThreadId,
         sink: forge_provider_api::ProviderEventSink,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -42,10 +42,12 @@ impl TerminalPublisher {
             TerminalSource::Main => &mut state.main,
             TerminalSource::Helper => &mut state.helper,
         };
-        let snapshot = forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: matches!(source, TerminalSource::Main),
-            terminal: Vec::new(),
+        // The main reader attaches with the native session, so its inventory starts unreported.
+        let snapshot = match source {
+            TerminalSource::Main => forge_provider_api::terminal::TerminalInventory::opening(),
+            TerminalSource::Helper => {
+                forge_provider_api::terminal::TerminalInventory::observed(Vec::new())
+            }
         };
         let lease = match slot {
             Some(previous) => {
@@ -72,7 +74,7 @@ impl TerminalPublisher {
     }
 
     /// Get the same combined inventory published to the binding event stream.
-    pub(super) fn snapshot(&self) -> forge_provider_api::terminal::TerminalSnapshot {
+    pub(super) fn snapshot(&self) -> forge_provider_api::terminal::TerminalInventory {
         self.state
             .lock()
             .expect("terminal publication state is not poisoned")
@@ -93,7 +95,7 @@ impl TerminalSourceHandle {
     /// Publish the union atomically; retiring a source also interrupts an unadmitted send.
     pub(super) async fn publish(
         &self,
-        snapshot: forge_provider_api::terminal::TerminalSnapshot,
+        snapshot: forge_provider_api::terminal::TerminalInventory,
     ) -> Result<(), forge_provider_api::ProviderError> {
         let mut lease = self.lease.clone();
         if *lease.borrow_and_update() != self.generation {
@@ -128,7 +130,7 @@ impl TerminalSourceHandle {
             biased;
             _ = lease.changed() => Ok(()),
             result = writer.send_wait(forge_provider_api::AdapterActivity::Thread {
-                thread_id: self.publisher.owner.thread_id(), event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(merged)),
+                thread_id: self.publisher.owner.clone(), event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(merged)),
             }) => result.map_err(Into::into),
         }
     }
@@ -142,14 +144,10 @@ struct PublishedInventories {
 
 impl PublishedInventories {
     /// Combine both source components in stable main-then-helper order.
-    fn snapshot(&self) -> forge_provider_api::terminal::TerminalSnapshot {
-        let mut snapshot = forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: Vec::new(),
-        };
+    fn snapshot(&self) -> forge_provider_api::terminal::TerminalInventory {
+        let mut snapshot = forge_provider_api::terminal::TerminalInventory::observed(Vec::new());
         for inventory in self.main.iter().chain(self.helper.iter()) {
-            snapshot.starting |= inventory.snapshot.starting;
+            snapshot.complete &= inventory.snapshot.complete;
             snapshot
                 .terminal
                 .extend(inventory.snapshot.terminal.iter().cloned());
@@ -161,7 +159,7 @@ impl PublishedInventories {
 struct PublishedInventory {
     generation: uuid::Uuid,
     lease: tokio::sync::watch::Sender<uuid::Uuid>,
-    snapshot: forge_provider_api::terminal::TerminalSnapshot,
+    snapshot: forge_provider_api::terminal::TerminalInventory,
 }
 
 /// Issue opaque terminal handles within one exact live binding.
@@ -174,7 +172,7 @@ impl TerminalRegistry {
     /// Replace native identities with issued handles and retire handles missing from this snapshot.
     pub(super) fn issue(
         &mut self,
-        snapshot: &mut forge_provider_api::terminal::TerminalSnapshot,
+        snapshot: &mut forge_provider_api::terminal::TerminalInventory,
     ) -> Result<(), forge_provider_api::ProviderError> {
         let present = snapshot
             .terminal
@@ -218,7 +216,7 @@ impl TerminalRegistry {
 /// Publish inventory through the binding's normalized stream and opaque handle registry.
 #[derive(Clone)]
 pub(super) struct TerminalPublication {
-    pub(super) owner: forge_provider_api::ThreadOwner,
+    pub(super) owner: forge_provider_api::ThreadId,
     pub(super) sink: forge_provider_api::ProviderEventSink,
     pub(super) registry: Arc<tokio::sync::Mutex<TerminalRegistry>>,
     pub(super) publisher: Option<Arc<TerminalPublisher>>,
@@ -230,7 +228,7 @@ pub struct CopilotTerminalMonitor {
     snapshot: tokio::sync::watch::Receiver<
         Option<
             std::result::Result<
-                forge_provider_api::terminal::TerminalSnapshot,
+                forge_provider_api::terminal::TerminalInventory,
                 forge_provider_api::ProviderError,
             >,
         >,
@@ -258,7 +256,7 @@ impl CopilotTerminalMonitor {
             session,
             |event| event.event_type == "session.background_tasks_changed",
             trace,
-            publication.owner.session_id().to_string(),
+            publication.owner.to_string(),
         );
         Self::from_stream(event, Arc::downgrade(&session.inner), publication)
     }
@@ -342,7 +340,7 @@ impl CopilotTerminalMonitor {
                             .sink
                             .activity_writer()
                             .send_wait(forge_provider_api::AdapterActivity::Thread {
-                                thread_id: publication.owner.thread_id(),
+                                thread_id: publication.owner.clone(),
                                 event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(
                                     failure,
                                 )),
@@ -399,7 +397,7 @@ impl CopilotTerminalMonitor {
         &self,
     ) -> Option<
         std::result::Result<
-            forge_provider_api::terminal::TerminalSnapshot,
+            forge_provider_api::terminal::TerminalInventory,
             forge_provider_api::ProviderError,
         >,
     > {
@@ -441,26 +439,25 @@ mod tests {
     /// Independent inventories remain visible when either source changes or its reader is replaced.
     #[tokio::test]
     async fn terminal_publication_merges_sources_and_rejects_retired_readers() {
-        let owner = forge_provider_api::ThreadOwner::root("terminal-union");
+        let owner = forge_provider_api::testing::root_thread("terminal-union");
         let (sink, mut events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-union").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let publisher = TerminalPublisher::new(owner, sink);
         let main = publisher.source(TerminalSource::Main);
         let helper = publisher.source(TerminalSource::Helper);
-        let snapshot = |id: Option<&str>| forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: id
-                .into_iter()
-                .map(|id| forge_provider_api::terminal::BackgroundTerminal {
-                    id: forge_provider_api::terminal::TerminalId::new(id).unwrap(),
-                    command: id.into(),
-                })
-                .collect(),
+        let snapshot = |id: Option<&str>| {
+            forge_provider_api::terminal::TerminalInventory::observed(
+                id.into_iter()
+                    .map(|id| forge_provider_api::terminal::BackgroundTerminal {
+                        id: forge_provider_api::terminal::TerminalId::new(id).unwrap(),
+                        command: id.into(),
+                    })
+                    .collect(),
+            )
         };
         helper.publish(snapshot(Some("helper"))).await.unwrap();
         main.publish(snapshot(Some("main"))).await.unwrap();
@@ -502,18 +499,19 @@ mod tests {
     /// Source revocation interrupts publication even while another sender owns its serialization lock.
     #[tokio::test]
     async fn retired_terminal_source_cancels_waiting_publication() {
-        let owner = forge_provider_api::ThreadOwner::root("terminal-retirement");
+        let owner = forge_provider_api::testing::root_thread("terminal-retirement");
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-retirement").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let publisher = TerminalPublisher::new(owner, sink);
         let old = publisher.source(TerminalSource::Main);
         let _held = publisher.publication.lock().await;
-        let mut publishing =
-            std::pin::pin!(old.publish(forge_provider_api::terminal::TerminalSnapshot::default()));
+        let mut publishing = std::pin::pin!(old.publish(
+            forge_provider_api::terminal::TerminalInventory::observed(Vec::new())
+        ));
         assert!(futures_util::poll!(publishing.as_mut()).is_pending());
         let _replacement = publisher.source(TerminalSource::Main);
         assert!(matches!(
@@ -525,11 +523,11 @@ mod tests {
     /// A cancelled blocked send must not suppress the replacement reader's identical inventory.
     #[tokio::test]
     async fn retired_terminal_source_republishes_identical_inventory_after_full_sink() {
-        let owner = forge_provider_api::ThreadOwner::root("terminal-full-sink");
+        let owner = forge_provider_api::testing::root_thread("terminal-full-sink");
         let (sink, mut events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-full-sink").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let publisher = TerminalPublisher::new(owner.clone(), sink.clone());
@@ -539,22 +537,20 @@ mod tests {
         for _ in 0..capacity {
             sink.activity_writer()
                 .send_wait(forge_provider_api::AdapterActivity::Thread {
-                    thread_id: owner.thread_id(),
+                    thread_id: owner.clone(),
                     event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
-                        forge_provider_api::terminal::TerminalSnapshot::default(),
+                        forge_provider_api::terminal::TerminalInventory::observed(Vec::new()),
                     )),
                 })
                 .await
                 .unwrap();
         }
-        let snapshot = forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: vec![forge_provider_api::terminal::BackgroundTerminal {
+        let snapshot = forge_provider_api::terminal::TerminalInventory::observed(vec![
+            forge_provider_api::terminal::BackgroundTerminal {
                 id: forge_provider_api::terminal::TerminalId::new("still-running").unwrap(),
                 command: "fixture".into(),
-            }],
-        };
+            },
+        ]);
         let mut publishing = Box::pin(old.publish(snapshot.clone()));
         assert!(futures_util::poll!(publishing.as_mut()).is_pending());
         assert_eq!(
@@ -610,11 +606,11 @@ mod tests {
         });
         starting.await.unwrap();
         let stream = event_stream::SessionEventStream::fixture(receive, reader);
-        let owner = forge_provider_api::ThreadOwner::root("terminal-fixture");
+        let owner = forge_provider_api::testing::root_thread("terminal-fixture");
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::session::BindingId::new("terminal-fixture").unwrap(),
             forge_provider_api::EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: owner.clone(),
             },
         );
         let mut monitor = CopilotTerminalMonitor::from_stream(
@@ -647,13 +643,13 @@ mod tests {
     /// A reused native task ID cannot turn an old selection into authority over another binding.
     #[test]
     fn issued_terminal_handles_reject_other_bindings_and_reused_native_tasks() {
-        let snapshot = || forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: vec![forge_provider_api::terminal::BackgroundTerminal {
-                id: forge_provider_api::terminal::TerminalId::new("native-reused").unwrap(),
-                command: "fixture".into(),
-            }],
+        let snapshot = || {
+            forge_provider_api::terminal::TerminalInventory::observed(vec![
+                forge_provider_api::terminal::BackgroundTerminal {
+                    id: forge_provider_api::terminal::TerminalId::new("native-reused").unwrap(),
+                    command: "fixture".into(),
+                },
+            ])
         };
         let mut first = TerminalRegistry::default();
         let mut original = snapshot();
@@ -665,7 +661,7 @@ mod tests {
         assert!(replacement.resolve(&old).is_none());
         assert_ne!(old, current.terminal[0].id);
         first
-            .issue(&mut forge_provider_api::terminal::TerminalSnapshot::default())
+            .issue(&mut forge_provider_api::terminal::TerminalInventory::observed(Vec::new()))
             .unwrap();
         original = snapshot();
         first.issue(&mut original).unwrap();

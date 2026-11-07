@@ -461,6 +461,39 @@ impl CopilotTurnEvent {
         }
     }
 
+    /// Report whether every accepted input is still queued natively, with no root turn started.
+    ///
+    /// Copilot queues a sent message until the session can process it, for example while a
+    /// foreground MCP load is in flight. An abort in that window discards the queue and emits only
+    /// `abort`: no `user.message` and no idle follow, so the turn must settle on the abort itself.
+    pub fn accepted_inputs_unconsumed(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        Ok(state.pending_sends == 0
+            && !state.accepted_inputs.is_empty()
+            && state.root_turns.is_empty()
+            && state
+                .accepted_inputs
+                .iter()
+                .all(|message| !state.observed_inputs.contains(message)))
+    }
+
+    /// Resolve the host submission whose accepted native message this user event consumes.
+    pub fn accepted_submission(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<forge_provider_api::lifecycle::SubmissionId>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
+            .accepted_submissions
+            .get(message_id)
+            .cloned())
+    }
+
     /// Get the positively correlated terminal idle after its delivery coverage settles.
     pub fn terminal_outcome(&self) -> Result<IdleOutcome> {
         self.state
@@ -1199,7 +1232,7 @@ fn terminal_coverage(state: &CopilotTurnState) -> Result<Vec<forge_provider_api:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::{InvocationScope, ThreadOwner};
+    use forge_provider_api::InvocationScope;
 
     /// Create metadata-only native evidence without copying session prompts or tool payloads.
     fn live_event(
@@ -1300,7 +1333,7 @@ mod tests {
         for acknowledge_first in [false, true] {
             let turn = CopilotTurnEvent::default();
             let scope = forge_provider_api::InvocationScope::new(
-                forge_provider_api::ThreadOwner::root("attempt-owner"),
+                forge_provider_api::testing::root_thread("attempt-owner"),
                 "turn",
             );
             let (sink, _events) = forge_provider_api::events::channel(
@@ -1359,7 +1392,7 @@ mod tests {
             turn.register_input(&scope, second_input.clone())?;
             assert!(
                 turn.register_input(
-                    &forge_provider_api::InvocationScope::new(scope.owner.clone(), "foreign"),
+                    &forge_provider_api::InvocationScope::new(scope.thread_id.clone(), "foreign"),
                     second_input.clone()
                 )
                 .is_err()
@@ -2337,7 +2370,10 @@ mod tests {
     #[tokio::test]
     async fn idle_context_keeps_steering_until_cancelled() -> Result<()> {
         let turn = CopilotTurnEvent::default();
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("session"),
+            "exchange",
+        );
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("turn-idle").unwrap(),
             scope.clone(),
@@ -2363,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn new_admission_replaces_retained_scope() -> Result<()> {
         let turn = CopilotTurnEvent::default();
-        let owner = ThreadOwner::root("session");
+        let owner = forge_provider_api::testing::root_thread("session");
         let old = InvocationScope::new(owner.clone(), "old");
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("turn-old").unwrap(),
@@ -2386,7 +2422,7 @@ mod tests {
     #[tokio::test]
     async fn stale_steering_scope_cannot_dispatch_into_successor() -> Result<()> {
         let turn = CopilotTurnEvent::default();
-        let owner = ThreadOwner::root("session");
+        let owner = forge_provider_api::testing::root_thread("session");
         let old = InvocationScope::new(owner.clone(), "old");
         let current = InvocationScope::new(owner, "successor");
         let binding = forge_provider_api::BindingId::new("steering-race")?;

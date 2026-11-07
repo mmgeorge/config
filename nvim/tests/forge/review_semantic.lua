@@ -86,9 +86,9 @@ invoke("<Tab>", 2)
 assert(vim.api.nvim_get_current_line():find("pub fn visible() {", 1, true),
   "source expansion moved the cursor away from its retained declaration")
 invoke("ov", 3)
-for _, window in ipairs(vim.fn.win_findbuf(state.replica.buffer)) do
-  assert(vim.wo[window].winbar:find("Public", 1, true), "visibility did not update both document windows")
-end
+-- The winbar no longer pins the visibility toggle, so the shared diff view carries the state.
+assert(state.diff_view.visibility == "public", "visibility did not switch to public declarations")
+assert(#vim.fn.win_findbuf(state.replica.buffer) == 2, "visibility change dropped a document window")
 assert(not table.concat(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false), "\n"):find("hidden", 1, true))
 invoke("ox", 4)
 invoke("ov", 5)

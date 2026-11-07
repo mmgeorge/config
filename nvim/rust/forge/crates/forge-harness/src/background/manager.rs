@@ -1047,9 +1047,13 @@ mod tests {
         Ok(())
     }
 
-    /// Supersession collects the old owner intentionally while preserving its prefix and subsequent reuse.
+    /// Supersession collects the old owner intentionally and reuses the completed successor.
+    ///
+    /// The superseded generation is cancelled before any model output, so cancellation retracts
+    /// its output-free exchange as described under `session.turn.cancel` in
+    /// `contributing/forge/architecture/harness.md`.
     #[tokio::test]
-    async fn background_supersession_preserves_prefix_and_reuses_completed_successor_without_loss_report()
+    async fn background_supersession_retracts_output_free_generation_and_reuses_completed_successor_without_loss_report()
     -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), async {
             let fixture = tempfile::tempdir()?;
@@ -1105,10 +1109,9 @@ mod tests {
             assert!(Arc::ptr_eq(&successor, &manager.retained.lock().await.get(&key).context("reused owner missing")?.runtime));
             manager.shutdown().await?;
             let exchanges = store.list_exchange(&session_id)?;
-            assert_eq!(exchanges.len(), 3);
-            assert_eq!(exchanges[0].state(), crate::exchange::ExchangeState::Cancelled);
-            assert!(!exchanges[0].turn.is_empty(), "intentional teardown discarded the accepted native prefix");
-            assert!(exchanges[1..].iter().all(|exchange| exchange.state() == crate::exchange::ExchangeState::Complete));
+            assert_eq!(exchanges.len(), 2, "the output-free superseded generation was not retracted");
+            assert!(exchanges.iter().all(|exchange| exchange.state() == crate::exchange::ExchangeState::Complete
+                && !exchange.prompt.contains("cancelled-old-generation")));
             let records = store.list_session_event(&session_id)?;
             assert!(!records.iter().any(|record| matches!(&record.detail,
                 crate::timeline::SessionEventKind::Configuration { field, .. } if field.iter().any(|field| field == "observation_loss")

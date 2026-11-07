@@ -2315,6 +2315,9 @@ impl ReadOnlyPlanReview {
             .map_err(|error| anyhow::anyhow!("plan visibility request failed: {error:?}"))?;
         let public_only = request.options.visibility == DiffVisibility::Public;
         self.source.public_only = public_only;
+        // Revealing a hidden declaration lifts Public filtering for its file side. An explicit
+        // visibility toggle supersedes that per-navigation override in both directions.
+        let previous_revealed = std::mem::take(&mut self.source.revealed);
         let projection = super::review_projection::project(
             &self.source,
             &self.width,
@@ -2330,6 +2333,7 @@ impl ReadOnlyPlanReview {
         });
         if projection.is_err() {
             self.diff_view.fail(request);
+            self.source.revealed = previous_revealed;
             self.source.public_only =
                 self.diff_view.committed().visibility == DiffVisibility::Public;
         }
@@ -3754,6 +3758,67 @@ mod tests {
         assert!(result["source"].is_object(), "{result}");
         assert_eq!(result["source"]["line"], 1);
         assert!(result.get("declarations").is_none());
+    }
+
+    #[test]
+    fn visibility_toggle_clears_reveal_override_and_restores_public_filtering() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&store.workspace);
+        let mut canonical = crate::plan::document::test_fixture("plan", "Reveal override");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Expose one function.".into();
+        design.document.background = "The fixture holds a public and a private function.".into();
+        design.document.design = "Keep the helper private.".into();
+        let (text, bodies) = crate::plan::calls::parse(
+            "lib.rs",
+            "/// Public entry.\npub fn inspect();\nCalls\n  hidden_helper\n/// Private helper.\nfn hidden_helper();\n",
+            &[],
+        )
+        .unwrap();
+        design.proposed.insert("lib.rs".into(), text);
+        design.proposed_calls.insert("lib.rs".into(), bodies);
+        canonical.design = Some(design);
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, digest) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = store
+            .capture_review_source("session", "plan", Some(1), &digest)
+            .unwrap();
+        let mut document = ReadOnlyPlanReview::new(
+            DocumentId("review".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let shows_hidden = |document: &ReadOnlyPlanReview| {
+            document.snapshot().block.iter().any(|block| {
+                block
+                    .text
+                    .row(0)
+                    .is_some_and(|row| row.contains("fn hidden_helper"))
+            })
+        };
+        assert!(document.source.public_only);
+        assert!(!shows_hidden(&document));
+        document
+            .source
+            .revealed
+            .insert(("lib.rs".into(), "proposed".into(), 3));
+
+        document.toggle_visibility().unwrap();
+        assert!(!document.source.public_only);
+        assert!(document.source.revealed.is_empty());
+        assert!(shows_hidden(&document));
+
+        document.toggle_visibility().unwrap();
+        assert!(document.source.public_only);
+        assert!(!shows_hidden(&document));
     }
 
     #[test]

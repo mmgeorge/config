@@ -343,6 +343,9 @@ pub struct TaskEntry {
     pub review_exchange: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionEntry>,
+    /// A resumed entry continues an already announced task instead of starting it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -602,7 +605,17 @@ impl TaskSnapshot {
             delivery: TaskInputDelivery::Pending,
             review_exchange: None,
             execution: None,
+            resumed: false,
         });
+        Ok(())
+    }
+
+    /// Retain a resumption's entry intent without re-announcing the task start.
+    pub(crate) fn request_resume_entry(&mut self, instruction: String, now_ms: i64) -> Result<()> {
+        self.request_entry(instruction, now_ms)?;
+        if let Some(entry) = self.entry.as_mut() {
+            entry.resumed = true;
+        }
         Ok(())
     }
 

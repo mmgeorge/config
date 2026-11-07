@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local commit = require("forge.integrations.commit")
 local ai_commit = require("forge.integrations.ai_commit")
 local git_write = require("forge.git.write")
@@ -48,7 +49,7 @@ local function run()
   assert_true(vim.uv.fs_chmod(repository .. "/.git/hooks/pre-commit", 493), "pre-commit hook could not become executable")
 
   ai_commit.ensure(repository, { ref = "HEAD" })
-  assert_true(request_list[1].params.operation == "generate" and request_list[1].params.comparison == "head",
+  assert_true(request_list[1].params.operation == "generate" and request_list[1].params.comparison == "status",
     "cold Status draft did not generate directly")
 
   local outcome

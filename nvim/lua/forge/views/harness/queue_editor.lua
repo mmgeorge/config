@@ -78,15 +78,19 @@ function M.move(state, draft, direction)
     edit.reserving = edit.reserving or {}
     if edit.reserving[entry.id] then return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments end
     edit.reserving[entry.id] = true
-    input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
-      reservation = edit.reservation }, function(failure)
-      edit.reserving[entry.id] = nil
-      if failure then edit.failure = failure end
-      if edit.commit and not next(edit.reserving) then
-        local commit = edit.commit
-        edit.commit = nil
-        commit()
-      end
+    -- An earlier edit of this message may still await its host result. Read the revision only
+    -- after it settles, because the displayed revision is stale until then.
+    input_state.after_commit(state, entry.id, function()
+      input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
+        reservation = edit.reservation }, function(failure)
+        edit.reserving[entry.id] = nil
+        if failure then edit.failure = failure end
+        if edit.commit and not next(edit.reserving) then
+          local commit = edit.commit
+          edit.commit = nil
+          commit()
+        end
+      end)
     end)
   end
   return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments

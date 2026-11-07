@@ -48,6 +48,15 @@ local success, failure = xpcall(function()
   submit("/plan build the feature")
   await(function() return not require("forge.views.harness.activity").busy(state) and state.active_plan and state.active_plan.model_revision == 1 end, "initial plan missing")
   local source = vim.deepcopy(state.active_plan)
+  -- An unscripted Plan turn revises and resubmits the plan, so script the discussion as an answer.
+  local scripted, script_failure
+  client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = {
+    operation = "script", script = { terminal = "completed", steps = {
+      { kind = "message", content = "response", text = "The design keeps the change in one module." },
+    } },
+  } }, function(_, problem) scripted, script_failure = true, problem end)
+  await(function() return scripted end, "discussion script was not installed")
+  assert(not script_failure, script_failure)
   submit("Why did you choose this design?")
   -- The plan exchange can still be finalizing when the question is submitted, so poll durable
   -- history instead of treating an idle presentation as the discussion's completion.
@@ -70,7 +79,7 @@ local success, failure = xpcall(function()
   end, history or {})))
   assert(require("forge.views.harness.task").current(state).kind == "plan", "discussion lost its planning task")
   assert(state.active_plan.id == source.id and state.active_plan.model_revision == source.model_revision,
-    "discussion changed the submitted plan")
+    "discussion changed the submitted plan: " .. vim.inspect({ source = { source.id, source.model_revision }, active = state.active_plan and { state.active_plan.id, state.active_plan.model_revision } }))
   -- Exchanges no longer record plan ownership; the task assertions above carry that association.
   assert(discussion.origin.kind == "user" and discussion.check_setup == nil,
     "discussion was not recorded as an ordinary user exchange: " .. vim.inspect(discussion.origin))

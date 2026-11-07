@@ -1,4 +1,5 @@
 //! Store observed native-child history separately from managed task scheduling.
+use crate::provider::ScopeOwner;
 
 use super::SqliteStore;
 use crate::agent::ObservedAgent;
@@ -171,7 +172,7 @@ fn select(
             anyhow::ensure!(
                 record.key().binding_id().as_str() == binding
                     && record.key().agent_id().as_str() == agent
-                    && record.parent_scope().owner.session_id().as_str() == session,
+                    && record.parent_scope().owner().session_id().as_str() == session,
                 "stored native child disagrees with its immutable row ownership"
             );
             Ok(record)
@@ -198,7 +199,7 @@ fn write(transaction: &rusqlite::Transaction<'_>, observed: &ObservedAgent) -> R
     let mut siblings = select(
         transaction,
         "SELECT binding_id,agent_id,session_id,payload FROM observed_agent_record WHERE session_id=?1",
-        [observed.parent_scope().owner.session_id().as_str()],
+        [observed.parent_scope().owner().session_id().as_str()],
     )?;
     siblings.retain(|sibling| sibling.key() != observed.key());
     siblings.push(observed.clone());
@@ -208,7 +209,7 @@ fn write(transaction: &rusqlite::Transaction<'_>, observed: &ObservedAgent) -> R
          ON CONFLICT(binding_id,agent_id) DO UPDATE SET payload=excluded.payload \
          WHERE observed_agent_record.session_id=excluded.session_id",
         params![observed.key().binding_id().as_str(), observed.key().agent_id().as_str(),
-            observed.parent_scope().owner.session_id().as_str(), serde_json::to_string(observed)?])?;
+            observed.parent_scope().owner().session_id().as_str(), serde_json::to_string(observed)?])?;
     anyhow::ensure!(
         written == 1,
         "observed native child cannot move between host sessions"
@@ -252,15 +253,15 @@ mod tests {
     /// Register summary-only native work through the production ownership registry.
     fn proof(binding: &str) -> (ObservedAgentAssociation, AgentEvent) {
         let root = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "root-exchange".into(),
             invocation_id: "root-turn".into(),
         };
         let id = AgentId::new("native-child").unwrap();
         let description = AgentDescription {
-            parent_agent_id: Some(root.owner.agent_id().clone()),
+            parent_agent_id: Some(root.owner().agent_id().clone()),
             delegation: Some(AgentDelegation {
-                parent_thread_id: root.owner.thread_id(),
+                parent_thread_id: root.owner().thread_id(),
                 parent_turn_id: root.turn_id().unwrap(),
                 parent_item_id: None,
             }),

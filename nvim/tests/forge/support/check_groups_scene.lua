@@ -1,3 +1,6 @@
+-- Resolve at load time; the scene changes into its workspace before using the helper.
+local check_storage = dofile(vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/check_storage.lua")
+local host_executable = dofile(vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")) .. "/host_executable.lua")
 local M = {}
 
 ---Open an isolated real-host scene with persisted mixed check results.
@@ -7,8 +10,8 @@ function M.open()
   local workspace, data = vim.fn.tempname(), vim.fn.tempname()
   vim.fn.mkdir(workspace, "p")
   vim.fn.mkdir(data, "p")
-  local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-  assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
+  -- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
+  local binary = host_executable()
   local original_stdpath = vim.fn.stdpath
   vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
   package.loaded["forge.builder"] = { ensure = function(callback)
@@ -33,24 +36,18 @@ function M.open()
   end
   client.host_stop()
   assert(vim.wait(5000, function() return client._client.process == nil end, 10), "scene host did not stop")
-  local directory = data .. "/forge/harness/" .. session_id .. "/checks/scene"
+  local directory = check_storage.path(data, session_id, "scene")
   vim.fn.mkdir(directory, "p")
   local commands = {}
   local function command(category, name, scope, status, output, report, cases)
     local index = #commands
     local path = directory .. "/" .. index .. ".output"
+    -- The host reads a callback report from its report file only while a run is live; saved
+    -- history carries the collected report on the command record itself.
     if report then
-      local fixtures, records, passed = {}, {}, 0
-      for _, result in ipairs(report.result) do
-        fixtures[#fixtures + 1] = result.file
-        passed = passed + (result.state == "passed" and 1 or 0)
-        records[#records + 1] = vim.json.encode({ test = result.file, command = { "nvim", "-l", result.file },
-          elapsed = tostring(result.duration_ms) .. "ms", exit_status = result.state == "passed" and 0 or 1,
-          stdout = "", stderr = result.output })
-      end
-      table.insert(records, 1, vim.json.encode({ suite = "scene", fixtures = fixtures }))
-      records[#records + 1] = vim.json.encode({ passed = passed, failed = #fixtures - passed })
-      output = table.concat(records, "\n")
+      local output_list = {}
+      for _, result in ipairs(report.result) do output_list[#output_list + 1] = result.output end
+      output = table.concat(output_list, "\n")
     end
     vim.fn.writefile(vim.split(output or "", "\n", { plain = true }), path)
     commands[#commands + 1] = {
@@ -58,7 +55,7 @@ function M.open()
       state = status, started_at_ms = 1000 + index * 100, completed_at_ms = 1050 + index * 100,
       exit_code = status == "failed" and 1 or 0, error = status == "blocked" and "Required input is unavailable" or vim.NIL,
       stdout = path, stderr = path, output = path, output_bytes = vim.fn.getfsize(path), preview = "",
-      report = vim.NIL,
+      report = report or vim.NIL,
       context = { definition_id = category .. "-fixture", name = name, area = ".", reason = "Fixture",
         matched_files = { scope }, category = category, directory = ".",
         selection = cases and { kind = "cases", cases = cases } or { kind = "files", files = { scope } },
@@ -96,7 +93,7 @@ function M.open()
     context = { automatic = false, trigger = "Scene", task_id = vim.NIL, overrides = vim.empty_dict(), changed_files = {},
       snapshot = { digest = "scene", config = vim.empty_dict(), helper_digest = vim.empty_dict() } },
   }
-  vim.fn.writefile({ vim.json.encode({ version = 4, run = run }) }, directory .. "/record.json")
+  vim.fn.writefile({ vim.json.encode({ version = 5, run = run }) }, directory .. "/record.json")
   local restored, failure
   client.session_initialize(function(value, problem) restored, failure = value, problem end, { session_id = session_id })
   assert(vim.wait(10000, function() return restored or failure end, 10), "scene reload timed out")
@@ -110,13 +107,29 @@ function M.open()
   assert(vim.wait(5000, function() return state.model_list ~= nil end, 10), "restored scene model catalog timed out")
   vim.api.nvim_set_current_win(state.transcript_win)
   local scene = { state = state, root = root, data = data, workspace = workspace }
+  local function toggle_at(row, label)
+    local revision = state.presentation.transcript.revision
+    vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
+    assert(state.presentation.toggle_heading(state.transcript_win), "scene node did not toggle: " .. label)
+    assert(vim.wait(5000, function() return state.presentation.transcript.revision ~= revision end, 10), "scene toggle timed out")
+  end
   function scene.toggle(identity)
     local _, row = state.presentation.transcript.sequence:position(identity)
     assert(row, "scene node is not visible: " .. identity)
-    local revision = state.presentation.transcript.revision
-    vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
-    assert(state.presentation.toggle_heading(state.transcript_win), "scene node did not toggle: " .. identity)
-    assert(vim.wait(5000, function() return state.presentation.transcript.revision ~= revision end, 10), "scene toggle timed out")
+    toggle_at(row, identity)
+  end
+  -- Result rows render inside their scope's group block without a block identity of their own,
+  -- so they are addressed by their unique heading text.
+  function scene.toggle_row(text)
+    local match
+    for index, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+      if line:find(text, 1, true) then
+        assert(not match, "scene row heading is ambiguous: " .. text)
+        match = index - 1
+      end
+    end
+    assert(match, "scene row is not visible: " .. text)
+    toggle_at(match, text)
   end
   function scene.lines()
     return vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)

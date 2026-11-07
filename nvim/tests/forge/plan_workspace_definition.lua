@@ -35,6 +35,36 @@ local autostarts = 0
 local group = vim.api.nvim_create_augroup("PlanDefinitionAutostartTest", { clear = true })
 vim.api.nvim_create_autocmd("FileType", { group = group, callback = function() autostarts = autostarts + 1 end })
 local range = { start = { line = 0, character = 25 }, ["end"] = { line = 0, character = 30 } }
+-- Fake libuv timers let the fixture fire the lookup deadline, cancellation guard, and hidden-buffer
+-- release directly instead of waiting for them on the real clock.
+local original_new_timer = vim.uv.new_timer
+local fake_timer_list = {}
+vim.uv.new_timer = function()
+  local timer = { active = false, closed = false }
+  function timer:start(timeout, repeat_interval, callback)
+    self.timeout, self.repeat_interval, self.callback, self.active = timeout, repeat_interval, callback, true
+    return 0
+  end
+  function timer:stop() self.active = false return 0 end
+  function timer:close() self.active, self.closed = false, true end
+  function timer:is_closing() return self.closed end
+  fake_timer_list[#fake_timer_list + 1] = timer
+  return timer
+end
+local function fire_timers(timeout)
+  local fired = 0
+  for _, timer in ipairs(vim.list_slice(fake_timer_list)) do
+    if timer.active and timer.timeout == timeout then
+      if timer.repeat_interval == 0 then timer.active = false end
+      fired = fired + 1
+      timer.callback()
+    end
+  end
+  return fired
+end
+local function await_submission(previous_count)
+  assert(vim.wait(1000, function() return request_count > previous_count end, 10), "definition request was not sent")
+end
 local function request(current)
   local completed, target, failure, message = false
   local cancel = definition.request(descriptor, current or function() return true end, function(location, error, notice)
@@ -52,7 +82,11 @@ local success, failure = xpcall(function()
   assert(not error, error)
   assert(target and target.line == 1 and target.column == 25, vim.inspect(target))
   assert(vim.fs.abspath(target.path) == vim.fs.normalize(target.path), "definition path is not normalized")
-  assert(not vim.api.nvim_buf_is_valid(source_buffer), "request leaked its hidden source buffer")
+  assert(vim.api.nvim_buf_is_valid(source_buffer) and #vim.fn.win_findbuf(source_buffer) == 0,
+    "hidden source buffer was not retained for reuse")
+  assert(fire_timers(60000) == 1, "released hidden source buffer has no expiry")
+  assert(vim.wait(1000, function() return not vim.api.nvim_buf_is_valid(source_buffer) end, 10),
+    "request leaked its hidden source buffer")
   handler = function(callback) callback(nil, { { targetUri = vim.uri_from_fname(target_path), targetSelectionRange = range, targetRange = range } }) end
   await = request()
   assert(await())
@@ -72,13 +106,18 @@ local success, failure = xpcall(function()
   assert(not retry and not retry_error and retry_notice:find("Retry the jump", 1, true))
   delayed = true
   local current = true
+  local submitted_count = request_count
   await = request(function() return current end)
-  assert(vim.wait(1000, function() return vim.api.nvim_buf_is_valid(source_buffer) end, 10))
+  await_submission(submitted_count)
   current = false
+  assert(fire_timers(50) >= 1, "definition lookup has no cancellation guard")
   local stale, stale_error, stale_message = await()
   assert(not stale and not stale_error and stale_message == "cancelled")
   submitted(nil, { uri = vim.uri_from_fname(target_path), range = range })
+  submitted_count = request_count
   await = request()
+  await_submission(submitted_count)
+  assert(fire_timers(5000) == 1, "definition lookup has no deadline")
   local timed_out, timeout_error = await()
   assert(not timed_out and timeout_error:find("timed out", 1, true))
   assert(cancelled > 0, "timed out requests were not cancelled")
@@ -110,6 +149,7 @@ local success, failure = xpcall(function()
     large_error or "large source or target rejected during definition lookup")
 end, debug.traceback)
 vim.lsp.get_clients, vim.lsp.buf_is_attached, vim.lsp.buf_attach_client = original_clients, original_attached, original_attach
+vim.uv.new_timer = original_new_timer
 vim.api.nvim_del_augroup_by_id(group)
 vim.fn.delete(directory, "rf")
 assert(success, failure)

@@ -280,66 +280,185 @@ fn capability(id: &str) -> ProviderCapability {
     match id {
         "codex" => ProviderCapability {
             integration: ProviderIntegration {
-                background_generation: true, isolated_generation: true, terminal_termination: true,
-                native_agent_suppression: true, mcp_runtime_status: true, mcp_tool_catalog: true,
-                tracked_submission: true, resource_target: Some("codexcli".into()),
-                isolation_modes: if cfg!(windows) { vec![
+                background_generation: true,
+                isolated_generation: true,
+                terminal_termination: true,
+                native_agent_suppression: true,
+                mcp_runtime_status: true,
+                mcp_tool_catalog: true,
+                tracked_submission: true,
+                resource_target: Some("codexcli".into()),
+                isolation_modes: if cfg!(windows) {
+                    vec![
                     forge_provider_api::model::IsolationMode { id: "elevated".into(), label: "Elevated".into(), description: "Dedicated low-privilege users and filesystem ACLs. Setup needs admin approval; sandboxed commands do not run as administrator.".into() },
                     forge_provider_api::model::IsolationMode { id: "unelevated".into(), label: "Unelevated".into(), description: "Restricted token for the current user without admin setup. Weaker network isolation; denied-read paths are unsupported.".into() },
                     forge_provider_api::model::IsolationMode { id: "mxc".into(), label: "MXC".into(), description: "Prefer Microsoft Execution Containers where supported; falls back to Elevated. Child processes stop when the command exits.".into() },
-                ] } else { Vec::new() },
-                limitations: vec![FeatureLimitation { id: CapabilityId::FilesystemAccess, support: Support::Limited { restrictions: vec![CapabilityRestriction::PermissionCallbacksOnly] }, reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. The selected read scope is not enforced as OS read confinement.".into() }],
+                ]
+                } else {
+                    Vec::new()
+                },
+                limitations: vec![FeatureLimitation {
+                    id: CapabilityId::FilesystemAccess,
+                    support: Support::Limited {
+                        restrictions: vec![
+                            CapabilityRestriction::PermissionCallbacksOnly,
+                            CapabilityRestriction::UnconfinedReads,
+                        ],
+                    },
+                }],
                 ..Default::default()
             },
-            os_sandbox: true, native_fork: true, native_compact: true,
-            compaction: CompactionCapability { lifecycle: true, background: false, summary: false, metrics: false },
-            native_steer: true, native_turn_rollback: true,
-            model_selection: true, effort_selection: true, fast_mode: true, ultrafast_mode: true,
-            permission_control: true, background_terminals: true, approval_mode_list: approvals,
-            agent: Default::default(), catalog,
+            os_sandbox: true,
+            native_fork: true,
+            native_compact: true,
+            compaction: CompactionCapability {
+                lifecycle: true,
+                background: false,
+                summary: false,
+                metrics: false,
+            },
+            native_steer: true,
+            native_turn_rollback: true,
+            model_selection: true,
+            effort_selection: true,
+            fast_mode: true,
+            ultrafast_mode: true,
+            permission_control: true,
+            background_terminals: true,
+            approval_mode_list: approvals,
+            agent: Default::default(),
+            catalog,
         },
         "copilot" => ProviderCapability {
-            integration: ProviderIntegration { background_generation: true, isolated_generation: true,
-                terminal_termination: true, native_agent_suppression: true, mcp_runtime_status: true,
-                mcp_tool_catalog: true, tracked_submission: true, resource_target: Some("copilotcli".into()), ..Default::default() },
-            native_fork: true, native_compact: true,
-            compaction: CompactionCapability { lifecycle: true, background: true, summary: true, metrics: true },
-            native_steer: true, native_turn_rollback: true, model_selection: true,
-            effort_selection: true, permission_control: true, background_terminals: true,
-            approval_mode_list: approvals, agent: Default::default(), catalog,
+            integration: ProviderIntegration {
+                background_generation: true,
+                isolated_generation: true,
+                terminal_termination: true,
+                native_agent_suppression: true,
+                mcp_runtime_status: true,
+                mcp_tool_catalog: true,
+                tracked_submission: true,
+                resource_target: Some("copilotcli".into()),
+                ..Default::default()
+            },
+            native_fork: true,
+            native_compact: true,
+            compaction: CompactionCapability {
+                lifecycle: true,
+                background: true,
+                summary: true,
+                metrics: true,
+            },
+            native_steer: true,
+            native_turn_rollback: true,
+            model_selection: true,
+            effort_selection: true,
+            permission_control: true,
+            background_terminals: true,
+            approval_mode_list: approvals,
+            agent: Default::default(),
+            catalog,
             ..Default::default()
         },
         "claude" | "antigravity" => {
             let claude = id == "claude";
             ProviderCapability {
                 integration: ProviderIntegration {
-                    runtime_setup: true, authentication: true, tracked_submission: true,
+                    runtime_setup: true,
+                    authentication: true,
+                    tracked_submission: true,
                     native_agent_suppression: claude,
-                    resource_target: Some(if claude { "claudecode" } else { "antigravity-cli" }.into()),
-                    limitations: if claude { vec![] } else { vec![
-                        FeatureLimitation { id: CapabilityId::FileDiff, support: Support::Limited { restrictions: vec![CapabilityRestriction::UnstructuredDiffs] }, reason: "Edit tools can complete without structured diffs; checkpoint review remains available".into() },
-                        FeatureLimitation { id: CapabilityId::ApprovalRules, support: Support::Limited { restrictions: vec![CapabilityRestriction::EnterpriseTerminalPolicy] }, reason: "Enterprise terminal policy may execute without approval callbacks".into() },
-                        FeatureLimitation { id: CapabilityId::SkillCatalog, support: Support::Limited { restrictions: vec![CapabilityRestriction::InheritedSkills] }, reason: "Project-native skills cannot be excluded by this integration".into() },
-                        FeatureLimitation { id: CapabilityId::SkillMutation, support: Support::Unsupported, reason: "This integration cannot replace skill selections on an existing binding".into() },
-                        FeatureLimitation { id: CapabilityId::McpMutation, support: Support::Unsupported, reason: "This integration cannot replace MCP selections on an existing binding".into() },
-                    ] }, ..Default::default()
+                    resource_target: Some(
+                        if claude {
+                            "claudecode"
+                        } else {
+                            "antigravity-cli"
+                        }
+                        .into(),
+                    ),
+                    limitations: if claude {
+                        vec![]
+                    } else {
+                        vec![
+                            FeatureLimitation {
+                                id: CapabilityId::FileDiff,
+                                support: Support::Limited {
+                                    restrictions: vec![CapabilityRestriction::UnstructuredDiffs],
+                                },
+                            },
+                            FeatureLimitation {
+                                id: CapabilityId::PermissionCallbacks,
+                                support: Support::Limited {
+                                    restrictions: vec![
+                                        CapabilityRestriction::EnterpriseTerminalPolicy,
+                                    ],
+                                },
+                            },
+                            FeatureLimitation {
+                                id: CapabilityId::SkillCatalog,
+                                support: Support::Limited {
+                                    restrictions: vec![CapabilityRestriction::InheritedSkills],
+                                },
+                            },
+                            FeatureLimitation {
+                                id: CapabilityId::SkillMutation,
+                                support: Support::Unsupported,
+                            },
+                            FeatureLimitation {
+                                id: CapabilityId::McpMutation,
+                                support: Support::Unsupported,
+                            },
+                        ]
+                    },
+                    ..Default::default()
                 },
-                native_fork: claude, native_compact: claude, native_steer: claude,
-                model_selection: true, effort_selection: claude, permission_control: true,
-                catalog, approval_mode_list: approvals,
-                compaction: CompactionCapability { lifecycle: claude, summary: claude, ..Default::default() },
+                native_fork: claude,
+                native_compact: claude,
+                native_steer: claude,
+                model_selection: true,
+                effort_selection: claude,
+                permission_control: true,
+                catalog,
+                approval_mode_list: approvals,
+                compaction: CompactionCapability {
+                    lifecycle: claude,
+                    summary: claude,
+                    ..Default::default()
+                },
                 ..Default::default()
             }
         }
         "mock" => ProviderCapability {
-            integration: ProviderIntegration { background_generation: true, isolated_generation: true,
-                terminal_termination: false, native_agent_suppression: true, mcp_runtime_status: true,
-                mcp_tool_catalog: true, local_acceptance: true, resource_target: Some("mock".into()), ..Default::default() },
-            native_fork: true, native_compact: true,
-            compaction: CompactionCapability { lifecycle: true, background: false, summary: true, metrics: true },
-            native_steer: true, native_turn_rollback: true, model_selection: true,
-            effort_selection: true, fast_mode: true, ultrafast_mode: true, permission_control: true,
-            background_terminals: false, approval_mode_list: approvals, agent: Default::default(), catalog: Default::default(),
+            integration: ProviderIntegration {
+                background_generation: true,
+                isolated_generation: true,
+                terminal_termination: false,
+                native_agent_suppression: true,
+                mcp_runtime_status: true,
+                mcp_tool_catalog: true,
+                local_acceptance: true,
+                resource_target: Some("mock".into()),
+                ..Default::default()
+            },
+            native_fork: true,
+            native_compact: true,
+            compaction: CompactionCapability {
+                lifecycle: true,
+                background: false,
+                summary: true,
+                metrics: true,
+            },
+            native_steer: true,
+            native_turn_rollback: true,
+            model_selection: true,
+            effort_selection: true,
+            fast_mode: true,
+            ultrafast_mode: true,
+            permission_control: true,
+            background_terminals: false,
+            approval_mode_list: approvals,
+            agent: Default::default(),
+            catalog: Default::default(),
             ..Default::default()
         },
         _ => unreachable!("registry only calls capability for known identities"),

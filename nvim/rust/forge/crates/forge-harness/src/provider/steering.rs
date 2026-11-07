@@ -576,7 +576,7 @@ mod test {
 
     fn scope() -> InvocationScope {
         InvocationScope {
-            owner: ThreadOwner::root("steering"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("steering")),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }

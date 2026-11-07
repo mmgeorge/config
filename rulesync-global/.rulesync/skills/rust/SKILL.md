@@ -155,27 +155,15 @@ drop(guard);
 | [documentation.md](references/documentation.md) | Writing doc comments, safety comments, or Facet error messages |
 | [synchronization.md](references/synchronization.md) | Adding or restructuring locks, atomics, channels, completion queues, cancellation, or shared mutable state |
 | [dynamic-libraries.md](references/dynamic-libraries.md) | Changing Rust dylibs, FFI, native loading, host/plugin contracts, or hot-reload unload order |
-| [testing.md](references/testing.md) | Adding, moving, or removing tests |
+| [testing.md](references/testing.md) | Adding, moving, or removing tests, or setting up a project's test runner |
 | [benchmarking-and-profiling.md](references/benchmarking-and-profiling.md) | Setting up Criterion/Samply helpers, reading artifacts without a GUI, or supporting optimization changes with measurements |
-
-
-## Testing
-
-Sparingly use add unit tests for algorithms, parsers, and codecs only. Mock external boundaries when isolation proves the owned logic.
-
-Most tests should be integration, include tests on coverage of lifecycle, persistence, concurrent handoff, plugins, rendering, and host/library boundaries.
-
-### Place tests at their boundary
-
-Keep unit tests in the inline `#[cfg(test)]` module of the file they cover.
-
-Keep crate-private integration workflows in the owning module's test module, so they exercise production composition without exposing implementation details. Use the crate's `tests/` directory for public contracts and multi-crate boundaries. Follow the existing fixture layout.
 
 ## Verification
 
-- Validate in the order `cargo check`, `cargo test`, `cargo fmt --check`, `cargo clippy`, `cargo build`. Run `cargo check` on the affected package and target first, and fix compiler errors before running tests. After a compilation failure, repeat `cargo check` before retrying a test.
+- Validate in the order `cargo check`, `cargo nextest run`, `cargo fmt --check`, `cargo clippy`, `cargo build`. Run `cargo check` on the affected package and target first, and fix compiler errors before running tests. After a compilation failure, repeat `cargo check` before retrying a test.
+- Run tests with `cargo nextest run`, never `cargo test`. nextest does not run doctests, so run `cargo test --doc` when the change touches documentation examples. When `cargo nextest` is not installed, report that rather than installing it or falling back to `cargo test`.
 - Never run broad automatic-fix commands such as `cargo clippy --fix` or `cargo fix`.
 - Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change. If a formatting fix changes source, restart from `cargo check`.
-- Pass `cargo check`, `cargo clippy`, `cargo test`, and `cargo build` the same arguments as the project's development build. A mismatched argument invalidates the build cache and recompiles the dependency graph.
+- Pass `cargo check`, `cargo clippy`, `cargo nextest run`, and `cargo build` the same arguments as the project's development build. A mismatched argument invalidates the build cache and recompiles the dependency graph.
 - Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a separate `--target-dir` by default. Select a named integration-test executable (`--test <name>`) only when the requested coverage requires it.
-- Select the smallest test coverage that exercises the change. Run individual tests with `cargo test -p <package> <filter>`, batching related tests in one invocation.
+- Select the smallest test coverage that exercises the change. Run individual tests with `cargo nextest run -p <package> <filter>`, batching related tests in one invocation. Use a filterset (`-E 'test(...)'`) when a name substring cannot select the tests precisely.

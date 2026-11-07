@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalSnapshot};
+use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalInventory};
 use forge_provider_api::{
-    ProviderError, ProviderEventSink, ProviderFailureKind, ProviderOperation, ThreadOwner,
+    ProviderError, ProviderEventSink, ProviderFailureKind, ProviderOperation, ThreadId,
 };
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
@@ -127,7 +127,7 @@ struct PausedShell {
     client: CopilotClient,
     reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown: watch::Sender<bool>,
-    inventory: watch::Sender<TerminalSnapshot>,
+    inventory: watch::Sender<TerminalInventory>,
     activity: watch::Sender<u64>,
     admitted: Result<(), ProviderError>,
     cleanup: Mutex<CleanupProgress>,
@@ -252,7 +252,7 @@ impl ShellSession {
     /// Create a dormant owner before the model session can expose shell tools.
     pub(super) fn new(
         callbacks: Weak<dyn NativeCallbackRouter>,
-        owner: ThreadOwner,
+        owner: ThreadId,
         sink: ProviderEventSink,
     ) -> Self {
         let (interruption, _) = watch::channel(0);
@@ -339,14 +339,10 @@ impl ShellSession {
     }
 
     /// Read the last observed native task inventory without creating a helper.
-    pub(super) async fn snapshot(&self) -> Result<TerminalSnapshot, ProviderError> {
+    pub(super) async fn snapshot(&self) -> Result<TerminalInventory, ProviderError> {
         let startup = self.state.lock().await.startup.clone();
         let Some(startup) = startup else {
-            return Ok(TerminalSnapshot {
-                supported: true,
-                starting: false,
-                terminal: Vec::new(),
-            });
+            return Ok(TerminalInventory::observed(Vec::new()));
         };
         let shell = tokio::time::timeout_at(startup.deadline, startup.result)
             .await
@@ -1068,11 +1064,7 @@ impl ShellSession {
             })
             .collect();
         drop(handles);
-        let snapshot = TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal,
-        };
+        let snapshot = TerminalInventory::observed(terminal);
         if *shell.inventory.borrow() != snapshot {
             shell.inventory.send_replace(snapshot.clone());
             tokio::select! {
@@ -1182,11 +1174,7 @@ async fn open(
         .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol));
     let mut subscription = session.subscribe();
     let (shutdown, mut stopped) = watch::channel(false);
-    let (inventory, _) = watch::channel(TerminalSnapshot {
-        supported: true,
-        starting: false,
-        terminal: Vec::new(),
-    });
+    let (inventory, _) = watch::channel(TerminalInventory::observed(Vec::new()));
     let (activity, _) = watch::channel(0);
     let shell = Arc::new(PausedShell {
         session,

@@ -110,11 +110,11 @@ async fn startup_burst_is_retained_until_create_or_resume_response() {
             let generation = client.generation.clone();
             let trace = Arc::new(StartupTrace {});
             let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(trace));
-            let owner = forge_provider_api::ThreadOwner::root("startup-burst");
+            let owner = forge_provider_api::testing::root_thread("startup-burst");
             let (sink, mut source) = forge_provider_api::events::channel(
                 forge_provider_api::BindingId::new("startup-burst").unwrap(),
                 forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: owner.clone(),
                 },
             );
             sessions.subscribe(owner.clone(), sink.clone()).await;
@@ -128,7 +128,7 @@ async fn startup_burst_is_retained_until_create_or_resume_response() {
                         async move { Ok((client, None)) },
                         SessionSelection {
                             execution_owner: owner.clone(),
-                            correlation_id: owner.session_id().to_string(),
+                            correlation_id: owner.to_string(),
                             session_id: resumed.then(|| "native-startup-resume".to_owned()),
                             model: None,
                             context_tier: None,

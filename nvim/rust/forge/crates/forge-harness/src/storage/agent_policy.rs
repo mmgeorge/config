@@ -1,4 +1,5 @@
 use crate::agent::{Agent, AgentContinuationPolicy, AgentSource, AgentTask};
+use crate::provider::ScopeOwner;
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::ExchangeId;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -10,9 +11,10 @@ impl super::SqliteStore {
         parent_scope: &crate::provider::InvocationScope,
         captured: &[AgentTask],
     ) -> Result<Vec<(Agent, AgentTask)>> {
-        let session_id = parent_scope.owner.session_id();
+        let parent_owner = parent_scope.owner();
+        let session_id = parent_owner.session_id();
         ensure!(
-            parent_scope.owner.agent_id().as_str()
+            parent_scope.owner().agent_id().as_str()
                 == crate::session::HarnessSession::primary_agent_id(session_id.as_str()),
             "only the original root owner can acknowledge child reports"
         );
@@ -21,7 +23,7 @@ impl super::SqliteStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let parent_owned: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE id=?1 AND session_id=?2 AND agent_id=?3)",
-            params![parent_scope.exchange_id.as_str(),session_id.as_str(),parent_scope.owner.agent_id().as_str()],
+            params![parent_scope.exchange_id.as_str(),session_id.as_str(),parent_scope.owner().agent_id().as_str()],
             |row|row.get(0),
         )?;
         ensure!(
@@ -299,7 +301,9 @@ mod tests {
         agent.continuation = stopped;
         store.complete_agent_task(&agent, &task, &child)?;
         let scope = crate::provider::InvocationScope {
-            owner: crate::provider::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                "session",
+            )),
             exchange_id: ExchangeId::from(parent.id.as_str()),
             invocation_id: forge_provider_api::InvocationId::from("accepted-parent-input"),
         };

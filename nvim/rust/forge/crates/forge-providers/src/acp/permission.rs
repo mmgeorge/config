@@ -27,10 +27,15 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
             })
         });
     if let Some(target) = mcp_target {
-        target_list.push(match target.strip_prefix("forge-harness-control/") {
-            Some(name) => PermissionTarget::HostTool { name: name.into() },
-            None => PermissionTarget::Mcp { target },
-        });
+        target_list.push(
+            match target
+                .strip_prefix(HOST_TOOL_SERVER)
+                .and_then(|name| name.strip_prefix('/'))
+            {
+                Some(name) => PermissionTarget::HostTool { name: name.into() },
+                None => PermissionTarget::Mcp { target },
+            },
+        );
     } else if tool["kind"] == "fetch" {
         target_list.push(PermissionTarget::Network {
             target: input["url"].as_str().unwrap_or("*").into(),
@@ -104,15 +109,17 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
             });
         }
         if target_list.is_empty() {
-            target_list.push(match tool["kind"].as_str() {
-                Some("read" | "search") => PermissionTarget::UnknownFile {
+            match tool["kind"].as_str() {
+                Some("read" | "search") => target_list.push(PermissionTarget::UnknownFile {
                     operation: forge_provider_api::access::DirectoryOperation::Read,
-                },
-                Some("edit" | "delete" | "move") => PermissionTarget::UnknownFile {
-                    operation: forge_provider_api::access::DirectoryOperation::Write,
-                },
-                _ => PermissionTarget::Unknown,
-            });
+                }),
+                Some("edit" | "delete" | "move") => {
+                    target_list.push(PermissionTarget::UnknownFile {
+                        operation: forge_provider_api::access::DirectoryOperation::Write,
+                    })
+                }
+                _ => target_list.extend(native_tool_targets(native_tool, tool)),
+            }
         }
     }
     Ok(PermissionRequest {
@@ -121,6 +128,53 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
         reason: None,
         target_list,
     })
+}
+
+/// Name of the MCP server through which Harness exposes its own control tools.
+pub(super) const HOST_TOOL_SERVER: &str = "forge-harness-control";
+
+/// Normalize a native tool that carries no file, command, network, or MCP target.
+///
+/// Claude Code asks permission for its own tools such as `ToolSearch` and `Skill`. Denying them
+/// as unknown operations silently blocks Harness workflows, because the agent discovers deferred
+/// Harness control tools through `ToolSearch`. Loading only Harness control tool schemas carries
+/// those tools' own host authority; any other native tool asks under its native name.
+fn native_tool_targets(native_tool: Option<&str>, tool: &Value) -> Vec<PermissionTarget> {
+    let Some(name) = native_tool
+        .or_else(|| tool["title"].as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return vec![PermissionTarget::Unknown];
+    };
+    if name == "ToolSearch"
+        && let Some(host_tools) = tool["rawInput"]["query"]
+            .as_str()
+            .and_then(|query| query.trim().strip_prefix("select:"))
+            .map(|selection| {
+                selection
+                    .split(',')
+                    .map(|selected| {
+                        selected
+                            .trim()
+                            .strip_prefix("mcp__")
+                            .and_then(|name| name.strip_prefix(HOST_TOOL_SERVER))
+                            .and_then(|name| name.strip_prefix("__"))
+                            .filter(|name| !name.is_empty())
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten()
+            .filter(|host_tools| !host_tools.is_empty())
+    {
+        return host_tools
+            .into_iter()
+            .map(|name| PermissionTarget::HostTool { name: name.into() })
+            .collect();
+    }
+    vec![PermissionTarget::Tool {
+        target: name.to_owned(),
+    }]
 }
 
 #[cfg(test)]
@@ -152,6 +206,54 @@ mod tests {
             vec![PermissionTarget::Mcp {
                 target: "external/plan_read".into()
             }],
+        );
+        Ok(())
+    }
+
+    /// Native tools without file or command targets reach host policy instead of a silent denial.
+    #[test]
+    fn native_tools_without_targets_ask_by_name_and_host_tool_search_uses_host_authority()
+    -> anyhow::Result<()> {
+        let host_search = permission_request(
+            ProviderKind::Claude,
+            &json!({
+                "kind":"other","title":"ToolSearch",
+                "_meta":{"claudeCode":{"toolName":"ToolSearch"}},
+                "rawInput":{"query":"select:mcp__forge-harness-control__goal_complete,mcp__forge-harness-control__goal_blocked","max_results":2}
+            }),
+        )?;
+        assert_eq!(
+            host_search.target_list,
+            vec![
+                PermissionTarget::HostTool {
+                    name: "goal_complete".into()
+                },
+                PermissionTarget::HostTool {
+                    name: "goal_blocked".into()
+                },
+            ],
+        );
+        for (tool, target) in [
+            (
+                json!({"kind":"other","title":"ToolSearch","rawInput":{"query":"select:mcp__external__tool"}}),
+                "ToolSearch",
+            ),
+            (
+                json!({"kind":"other","title":"Load skill: forge-managed:harness-checks",
+                    "_meta":{"claudeCode":{"toolName":"Skill"}},"rawInput":{"skill":"forge-managed:harness-checks"}}),
+                "Skill",
+            ),
+        ] {
+            assert_eq!(
+                permission_request(ProviderKind::Claude, &tool)?.target_list,
+                vec![PermissionTarget::Tool {
+                    target: target.into()
+                }],
+            );
+        }
+        assert_eq!(
+            permission_request(ProviderKind::Claude, &json!({"kind":"other"}))?.target_list,
+            vec![PermissionTarget::Unknown],
         );
         Ok(())
     }

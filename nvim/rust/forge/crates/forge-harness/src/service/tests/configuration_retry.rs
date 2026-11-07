@@ -1,6 +1,7 @@
 //! Verify deferred native configuration against actual child availability and durable desired revisions.
 use super::super::{HarnessBroker, SessionController, native_settings, prompt};
 use super::bootstrap::initialize;
+use crate::provider::ScopeOwner;
 use anyhow::{Context, Result, ensure};
 use forge_protocol::message::Request;
 use serde_json::json;
@@ -8,7 +9,6 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
 
 /// Retain newest preferences through a live child without treating metadata as collection or reviving a canceled root.
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
                                 event: forge_provider_api::agent::AgentLifecycleEvent::Started {
                                     agent: forge_provider_api::agent::AgentDescription {
                                         parent_agent_id: Some(
-                                            request.scope.owner.agent_id().clone(),
+                                            request.scope.owner().agent_id().clone(),
                                         ),
                                         delegation: Some(
                                             forge_provider_api::agent::AgentDelegation {
@@ -123,11 +123,11 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
     });
     let scenario = async {
         controller.start_provider(&sink).await;
-        tokio::time::timeout(Duration::from_secs(5), async { while !controller.provider_ready().await { tokio::task::yield_now().await; } }).await?;
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async { while !controller.provider_ready().await { tokio::task::yield_now().await; } }).await?;
         controller.attach_input(&sink).await?;
         prompt::apply(&controller, Request { id: 1, method: "session.prompt.submit".into(), params: json!({"operation_id":"canceled-root","text":"Do not revive this canceled request"}) }, &sink).await?;
         let session = controller.observer.session_id().to_owned();
-        tokio::time::timeout(Duration::from_secs(5), started.notified()).await.context("root did not admit child while running")?;
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, started.notified()).await.context("root did not admit child while running")?;
         let parent = parent.lock().unwrap().clone().context("parent scope missing")?;
         let owner = crate::provider::ThreadOwner::root(&session);
         let writer = native.event_sink(&owner).await?;
@@ -147,7 +147,7 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
             latest = settings.update(revision, crate::settings::SettingScope::Session, &workspace, &session,
                 &crate::settings::PortableSettings { session_tools: Some(toggle), tool_timeout: Some(crate::session::InputTimeout { amount, unit: crate::session::TimeoutUnit::M }), ..Default::default() })?;
             let command = native_settings::decode_command(&Request { id: 2, method: "session.command.apply".into(), params: json!({"operation_id":format!("desired-{amount}"),"action":"configure","config":{"settings_revision":latest}}) })?;
-            let error = tokio::time::timeout(Duration::from_secs(10), controller.exchange_owner.execute_identified(command, sink.clone())).await?.expect_err("active child configuration unexpectedly committed");
+            let error = tokio::time::timeout( crate::hang_guard::HANG_GUARD, controller.exchange_owner.execute_identified(command, sink.clone())).await?.expect_err("active child configuration unexpectedly committed");
             ensure!(matches!(error, crate::exchange::command::ExecuteCommandError::Failed(crate::exchange::command::CommandFailure::ConfigurationRejected(crate::exchange::command::ConfigurationRejection::Provider(forge_provider_api::ProviderFailureKind::ExecutionActive)))), "guard did not certify unchanged native-child rejection: {error:#}");
             ensure!(settings.application(&session)?.applied_revision != Some(latest), "rejected native configuration was marked applied");
         }
@@ -163,7 +163,7 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
         let history = controller.observer.snapshot()?.session.provider_session_id.context("native history missing")?;
         writer.send_wait(forge_provider_api::AdapterActivity::Thread { thread_id: owner.thread_id(), event: forge_provider_api::ThreadEvent::IdentityResolved(history.try_into()?) }).await.context("identity delivery failed after ordered root cancellation")?;
         writer.send_wait(forge_provider_api::AdapterActivity::Thread { thread_id: owner.thread_id(), event: forge_provider_api::ThreadEvent::ContextUsage(forge_provider_api::context::ContextUsage::reported(7, 100).unwrap()) }).await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             while controller.observer.snapshot()?.session.context_usage.as_ref().map(|usage| usage.used) != Some(7) { tokio::task::yield_now().await; }
             Ok::<(), anyhow::Error>(())
         }).await??;
@@ -171,7 +171,7 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
         ensure!(attempts.load(Ordering::Acquire) == before, "identity or token metadata retried native configuration");
         child_active.store(false, Ordering::Release);
         writer.send_wait(forge_provider_api::AdapterActivity::Agent { agent_id: child, event: forge_provider_api::agent::AgentEvent::Lifecycle { event: forge_provider_api::agent::AgentLifecycleEvent::Finished { agent: description, outcome: forge_provider_api::agent::AgentOutcome::Completed } } }).await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
             loop {
                 let settings = crate::settings::SettingsStore::open(&controller.data_root)?;
                 if settings.application(&session)?.applied_revision == Some(latest) { return Ok::<(), anyhow::Error>(()); }
@@ -190,7 +190,11 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
     let cleanup = async {
-        tokio::time::timeout(Duration::from_secs(5), controller.finish_exchange_owner()).await??;
+        tokio::time::timeout(
+            crate::hang_guard::HANG_GUARD,
+            controller.finish_exchange_owner(),
+        )
+        .await??;
         provider.provider_handle().shutdown().await?;
         controller.finish_session_events().await?;
         Ok::<(), anyhow::Error>(())

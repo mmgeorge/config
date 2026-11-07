@@ -248,8 +248,10 @@ mod tests {
     async fn queued_cancellation_waits_for_original_handoff_not_discarded_replay() {
         let pending = PendingInputs::new();
         let binding = BindingId::new("binding").unwrap();
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("owner"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("owner"),
+            "exchange",
+        );
         let operation = OperationId::new("input-operation").unwrap();
         let original = pending.register(&binding, &scope, &operation);
         drop(pending.register(&binding, &scope, &operation));
@@ -266,7 +268,7 @@ mod tests {
     async fn absent_scope_cancellation_prevents_late_registration_only_for_that_scope() {
         let pending = PendingInputs::new();
         let binding = BindingId::new("binding").unwrap();
-        let owner = forge_provider_api::ThreadOwner::root("owner");
+        let owner = forge_provider_api::testing::root_thread("owner");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         pending.cancel(&binding, &scope).await;
         let late = pending.register(&binding, &scope, &OperationId::new("late-input").unwrap());
@@ -290,8 +292,10 @@ mod tests {
     async fn queued_cancellation_finishes_after_candidate_is_dropped() {
         let pending = PendingInputs::new();
         let binding = BindingId::new("binding").unwrap();
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("owner"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("owner"),
+            "exchange",
+        );
         let candidate = pending.register(&binding, &scope, &OperationId::new("input").unwrap());
         let cancel = pending.cancel(&binding, &scope);
         tokio::pin!(cancel);
@@ -306,8 +310,10 @@ mod tests {
         let pending = PendingInputs::new();
         let binding = BindingId::new("binding").unwrap();
         let sibling = BindingId::new("sibling").unwrap();
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("owner"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("owner"),
+            "exchange",
+        );
         let operation = OperationId::new("input").unwrap();
         for _ in 0..20 {
             drop(pending.register(&binding, &scope, &operation));
@@ -338,7 +344,7 @@ mod tests {
         retired.await;
         let late = pending.register(
             &binding,
-            &InvocationScope::new(scope.owner.clone(), "new-exchange"),
+            &InvocationScope::new(scope.thread_id.clone(), "new-exchange"),
             &OperationId::new("late-input").unwrap(),
         );
         assert!(
@@ -356,8 +362,10 @@ mod tests {
     async fn binding_close_reason_dominates_invocation_cancellation() {
         let pending = PendingInputs::new();
         let binding = BindingId::new("binding").unwrap();
-        let scope =
-            InvocationScope::new(forge_provider_api::ThreadOwner::root("owner"), "exchange");
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("owner"),
+            "exchange",
+        );
         let candidate = pending.register(&binding, &scope, &OperationId::new("input").unwrap());
         candidate.registered();
         pending.cancel(&binding, &scope).await;

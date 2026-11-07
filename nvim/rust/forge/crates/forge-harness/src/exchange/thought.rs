@@ -75,6 +75,9 @@ impl Exchange {
             .filter(|entry| matches!(entry, ExchangeEntry::Commentary { commentary }
                 if self.commentary_is_eligible(commentary)))
             .map(ExchangeEntry::id);
+        // A parked, finalizing, or finished exchange runs nothing, so only a running execution
+        // clock keeps the newest group open; otherwise its label would report stale running tools.
+        let executing = !self.is_finished() && self.execution_started_at_ms().is_some();
         let mut content = ExchangeContentView {
             commentary: Vec::new(),
             part: Vec::new(),
@@ -115,7 +118,7 @@ impl Exchange {
             if message.is_none() && commentary.tool.is_empty() && commentary.check.is_empty() {
                 continue;
             }
-            let live = !self.is_finished() && active == Some(commentary.id.as_str());
+            let live = executing && active == Some(commentary.id.as_str());
             let mut view = CommentaryView {
                 id: if matches!(commentary.source, CommentarySource::Provider { .. })
                     && message.is_none()
@@ -178,7 +181,7 @@ impl Exchange {
                     } else {
                         &mut view.tools
                     };
-                    group.live |= !self.is_finished() && tool.state() == ToolState::Running;
+                    group.live |= executing && tool.state() == ToolState::Running;
                     group.call.push(ThoughtCall {
                         id: node.id(),
                         turn,
@@ -325,6 +328,36 @@ mod tests {
         assert!(owner.tools.live);
         assert!(matches!(content.part[1], EntryPart::Event(_)));
         assert_eq!(restored.node_list.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn parked_exchange_settles_its_latest_tool_group() -> Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"parked", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let start =
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                title: "inspect".into(),
+                name: "inspect".into(),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+        crate::turn::test_support::tool(&mut exchange, &address, "call", start, [], 1)?;
+        let running = exchange.content(&exchange.node_list.iter().collect::<Vec<_>>(), true)?;
+        assert!(running.commentary[0].tools.live);
+        exchange.pause_for_restart(3)?;
+        assert!(exchange.is_parked());
+        let parked = exchange.content(&exchange.node_list.iter().collect::<Vec<_>>(), true)?;
+        assert!(
+            !parked.commentary[0].tools.live,
+            "a parked exchange kept its tool group running"
+        );
         Ok(())
     }
 

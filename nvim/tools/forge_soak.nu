@@ -8,14 +8,12 @@ def process_memory_bytes [] {
 
 def main [
   --duration: duration = 30min
-  --timeout: duration = 60sec
   --workflows: string = "performance_acceptance,status_native,native_syntax_bypass,review_document,commit_host"
 ] {
   if $duration <= 0sec { error make {msg: "duration must be greater than zero"} }
-  if $timeout <= 0sec or $timeout > 120sec { error make {msg: "timeout must be between zero and 120 seconds"} }
   cd $repository_root
   let workflow_list = $workflows | split row "," | each {|value| $value | str trim } | where {|value| $value != ""}
-  if ($workflow_list | is-empty) { error make {msg: "workflows must contain at least one fixture filter"} }
+  if ($workflow_list | is-empty) { error make {msg: "workflows must name at least one Forge fixture"} }
   let started = date now
   let deadline = $started + $duration
   mut iteration = 0
@@ -26,7 +24,7 @@ def main [
       let operation_started = date now
       let memory_before = process_memory_bytes
       let result = try {
-        run-external $nu.current-exe nvim/tools/run_tests.nu $workflow ...["--timeout", ($timeout | into string)] | complete
+        run-external $nu.current-exe "--no-config-file" .forge/checks/lua-tests.nu $"nvim/tests/forge/($workflow).lua" | complete
       } catch {|failure| {exit_code: 127, stdout: "", stderr: $failure.msg} }
       let entry = {
         iteration: $iteration

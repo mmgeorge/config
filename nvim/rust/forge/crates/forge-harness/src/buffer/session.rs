@@ -3125,6 +3125,7 @@ mod tests {
                     intent: crate::exchange::InputIntent::Steering,
                     created_at_ms: 1,
                     question: None,
+                    submission_id: None,
                 },
             });
         owner.reconcile(vec![entry])?;
@@ -3541,10 +3542,7 @@ mod tests {
         reopen_turn(&mut active["exchange"]["turn"][0]);
         crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["output"] =
             serde_json::json!(output);
-        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
-            serde_json::json!("inProgress");
-        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["completed_at_ms"] =
-            serde_json::Value::Null;
+        crate::turn::test_support::reopen_tool_value(&mut active["exchange"], "tool");
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let entry = TimelineEntry::Exchange {
             id: "active".into(),
@@ -4173,10 +4171,7 @@ mod tests {
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
         reopen_turn(&mut active["exchange"]["turn"][0]);
-        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["status"] =
-            serde_json::json!("inProgress");
-        crate::turn::test_support::tool_value_mut(&mut active["exchange"], "tool")["completed_at_ms"] =
-            serde_json::Value::Null;
+        crate::turn::test_support::reopen_tool_value(&mut active["exchange"], "tool");
         let active = TimelineEntry::Exchange {
             id: "active".into(),
 
@@ -4188,7 +4183,10 @@ mod tests {
         let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else {
             unreachable!()
         };
-        let mut entries: Vec<_> = (0..3000)
+        // History size is irrelevant to the property: every historical entry must stay
+        // untouched, so a handful of entries proves it as well as thousands.
+        const HISTORY_ENTRY_COUNT: usize = 32;
+        let mut entries: Vec<_> = (0..HISTORY_ENTRY_COUNT)
             .map(|index| interaction_entry(&format!("history-{index}")))
             .collect();
         entries.push(active);
@@ -4216,7 +4214,7 @@ mod tests {
                 .iter()
                 .map(|block| block.text.row_count())
                 .sum::<usize>()
-                < 30000
+                < HISTORY_ENTRY_COUNT * 10
         );
         let historical_preview =
             format!("{}:preview", tool_display(&owner, "history-0:turn:1:tool"));
@@ -4244,7 +4242,7 @@ mod tests {
             .expect("incremental output");
         assert!(matches!(
             &patch.operation[..],
-            [TimelineOperation::ToolOutput { index: 3000, .. }]
+            [TimelineOperation::ToolOutput { index, .. }] if *index == HISTORY_ENTRY_COUNT
         ));
         let sync = owner.sync(&document, expanded_revision)?;
         assert!(sync.snapshot.is_none());
@@ -5307,11 +5305,8 @@ mod tests {
         value["exchange"]["state"] = json!("running");
         value["exchange"]["completed_at_ms"] = Value::Null;
         value["exchange"]["execution_started_at_ms"] = json!(1);
-        value["exchange"]["turn"][0]["state"] = json!({"kind":"running"});
-        crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["status"] =
-            json!("inProgress");
-        crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["completed_at_ms"] =
-            Value::Null;
+        reopen_turn(&mut value["exchange"]["turn"][0]);
+        crate::turn::test_support::reopen_tool_value(&mut value["exchange"], "tool");
         let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
         let address = exchange.turn[0].provider().clone();
         crate::turn::test_support::tool(
@@ -6086,10 +6081,7 @@ mod tests {
             reopen_turn(&mut value["exchange"]["turn"][0]);
             crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["output"] =
                 serde_json::json!(initial);
-            crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["status"] =
-                serde_json::json!("inProgress");
-            crate::turn::test_support::tool_value_mut(&mut value["exchange"], "tool")["completed_at_ms"] =
-                serde_json::Value::Null;
+            crate::turn::test_support::reopen_tool_value(&mut value["exchange"], "tool");
             let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![TimelineEntry::Exchange {
@@ -6499,10 +6491,7 @@ mod tests {
             raw["completed_at_ms"] = serde_json::Value::Null;
             raw["execution_started_at_ms"] = serde_json::json!(1);
             reopen_turn(&mut raw["turn"][0]);
-            crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
-                serde_json::json!("inProgress");
-            crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
-                serde_json::Value::Null;
+            crate::turn::test_support::reopen_tool_value(&mut raw, "tool");
             Ok(serde_json::from_value(raw)?)
         };
         let mut child = live("child")?;
@@ -6693,10 +6682,7 @@ mod tests {
         raw["completed_at_ms"] = serde_json::Value::Null;
         raw["execution_started_at_ms"] = serde_json::json!(1);
         reopen_turn(&mut raw["turn"][0]);
-        crate::turn::test_support::tool_value_mut(&mut raw, "tool")["status"] =
-            serde_json::json!("inProgress");
-        crate::turn::test_support::tool_value_mut(&mut raw, "tool")["completed_at_ms"] =
-            serde_json::Value::Null;
+        crate::turn::test_support::reopen_tool_value(&mut raw, "tool");
         let mut interaction: Exchange = serde_json::from_value(raw)?;
         let agent = TimelineEntry::AgentLifecycle {
             id: "agent:child".into(),

@@ -1,4 +1,14 @@
-pub use forge_provider_api::retry::ProviderRetry;
+use crate::provider::ScopeOwner;
+/// Host retry schedule for one admitted provider request.
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct ProviderRetry {
+    /// One-based retry number, excluding the initial attempt.
+    pub attempt: usize,
+    /// Maximum retries for this request.
+    pub max_attempts: usize,
+    /// Deadline for the delay, absent once the retry is running.
+    pub retry_at_ms: Option<i64>,
+}
 use std::time::Duration;
 
 use anyhow::Result;
@@ -370,7 +380,7 @@ where
         author_continuation(&mut request);
         let previous_scope = event_sink.invocation_scope()?;
         let scope = super::InvocationScope::new(
-            previous_scope.owner.clone(),
+            previous_scope.owner().clone(),
             previous_scope.exchange_id.clone(),
         );
         let successor_sink = event_sink.successor_invocation_sink(&scope)?;
@@ -593,7 +603,7 @@ mod tests {
         )
         .unwrap();
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
@@ -643,7 +653,7 @@ mod tests {
 
     fn scope() -> InvocationScope {
         InvocationScope {
-            owner: ThreadOwner::root("retry-fixture"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("retry-fixture")),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
@@ -961,7 +971,7 @@ mod tests {
         assert_eq!(retry_scopes[0], scope());
         assert_eq!(retry_scopes[1], scope());
         assert_ne!(retry_scopes[2].invocation_id, scope().invocation_id);
-        assert_eq!(retry_scopes[2].owner, scope().owner);
+        assert_eq!(retry_scopes[2].owner(), scope().owner());
         assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
         assert_eq!(recovered_log.prompt_count.load(Ordering::SeqCst), 2);
         assert_eq!(recovered_log.continuation_count.load(Ordering::SeqCst), 1);
@@ -1032,7 +1042,7 @@ mod tests {
                 assert_eq!(retry_scopes[0], scope());
                 assert_eq!(retry_scopes[1], scope());
                 assert_ne!(retry_scopes[2].invocation_id, scope().invocation_id);
-                assert_eq!(retry_scopes[2].owner, scope().owner);
+                assert_eq!(retry_scopes[2].owner(), scope().owner());
                 assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
             }
         }

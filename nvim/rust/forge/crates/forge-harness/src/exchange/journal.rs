@@ -816,8 +816,7 @@ mod tests {
                     event: forge_provider_api::ProviderConnectionEvent::Warning(
                         forge_provider_api::ProviderWarning {
                             scope: forge_provider_api::WarningScope::Thread {
-                                thread_id: forge_provider_api::ThreadOwner::root("owner")
-                                    .thread_id(),
+                                thread_id: crate::provider::ThreadOwner::root("owner").thread_id(),
                             },
                             kind: forge_provider_api::ProviderWarningKind::NativeNotice {
                                 category: forge_provider_api::ProviderFailureKind::Transport,
@@ -832,7 +831,9 @@ mod tests {
             assert_eq!(
                 journal.append_core(&CoreRecord::provider_event(
                     forge_provider_api::EventScope::Binding {
-                        owner: forge_provider_api::ThreadOwner::root("owner")
+                        thread_id: forge_provider_api::ThreadId::from(
+                            crate::provider::ThreadOwner::root("owner")
+                        )
                     },
                     &event
                 ))?,

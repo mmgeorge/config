@@ -1428,22 +1428,19 @@ impl TimelineRenderer<'_> {
             MarkdownRole::Response,
         )?;
         if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
-            self.task_started(&interaction.id, start, &interaction.prompt)?;
+            self.task_notice(
+                &format!("{}:start", interaction.id),
+                &start.heading(),
+                &interaction.prompt,
+            )?;
         } else if let crate::exchange::ExchangeOrigin::TaskContinuation { reason } =
             &interaction.origin
         {
-            self.literal(
+            self.task_notice(
                 &format!("{}:origin", interaction.id),
-                &format!("◇ {reason}"),
-                None,
-            )?;
-            let prompt = TranscriptRenderer::new(&self.content_width())?.literal(
-                BlockId(format!("{}:prompt", interaction.id)),
+                reason,
                 &interaction.prompt,
-                2,
             )?;
-            self.prompt.push(prompt.id.clone());
-            self.push(prompt)?;
         } else if !matches!(
             interaction.origin,
             crate::exchange::ExchangeOrigin::NativeAgent
@@ -2966,7 +2963,7 @@ impl TimelineRenderer<'_> {
 
     fn session_event(&mut self, event: &crate::timeline::SessionEventRecord) -> Result<()> {
         if let SessionEventKind::TaskStarted { start, prompt } = &event.detail {
-            return self.task_started(&event.id, start, prompt);
+            return self.task_notice(&format!("{}:start", event.id), &start.heading(), prompt);
         }
         if let SessionEventKind::Compaction { compaction } = &event.detail {
             return self.compaction(&event.id, compaction);
@@ -2986,20 +2983,19 @@ impl TimelineRenderer<'_> {
         )
     }
 
-    fn task_started(
-        &mut self,
-        id: &str,
-        start: &crate::exchange::TaskStart,
-        prompt: &str,
-    ) -> Result<()> {
-        let identity = format!("{id}:start");
-        let mut text = format!("◇ {}", start.heading());
-        if !prompt.is_empty() {
+    /// Render a task start or continuation as one notice whose Harness-authored input stays folded.
+    ///
+    /// The provider receives the input, but the user reads only the notice heading; a multi-line
+    /// literal starts as a closed fold, so the complete instruction remains inspectable without
+    /// filling the transcript.
+    fn task_notice(&mut self, identity: &str, heading: &str, input: &str) -> Result<()> {
+        let mut text = format!("◇ {heading}");
+        if !input.is_empty() {
             text.push('\n');
-            text.push_str(prompt);
+            text.push_str(input);
         }
-        self.literal(&identity, &text, None)?;
-        self.prompt.push(BlockId(identity));
+        self.literal(identity, &text, None)?;
+        self.prompt.push(BlockId(identity.to_owned()));
         Ok(())
     }
 
@@ -3595,6 +3591,7 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::ScopeOwner;
     #[test]
     fn compaction_context_usage_survives_event_order_and_reload() -> anyhow::Result<()> {
         use super::*;
@@ -4024,7 +4021,7 @@ mod tests {
         );
         let evidence_address = crate::turn::ToolAddress {
             turn: crate::provider::TurnAddress {
-                thread_id: scope.owner.thread_id(),
+                thread_id: scope.owner().thread_id(),
                 turn_id: scope.turn_id().unwrap(),
                 scope,
             },
@@ -6448,7 +6445,7 @@ mod tests {
             .unwrap()
         };
         for count in 1..=4 {
-            for status in ["in_progress", "completed"] {
+            for status in ["running", "completed"] {
                 let fixture_start = forge_provider_api::ItemStart::CommandExecution(
                     forge_provider_api::ToolDescriptor {
                         semantics: Default::default(),
@@ -8299,7 +8296,7 @@ mod tests {
     }
 
     #[test]
-    fn task_continuation_renders_actual_input_with_harness_origin() {
+    fn task_continuation_folds_its_input_under_the_harness_notice() {
         let interaction: Exchange = serde_json::from_value(json!({
             "id":"continuation", "session_id":"session", "agent_id":"primary", "ordinal":2,
             "prompt":"Run the remaining validation and resolve failures.",
@@ -8321,23 +8318,26 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert_eq!(projected.entry.block[0].id.0, "continuation:origin");
+        // The Harness-authored input stays in the notice's closed fold, like a task start.
+        let notice = &projected.entry.block[0];
+        assert_eq!(notice.id.0, "continuation:origin");
+        let text = notice.text.wire_rows().join("\n");
+        assert!(text.contains("Validation remains"), "{text}");
+        assert!(text.contains("Run the remaining validation and resolve failures."));
+        assert_eq!(notice.metadata.fold.len(), 1);
         assert!(
-            projected.entry.block[0]
-                .text
-                .wire_rows()
-                .join("\n")
-                .contains("◇ Validation remains")
+            notice.metadata.fold[0].closed,
+            "continuation input rendered unfolded"
         );
-        assert_eq!(projected.entry.block[1].id.0, "continuation:prompt");
         assert!(
-            projected.entry.block[1]
-                .text
-                .wire_rows()
-                .join("\n")
-                .contains("Run the remaining validation and resolve failures.")
+            projected
+                .entry
+                .block
+                .iter()
+                .all(|block| block.id.0 != "continuation:prompt"),
+            "continuation input rendered as a separate prompt block"
         );
-        assert_eq!(projected.prompt, vec![projected.entry.block[1].id.clone()]);
+        assert_eq!(projected.prompt, vec![notice.id.clone()]);
     }
 
     #[test]
@@ -8972,11 +8972,13 @@ mod tests {
         let mut turn = Turn::new(
             "turn".into(),
             crate::provider::test_support::address(&InvocationScope {
-                owner: ThreadOwner::new(
-                    "session".into(),
-                    forge_provider_api::agent::AgentId::new("primary").unwrap(),
-                )
-                .expect("registered session and agent identities are nonempty"),
+                thread_id: forge_provider_api::ThreadId::from(
+                    ThreadOwner::new(
+                        "session".into(),
+                        forge_provider_api::agent::AgentId::new("primary").unwrap(),
+                    )
+                    .expect("registered session and agent identities are nonempty"),
+                ),
                 exchange_id: "work".into(),
                 invocation_id: "invocation".into(),
             }),
@@ -10143,6 +10145,192 @@ mod tests {
         Ok(())
     }
 
+    /// Steering a provider consumes after its current answer renders between the two answers.
+    ///
+    /// Copilot can hold steering until a model call ends: the input is acknowledged before the
+    /// first answer streams, and its native echo arrives after that answer. The echo, not the
+    /// acknowledgement, marks where the model read the input, so the steering row moves there and
+    /// the reply to it no longer runs on from the earlier answer.
+    #[test]
+    fn steering_consumed_after_an_answer_renders_between_the_answers() -> anyhow::Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"late-steering", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Write an essay", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let submission = forge_provider_api::SubmissionId::try_from("steering-submission")?;
+        exchange.append_acknowledged_input(
+            Some("steering-input".into()),
+            Some(submission.clone()),
+            crate::exchange::InputIntent::Steering,
+            "Reply with BETA.".into(),
+            1,
+        )?;
+        let message = |id: &str, item: forge_provider_api::ItemStart| {
+            crate::turn::test_support::item_event(
+                &address,
+                id,
+                forge_provider_api::ItemEvent::Started(item),
+            )
+        };
+        let agent = |text: &str| {
+            forge_provider_api::ItemStart::AgentMessage(forge_provider_api::AgentMessageStart {
+                text: text.into(),
+                classification: forge_provider_api::MessageClassification::Unclassified,
+            })
+        };
+        exchange.observe_event(&message("essay", agent("Bridges are old.")), 2)?;
+        exchange.observe_event(
+            &message(
+                "steering-echo",
+                forge_provider_api::ItemStart::UserMessage(forge_provider_api::UserMessageStart {
+                    text: "Reply with BETA.".into(),
+                    submission_id: Some(submission),
+                }),
+            ),
+            3,
+        )?;
+        exchange.observe_event(&message("reply", agent("BETA")), 4)?;
+        let order = exchange
+            .node_list
+            .iter()
+            .map(|node| match node {
+                crate::exchange::ExchangeNode::ExchangeInput { prompt } => prompt.text.clone(),
+                crate::exchange::ExchangeNode::TurnContent { id, .. } => id.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        // The essay, the echo, and the reply are the turn's first three messages; the echo
+        // renders no row of its own.
+        assert!(
+            order.len() == 3
+                && order[0].ends_with(":message:1")
+                && order[1] == "Reply with BETA."
+                && order[2].ends_with(":message:3"),
+            "steering did not move to where the provider consumed it: {order:?}"
+        );
+        Ok(())
+    }
+
+    /// A native echo of a Harness child-result report is input evidence, not a user prompt row.
+    #[test]
+    fn native_echo_of_a_child_report_renders_no_prompt_row() -> anyhow::Result<()> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"child-echo", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Delegate the work", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let report = format!(
+            "{}\n{{\"task_id\":\"child-task\"}}",
+            crate::agent::report::CHILD_RESULT_PREAMBLE
+        );
+        exchange.observe_event(
+            &crate::turn::test_support::item_event(
+                &address,
+                "child-report-echo",
+                forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                    forge_provider_api::UserMessageStart {
+                        text: report,
+                        submission_id: None,
+                    },
+                )),
+            ),
+            1,
+        )?;
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            2,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Harness child result"), "{text}");
+        assert!(!text.contains("child-task"), "{text}");
+        Ok(())
+    }
+
+    /// A provider echo of Harness-authored task input renders only the task notice.
+    #[test]
+    fn native_echo_of_task_input_renders_no_prompt_row() -> anyhow::Result<()> {
+        let instruction =
+            "Resume working toward this goal: write out.txt. Use goal_complete or goal_blocked.";
+        for origin in [
+            json!({"kind":"task_continuation","reason":"The task was resumed"}),
+            json!({"kind":"task_started","start":{"kind":"goal","title":"write out.txt"}}),
+        ] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"task-echo", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":instruction, "origin":origin, "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            exchange.resume(0)?;
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 0)?;
+            exchange.observe_event(
+                &crate::turn::test_support::item_event(
+                    &address,
+                    "task-input-echo",
+                    forge_provider_api::ItemEvent::Started(
+                        forge_provider_api::ItemStart::UserMessage(
+                            forge_provider_api::UserMessageStart {
+                                text: instruction.into(),
+                                submission_id: None,
+                            },
+                        ),
+                    ),
+                ),
+                1,
+            )?;
+            let projected = project_at(
+                &TimelineEntry::Exchange {
+                    id: exchange.id.clone(),
+                    created_at_ms: 0,
+                    exchange: exchange.into(),
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                2,
+            )?;
+            // Only the notice's closed fold carries the instruction; the echo adds no prompt row.
+            let carriers = projected
+                .entry
+                .block
+                .iter()
+                .filter(|block| block.text.wire_rows().join("\n").contains("goal_complete"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                carriers.len(),
+                1,
+                "the task input rendered outside its notice"
+            );
+            assert!(
+                carriers[0]
+                    .metadata
+                    .fold
+                    .first()
+                    .is_some_and(|fold| fold.closed),
+                "the task input rendered unfolded"
+            );
+        }
+        Ok(())
+    }
+
     /// A turn restarted after an interruption is separated from the partial answer it replaces.
     #[test]
     fn interrupted_turn_and_its_resumption_render_a_boundary() -> anyhow::Result<()> {
@@ -10192,35 +10380,35 @@ mod tests {
     /// Native child history remains visible without managed actions or a fabricated user submission.
     #[test]
     fn observed_native_history_is_read_only_and_unavailable_is_explicit() -> anyhow::Result<()> {
-        use crate::provider::{InvocationScope, ThreadOwner, TurnAddress};
+        use crate::provider::{InvocationScope, ScopeOwner, ThreadOwner, TurnAddress};
         use forge_provider_api::agent::{
             AgentActiveState, AgentDelegation, AgentDescription, AgentEvent, AgentId,
             AgentLifecycleEvent,
         };
         let root = InvocationScope {
-            owner: ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
             exchange_id: "root".into(),
             invocation_id: "root-turn".into(),
         };
         let owner = ThreadOwner::new(
-            root.owner.session_id().clone(),
+            root.owner().session_id().clone(),
             AgentId::new("execution-owner")?,
         )?;
         let scope = InvocationScope {
-            owner,
+            thread_id: owner.thread_id(),
             exchange_id: root.exchange_id.clone(),
             invocation_id: "child-turn".into(),
         };
         let address = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id()?,
             scope,
         };
         let public = AgentId::new("public-child")?;
         let description = AgentDescription {
-            parent_agent_id: Some(root.owner.agent_id().clone()),
+            parent_agent_id: Some(root.owner().agent_id().clone()),
             delegation: Some(AgentDelegation {
-                parent_thread_id: root.owner.thread_id(),
+                parent_thread_id: root.owner().thread_id(),
                 parent_turn_id: root.turn_id()?,
                 parent_item_id: None,
             }),

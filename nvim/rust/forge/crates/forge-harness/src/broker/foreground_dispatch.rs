@@ -100,7 +100,7 @@ impl ForegroundDispatch {
             .engine
             .active_invocation_scope()?
             .unwrap_or_else(|| transaction.state.scope.clone());
-        if scope.owner != transaction.state.scope.owner
+        if scope.owner() != transaction.state.scope.owner()
             || scope.exchange_id != transaction.state.scope.exchange_id
         {
             return Err(ProviderError::Failure(
@@ -318,10 +318,12 @@ pub(crate) struct StagedInteraction {
     pub(crate) effects: Vec<AppliedProviderEvent>,
 }
 
-/// Keep executor choices on their selected invocation instead of persisted session defaults.
+/// Keep the executor model on its selected invocation instead of persisted session defaults.
+///
+/// Approval is not part of this override: the accepted review answer becomes the session's
+/// approval mode, so every later task invocation and the winbar observe the same policy.
 struct TaskInvocationConfiguration {
     model: Option<crate::settings::ValidatedModelSelection>,
-    approval: ApprovalMode,
 }
 
 impl TaskInvocationConfiguration {
@@ -335,7 +337,6 @@ impl TaskInvocationConfiguration {
             request.context_window = selected.context_window;
             request.service_tier = selected.service_tier;
         }
-        request.approval_mode = self.approval;
     }
 }
 
@@ -1500,8 +1501,13 @@ impl HarnessBroker {
                 revision, start, ..
             } => Some((
                 revision,
-                crate::exchange::ExchangeOrigin::TaskStarted {
-                    start: start.clone(),
+                match start {
+                    Some(start) => crate::exchange::ExchangeOrigin::TaskStarted {
+                        start: start.clone(),
+                    },
+                    None => {
+                        crate::exchange::ExchangeOrigin::task_continuation("The task was resumed")
+                    }
                 },
             )),
             crate::input::InputPurpose::TaskContinuation {
@@ -1521,7 +1527,10 @@ impl HarnessBroker {
                 &task.revision == revision,
                 "task input was replaced before dispatch"
             );
-            let review = if matches!(&origin, crate::exchange::ExchangeOrigin::TaskStarted { .. }) {
+            let review = if matches!(
+                &admission.purpose,
+                crate::input::InputPurpose::TaskEntry { .. }
+            ) {
                 task.entry
                     .as_ref()
                     .and_then(|entry| entry.review_exchange.as_ref())
@@ -1773,7 +1782,13 @@ impl HarnessBroker {
                 if let Some(preparation) = task
                     .entry
                     .as_ref()
-                    .filter(|entry| input_id.as_deref() == Some(entry.id.as_str()))
+                    // The admitted input names its task entry by purpose; the native receipt
+                    // carries the same identity once the input queue has recorded it.
+                    .filter(|entry| {
+                        input_id.as_deref() == Some(entry.id.as_str())
+                            || matches!(&admission.purpose,
+                                crate::input::InputPurpose::TaskEntry { id, .. } if id == &entry.id)
+                    })
                     .and_then(|entry| entry.execution.clone())
                 {
                     let permit = task.permit();
@@ -1813,6 +1828,27 @@ impl HarnessBroker {
                             delivery,
                         )));
                     }
+                    // The review answer governs every invocation of the task, including
+                    // continuations, Verify, and resumed phases, so it becomes the session's
+                    // approval mode through the permission authority that `/allow` uses. A
+                    // per-invocation override would revert after the entry turn and leave the
+                    // winbar showing a mode that no longer applied.
+                    if self.session.approval_mode != preparation.approval_mode {
+                        let captured = self.prepare_permission_configuration(&json!({
+                            "change": crate::task::PermissionChange::SetApproval {
+                                mode: preparation.approval_mode,
+                            },
+                        }))?;
+                        let result = self.commit_permission_configuration(captured)?;
+                        anyhow::ensure!(
+                            result.resume.is_none(),
+                            "execution approval unexpectedly requested a restart"
+                        );
+                        admission.phase = AdmissionPhase::PermissionPublishing;
+                        return Ok(ForegroundAction::Effect(
+                            ForegroundJob::PermissionPublication(result.delivery),
+                        ));
+                    }
                     admission.task_configuration = Some(TaskInvocationConfiguration {
                         model: if preparation.executor.enabled {
                             Some(
@@ -1824,7 +1860,6 @@ impl HarnessBroker {
                         } else {
                             None
                         },
-                        approval: preparation.approval_mode,
                     });
                     self.task_controller.apply(
                         &mut self.store,
@@ -2088,8 +2123,11 @@ impl HarnessBroker {
         use prior_finalization::PriorFinalizationAction;
         let job = match action {
             PriorFinalizationAction::Ready => {
+                // Several exchanges can await finalization, such as an interrupted
+                // exchange and an admission whose baseline capture then failed. Leave
+                // the check open so the next pass settles any remaining one before
+                // `activate_staged_runtime` requires that none is pending.
                 admission.prior_finalization = None;
-                admission.prior_checked = true;
                 admission.phase = AdmissionPhase::Prepared;
                 return Ok(ForegroundAction::Wait);
             }
@@ -2294,7 +2332,7 @@ mod tests {
     use super::*;
     use crate::session::SessionStore;
 
-    /// Executor configuration affects one invocation and cannot replace ordinary or reloaded defaults.
+    /// The executor model affects one invocation and cannot replace ordinary or reloaded defaults.
     #[test]
     fn task_invocation_configuration_preserves_session_defaults_after_reload() -> Result<()> {
         let workspace = super::super::test::repository();
@@ -2330,16 +2368,13 @@ mod tests {
             &capability,
             &catalog,
         )?;
-        let configuration = TaskInvocationConfiguration {
-            model: Some(model),
-            approval: ApprovalMode::Allow,
-        };
+        let configuration = TaskInvocationConfiguration { model: Some(model) };
         let mut task =
             broker.provider_request(ProviderInput::from_text("task input"), PromptMode::Chat)?;
         configuration.apply(&broker.session, &mut task);
         assert_eq!(task.model, "task-executor");
         assert_eq!(task.effort, "high");
-        assert_eq!(task.approval_mode, ApprovalMode::Allow);
+        assert_eq!(task.approval_mode, before.approval_mode);
         let ordinary = broker
             .provider_request(ProviderInput::from_text("ordinary input"), PromptMode::Chat)?;
         assert_eq!(ordinary.model, before.model);
@@ -2397,7 +2432,7 @@ mod tests {
             let scope = dispatch
                 .invocation_scope()?
                 .context("preparation has no owner-issued scope")?;
-            assert_eq!(scope.owner, owner);
+            assert_eq!(scope.owner(), owner);
             assert_eq!(scope.exchange_id, selected);
             assert!(previous.as_ref().is_none_or(|prior| prior != &scope));
             assert!(engine.active_invocation_snapshot()?.is_none());

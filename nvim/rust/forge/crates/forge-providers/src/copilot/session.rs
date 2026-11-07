@@ -259,6 +259,7 @@ pub async fn open(
             inner: Arc::new(session),
             events: super::intake::SessionIntake::new(events, generation.clone()),
             generation,
+            mcp_loading: Default::default(),
         })
     }
     .await;

@@ -811,14 +811,14 @@ Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capabi
 pub enum CapabilityRestriction {
     /// Enforce filesystem scopes only for operations which use normalized permission callbacks.
     PermissionCallbacksOnly,
+    /// The selected read scope is not enforced as operating-system read confinement.
+    UnconfinedReads,
     /// Native edit tools may omit structured diff output; host checkpoint review remains available.
     UnstructuredDiffs,
     /// Provider enterprise terminal policy can execute without normalized approval callbacks.
     EnterpriseTerminalPolicy,
     /// Inherited project-native skills remain available despite the explicit portable selection.
     InheritedSkills,
-    /// Permit only the listed normalized task kinds when steering an active invocation.
-    TaskKinds(Vec<crate::input::TaskKind>),
     /// Require the exact source checkpoint for history mutation.
     CheckpointRequired,
     /// Require settled foreground execution before applying configuration or history mutation.
@@ -830,8 +830,11 @@ pub enum CapabilityRestriction {
 
 Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
+The provider API identifies only provider-implemented capabilities. Harness-owned workflows, such as goals, queues, plans, child agents, and the Harness tool settings, appear in the menu as `HostCapabilityId` rows instead. Steering applies to an active task of any kind whenever `native_steer` is supported; the manifest carries no per-task steering list.
+
 ```rust
-/// Identify a normalized capability independently of provider names or native protocol methods.
+/// Identify a provider-implemented capability independently of provider names or native
+/// protocol methods. Harness-owned workflows are host capabilities, not provider capabilities.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityId {
@@ -840,12 +843,6 @@ pub enum CapabilityId {
     Resume,
     Cleanup,
     Tools,
-    Goals,
-    Queue,
-    Undo,
-    Plans,
-    Questions,
-    SessionDelete,
     NativeFork,
     NativeCompact,
     NativeSteer,
@@ -860,44 +857,20 @@ pub enum CapabilityId {
     UltrafastMode,
     SkillCatalog,
     McpCatalog,
-    ApprovalRules,
+    PermissionCallbacks,
     OsSandbox,
     BackgroundTerminals,
     FileDiff,
     BackgroundTermination,
-    Recap,
+    IsolatedGeneration,
     RuntimeSetup,
     Authentication,
-    AgentObserve,
-    AgentSpawn,
-    AgentFollowup,
-    AgentMessage,
-    AgentInterrupt,
-    AgentCrossProvider,
-    LspTools,
-    SubagentTools,
-    SessionTools,
     NativeAgentSuppression,
     SkillMutation,
-    NativeImport,
     McpMutation,
     McpRuntimeStatus,
     McpToolCatalog,
     FilesystemAccess,
-}
-```
-
-## CapabilityOwner
-
-Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
-
-```rust
-/// Identify the layer that implements a normalized capability.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityOwner {
-    Forge,
-    Provider,
 }
 ```
 
@@ -922,25 +895,15 @@ pub enum CapabilityApplication {
 Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
 ```rust
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Describes one user-visible operation and its application boundary.
+/// Report one provider capability's support and when a change to it takes effect.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct Capability {
-    /// Identifies the operation across providers and menu refreshes.
+    /// Identifies the operation across providers and refreshes.
     pub id: CapabilityId,
-    /// Names the menu group.
-    pub group: String,
-    /// Names the operation in the menu.
-    pub label: String,
-    /// Records whether every provider must implement this operation.
-    pub required: bool,
-    /// Identifies Forge or the provider as the implementation owner.
-    pub implementation: CapabilityOwner,
     /// Reports support independently of discovery availability.
     pub support: Support,
     /// Describes the configuration application boundary.
     pub application: CapabilityApplication,
-    /// Explains the observable restriction or guarantee.
-    pub reason: String,
 }
 ```
 
@@ -948,26 +911,89 @@ pub struct Capability {
 
 Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
+The manifest carries provider facts only. `session.provider.capabilities.get` returns the Harness-composed `CapabilityMenu` below rather than this record.
+
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
-/// Captures one coherent provider capability revision for presentation and dispatch.
 pub struct CapabilityManifest {
     /// Identifies the selected provider.
     pub provider: ProviderId,
-    /// Identifies the provider in the menu.
-    pub label: String,
-    /// Changes when the capability schema changes.
+    /// Capability schema version, independent of event sequencing and negotiated support changes.
     pub revision: u64,
-    /// Increase whenever negotiated support changes; independent of schema revision.
+    /// Binding-local support revision, advanced by the adapter when negotiated support changes.
     pub effective_revision: u64,
-    /// Permit steering only for explicitly negotiated normalized task kinds.
-    pub task_steering: Vec<crate::input::TaskKind>,
     /// Retains the negotiated agent version when the transport exposes it.
     pub provider_version: Option<String>,
     /// Reports unavailable default resources without exposing credential values.
     pub notice: Vec<String>,
     /// Contains supported and unsupported operations.
     pub capability: Vec<Capability>,
+}
+```
+
+## CapabilityMenu
+
+Source: [capability_menu.rs](../../../rust/forge/crates/forge-harness/src/provider/capability_menu.rs).
+
+Harness composes the `/capabilities` response from the effective manifest. It adds the provider label, each row's group, label, required-contract marker, implementing component, and explanation, and it adds the Harness-owned workflow rows. A row's `id` is a flat string from either `CapabilityId` or `HostCapabilityId`. When a provider reports `skill_mutation`, `mcp_mutation`, or `isolated_generation` as unsupported, the row's `reason` names that limitation instead of the default explanation.
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityImplementation {
+    Forge,
+    Provider,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapabilityId {
+    Goals,
+    Queue,
+    Undo,
+    Plans,
+    Questions,
+    SessionDelete,
+    AgentObserve,
+    AgentSpawn,
+    AgentFollowup,
+    AgentMessage,
+    AgentInterrupt,
+    AgentCrossProvider,
+    LspTools,
+    SubagentTools,
+    SessionTools,
+    NativeImport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum CapabilityRowId {
+    Provider(CapabilityId),
+    Host(HostCapabilityId),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CapabilityRow {
+    pub id: CapabilityRowId,
+    pub group: &'static str,
+    pub label: &'static str,
+    pub required: bool,
+    pub implementation: CapabilityImplementation,
+    pub support: Support,
+    pub application: CapabilityApplication,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CapabilityMenu {
+    pub provider: forge_provider_api::ProviderId,
+    pub label: String,
+    pub revision: u64,
+    pub effective_revision: u64,
+    pub provider_version: Option<String>,
+    pub notice: Vec<String>,
+    pub capability: Vec<CapabilityRow>,
 }
 ```
 

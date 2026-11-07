@@ -44,6 +44,23 @@ local function edit(result, window)
       end)
     end,
   })
+  -- Harness windows pin their buffers with 'winfixbuf', so the document opens in a new tab there
+  -- instead of replacing the pinned buffer.
+  if vim.wo[window].winfixbuf then
+    vim.api.nvim_win_call(window, function()
+      vim.cmd("tabnew")
+      window = vim.api.nvim_get_current_win()
+    end)
+    vim.api.nvim_set_current_win(window)
+    vim.wo[window].winfixbuf = false
+    local scratch = vim.api.nvim_win_get_buf(window)
+    vim.api.nvim_win_set_buf(window, buffer)
+    if scratch ~= buffer and vim.api.nvim_buf_is_valid(scratch) and vim.api.nvim_buf_get_name(scratch) == ""
+      and not vim.bo[scratch].modified then
+      vim.api.nvim_buf_delete(scratch, { force = true })
+    end
+    return
+  end
   vim.api.nvim_win_set_buf(window, buffer)
 end
 

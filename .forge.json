@@ -31,11 +31,10 @@
           "nu",
           "--no-config-file",
           "--stdin",
-          "nvim/tools/checks/lua.nu",
+          ".forge/checks/lua-tests.nu",
+          "check",
           "benchmarks",
-          "--full",
-          "--timeout",
-          "120sec"
+          "--full"
         ],
         "inputs": {
           "files": {
@@ -72,7 +71,6 @@
           "nvim/tests/forge/client_initialize_host.lua",
           "nvim/tests/forge/client_executable_copy.lua",
           "nvim/tests/forge/client_callback_isolation.lua",
-          "nvim/tests/forge/commit_generation_host.lua",
           "nvim/tests/forge/commit_host.lua",
           "nvim/tests/forge/commit_large_output_host.lua",
           "nvim/tests/forge/composer_autopair.lua",
@@ -90,9 +88,6 @@
           "nvim/tests/forge/harness_automatic_checks.lua",
           "nvim/tests/forge/harness_attachments_host.lua",
           "nvim/tests/forge/harness_approval_resume_host.lua",
-          "nvim/rust/forge/crates/forge-providers/tests/fixtures/children_host.lua",
-          "nvim/tests/forge/harness_access_host.lua",
-          "nvim/tests/forge/harness_prompt_history_host.lua",
           "nvim/tests/forge/harness_plan_browsing_host.lua",
           "nvim/tests/forge/harness_package_checks.lua",
           "nvim/tests/forge/harness_model_pins_host.lua",
@@ -103,7 +98,6 @@
           "nvim/tests/forge/harness_input_timeout_host.lua",
           "nvim/tests/forge/harness_input_timeout.lua",
           "nvim/tests/forge/harness_host.lua",
-          "nvim/tests/forge/harness_task_recovery_host.lua",
           "nvim/tests/forge/harness_tasks_host.lua",
           "nvim/tests/forge/walkthrough_host.lua",
           "nvim/rust/forge/crates/forge-providers/tests/fixtures/skill_reads_host.lua",
@@ -115,10 +109,8 @@
           "nvim/tests/forge/markdown_viewport.lua",
           "nvim/tests/forge/markdown_math_render.lua",
           "nvim/tests/forge/markdown_math_async.lua",
-          "nvim/tests/forge/lsp_tools_host.lua",
           "nvim/tests/forge/plan_review_definition_host.lua",
           "nvim/tests/forge/plan_review_calls_host.lua",
-          "nvim/tests/forge/plan_declaration_presentation_host.lua",
           "nvim/tests/forge/plan_checks_host.lua",
           "nvim/tests/forge/receive_initialize_host.lua",
           "nvim/tests/forge/pr_context_host.lua",
@@ -163,10 +155,9 @@
           "nu",
           "--no-config-file",
           "--stdin",
-          "nvim/tools/checks/lua.nu",
-          "affected",
-          "--timeout",
-          "30sec"
+          ".forge/checks/lua-tests.nu",
+          "check",
+          "affected"
         ],
         "inputs": {
           "files": {
@@ -183,7 +174,7 @@
           },
           "suite": {
             "type": "string",
-            "description": "Feature suite or affected",
+            "description": "Feature suite, or affected for the suites covering the changed paths",
             "required": false,
             "default": "affected"
           }
@@ -210,11 +201,10 @@
           "nu",
           "--no-config-file",
           "--stdin",
-          "nvim/tools/checks/lua.nu",
+          ".forge/checks/lua-tests.nu",
+          "check",
           "live-integration",
-          "--full",
-          "--timeout",
-          "120sec"
+          "--full"
         ],
         "inputs": {
           "files": {
@@ -249,11 +239,10 @@
           "nu",
           "--no-config-file",
           "--stdin",
-          "nvim/tools/checks/lua.nu",
+          ".forge/checks/lua-tests.nu",
+          "check",
           "mock-integration",
-          "--full",
-          "--timeout",
-          "120sec"
+          "--full"
         ],
         "inputs": {
           "files": {

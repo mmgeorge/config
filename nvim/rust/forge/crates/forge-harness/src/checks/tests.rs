@@ -932,8 +932,10 @@ async fn configured_command_failure_preserves_project_output() -> Result<()> {
     Ok(())
 }
 
+/// A check that rewrites its own inputs still passes; its evidence binds the checkpoint captured
+/// before execution, so the gate cannot reuse it for the rewritten source.
 #[tokio::test]
-async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<()> {
+async fn source_changed_by_a_check_keeps_evidence_for_its_starting_inputs() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     std::fs::write(workspace.path().join("source.txt"), "before")?;
@@ -954,14 +956,12 @@ async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<
         "Explicit".into(),
     )?;
     let run = runner.run(run, None, None).await?;
-    assert_eq!(run.state, CheckState::Stale);
-    assert!(run.commands[0].evidence.is_none());
-    assert!(
-        run.commands[0]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("inputs changed")
+    assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
+    assert!(run.commands[0].evidence.is_some());
+    assert!(run.commands[0].error.is_none());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("source.txt"))?.trim(),
+        "after"
     );
     Ok(())
 }
@@ -2032,7 +2032,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     assert!(runner.start(second, None, None, None).await.is_err());
     runner.cancel(&id)?;
     assert_eq!(runner.active()?.as_deref(), Some(id.as_str()));
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while runner.active()?.is_some() {
             runner.status(&id, 500, false).await?;
         }
@@ -2052,7 +2052,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     )?;
     automatic.context.automatic = true;
     let stopped = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        crate::hang_guard::HANG_GUARD,
         runner.run(automatic, None, None),
     )
     .await??;
@@ -2105,7 +2105,7 @@ async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()>
     )?;
     runner.expire_command_deadline();
     let failure = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        crate::hang_guard::HANG_GUARD,
         runner.run(request, None, None),
     )
     .await?
@@ -2146,7 +2146,7 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
         .start(run, None, Some(cancelled.subscribe()), None)
         .await?;
     cancelled.send_replace(true);
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while runner.active()?.is_some() {
             runner.status(&id, 500, false).await?;
         }
@@ -2201,18 +2201,18 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     .clone();
     let permit = Arc::clone(&admission).acquire_owned().await?;
     let id = tokio::time::timeout(
-        Duration::from_secs(1),
+        crate::hang_guard::HANG_GUARD,
         runner.start(run, Some(sink), None, Some(permit)),
     )
     .await??;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !ready.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await?;
     runner.cancel(&id)?;
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while runner.active()?.is_some() {
             runner.status(&id, 50, false).await?;
         }
@@ -2230,7 +2230,7 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     assert!(finished.completed_at_ms.is_some());
     assert!(!workspace.path().join("orphan.txt").exists());
     // Drain the same transport to prove that the final invalidation survives coalescing.
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         loop {
             let event = stream.recv().await.unwrap().unwrap();
             if matches!(event, crate::broker::publication::SessionUpdate::DocumentChanged { patch }
@@ -2282,7 +2282,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
         )
     };
     let first = runner.start(prepare()?, None, None, None).await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while !ready.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2294,8 +2294,11 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     assert!(cancelled.cancelled_inputs.is_some());
     let mut automatic = prepare()?;
     automatic.context.automatic = true;
-    let blocked =
-        tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
+    let blocked = tokio::time::timeout(
+        crate::hang_guard::HANG_GUARD,
+        runner.run(automatic, None, None),
+    )
+    .await??;
     assert_eq!(blocked.commands[0].state, CheckState::Stopped);
     assert!(blocked.commands[0].started_at_ms.is_none());
     let mut policy = AutomaticChecks::open(data.path(), "recorded-task")?;
@@ -2382,11 +2385,8 @@ async fn output_failure_collects_the_process_before_releasing_admission() -> Res
         "Output failure".into(),
     )?;
     std::fs::create_dir_all(&run.commands[0].output)?;
-    let run = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        runner.run(run, None, None),
-    )
-    .await??;
+    let run =
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, runner.run(run, None, None)).await??;
     assert_eq!(run.state, CheckState::ExecutionError);
     assert!(runner.active()?.is_none());
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

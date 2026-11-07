@@ -6,7 +6,7 @@ use super::{
 };
 use crate::pending_input::{PendingInput, PendingInputs};
 use async_trait::async_trait;
-use forge_provider_api::ThreadOwner;
+use forge_provider_api::ThreadId;
 use forge_provider_api::events::{self, ProviderEventSink};
 use forge_provider_api::retained_operation::{IdentityRegistry, Interruption, Store};
 use forge_provider_api::session::{
@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 struct AcpBinding {
     binding: SessionBinding,
-    owner: ThreadOwner,
+    owner: ThreadId,
     conversation: Arc<AcpConversation>,
     state: Arc<AcpSessionState>,
     sink: ProviderEventSink,
@@ -110,14 +110,6 @@ impl AcpBinding {
         let mut manifest =
             forge_provider_api::capability::CapabilityManifest::from_descriptor(descriptor.clone());
         manifest.provider_version = self.conversation.version();
-        manifest.task_steering = if descriptor.capability.native_steer {
-            vec![
-                forge_provider_api::TaskKind::Plan,
-                forge_provider_api::TaskKind::Execute,
-            ]
-        } else {
-            Vec::new()
-        };
         manifest
     }
 
@@ -254,7 +246,7 @@ struct AcpOperations {
         forge_provider_api::catalog::McpQuery,
         Vec<forge_provider_api::catalog::McpDefinition>,
     >,
-    terminals: Store<BindingId, forge_provider_api::terminal::TerminalSnapshot>,
+    terminals: Store<BindingId, forge_provider_api::terminal::TerminalInventory>,
     terminate: Store<(BindingId, forge_provider_api::terminal::TerminalId), ()>,
 }
 
@@ -356,7 +348,7 @@ impl AcpOperations {
 #[derive(Clone)]
 struct HistoryReservation {
     operation_id: OperationId,
-    owner: ThreadOwner,
+    owner: ThreadId,
     cleanup: super::connection::AcpCleanup,
 }
 
@@ -439,8 +431,8 @@ pub struct AcpProvider {
     cleanup: super::connection::AcpCleanup,
     runtime_root: PathBuf,
     bindings: Arc<std::sync::Mutex<HashMap<BindingId, Arc<AcpBinding>>>>,
-    owners: Arc<Mutex<HashMap<ThreadOwner, BindingId>>>,
-    preparation: Arc<Mutex<HashMap<ThreadOwner, Arc<Mutex<()>>>>>,
+    owners: Arc<Mutex<HashMap<ThreadId, BindingId>>>,
+    preparation: Arc<Mutex<HashMap<ThreadId, Arc<Mutex<()>>>>>,
     history_admission: Arc<Mutex<()>>,
     history_reservations:
         Arc<Mutex<HashMap<forge_provider_api::ProviderSessionId, Vec<HistoryReservation>>>>,
@@ -662,7 +654,7 @@ impl AcpProvider {
         session
             .state
             .ensure_admission(ProviderOperation::TurnStart)?;
-        if request.scope.owner != session.owner
+        if request.scope.thread_id != session.owner
             || request.receipt.id() != &request.submission_id
             || request.receipt.attempt_id()? != request.attempt_id
             || !request.dispatch.matches(
@@ -815,7 +807,7 @@ impl AcpProvider {
                 .cloned()
                 .unwrap_or_default();
             if reservations.iter().any(|reservation| {
-                reservation.owner != request.owner && !reservation.cleanup.is_collected()
+                reservation.owner != request.thread_id && !reservation.cleanup.is_collected()
             }) {
                 return Err(failure(
                     ProviderOperation::ThreadOpen,
@@ -827,7 +819,7 @@ impl AcpProvider {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if bindings.values().any(|binding| {
-                binding.owner != request.owner
+                binding.owner != request.thread_id
                     && binding.binding.provider_session_id.as_ref() == Some(resume)
                     && !binding.history_released.load(Ordering::Acquire)
             }) {
@@ -841,11 +833,11 @@ impl AcpProvider {
             .preparation
             .lock()
             .await
-            .entry(request.owner.clone())
+            .entry(request.thread_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let _preparation = preparation.lock().await;
-        let existing = self.owners.lock().await.get(&request.owner).cloned();
+        let existing = self.owners.lock().await.get(&request.thread_id).cloned();
         if let Some(existing) = existing {
             self.close_session(&existing).await?;
         }
@@ -869,7 +861,7 @@ impl AcpProvider {
                 .or_default()
                 .push(HistoryReservation {
                     operation_id: context.id().clone(),
-                    owner: request.owner.clone(),
+                    owner: request.thread_id.clone(),
                     cleanup: cleanup.clone(),
                 });
         }
@@ -877,7 +869,7 @@ impl AcpProvider {
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Unknown))?;
         let scope = forge_provider_api::EventScope::Binding {
-            owner: request.owner.clone(),
+            thread_id: request.thread_id.clone(),
         };
         let (sink, stream) = events::channel(binding_id.clone(), scope);
         let profile = cleanup.retain_profile(super::profile::create(
@@ -929,7 +921,7 @@ impl AcpProvider {
             let entries = reservations.entry(session_id.clone()).or_default();
             let conflict = entries.iter().any(|reservation| {
                 reservation.operation_id != *context.id()
-                    && reservation.owner != request.owner
+                    && reservation.owner != request.thread_id
                     && !reservation.cleanup.is_collected()
             });
             if !entries
@@ -938,7 +930,7 @@ impl AcpProvider {
             {
                 entries.push(HistoryReservation {
                     operation_id: context.id().clone(),
-                    owner: request.owner.clone(),
+                    owner: request.thread_id.clone(),
                     cleanup: cleanup.clone(),
                 });
             }
@@ -965,7 +957,7 @@ impl AcpProvider {
         let requested_model = request.configuration.model.clone();
         let retained = Arc::new(AcpBinding {
             binding: binding.clone(),
-            owner: request.owner.clone(),
+            owner: request.thread_id.clone(),
             conversation: Arc::new(conversation),
             state,
             sink,
@@ -991,14 +983,14 @@ impl AcpProvider {
         self.owners
             .lock()
             .await
-            .insert(request.owner.clone(), binding_id.clone());
+            .insert(request.thread_id.clone(), binding_id.clone());
         let configured = match context.check_admission(ProviderOperation::ThreadOpen) {
             Ok(()) => {
                 configure_model(
                     &retained,
                     &requested_model,
                     &forge_provider_api::ModelSelection::default(),
-                    forge_provider_api::PromptMode::Chat,
+                    forge_provider_api::ExecutionMode::Default,
                 )
                 .await
             }
@@ -1119,7 +1111,7 @@ impl AcpProvider {
             &session,
             &configuration.model,
             &stored_model,
-            forge_provider_api::PromptMode::Chat,
+            forge_provider_api::ExecutionMode::Default,
         )
         .await
         {
@@ -1226,7 +1218,7 @@ impl AcpProvider {
             .into());
         }
         let source_owner = &session.owner;
-        if &request.target.owner == source_owner {
+        if &request.target.thread_id == source_owner {
             return Err(failure(
                 ProviderOperation::ThreadFork,
                 ProviderFailureKind::WrongInvocation,
@@ -1388,7 +1380,7 @@ impl AcpProvider {
                 ProviderFailureKind::ExecutionActive,
             ));
         }
-        if request.scope.owner() != &session.owner {
+        if request.scope.thread_id() != &session.owner {
             return Err(failure(
                 ProviderOperation::ThreadCompact,
                 ProviderFailureKind::WrongInvocation,
@@ -1413,13 +1405,9 @@ impl AcpProvider {
         if response["stopReason"] == "cancelled" {
             return Err(ProviderError::Cancelled);
         }
-        let compaction = match session.state.latest_compaction().await {
-            Some(compaction)
-                if compaction.state == forge_provider_api::CompactionState::Completed =>
-            {
-                compaction
-            }
-            _ => {
+        let compaction = match settled_compaction(session.state.latest_compaction().await) {
+            Some(compaction) => compaction,
+            None => {
                 let cause = ProviderError::Failure(
                     ProviderFailure::new(
                         ProviderOperation::ThreadCompact,
@@ -1453,7 +1441,7 @@ impl AcpProvider {
         session
             .state
             .ensure_admission(ProviderOperation::TurnSteer)?;
-        if request.scope.owner != session.owner {
+        if request.scope.thread_id != session.owner {
             return Err(failure(
                 ProviderOperation::TurnSteer,
                 ProviderFailureKind::WrongInvocation,
@@ -1478,13 +1466,8 @@ impl AcpProvider {
             .into());
         }
         let capabilities = session.capabilities().await;
-        if !capabilities.capability.iter().any(|capability| {
-            capability.id == forge_provider_api::capability::CapabilityId::NativeSteer
-                && capability.support == forge_provider_api::capability::Support::Supported
-        }) || request
-            .task
-            .as_ref()
-            .is_some_and(|task| !capabilities.task_steering.contains(&task.kind))
+        if capabilities.support(forge_provider_api::capability::CapabilityId::NativeSteer)
+            != Some(&forge_provider_api::capability::Support::Supported)
         {
             return Err(forge_provider_api::capability::UnsupportedCapability(
                 forge_provider_api::capability::ProviderFeature::NativeSteer,
@@ -1492,11 +1475,8 @@ impl AcpProvider {
             .into());
         }
         let input = prompt_input(&request.input);
-        let text = request.task.as_ref().map_or(input.clone(), |task| {
-            format!("{}\n\n{input}", task.heading())
-        });
         let prompt = super::attachments::input(
-            text,
+            input,
             &request.attachments,
             session.conversation.supports_images(),
         )?;
@@ -1987,7 +1967,7 @@ impl AcpProvider {
                 ProviderFailureKind::ExecutionActive,
             ));
         }
-        if request.scope.owner != session.owner {
+        if request.scope.thread_id != session.owner {
             return Err(failure(
                 ProviderOperation::InputRetract,
                 ProviderFailureKind::WrongInvocation,
@@ -2402,7 +2382,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                     let session = provider.binding(&binding, ProviderOperation::TurnInterrupt)?;
                     Ok(forge_provider_api::TurnInterruptResult {
                         operation_id,
-                        thread_id: request.scope.owner.thread_id(),
+                        thread_id: request.scope.thread_id.clone(),
                         turn_id: request.scope.turn_id().map_err(|_| {
                             failure(
                                 ProviderOperation::TurnInterrupt,
@@ -2756,7 +2736,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         &self,
         context: OperationContext,
         binding: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         self.operations
             .terminals
             .observe(
@@ -2821,7 +2801,7 @@ fn initialize_params() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion":1,
         "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-        "clientCapabilities":{"auth":{"terminal":true},"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}
+        "clientCapabilities":{"auth":{"terminal":true},"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}
     })
 }
 
@@ -2990,7 +2970,7 @@ async fn run_prompt(
             &session,
             &request.configuration.model,
             &current_model,
-            request.mode,
+            request.execution,
         )
         .await
         {
@@ -3189,7 +3169,7 @@ async fn configure_model(
     session: &AcpBinding,
     requested: &forge_provider_api::session::ModelSelection,
     retained: &forge_provider_api::session::ModelSelection,
-    mode: forge_provider_api::PromptMode,
+    mode: forge_provider_api::ExecutionMode,
 ) -> Result<(), ProviderError> {
     use forge_provider_api::generation::ReasoningSelection;
 
@@ -3487,9 +3467,6 @@ fn prompt_content(
     if !request.instructions.is_empty() {
         content.push(serde_json::json!({"type":"text","text":request.instructions}));
     }
-    if let Some(task) = &request.task {
-        content.push(serde_json::json!({"type":"text","text":task.heading()}));
-    }
     let mut attachments =
         super::attachments::input(String::new(), &request.attachments, supports_images)?;
     attachments.pop();
@@ -3677,8 +3654,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         )
         .unwrap();
         let request = SessionRequest {
-            thread_id: (ThreadOwner::root("failed-open")).thread_id(),
-            owner: ThreadOwner::root("failed-open"),
+            thread_id: (forge_provider_api::testing::root_thread("failed-open")).clone(),
             mode: forge_provider_api::SessionMode::Interactive,
             workspace: directory.path().to_string_lossy().into_owned(),
             history: forge_provider_api::SessionHistory::Durable { resume: None },
@@ -3710,14 +3686,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         let binding = opened.binding.id;
         let scope = forge_provider_api::InvocationScope::new(
-            ThreadOwner::root("failed-open"),
+            forge_provider_api::testing::root_thread("failed-open"),
             "queued-input",
         );
         let pending = provider
             .pending_inputs
             .register(&binding, &scope, operation_context().id());
         let successor_scope =
-            forge_provider_api::InvocationScope::new(scope.owner.clone(), "successor");
+            forge_provider_api::InvocationScope::new(scope.thread_id.clone(), "successor");
         let successor =
             provider
                 .pending_inputs
@@ -3775,7 +3751,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .unwrap();
         let binding = opened.binding.id;
         let scope = forge_provider_api::InvocationScope::new(
-            ThreadOwner::root("failed-open"),
+            forge_provider_api::testing::root_thread("failed-open"),
             "not-yet-polled",
         );
         assert!(
@@ -3785,7 +3761,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .pending_inputs
             .register(&binding, &scope, operation_context().id());
         assert!(late.is_cancelled());
-        let successor_scope = forge_provider_api::InvocationScope::new(scope.owner, "successor");
+        let successor_scope =
+            forge_provider_api::InvocationScope::new(scope.thread_id, "successor");
         let successor =
             provider
                 .pending_inputs
@@ -3937,8 +3914,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             resume: Some("failed-open-history".to_owned().try_into().unwrap()),
         };
         let mut competing = request.clone();
-        competing.owner = ThreadOwner::root("competing-owner");
-        competing.thread_id = competing.owner.thread_id();
+        competing.thread_id = forge_provider_api::testing::root_thread("competing-owner");
+        competing.thread_id = competing.thread_id.clone();
         provider.cleanup.fail_next_collection(1);
         assert!(
             provider
@@ -3968,7 +3945,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 BindingId::new("source-binding").unwrap(),
             ),
             target: forge_provider_api::ForkTarget {
-                owner: ThreadOwner::root("target-owner"),
+                thread_id: forge_provider_api::testing::root_thread("target-owner"),
                 workspace: "target-workspace".into(),
                 system_instructions: "target instructions".into(),
                 configuration: forge_provider_api::SessionConfiguration {
@@ -4023,7 +4000,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         };
         changed.push(next);
         let mut next = request.clone();
-        next.target.owner = ThreadOwner::root("other-target");
+        next.target.thread_id = forge_provider_api::testing::root_thread("other-target");
         changed.push(next);
         let mut next = request.clone();
         next.target.workspace = "other-workspace".into();
@@ -4074,7 +4051,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         let operation_id = context.id().clone();
         let request = forge_provider_api::CompactionRequest {
             scope: forge_provider_api::EventScope::SessionOperation {
-                owner: ThreadOwner::root("source-owner"),
+                thread_id: forge_provider_api::testing::root_thread("source-owner"),
                 operation_id: operation_id.clone(),
             },
         };
@@ -4086,7 +4063,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
         );
         let mut changed = request;
         changed.scope = forge_provider_api::EventScope::SessionOperation {
-            owner: ThreadOwner::root("other-owner"),
+            thread_id: forge_provider_api::testing::root_thread("other-owner"),
             operation_id,
         };
         assert!(
@@ -4273,8 +4250,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             .thread_open(
                 operation_context(),
                 forge_provider_api::SessionRequest {
-                    thread_id: (forge_provider_api::ThreadOwner::root("isolated")).thread_id(),
-                    owner: forge_provider_api::ThreadOwner::root("isolated"),
+                    thread_id: (forge_provider_api::testing::root_thread("isolated")).clone(),
                     mode: forge_provider_api::SessionMode::Background,
                     workspace: "must-not-inspect".into(),
                     history: forge_provider_api::SessionHistory::IsolatedText(
@@ -4322,5 +4298,48 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 .unwrap(),
             forge_provider_api::SubmissionEvidence::Accepted { .. }
         ));
+    }
+}
+
+/// Return the compaction Claude reported as completed or failed after `/compact`.
+///
+/// A failed compaction leaves the conversation unchanged, so the binding stays usable. When
+/// Claude reports neither outcome, the conversation state is unknown and the binding is invalidated.
+fn settled_compaction(
+    latest: Option<forge_provider_api::Compaction>,
+) -> Option<forge_provider_api::Compaction> {
+    latest.filter(|compaction| {
+        matches!(
+            compaction.state,
+            forge_provider_api::CompactionState::Completed
+                | forge_provider_api::CompactionState::Failed
+        )
+    })
+}
+
+#[cfg(test)]
+mod settled_compaction_tests {
+    use forge_provider_api::{Compaction, CompactionState};
+
+    fn compaction(state: CompactionState) -> Compaction {
+        serde_json::from_value(serde_json::json!({
+            "id":"compact", "thread_id":"thread", "state":state, "manual":true,
+            "started_at_ms":1, "completed_at_ms":2, "result":{}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reported_compaction_failure_keeps_the_binding() {
+        for state in [CompactionState::Completed, CompactionState::Failed] {
+            assert_eq!(
+                super::settled_compaction(Some(compaction(state))).map(|value| value.state),
+                Some(state)
+            );
+        }
+        for state in [CompactionState::Running, CompactionState::Unconfirmed] {
+            assert!(super::settled_compaction(Some(compaction(state))).is_none());
+        }
+        assert!(super::settled_compaction(None).is_none());
     }
 }

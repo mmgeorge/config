@@ -23,6 +23,8 @@ pub struct CopilotSession {
     pub(crate) inner: Arc<github_copilot_sdk::session::Session>,
     pub(crate) events: super::intake::SessionIntake,
     pub(crate) generation: super::client_generation::ClientGeneration,
+    /// Set while selected MCP servers are still starting, so accepted input must release the load.
+    pub(crate) mcp_loading: std::sync::atomic::AtomicBool,
 }
 
 pub struct SkillSelection {
@@ -190,6 +192,19 @@ impl CopilotClient {
 }
 
 impl CopilotSession {
+    /// Let accepted input proceed while selected MCP servers finish starting.
+    ///
+    /// Copilot holds a queued turn until its in-flight MCP load settles, which a hung server holds
+    /// for the native startup bound. `moveLoadingToBackground` releases only turns already
+    /// waiting, so the call follows native acceptance of the input; before any turn waits it is a
+    /// no-op. Release is best effort: on failure the turn waits for the load as Copilot defaults to.
+    pub async fn release_mcp_loading(&self) {
+        if self.mcp_loading.load(std::sync::atomic::Ordering::Acquire) {
+            let _ =
+                super::operation::wait(self.inner.rpc().mcp().move_loading_to_background()).await;
+        }
+    }
+
     /// Check whether a failure applies to this session's exact native client.
     pub fn belongs_to(&self, failed: &super::client_generation::FailedGeneration) -> bool {
         failed.matches(&self.generation)
@@ -289,7 +304,7 @@ impl CopilotSession {
     /// Inspect native tasks before allowing a destructive SDK refresh of the binding.
     pub async fn terminal_snapshot(
         &self,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         self.ensure_healthy()?;
         self.inner.rpc().tasks().refresh().await.map_err(|_| {
             native_failure(
@@ -865,7 +880,7 @@ impl CopilotSession {
             receipt
                 .clone()
                 .record_sending(Some(super::prompt::sending_recovery_token(
-                    scope.owner.clone(),
+                    scope.thread_id.clone(),
                     receipt.id().clone(),
                     receipt.attempt_id()?,
                     super::prompt::NativeDeliveryBoundary {
@@ -897,7 +912,7 @@ impl CopilotSession {
                 .record_accepted(Some(super::prompt::accepted_recovery_token(
                     receipt_id,
                     attempt_id,
-                    scope.owner.clone(),
+                    scope.thread_id.clone(),
                     self.id(),
                     accepted.clone(),
                 )?))

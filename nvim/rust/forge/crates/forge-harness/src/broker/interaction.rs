@@ -592,8 +592,8 @@ impl HarnessBroker {
             None => None,
         };
         let mut guard = guard;
-        if change.scope.owner.agent_id().as_str() == interaction.agent_id
-            && change.scope.owner.session_id().as_str() == interaction.session_id
+        if change.scope.owner().agent_id().as_str() == interaction.agent_id
+            && change.scope.owner().session_id().as_str() == interaction.session_id
         {
             let mut candidate = interaction.clone();
             let changed = candidate.record_host_file_change(change)?;
@@ -662,7 +662,12 @@ impl HarnessBroker {
             serde_json::to_value(&output)?,
         );
         interaction.pause(self.clock.now_ms());
-        if let Some(context_usage) = output.metrics.context_usage.clone() {
+        if let Some(context_usage) = output
+            .metrics
+            .context_usage
+            .as_ref()
+            .and_then(crate::session::ContextUsage::from_report)
+        {
             self.session.context_usage = Some(context_usage);
             self.context_usage_fresh = true;
         }

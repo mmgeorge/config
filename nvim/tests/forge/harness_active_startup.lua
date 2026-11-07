@@ -21,6 +21,8 @@ local success, error_message = xpcall(function()
         requests[#requests + 1] = request.method
         if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
+        elseif request.method == "provider.registry.list" then
+          emit({ id = request.id, result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry() })
         elseif request.method == "session.initialize" then
           for kind, configured in pairs(require("forge.infra.config").options.harness.providers) do
             local launch = request.params.provider_launch_by_provider[kind]
@@ -54,7 +56,7 @@ local success, error_message = xpcall(function()
   assert(phases[3].phase == "harness.initialize.requested" and phases[4].phase == "harness.initialize.received")
   assert(phases[4].fields.rust.broker.database_open_ms == 4 and phases[5].phase == "trace.configure.received")
   assert(vim.tbl_contains(requests, "host.trace.configure"), "startup omitted tracing configuration")
-  local allowed = { ["host.initialize"] = true, ["session.initialize"] = true,
+  local allowed = { ["host.initialize"] = true, ["provider.registry.list"] = true, ["session.initialize"] = true,
     ["host.trace.configure"] = true, ["host.transport.consumed"] = true }
   for _, method in ipairs(requests) do
     assert(allowed[method], "startup sent a session mutation: " .. method)

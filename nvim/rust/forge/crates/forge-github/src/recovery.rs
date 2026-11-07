@@ -513,8 +513,8 @@ mod tests {
     #[test]
     fn complete_large_capture_and_growing_settlement_survive_reopening() {
         let directory = tempfile::Builder::new()
-            .prefix(".forge-recovery-")
-            .tempdir_in(std::env::current_dir().unwrap())
+            .prefix("forge-recovery-")
+            .tempdir()
             .unwrap();
         let store = store(&directory);
         let text = format!("{}capture tail", "x".repeat(16 * 1024 * 1024 + 1));

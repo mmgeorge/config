@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -885,7 +886,7 @@ impl Submission {
             ))
         };
         let record = self.record().map_err(|_| invalid())?;
-        if record.request.owner()? != scope.owner {
+        if record.request.owner()? != scope.owner() {
             return Err(invalid());
         }
         let reporter = tracker
@@ -1644,7 +1645,7 @@ pub(crate) fn journal_failure(error: anyhow::Error) -> super::ProviderError {
     match error.downcast::<super::ProviderError>() {
         Ok(error) => error,
         Err(error) => {
-            let failure = if error.is::<forge_provider_api::execution::ThreadOwnerError>() {
+            let failure = if error.is::<crate::provider::ThreadOwnerError>() {
                 forge_provider_api::ProviderFailure::new(
                     forge_provider_api::ProviderOperation::TurnStart,
                     forge_provider_api::ProviderFailureKind::Protocol,
@@ -1794,7 +1795,7 @@ mod tests {
                     &forge_provider_api::submission::DispatchTracker::default(),
                     binding.clone(),
                     forge_provider_api::InvocationScope::new(
-                        forge_provider_api::ThreadOwner::root("foreign"),
+                        crate::provider::ThreadOwner::root("foreign"),
                         "exchange",
                     )
                 )
@@ -2183,13 +2184,13 @@ mod tests {
         let provider = forge_providers::registry::default_id();
         let mut first = request("first owner");
         first.harness_session_id = "a:agent:b".into();
-        first.execution_owner = Some(forge_provider_api::ThreadOwner::root(
+        first.execution_owner = Some(crate::provider::ThreadOwner::root(
             &first.harness_session_id,
         ));
         let mut second = request("second owner");
         second.harness_session_id = "a".into();
         second.execution_owner = Some(
-            forge_provider_api::ThreadOwner::new(
+            crate::provider::ThreadOwner::new(
                 "a".into(),
                 forge_provider_api::AgentId::new("b").unwrap(),
             )

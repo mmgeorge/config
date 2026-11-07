@@ -1,4 +1,5 @@
 //! Stage authenticated question-tool effects until the owner has applied same-step lifecycle transitions.
+use crate::provider::ScopeOwner;
 
 use super::{
     question_event::{QuestionChange, QuestionCreation, QuestionEventError, QuestionToolCall},
@@ -146,7 +147,7 @@ fn validate_live_source(
 ) -> Result<(), QuestionEventError> {
     // A fast callback can reach owner intake before its native TurnStarted observation.
     if live_scope != Some(scope)
-        || scope.owner.session_id().as_str() != session
+        || scope.owner().session_id().as_str() != session
         || source.session_id != session
     {
         return Err(QuestionEventError::ForeignScope);
@@ -204,7 +205,7 @@ mod tests {
             archived_output: Default::default(),
             input_message_id: None,
             provider_retry: None,
-            agent_id: scope.owner.agent_id().to_string(),
+            agent_id: scope.owner().agent_id().to_string(),
             id: "exchange".into(),
             session_id: "session".into(),
             ordinal: 1,
@@ -232,7 +233,7 @@ mod tests {
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
         };
         assert!(validate_live_source(&scope, Some(&scope), "session", &source).is_ok());
-        let replacement = crate::provider::InvocationScope::new(scope.owner.clone(), "exchange");
+        let replacement = crate::provider::InvocationScope::new(scope.owner().clone(), "exchange");
         assert!(matches!(
             validate_live_source(&scope, Some(&replacement), "session", &source),
             Err(QuestionEventError::ForeignScope)

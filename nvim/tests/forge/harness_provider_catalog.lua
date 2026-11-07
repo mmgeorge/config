@@ -217,6 +217,7 @@ assert_true(mcp_page.option_list[2].label == "✓ github-mcp" and workspace_mcp_
 
 picker.close(false)
 client.request = original_request
+vim.uv.new_timer = real_new_timer
 provider_catalog.clear()
 local initial_reply
 client.request = function(request_specification, callback)
@@ -236,6 +237,40 @@ mcp_picker = picker._state_for_test()
 assert_true(vim.iter(mcp_picker.frame.lines):any(function(line) return line:find("simulated initial failure", 1, true) end),
   "catalog failures must remain visible in the picker")
 picker.close(false)
+-- The picker polls MCP status from a repeating `vim.uv` timer. A fake timer lets the fixture
+-- advance ticks deterministically instead of waiting for the real interval.
+local real_new_timer = vim.uv.new_timer
+local active_timer_set = {}
+vim.uv.new_timer = function()
+  local timer = {}
+  function timer:start(_, _, callback) self.callback = callback active_timer_set[self] = true end
+  function timer:stop() active_timer_set[self] = nil end
+  function timer:close() active_timer_set[self] = nil end
+  function timer:is_active() return active_timer_set[self] == true end
+  return timer
+end
+local function flush_scheduled()
+  local flushed = false
+  vim.schedule(function() flushed = true end)
+  assert_true(vim.wait(1000, function() return flushed end, 1), "scheduled callbacks did not run")
+end
+local function advance_ticks(count)
+  for _ = 1, count do
+    local timer_list = vim.tbl_keys(active_timer_set)
+    for _, timer in ipairs(timer_list) do
+      if active_timer_set[timer] then timer.callback() end
+    end
+    flush_scheduled()
+  end
+end
+-- Advance at most two refresh intervals; the picker refreshes every 17 ticks.
+local function advance_until(predicate, message)
+  for _ = 1, 34 do
+    if predicate() then return end
+    advance_ticks(1)
+  end
+  assert_true(predicate(), message)
+end
 local catalog_reads = 0
 local pending_refresh
 client.request = function(request_specification, callback)
@@ -250,16 +285,16 @@ client.request = function(request_specification, callback)
   end
 end
 provider_picker.open_mcp({ host = host })
-assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20),
+advance_until(function() return pending_refresh ~= nil end,
   "starting servers should refresh their status without reopening the picker")
-vim.wait(2200, function() return false end, 20)
+advance_ticks(34)
 assert_true(catalog_reads == 2, "status refreshes must not overlap")
 pending_refresh({ { name = "starting-server", enabled = true, status = "connected" } })
 mcp_picker = picker._state_for_test()
 mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
 assert_true(mcp_page.option_list[1].label == "✓ starting-server", "refresh should replace starting status")
 pending_refresh = nil
-assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20),
+advance_until(function() return pending_refresh ~= nil end,
   "connected servers must keep refreshing without returning to starting")
 mcp_picker = picker._state_for_test()
 mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
@@ -272,7 +307,7 @@ assert_true(mcp_page.option_list[1].detail:find("connection closed", 1, true),
 assert_true(mcp_page.option_list[1].columns[5] == "failed: connection closed",
   "the Status column must explain why a server failed")
 pending_refresh = nil
-assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20), "failed rows must remain refreshable")
+advance_until(function() return pending_refresh ~= nil end, "failed rows must remain refreshable")
 pending_refresh({ { name = "starting-server", enabled = true, status = "unavailable",
   status_detail = "missing environment variable FIXTURE_KEY", transport = "stdio" } })
 mcp_picker = picker._state_for_test()
@@ -287,7 +322,7 @@ picker.close(false)
 catalog_reads = 0
 pending_refresh = nil
 provider_picker.open_mcp({ host = host })
-assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20), "second picker should poll")
+advance_until(function() return pending_refresh ~= nil end, "second picker should poll")
 picker.close(false)
 local old_refresh = pending_refresh
 client.request = function(request_specification, callback)

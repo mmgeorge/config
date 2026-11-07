@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 use crate::provider::{ProviderChangeSet, ToolOutcome, TurnAddress};
 use forge_provider_api::{
     ItemCompletion, ItemEvent, ItemId, ItemStart, TextUpdate, ToolCompletion, ToolDescriptor,
@@ -251,7 +252,7 @@ impl TryFrom<ToolStoreWire> for ToolStore {
             if tool.id != id.as_str() || native.item_id != *id {
                 return Err(ToolStoreLoadError::Identity);
             }
-            if native.address.thread_id != native.address.scope.owner.thread_id()
+            if native.address.thread_id != native.address.scope.owner().thread_id()
                 || native.address.scope.turn_id().as_ref() != Ok(&native.address.turn_id)
                 || original_owner.is_some_and(|owner| owner != &native.address)
             {
@@ -362,7 +363,7 @@ impl TryFrom<ToolExecutionWire> for ToolExecution {
             final_snapshot,
             lifetime,
         } = wire;
-        if address.thread_id != address.scope.owner.thread_id()
+        if address.thread_id != address.scope.owner().thread_id()
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
         {
             return Err(ToolStoreLoadError::Owner);
@@ -746,7 +747,7 @@ mod tests {
             "exchange",
         );
         TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         }
@@ -1044,7 +1045,7 @@ mod tests {
             "child-exchange",
         );
         let other = TurnAddress {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };

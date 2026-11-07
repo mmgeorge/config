@@ -36,7 +36,7 @@ end
 local function expand(path, section)
   local file, row = select_file(path, section)
   if require("forge.nodes").closed(state.replica, "file:" .. file.id) then key("<Tab>") end
-  local context = "Source" .. tonumber(path:match("source_(%d+)")) .. ".render"
+  local context = "impl Source" .. tonumber(path:match("source_(%d+)")) .. " {"
   await(function()
     local body = state.replica.file[file.id].body
     if not body or not settled() then return false end

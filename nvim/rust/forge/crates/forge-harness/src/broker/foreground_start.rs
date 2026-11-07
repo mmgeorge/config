@@ -85,7 +85,7 @@ impl HarnessBroker {
         }
         // Acquire all fallible tool scopes before transferring the exchange runtime or dispatching.
         let (agent_scope, agent_lease) = crate::agent::AgentToolScope::new(
-            scope.owner.clone(),
+            scope.owner().clone(),
             staged.exchange.id.clone(),
             self.agent_coordinator.clone(),
         )?;
@@ -166,9 +166,11 @@ impl HarnessBroker {
                 scope: scope.clone(),
                 authorization_sink: provider_event_sink.clone(),
                 editing: self.observer.check_editing.clone(),
-                can_run: staged.exchange.check_setup.is_none()
-                    && self.agent_coordinator.active_count() == 0
-                    && execution.is_none(),
+                can_run: crate::checks::model_may_run_checks(
+                    staged.exchange.check_setup.is_some(),
+                    self.agent_coordinator.active_count(),
+                    execution.as_ref().map(|execution| execution.phase),
+                ),
                 agent: self.agent_coordinator.clone(),
                 cancelled: self.turn_cancellation.subscribe(),
                 sink: self.event_sink.clone(),
@@ -268,6 +270,7 @@ impl HarnessBroker {
             question_stop_pending: false,
             question_override: None,
             pending_native_ready: None,
+            native_ready_parked: false,
             retraction_boundary: None,
             scan_enabled: execution.is_some(),
             execution_open: true,

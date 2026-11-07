@@ -626,6 +626,13 @@ struct PendingReconnect {
 }
 
 impl ExchangeDriver {
+    /// Replace the wait capacity before the driver starts, so fixtures saturate it with a few waits.
+    #[cfg(test)]
+    pub(crate) fn with_question_wait_capacity(mut self, capacity: usize) -> Self {
+        self.question_waits = super::question_wait::QuestionWaits::with_capacity(capacity);
+        self
+    }
+
     /// Select task delivery from owned work, rather than inferring it from semaphore availability.
     fn task_delivery_gate(
         &self,
@@ -670,8 +677,13 @@ impl ExchangeDriver {
                 let _ = request.reply.send(Err(super::ReconnectError::OwnerClosed));
                 continue;
             }
+            // A running turn may hold the broker for its whole duration. Reconnect then reads the
+            // committed state with the last published runtime metadata instead of waiting.
             let result = super::reconnect::capture(
-                &*broker.lock().await,
+                || match broker.try_lock() {
+                    Ok(broker) => broker.snapshot(),
+                    Err(_) => services.observer.snapshot(),
+                },
                 services,
                 request.cursor,
                 request.limit,
@@ -1021,7 +1033,14 @@ impl ExchangeDriver {
             }
             if self.commands.storage_unavailable() {
                 services.execution.close();
-                if matches!(self.foreground_access, ForegroundAccess::Open) {
+                // The closed execution gate already prevents new foreground work. Collection is
+                // lost only while delivery work that may own native execution is still retained;
+                // an idle owner stays collectable so shutdown can confirm quiescence.
+                if matches!(self.foreground_access, ForegroundAccess::Open)
+                    && (self.input_delivery.is_some()
+                        || !self.steering.is_empty()
+                        || !input_cleanup.is_empty())
+                {
                     self.foreground_access = ForegroundAccess::CollectionLost;
                 }
                 for prepared in pending.drain(..) {
@@ -2811,6 +2830,7 @@ impl ExchangeDriver {
                     trace.record(&session_id, "exchange.event.read", serde_json::json!({
                         "source":"input_receipt_watch","submission_id":submission.as_str(),"update_step":update_step,
                     }));
+                    let carries_task_input = self.input_receipts.carries_task_input(&submission);
                     match self.input_receipts.apply(
                         InputReceiptFact::Acceptance {
                             submission: submission.clone(),
@@ -2830,6 +2850,18 @@ impl ExchangeDriver {
                                     &session_id,
                                     update_step,
                                 );
+                                // Acceptance of task input acknowledged the task entry or
+                                // continuation; a held native turn may not settle for a long
+                                // time, so clients must see the accepted task state now.
+                                if carries_task_input {
+                                    publish_task_snapshot(
+                                        command_messages.as_ref(),
+                                        &services,
+                                        &trace,
+                                        &session_id,
+                                        update_step,
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
@@ -6104,10 +6136,10 @@ fn steering_input_eligible(
     Ok(match &message.purpose {
         InputPurpose::User => true,
         InputPurpose::Clarification { .. } => false,
-        InputPurpose::TaskEntry { start, .. } => {
+        InputPurpose::TaskEntry { .. } => {
             services
                 .observer
-                .task_steering_supported(start.kind)
+                .native_steer_supported()
                 .map_err(InputOfferError::Queue)?
                 && task
                     .as_ref()
@@ -6203,37 +6235,52 @@ fn publish_task_state(
     command: &CommandId,
     step: u64,
 ) {
-    let published = (|| -> Result<()> {
-        let snapshot = services.observer.snapshot()?;
-        let mut events = vec![forge_protocol::message::SessionEvent {
-            session_id: session.into(),
-            event: "session_changed".into(),
-            payload: serde_json::json!({"snapshot":&snapshot}),
-        }];
-        let patch = services
-            .presentation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .reconcile_with_status_thoughts(
-                snapshot.timeline,
-                services
-                    .observer
-                    .status_thoughts
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )?;
-        if !patch.is_empty() {
-            events.push(forge_protocol::message::SessionEvent {
-                session_id: session.into(),
-                event: "document_changed".into(),
-                payload: patch.notification(),
-            });
-        }
-        services.publications.publish_batch(events)?;
-        Ok(())
-    })();
-    if let Err(error) = published {
+    if let Err(error) = publish_session_snapshot(services, session) {
         trace.record(session, "exchange.command.publication_failed", serde_json::json!({"command_id":command.as_str(),"source":"task_commit","update_step":step,"reason":error.to_string()}));
     }
+}
+
+/// Publish task state that native input acceptance committed outside any caller command.
+fn publish_task_snapshot(
+    _messages: Option<&MessageSender>,
+    services: &OwnerServices,
+    trace: &TraceStore,
+    session: &str,
+    step: u64,
+) {
+    if let Err(error) = publish_session_snapshot(services, session) {
+        trace.record(session, "exchange.input_receipt.publication_failed", serde_json::json!({"source":"task_acceptance","update_step":step,"reason":error.to_string()}));
+    }
+}
+
+/// Publish the committed session snapshot with any timeline presentation patch it implies.
+fn publish_session_snapshot(services: &OwnerServices, session: &str) -> Result<()> {
+    let snapshot = services.observer.snapshot()?;
+    let mut events = vec![forge_protocol::message::SessionEvent {
+        session_id: session.into(),
+        event: "session_changed".into(),
+        payload: serde_json::json!({"snapshot":&snapshot}),
+    }];
+    let patch = services
+        .presentation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+        .reconcile_with_status_thoughts(
+            snapshot.timeline,
+            services
+                .observer
+                .status_thoughts
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )?;
+    if !patch.is_empty() {
+        events.push(forge_protocol::message::SessionEvent {
+            session_id: session.into(),
+            event: "document_changed".into(),
+            payload: patch.notification(),
+        });
+    }
+    services.publications.publish_batch(events)?;
+    Ok(())
 }
 
 /// Publish committed internal input events without inventing a caller command identity.

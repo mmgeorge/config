@@ -1,4 +1,5 @@
 //! Reduce admitted input attempts and the sole native turn completion.
+use crate::provider::ScopeOwner;
 mod cleanup;
 mod inbox;
 mod runtime;
@@ -73,7 +74,7 @@ pub enum InputPresentation {
     Steering { text: String },
     /// Append the accepted workflow entry and its original instruction.
     TaskStarted {
-        start: forge_provider_api::input::TaskStart,
+        start: crate::exchange::TaskStart,
         prompt: String,
     },
 }
@@ -151,7 +152,7 @@ impl ExecutionState {
         included: &[forge_provider_api::CoveredInput],
     ) -> Result<(), LifecycleError> {
         // Validate the complete receipt group before publishing any admission.
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Err(LifecycleError::OwnershipMismatch);
         }
         let mut inputs = vec![forge_provider_api::CoveredInput::new(
@@ -318,7 +319,7 @@ impl ExecutionState {
             .get(&scope.invocation_id)
             .filter(|state| &state.scope == scope)
             .ok_or(LifecycleError::OwnershipMismatch)?;
-        if &scope.owner.thread_id() != thread_id
+        if &scope.owner().thread_id() != thread_id
             || scope
                 .turn_id()
                 .map_err(|_| LifecycleError::OwnershipMismatch)?

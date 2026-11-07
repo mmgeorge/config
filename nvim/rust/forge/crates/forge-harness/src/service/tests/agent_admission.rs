@@ -181,7 +181,7 @@ async fn saturated_child_admission(followup: bool) -> Result<()> {
                     },
                     &children,
                 )?));
-        let (interrupted, admitted) = tokio::time::timeout(Duration::from_secs(10), async {
+        let (interrupted, admitted) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
             tokio::join!(interrupt, overflow.as_mut())
         })
         .await

@@ -1,3 +1,4 @@
+use crate::provider::ScopeOwner;
 pub(crate) mod admission;
 mod agent_policy;
 mod archive;
@@ -69,7 +70,24 @@ pub fn error_message(error: &anyhow::Error) -> String {
         }
         return format!("SQLite storage failure: {error:#}");
     }
-    format!("{error:#}")
+    distinct_cause_message(error)
+}
+
+/// Render an error chain without repeating a cause that an outer layer already displays.
+/// Several typed wrappers both print and expose their cause, so `{:#}` alone renders it twice.
+pub fn distinct_cause_message(error: &anyhow::Error) -> String {
+    let mut message = String::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if message.contains(&text) {
+            continue;
+        }
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+        message.push_str(&text);
+    }
+    message
 }
 
 /// Stores one session with the exact durable format that produced it.
@@ -551,10 +569,10 @@ impl SqliteStore {
                 WHERE json_extract(provider_turn.value, '$.provider.thread_id')=?2 \
                 AND json_extract(provider_turn.value, '$.provider.turn_id')=?3 \
                 AND json_extract(provider_turn.value, '$.provider.scope.invocation_id')=?6 \
-                AND json_extract(provider_turn.value, '$.provider.scope.owner.session_id')=?7) LIMIT 1",
+                AND json_extract(provider_turn.value, '$.provider.scope.thread_id')=?7) LIMIT 1",
                 params![session_id, address.thread_id.as_str(), address.turn_id.as_str(),
-                    address.scope.exchange_id.as_str(), address.scope.owner.agent_id().as_str(),
-                    address.scope.invocation_id.as_str(), address.scope.owner.session_id().as_str()],
+                    address.scope.exchange_id.as_str(), address.scope.owner().agent_id().as_str(),
+                    address.scope.invocation_id.as_str(), address.scope.thread_id.as_str()],
             )?
             .pop())
     }

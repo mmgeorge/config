@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ScopeOwner;
 
 use forge_provider_api::{
     BindingId, ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
@@ -270,7 +271,7 @@ impl NativeProvider for BridgeFixtureProvider {
         let (sink, events) = events::channel(
             binding.clone(),
             forge_provider_api::EventScope::Binding {
-                owner: request.owner,
+                thread_id: forge_provider_api::ThreadId::from(request.owner()),
             },
         );
         let mut sinks = self.sinks.lock().unwrap();
@@ -471,16 +472,14 @@ impl NativeProvider for BridgeFixtureProvider {
         &self,
         operation: forge_provider_api::OperationContext,
         _: &BindingId,
-    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
         operation.check_admission(ProviderOperation::TerminalList)?;
         self.terminal_calls.fetch_add(1, Ordering::AcqRel);
         self.terminal_started.notify_one();
         self.terminal_release.notified().await;
-        Ok(forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: Vec::new(),
-        })
+        Ok(forge_provider_api::terminal::TerminalInventory::observed(
+            Vec::new(),
+        ))
     }
 }
 
@@ -547,7 +546,7 @@ async fn bridge(
 async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
 -> anyhow::Result<()> {
     let stage = std::sync::Mutex::new("open original");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
         let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
@@ -582,7 +581,7 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
             ThreadOwner::new(first_owner.session_id().clone(), forge_provider_api::AgentId::new("pending-native-child-owner")?)?,
             original_scope.exchange_id.clone(),
         );
-        let child_address = forge_provider_api::TurnAddress { thread_id: child_scope.owner.thread_id(), turn_id:child_scope.turn_id()?, scope:child_scope.clone() };
+        let child_address = forge_provider_api::TurnAddress { thread_id: child_scope.owner().thread_id(), turn_id:child_scope.turn_id()?, scope:child_scope.clone() };
         let agent_id = forge_provider_api::AgentId::new("pending-native-child")?;
         let proof = {
             let mut registry = original.lock().unwrap();
@@ -748,7 +747,7 @@ async fn open_log_failure_retries_native_cleanup_and_drains_retained_stream() ->
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     assert_eq!(native.sinks.lock().unwrap().len(), 1);
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::hang_guard::HANG_GUARD,
         bridge.session_close_owner(&owner),
     )
     .await??;
@@ -905,7 +904,7 @@ async fn history_shutdown_cancels_pending_fork() -> anyhow::Result<()> {
         async move { bridge.thread_fork(request).await }
     });
     native.fork_started.notified().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
     assert!(
         matches!(pending.await?, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Cancelled)
     );
@@ -931,7 +930,7 @@ async fn history_shutdown_cancels_compaction_watermark_wait() -> anyhow::Result<
         async move { bridge.thread_compact(request).await }
     });
     native.compact_started.notified().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
     assert!(
         matches!(pending.await?, Err(ProviderError::Failure(failure))
         if failure.kind() == ProviderFailureKind::Cancelled && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain)
@@ -1295,7 +1294,7 @@ async fn cold_configuration_defers_native_write_until_initialization() -> anyhow
 #[tokio::test]
 async fn configuration_receipt_rejects_new_operation_identity_and_retired_generation()
 -> anyhow::Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let root = tempfile::tempdir()?;
         let native = BridgeFixtureProvider::new(false);
         *native.open_identity.lock().unwrap() = Some("before".try_into()?);
@@ -1465,7 +1464,7 @@ async fn identity_boundary(
 /// Publish a new binding identity only after metadata used by the broker's stale-event filter advances.
 #[tokio::test]
 async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow::Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
         let root = tempfile::tempdir()?;
         let native = BridgeFixtureProvider::new(false);
         *native.open_identity.lock().unwrap() = Some("opened".try_into()?);
@@ -1494,7 +1493,7 @@ async fn native_identity_metadata_precedes_queued_owner_publication() -> anyhow:
         let host = bridge.session(owner.clone()).await;
         host.sender
             .send(Ok(ProviderObservation::host(crate::provider::HarnessEvent::Host {
-                scope: forge_provider_api::EventScope::Binding { owner: owner.clone() },
+                scope: forge_provider_api::EventScope::Binding { thread_id: forge_provider_api::ThreadId::from(owner.clone())},
                 event: crate::provider::HostEvent::Failure {
                     failure: forge_provider_api::ProviderFailure::new(ProviderOperation::ThreadConfigure, ProviderFailureKind::Unknown),
                     message: forge_provider_api::SanitizedMessage::new("identity-publication-marker")?,
@@ -1591,11 +1590,11 @@ async fn unexpected_native_eof_retains_failed_close_for_retry() -> anyhow::Resul
     let binding = session.initialized.get().unwrap().binding.id.clone();
     native.close_native_stream(&binding);
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+    let error = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
         .await?
         .expect_err("unexpected native EOF was not reported to the host stream");
     assert!(matches!(error, EventDeliveryError::Closed));
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         while native.retire_calls.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
@@ -2033,12 +2032,12 @@ async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()
     assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
     native.close_native_stream(&binding);
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
             .await?
             .is_err()
     );
     let error = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         bridge.wait_watermark(&owner, forge_provider_api::EventSequence::new(1)),
     )
     .await?
@@ -2090,7 +2089,7 @@ async fn close_waits_for_published_prefix_without_fabricating_observation_loss()
     assert!(futures_util::poll!(closing.as_mut()).is_pending());
     assert!(bridge.sessions.lock().await.contains_key(&owner));
     bridge.event_consumed(&binding, sequence).await?;
-    tokio::time::timeout(std::time::Duration::from_secs(2), closing).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, closing).await??;
     assert!(!bridge.sessions.lock().await.contains_key(&owner));
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     Ok(())
@@ -2122,7 +2121,7 @@ async fn rejected_open_allows_corrected_configuration_without_operation_conflict
         assert_eq!(attempts.len(), 2);
         assert_ne!(attempts[0].0, attempts[1].0);
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
     Ok(())
 }
 
@@ -2138,7 +2137,7 @@ async fn detached_open_observes_original_request_and_operation() -> anyhow::Resu
     let first_bridge = bridge.clone();
     let first = tokio::spawn(async move { first_bridge.thread_open(original).await });
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        crate::hang_guard::HANG_GUARD,
         native.open_started.notified(),
     )
     .await?;
@@ -2153,7 +2152,7 @@ async fn detached_open_observes_original_request_and_operation() -> anyhow::Resu
         assert_eq!(attempts[0].0, attempts[1].0);
         assert!(attempts[0].1 == attempts[1].1);
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
     Ok(())
 }
 
@@ -2261,7 +2260,7 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     let opening = bridge.clone();
     let worker = tokio::spawn(async move { opening.thread_open(request).await });
     native.open_started.notified().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), bridge.shutdown()).await??;
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
     let error = worker
         .await?
         .expect_err("shutdown must interrupt the held open");
@@ -2292,7 +2291,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
         tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
     native.terminal_started.notified().await;
     let error = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        crate::hang_guard::HANG_GUARD,
         bridge.session_close_owner(&owner),
     )
     .await?
@@ -2329,7 +2328,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
     native.terminal_release.notify_one();
     query.await??;
     tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        crate::hang_guard::HANG_GUARD,
         bridge.session_close_owner(&owner),
     )
     .await??;
@@ -2450,7 +2449,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
     };
     use forge_provider_api::{AdapterActivity, AgentId, ItemId};
     let phase = std::sync::Mutex::new("fixture setup");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let root = tempfile::tempdir()?;
         let readable = root.path().join("child-readable.txt");
         std::fs::write(&readable, "child resource")?;
@@ -2466,7 +2465,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
                     start.observed(1).await?;
                     let agent_id = AgentId::new("observed-child").unwrap();
                     let child_owner = ThreadOwner::new(
-                        request.scope.owner.session_id().clone(),
+                        request.scope.owner().session_id().clone(),
                         AgentId::new("independent-child-owner").unwrap(),
                     )
                     .unwrap();
@@ -2480,7 +2479,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
                         scope,
                     };
                     let description = AgentDescription {
-                        parent_agent_id: Some(request.scope.owner.agent_id().clone()),
+                        parent_agent_id: Some(request.scope.owner().agent_id().clone()),
                         delegation: Some(AgentDelegation {
                             parent_thread_id: request.thread_id.clone(),
                             parent_turn_id: request.turn_id.clone(),
@@ -2536,7 +2535,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
         assert_ne!(
             fixture
                 .provider_handle()
-                .retained_session_id(&parent.owner)
+                .retained_session_id(&parent.owner())
                 .await
                 .as_ref()
                 .map(|id| id.as_str()),
@@ -2572,7 +2571,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
             arguments: serde_json::json!({}),
         };
         let foreign_parent = forge_provider_api::InvocationScope::new(
-            parent.owner.clone(),
+            parent.owner().clone(),
             parent.exchange_id.clone(),
         );
         assert!(
@@ -2628,7 +2627,7 @@ async fn observed_child_policy_survives_parent_collection_and_retires_on_child_c
             .sessions
             .lock()
             .await
-            .get(&parent.owner)
+            .get(&parent.owner())
             .cloned()
             .expect("original parent binding is retained");
         let child_context = host

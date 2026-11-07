@@ -81,7 +81,7 @@ impl HarnessBroker {
                         ) =>
                     {
                         forwarded.push(self.event("provider_event", json!({
-                            "kind":"error", "text":format!("Session observation failed: {error:#}"),
+                            "kind":"error", "text":format!("Session observation failed: {}", crate::storage::error_message(&error)),
                         }))?);
                     }
                     Err(error) => return Err(error),
@@ -135,6 +135,12 @@ impl HarnessBroker {
                     }
                 }
             };
+            // Match the service owner's per-signal diagnostics so a hot reducer loop is visible.
+            self.trace.record(
+                &self.session.id,
+                "exchange.event.read",
+                json!({"signal": signal.diagnostic_name()}),
+            );
             let signal = match signal {
                 ForegroundSignal::ObservationPublicationNeedsForward { events } => {
                     forwarded.extend(events);

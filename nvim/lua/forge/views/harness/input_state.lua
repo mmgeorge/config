@@ -12,6 +12,8 @@ local command = require("forge.command")
 ---@field drafts table[] Unacknowledged or rejected editor drafts, never eligible for host delivery.
 ---@field entry_by_id table<string, table> Stable display objects for queue editing.
 ---@field retraction table<string, fun(): boolean>
+---@field committing table<string, integer> In-flight edit commits per message id.
+---@field commit_waiters table<string, fun()[]> Reservations waiting for a message's commit result.
 ---@field refreshing? boolean
 ---@field required_revision? integer
 ---@field suspended boolean
@@ -137,6 +139,7 @@ function M.attach(state, changed)
     session_id = state.session.id, runtime_epoch = state.runtime_epoch,
     host_generation = client.host_get_generation(), revision = 0, control_revision = 0,
     confirmed = {}, drafts = {}, entry_by_id = {}, retraction = {}, suspended = false, changed = changed,
+    committing = {}, commit_waiters = {},
   }
   M.refresh(state)
 end
@@ -195,13 +198,32 @@ function M.perform(state, action, callback, target)
     render(state)
   end
   local completed = false
+  local committing = {}
+  for _, edit in ipairs(action.kind == "commit" and action.edits or {}) do
+    committing[#committing + 1] = edit.id
+    input.committing[edit.id] = (input.committing[edit.id] or 0) + 1
+  end
   client.request({ session_id = input.session_id, method = "session.input.apply", params = {
     id = id, action = vim.deepcopy(action), control_revision = input.control_revision,
     after_control = input.pause_operation_id, target = vim.deepcopy(target),
   } }, function(result, failure, detail)
     if completed then return end
     completed = true
-    if not owns_input(state, input) then return end
+    local waiters = {}
+    -- Release commit ownership only after the result updated the displayed revision, so waiters
+    -- observe the revision the host published.
+    local function settle_commits()
+      for _, edit_id in ipairs(committing) do
+        local remaining = input.committing[edit_id] - 1
+        input.committing[edit_id] = remaining > 0 and remaining or nil
+        if not input.committing[edit_id] then
+          for _, waiter in ipairs(input.commit_waiters[edit_id] or {}) do waiters[#waiters + 1] = waiter end
+          input.commit_waiters[edit_id] = nil
+        end
+      end
+      for _, waiter in ipairs(waiters) do waiter() end
+    end
+    if not owns_input(state, input) then settle_commits() return end
     local admitted = draft and not index_of(input.drafts, draft.id)
     if result then
       M.receive(state, result)
@@ -219,7 +241,22 @@ function M.perform(state, action, callback, target)
     end
     if failure then notifications.error(failure, "Harness message") end
     if callback then callback(failure) end
+    settle_commits()
   end)
+end
+
+---Run `continuation` once no edit commit for the message is awaiting its host result.
+---A reservation must name the revision that result publishes, so it cannot read the displayed
+---revision while a commit for the same message is still in flight.
+---@param state table
+---@param id string
+---@param continuation fun()
+function M.after_commit(state, id, continuation)
+  local input = state.input
+  if not input.committing[id] then continuation() return end
+  local waiters = input.commit_waiters[id] or {}
+  input.commit_waiters[id] = waiters
+  waiters[#waiters + 1] = continuation
 end
 
 ---Discard an editor-only recovery draft without sending a host input mutation.

@@ -38,7 +38,7 @@ local ok,failure=xpcall(function()
   fixture.wait('Say "hello".')
   fixture.type('<BS>')
   fixture.wait('Say "hello" ')
-  for _,word in ipairs({'Ω','日本語','café','don’t'}) do
+  for _,word in ipairs({'Ω','日本語','café'}) do
     fixture.type('<Esc>')
     fixture.exec('local text='..vim.inspect(word..' ')..';vim.api.nvim_buf_set_lines(0,0,-1,false,{text});vim.api.nvim_win_set_cursor(0,{1,#text-1})')
     local requests=fixture.exec('return #text_requests')

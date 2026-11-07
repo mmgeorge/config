@@ -1,4 +1,5 @@
 //! Collect and settle exchange transitions from identified evidence inside the session owner.
+use crate::provider::ScopeOwner;
 
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -477,7 +478,7 @@ impl ExchangeTransition {
                         .map(|scope| {
                             let engine = broker
                                 .execution_registry()
-                                .existing_owner(&scope.owner)
+                                .existing_owner(&scope.owner())
                                 .map_err(|error| TransitionFailure::Domain(error.into()))?
                                 .ok_or(TransitionFailure::Uncertain)?;
                             Ok::<_, TransitionFailure>(InvocationCollection {

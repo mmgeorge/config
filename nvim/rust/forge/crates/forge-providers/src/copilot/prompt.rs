@@ -21,7 +21,6 @@ pub struct TurnOptions {
     pub model: Option<String>,
     pub capability: ProviderCapability,
     pub input: PromptInput,
-    pub task: Option<forge_provider_api::input::TaskStart>,
     pub recovered: Vec<forge_provider_api::session::RecoveredInput>,
     pub instructions: String,
     pub repair_caution: Option<String>,
@@ -122,10 +121,6 @@ pub async fn run(
     }
     let provider_text = input_text(session, &options.input).await?;
     let provider_text = with_attachment_context(provider_text, &options.attachments.attachments);
-    let provider_text = match &options.task {
-        Some(task) => format!("{}\n\n{provider_text}", task.heading()),
-        None => provider_text,
-    };
     let mut recovered = Vec::new();
     let mut recovered_attachments = Vec::new();
     for input in &options.recovered {
@@ -163,7 +158,7 @@ pub async fn run(
                     submission
                         .clone()
                         .record_sending(Some(sending_recovery_token(
-                            options.scope.owner.clone(),
+                            options.scope.thread_id.clone(),
                             options.submission_id.clone().ok_or_else(|| {
                                 native_failure(
                                     ProviderOperation::TurnStart,
@@ -196,7 +191,7 @@ pub async fn run(
                                 )
                             })?,
                             submission.attempt_id()?,
-                            options.scope.owner.clone(),
+                            options.scope.thread_id.clone(),
                             session.id().to_string(),
                             receipt.clone(),
                         )?))
@@ -207,6 +202,9 @@ pub async fn run(
             },
         )
         .await;
+    if sending.is_ok() {
+        owned_session.release_mcp_loading().await;
+    }
     if let Err(error) = sending {
         let acceptance_error =
             if super::operation::current().is_some_and(|operation| !operation.dispatched()) {
@@ -280,6 +278,26 @@ pub async fn run(
                     let provider_event = provider_event.map_err(|_| native_failure(ProviderOperation::ThreadClose, ProviderFailureKind::Transport))?;
                     let observed_at_ms = subscription.observed_at(&provider_event);
                     normalize_internal(turn_event.observe(&provider_event), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
+                    // An abort that discards still-queued input is terminal: Copilot emits no idle.
+                    if provider_event.agent_id.is_none()
+                        && provider_event.event_type == "abort"
+                        && normalize_internal(turn_event.accepted_inputs_unconsumed(), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?
+                    {
+                        return Ok(super::turn::IdleOutcome::Aborted);
+                    }
+                    if provider_event.agent_id.is_none()
+                        && provider_event.event_type == "user.message"
+                        && let Some(submission) = provider_event
+                            .data
+                            .get("messageId")
+                            .and_then(Value::as_str)
+                            .map(|message| turn_event.accepted_submission(message))
+                            .transpose()
+                            .map_err(|_| native_failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?
+                            .flatten()
+                    {
+                        decoder.consumed_input(&provider_event, submission, sink).await?;
+                    }
                     if provider_event.agent_id.is_none()
                         && provider_event.event_type == "assistant.idle"
                     {
@@ -443,7 +461,7 @@ pub(super) enum NativeRecoveryEvidence {
         version: u8,
         submission_id: forge_provider_api::SubmissionId,
         attempt_id: forge_provider_api::DeliveryAttemptId,
-        owner: forge_provider_api::ThreadOwner,
+        owner: forge_provider_api::ThreadId,
         workspace: String,
         session_id: String,
         cursor: String,
@@ -454,7 +472,7 @@ pub(super) enum NativeRecoveryEvidence {
         version: u8,
         submission_id: forge_provider_api::SubmissionId,
         attempt_id: forge_provider_api::DeliveryAttemptId,
-        owner: forge_provider_api::ThreadOwner,
+        owner: forge_provider_api::ThreadId,
         session_id: String,
         message_id: String,
     },
@@ -468,7 +486,7 @@ pub(super) struct NativeDeliveryBoundary {
 }
 
 pub(super) fn sending_recovery_token(
-    owner: forge_provider_api::ThreadOwner,
+    owner: forge_provider_api::ThreadId,
     submission_id: forge_provider_api::SubmissionId,
     attempt_id: forge_provider_api::DeliveryAttemptId,
     boundary: NativeDeliveryBoundary,
@@ -496,7 +514,7 @@ pub(super) fn sending_recovery_token(
 pub(super) fn accepted_recovery_token(
     submission_id: forge_provider_api::SubmissionId,
     attempt_id: forge_provider_api::DeliveryAttemptId,
-    owner: forge_provider_api::ThreadOwner,
+    owner: forge_provider_api::ThreadId,
     session_id: String,
     message_id: String,
 ) -> Result<forge_provider_api::RecoveryToken, ProviderError> {
@@ -622,7 +640,7 @@ mod tests {
             super::super::turn::IdleOutcome::HostHandoff,
         ] {
             let scope = forge_provider_api::InvocationScope::new(
-                forge_provider_api::ThreadOwner::root("session"),
+                forge_provider_api::testing::root_thread("session"),
                 "invocation",
             );
             let (authority, _activity) = forge_provider_api::events::channel(
@@ -805,7 +823,7 @@ mod tests {
         let turn = CopilotTurnEvent::default();
         let _guard = turn.activate(None, None)?;
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("missing-terminal"),
+            forge_provider_api::testing::root_thread("missing-terminal"),
             "exchange",
         );
         let (_sink, mut stream) = forge_provider_api::events::channel(

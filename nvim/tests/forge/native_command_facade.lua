@@ -4,13 +4,17 @@ local opened, refreshed, closed = {}, 0, 0
 package.loaded["forge.status"] = {
   open_comparison = function(options) calls[#calls + 1] = options end,
   open = function(options)
-    local state = { active = true, replica = { buffer = vim.api.nvim_create_buf(false, true) } }
+    local state = { active = true, ready = true, replica = { buffer = vim.api.nvim_create_buf(false, true) } }
     opened[#opened + 1] = { options = options, state = state }
     return state
   end,
   refresh = function() refreshed = refreshed + 1 end,
   close = function(state) closed = closed + 1 state.active = false end,
+  -- Reopening a ready status view remounts its buffer in the current window.
+  show = function() return true end,
 }
+-- The facade warms the host on entry; this fixture exercises only routing.
+require("forge.client").host_start = function() end
 package.loaded["forge.git.git_provider"] = { git_root_async = function(callback) callback("D:/config") end }
 package.loaded["forge.views.branch_diff"] = setmetatable({}, { __index = function() error("legacy branch rendering was loaded") end })
 local commands = require("forge.views.commands")

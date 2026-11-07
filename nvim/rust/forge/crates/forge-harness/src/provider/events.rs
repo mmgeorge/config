@@ -1,4 +1,5 @@
 //! Host publications retain their resolved owner independently of native transport.
+use crate::provider::ScopeOwner;
 
 use super::session_execution::{InputPresentation, OwnerObservation};
 use super::{EventScope, InvocationScope, ProviderEvent};
@@ -145,7 +146,7 @@ impl HarnessEventSink {
             .cloned()
             .ok_or(EventDeliveryError::InvalidTransportData)?;
         if !matches!(self.scope, EventScope::Binding { .. })
-            || self.scope.owner().session_id() != scope.owner.session_id()
+            || self.scope.owner().session_id() != scope.owner().session_id()
         {
             return Err(self.mismatch(scope.into()));
         }
@@ -167,7 +168,7 @@ impl HarnessEventSink {
             .scope
             .invocation()
             .ok_or_else(|| self.mismatch(invocation.clone().into()))?;
-        if original.owner != invocation.owner
+        if original.owner() != invocation.owner()
             || original.exchange_id != invocation.exchange_id
             || original.invocation_id == invocation.invocation_id
         {
@@ -190,7 +191,7 @@ impl HarnessEventSink {
         let parent = self
             .invocation_scope()
             .map_err(|_| self.mismatch(scope.clone().into()))?;
-        if parent.owner.session_id() != scope.owner.session_id()
+        if parent.owner().session_id() != scope.owner().session_id()
             || parent.exchange_id != scope.exchange_id
         {
             return Err(self.mismatch(scope.clone().into()));

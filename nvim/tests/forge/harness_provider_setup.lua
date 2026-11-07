@@ -56,16 +56,18 @@ spec, option = wait_for("login")
 assert(not selected("install"), "available runtime exposed an installer")
 assert(spec.page_list[1].subtitle:find("Provider version 2.1.302 · Adapter 0.89.1", 1, true), "CLI and adapter versions were conflated")
 spec.on_confirm({ option = option })
-assert(vim.wait(5000, function() return not state.configuring and refreshes == 3 end, 10), "successful terminal login did not refresh setup")
+assert(vim.wait(5000, function() return refreshes == 3 end, 10), "successful terminal login did not refresh setup")
 wait_for("login")
 local before = refreshes
 auth_command = { "node", "-e", "process.exit(7)" }
 setup.open({ host = host, session_id = "setup-test" })
 spec, option = wait_for("login")
 spec.on_confirm({ option = option })
-assert(vim.wait(5000, function() return not state.configuring end, 10), "failed login left configuration blocked")
+local function reported_failure()
+  return vim.iter(notices):any(function(notice) return notice.message:find("status 7", 1, true) end)
+end
+assert(vim.wait(5000, reported_failure, 10), "terminal failure was not reported: " .. vim.inspect(notices))
 assert(refreshes == before + 1, "failed login was reported as successful")
-assert(vim.iter(notices):any(function(notice) return notice.message:find("status 7", 1, true) end), "terminal failure was not reported")
 for _, window in ipairs(vim.api.nvim_list_wins()) do
   if vim.api.nvim_win_get_config(window).relative ~= "" then pcall(vim.api.nvim_win_close, window, true) end
 end
@@ -77,11 +79,11 @@ spec.on_confirm({ option = option })
 local login_window = vim.api.nvim_get_current_win()
 local login_buffer = vim.api.nvim_win_get_buf(login_window)
 local login_job = vim.b[login_buffer].terminal_job_id
-assert(login_job and state.configuring, "terminal login was not admitted")
+assert(login_job and login_job > 0, "terminal login was not admitted")
 vim.api.nvim_win_close(login_window, true)
 assert(vim.wait(5000, function()
-  return not state.configuring and vim.fn.jobwait({ login_job }, 0)[1] ~= -1
-end, 10), "cancelled login retained its process or configuration lock")
+  return vim.fn.jobwait({ login_job }, 0)[1] ~= -1
+end, 10), "cancelled login retained its process")
 assert(refreshes == before, "cancelled login was reported as successful")
 version_error = "runtime"
 setup.open({ host = host, session_id = "setup-test" })

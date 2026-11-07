@@ -32,13 +32,14 @@ return function(context)
   local function exchanges()
     return context.request("session.exchange.list", {})
   end
-  local function assert_once(prompt)
+  local function assert_exchange_count(prompt, expected)
     local count = 0
     for _, exchange in ipairs(exchanges()) do
       if exchange.prompt == prompt then count = count + 1 end
     end
-    assert(count == 1, prompt .. " appeared in " .. count .. " exchanges")
+    assert(count == expected, prompt .. " appeared in " .. count .. " exchanges, expected " .. expected)
   end
+  local function assert_once(prompt) assert_exchange_count(prompt, 1) end
   local function find_message(id)
     for _, message in ipairs(state.input.confirmed) do
       if message.id == id then return message end
@@ -92,7 +93,8 @@ return function(context)
       delayed()
       client.request = original_request
       context.request("session.input.apply", operation)
-      assert_once(prompt)
+      -- Cancelling an output-free turn retracts its exchange; the late replay must not revive it.
+      assert_exchange_count(prompt, outcome == "cancel" and 0 or 1)
       assert(#state.queue == 0 and #state.pending_submit == 0 and #state.pending_steer == 0,
         "late or duplicate admission revived an accepted message")
       assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "Newer unsent draft " .. outcome,

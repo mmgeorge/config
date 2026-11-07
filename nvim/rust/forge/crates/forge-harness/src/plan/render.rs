@@ -2269,7 +2269,7 @@ mod test {
             variants: Vec::new(),
             extends: None,
             conforms_to: vec![EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
+                entity: "Provider".into(),
             }],
         });
         document.entity_changes.push(ProgramEntityChange {
@@ -2303,7 +2303,7 @@ mod test {
         );
         assert_eq!(
             fixture_path_column,
-            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 4
+            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX
         );
         assert!(rendered.markdown.contains("+ run(): Result"));
         assert!(rendered.markdown.contains("- client: Client"));

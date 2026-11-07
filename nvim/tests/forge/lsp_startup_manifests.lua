@@ -57,7 +57,8 @@ local success, failure = xpcall(function()
   for index = 1, 130 do vim.fn.mkdir(directory .. "/directory-" .. index, "p") end
   local noise = directory .. "/noise"
   vim.fn.mkdir(noise, "p")
-  for index = 1, 4100 do vim.fn.writefile({}, noise .. "/entry-" .. index) end
+  -- Discovery yields after every 256 directory entries, so a few batches of noise prove it keeps scanning.
+  for index = 1, 600 do vim.fn.writefile({}, noise .. "/entry-" .. index) end
 
   state = startup.start(directory)
   assert(vim.wait(10000, function() return #launched == 2 end, 5), "nested manifests were not discovered")

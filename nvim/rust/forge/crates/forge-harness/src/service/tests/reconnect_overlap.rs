@@ -37,7 +37,7 @@ async fn owner_reconnect_serializes_overlapping_snapshot_leases() -> Result<()> 
         None,
     )?;
     drop(first_confirmation);
-    let second = tokio::time::timeout(Duration::from_secs(5), second).await??;
+    let second = tokio::time::timeout(crate::hang_guard::HANG_GUARD, second).await??;
     let (second_state, second_confirmation) = second.into_parts();
     assert!(
         second_state["owner_publication"]["high_water"]
@@ -69,7 +69,7 @@ async fn owner_reconnect_captures_latest_input_after_held_cancellation_publicati
     let controller =
         SessionController::new(HarnessBroker::initialize(initialize(&root, "mock"))?).await?;
     let (sink, _output) = forge_protocol::outbound::channel();
-    let scenario = tokio::time::timeout(Duration::from_secs(10), async {
+    let scenario = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
         let empty = controller.coordinator.submissions.snapshot()?;
         controller
             .exchange_owner

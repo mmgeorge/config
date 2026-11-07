@@ -1,5 +1,4 @@
 use crate::TurnAddress;
-use serde::{Deserialize, Serialize};
 use std::{fmt, time::Duration};
 
 /// Identify a retry-safe failure class without exposing native codes or payloads.
@@ -9,17 +8,6 @@ pub enum RetryCategory {
     RateLimited,
     TemporaryCapacity,
     TemporaryTransport,
-}
-
-/// Current retry attempt within one admitted provider request.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderRetry {
-    /// One-based retry number, excluding the initial attempt.
-    pub attempt: usize,
-    /// Maximum retries for this request.
-    pub max_attempts: usize,
-    /// Deadline for the delay, absent once the retry is running.
-    pub retry_at_ms: Option<i64>,
 }
 
 /// Retain canonical native permission to retry after shared delivery and effect checks.
@@ -37,7 +25,7 @@ impl RetryableFailure {
         result: &crate::TurnResult,
         category: RetryCategory,
     ) -> Result<Self, crate::ProviderError> {
-        if address.thread_id != address.scope.owner.thread_id()
+        if address.thread_id != address.scope.thread_id
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
         {
             return Err(crate::ProviderFailure::new(

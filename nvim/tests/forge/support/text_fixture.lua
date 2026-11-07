@@ -34,8 +34,13 @@ function M.open()
   return fixture
 end
 
+local host_executable=dofile(vim.fs.dirname(debug.getinfo(1,'S').source:sub(2))..'/host_executable.lua')
+
 function M.native(options)
   local fixture=M.open()
+  -- The parent leases the built executable from the content-addressed cache, so the child
+  -- launches an image Windows has already scanned instead of a fresh per-run copy.
+  fixture.exec('text_host_binary=...',{host_executable()})
   fixture.exec([[
     require('forge.text').detach(vim.api.nvim_get_current_buf())
     package.loaded['forge.text.service']=nil
@@ -43,9 +48,7 @@ function M.native(options)
     package.loaded['forge.text']=nil
     local data=vim.fn.tempname()
     vim.fn.mkdir(data,'p')
-    local executable='forge'..(vim.fn.has('win32')==1 and '.exe' or '')
-    local binary=data..'/'..executable
-    assert(vim.uv.fs_copyfile(vim.fn.getcwd()..'/nvim/rust/forge/target/debug/'..executable,binary))
+    local binary=text_host_binary
     package.loaded['forge.builder']={ensure=function(callback)callback({ok=true,path=binary});return function()end end}
     local previous=vim.fn.stdpath
     vim.fn.stdpath=function(kind)

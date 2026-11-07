@@ -1,9 +1,10 @@
 //! Resolve normalized identities to their immutable host invocation before delivery.
+use crate::provider::ScopeOwner;
+use crate::provider::ThreadOwner;
 use forge_provider_api::agent::{AgentEvent, AgentId, AgentLifecycleEvent};
 use forge_provider_api::events::EventDeliveryError;
 use forge_provider_api::{
-    BindingId, EventScope, InvocationScope, ItemId, ProviderEvent, ThreadId, ThreadOwner,
-    TurnEvent, TurnId,
+    BindingId, EventScope, InvocationScope, ItemId, ProviderEvent, ThreadId, TurnEvent, TurnId,
 };
 use std::collections::HashMap;
 
@@ -75,7 +76,7 @@ impl OwnershipRegistry {
         threads.insert(
             owner.thread_id(),
             EventScope::Binding {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             },
         );
         Self {
@@ -191,11 +192,11 @@ impl OwnershipRegistry {
 
     /// Retain a preparing invocation before the adapter may dispatch native work.
     pub(super) fn prepare(&mut self, scope: InvocationScope) -> Result<(), EventDeliveryError> {
-        if scope.owner != self.owner {
+        if scope.owner() != self.owner {
             return Err(conflict());
         }
         let turn_id = scope.turn_id().map_err(|_| conflict())?;
-        let thread_id = scope.owner.thread_id();
+        let thread_id = scope.owner().thread_id();
         if let Some(existing) = self.turns.get(&turn_id) {
             if existing.completed {
                 return Err(conflict());
@@ -261,9 +262,9 @@ impl OwnershipRegistry {
             .get(&address.thread_id)
             .and_then(EventScope::invocation)
             .ok_or_else(conflict)?;
-        if address.thread_id != address.scope.owner.thread_id()
+        if address.thread_id != address.scope.owner().thread_id()
             || address.thread_id == self.owner.thread_id()
-            || address.scope.owner.session_id() != self.owner.session_id()
+            || address.scope.owner().session_id() != self.owner.session_id()
             || address.scope.exchange_id != original.exchange_id
             || address.scope.turn_id().map_err(|_| conflict())? != address.turn_id
         {
@@ -272,12 +273,12 @@ impl OwnershipRegistry {
         if self
             .child_owners
             .get(&address.thread_id)
-            .is_some_and(|owner| owner != &address.scope.owner)
+            .is_some_and(|owner| owner != &address.scope.owner())
         {
             return Err(conflict());
         }
         self.child_owners
-            .insert(address.thread_id.clone(), address.scope.owner.clone());
+            .insert(address.thread_id.clone(), address.scope.owner().clone());
         self.turns.insert(
             address.turn_id,
             RegisteredTurn {
@@ -306,18 +307,20 @@ impl OwnershipRegistry {
                     forge_provider_api::ProviderConnectionEvent::CapabilitiesChanged(_)
                     | forge_provider_api::ProviderConnectionEvent::Unavailable(_),
             } => Ok(EventScope::Binding {
-                owner: self.owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
             }),
             ProviderEvent::Thread { thread_id, .. } => {
                 if thread_id == &self.owner.thread_id() {
                     return Ok(EventScope::Binding {
-                        owner: self.owner.clone(),
+                        thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
                     });
                 }
                 self.child_owners
                     .get(thread_id)
                     .cloned()
-                    .map(|owner| EventScope::Binding { owner })
+                    .map(|owner| EventScope::Binding {
+                        thread_id: owner.thread_id(),
+                    })
                     .ok_or_else(conflict)
             }
             ProviderEvent::Turn {
@@ -417,18 +420,20 @@ impl OwnershipRegistry {
         use forge_provider_api::WarningScope;
         match scope {
             WarningScope::Provider => Ok(EventScope::Binding {
-                owner: self.owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
             }),
             WarningScope::Thread { thread_id } => {
                 if thread_id == &self.owner.thread_id() {
                     return Ok(EventScope::Binding {
-                        owner: self.owner.clone(),
+                        thread_id: forge_provider_api::ThreadId::from(self.owner.clone()),
                     });
                 }
                 self.child_owners
                     .get(thread_id)
                     .cloned()
-                    .map(|owner| EventScope::Binding { owner })
+                    .map(|owner| EventScope::Binding {
+                        thread_id: owner.thread_id(),
+                    })
                     .ok_or_else(conflict)
             }
             WarningScope::Turn { thread_id, turn_id } => {
@@ -672,7 +677,7 @@ pub(crate) fn observed_agent_fixture(
     turn: Option<TurnId>,
 ) -> Result<ObservedAgentAssociation, EventDeliveryError> {
     let mut registry =
-        OwnershipRegistry::new(binding.clone(), root.owner.clone(), Default::default());
+        OwnershipRegistry::new(binding.clone(), root.owner().clone(), Default::default());
     registry.prepare(root)?;
     for (agent_id, description, address) in registrations {
         registry.resolve(
@@ -879,7 +884,7 @@ mod tests {
             EventScope::from(scope.clone())
         );
         let foreground = ProviderEvent::Item {
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.owner().thread_id(),
             turn_id: scope.turn_id().unwrap(),
             item_id: ItemId::new("new-foreground").unwrap(),
             event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {

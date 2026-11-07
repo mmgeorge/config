@@ -76,7 +76,7 @@ pub(super) struct CodexOutput {
 #[derive(Default)]
 pub struct CodexNormalization {
     scope: Option<EventScope>,
-    threads: HashMap<String, ThreadOwner>,
+    threads: HashMap<String, ThreadId>,
     turns: HashMap<(String, String), TurnAddress>,
     items: HashMap<(TurnId, String, ItemPart), NativeItem>,
     pending_child: HashMap<String, Vec<Value>>,
@@ -175,7 +175,7 @@ impl CodexNormalization {
     pub(super) fn admit_thread(
         &mut self,
         native: &str,
-        owner: &ThreadOwner,
+        owner: &ThreadId,
     ) -> std::result::Result<(), ProviderError> {
         if native.trim().is_empty() || self.threads.get(native).is_some_and(|old| old != owner) {
             return Err(protocol_error());
@@ -191,7 +191,7 @@ impl CodexNormalization {
         native_turn: &str,
         scope: &InvocationScope,
     ) -> std::result::Result<TurnAddress, ProviderError> {
-        self.admit_thread(thread, &scope.owner)?;
+        self.admit_thread(thread, &scope.thread_id)?;
         if native_turn.trim().is_empty() {
             return Err(protocol_error());
         }
@@ -204,7 +204,7 @@ impl CodexNormalization {
         }
         let address = TurnAddress {
             scope: scope.clone(),
-            thread_id: scope.owner.thread_id(),
+            thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().map_err(|_| protocol_error())?,
         };
         self.turns.insert(key, address.clone());
@@ -224,11 +224,11 @@ impl CodexNormalization {
     /// operation's thread, so host attempt and native progress settle one record.
     fn compaction_id(
         &self,
-        thread: &ThreadOwner,
+        thread: &ThreadId,
         params: &Value,
     ) -> std::result::Result<String, ProviderError> {
         if let Some(EventScope::SessionOperation {
-            owner,
+            thread_id: owner,
             operation_id,
         }) = &self.scope
             && owner == thread
@@ -294,7 +294,9 @@ impl CodexNormalization {
             if &ancestor.scope == parent {
                 return Ok(NativeCallbackOwner::ObservedChild(address.clone()));
             }
-            if ancestor.scope.owner.is_root() || !visited.insert(ancestor.turn_id.clone()) {
+            if ancestor.scope.thread_id == parent.thread_id
+                || !visited.insert(ancestor.turn_id.clone())
+            {
                 return Err(protocol_error());
             }
             ancestor_thread = native_thread.clone();
@@ -429,7 +431,7 @@ impl CodexNormalization {
                     .threads
                     .get(&thread)
                     .ok_or_else(protocol_error)?
-                    .thread_id(),
+                    .clone(),
                 event: ThreadEvent::Error { error },
             }),
         }
@@ -642,7 +644,7 @@ impl CodexNormalization {
                 .and_then(|thread| self.threads.get(thread))
                 .ok_or_else(protocol_error)?;
             events.push(AdapterActivity::Thread {
-                thread_id: thread.thread_id(),
+                thread_id: thread.clone(),
                 event: ThreadEvent::ContextUsage(usage),
             });
         }
@@ -657,10 +659,10 @@ impl CodexNormalization {
                 .ok_or_else(protocol_error)?;
             *self.compaction_counts.entry(native_id.clone()).or_default() += 1;
             events.push(AdapterActivity::Thread {
-                thread_id: thread.thread_id(),
+                thread_id: thread.clone(),
                 event: ThreadEvent::CompactionUpdated(Box::new(Compaction {
                     id: self.compaction_id(thread, params)?,
-                    thread_id: thread.thread_id().as_str().to_owned(),
+                    thread_id: thread.clone().as_str().to_owned(),
                     state: if method == "item/started" {
                         CompactionState::Running
                     } else {
@@ -693,7 +695,7 @@ impl CodexNormalization {
             // turn executes the bound host operation; admitting it as an invocation would
             // publish activity under a scope the host never created.
             if let Some(EventScope::SessionOperation {
-                owner: operation_owner,
+                thread_id: operation_owner,
                 ..
             }) = &self.scope
                 && operation_owner == &owner
@@ -1416,8 +1418,7 @@ impl CodexNormalization {
                     })
                 })
                 .clone();
-            let child_owner = ThreadOwner::new(parent.session_id().clone(), agent_id.clone())
-                .map_err(|_| protocol_error())?;
+            let child_owner = parent.child(&agent_id).map_err(|_| protocol_error())?;
             self.admit_thread(&thread, &child_owner)?;
             let pending_child = self.pending_child.remove(&thread).unwrap_or_default();
             let delegation = self
@@ -1428,7 +1429,7 @@ impl CodexNormalization {
             let description = AgentDescription {
                 parent_agent_id,
                 delegation: Some(delegation),
-                thread_id: Some(child_owner.thread_id()),
+                thread_id: Some(child_owner.clone()),
                 definition: None,
                 nickname: None,
                 task: native.task,
@@ -1457,7 +1458,7 @@ impl CodexNormalization {
                 events.push(AdapterActivity::Agent {
                     agent_id,
                     event: AgentEvent::ConversationResolved {
-                        thread_id: child_owner.thread_id(),
+                        thread_id: child_owner.clone(),
                     },
                 });
             }
@@ -1732,13 +1733,14 @@ mod tests {
     /// Keep identical native IDs in separate turns and reasoning representations from aliasing.
     #[tokio::test]
     async fn native_identity_mapping_keeps_original_turn_and_item_owners() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         let first = normalization.admit_turn("native", "turn-one", &scope)?;
         let second = normalization.admit_turn(
             "native",
             "turn-two",
-            &InvocationScope::new(scope.owner.clone(), "two"),
+            &InvocationScope::new(scope.thread_id.clone(), "two"),
         )?;
         assert_ne!(first.turn_id, second.turn_id);
         for turn in ["turn-one", "turn-two"] {
@@ -1757,7 +1759,7 @@ mod tests {
     /// Keep nested compaction metadata in the same host thread as its public envelope.
     #[test]
     fn compaction_metadata_uses_registered_host_thread_identity() -> Result<()> {
-        let owner = ThreadOwner::root("compaction-owner");
+        let owner = forge_provider_api::testing::root_thread("compaction-owner");
         let mut normalization = CodexNormalization::default();
         normalization.admit_thread("private-native-thread", &owner)?;
         for method in ["item/started", "item/completed"] {
@@ -1766,7 +1768,7 @@ mod tests {
             }}), "")?;
             assert!(
                 matches!(events.as_slice(), [AdapterActivity::Thread { thread_id, event: ThreadEvent::CompactionUpdated(compaction) }]
-                if thread_id == &owner.thread_id() && compaction.thread_id == thread_id.as_str())
+                if thread_id == &owner.clone() && compaction.thread_id == thread_id.as_str())
             );
         }
         Ok(())
@@ -1775,7 +1777,8 @@ mod tests {
     /// Close unfinished foreground work without inferring background lifetime from turn success.
     #[test]
     fn completed_turn_requires_explicit_native_lifetime_evidence() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         let address = normalization.admit_turn("native", "turn", &scope)?;
         normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
@@ -1794,7 +1797,10 @@ mod tests {
     fn unpolled_unified_exec_requires_source_process_and_normal_native_end() -> Result<()> {
         for source in [Some("unifiedExecStartup"), Some("agent"), None] {
             for status in ["completed", "interrupted", "failed"] {
-                let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+                let scope = InvocationScope::new(
+                    forge_provider_api::testing::root_thread("session"),
+                    "one",
+                );
                 let mut normalization = CodexNormalization::default();
                 normalization.admit_turn("native", "turn", &scope)?;
                 let mut item = json!({"type":"commandExecution","id":"command","command":"server","status":"inProgress","processId":"42"});
@@ -1825,7 +1831,8 @@ mod tests {
     /// A user interrupt stops the turn's foreground commands but not unified-exec sessions.
     #[test]
     fn interrupt_selects_only_foreground_commands_of_the_turn() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         normalization.admit_turn("native", "turn", &scope)?;
         normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"sleep","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
@@ -1846,7 +1853,8 @@ mod tests {
     /// closed it as interrupted; that late activity is absorbed, not a protocol failure.
     #[test]
     fn late_native_activity_after_an_interrupted_turn_is_absorbed() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         normalization.admit_turn("native", "turn", &scope)?;
         normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
@@ -1872,7 +1880,8 @@ mod tests {
             ("99", false, false),
             ("42", true, false),
         ] {
-            let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+            let scope =
+                InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
             let mut normalization = CodexNormalization::default();
             let address = normalization.admit_turn("native", "turn", &scope)?;
             normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"server","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), "")?;
@@ -1898,7 +1907,8 @@ mod tests {
     /// Preserve the original turn for turnless output after a successor is admitted.
     #[tokio::test]
     async fn certified_background_output_keeps_original_owner_across_successor() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         let address = normalization.admit_turn("native", "old", &scope)?;
         normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"old","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
@@ -1916,7 +1926,7 @@ mod tests {
         let next = normalization.admit_turn(
             "native",
             "new",
-            &InvocationScope::new(scope.owner.clone(), "two"),
+            &InvocationScope::new(scope.thread_id.clone(), "two"),
         )?;
         let events = normalization.normalize_background(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","itemId":"command","delta":"late"}}), "").await?.unwrap();
         assert!(!events.is_empty());
@@ -1928,7 +1938,8 @@ mod tests {
     /// Freeze authoritative message snapshots and reject conflicting replay before changing content.
     #[test]
     fn final_text_snapshots_are_idempotent_and_immutable() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         normalization.admit_turn("native", "turn", &scope)?;
         let delta = json!({"method":"item/agentMessage/delta","params":{"threadId":"native","turnId":"turn","itemId":"message","delta":"partial"}});
@@ -1947,7 +1958,8 @@ mod tests {
     /// Keep multiple native reports identified and never count context compaction as expenditure.
     #[test]
     fn usage_replays_keep_one_report_and_context_adjustments_are_separate() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         let address = normalization.admit_turn("native", "turn", &scope)?;
         let usage = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"turn","tokenUsage":{"last":{"inputTokens":10,"outputTokens":5},"total":{"inputTokens":30,"outputTokens":20,"totalTokens":50}}}});
@@ -1957,7 +1969,8 @@ mod tests {
         let adjustment = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"turn","tokenUsage":{"last":{"inputTokens":0,"outputTokens":0},"total":{"inputTokens":20,"outputTokens":10,"totalTokens":30}}}});
         normalization.activities(&adjustment, "")?;
         assert_eq!(normalization.final_usage(&address).len(), 1);
-        let later_scope = InvocationScope::new(ThreadOwner::root("session"), "two");
+        let later_scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "two");
         let later = normalization.admit_turn("native", "later", &later_scope)?;
         let replay = json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"later","tokenUsage":{"last":{"inputTokens":10,"outputTokens":5},"total":{"inputTokens":30,"outputTokens":20,"totalTokens":50}}}});
         normalization.activities(&replay, "")?;
@@ -1974,7 +1987,8 @@ mod tests {
     /// Resolve a child learned after spawn acknowledgement without replacing its original host agent.
     #[test]
     fn late_native_child_identity_resolves_the_original_pending_agent() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         normalization.admit_turn("native", "parent", &scope)?;
         let pending = normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"parent","item":{"type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","status":"inProgress","senderThreadId":"native","receiverThreadIds":[]}}}), "")?;
@@ -2000,7 +2014,8 @@ mod tests {
     /// Keep sparse output from erasing request metadata and reject changed final descriptors.
     #[test]
     fn sparse_tool_progress_preserves_descriptor_and_final_replay_is_checked() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         normalization.admit_turn("native", "turn", &scope)?;
         normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"cargo check","cwd":"workspace","status":"inProgress"}}}), "")?;
@@ -2054,7 +2069,8 @@ mod tests {
     /// Preserve explicit error correlation and reject foreign or conflicting supplied identities.
     #[test]
     fn native_errors_require_retained_exact_ownership() -> Result<()> {
-        let scope = InvocationScope::new(ThreadOwner::root("session"), "one");
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
         let mut normalization = CodexNormalization::default();
         let address = normalization.admit_turn("native", "turn", &scope)?;
         assert!(

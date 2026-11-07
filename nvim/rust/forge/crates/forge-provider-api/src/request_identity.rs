@@ -32,7 +32,6 @@ impl<T: ?Sized> Eq for AuthorityIdentity<T> {}
 #[derive(Clone, Eq, PartialEq)]
 pub struct SessionRequestIdentity {
     thread_id: crate::ThreadId,
-    owner: ThreadOwner,
     mode: SessionMode,
     workspace: String,
     history: SessionHistory,
@@ -48,7 +47,6 @@ impl From<&SessionRequest> for SessionRequestIdentity {
     fn from(request: &SessionRequest) -> Self {
         let SessionRequest {
             thread_id,
-            owner,
             mode,
             workspace,
             history,
@@ -61,7 +59,6 @@ impl From<&SessionRequest> for SessionRequestIdentity {
         } = request;
         Self {
             thread_id: thread_id.clone(),
-            owner: owner.clone(),
             mode: *mode,
             workspace: workspace.clone(),
             history: history.clone(),
@@ -85,9 +82,8 @@ pub struct PromptRequestIdentity {
     thread_id: crate::ThreadId,
     turn_id: crate::TurnId,
     scope: InvocationScope,
-    mode: PromptMode,
+    execution: ExecutionMode,
     configuration: InvocationConfiguration,
-    task: Option<TaskStart>,
     tools: Vec<ControlToolDefinition>,
     tool_endpoint: Option<HostToolEndpoint>,
     resource_lease: Option<AuthorityIdentity<dyn ResourceLease>>,
@@ -111,9 +107,8 @@ impl From<&PromptRequest> for PromptRequestIdentity {
             thread_id,
             turn_id,
             scope,
-            mode,
+            execution,
             configuration,
-            task,
             tools,
             tool_endpoint,
             resource_lease,
@@ -134,9 +129,8 @@ impl From<&PromptRequest> for PromptRequestIdentity {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
             scope: scope.clone(),
-            mode: *mode,
+            execution: *execution,
             configuration: configuration.clone(),
-            task: task.clone(),
             tools: tools.clone(),
             tool_endpoint: tool_endpoint.clone(),
             resource_lease: resource_lease.as_ref().map(AuthorityIdentity::new),
@@ -174,7 +168,6 @@ pub struct SteeringRequestIdentity {
     delivery: SteeringDeliveryIdentity,
     input: PromptInput,
     attachments: Vec<FileAttachment>,
-    task: Option<TaskStart>,
 }
 impl From<&SteeringRequest> for SteeringRequestIdentity {
     /// Snapshot the exact target and input without extending the receipt's lifetime.
@@ -184,7 +177,6 @@ impl From<&SteeringRequest> for SteeringRequestIdentity {
             delivery,
             input,
             attachments,
-            task,
         } = request;
         let delivery = match delivery {
             SteeringDelivery::Journaled { receipt } => SteeringDeliveryIdentity::Journaled {
@@ -198,7 +190,6 @@ impl From<&SteeringRequest> for SteeringRequestIdentity {
             delivery,
             input: input.clone(),
             attachments: attachments.clone(),
-            task: task.clone(),
         }
     }
 }
@@ -226,8 +217,7 @@ mod tests {
         let trace: Arc<dyn ProviderTrace> = Arc::new(Trace);
         let trace_lifetime = Arc::downgrade(&trace);
         let request = SessionRequest {
-            thread_id: (ThreadOwner::root("weak-operation-owner")).thread_id(),
-            owner: ThreadOwner::root("weak-operation-owner"),
+            thread_id: (crate::testing::root_thread("weak-operation-owner")),
             mode: SessionMode::Interactive,
             workspace: "fixture".into(),
             history: SessionHistory::Durable { resume: None },

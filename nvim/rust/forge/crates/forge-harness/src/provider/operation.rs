@@ -1,4 +1,5 @@
 //! Retain host-issued provider operation identity and explicit interruption authority.
+use crate::provider::ScopeOwner;
 
 use std::time::Duration;
 use std::{future::Future, sync::Arc};
@@ -63,7 +64,7 @@ impl OperationRegistry {
         &self,
         id: &OperationId,
         binding: &forge_provider_api::BindingId,
-        owner: &forge_provider_api::ThreadOwner,
+        owner: &crate::provider::ThreadOwner,
     ) -> Result<forge_provider_api::EventScope, forge_provider_api::events::EventDeliveryError>
     {
         let records = self
@@ -71,11 +72,11 @@ impl OperationRegistry {
             .lock()
             .map_err(|_| operation_warning_conflict())?;
         let original = records.get(id).ok_or_else(operation_warning_conflict)?;
-        if original.binding.as_ref() != Some(binding) || original.scope.owner() != owner {
+        if original.binding.as_ref() != Some(binding) || original.scope.owner() != *owner {
             return Err(operation_warning_conflict());
         }
         Ok(forge_provider_api::EventScope::SessionOperation {
-            owner: owner.clone(),
+            thread_id: forge_provider_api::ThreadId::from(owner.clone()),
             operation_id: id.clone(),
         })
     }
@@ -444,15 +445,15 @@ mod tests {
     #[test]
     fn operation_warning_requires_original_request_and_binding() {
         let registry = super::OperationRegistry::default();
-        let owner = forge_provider_api::ThreadOwner::root("owner");
-        let foreign = forge_provider_api::ThreadOwner::root("foreign");
+        let owner = crate::provider::ThreadOwner::root("owner");
+        let foreign = crate::provider::ThreadOwner::root("foreign");
         let id = forge_provider_api::OperationId::new("configure").unwrap();
         let binding = forge_provider_api::BindingId::new("binding").unwrap();
         registry
             .register(
                 id.clone(),
                 forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                 },
                 Some(binding.clone()),
             )
@@ -460,7 +461,7 @@ mod tests {
         assert_eq!(
             registry.resolve(&id, &binding, &owner).unwrap(),
             forge_provider_api::EventScope::SessionOperation {
-                owner: owner.clone(),
+                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                 operation_id: id.clone()
             }
         );
@@ -487,7 +488,9 @@ mod tests {
             registry
                 .register(
                     id,
-                    forge_provider_api::EventScope::Binding { owner: foreign },
+                    forge_provider_api::EventScope::Binding {
+                        thread_id: forge_provider_api::ThreadId::from(foreign)
+                    },
                     Some(binding)
                 )
                 .is_err()
@@ -498,14 +501,14 @@ mod tests {
     #[test]
     fn opening_operation_requires_exact_binding_result() {
         let registry = super::OperationRegistry::default();
-        let owner = forge_provider_api::ThreadOwner::root("owner");
+        let owner = crate::provider::ThreadOwner::root("owner");
         let id = forge_provider_api::OperationId::new("open").unwrap();
         let binding = forge_provider_api::BindingId::new("binding").unwrap();
         registry
             .register(
                 id.clone(),
                 forge_provider_api::EventScope::Binding {
-                    owner: owner.clone(),
+                    thread_id: forge_provider_api::ThreadId::from(owner.clone()),
                 },
                 None,
             )
@@ -536,7 +539,9 @@ mod tests {
         let core = CoreEventLog::new(root.path().to_owned());
         let control = OperationControl::fresh(ProviderOperation::Authenticate)?;
         let scope = forge_provider_api::EventScope::SessionOperation {
-            owner: forge_provider_api::ThreadOwner::root("session"),
+            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
+                "session",
+            )),
             operation_id: control.context().id().clone(),
         };
         let mut credentials_changed = false;
@@ -574,7 +579,7 @@ mod tests {
         let control = OperationControl::fresh(ProviderOperation::TurnStart)?;
         let context = control.context();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("session"),
+            crate::provider::ThreadOwner::root("session"),
             "exchange",
         );
         let expected =
@@ -618,7 +623,7 @@ mod tests {
         let core = CoreEventLog::new(root.path().to_owned());
         let context = OperationControl::fresh(ProviderOperation::TurnInterrupt)?.context();
         let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::ThreadOwner::root("session"),
+            crate::provider::ThreadOwner::root("session"),
             "exchange",
         );
         let called = std::sync::atomic::AtomicBool::new(false);

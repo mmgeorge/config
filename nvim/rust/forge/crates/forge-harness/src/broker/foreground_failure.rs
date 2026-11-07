@@ -162,7 +162,7 @@ impl FailureBaselineJob {
                     )
                 }
                 FailureBaselinePolicy::Retract { context, request } => {
-                    let owner = request.scope.owner.clone();
+                    let owner = request.scope.owner().clone();
                     let outcome = tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         self.provider.input_retract(context, &owner, request),
@@ -305,6 +305,7 @@ impl HarnessBroker {
                 else if error.is::<TurnCancelled>() { "turn_cancelled" }
                 else if error.downcast_ref::<ProviderError>().is_some_and(ProviderError::is_clean_cancellation) { "provider_cancelled" }
                 else { "foreground_failure" },
+            "reason": format!("{error:#}"),
         }));
         // Cancellation revokes the old task authority before its final worker results drain.
         // Preserve scoped cancellation instead of closing the binding for that expected revocation.
@@ -1546,14 +1547,15 @@ impl HarnessBroker {
                 } else {
                     let diagnostic = super::publication::DiagnosticView {
                         kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new(format!(
-                            "{:#}",
-                            failure.original
-                        ))
+                        message: forge_provider_api::SanitizedMessage::new(
+                            crate::storage::error_message(&failure.original),
+                        )
                         .expect("host diagnostic is nonempty"),
                         severity: super::publication::DiagnosticSeverity::Error,
                         scope: crate::provider::EventScope::Binding {
-                            owner: crate::provider::ThreadOwner::root(&self.session.id),
+                            thread_id: forge_provider_api::ThreadId::from(
+                                crate::provider::ThreadOwner::root(&self.session.id),
+                            ),
                         },
                         native_scope: forge_provider_api::WarningScope::Provider,
                     };

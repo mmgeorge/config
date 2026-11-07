@@ -201,18 +201,17 @@ mod tests {
     /// Callback-first child processing must wait until native ancestry publication has completed.
     #[tokio::test]
     async fn child_processing_waits_for_relationship_publication_before_started() {
-        let parent = ThreadOwner::root("relationship");
-        let owner =
-            ThreadOwner::new(parent.session_id().clone(), AgentId::new("child").unwrap()).unwrap();
+        let parent = forge_provider_api::testing::root_thread("relationship");
+        let owner = parent.child(&AgentId::new("child").unwrap()).unwrap();
         let scope = InvocationScope::new(owner.clone(), "original-exchange");
         let address = TurnAddress {
-            thread_id: owner.thread_id(),
+            thread_id: owner.clone(),
             turn_id: scope.turn_id().unwrap(),
             scope,
         };
         let (sink, mut stream) = events::channel(
             BindingId::new("child-relationship").unwrap(),
-            EventScope::Binding { owner: parent },
+            EventScope::Binding { thread_id: parent },
         );
         let child = AcpChildTurn::new(sink, address, ChildResources::new()).unwrap();
         let processing = child.observe(1);

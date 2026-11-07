@@ -101,7 +101,7 @@ mod tests {
             });
             let session = client.create_session(github_copilot_sdk::SessionConfig::default().with_session_id(github_copilot_sdk::SessionId::new("post-dispatch"))).await.unwrap();
             let turn = super::super::turn::CopilotTurnEvent::default();
-            let scope = forge_provider_api::InvocationScope::new(forge_provider_api::ThreadOwner::root("post-dispatch"), "invocation");
+            let scope = forge_provider_api::InvocationScope::new(forge_provider_api::testing::root_thread("post-dispatch"), "invocation");
             let (sink, _events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("binding").unwrap(), scope.clone());
             let guard = turn.activate(Some(sink.clone()), None).unwrap();
             turn.steer_native(None, None, |authority| async {
@@ -164,7 +164,7 @@ mod tests {
             let turn = super::super::turn::CopilotTurnEvent::default();
             let guard = turn.activate(None, None).unwrap();
             let scope = forge_provider_api::InvocationScope::new(
-                forge_provider_api::ThreadOwner::root("handoff"),
+                forge_provider_api::testing::root_thread("handoff"),
                 "invocation",
             );
             let submission = forge_provider_api::SubmissionId::try_from("submission").unwrap();

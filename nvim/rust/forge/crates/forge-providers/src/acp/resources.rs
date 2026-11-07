@@ -12,7 +12,7 @@ pub(super) fn mcp_launches(
 ) -> Result<Vec<Value>, ProviderError> {
     let mut names = std::collections::HashSet::with_capacity(launches.len());
     launches.iter().map(|launch| {
-        if launch.name == "forge-harness-control" || !names.insert(&launch.name) {
+        if launch.name == super::permission::HOST_TOOL_SERVER || !names.insert(&launch.name) {
             return Err(ProviderError::Failure(forge_provider_api::ProviderFailure::new(
                 operation,
                 forge_provider_api::ProviderFailureKind::Rejected,

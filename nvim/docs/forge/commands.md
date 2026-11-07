@@ -313,6 +313,8 @@ not filesystem-wide access. Explicit denials and protected files remain restrict
 Directory grants for writes use the containing Git worktree root when available,
 including linked worktrees and nested repositories. Non-Git paths use the nearest
 existing directory. The popup shows the selected root before approval.
+Permission popups, like every Forge picker, close with `q` or `Esc` without
+approving or rejecting the tool; the request stays pending until you decide it.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
 two latest prior responses stay open during the current exchange. Submitting another prompt folds

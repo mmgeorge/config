@@ -179,9 +179,10 @@ local success, failure = xpcall(function()
   await(function() return bullet_count() == 3 end, "expanded response bullets did not render")
   toggle(list_response)
   await(function() return messages("ForgeHarnessResponse")[6].entry.metadata.node.display == "preview" end, "list response did not collapse")
-  vim.wait(200)
+  -- Drive the collapsed render directly and wait for its decorations instead of sleeping
+  -- through render-markdown's debounce.
   require("render-markdown.core.ui").update(state.transcript_buf, state.transcript_win, "CursorMoved", false)
-  vim.wait(30)
+  await(function() return bullet_count() == 1 end, "collapsed response retained hidden bullet decorations")
   vim.cmd("redraw!")
   assert(bullet_count() == 1, "collapsed response retained hidden bullet decorations: " .. bullet_count())
   local preview_row = vim.fn.screenpos(state.transcript_win, list_start + 3, 1).row

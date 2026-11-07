@@ -1,4 +1,8 @@
 vim.loader.enable(false)
+local data = vim.fn.stdpath("data")
+vim.opt.runtimepath:append(data .. "/site")
+vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
 require("render-markdown").setup(require("plugins.markdown")[1].opts())
 local system, active, maximum, calls = vim.system, 0, 0, 0
 vim.system = function(command, options, callback)

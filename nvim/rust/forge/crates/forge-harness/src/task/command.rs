@@ -772,36 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn retired_acceptance_cancellation_has_no_task_command_alias() -> Result<()> {
-        for (method, params) in [
-            ("session.plan.acceptance.cancel", json!({"plan_id":"plan"})),
-            ("session.plan.acceptance.begin", json!({"plan_id":"plan"})),
-            (
-                "session.command.apply",
-                json!({"action":"begin_acceptance","plan_id":"plan"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"complete_acceptance","plan_id":"plan"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"cancel_acceptance","plan_id":"plan"}),
-            ),
-        ] {
-            assert!(
-                SessionCommand::parse_request(&Request {
-                    id: 1,
-                    method: method.into(),
-                    params,
-                })?
-                .is_none()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn review_aliases_preserve_arguments_and_dedicated_review_methods() -> Result<()> {
         for (method, action) in [
             ("session.plan.changes.request", "request_changes"),

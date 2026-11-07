@@ -184,7 +184,7 @@ pub(super) async fn recovery_frame(reader: &mut tokio::io::DuplexStream) -> Opti
 pub(super) async fn recovery_session(
     sessions: &Arc<CopilotSessions<tempfile::TempDir>>,
     client: CopilotClient,
-    owner: &forge_provider_api::ThreadOwner,
+    owner: &forge_provider_api::ThreadId,
 ) -> Arc<CopilotSession> {
     sessions
         .acquire(
@@ -192,7 +192,7 @@ pub(super) async fn recovery_session(
             SessionSelection {
                 execution_owner: owner.clone(),
 
-                correlation_id: owner.session_id().to_string(),
+                correlation_id: owner.to_string(),
                 session_id: None,
                 model: None,
                 context_tier: None,
