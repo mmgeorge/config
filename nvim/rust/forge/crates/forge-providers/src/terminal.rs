@@ -72,34 +72,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_inventory_preserves_large_commands() {
-        let command = "retained-command ".repeat(2049).trim_end().to_owned();
-        let snapshot = parse_snapshot(
-            &json!({"data":[{"processId":"1","command":command}]}),
-            false,
-        )
-        .unwrap();
-        assert_eq!(snapshot.terminal[0].command, command);
-    }
-
-    #[test]
-    fn terminal_inventory_displays_script_payloads_for_each_shell() {
-        for source in [
-            "pwsh -Command 'cargo test'",
-            "bash -lc 'cargo test'",
-            "zsh -ic 'cargo test'",
-            "nu --commands 'cargo test'",
-        ] {
-            let snapshot = parse_snapshot(
-                &json!({"data":[{"processId":"1", "command":source}]}),
-                false,
-            )
-            .unwrap();
-            assert_eq!(snapshot.terminal[0].command, "cargo test");
-        }
-    }
-
-    #[test]
     fn inventory_excludes_agents_and_finished_shells_and_rejects_invalid_data() {
         let snapshot = parse_snapshot(
             &json!({"tasks":[

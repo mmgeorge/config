@@ -8,15 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 pub(super) struct SdkPeer {
     requests: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
-    writer: Arc<tokio::sync::Mutex<DuplexStream>>,
+    _writer: Arc<tokio::sync::Mutex<DuplexStream>>,
 }
 
 impl SdkPeer {
-    /// Deliver an actual SDK notification independently of its original parent request.
-    pub(super) async fn notify(&self, notification: Value) {
-        write_frame(&mut *self.writer.lock().await, &notification).await;
-    }
-
     /// Join peer exit and inspect the complete native request sequence.
     pub(super) async fn collected(self) -> Vec<Value> {
         self.task
@@ -68,7 +63,7 @@ pub(super) fn streams(
         SdkPeer {
             requests,
             task,
-            writer,
+            _writer: writer,
         },
     )
 }

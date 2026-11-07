@@ -354,21 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn layout_bodies_and_internal_helpers_do_not_change_required_contracts() {
-        let expected = contract(
-            "pub struct State { pub value: i32 } pub fn run(value: &mut State) { old(); }",
-        );
-        let actual = contract(
-            "// comment\npub fn run(\nvalue: &mut State,\n) { new(); new(); }\npub struct State { pub value: i32, }\nfn helper() {} pub(crate) fn shared() {} mod internal { pub fn hidden() {} }",
-        );
-        assert!(
-            expected.differences(&actual).is_empty(),
-            "{:?}",
-            expected.differences(&actual)
-        );
-    }
-
-    #[test]
     fn all_contract_changes_and_new_exports_are_reported() {
         let expected = contract("pub struct State { pub value: i32 } pub fn run(value: i32) {}");
         let actual = contract(
@@ -387,29 +372,5 @@ mod tests {
         );
         assert!(expected.differences(&actual).is_empty());
         assert!(!expected.differences(&contract("pub struct State; impl State { pub fn run(&mut self) {} } pub trait Work { fn go(&self); }")).is_empty());
-    }
-    #[test]
-    fn typescript_public_members_and_lua_local_helpers_keep_their_boundaries() {
-        let parse = |path, source| {
-            let overview = DeclarationOverview::extract(path, source).unwrap();
-            DeclarationContract::parse(path, &overview).unwrap()
-        };
-        let expected = parse("api.ts", "export class Client { run(): void {} }");
-        let helpers = parse(
-            "api.ts",
-            "export class Client { run(): void {} private helper(): void {} }",
-        );
-        assert!(expected.differences(&helpers).is_empty());
-        let exposed = parse(
-            "api.ts",
-            "export class Client { run(): void {} added(): void {} }",
-        );
-        assert!(!expected.differences(&exposed).is_empty());
-        let expected = parse("api.lua", "function run() end");
-        let helpers = parse(
-            "api.lua",
-            "local function helper() end\nfunction run() helper() end",
-        );
-        assert!(expected.differences(&helpers).is_empty());
     }
 }

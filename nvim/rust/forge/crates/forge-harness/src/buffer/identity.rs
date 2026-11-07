@@ -74,18 +74,6 @@ impl DisplayRegistry {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn check_id(&self, command: &str, result: Option<usize>) -> Option<DisplayId> {
-        self.id.iter().find_map(|(key, id)| {
-            (key.source
-                == DisplaySource::Check {
-                    id: command.to_owned(),
-                    result,
-                })
-            .then_some(*id)
-        })
-    }
-
     pub(super) fn project(&mut self, owner: String) -> DisplayProjection<'_> {
         DisplayProjection {
             registry: self,

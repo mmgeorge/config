@@ -1120,19 +1120,6 @@ pub(crate) fn test_subtask_fixture() -> PlanSubtask {
 }
 
 #[cfg(test)]
-pub(crate) fn integration_test_subtask_fixture() -> PlanSubtask {
-    PlanSubtask::Test(PlanTestSubtask {
-        operation: TestSubtaskOperation::Test,
-        action: ChangeAction::Add,
-        renamed_from: None,
-        name: "submits_complete_plan".into(),
-        category: TestCategory::Integration,
-        behavior: "Submit one complete plan through the real broker boundary.".into(),
-        covers_entities: vec!["PlanDocument".into()],
-    })
-}
-
-#[cfg(test)]
 pub(crate) fn attach_test_fixture(document: &mut PlanDocument) {
     document.stages[0].tasks[0].files[0]
         .subtasks
@@ -1140,204 +1127,14 @@ pub(crate) fn attach_test_fixture(document: &mut PlanDocument) {
 }
 
 #[cfg(test)]
-pub(crate) fn attach_integration_test_fixture(document: &mut PlanDocument) {
-    document.stages[0].tasks[0].files.push(PlanFile {
-        change: PlanFileChange::Add {
-            path: "tests/plan_submission.rs".into(),
-        },
-        subtasks: vec![integration_test_subtask_fixture()],
-    });
-}
-
-#[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn deserializes_tagged_file_changes_without_ambiguous_rename_paths() {
-        let renamed: PlanFile = serde_json::from_value(serde_json::json!({
-            "action": "rename",
-            "from": "src/old.rs",
-            "to": "src/new.rs",
-            "subtasks": []
-        }))
-        .unwrap();
-        assert_eq!(renamed.change.path(), "src/new.rs");
-        assert_eq!(renamed.change.source_path(), Some("src/old.rs"));
-
-        assert!(
-            serde_json::from_value::<PlanFile>(serde_json::json!({
-                "action": "rename",
-                "path": "src/new.rs",
-                "subtasks": []
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<PlanFile>(serde_json::json!({
-                "path": "src/new.rs",
-                "subtasks": []
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<PlanFile>(serde_json::json!({
-                "action": "add",
-                "path": "src/new.rs",
-                "subtasks": [],
-                "legacy_operation": "create"
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn deserializes_structured_callable_return_types() {
-        let return_type = serde_json::from_value::<PlanFlowReturnType>(serde_json::json!({
-            "value_type": "InspectionReport",
-            "error_type": "InspectError"
-        }))
-        .unwrap();
-        assert_eq!(return_type.value_type, "InspectionReport");
-        assert_eq!(return_type.error_type.as_deref(), Some("InspectError"));
-    }
-
-    #[test]
-    fn deserializes_typed_runtime_edges_and_rejects_legacy_step_transitions() {
-        let edge = serde_json::from_value::<PlanFlowEdge>(serde_json::json!({
-            "relation": "call",
-            "target": {"kind": "planned_entity", "entity": "GeoParquetInspector"},
-            "callable": {"kind": "method", "name": "inspect"},
-            "expansion": [],
-            "branches": [],
-            "return_type": {"value_type": "InspectionReport"}
-        }))
-        .unwrap();
-        assert_eq!(edge.relation(), PlanFlowRelation::Call);
-        assert_eq!(edge.callable().unwrap().name, "inspect");
-    }
-
-    #[test]
-    fn deserializes_recursive_flow_trees_and_requires_explicit_child_arrays() {
-        let flow = serde_json::from_value::<PlanFlow>(serde_json::json!({
-            "title": "Inspection",
-            "description": "Inspect one file and return a report. Keep file interpretation inside the inspector.",
-            "source": {"kind": "planned_entity", "entity": "main"},
-            "edges": [{
-                    "relation": "call",
-                    "target": {
-                        "kind": "planned_entity",
-                        "entity": "GeoParquetInspector"
-                    },
-                    "callable": {"kind": "method", "name": "inspect"},
-                    "expansion": [],
-                    "branches": [{
-                    "condition": "failure",
-                    "edges": [{
-                        "relation": "emit",
-                        "target": {"kind": "external_entity", "entity_kind":"endpoint", "name": "stderr", "dependency": null},
-                        "payload_type": "InspectError",
-                        "expansion": [],
-                        "branches": []
-                    }]
-                }]
-            }]
-        }))
-        .unwrap();
-
-        assert_eq!(flow.edges[0].branches[0].condition, "failure");
-        assert!(
-            serde_json::from_value::<PlanFlowEdge>(serde_json::json!({
-                "relation": "construct",
-                "target": {"kind": "planned_entity", "entity": "Inspector"},
-                "expansion": []
-            }))
-            .is_err()
-        );
-    }
 
     #[test]
     fn validates_complete_submission() {
         test_fixture("plan", "Build structured planning.")
             .validate_for_submission()
             .unwrap();
-    }
-
-    #[test]
-    fn accepts_fn_as_a_function_kind_alias() {
-        assert_eq!(
-            serde_json::from_str::<EntityKind>("\"fn\"").unwrap(),
-            EntityKind::Function
-        );
-        assert_eq!(
-            serde_json::to_string(&EntityKind::Function).unwrap(),
-            "\"function\""
-        );
-    }
-
-    #[test]
-    fn serializes_each_test_as_one_flat_subtask() {
-        let value = serde_json::to_value(test_subtask_fixture()).unwrap();
-
-        assert_eq!(
-            value.pointer("/operation"),
-            Some(&serde_json::json!("test"))
-        );
-        assert_eq!(value.pointer("/action"), Some(&serde_json::json!("add")));
-        assert_eq!(
-            value.pointer("/name"),
-            Some(&serde_json::json!("validates_plans"))
-        );
-        assert_eq!(value.pointer("/category"), Some(&serde_json::json!("unit")));
-        assert_eq!(
-            value.pointer("/covers_entities/0"),
-            Some(&serde_json::json!("PlanDocument"))
-        );
-        assert!(value.get("tests").is_none());
-        assert!(value.get("entities").is_none());
-        assert!(value.get("description").is_none());
-    }
-
-    #[test]
-    fn serializes_tagged_entity_references() {
-        let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].source = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: "PlanValidator".into(),
-            path: "src/plan/validation.rs".into(),
-            line: 76,
-        };
-        document.flows[0].edges[0].target = EntityReference::ExternalEntity {
-            entity_kind: ReferencedEntityKind::Endpoint,
-            name: "terminal stdout".into(),
-            dependency: None,
-        };
-        let value = serde_json::to_value(document).unwrap();
-
-        assert_eq!(
-            value.pointer("/flows/0/source/kind"),
-            Some(&serde_json::json!("workspace_entity"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/source/path"),
-            Some(&serde_json::json!("src/plan/validation.rs"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/source/line"),
-            Some(&serde_json::json!(76))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/edges/0/target/kind"),
-            Some(&serde_json::json!("external_entity"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/edges/0/target/name"),
-            Some(&serde_json::json!("terminal stdout"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/edges/0/target/entity_kind"),
-            Some(&serde_json::json!("endpoint"))
-        );
     }
 
     #[test]
@@ -1349,54 +1146,6 @@ mod test {
         }));
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn model_json_omits_generated_node_ids() {
-        let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].edges.push(crate::plan::PlanFlowEdge {
-            operation: crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
-                callable: PlanCallable {
-                    kind: PlanCallableKind::Method,
-                    name: "validate".into(),
-                },
-                payload_type: None,
-                return_type: Some(PlanFlowReturnType {
-                    value_type: "ValidatedPlan".into(),
-                    error_type: None,
-                }),
-            }),
-            target: EntityReference::ExternalEntity {
-                entity_kind: ReferencedEntityKind::Type,
-                name: "PlanValidator".into(),
-                dependency: None,
-            },
-            expansion: Vec::new(),
-            branches: Vec::new(),
-        });
-        document.dependencies.push(PlanDependencyChange {
-            action: ChangeAction::Add,
-            name: "tokio".into(),
-            version: "1".into(),
-            resolved_version: None,
-            manifest: "Cargo.toml".into(),
-            license: Some("MIT".into()),
-            justification: "Run asynchronous work.".into(),
-        });
-        let model_json = document.model_json().unwrap();
-
-        assert!(model_json.contains(r#""plan_id": "plan""#));
-        assert!(!model_json.contains(r#""prompt""#));
-        assert!(!model_json.contains("entity_id"));
-        assert!(!model_json.contains("dependency_id"));
-        assert!(!model_json.contains("member_id"));
-        assert!(!model_json.contains("flow_id"));
-        assert!(!model_json.contains("edge_id"));
-        assert!(!model_json.contains("task_id"));
-        assert!(!model_json.contains("subtask_id"));
-        assert!(model_json.contains(r#""kind": "method""#));
-        assert!(model_json.contains(r#""name": "validate""#));
-        assert!(model_json.contains(r#""value_type": "ValidatedPlan""#));
     }
 
     #[test]

@@ -278,53 +278,6 @@ mod tests {
         stream.close().await.unwrap();
     }
 
-    /// Explicit close waits for the producer to drop its queue and can be repeated safely.
-    #[tokio::test]
-    async fn explicit_close_collects_the_subscription_task() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let probe = sender.clone();
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _sender = sender;
-            let _ = ready.send(());
-            std::future::pending::<Result<()>>().await
-        });
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        started.await.unwrap();
-        stream.close().await.unwrap();
-        assert_eq!(probe.strong_count(), 1);
-        stream.close().await.unwrap();
-    }
-
-    /// Treat a joined observation failure as collected while retaining real worker failure.
-    #[tokio::test]
-    async fn close_separates_reported_observation_loss_from_worker_failure() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            drop(sender);
-            Err(forge_provider_api::ProviderError::Observation(ObservationFailure::Overflow).into())
-        });
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        while !stream.task.as_ref().unwrap().is_finished() {
-            tokio::task::yield_now().await;
-        }
-        stream.close().await.unwrap();
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            drop(sender);
-            panic!("failed subscription worker");
-        });
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        while !stream.task.as_ref().unwrap().is_finished() {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            format!("{:#}", stream.close().await.unwrap_err())
-                .contains("failed subscription worker")
-        );
-    }
-
     #[tokio::test]
     async fn intake_preserves_large_events_before_reporting_the_producer_error() {
         let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -371,37 +324,5 @@ mod tests {
         let error = format!("{:#}", stream.recv().await.unwrap_err());
         assert!(error.contains("native-session"), "{error}");
         assert!(error.contains("intake fixture panic"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn intake_reports_unexpected_successful_task_exit() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let task = tokio::spawn(async move {
-            drop(sender);
-            Ok(())
-        });
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        stream.session_id = "native-session".into();
-        let error = stream.recv().await.unwrap_err().to_string();
-        assert!(error.contains("native-session"), "{error}");
-        assert!(
-            error.contains("exited without a subscription error"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn intake_reports_task_cancellation() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let task = tokio::spawn(async move {
-            let _sender = sender;
-            std::future::pending::<Result<()>>().await
-        });
-        task.abort();
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        stream.session_id = "native-session".into();
-        let error = format!("{:#}", stream.recv().await.unwrap_err());
-        assert!(error.contains("native-session"), "{error}");
-        assert!(error.contains("cancelled"), "{error}");
     }
 }

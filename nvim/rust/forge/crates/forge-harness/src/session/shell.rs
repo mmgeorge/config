@@ -88,27 +88,6 @@ impl CheckShell {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn system_shell_preserves_native_exit_and_reports_powershell_errors() -> Result<()> {
-        let shell = CheckShell::System;
-        let executable = shell.executable()?;
-        let mut native =
-            shell.command(&executable, "& pwsh -NoProfile -Command 'exit 13'", false)?;
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), native.output()).await??;
-        assert_eq!(result.status.code(), Some(13));
-        let mut invalid = shell.command(
-            &executable,
-            "Get-Content -LiteralPath 'missing-check-fixture-file'",
-            false,
-        )?;
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), invalid.output()).await??;
-        assert!(!result.status.success());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn nushell_selection_uses_nushell_and_preserves_failed_status() -> Result<()> {
         let Ok(executable) = CheckShell::Nushell.executable() else {

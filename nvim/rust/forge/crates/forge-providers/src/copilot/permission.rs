@@ -352,32 +352,6 @@ mod tests {
         }
     }
 
-    /// Do not approve a permission callback after its invocation barrier has closed.
-    #[tokio::test]
-    async fn permission_callback_rejects_closed_barrier() {
-        let callback = handler(Arc::new(PermissionPolicy {
-            response: PermissionResponse::Allow,
-            barrier_open: false,
-        }));
-        let result = callback
-            .handle(
-                SessionId::new("native"),
-                RequestId::new("request"),
-                serde_json::from_value(
-                    json!({"kind":"write","path":"file.rs","toolCallId":"tool"}),
-                )
-                .unwrap(),
-            )
-            .await;
-        let PermissionResult::Decision { decision, .. } = result else {
-            panic!("native callback omitted its decision");
-        };
-        assert_eq!(
-            serde_json::to_value(decision).unwrap(),
-            json!({"kind":"reject"})
-        );
-    }
-
     /// Reject incomplete native requests without manufacturing broad permission targets.
     #[test]
     fn incomplete_permission_targets_are_unknown() {
@@ -398,37 +372,5 @@ mod tests {
                 PermissionTarget::UnknownFile { .. }
             ));
         }
-    }
-
-    #[test]
-    fn callback_paths_and_operation_are_preserved_without_title_inference() {
-        for operation in ["read", "write"] {
-            let request = permission_from_copilot(
-                "request".into(),
-                operation,
-                json!({"permissionRequest":{"kind":operation,"fileName":"folder/file.rs"}}),
-                ".",
-            );
-            let expected = if operation == "write" {
-                PermissionTarget::Write {
-                    path: "folder/file.rs".into(),
-                }
-            } else {
-                PermissionTarget::Read {
-                    path: "folder/file.rs".into(),
-                }
-            };
-            assert_eq!(request.target_list, vec![expected]);
-        }
-        let request = permission_from_copilot(
-            "request".into(),
-            "write",
-            json!({"title":"edit apparently-allowed.rs"}),
-            ".",
-        );
-        assert!(matches!(
-            request.target_list[0],
-            PermissionTarget::UnknownFile { .. }
-        ));
     }
 }

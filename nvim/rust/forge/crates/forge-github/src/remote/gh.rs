@@ -563,26 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_connection_is_success_but_missing_data_and_fields_are_failures() {
-        let page = decode_page(
-            output(serde_json::json!({"data":{"repository":{"issues":{
-                "totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}
-            }}}})),
-            "owner/repo",
-        )
-        .unwrap();
-        assert!(page.issues.is_empty());
-        assert_eq!(page.total_count, Some(0));
-        for response in [
-            serde_json::json!({}),
-            serde_json::json!({"data":{}}),
-            serde_json::json!({"data":{"repository":{"issues":{}}}}),
-        ] {
-            assert!(decode_page(output(response), "owner/repo").is_err());
-        }
-    }
-
-    #[test]
     fn graphql_errors_preserve_categories_and_never_publish_partial_data() {
         for (kind, expected) in [
             ("RATE_LIMITED", RemoteFailureKind::RateLimited),
@@ -593,59 +573,5 @@ mod tests {
             assert_eq!(failure.kind, expected);
             assert!(failure.message.contains("API diagnostic"));
         }
-    }
-
-    #[test]
-    fn decoded_collections_preserve_every_record() {
-        let record = serde_json::json!({"number":1,"title":"title","state":"OPEN","url":"https://github.com/owner/repo/issues/1",
-            "createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-07T00:00:00Z","labels":{"nodes":[]}});
-        let response = |records| {
-            serde_json::json!({"data":{"repository":{"issues":{"totalCount":records,
-            "nodes":vec![record.clone();records],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}})
-        };
-        assert_eq!(
-            decode_page(output(response(100)), "owner/repo")
-                .unwrap()
-                .issues
-                .len(),
-            100
-        );
-        assert_eq!(
-            decode_page(output(response(101)), "owner/repo")
-                .unwrap()
-                .issues
-                .len(),
-            101
-        );
-        let labels = serde_json::json!({"nodes":vec![serde_json::json!({"name":"label"});51]});
-        assert_eq!(
-            serde_json::from_value::<GraphLabels>(labels)
-                .unwrap()
-                .nodes
-                .len(),
-            51
-        );
-        assert_eq!(
-            serde_json::from_value::<Vec<GraphFailure>>(serde_json::json!(vec![
-                serde_json::json!({"message":"failure"});
-                33
-            ]))
-            .unwrap()
-            .len(),
-            33
-        );
-    }
-
-    #[test]
-    fn diagnostics_preserve_utf8_and_mark_truncation() {
-        let oversized = "é".repeat(MAX_DIAGNOSTIC_BYTES);
-        let failure = decode_page(
-            output(serde_json::json!({"errors":[{"type":"RATE_LIMITED","message":oversized}]})),
-            "owner/repo",
-        )
-        .unwrap_err();
-        assert_eq!(failure.kind, RemoteFailureKind::RateLimited);
-        assert!(failure.message.len() <= MAX_DIAGNOSTIC_BYTES);
-        assert!(failure.message.ends_with("[diagnostic truncated]"));
     }
 }

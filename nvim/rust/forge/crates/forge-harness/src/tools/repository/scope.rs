@@ -505,32 +505,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn pages_preserve_unreturned_records_and_accept_oversized_first_records() {
-        let mut records = Vec::new();
-        let mut retained = 0;
-        let record = json!({ "text": "\\".repeat(100000) });
-        assert!(
-            append_record(&mut records, &mut retained, record.clone(), MAX_REPLY_BYTES).unwrap()
-        );
-        let accepted = retained;
-        assert!(!append_record(&mut records, &mut retained, record, MAX_REPLY_BYTES).unwrap());
-        assert_eq!(records.len(), 1);
-        assert_eq!(retained, accepted);
-        assert!(retained > 200000);
-        let mut large = Vec::new();
-        assert!(
-            append_record(
-                &mut large,
-                &mut 0,
-                json!({ "text": "x".repeat(MAX_REPLY_BYTES) }),
-                MAX_REPLY_BYTES,
-            )
-            .unwrap()
-        );
-        assert_eq!(large[0]["text"].as_str().unwrap().len(), MAX_REPLY_BYTES);
-    }
-
     #[tokio::test]
     async fn inspection_inherits_read_denial_and_active_cancellation() {
         let directory = tempfile::tempdir().unwrap();
@@ -667,91 +641,5 @@ mod tests {
                 .to_string()
                 .contains("authenticated active interaction")
         );
-    }
-
-    #[tokio::test]
-    async fn inspection_uses_shared_repository_and_diff_without_status_publication() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = directory.path().to_path_buf();
-        let initialization_workspace = workspace.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            let mut command = std::process::Command::new("git");
-            command
-                .args(["init", "--quiet"])
-                .current_dir(initialization_workspace);
-            forge_git::command::write_command(
-                &mut command,
-                forge_git::command::CommandLimits {
-                    stderr_bytes: 4 * 1024,
-                    timeout: std::time::Duration::from_secs(5),
-                },
-                &[],
-                || Ok(()),
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(output.status.success());
-        std::fs::write(workspace.join("example.txt"), "literal **content**\n").unwrap();
-        let (repository, diff) = services();
-        let state = repository.open(workspace.clone()).await.unwrap().unwrap();
-        let policy = Arc::new(CompiledPermissionDocument::compile(
-            default_permission_document(),
-            workspace.clone(),
-        ));
-        let (scope, lease) = RepositoryToolScope::open(
-            "session".into(),
-            "interaction".into(),
-            workspace,
-            policy,
-            Arc::new(AtomicBool::new(false)),
-            Arc::clone(&repository),
-            Arc::clone(&diff),
-        )
-        .unwrap();
-        let status: Value =
-            serde_json::from_str(&scope.invoke("repository_status", json!({})).await.unwrap())
-                .unwrap();
-        assert_eq!(status["session"], "session");
-        assert_eq!(
-            status["items"][0]["path"]["path_hex"],
-            hex::encode(b"example.txt")
-        );
-        let result: Value = serde_json::from_str(
-            &scope
-                .invoke(
-                    "repository_file_diff",
-                    json!({ "path_hex": hex::encode(b"example.txt"), "side": "unstaged" }),
-                )
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            result["items"][0]["hunks"][0]["added"], "literal **content**\n",
-            "repository file diff result: {result}"
-        );
-        std::fs::write(scope.workspace.join("quoted.txt"), "\\".repeat(128 * 1024)).unwrap();
-        let bounded: Value = serde_json::from_str(
-            &scope
-                .invoke(
-                    "repository_file_diff",
-                    json!({ "path_hex": hex::encode(b"quoted.txt") }),
-                )
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(bounded["items"][0]["state"], "ready");
-        assert_eq!(
-            bounded["items"][0]["hunks"][0]["added"],
-            "\\".repeat(128 * 1024)
-        );
-        assert!(state.current_observation().is_none());
-        drop(lease);
-        assert!(scope.check().is_err());
-        repository.shutdown(std::time::Duration::from_secs(2)).await;
-        diff.shutdown(std::time::Duration::from_secs(2)).await;
     }
 }

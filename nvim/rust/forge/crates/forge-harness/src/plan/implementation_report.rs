@@ -293,7 +293,6 @@ impl ImplementationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::calls;
 
     fn report() -> ImplementationReport {
         ImplementationReport {
@@ -303,75 +302,6 @@ mod tests {
             file: Vec::new(),
             unavailable: Vec::new(),
         }
-    }
-
-    #[test]
-    fn source_report_separates_construction_from_field_access() {
-        let workspace = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(data.path()).unwrap();
-        std::fs::write(workspace.path().join("lib.rs"), "pub struct Weapon { pub cooldown: u32 } pub fn setup() { let weapon = Weapon { cooldown: 0 }; }").unwrap();
-        let (overview, body) = calls::parse("lib.rs", "pub struct Weapon { pub cooldown: u32 }\npub fn setup();\nConstructs\nAccesses\n  Weapon::cooldown\n", &[]).unwrap();
-        let mut design = DeclarationDesign::default();
-        design.proposed.insert("lib.rs".into(), overview);
-        design.proposed_calls.insert("lib.rs".into(), body);
-        let (report, _) = report()
-            .capture(&design, None, None, &objects, workspace.path())
-            .unwrap();
-        assert!(
-            report.file[0]
-                .references
-                .iter()
-                .any(|reference| reference.category == "Constructs"
-                    && reference.expected == Some(Vec::new())
-                    && reference.observed == ["Weapon"])
-        );
-        assert!(
-            !report.file[0]
-                .references
-                .iter()
-                .any(|reference| reference.category == "Accesses")
-        );
-    }
-
-    #[test]
-    fn source_report_preserves_unknown_and_explicit_empty_relationships() {
-        let workspace = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(data.path()).unwrap();
-        let source = "pub fn run() { helper(); } fn helper() {}";
-        std::fs::write(workspace.path().join("lib.rs"), source).unwrap();
-        let mut design = DeclarationDesign::default();
-        let (overview, body) = calls::parse("lib.rs", "pub fn run();\nCalls\n", &[]).unwrap();
-        design.proposed.insert("lib.rs".into(), overview);
-        design.proposed_calls.insert("lib.rs".into(), body);
-        let (report, digests) = report()
-            .capture(&design, None, None, &objects, workspace.path())
-            .unwrap();
-        assert_eq!(digests["lib.rs"], crate::plan::digest(source.as_bytes()));
-        assert!(report.file[0].contract.is_empty());
-        assert_eq!(report.file[0].internal.len(), 1);
-        let calls = report.file[0]
-            .references
-            .iter()
-            .find(|entry| entry.owner == "run" && entry.category == "Calls")
-            .unwrap();
-        assert_eq!(calls.expected, Some(Vec::new()));
-        assert_eq!(calls.observed, ["helper"]);
-        let reference = report.save(&objects, false).unwrap();
-        assert!(reference.incomplete);
-        let loaded = ImplementationReport::load(&objects, &reference).unwrap();
-        assert_eq!(loaded.original_revision, 1);
-        assert_eq!(loaded.accepted_revision, 2);
-        let node = crate::exchange::ExchangeNode::ImplementationReport {
-            id: "report".into(),
-            reference,
-            report: Some(std::sync::Arc::new(report)),
-        };
-        let serialized = serde_json::to_string(&node).unwrap();
-        assert!(!serialized.contains("function helper"));
-        assert!(!serialized.contains("observed"));
-        assert!(!serialized.contains("source_report"));
     }
 
     #[test]

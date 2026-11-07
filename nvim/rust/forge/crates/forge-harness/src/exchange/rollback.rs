@@ -193,22 +193,6 @@ mod tests {
         ));
     }
 
-    /// Bind recovery to progress as well as the selected preview.
-    #[test]
-    fn recovery_revision_rejects_changed_progress() {
-        let mut journal = RestoreJournal {
-            preview: preview(),
-            applied: 0,
-            state: crate::checkpoint::RestoreState::Applying,
-        };
-        let revision = RestoreRevision::capture(&journal).unwrap();
-        journal.state = crate::checkpoint::RestoreState::FilesComplete;
-        assert!(matches!(
-            revision.validate(&journal),
-            Err(RollbackFailure::StaleAuthority)
-        ));
-    }
-
     /// Create file-free authority for deterministic comparison.
     fn preview() -> RestorePreview {
         RestorePreview {

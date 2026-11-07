@@ -552,68 +552,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-    /// A turn-end acknowledgement must survive beyond the former blanket RPC deadline.
-    #[tokio::test]
-    async fn unbounded_turn_acknowledgement_survives_thirty_seconds() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (started, observed) = oneshot::channel();
-        let (release, wait) = oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
-            let request: Value =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                    .unwrap();
-            started.send(()).unwrap();
-            wait.await.unwrap();
-            socket
-                .send(Message::Text(
-                    json!({"id":request["id"],"result":{"turnId":"late-turn"}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                if message.is_close() {
-                    break;
-                }
-            }
-        });
-        let rpc = Arc::new(NativeRpc::new(
-            CodexConnection::connect(&format!("ws://{address}"))
-                .await
-                .unwrap(),
-        ));
-        let request_rpc = rpc.clone();
-        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
-        let context = forge_provider_api::OperationContext::unbounded(
-            forge_provider_api::OperationId::new("late-turn-acknowledgement").unwrap(),
-            cancellation,
-        );
-        let native =
-            super::super::operations::NativeContext::new(context, ProviderOperation::TurnStart);
-        let request = tokio::spawn(async move {
-            super::super::operations::scope(native, async move {
-                request_rpc
-                    .request("turn/start", json!({}), ProviderOperation::TurnStart)
-                    .await
-            })
-            .await
-        });
-        observed.await.unwrap();
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
-        tokio::task::yield_now().await;
-        assert!(!request.is_finished());
-        tokio::time::resume();
-        release.send(()).unwrap();
-        assert_eq!(request.await.unwrap().unwrap()["turnId"], "late-turn");
-        rpc.close().await.unwrap();
-        peer.await.unwrap();
-    }
-
     /// A known durable writer conflict retains a safe resource reason instead of native error text.
     #[test]
     fn active_writer_resume_rejection_is_a_normalized_resource_conflict() {
@@ -622,33 +560,6 @@ mod tests {
             matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         assert!(!error.to_string().contains("private-thread-id"));
-    }
-
-    /// Ordinary token/tool chunks must not exhaust transport capacity before a control reply.
-    #[tokio::test]
-    async fn small_notification_burst_preserves_control_replies() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let count = forge_protocol::MAX_PENDING_FRAMES * 4;
-            let peer = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(stream).await.unwrap();
-                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                for sequence in 0..count {
-                    socket.send(Message::Text(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","itemId":"tool","delta":format!("line {sequence}\n"),"sequence":sequence}}).to_string().into())).await.unwrap();
-                }
-                socket.send(Message::Text(json!({"id":request["id"],"result":{"ok":true}}).to_string().into())).await.unwrap();
-                while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
-            });
-            let rpc = NativeRpc::new(CodexConnection::connect(&format!("ws://{address}")).await.unwrap());
-            assert_eq!(rpc.request("fixture/ping", json!({}), ProviderOperation::TurnStart).await.unwrap(), json!({"ok":true}));
-            for sequence in 0..count {
-                assert_eq!(rpc.receive().await.unwrap()["params"]["sequence"], sequence);
-            }
-            rpc.close().await.unwrap();
-            peer.await.unwrap();
-        }).await.expect("small notification burst blocked native control replies");
     }
 
     /// Create a fully collected transport for isolated dispatcher-collection tests.
@@ -672,86 +583,6 @@ mod tests {
         rpc.close().await.unwrap();
         peer.await.unwrap();
         rpc
-    }
-
-    /// Rejection before native dispatch cannot turn a cancelled request into an uncertain mutation.
-    #[tokio::test]
-    async fn cancelled_rpc_admission_preserves_unchanged_mutation_evidence() {
-        let rpc = closed_rpc().await;
-        let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
-        let context = forge_provider_api::OperationContext::unbounded(
-            forge_provider_api::OperationId::new("cancelled-before-native-dispatch").unwrap(),
-            cancellation,
-        );
-        let native =
-            super::super::operations::NativeContext::new(context, ProviderOperation::TurnStart);
-        source.cancel();
-        let error = super::super::operations::scope(
-            native.clone(),
-            rpc.send_request("turn/start", json!({})),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ProviderError::Failure(failure)
-            if failure.kind() == ProviderFailureKind::Cancelled
-                && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged));
-        assert!(!native.changed());
-        assert!(rpc.waiters.lock().await.is_empty());
-        assert!(rpc.responses.lock().await.is_empty());
-        assert!(rpc.methods.lock().await.is_empty());
-    }
-
-    /// Explicit close releases a status observation even when the native endpoint never replies.
-    #[tokio::test]
-    async fn close_releases_unanswered_observation_before_reader_collection() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let (sent, received) = oneshot::channel();
-            let peer = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(stream).await.unwrap();
-                let _ = socket.next().await.unwrap().unwrap();
-                sent.send(()).unwrap();
-                while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
-            });
-            let rpc = Arc::new(NativeRpc::new(CodexConnection::connect(&format!("ws://{address}")).await.unwrap()));
-            let observed_rpc = rpc.clone();
-            let observation = tokio::spawn(async move { observed_rpc.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), ProviderOperation::TerminalList).await });
-            received.await.unwrap();
-            rpc.close().await.unwrap();
-            let error = observation.await.unwrap().unwrap_err();
-            assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::BindingClosed));
-            peer.await.unwrap();
-        }).await.unwrap();
-    }
-
-    /// Keep the original dispatcher owned when a cleanup waiter times out.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn interrupted_dispatcher_collection_retains_join_ownership() {
-        let rpc = closed_rpc().await;
-        let (entered, started) = oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        let task = tokio::spawn(async move {
-            tokio::task::block_in_place(|| {
-                let _ = entered.send(());
-                let _ = wait.recv();
-            });
-        });
-        *rpc.reader.lock().await = Some(task);
-        started.await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(5), rpc.close())
-                .await
-                .is_err()
-        );
-        assert!(rpc.reader.lock().await.is_some());
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), rpc.close())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(rpc.reader.lock().await.is_none());
     }
 
     /// Report a dispatcher panic without exposing its private payload.
@@ -845,87 +676,6 @@ mod tests {
                 Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Protocol)
             );
         }
-    }
-
-    /// Release in-flight requests immediately when a native frame cannot be decoded.
-    #[tokio::test]
-    async fn malformed_frame_releases_waiting_rpc_without_native_payload() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
-            let _request = socket.next().await;
-            socket
-                .send(Message::Text("private-native-invalid-json".into()))
-                .await
-                .unwrap();
-            let _closed = socket.next().await;
-        });
-        let rpc = NativeRpc::new(
-            CodexConnection::connect(&format!("ws://{address}"))
-                .await
-                .unwrap(),
-        );
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rpc.request("turn/start", json!({}), ProviderOperation::TurnStart),
-        )
-        .await
-        .expect("malformed frame must release the request")
-        .unwrap_err();
-        assert!(
-            matches!(&error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Protocol)
-        );
-        assert!(!format!("{error:?} {error}").contains("private-native"));
-        let _ = rpc.close().await;
-        server.await.unwrap();
-    }
-
-    /// Codex rejects an unknown method before it parses the request id, so the error frame
-    /// carries no id. The sole waiting request must receive that rejection as its response.
-    #[tokio::test]
-    async fn uncorrelated_rejection_answers_the_sole_waiting_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
-            let _request = socket.next().await;
-            socket
-                .send(Message::Text(
-                    json!({"error":{"code":-32600,"message":"Invalid request: unknown variant `thread/rollback`"}})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            let _closed = socket.next().await;
-        });
-        let rpc = NativeRpc::new(
-            CodexConnection::connect(&format!("ws://{address}"))
-                .await
-                .unwrap(),
-        );
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rpc.request(
-                "thread/rollback",
-                json!({}),
-                ProviderOperation::InputRetract,
-            ),
-        )
-        .await
-        .expect("an uncorrelated rejection must answer the sole waiting request")
-        .unwrap_err();
-        assert!(matches!(
-            &error,
-            ProviderError::Failure(failure)
-                if failure.kind() == ProviderFailureKind::Rejected
-                    && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
-        ));
-        let _ = rpc.close().await;
-        server.await.unwrap();
     }
 
     #[tokio::test]

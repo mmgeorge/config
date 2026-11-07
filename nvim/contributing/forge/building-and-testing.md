@@ -23,7 +23,7 @@ Inside Harness, run the configured checks instead of these commands:
 | Lint | `rust-lint` |
 | Build | `rust-build` |
 
-`.forge.json` uses explicit dependencies only for host integration and benchmark checks, which need the built executable. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
+`.forge.json` uses explicit dependencies only for the mock integration check, which needs the built executable. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
 
@@ -58,7 +58,7 @@ cargo nextest run --cargo-profile dev --locked -p forge-diff --lib declaration_c
 
 A positional filter selects tests whose names contain it. Select one test exactly with a filter expression, such as `-E 'test(=plan::tests::accepts_revision)'`. Nextest does not run doctests; run `cargo test --doc -p <package>` when a change touches one.
 
-Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after five seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it. Waits a test expects to complete use the crate's `hang_guard::HANG_GUARD`, which fires just before termination so the failure names the stuck step.
+Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after two seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it. Waits a test expects to complete use the crate's `hang_guard::HANG_GUARD`, which fires just before termination so the failure names the stuck step.
 
 Add `--all-targets` to the check only when changed test or executable targets need it. Broaden to the workspace only when shared interfaces require it, and keep Cargo-heavy jobs serial. Record the command, deadline, exit status, and failing assertion or diagnostic.
 
@@ -70,7 +70,7 @@ Test fixtures must use the current public check configuration. Task-specific ena
 
 ## Lua tests
 
-Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run exact fixtures, a suite, or the default selection of every fixture except the live-provider suite:
+Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run exact fixtures, a suite, or the default selection of every fixture:
 
 ```nu
 nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua
@@ -79,18 +79,6 @@ nu .forge/checks/lua-tests.nu
 ```
 
 The five-second limit has no per-fixture exceptions. A fixture that needs longer waits on real time or hangs, so fix it with an injected clock, a mocked `vim.uv` timer, or a deterministic signal, or remove it. [Editor tests](editor-tests.md) covers suites, parameterized fixtures, and output.
-
-## Live provider tests
-
-Tests that need installed or authenticated provider CLIs live in the internal `live_provider` test module, with sources under `tests/live_provider/`. This lets complete-result fixtures use the same crate-private execution engine as production. Each case is marked `#[ignore]`, because it depends on local tools, credentials, remote services, or billable requests. Normal library test runs compile these cases without running them.
-
-After authorizing external requests and checking a case's prerequisites, run only that case:
-
-```nu
-cargo nextest run --cargo-profile dev --locked -p forge-harness --lib --run-ignored only -E 'test(=live_provider::<module::test_name>)' --profile live
-```
-
-Never enable ignored cases in routine project checks.
 
 ## Static checks
 

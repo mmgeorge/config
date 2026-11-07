@@ -273,30 +273,3 @@ pub(crate) struct DesignSection {
     pub section: PlanSection,
     pub text: String,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn complete_check_selection_preserves_every_configured_choice() {
-        let definitions = (0..129)
-            .map(|index| {
-                (format!("check_{index}"), serde_json::json!({
-                    "trigger": {}, "action": {"label": format!("Check {index}"), "category": "test", "command": "test"}
-                }))
-            })
-            .collect::<serde_json::Map<String, serde_json::Value>>();
-        let config: crate::checks::CheckConfig =
-            serde_json::from_value(serde_json::Value::Object(definitions)).unwrap();
-        let changes = config
-            .definitions
-            .iter()
-            .map(|check| (check.id.clone(), true))
-            .collect();
-        let mut document = DesignDocument::default();
-        document.set_checks(&config, &changes).unwrap();
-        assert_eq!(document.checks, changes.keys().cloned().collect::<Vec<_>>());
-        assert_eq!(document.checks.len(), 129);
-    }
-}

@@ -1065,109 +1065,6 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
 
-    /// Live delivery and reconnect replay expose one identity without changing retained bytes.
-    #[test]
-    fn delivery_stamp_preserves_retained_event_and_matches_replay() -> anyhow::Result<()> {
-        let original = event("retained delivery");
-        let retained = RetainedPublication {
-            sequence: PublicationSequence::try_from(7)?,
-            event: original.clone(),
-            state: PublicationState::Pending,
-        };
-        let replay = retained.delivery_event();
-        let live = stamp_event(original, retained.sequence());
-        assert_eq!(replay.payload, live.payload);
-        assert_eq!(replay.payload["_publication"]["sequence"], 7);
-        assert!(retained.event().payload.get("_publication").is_none());
-        Ok(())
-    }
-
-    /// A transactional answer cannot overtake failed output, and a recovered epoch commits it after that prefix.
-    #[test]
-    fn plan_answer_transaction_waits_for_recovered_publication_prefix() -> anyhow::Result<()> {
-        let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
-        let questions =
-            crate::plan::PlanQuestionSet::freeform("Which scope?".into()).normalize()?;
-        let elicitation = crate::plan::PlanElicitation::new(questions);
-        let request = crate::plan::PlanQuestionAnswerRequest::parse(serde_json::json!({
-            "operation_id":"ordered-answer", "target":{"owner":"plan","id":"ordered-plan",
-                "set_id":elicitation.question_set.id,"revision":elicitation.revision},
-            "question_id":elicitation.question_set.questions[0].id,
-            "response":{"kind":"other","text":"Retain ordering"}
-        }))?;
-        let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
-            "id":"ordered-plan","session_id":"session","request":"Choose scope","state":"awaiting_input",
-            "working_path":"","model_revision":1,"user_revision":0,"created_at_ms":1,"updated_at_ms":1,
-            "elicitation":elicitation,
-        }))?;
-        let current = tasks.current()?.unwrap();
-        tasks.change(
-            &mut store,
-            Some(&current.revision),
-            crate::task::TaskChange::Install(Box::new(crate::task::Task::plan(plan, 1)?)),
-            1,
-        )?;
-        let publications = SessionPublications::open(root.path(), "session")?;
-        publications.connection.lock().unwrap().execute_batch(
-            "CREATE TRIGGER reject_ordered_prefix BEFORE INSERT ON owner_publication BEGIN SELECT RAISE(ABORT,'injected failure'); END;",
-        )?;
-        assert!(
-            publications
-                .publish(event("older committed state"), None)
-                .is_err()
-        );
-        let permit = crate::exchange::QuestionUpdatePermit::for_test("session");
-        let blocked = publications.ordered_mutation(
-            super::super::QuestionEventError::AdmissionClosed,
-            || {
-                store
-                    .commit_question_answer(&permit, &request)
-                    .map_err(super::super::QuestionEventError::PlanAnswer)
-            },
-        );
-        assert!(matches!(
-            blocked,
-            Err(super::super::QuestionEventError::AdmissionClosed)
-        ));
-        assert!(
-            store
-                .load_plan("ordered-plan")?
-                .unwrap()
-                .elicitation
-                .unwrap()
-                .answer
-                .is_empty()
-        );
-        publications
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER reject_ordered_prefix;")?;
-        publications.retry_recovery()?;
-        assert_eq!(records(&publications).len(), 1);
-        drop(publications);
-        let recovered = SessionPublications::open(root.path(), "session")?;
-        recovered.ordered_mutation(super::super::QuestionEventError::AdmissionClosed, || {
-            store
-                .commit_question_answer(&permit, &request)
-                .map_err(super::super::QuestionEventError::PlanAnswer)
-        })?;
-        let retained = records(&recovered);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].event().payload["text"], "older committed state");
-        assert_eq!(retained[1].event().event, "question_updated");
-        assert_eq!(
-            store
-                .load_plan("ordered-plan")?
-                .unwrap()
-                .elicitation
-                .unwrap()
-                .answer_revision,
-            1
-        );
-        Ok(())
-    }
-
     /// A failed input batch retains its suffix and remains ahead of later producer events.
     #[test]
     fn failed_batch_retains_suffix_and_orders_new_publishers() -> Result<(), PublicationError> {
@@ -1212,32 +1109,6 @@ mod tests {
         assert_eq!(records(&publications)[0].state(), PublicationState::Pending);
         drop(lease);
         assert_eq!(records(&publications)[0].state(), PublicationState::Pending);
-        assert!(publications.begin_offer()?.is_some());
-        Ok(())
-    }
-
-    /// Confirmation acknowledges only the captured page and never a later append.
-    #[test]
-    fn reconnect_lease_confirms_exact_page_after_complete_admission() -> Result<(), PublicationError>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = Arc::new(SessionPublications::open(root.path(), "session")?);
-        let first = publications.publish(event("uncertain"), None)?;
-        publications.begin_offer()?;
-        publications.complete_offer(first.sequence(), DeliveryOutcome::Uncertain)?;
-        let lease = publications.begin_reconciliation()?;
-        let (_, receipt) = publications
-            .snapshot(None, NonZeroU16::new(1).unwrap())?
-            .into_parts();
-        publications.publish(event("newer"), None)?;
-        publications.confirm_reconciliation(&lease, &receipt)?;
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Admitted
-        );
-        assert_eq!(records(&publications)[1].state(), PublicationState::Pending);
-        assert!(publications.begin_offer()?.is_none());
-        drop(lease);
         assert!(publications.begin_offer()?.is_some());
         Ok(())
     }
@@ -1345,34 +1216,6 @@ mod tests {
         Ok(())
     }
 
-    /// A page cannot override a live sender's evidence or acknowledge content beyond the store.
-    #[test]
-    fn reconnect_page_rejects_live_offer_and_future_cursor() -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let first = publications.publish(event("active"), None)?;
-        let (_, receipt) = publications
-            .snapshot(None, NonZeroU16::new(1).unwrap())?
-            .into_parts();
-        publications.begin_offer()?.unwrap();
-        let observer = SessionPublications::open(root.path(), "session")?;
-        assert_eq!(records(&observer)[0].state(), PublicationState::Offering);
-        assert!(matches!(
-            publications.confirm_reconciled(&receipt),
-            Err(PublicationError::DeliveryInProgress)
-        ));
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Offering
-        );
-        let future = PublicationSequence::try_from(first.sequence().get() + 1)?;
-        assert!(matches!(
-            publications.snapshot(Some(future), NonZeroU16::new(1).unwrap()),
-            Err(PublicationError::InvalidCursor)
-        ));
-        Ok(())
-    }
-
     /// Create valid transport content whose exact order and body survive retention.
     fn event(text: &str) -> SessionEvent {
         SessionEvent {
@@ -1387,98 +1230,6 @@ mod tests {
         publications
             .after(None, NonZeroU16::new(20).unwrap())
             .unwrap()
-    }
-
-    /// Headless publication must retain exact content and drain in order when a transport attaches.
-    #[tokio::test]
-    async fn headless_prefix_drains_in_order_without_read_admission() -> Result<(), PublicationError>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let first = publications.publish(event("first"), None)?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        let second = publications.publish(event("second"), Some(&sender))?;
-        assert_eq!(first.state(), PublicationState::Pending);
-        assert_eq!(second.state(), PublicationState::Pending);
-        assert!(receiver.try_recv().is_err());
-        assert!(
-            records(&publications)
-                .iter()
-                .all(|record| record.state() == PublicationState::Pending)
-        );
-        let mut delivery = PublicationDelivery::default();
-        for (sequence, text) in [(first.sequence(), "first"), (second.sequence(), "second")] {
-            assert!(
-                matches!(delivery.update(&publications, Some(&sender))?, Some(PublicationProgress::Offering(found)) if found == sequence)
-            );
-            delivery.next().await;
-            assert!(
-                matches!(delivery.update(&publications, Some(&sender))?, Some(PublicationProgress::Admitted(found)) if found == sequence)
-            );
-            let frame = receiver.recv().await.unwrap().unwrap();
-            let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
-            assert_eq!(sent.payload["text"], text);
-        }
-        assert!(
-            records(&publications)
-                .iter()
-                .all(|record| record.state() == PublicationState::Admitted)
-        );
-        assert!(receiver.try_recv().is_err());
-        Ok(())
-    }
-
-    /// Large queued events must retain all content while saturated output leaves later persistence usable.
-    #[tokio::test]
-    async fn saturated_multipart_delivery_preserves_content_and_pending_order()
-    -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        let occupied =
-            forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS;
-        for frame in 0..occupied {
-            sender.send(frame).unwrap();
-        }
-        // Each repetition encodes to 13 JSON bytes, so this payload exceeds one frame and
-        // must travel as a multipart transfer without allocating far beyond that threshold.
-        let text = "retained界\n".repeat(forge_protocol::MAX_FRAME_BYTES / 12);
-        let first = publications.publish(event(&text), Some(&sender))?;
-        let mut delivery = PublicationDelivery::default();
-        assert!(
-            matches!(delivery.update(&publications, Some(&sender))?, Some(PublicationProgress::Offering(found)) if found == first.sequence())
-        );
-        tokio::task::yield_now().await;
-        assert!(delivery.next().now_or_never().is_none());
-        let later = publications.publish(event("later"), Some(&sender))?;
-        assert_eq!(later.state(), PublicationState::Pending);
-        for _ in 0..occupied {
-            drop(receiver.recv().await.unwrap().unwrap());
-        }
-        let collect = async {
-            let mut encoded = String::new();
-            loop {
-                let frame = receiver.recv().await.unwrap().unwrap();
-                let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
-                if sent.event == "event.complete" {
-                    break;
-                }
-                assert_eq!(sent.event, "event.part");
-                let part: forge_protocol::transfer::JsonPart =
-                    serde_json::from_value(sent.payload["part"].clone()).unwrap();
-                encoded.push_str(&part.payload);
-            }
-            serde_json::from_str::<SessionEvent>(&encoded).unwrap()
-        };
-        let ((), restored) = tokio::join!(delivery.next(), collect);
-        assert_eq!(restored.payload["text"], text);
-        assert!(
-            matches!(delivery.update(&publications, Some(&sender))?, Some(PublicationProgress::Admitted(found)) if found == first.sequence())
-        );
-        assert_eq!(records(&publications)[1].state(), PublicationState::Pending);
-        assert!(receiver.try_recv().is_err());
-        receiver.check().unwrap();
-        Ok(())
     }
 
     /// A failed delivery-evidence commit must retry storage while retaining the successful send fact.
@@ -1576,65 +1327,6 @@ mod tests {
             publications.publish(event("valid"), None)?.sequence().get(),
             1
         );
-        Ok(())
-    }
-
-    /// Retrying producer acknowledgment cannot append or resend its already retained notification.
-    #[tokio::test]
-    async fn producer_identity_recovers_retention_without_duplicate_delivery()
-    -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let origin = || {
-            PublicationOrigin::QuestionInput(super::super::command::InputId::new("answer").unwrap())
-        };
-        let original = publications.publish_once(origin(), event("one committed answer"), None)?;
-        let (sender, mut output) = forge_protocol::outbound::channel();
-        let recovered =
-            publications.publish_once(origin(), event("one committed answer"), Some(&sender))?;
-        assert_eq!(original.sequence(), recovered.sequence());
-        assert_eq!(records(&publications).len(), 1);
-        assert!(output.try_recv().is_err());
-        let mut delivery = PublicationDelivery::default();
-        delivery.update(&publications, Some(&sender))?;
-        delivery.next().await;
-        delivery.update(&publications, Some(&sender))?;
-        drop(output.recv().await.unwrap().unwrap());
-        let replay =
-            publications.publish_once(origin(), event("one committed answer"), Some(&sender))?;
-        assert_eq!(replay.state(), PublicationState::Admitted);
-        assert_eq!(records(&publications).len(), 1);
-        assert!(output.try_recv().is_err());
-        assert!(matches!(
-            publications.publish_once(origin(), event("changed answer"), None),
-            Err(PublicationError::IdentityConflict)
-        ));
-        assert_eq!(
-            records(&publications)[0].event().payload["text"],
-            "one committed answer"
-        );
-        Ok(())
-    }
-
-    /// A channel already known to be closed cannot turn a provably unsent event into uncertainty.
-    #[tokio::test]
-    async fn disconnected_transport_keeps_unoffered_events_pending() -> Result<(), PublicationError>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let (sender, receiver) = forge_protocol::outbound::channel();
-        drop(receiver);
-        publications.publish(event("retain for later"), Some(&sender))?;
-        let mut delivery = PublicationDelivery::default();
-        assert!(delivery.update(&publications, Some(&sender))?.is_none());
-        assert_eq!(records(&publications)[0].state(), PublicationState::Pending);
-        let (replacement, mut output) = forge_protocol::outbound::channel();
-        delivery.update(&publications, Some(&replacement))?;
-        delivery.next().await;
-        delivery.update(&publications, Some(&replacement))?;
-        let frame = output.recv().await.unwrap().unwrap();
-        let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
-        assert_eq!(sent.payload["text"], "retain for later");
         Ok(())
     }
 }

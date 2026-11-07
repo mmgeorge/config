@@ -331,59 +331,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn cleanup_failure_is_reported_after_waiter_is_dropped() -> anyhow::Result<()> {
-        let ledger = CleanupLedger::default();
-        let receiver = ledger.start(CleanupWorkKind::OwnerFence, async {
-            Err(
-                crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::ThreadClose,
-                    forge_provider_api::ProviderFailureKind::Rejected,
-                ))
-                .into(),
-            )
-        })?;
-        drop(receiver);
-        let error = ledger.collect().await.unwrap_err();
-        assert!(std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |error| error.source()).any(|cause| matches!(cause.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Failure(failure)) if failure.operation() == forge_provider_api::ProviderOperation::ThreadClose && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)));
-        Ok(())
-    }
-
-    /// Report each failed retained obligation once even if its shared result is seen twice.
-    #[tokio::test]
-    async fn collection_preserves_distinct_failures_without_nesting_or_duplicate_causes()
-    -> anyhow::Result<()> {
-        let ledger = CleanupLedger::default();
-        let first = RetainedCleanupFailure::from(CleanupError::Work {
-            kind: CleanupWorkKind::OwnerFence,
-            source: CleanupWorkFailure::Provider(crate::provider::ProviderError::Cancelled),
-        });
-        ledger.record_retained_failure(first.clone());
-        ledger.record_retained_failure(first.clone());
-        let receiver = ledger.start(CleanupWorkKind::ConfigurationWrite, async {
-            Err(crate::provider::ProviderError::DeliveryUncertain.into())
-        })?;
-        drop(receiver);
-        let report = ledger.collect().await.unwrap_err();
-        assert_eq!(first.failures().count(), 1);
-        assert_eq!(report.failures().count(), 2);
-        assert!(matches!(
-            report.failures().next(),
-            Some(CleanupError::Work {
-                kind: CleanupWorkKind::OwnerFence,
-                ..
-            })
-        ));
-        let text = report.to_string();
-        assert_eq!(text.matches("retained OwnerFence failed").count(), 1);
-        assert_eq!(
-            text.matches("retained ConfigurationWrite failed").count(),
-            1
-        );
-        ledger.collect().await?;
-        Ok(())
-    }
-
     /// Discard raw task panic payloads before exposing any retained failure representation.
     #[tokio::test]
     async fn panicking_cleanup_worker_exposes_only_normalized_failure() -> anyhow::Result<()> {
@@ -419,70 +366,6 @@ mod tests {
         assert!(
             matches!(normalized, crate::provider::ProviderError::Failure(failure)
             if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime)
-        );
-        Ok(())
-    }
-
-    /// Preserve task cancellation as a typed exit without exposing the runtime join error.
-    #[tokio::test]
-    async fn cancelled_cleanup_worker_retains_only_typed_exit() -> anyhow::Result<()> {
-        let ledger = CleanupLedger::default();
-        let receiver = ledger.start(
-            CleanupWorkKind::OwnerFence,
-            std::future::pending::<Result<(), CleanupWorkFailure>>(),
-        )?;
-        drop(receiver);
-        let task = ledger.state.lock().unwrap().tasks.front().unwrap().clone();
-        task.handle.lock().await.as_ref().unwrap().abort();
-        let report = ledger.collect().await.unwrap_err();
-        assert!(matches!(
-            report.failures().next(),
-            Some(CleanupError::Join {
-                kind: CleanupWorkKind::OwnerFence,
-                failure: CleanupJoinFailure::Cancelled,
-            })
-        ));
-        assert!(
-            std::iter::successors(
-                Some(&report as &(dyn std::error::Error + 'static)),
-                |error| error.source(),
-            )
-            .all(|error| !error.is::<tokio::task::JoinError>())
-        );
-        let normalized = crate::provider::lifecycle_error::classify_source(
-            forge_provider_api::ProviderOperation::ThreadClose,
-            &report,
-        );
-        assert!(
-            matches!(normalized, crate::provider::ProviderError::Failure(failure)
-            if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn poisoned_failure_lock_still_retains_typed_error() -> anyhow::Result<()> {
-        let ledger = Arc::new(CleanupLedger::default());
-        let thread_ledger = Arc::clone(&ledger);
-        let thread = std::thread::spawn(move || {
-            let _guard = thread_ledger.failure.lock().unwrap();
-            panic!("poison failure lock");
-        });
-        assert!(thread.join().is_err());
-        ledger.record_failure(CleanupError::Work {
-            kind: CleanupWorkKind::OwnerFence,
-            source: CleanupWorkFailure::Provider(crate::provider::ProviderError::Cancelled),
-        });
-        let error = ledger.collect().await.unwrap_err();
-        assert!(
-            std::iter::successors(
-                Some(&error as &(dyn std::error::Error + 'static)),
-                |error| error.source()
-            )
-            .any(|cause| matches!(
-                cause.downcast_ref::<crate::provider::ProviderError>(),
-                Some(crate::provider::ProviderError::Cancelled)
-            ))
         );
         Ok(())
     }

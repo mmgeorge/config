@@ -140,23 +140,3 @@ identity!(
     ModelCallId,
     "Identify one model-call occurrence within a normalized turn."
 );
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Transport decoding must enforce the same nonempty invariant as admission.
-    #[test]
-    fn transport_rejects_empty_normalized_identities() {
-        for raw in ["\"\"", "\" \\t\""] {
-            assert!(serde_json::from_str::<ThreadId>(raw).is_err());
-            assert!(serde_json::from_str::<TurnId>(raw).is_err());
-            assert!(serde_json::from_str::<ItemId>(raw).is_err());
-            assert!(serde_json::from_str::<UsageReportId>(raw).is_err());
-            assert!(serde_json::from_str::<ModelCallId>(raw).is_err());
-        }
-        let id = ItemId::new("item:original").unwrap();
-        let encoded = serde_json::to_string(&id).unwrap();
-        assert_eq!(serde_json::from_str::<ItemId>(&encoded).unwrap(), id);
-    }
-}

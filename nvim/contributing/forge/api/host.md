@@ -29,7 +29,7 @@ The first frame on a new connection must be this request. The decoder rejects un
 
 Success returns `protocol_version`. When a Git cache path is supplied, `git_config_cache` also reports its initialization `state`. A cache failure returns `state: "error"` and `warning` without failing the handshake. Invalid recovery or ignore configuration returns `invalid_request`. A version mismatch returns `protocol_mismatch` with `data.expected_version`, and the host closes instead of admitting feature work. No progress events accompany the handshake. Wait for its response before sending other requests. Reconnecting starts a new handshake and does not recover unknown mutation outcomes by itself.
 
-The minimal exchange is exercised by [the host handshake fixture](../../../../nvim/tests/forge/host_initialize.lua):
+The minimal exchange:
 
 ```json
 {"id":1,"method":"host.initialize","params":{"protocol_version":29}}
@@ -53,7 +53,7 @@ Stop accepting work and drain the shared host.
 
 There are no parameter fields or nested operations. The host stops admission, collects outstanding work and producers, and sends the terminal `shutdown: true` response before the connection exits. It may still require receive-credit frames while draining buffered output. Sending ordinary work after shutdown starts is invalid. A broken pipe or collection failure can prevent the acknowledgement, so the caller must also observe process exit and retain unresolved mutation receipts. The request emits no progress and does not delete session storage. It is a connection lifecycle operation, not a replayable service mutation.
 
-[The same handshake fixture](../../../../nvim/tests/forge/host_initialize.lua) sends shutdown and verifies process collection:
+A shutdown request, after which the caller verifies process collection:
 
 ```json
 {"id":2,"method":"host.shutdown","params":{}}
@@ -149,4 +149,4 @@ This frame has **no response or progress event**. The Lua transport owns it and 
 {"id":0,"method":"host.transport.consumed","params":{"bytes":0,"frames":0}}
 ```
 
-[Receive-credit validation](../../../rust/forge/crates/forge-protocol/src/credit.rs) verifies exact prefixes, and [the host fixture](../../../../nvim/tests/forge/host_initialize.lua) grants the real handshake byte count before shutdown. The [host reader](../../../rust/forge/src/host.rs) intercepts this frame even while ordinary requests drain.
+[Receive-credit validation](../../../rust/forge/crates/forge-protocol/src/credit.rs) verifies exact prefixes; a client grants the real handshake byte count before shutdown. The [host reader](../../../rust/forge/src/host.rs) intercepts this frame even while ordinary requests drain.

@@ -76,8 +76,3 @@ pub(in crate::tools) fn strict_object_input_schema(
         "additionalProperties": false
     })
 }
-
-#[cfg(test)]
-pub(in crate::tools) fn plan_edit_input_schema() -> Value {
-    crate::plan::plan_edit_request_schema()
-}

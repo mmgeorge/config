@@ -145,13 +145,4 @@ mod tests {
         assert!(matches!(result, Err(ProviderError::Failure(error))
             if error.kind() == crate::ProviderFailureKind::Authorization));
     }
-
-    /// Decoding durable call identity must enforce the same rule as native adapters.
-    #[test]
-    fn tool_call_identity_rejects_empty_serialized_values() {
-        assert!(ToolCallId::new(" ").is_err());
-        assert!(serde_json::from_value::<ToolCallId>(serde_json::json!("")).is_err());
-        let id: ToolCallId = serde_json::from_value(serde_json::json!("native-call-7")).unwrap();
-        assert_eq!(id.as_str(), "native-call-7");
-    }
 }

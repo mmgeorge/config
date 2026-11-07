@@ -10,10 +10,8 @@ Host fixtures need a built executable. See [Building and testing](building-and-t
 | --- | --- | --- |
 | `lua-test` | Ordinary module fixtures | None |
 | `lua-test-mock-integration` | Host fixtures | `MockProvider` or a simulated process, with no model requests |
-| `lua-test-live-integration` | Fixtures that use installed provider CLIs | Real, and may make model requests |
-| `lua-benchmark` | Benchmarks | Varies |
 
-The `lua-test` check runs the ordinary suite, which excludes both integration suites and benchmarks; its default `affected` selection maps changed source paths to the feature suites that cover them. The registry rejects a live fixture submitted to the mock check. Run the live check only after checking credentials and each fixture's prerequisites. Its fixtures include `forge-providers/tests/fixtures/skill_reads_host.lua`, `forge-providers/tests/fixtures/activity_host.lua`, and `harness_provider_switch_host.lua`.
+The `lua-test` check runs the ordinary suite, which excludes the mock integration suite; its default `affected` selection maps changed source paths to the feature suites that cover them. The registry rejects a fixture outside the mock suite submitted to the mock check, and the ordinary check rejects mock fixtures so they keep their `rust-build` prerequisite.
 
 ## Run a fixture
 
@@ -28,7 +26,7 @@ check_run({"check":"lua-test-mock-integration","inputs":{"files":["nvim/tests/fo
 
 Use `inputs:{"suite":"walkthrough"}` only when a whole feature needs coverage. Omitting `files` from an integration check selects its whole suite.
 
-Outside Harness, call the runner directly. Without paths it runs every fixture except the live-provider suite:
+Outside Harness, call the runner directly. Without paths it runs every fixture:
 
 ```nu
 nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua

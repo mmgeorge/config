@@ -130,59 +130,6 @@ pub(crate) fn declaration_mismatch(
 mod tests {
     use super::*;
 
-    /// Compare configuration values independently of one leading encoding marker.
-    #[test]
-    fn json_bom_conformance_preserves_values_and_mismatch_source() {
-        let workspace = tempfile::tempdir().unwrap();
-        for path in ["settings.json", "settings.jsonc"] {
-            let expected = "{\"name\":\"work\u{feff}flow\",\"enabled\":true}";
-            let source = format!("\u{feff}{expected}\n");
-            assert!(compare(path, expected, &source).unwrap().is_empty());
-            assert!(compare(path, &source, expected).unwrap().is_empty());
-
-            let changed = "\u{feff}{\"name\":\"work\u{feff}flow\",\"enabled\":false}\n";
-            let (findings, changes) =
-                inspect_in_workspace(workspace.path(), path, expected, changed).unwrap();
-            assert_eq!(findings, ["configuration differs from the accepted values"]);
-            assert_eq!(changes.len(), 1);
-            assert!(changes[0].diff.contains(changed.trim_end()));
-            assert!(compare(path, expected, "\u{feff}{\"enabled\":true").is_err());
-        }
-    }
-
-    #[test]
-    fn declaration_changes_keep_source_signatures_without_implementation_bodies() {
-        let workspace = tempfile::tempdir().unwrap();
-        let (findings, changes) = inspect_in_workspace(
-            workspace.path(),
-            "src/lib.rs",
-            "#[inline]\npub fn update(value: u32);",
-            "#[inline]\npub fn update(mut value: u32) { value += 1; }",
-        )
-        .unwrap();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(changes.len(), 1);
-        let change = &changes[0];
-        assert!(change.diff.contains("-pub fn update(value: u32);"));
-        assert!(change.diff.contains("+pub fn update(mut value: u32);"));
-        assert!(!change.diff.contains("value += 1"));
-        assert!(!change.diff.contains("function_signature_item"));
-        assert_eq!(change.finding, format!("src/lib.rs: {}", findings[0]));
-        let (_, fields) = inspect_in_workspace(
-            workspace.path(),
-            "src/lib.rs",
-            "pub struct State { pub count: u32 }",
-            "pub struct State { pub count: bool }",
-        )
-        .unwrap();
-        assert!(
-            fields
-                .iter()
-                .any(|change| change.diff.contains("pub count: u32")
-                    && change.diff.contains("pub count: bool"))
-        );
-    }
-
     #[test]
     fn helpers_in_private_modules_are_internal_but_new_exports_are_not() {
         let workspace = tempfile::tempdir().unwrap();

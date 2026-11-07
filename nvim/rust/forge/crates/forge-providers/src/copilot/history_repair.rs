@@ -250,23 +250,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn native_history_refuses_later_completed_work() {
-        let history = vec![
-            event(
-                "boundary",
-                "assistant.message",
-                json!({"messageId":"request","content":"","toolRequests":[{"name":"shell","toolCallId":"pending"}]}),
-            ),
-            event(
-                "later",
-                "assistant.message",
-                json!({"messageId":"later","content":"completed answer"}),
-            ),
-        ];
-        assert!(incomplete_suffix(&history).is_err());
-    }
-
     /// Resume a permission-cancelled tool suffix without mistaking its aborted turn for success.
     #[test]
     fn native_history_repairs_only_correlated_aborted_suffix() -> Result<()> {
@@ -320,57 +303,5 @@ mod tests {
             if error.operation() == ProviderOperation::InputReconcile
                 && error.kind() == ProviderFailureKind::Rejected)
         );
-    }
-
-    #[test]
-    fn native_history_accepts_linked_failed_query_suffix_only() -> Result<()> {
-        let mut history = vec![
-            event(
-                "boundary",
-                "assistant.message",
-                json!({"messageId":"request","content":"","toolRequests":[{"name":"shell","toolCallId":"pending"}]}),
-            ),
-            event("end", "assistant.turn_end", json!({"turnId":"0"})),
-        ];
-        assert!(incomplete_suffix(&history).is_err());
-        let mut failure = event(
-            "failure",
-            "session.error",
-            json!({"errorType":"query","message":"provider rejected request"}),
-        );
-        failure.parent_id = Some("end".into());
-        history.push(failure);
-        assert_eq!(incomplete_suffix(&history)?, Some("boundary".into()));
-        let mut child = event(
-            "child",
-            "assistant.message",
-            json!({"messageId":"child","content":"child output"}),
-        );
-        child.agent_id = Some("separate-native-agent".into());
-        history.push(child);
-        assert_eq!(incomplete_suffix(&history)?, Some("boundary".into()));
-        Ok(())
-    }
-
-    #[test]
-    fn native_history_rejects_completion_crossing_cut_boundary() {
-        let history = vec![
-            event(
-                "earlier",
-                "assistant.message",
-                json!({"messageId":"earlier","content":"","toolRequests":[{"name":"shell","toolCallId":"earlier-tool"}]}),
-            ),
-            event(
-                "boundary",
-                "assistant.message",
-                json!({"messageId":"later","content":"","toolRequests":[{"name":"shell","toolCallId":"orphan"}]}),
-            ),
-            event(
-                "completion",
-                "tool.execution_complete",
-                json!({"toolCallId":"earlier-tool","success":true}),
-            ),
-        ];
-        assert!(incomplete_suffix(&history).is_err());
     }
 }

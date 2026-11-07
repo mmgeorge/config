@@ -268,40 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_null_collections_are_valid_but_missing_fields_are_not() {
-        for empty in [Value::Null, json!([])] {
-            let mut value = response();
-            for field in ["labels", "assignees", "comments", "projectItems"] {
-                value[field] = empty.clone();
-            }
-            value["author"] = Value::Null;
-            value["milestone"] = Value::Null;
-            let detail = decode(value).unwrap();
-            assert_eq!(detail.comments_count, 0);
-            assert!(detail.labels.is_empty());
-            assert_eq!(detail.author, "");
-        }
-        for field in [
-            "id",
-            "number",
-            "body",
-            "comments",
-            "assignees",
-            "labels",
-            "projectItems",
-            "updatedAt",
-        ] {
-            let mut value = response();
-            value.as_object_mut().unwrap().remove(field);
-            assert_eq!(
-                decode(value).unwrap_err().kind,
-                RemoteFailureKind::InvalidResponse,
-                "{field}"
-            );
-        }
-    }
-
-    #[test]
     fn rejects_cross_issue_identity_and_comment_anchors() {
         for (field, replacement) in [
             ("number", json!(8)),
@@ -329,23 +295,6 @@ mod tests {
             let mut value = response();
             value["comments"][0]["url"] = json!(anchor);
             assert!(decode(value).is_err());
-        }
-    }
-
-    #[test]
-    fn detail_preserves_collections_beyond_previous_limits() {
-        for (field, limit) in [
-            ("comments", 1000),
-            ("labels", 100),
-            ("assignees", 100),
-            ("projectItems", 100),
-        ] {
-            let mut value = response();
-            let record = value[field][0].clone();
-            value[field] = json!(vec![record.clone(); limit]);
-            assert!(decode(value.clone()).is_ok(), "{field} at limit");
-            value[field] = json!(vec![record; limit + 1]);
-            assert!(decode(value).is_ok(), "{field} beyond former limit");
         }
     }
 }

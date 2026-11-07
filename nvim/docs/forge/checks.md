@@ -299,10 +299,10 @@ a complete feature `suite`, or name one `fixture`:
 `suite` defaults to `affected` and `fixture` defaults to an empty string.
 An exact fixture cannot be combined with a named or full suite. Existing feature
 names remain in the repository runner, not separate saved definitions.
-`lua-test-host` and `lua-benchmark` remain explicit checks with a
-`rust-build` prerequisite. The ordinary callback rejects those suite names and
+`lua-test-mock-integration` remains an explicit check with a `rust-build`
+prerequisite. The ordinary callback rejects that suite name and
 build-dependent fixtures rather than bypassing that prerequisite.
-Supply explicit `files` to `lua-test-host` or `lua-benchmark` to select individual
+Supply explicit `files` to `lua-test-mock-integration` to select individual
 fixtures while retaining the build prerequisite. Omitting inputs keeps the full
 saved suite.
 

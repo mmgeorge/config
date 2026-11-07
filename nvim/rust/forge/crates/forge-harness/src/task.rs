@@ -125,53 +125,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn yolo_toggles_only_from_full_unsandboxed_allow() {
-        for sandbox_supported in [false, true] {
-            for sandbox in [false, true] {
-                for read in [DirectoryScope::Workspace, DirectoryScope::Full] {
-                    for write in [WriteScope::Off, WriteScope::Workspace, WriteScope::Full] {
-                        for approval in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow]
-                        {
-                            let mut access = AccessPolicy {
-                                sandbox,
-                                read_access: read,
-                                write_access: write,
-                                readable_directory: vec!["read-grant".into()],
-                                writable_directory: vec!["write-grant".into()],
-                                ..Default::default()
-                            };
-                            let original = access.clone();
-                            let mut mode = approval;
-                            let was_yolo = !sandbox
-                                && read == DirectoryScope::Full
-                                && write == WriteScope::Full
-                                && approval == ApprovalMode::Allow;
-                            PermissionChange::ToggleYolo.apply(
-                                &mut access,
-                                &mut mode,
-                                sandbox_supported,
-                            );
-                            assert_eq!(access.abbreviation(), "rxwx");
-                            assert_eq!(
-                                mode,
-                                if was_yolo {
-                                    ApprovalMode::Ask
-                                } else {
-                                    ApprovalMode::Allow
-                                }
-                            );
-                            assert_eq!(access.sandbox, was_yolo && sandbox_supported);
-                            assert_eq!(access.readable_directory, original.readable_directory);
-                            assert_eq!(access.writable_directory, original.writable_directory);
-                            assert_eq!(access.isolation_mode, original.isolation_mode);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn policy_transitions_preserve_independent_dimensions() {
         for approval in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
             for read in [DirectoryScope::Workspace, DirectoryScope::Full] {

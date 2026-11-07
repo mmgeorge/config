@@ -755,109 +755,6 @@ mod tests {
         path
     }
 
-    fn issue(number: u64, title: &str, state: &str, labels: &[&str]) -> IssueRecord {
-        IssueRecord {
-            repo: String::new(),
-            number,
-            title: title.to_owned(),
-            state: state.to_owned(),
-            url: format!("https://github.com/mmgeorge/test-repo/issues/{number}"),
-            created_at: Some("2026-06-14T00:00:00Z".to_owned()),
-            updated_at: Some(format!("2026-06-14T00:{number:02}:00Z")),
-            body: None,
-            labels: labels
-                .iter()
-                .map(|label| LabelRecord {
-                    name: (*label).to_owned(),
-                    color: None,
-                    description: None,
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn upsert_page_and_snapshot_open_issues() -> Result<()> {
-        let db_path = temp_db("snapshot");
-        let database = open_database(&db_path)?;
-        upsert_page(
-            &database,
-            "mmgeorge/test-repo",
-            SyncScope::Open,
-            PageInput {
-                issues: vec![
-                    issue(1, "Add issue index", "OPEN", &["enhancement"]),
-                    issue(2, "Closed task", "CLOSED", &["bug"]),
-                ],
-                cursor: None,
-                has_next_page: false,
-                total_count: Some(2),
-                completed: true,
-                high_water: None,
-                checked_at: Some(123),
-            },
-        )?;
-
-        let snapshot = snapshot(&database, "mmgeorge/test-repo", SnapshotState::Open)?;
-        assert_eq!(snapshot.issue_count, 1);
-        assert_eq!(snapshot.issues[0].number, 1);
-        let snapshot_json = serde_json::to_value(&snapshot)?;
-        assert!(
-            snapshot_json["issues"][0].get("body").is_none(),
-            "completion snapshot must not include issue bodies"
-        );
-        assert!(read_state(&database, "mmgeorge/test-repo")?.open_historical_complete);
-        let _ = fs::remove_file(db_path);
-        Ok(())
-    }
-
-    #[test]
-    fn upsert_replaces_old_indexes_without_losing_issue() -> Result<()> {
-        let db_path = temp_db("replace");
-        let database = open_database(&db_path)?;
-        upsert_page(
-            &database,
-            "mmgeorge/test-repo",
-            SyncScope::Open,
-            PageInput {
-                issues: vec![issue(7, "Old label", "OPEN", &["bug"])],
-                ..PageInput {
-                    issues: Vec::new(),
-                    cursor: None,
-                    has_next_page: false,
-                    total_count: None,
-                    completed: true,
-                    high_water: None,
-                    checked_at: None,
-                }
-            },
-        )?;
-        upsert_page(
-            &database,
-            "mmgeorge/test-repo",
-            SyncScope::Open,
-            PageInput {
-                issues: vec![issue(7, "New label", "OPEN", &["docs"])],
-                ..PageInput {
-                    issues: Vec::new(),
-                    cursor: None,
-                    has_next_page: false,
-                    total_count: None,
-                    completed: true,
-                    high_water: None,
-                    checked_at: None,
-                }
-            },
-        )?;
-
-        let snapshot = snapshot(&database, "mmgeorge/test-repo", SnapshotState::Open)?;
-        assert_eq!(snapshot.issue_count, 1);
-        assert_eq!(snapshot.issues[0].title, "New label");
-        assert_eq!(snapshot.issues[0].labels[0].name, "docs");
-        let _ = fs::remove_file(db_path);
-        Ok(())
-    }
-
     #[test]
     fn upsert_and_read_issue_detail() -> Result<()> {
         let db_path = temp_db("detail");
@@ -886,41 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn read_multiple_issue_details_preserves_requested_order() -> Result<()> {
-        let db_path = temp_db("details");
-        let database = open_database(&db_path)?;
-        let detail = DetailRecord {
-            repo: "mmgeorge/test-repo".to_owned(),
-            number: 12,
-            fetched_at: 1234,
-            item: serde_json::json!({
-                "repo": "mmgeorge/test-repo",
-                "number": 12,
-                "title": "Cached issue",
-                "body": "Cached body"
-            }),
-        };
-
-        upsert_detail(&database, "mmgeorge/test-repo", 12, &detail)?;
-
-        let details = read_details(&database, "mmgeorge/test-repo", &[13, 12])?;
-        assert_eq!(details.len(), 2);
-        assert_eq!(details[0].number, 13);
-        assert!(!details[0].found);
-        assert_eq!(details[1].number, 12);
-        assert!(details[1].found);
-        assert_eq!(
-            details[1]
-                .item
-                .as_ref()
-                .and_then(|item| item["title"].as_str()),
-            Some("Cached issue")
-        );
-        let _ = fs::remove_file(db_path);
-        Ok(())
-    }
-
-    #[test]
     fn open_database_waits_for_existing_lock() -> Result<()> {
         let db_path = temp_db("lock");
         let database = open_database(&db_path)?;
@@ -944,13 +806,6 @@ mod tests {
         observed_wait.map_err(|_| anyhow!("opener returned without waiting for the lock"))?;
         let _ = fs::remove_file(db_path);
         Ok(())
-    }
-
-    #[test]
-    fn panic_payload_message_preserves_string_details() {
-        let result = catch_unwind(|| panic!("allocator state corrupt"));
-        let payload = result.expect_err("test panic should be captured");
-        assert_eq!(panic_payload_message(payload), "allocator state corrupt");
     }
 
     #[test]

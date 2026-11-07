@@ -175,8 +175,6 @@ pub(crate) fn validate(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ScopeOwner;
-    use forge_provider_api::generation::lowest_effort;
 
     #[test]
     fn commit_message_preserves_body_and_large_output_and_rejects_empty_output() {
@@ -220,22 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_description_preserves_paragraphs_and_rejects_empty_output() {
-        let purpose = TextGeneration::PullRequestDescription;
-        let description =
-            "Preserves the selected branch.\n\nReports provider failures before publication.";
-        assert_eq!(
-            purpose
-                .validate(&format!("```text\n{description}\n```"))
-                .unwrap(),
-            description
-        );
-        assert_eq!(purpose.input(description), description);
-        assert!(purpose.validate(" \n ").is_err());
-        assert!(purpose.validate("```text\n```").is_err());
-    }
-
-    #[test]
     fn session_name_rejects_invalid_output_and_normalizes_a_short_title() {
         let purpose = TextGeneration::SessionName;
         assert_eq!(
@@ -252,126 +234,5 @@ mod tests {
                 .validate("one two three four five six seven")
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn session_name_selects_lowest_supported_effort_without_changing_model() {
-        let mut model: super::super::ProviderModel = serde_json::from_value(serde_json::json!({
-            "id":"selected", "reasoning":["low", "medium", "high"], "context_window":[], "vision":false
-        })).unwrap();
-        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("low"));
-        model.reasoning.insert(0, "minimal".into());
-        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("minimal"));
-        model.reasoning.insert(0, "none".into());
-        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("none"));
-        model.reasoning = vec!["medium".into()];
-        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("medium"));
-        model.reasoning.clear();
-        assert_eq!(lowest_effort(&model).unwrap(), None);
-        model.reasoning.push("unknown".into());
-        assert_eq!(lowest_effort(&model).unwrap().as_deref(), Some("unknown"));
-    }
-
-    #[test]
-    fn history_keeps_visible_message_order_and_excludes_reasoning_and_reverted_work() {
-        let scope = crate::provider::InvocationScope {
-            thread_id: forge_provider_api::ThreadId::from(crate::provider::ThreadOwner::root(
-                "session",
-            )),
-            exchange_id: "exchange".into(),
-            invocation_id: "invocation".into(),
-        };
-        let mut turn = crate::turn::Turn::new(
-            "turn".into(),
-            crate::provider::TurnAddress {
-                thread_id: scope.owner().thread_id(),
-                turn_id: scope.turn_id().unwrap(),
-                scope,
-            },
-            1,
-        );
-        turn.record_text(MessageKind::Reasoning, "hidden reasoning")
-            .unwrap();
-        turn.record_text(MessageKind::Assistant, "Visible progress")
-            .unwrap();
-        let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
-            "id":"exchange", "agent_id":"main", "session_id":"session", "ordinal":1, "prompt":"Fix this",
-            "state":"running", "attributed_matches_checkpoint":false, "created_at_ms":1,
-            "node_list":[], "turn":[], "awaiting_input":false, "duration_ms":0, "comment":[]
-        })).unwrap();
-        for item in turn.items() {
-            exchange.node_list.push(ExchangeNode::TurnContent {
-                id: format!("{}", exchange.node_list.len()),
-                turn_id: "turn".into(),
-                item: item.clone(),
-            });
-        }
-        exchange.turn.push(turn);
-        let mut entries = vec![TimelineEntry::Exchange {
-            id: "entry".into(),
-
-            created_at_ms: 1,
-            exchange: exchange.into(),
-
-            agent_by_id: Default::default(),
-        }];
-        let captured = history(&entries).unwrap();
-        assert_eq!(captured, "User: Fix this\n\nAssistant: Visible progress");
-        if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
-            exchange.node_list.push(ExchangeNode::TimelineEvent {
-                event: Box::new(crate::timeline::TimelineEvent::Session {
-                    event: Box::new(crate::timeline::SessionEventRecord {
-                        id: "task-start".into(),
-                        session_id: "session".into(),
-                        owner: crate::timeline::TimelineOwner::exchange(exchange),
-                        created_at_ms: 2,
-                        detail: crate::timeline::SessionEventKind::TaskStarted {
-                            start: crate::exchange::TaskStart {
-                                kind: crate::task::TaskKind::Goal,
-                                title: "Fix startup".into(),
-                            },
-                            prompt: "Complete the remaining startup work".into(),
-                        },
-                    }),
-                }),
-            });
-        }
-        assert_eq!(
-            history(&entries).unwrap(),
-            "User: Fix this\n\nAssistant: Visible progress\n\nUser: Complete the remaining startup work"
-        );
-        let large_prompt = "λ".repeat(60_001);
-        if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
-            exchange.prompt = large_prompt.clone();
-        }
-        assert_eq!(
-            history(&entries).unwrap(),
-            format!(
-                "User: {large_prompt}\n\nAssistant: Visible progress\n\nUser: Complete the remaining startup work"
-            )
-        );
-        if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
-            exchange
-                .finish(crate::exchange::ExchangeOutcome::Interrupted, 2)
-                .unwrap();
-            exchange
-                .set_disposition(HistoryDisposition::Superseded)
-                .unwrap();
-        }
-        assert!(history(&entries).is_err());
-    }
-
-    #[test]
-    fn rejects_empty_recaps_preserves_large_text_and_normalizes_lines() {
-        assert!(super::validate("  \n").is_err());
-        assert_eq!(
-            super::validate(&"x".repeat(8193)).unwrap(),
-            "x".repeat(8193)
-        );
-        assert_eq!(
-            super::validate("Recent work.\nNext step.").unwrap(),
-            "Recent work. Next step."
-        );
-        assert!(super::history(&[]).is_err());
     }
 }

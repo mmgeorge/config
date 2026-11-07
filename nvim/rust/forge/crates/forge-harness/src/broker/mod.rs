@@ -156,34 +156,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// Holds test time still until the test advances it, so elapsed-time behavior never waits.
-#[cfg(test)]
-pub(crate) struct ManualClock {
-    now_ms: std::sync::atomic::AtomicI64,
-}
-
-#[cfg(test)]
-impl ManualClock {
-    pub(crate) fn new(now_ms: i64) -> Self {
-        Self {
-            now_ms: std::sync::atomic::AtomicI64::new(now_ms),
-        }
-    }
-
-    /// Move test time forward by an exact interval.
-    pub(crate) fn advance(&self, interval: std::time::Duration) {
-        let interval_ms = i64::try_from(interval.as_millis()).expect("test interval fits in i64");
-        self.now_ms.fetch_add(interval_ms, Ordering::AcqRel);
-    }
-}
-
-#[cfg(test)]
-impl Clock for ManualClock {
-    fn now_ms(&self) -> i64 {
-        self.now_ms.load(Ordering::Acquire)
-    }
-}
-
 /// Represents initialization state supplied by the Neovim client.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InitializeRequest {

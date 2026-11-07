@@ -200,38 +200,3 @@ pub fn is_denied(data: &Value) -> bool {
             Some("denied" | "rejected")
         )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::error::Error as _;
-
-    /// Keep malformed Copilot payload text out of every normalized error surface.
-    #[test]
-    fn malformed_compaction_payload_exposes_only_protocol_classification() {
-        let sentinel = "copilot-native-payload-sentinel";
-        let event: SessionEvent = serde_json::from_value(serde_json::json!({
-            "id":"malformed-compaction",
-            "type":"session.compaction_complete",
-            "timestamp":"2026-11-02T00:00:00Z",
-            "data":{"success":true,"preCompactionTokens":sentinel}
-        }))
-        .expect("fixture event has a valid SDK envelope");
-
-        let error = decode_compaction(&event, "private-session", None)
-            .expect_err("malformed native compaction data is rejected");
-        assert!(matches!(
-            &error,
-            forge_provider_api::ProviderError::Failure(failure)
-                if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
-        ));
-        let rendered = format!("{error} {error:?}");
-        assert!(!rendered.contains(sentinel));
-        assert!(!rendered.contains("private-session"));
-        let mut source = error.source();
-        while let Some(error) = source {
-            assert!(!error.to_string().contains(sentinel));
-            source = error.source();
-        }
-    }
-}

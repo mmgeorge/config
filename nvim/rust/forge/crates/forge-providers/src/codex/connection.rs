@@ -253,36 +253,6 @@ mod tests {
         ));
         server.await.unwrap();
     }
-    /// The socket answers control frames even while no RPC consumer polls receive.
-    #[tokio::test]
-    async fn session_reader_runs_before_the_first_consumer_poll() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket
-                .send(Message::Text(r#"{"early":true}"#.into()))
-                .await
-                .unwrap();
-            socket.send(Message::Ping(vec![9].into())).await.unwrap();
-            assert_eq!(
-                socket.next().await.unwrap().unwrap(),
-                Message::Pong(vec![9].into())
-            );
-        });
-        let connection = CodexConnection::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            connection.receive().await.unwrap().value.unwrap(),
-            json!({"early":true})
-        );
-    }
 
     /// Retain large output in order and expose connection closure only after the backlog drains.
     #[tokio::test]

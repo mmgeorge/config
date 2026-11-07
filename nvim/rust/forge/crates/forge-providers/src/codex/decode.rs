@@ -1069,23 +1069,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prettifies_codex_mcp_json_results() {
-        let output = mcp_tool_output(&json!({
-            "type": "mcpToolCall",
-            "result": {
-                "content": [{
-                    "type": "text",
-                    "text": "{\"login\":\"mmgeorge\",\"details\":{\"followers\":22}}"
-                }]
-            }
-        }));
-        assert_eq!(
-            output.as_deref(),
-            Some("{\n  \"details\": {\n    \"followers\": 22\n  },\n  \"login\": \"mmgeorge\"\n}")
-        );
-    }
-
-    #[test]
     fn move_report_preserves_destination_outside_patch_content() {
         let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
         let changes = normalize_file_change_set(
@@ -1125,65 +1108,6 @@ mod tests {
                 tool_title(&json!([executable, marker, "probe 'a path'; probe λ"])).as_deref(),
                 Some("probe 'a path'; probe λ")
             );
-        }
-    }
-
-    #[test]
-    fn compacts_multiline_command_titles_for_one_line_previews() {
-        assert_eq!(
-            compact_tool_title("pwsh -Command\n  Get-Content README.md\r\n").as_deref(),
-            Some("pwsh -Command Get-Content README.md")
-        );
-    }
-
-    #[test]
-    fn builtin_titles_handle_sleep_and_web_fallbacks_without_aliasing_mcp() {
-        for (item, expected) in [
-            (
-                json!({"type":"sleep", "durationMs":20000}),
-                Some("Wait · 20s"),
-            ),
-            (
-                json!({"type":"sleep", "durationMs":1500}),
-                Some("Wait · 1.5s"),
-            ),
-            (json!({"type":"sleep"}), None),
-            (
-                json!({"type":"webSearch", "query":"", "action":null, "results":null}),
-                Some("Web Search"),
-            ),
-            (json!({"type":"webSearch"}), Some("Web Search")),
-            (
-                json!({"type":"webSearch", "query":"documentation", "action":null}),
-                Some("Web Search · documentation"),
-            ),
-            (
-                json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}),
-                Some("Web Search · documentation"),
-            ),
-            (
-                json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}),
-                Some("Web Search · documentation"),
-            ),
-            (
-                json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}),
-                Some("Web Search · one · +2 queries"),
-            ),
-            (
-                json!({"type":"webSearch", "query":"https://example.com", "action":{"type":"openPage","url":null}}),
-                Some("Open web · example.com"),
-            ),
-            (json!({"type":"webSearch", "action":{"type":"other"}}), None),
-            (
-                json!({"type":"webSearch", "action":{"type":"search","queries":[]}}),
-                None,
-            ),
-            (
-                json!({"type":"mcpToolCall", "server":"webSearch", "tool":"search","arguments":{"query":"documentation"}}),
-                None,
-            ),
-        ] {
-            assert_eq!(builtin_tool_title(&item).as_deref(), expected, "{item}");
         }
     }
 

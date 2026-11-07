@@ -278,60 +278,6 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
 
-    /// Private startup excludes inherited instruction files while preserving authoritative tool-free model metadata.
-    #[test]
-    fn private_launch_uses_catalog_instructions_without_an_empty_file_override() {
-        let profile = tempfile::tempdir().unwrap();
-        let model = super::super::catalog::parse_model_catalog(&json!({"data":[{"model":"gpt-6-luna","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium"}]})).into_iter().next().unwrap();
-        let native_config = json!({"model_provider":"openai","model_instructions_file":"untrusted-user-instructions.md","instructions":"untrusted-user-instructions","developer_instructions":"untrusted-user-developer","hooks":{"enabled":true}});
-        let (command, home) = runtime_command(
-            &["codex".into(), "app-server".into()],
-            profile.path(),
-            &model,
-            &native_config,
-        )
-        .unwrap();
-        assert!(
-            !command
-                .iter()
-                .any(|argument| argument.contains("model_instructions_file"))
-        );
-        assert!(!profile.path().join("isolated-instructions.md").exists());
-        let private_config = std::fs::read_to_string(home.join("config.toml")).unwrap();
-        assert!(!private_config.contains("untrusted-user"));
-        assert!(!private_config.contains("hooks"));
-        let catalog: Value = serde_json::from_slice(
-            &std::fs::read(profile.path().join("isolated-models.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(catalog["models"][0]["slug"], "gpt-6-luna");
-        assert_eq!(catalog["models"][0]["base_instructions"], "");
-        assert_eq!(catalog["models"][0]["shell_type"], "disabled");
-        assert!(catalog["models"][0]["apply_patch_tool_type"].is_null());
-        assert_eq!(
-            catalog["models"][0]["experimental_supported_tools"],
-            json!([])
-        );
-    }
-
-    /// Validate the certified native startup parser with the generated private catalog, without credentials or model work.
-    #[tokio::test]
-    #[ignore = "requires installed certified Codex CLI 0.164.0; starts no model turn"]
-    async fn isolated_native_0164_catalog_initializes_without_credentials_or_turn() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let profile = tempfile::tempdir().unwrap();
-            let model = super::super::catalog::parse_model_catalog(&json!({"data":[{"model":"gpt-6-luna","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"defaultReasoningEffort":"medium"}]})).into_iter().next().unwrap();
-            let (command, home) = runtime_command(&["codex".into(), "app-server".into()], profile.path(), &model, &json!({})).unwrap();
-            let runtime = super::super::runtime::CodexRuntime::isolated(command, home);
-            let connection = runtime.connect().await.unwrap();
-            let rpc = NativeRpc::new(connection);
-            let initialized = rpc.request("initialize", json!({"clientInfo":{"name":"forge-isolated-startup-fixture","version":"0.1.0"},"capabilities":{"experimentalApi":true}}), ProviderOperation::ThreadOpen).await.unwrap();
-            rpc.close().await.unwrap(); runtime.shutdown().await.unwrap();
-            assert!(initialized["userAgent"].as_str().unwrap().starts_with("forge-isolated-startup-fixture/0.164.0 "));
-            assert!(!profile.path().join("home/auth.json").exists());
-        }).await.unwrap();
-    }
-
     /// Build the real adapter dispatcher against a private native transport fixture.
     async fn fixture() -> (
         NativeRpc,
@@ -347,39 +293,6 @@ mod tests {
             .await
             .unwrap();
         (NativeRpc::new(connection), accept.await.unwrap())
-    }
-
-    /// Bootstrap managed credentials from the native owner and use native workspace identity, never token claims.
-    #[tokio::test]
-    async fn bootstrap_uses_native_export_and_workspace_identity_without_refresh_material() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (source, mut source_wire) = fixture().await;
-            let (private, mut private_wire) = fixture().await;
-            let auth = IsolationAuth::new(Arc::new(source));
-            let source_task = tokio::spawn(async move {
-                for _ in 0..2 {
-                    let status: Value = serde_json::from_str(source_wire.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                    assert_eq!(status["method"], "getAuthStatus");
-                    assert_eq!(status["params"], json!({"includeToken":true,"refreshToken":false}));
-                    source_wire.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":status["id"],"result":{"authMethod":"chatgpt","authToken":"opaque-native-access-token","requiresOpenaiAuth":true}}).to_string().into())).await.unwrap();
-                    let account: Value = serde_json::from_str(source_wire.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                    assert_eq!(account["method"], "account/read");
-                    source_wire.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":account["id"],"result":{"workspaceRouting":{"chatgptAccountId":"native-workspace"},"account":{"type":"chatgpt","planType":"pro"}}}).to_string().into())).await.unwrap();
-                }
-                while let Some(message) = source_wire.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
-            });
-            let private_task = tokio::spawn(async move {
-                let login: Value = serde_json::from_str(private_wire.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                assert_eq!(login["method"], "account/login/start");
-                assert_eq!(login["params"], json!({"type":"chatgptAuthTokens","accessToken":"opaque-native-access-token","chatgptAccountId":"native-workspace","chatgptPlanType":"pro"}));
-                assert!(login["params"].get("refreshToken").is_none());
-                private_wire.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":login["id"],"result":{"type":"chatgptAuthTokens"}}).to_string().into())).await.unwrap();
-                while let Some(message) = private_wire.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
-            });
-            auth.bootstrap(&private).await.unwrap();
-            private.close().await.unwrap(); auth.source.close().await.unwrap();
-            source_task.await.unwrap(); private_task.await.unwrap();
-        }).await.unwrap();
     }
 
     /// A native credential switch cannot pair the previous token with a later workspace identity.

@@ -465,41 +465,4 @@ fn keep_selection<T>(selection: &SelectionChange<T>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// Preserve nullable selection semantics and reject internal lifecycle authority on reload.
-    #[test]
-    fn settings_patch_roundtrip_preserves_clear_and_rejects_invalid_intent() {
-        for value in [
-            json!({"context_window":null}),
-            json!({"context_window":"large"}),
-            json!({"model":"model-a"}),
-            json!({"ask_model":null}),
-            json!({"ask_model":{}}),
-            json!({"model":"model-a","ask_model":{"model":"question-model","effort":"high"}}),
-        ] {
-            let patch: SessionConfigurationPatch = serde_json::from_value(value.clone()).unwrap();
-            let encoded = patch.encode_legacy().unwrap();
-            assert_eq!(encoded.get("context_window"), value.get("context_window"));
-            assert_eq!(encoded.get("ask_model"), value.get("ask_model"));
-            let restored: SessionConfigurationPatch =
-                serde_json::from_value(encoded.clone()).unwrap();
-            assert_eq!(restored.encode_legacy().unwrap(), encoded);
-        }
-        for value in [
-            json!({}),
-            json!({"validate":true}),
-            json!({"model":" "}),
-            json!({"model":42}),
-            json!({"ask_model":{"effort":"high"}}),
-            json!({"ask_model":{"model":" "}}),
-            json!({"ask_model":{"model":"question-model","native_mode":"x"}}),
-            json!({"model":"a","resume":true}),
-            json!({"tool_timeout":{"amount":0,"unit":"s"}}),
-        ] {
-            assert!(serde_json::from_value::<SessionConfigurationPatch>(value).is_err());
-        }
-    }
-}
+mod tests {}

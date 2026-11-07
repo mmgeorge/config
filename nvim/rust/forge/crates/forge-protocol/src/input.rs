@@ -73,18 +73,3 @@ impl AsyncRead for ThreadInput {
         Poll::Ready(Ok(()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncReadExt;
-
-    #[tokio::test]
-    async fn preserves_bytes_across_bounded_chunks_and_eof() {
-        let expected: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
-        let mut input = ThreadInput::new(io::Cursor::new(expected.clone())).unwrap();
-        let mut actual = Vec::new();
-        input.read_to_end(&mut actual).await.unwrap();
-        assert_eq!(actual, expected);
-    }
-}

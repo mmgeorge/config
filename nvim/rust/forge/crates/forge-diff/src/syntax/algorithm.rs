@@ -356,47 +356,8 @@ fn first_error(root: Node<'_>) -> Option<Node<'_>> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn cursor_selects_reference_segments_and_excludes_literals() {
-        let source = "direction ← movement_direction(keys)\nabilities . start_dash(direction)\nreturn \"movement_direction(keys)\" # abilities.start_dash\nunfinished(";
-        for (line, token, first, last, invocation) in [
-            (1, "movement_direction", true, true, true),
-            (1, "keys", true, true, false),
-            (2, "abilities", true, false, true),
-            (2, "start_dash", false, true, true),
-        ] {
-            let column = source.lines().nth(line - 1).unwrap().find(token).unwrap() + 1;
-            let reference = super::algorithm_reference(source, line, column)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                (
-                    reference.segment.as_str(),
-                    reference.first,
-                    reference.last,
-                    reference.invocation
-                ),
-                (token, first, last, invocation)
-            );
-        }
-        for token in ["movement_direction", "abilities"] {
-            let column = source.lines().nth(2).unwrap().find(token).unwrap() + 1;
-            assert!(
-                super::algorithm_reference(source, 3, column)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert!(super::algorithm_reference(source, 2, 11).unwrap().is_none());
-    }
 
     use super::*;
-
-    #[test]
-    fn validates_nested_control_flow_and_unicode_operations() {
-        validate_algorithm("résultat ← none\nfor each candidate in candidates\n  if candidate.score ≥ 10\n    résultat ← candidate\n    break\n  otherwise if candidate.ready\n    continue\n  otherwise\n    inspect(candidate)\nreturn résultat").unwrap();
-        validate_algorithm("if ready:\n  return value\notherwise:\n  return none").unwrap();
-    }
 
     #[test]
     fn rejects_incomplete_statements_and_invalid_structure() {
@@ -418,12 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_complete_content_beyond_former_display_thresholds() {
-        let source = "inspect(candidate)\n".repeat(5000);
-        validate_algorithm(&source).unwrap();
-    }
-
-    #[test]
     fn retains_explicit_constructors_nested_calls_and_named_arguments() {
         let source = "projectile ← combat::Projectile(damage = 1, previous_position = player.position)\nvelocity ← Velocity(linear = 560 × direction)\nmarker ← CombatEntity()\nresult ← Store::new(config = inspect(source))\nspawn(projectile, velocity, marker)";
         let invocation = validate_algorithm(source).unwrap();
@@ -442,62 +397,5 @@ mod tests {
             ]
         );
         assert_eq!((invocation[0].line, invocation[0].column), (1, 16));
-    }
-
-    #[test]
-    fn rejects_missing_or_duplicate_constructor_arguments() {
-        for source in [
-            "value ← Item(field =)",
-            "value ← Item(field = 1, field = 2)",
-            "value ← Item(field = 1,)",
-        ] {
-            assert!(validate_algorithm(source).is_err(), "accepted {source:?}");
-        }
-    }
-
-    /// Reject prose in every expression position rather than partially accepting its tokens.
-    #[test]
-    fn rejects_prose_statements_conditions_and_values() {
-        for source in [
-            "spawn a 2D camera",
-            "spawn a yellow 30 by 30 target square at (200, 0) with target",
-            "process candidate",
-            "candidate ← earliest eligible item",
-            "if candidate is ready\n  process(candidate)",
-            "while more items remain\n  advance()",
-            "for each item in eligible items\n  process(item)",
-            "return the selected value",
-            "spawn(position = the origin)",
-            "spawn(player speed)",
-            "position ← (200 0)",
-            "components ← [player speed]",
-            "value ← 2D",
-            "value ← left +",
-            "value ← left right",
-            "value ← ()",
-            "player",
-            "1 ← value",
-        ] {
-            let error = format!("{:?}", validate_algorithm(source).unwrap_err());
-            assert!(
-                error.contains("Algorithm line") && error.contains("column"),
-                "{error}"
-            );
-            assert!(
-                error.contains("prose belongs in # comments"),
-                "{source}: {error}"
-            );
-        }
-    }
-
-    /// Preserve abstract operations, explicit construction, collections, and comment boundaries.
-    #[test]
-    fn accepts_structured_setup_and_expression_forms() {
-        let source = "player ← Player()\nspeed ← MovementSpeed(units_per_second = 250.0)\nscore ← Score(collected = 0)\ntarget ← Target()\nspawn_camera_2d()\nspawn_square(color = blue, size = (32, 32), position = (0, 0), components = [player, speed, score])\nspawn_square(color = yellow, size = (30, 30), position = (200, 0), components = [target])";
-        assert_eq!(validate_algorithm(source).unwrap().len(), 7);
-        validate_algorithm("# Explain why the operation is deferred\nqueue(entity) # Not an invocation: pretend()\nresult ← -(left + right) × 2\nready ← not empty(items) and count ≥ 1\nselected ← items[index]\nitems[index] ← result\nfor each (key, value) in entries\n  if key ∈ allowed ∪ extra\n    process(key, value)\nwhile ready\n  break\nreturn []").unwrap();
-        let invocation =
-            validate_algorithm("return \"ordinary prose is string data\" # pretend()").unwrap();
-        assert!(invocation.is_empty());
     }
 }

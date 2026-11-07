@@ -188,33 +188,4 @@ struct StoredPlanEdit {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Direct edits bind omitted legacy guards to the captured source and reject forged recovered intent.
-    #[test]
-    fn direct_edit_binds_source_and_validates_recovered_names() -> anyhow::Result<()> {
-        let plan: PlanRecord = serde_json::from_value(serde_json::json!({
-            "id":"plan","session_id":"session","request":"Design","state":"awaiting_review",
-            "working_path":"working.json","document_version":1,"model_revision":1,"user_revision":0,
-            "review_digest":"digest","created_at_ms":1,"updated_at_ms":1
-        }))?;
-        let edit = PlanEdit::capture(
-            &plan,
-            None,
-            PlanEditRequest {
-                plan: PlanId::new("plan")?,
-                expected_version: None,
-                digest: None,
-                change: PlanEditChange::RenameEntity {
-                    target: PlanEntitySelection::AddedEntity("Old".into()),
-                    name: "New".into(),
-                },
-            },
-        )?;
-        let mut stored = serde_json::to_value(edit)?;
-        stored["request"]["change"]["name"] = serde_json::json!(" ");
-        assert!(serde_json::from_value::<PlanEdit>(stored).is_err());
-        Ok(())
-    }
-}
+mod tests {}

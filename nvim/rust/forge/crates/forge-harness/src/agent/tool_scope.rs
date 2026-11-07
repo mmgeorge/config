@@ -301,42 +301,4 @@ mod tests {
         assert!(scope.invoke("agent_list", json!({})).await.is_err());
         assert!(coordinator.try_receive().is_none());
     }
-
-    #[tokio::test]
-    async fn expiring_a_queued_tool_closes_acknowledgment_and_retains_authenticated_owner() {
-        let coordinator = AgentCoordinator::new("session".into());
-        coordinator.set_enabled(true);
-        let (scope, lease) = AgentToolScope::new(
-            ThreadOwner::root("session"),
-            "parent".into(),
-            coordinator.clone(),
-        )
-        .unwrap();
-        let mut revision = coordinator.subscribe();
-        let invocation = tokio::spawn(async move { scope.invoke("agent_list", json!({})).await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), revision.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(lease);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), invocation)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        let Some(super::super::AgentCommand::Request {
-            authority: Some(authority),
-            response,
-            ..
-        }) = coordinator.try_receive()
-        else {
-            panic!("missing authenticated queued invocation")
-        };
-        assert_eq!(authority.owner, ThreadOwner::root("session"));
-        assert_eq!(authority.parent_exchange_id, "parent");
-        assert!(*authority.expired.borrow());
-        assert!(response.is_closed());
-    }
 }

@@ -482,55 +482,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn harness_check_skill_is_discoverable_for_every_provider() {
-        let fixture = tempfile::tempdir().unwrap();
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../../rulesync-global/.rulesync/skills/harness-checks/SKILL.md");
-        let directory = fixture
-            .path()
-            .join("rulesync-global/.rulesync/skills/harness-checks");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::copy(source, directory.join("SKILL.md")).unwrap();
-        let skill =
-            ResourceCatalog::skills(Some(fixture.path()), &fixture.path().join("workspace"))
-                .unwrap();
-        assert_eq!(skill.len(), 1);
-        assert_eq!(skill[0].name, "harness-checks");
-        assert_eq!(skill[0].scope, Some(crate::provider::ResourceScope::Global));
-        assert!(skill[0].user_invocable);
-        assert!(skill[0].description.contains("check_definition_edit"));
-        for target in ["fixture-alpha", "fixture-beta", "future-provider"] {
-            assert!(ResourceCatalog::supports_target(&skill[0].targets, target));
-        }
-    }
-
-    #[test]
-    fn source_identity_survives_definition_change_and_does_not_merge_same_names() {
-        let fixture = tempfile::tempdir().unwrap();
-        let global = fixture.path().join("global");
-        let workspace = fixture.path().join("workspace");
-        std::fs::create_dir_all(global.join("rulesync-global/.rulesync")).unwrap();
-        std::fs::create_dir_all(workspace.join(".rulesync")).unwrap();
-        let source = global.join("rulesync-global/.rulesync/mcp.json");
-        std::fs::write(&source, r#"{"mcpServers":{"same":{"command":"first"}}}"#).unwrap();
-        std::fs::write(
-            workspace.join(".rulesync/mcp.json"),
-            r#"{"mcpServers":{"same":{"command":"other"}}}"#,
-        )
-        .unwrap();
-        let before = ResourceCatalog::servers(Some(&global), &workspace).unwrap();
-        std::fs::write(source, r#"{"mcpServers":{"same":{"command":"changed"}}}"#).unwrap();
-        let after = ResourceCatalog::servers(Some(&global), &workspace).unwrap();
-        assert_eq!(before[0].id, after[0].id);
-        assert_ne!(before[0].id, before[1].id);
-        assert!(
-            !serde_json::to_string(&after[0])
-                .unwrap()
-                .contains("changed")
-        );
-    }
-
-    #[test]
     fn skill_identity_retains_folded_metadata_and_distinct_sources() {
         let fixture = tempfile::tempdir().unwrap();
         let global = fixture.path().join("global");

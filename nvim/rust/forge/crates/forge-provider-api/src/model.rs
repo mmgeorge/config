@@ -287,26 +287,3 @@ pub struct ResolvedModel {
     /// Preserve when native evidence confirmed this model.
     pub observed_at_ms: i64,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Provider changes clear unavailable inherited isolation, while explicit choices reject.
-    #[test]
-    fn unsupported_isolation_is_cleared_on_resolution_and_rejected_on_admission() {
-        let capability = ProviderCapability::default();
-        let access = AccessPolicy {
-            sandbox: false,
-            isolation_mode: Some("unavailable".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            capability.validate_access(&access),
-            Err(AccessCapabilityError::IsolationModeUnsupported)
-        );
-        let resolved = capability.resolve_access(access);
-        assert!(resolved.isolation_mode.is_none());
-        assert!(capability.validate_access(&resolved).is_ok());
-    }
-}

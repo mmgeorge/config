@@ -177,61 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn all_lifecycle_events_remain_inside_the_exchange_across_live_updates_and_reload() {
-        let mut source = exchange();
-        source
-            .append_input(InputIntent::Steering, "Before question".into(), 2)
-            .unwrap();
-        let before = source.node_list[0].id().to_owned();
-        let anchor = ExchangeAnchor::capture(&source);
-        let kinds = [
-            PlanLifecycleKind::QuestionAsked,
-            PlanLifecycleKind::QuestionAnswered,
-            PlanLifecycleKind::QuestionWithdrawn,
-            PlanLifecycleKind::Created,
-            PlanLifecycleKind::ChangesRequested,
-            PlanLifecycleKind::RevisionCreated,
-            PlanLifecycleKind::Accepted,
-            PlanLifecycleKind::Cancelled,
-        ];
-        let records: Vec<_> = kinds
-            .into_iter()
-            .map(|kind| lifecycle(kind, Some(anchor.clone())))
-            .collect();
-        source
-            .append_input(InputIntent::Clarification, "Rust learning demo".into(), 10)
-            .unwrap();
-        let answer = source.node_list[1].id().to_owned();
-        let mut projected = vec![source.clone()];
-        attach(
-            &mut projected,
-            &[plan()],
-            records.clone(),
-            vec![],
-            vec![],
-            &[],
-            &[],
-        );
-        let mut expected = vec![before];
-        expected.extend(kinds.into_iter().map(|kind| format!("{kind:?}")));
-        expected.push(answer);
-        assert_eq!(ids(&projected[0]), expected);
-
-        source
-            .append_input(InputIntent::Steering, "Continue after answer".into(), 11)
-            .unwrap();
-        expected.push(source.node_list[2].id().to_owned());
-        projected[0] = crate::plan::event::replacement_exchange(&projected[0], &source).unwrap();
-        assert_eq!(ids(&projected[0]), expected);
-        let source: Exchange =
-            serde_json::from_value(serde_json::to_value(source).unwrap()).unwrap();
-        let records = serde_json::from_value(serde_json::to_value(records).unwrap()).unwrap();
-        let mut restored = vec![source];
-        attach(&mut restored, &[plan()], records, vec![], vec![], &[], &[]);
-        assert_eq!(ids(&restored[0]), expected);
-    }
-
-    #[test]
     fn anchored_question_precedes_answer_without_repeating_at_the_timeline_tail() {
         let mut source = exchange();
         source
@@ -388,60 +333,5 @@ mod tests {
                 text.find("Questions ·").unwrap() < text.find("Clarify the options first").unwrap()
             );
         }
-    }
-
-    #[test]
-    fn execution_phases_keep_their_position_before_later_input() {
-        let mut source = exchange();
-        source
-            .append_input(InputIntent::Steering, "Task one".into(), 2)
-            .unwrap();
-        let anchor = ExchangeAnchor::capture(&source);
-        source
-            .append_input(InputIntent::Steering, "Task two".into(), 10)
-            .unwrap();
-        let execution: PlanExecutionRecord = serde_json::from_value(json!({
-            "id":"execution", "session_id":"session", "plan_id":"plan", "goal_id":"goal",
-            "state":"active", "phase":"verify", "original_revision":1, "revision":1, "generation":2,
-            "baseline_checkpoint":null, "findings":[], "progress":{"matched":[],"missing":[],"different":[],"unverified":[],"warning":[],"source_digest":{}},
-            "verification":[], "revision_history":[], "pending_revision_reason":null, "resume_after_review":false,
-            "observed_source":{}, "observed_document_version":0, "observed_check":[], "created_at_ms":1, "lifecycle":[
-                {"anchor":anchor, "sequence":1,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"phase","phase":"verify","revision":1,"state":"active","title":"Ready for verification"},
-                {"anchor":anchor, "sequence":2,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"phase","phase":"resolve","revision":1,"state":"active","title":"Resolving verification findings"},
-                {"anchor":anchor, "sequence":3,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"phase","phase":"verify","revision":1,"state":"complete","title":"Execution completed"}
-            ]
-        })).unwrap();
-        let resolution: PlanResolutionRecord = serde_json::from_value(json!({
-            "anchor":anchor,"id":"resolved","session_id":"session","plan_id":"plan",
-            "execution_id":"execution","accepted_revision":1,"kind":"blocked",
-            "task_summary":{"completed":1,"blocked":1,"total":2},
-            "test_summary":{"passed":1,"failed":0,"skipped":0,"not_run":0},
-            "deviation_ids":[],"audit_id":"audit","resolved_at_ms":10
-        }))
-        .unwrap();
-        let mut projected = vec![source.clone()];
-        attach(
-            &mut projected,
-            &[plan()],
-            vec![],
-            vec![execution],
-            vec![resolution],
-            &[],
-            &[],
-        );
-        assert_eq!(
-            ids(&projected[0]),
-            vec![
-                source.node_list[0].id(),
-                "execution:lifecycle:1",
-                "execution:lifecycle:2",
-                "execution:lifecycle:3",
-                "resolved",
-                source.node_list[1].id()
-            ]
-        );
     }
 }

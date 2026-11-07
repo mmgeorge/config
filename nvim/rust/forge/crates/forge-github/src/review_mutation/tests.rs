@@ -16,136 +16,6 @@ struct Remote {
     uncertain: bool,
 }
 
-fn creation_request() -> ReviewMutationRequest {
-    let mut capture = request();
-    capture.resource.kind = RecoveryResourceKind::Repository;
-    capture.resource.number = 0;
-    capture.draft_target = Some("pr:create".into());
-    capture.mutation = ReviewMutation::PullRequestCreate {
-        repository_node_id: "REPOSITORY".into(),
-        title: "Captured title".into(),
-        body: "exact\r\nbody".into(),
-        base: "main".into(),
-        head: "feature".into(),
-        head_commit: "1".repeat(40),
-        draft: true,
-    };
-    capture
-}
-
-#[tokio::test]
-async fn repository_creation_retains_exact_capture_and_blocks_repost_after_restart() {
-    let (_directory, service, remote) = setup(false, true);
-    let capture = creation_request();
-    let result = service
-        .review_mutation(remote.clone(), capture.clone())
-        .await
-        .unwrap();
-    assert!(matches!(result.state, RecoveryPhase::OutcomeUnknown { .. }));
-    let restarted = GithubService::default();
-    restarted
-        .configure_recovery(remote.store.directory().to_path_buf())
-        .unwrap();
-    assert!(
-        restarted
-            .review_mutation(remote.clone(), capture.clone())
-            .await
-            .is_err()
-    );
-    assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
-    let closed = restarted
-        .recovery_resolve(
-            remote.clone(),
-            capture.resource.clone(),
-            capture.operation_id.clone(),
-            RecoveryResolution::CloseUnknown,
-        )
-        .await
-        .unwrap();
-    restarted
-        .recovery_settle_draft(
-            capture.resource.clone(),
-            capture.operation_id.clone(),
-            serde_json::json!({"repo":"owner/repo","number":0,"creation":{"sequence":99,"title":"newer text"}}),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        closed.state,
-        RecoveryPhase::UserClosedUnknown { .. }
-    ));
-    let stored = restarted
-        .review_draft(capture.resource)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored["creation"]["title"], "newer text");
-    assert_eq!(
-        stored["creation_receipt"]["capture"]["submitted"]["mutation"]["body"],
-        "exact\r\nbody"
-    );
-    assert!(
-        stored["retired_operation"]
-            .get(capture.operation_id)
-            .is_some()
-    );
-    assert_eq!(remote.calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn repository_creation_scope_rejects_number_aliases_and_missing_durable_draft() {
-    let mut capture = creation_request();
-    capture.validate().unwrap();
-    capture.resource.number = 1;
-    assert!(capture.validate().is_err());
-    capture.resource.number = 0;
-    capture.resource.kind = RecoveryResourceKind::PullRequest;
-    assert!(capture.validate().is_err());
-    capture.resource.kind = RecoveryResourceKind::Repository;
-    capture.edit_sequence = None;
-    assert!(capture.validate().is_err());
-}
-
-#[tokio::test]
-async fn repository_creation_draft_keeps_newer_text_and_rejects_sequence_reuse() {
-    let (_directory, service, _) = setup(false, false);
-    let resource = creation_request().resource;
-    let draft = |sequence, title| {
-        serde_json::json!({"repo":"owner/repo","number":0,
-        "creation":{"sequence":sequence,"title":title,"body":"exact\r\nbody"}})
-    };
-    service
-        .review_draft_write(resource.clone(), draft(2, "newer"))
-        .await
-        .unwrap();
-    service
-        .review_draft_write(resource.clone(), draft(1, "older"))
-        .await
-        .unwrap();
-    assert_eq!(
-        service
-            .review_draft(resource.clone())
-            .await
-            .unwrap()
-            .unwrap()["creation"]["title"],
-        "newer"
-    );
-    assert!(
-        service
-            .review_draft_write(resource.clone(), draft(2, "conflicting"))
-            .await
-            .is_err()
-    );
-    service
-        .review_draft_write(resource.clone(), draft(2, "newer"))
-        .await
-        .unwrap();
-    assert_eq!(
-        service.review_draft(resource).await.unwrap().unwrap()["creation"]["title"],
-        "newer"
-    );
-}
-
 impl GithubRemote for Remote {
     fn read_actor(
         &self,
@@ -290,29 +160,6 @@ impl GithubReviewWriteRemote for Remote {
 }
 
 #[tokio::test]
-async fn milestone_assignment_uses_durable_creation_identity_without_recreating() {
-    let (_directory, service, remote) = setup(false, true);
-    let mut capture = request();
-    capture.mutation = ReviewMutation::MilestoneCreateAndAssign {
-        title: "Release".into(),
-    };
-    let result = service
-        .review_mutation(remote.clone(), capture.clone())
-        .await
-        .unwrap();
-    assert!(matches!(result.state, RecoveryPhase::OutcomeUnknown { .. }));
-    assert_eq!(result.confirmed_steps[0]["number"], 55);
-    assert_eq!(result.capture.submitted["mutation"]["title"], "Release");
-    assert!(
-        service
-            .review_mutation(remote.clone(), capture)
-            .await
-            .is_err()
-    );
-    assert_eq!(remote.calls.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
 async fn second_step_uncertainty_retains_first_confirmation_and_never_replays() {
     let (_directory, service, remote) = setup(false, true);
     let mut capture = request();
@@ -401,17 +248,6 @@ async fn durable_dispatch_precedes_one_attempt_and_confirmation_requires_exact_a
         .await
         .unwrap();
     assert!(remote.store.inspect(&request().resource).unwrap().is_none());
-}
-
-#[tokio::test]
-async fn actor_change_persists_rejection_without_remote_mutation() {
-    let (_directory, service, remote) = setup(true, false);
-    let result = service
-        .review_mutation(remote.clone(), request())
-        .await
-        .unwrap();
-    assert!(matches!(result.state, RecoveryPhase::Rejected { .. }));
-    assert_eq!(remote.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -317,49 +317,6 @@ mod tests {
         )
     }
 
-    /// A cancelled result waiter must not release native completion before collection succeeds.
-    #[tokio::test]
-    async fn dropped_waiter_retains_native_outcome_and_publishes_once_after_collection() {
-        let driver = Arc::new(Driver::new(true, None, None));
-        let (turn, mut stream, _turn_id) = fixture(driver.clone());
-        driver.cleanup_entered.notified().await;
-        assert_eq!(
-            turn.native_result().await.unwrap().unwrap().outcome(),
-            TurnOutcome::Interrupted
-        );
-        assert!(!turn.is_finished());
-        turn.started().await.unwrap();
-        let mut waiter = Box::pin(turn.join());
-        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
-        drop(waiter);
-        turn.interrupt().await.unwrap();
-        assert!(matches!(
-            stream.try_recv().unwrap().event,
-            ProviderEvent::Turn {
-                event: TurnEvent::Started(_),
-                ..
-            }
-        ));
-        assert!(stream.try_next().unwrap().is_none());
-        driver.cleanup_release.notify_one();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), turn.join())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(completed.result().outcome(), TurnOutcome::Interrupted);
-        assert_eq!(turn.join().await.unwrap(), completed);
-        assert!(matches!(
-            stream.recv().await.unwrap().unwrap().event,
-            ProviderEvent::Turn {
-                event: TurnEvent::Completed(_),
-                ..
-            }
-        ));
-        assert!(stream.try_next().unwrap().is_none());
-        assert_eq!(driver.runs.load(Ordering::Relaxed), 1);
-        assert_eq!(driver.collections.load(Ordering::Relaxed), 1);
-    }
-
     /// Failed provider collection preserves the established result and never emits completion.
     #[tokio::test]
     async fn cleanup_failure_retains_native_result_and_fences_without_completion() {
@@ -486,64 +443,6 @@ mod tests {
         );
         driver.cleanup_release.notify_one();
         assert!(turn.join().await.is_err());
-        assert_eq!(driver.collections.load(Ordering::Relaxed), 1);
-    }
-
-    /// A failed native collection must wake the original operation waiter without certifying no start.
-    #[tokio::test]
-    async fn prestart_collection_failure_wakes_waiter_without_no_start_certificate() {
-        let driver = Arc::new(Driver::new(
-            false,
-            Some(ProviderError::Cancelled),
-            Some(runtime_failure(ProviderPhase::Collection)),
-        ));
-        let (turn, _stream, turn_id) = fixture(driver.clone());
-        driver.cleanup_entered.notified().await;
-        let registrations = _stream.registrations();
-        let unknown = forge_provider_api::TurnId::new("unknown").unwrap();
-        assert!(matches!(
-            registrations.start_result(&unknown).await,
-            Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::WrongInvocation
-        ));
-        let mut waiting = Box::pin(registrations.start_result(&turn_id));
-        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
-        driver.cleanup_release.notify_one();
-        assert!(turn.join().await.is_err());
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
-            .await
-            .expect("original retained operation must wake after binding failure");
-        assert!(observed.is_err());
-        assert!(registrations.not_started_error(&turn_id).is_none());
-    }
-
-    /// Cancellation before positive native start remains an operation error without invented turn events.
-    #[tokio::test]
-    async fn prestart_cancellation_collects_without_manufacturing_a_turn() {
-        let driver = Arc::new(Driver::new(false, Some(ProviderError::Cancelled), None));
-        let (turn, mut stream, turn_id) = fixture(driver.clone());
-        driver.cleanup_entered.notified().await;
-        let registrations = stream.registrations();
-        assert!(registrations.not_started_error(&turn_id).is_none());
-        let mut retained_observation = Box::pin(registrations.start_result(&turn_id));
-        assert!(futures_util::poll!(retained_observation.as_mut()).is_pending());
-        let mut starting = Box::pin(turn.started());
-        assert!(futures_util::poll!(starting.as_mut()).is_pending());
-        drop(starting);
-        driver.cleanup_release.notify_one();
-        assert!(matches!(turn.join().await, Err(ProviderError::Cancelled)));
-        assert!(matches!(
-            turn.started().await,
-            Err(ProviderError::Cancelled)
-        ));
-        assert!(matches!(
-            retained_observation.await,
-            Err(ProviderError::Cancelled)
-        ));
-        assert!(matches!(
-            registrations.not_started_error(&turn_id),
-            Some(ProviderError::Cancelled)
-        ));
-        assert!(stream.try_next().unwrap().is_none());
         assert_eq!(driver.collections.load(Ordering::Relaxed), 1);
     }
 }

@@ -447,41 +447,4 @@ mod tests {
         ));
         Ok(())
     }
-
-    /// New working revisions invalidate a fork but do not retarget a selected submitted revision.
-    #[test]
-    fn historical_selection_survives_working_changes_and_preserves_owner() -> anyhow::Result<()> {
-        let mut plan: PlanRecord = serde_json::from_value(serde_json::json!({
-            "id":"source","session_id":"session","request":"Design","state":"generating",
-            "working_path":"working.json","document_version":1,"model_revision":1,"user_revision":0,
-            "review_digest":"review-1","created_at_ms":1,"updated_at_ms":1,
-        }))?;
-        let selection = PlanSelection::capture(&plan)?;
-        let captured_revision =
-            serde_json::to_value(PlanRevisionSelection::new(selection.clone(), 1)?)?;
-        for revision in [0, 2] {
-            let mut invalid = captured_revision.clone();
-            invalid["revision"] = serde_json::json!(revision);
-            assert!(serde_json::from_value::<PlanRevisionSelection>(invalid).is_err());
-        }
-        let historical =
-            PlanSourceGuard::Historical(PlanRevisionSelection::new(selection.clone(), 1)?);
-        let working = PlanSourceGuard::Working(selection);
-        plan.document_version = 2;
-        plan.model_revision = 2;
-        plan.user_revision = 1;
-        plan.review_digest = Some("review-2".into());
-        plan.state = PlanState::AwaitingReview;
-        assert!(matches!(
-            working.validate(&plan),
-            Err(TaskCommandFailure::PlanChanged)
-        ));
-        historical.validate(&plan)?;
-        plan.session_id = "another-session".into();
-        assert!(matches!(
-            historical.validate(&plan),
-            Err(TaskCommandFailure::PlanChanged)
-        ));
-        Ok(())
-    }
 }

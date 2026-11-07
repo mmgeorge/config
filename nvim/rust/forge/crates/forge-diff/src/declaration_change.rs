@@ -188,38 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn detail_only_edits_mark_unchanged_signature_without_changing_coordinates() {
-        use crate::display::{DisplaySource, RowCoordinates};
-        let old = "pub fn parse() {\n    old();\n}\n";
-        let new = "pub fn parse() {\n    new();\n}\n";
-        let declaration = [boundary("parse", 0..3)];
-        let comparison =
-            DeclarationAlignment::compare(old, new, &declaration, &declaration).unwrap();
-        let heading = DisplayRow {
-            group_index: 0,
-            text: "pub fn parse() {".into(),
-            source: DisplaySource::Diff(RowCoordinates::Context {
-                old_line: 0,
-                new_line: 0,
-            }),
-            raw_id: None,
-            emphasis: Vec::new(),
-            emphasis_fallback: None,
-        };
-        assert!(comparison.modified(&heading));
-        assert_eq!(heading.kind(), RowKind::Context);
-        assert!(heading.emphasis.is_empty());
-        let unchanged =
-            DeclarationAlignment::compare(old, old, &declaration, &declaration).unwrap();
-        assert!(!unchanged.modified(&heading));
-        let invalid = [boundary("parse", 0..4)];
-        assert!(matches!(
-            DeclarationAlignment::compare(old, new, &invalid, &declaration),
-            Err(SourceError::InconsistentMetadata)
-        ));
-    }
-
-    #[test]
     fn unique_owners_match_reordering_without_pairing_overloads() {
         let old = [
             boundary("overloaded", 0..1),

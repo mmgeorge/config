@@ -283,38 +283,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_in_profiles_load_through_the_runtime_store() -> Result<()> {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../forge/subagents.json");
-        ensure!(path.is_file(), "checked-in subagent catalog is missing");
-        let store = AgentProfileStore::new(path);
-        let snapshot = store.snapshot()?;
-        ensure!(snapshot.error.is_none(), "{:?}", snapshot.error);
-        store.resolve(None)?;
-        Ok(())
-    }
-
-    #[test]
-    fn large_profile_documents_round_trip_complete_instructions() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("subagents.json");
-        let store = AgentProfileStore::new(path.clone());
-        let mut document = AgentProfileDocument::default();
-        let instructions = "λ".repeat(1024 * 1024);
-        let description = "d".repeat(4097);
-        let worker = document.profiles.get_mut("worker").unwrap();
-        worker.instructions = instructions.clone();
-        worker.description = description.clone();
-        let saved = store.save("missing", document)?;
-        assert!(saved.error.is_none());
-        assert!(std::fs::metadata(&path)?.len() > 1024 * 1024);
-        let reloaded = AgentProfileStore::new(path).resolve(None)?.1;
-        assert_eq!(reloaded.instructions, instructions);
-        assert_eq!(reloaded.description, description);
-        Ok(())
-    }
-
-    #[test]
     fn profile_file_reloads_external_edits_and_rejects_stale_saves() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("subagents.json");

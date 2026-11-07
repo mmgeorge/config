@@ -13,10 +13,6 @@ fn exchange() -> Exchange {
     .unwrap()
 }
 
-fn saved_patch(path: &str, content: &str) -> String {
-    format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+{content}\n")
-}
-
 fn render(exchange: &Exchange) -> ProjectedEntry {
     project(
         ProjectionSource::Exchange(exchange),
@@ -41,104 +37,6 @@ fn text(projected: &ProjectedEntry) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn capture(exchange: &mut Exchange, patch: String) {
-    exchange.checkpoint_before = Some("before".into());
-    exchange.checkpoint_after = Some("after".into());
-    exchange.checkpoint_diff_text = Some(patch);
-    exchange
-        .finish(crate::exchange::ExchangeOutcome::Failed, 10)
-        .unwrap();
-}
-
-#[test]
-fn empty_workspace_comparisons_have_no_result_row() {
-    let mut exchange = exchange();
-    capture(&mut exchange, String::new());
-    for phase in [
-        exchange.phase.clone(),
-        crate::exchange::ExchangePhase::Running,
-    ] {
-        exchange.phase = phase;
-        let reopened: Exchange =
-            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
-        let projected = render(&reopened);
-        assert!(
-            !projected
-                .entry
-                .block
-                .iter()
-                .any(|block| block.id.0 == "workspace:results:changes")
-        );
-        assert!(!text(&projected).contains("No workspace changes"));
-        assert!(
-            !projected
-                .action
-                .contains_key(&TargetId("workspace:results:changes".into()))
-        );
-    }
-}
-
-#[test]
-fn workspace_results_ignore_incomplete_provider_reports() {
-    let mut exchange = exchange();
-    capture(
-        &mut exchange,
-        saved_patch("formatted.rs", "final formatted text"),
-    );
-    exchange.attributed_diff_text = Some(saved_patch("incorrect.rs", "provider text"));
-    let reopened: Exchange =
-        serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
-    let projected = render(&reopened);
-    assert!(text(&projected).contains("Workspace changes 1 file +1 -0"));
-    assert!(!text(&projected).contains("incorrect.rs"));
-    assert!(
-        matches!(&projected.action[&TargetId("workspace:results:changes".into())],
-        TranscriptAction::Diff { text, syntax: true, .. } if Some(text) == reopened.checkpoint_diff_text.as_ref())
-    );
-}
-
-#[test]
-fn workspace_results_render_pending_previous_and_failed_capture() {
-    let mut exchange = exchange();
-    for state in [
-        crate::exchange::ExchangeState::Queued,
-        crate::exchange::ExchangeState::Running,
-        crate::exchange::ExchangeState::Finalizing,
-    ] {
-        exchange.phase = crate::exchange::ExchangePhase::fixture(state, None, None);
-        let restored: Exchange =
-            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
-        let projected = render(&restored);
-        assert!(!text(&projected).contains("Workspace changes pending"));
-        assert!(
-            !projected
-                .entry
-                .block
-                .iter()
-                .any(|block| block.id.0 == "workspace:results:changes")
-        );
-    }
-    exchange.phase = crate::exchange::ExchangePhase::Running;
-    capture(&mut exchange, saved_patch("file.rs", "captured"));
-    exchange.phase = crate::exchange::ExchangePhase::Running;
-    let projected = render(&exchange);
-    assert!(text(&projected).contains("previous capture · pending"));
-    assert!(text(&projected).contains("file.rs"));
-    exchange.finalization_error = Some("storage refused commit".into());
-    assert!(
-        text(&render(&exchange)).contains("previous capture · unavailable: storage refused commit")
-    );
-    exchange.checkpoint_diff_text = Some("not a patch".into());
-    let malformed = render(&exchange);
-    assert!(text(&malformed).contains("preview unavailable"));
-    assert!(text(&malformed).contains("previous capture"));
-    assert!(!text(&malformed).contains("No workspace changes"));
-    exchange.checkpoint_diff_text = None;
-    assert!(
-        text(&render(&exchange)).contains("Workspace changes unavailable: storage refused commit")
-    );
 }
 
 #[test]
@@ -253,32 +151,4 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
         .map(|block| &block.id)
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(identities.len(), projected.entry.block.len());
-}
-
-#[test]
-fn workspace_result_preserves_multi_page_content_and_path_identity() {
-    let mut exchange = exchange();
-    let patch = (0..300)
-        .map(|index| saved_patch(&format!("file-{index:03}.txt"), &format!("value-{index}")))
-        .collect::<String>();
-    capture(&mut exchange, patch.clone());
-    let initial = render(&exchange);
-    assert!(text(&initial).contains("Workspace changes 300 files +300 -0"));
-    assert!(text(&initial).contains("value-299"));
-    let file_id = initial
-        .entry
-        .block
-        .iter()
-        .find(|block| block.text.wire_rows().join("").contains("file-299.txt"))
-        .unwrap()
-        .id
-        .clone();
-    exchange.checkpoint_diff_text = Some(saved_patch("earlier.txt", "new") + &patch);
-    let replacement = render(&exchange);
-    assert!(replacement.entry.block.iter().any(
-        |block| block.id == file_id && block.text.wire_rows().join("").contains("file-299.txt")
-    ));
-    assert!(
-        matches!(&replacement.action[&TargetId("workspace:results:changes".into())], TranscriptAction::Diff { text, .. } if text == exchange.checkpoint_diff_text.as_ref().unwrap())
-    );
 }

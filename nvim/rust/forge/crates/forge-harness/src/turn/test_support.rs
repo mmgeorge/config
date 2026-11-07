@@ -73,22 +73,6 @@ pub(crate) fn item_event(
     )
 }
 
-/// Preserve identified native accounting under its original invocation scope.
-pub(crate) fn usage_event(
-    address: &TurnAddress,
-    report: forge_provider_api::TurnUsageReport,
-) -> crate::provider::events::HarnessEvent {
-    crate::provider::test_support::native_event(
-        crate::provider::EventScope::Invocation {
-            invocation: address.scope.clone(),
-        },
-        ProviderEvent::Turn {
-            thread_id: address.thread_id.clone(),
-            turn_id: address.turn_id.clone(),
-            event: forge_provider_api::TurnEvent::Usage(report),
-        },
-    )
-}
 /// Start an explicitly identified native reasoning representation.
 pub(crate) fn reasoning(
     address: &TurnAddress,
@@ -316,62 +300,4 @@ impl std::ops::DerefMut for TestTurn {
     fn deref_mut(&mut self) -> &mut Turn {
         &mut self.exchange.turn[0]
     }
-}
-
-pub(crate) fn tool_value_mut<'value>(
-    value: &'value mut serde_json::Value,
-    id: &str,
-) -> &'value mut serde_json::Value {
-    let entries = value["entry"].as_array_mut().expect("exchange entries");
-    for entry in entries {
-        if entry["kind"] != "commentary" {
-            continue;
-        }
-        for group in entry["commentary"]["tool"]
-            .as_array_mut()
-            .expect("commentary tools")
-        {
-            if let Some(tool) = group["store"]["item"]
-                .as_object_mut()
-                .expect("tool store")
-                .get_mut(id)
-            {
-                return tool;
-            }
-        }
-    }
-    panic!("serialized commentary has no tool {id}");
-}
-
-/// Reopen one serialized tool as running, keeping its display row and native outcome consistent.
-pub(crate) fn reopen_tool_value(value: &mut serde_json::Value, id: &str) {
-    let entries = value["entry"].as_array_mut().expect("exchange entries");
-    for entry in entries {
-        if entry["kind"] != "commentary" {
-            continue;
-        }
-        for group in entry["commentary"]["tool"]
-            .as_array_mut()
-            .expect("commentary tools")
-        {
-            let store = &mut group["store"];
-            let Some(tool) = store["item"]
-                .as_object_mut()
-                .expect("tool store")
-                .get_mut(id)
-            else {
-                continue;
-            };
-            tool["status"] = serde_json::json!("running");
-            tool["state"] = serde_json::json!("running");
-            tool["failed"] = serde_json::json!(false);
-            tool["completed_at_ms"] = serde_json::Value::Null;
-            tool["completed_active_ms"] = serde_json::Value::Null;
-            let execution = &mut store["execution"][id];
-            execution["outcome"] = serde_json::Value::Null;
-            execution["final_snapshot"] = serde_json::Value::Null;
-            return;
-        }
-    }
-    panic!("serialized commentary has no tool {id}");
 }

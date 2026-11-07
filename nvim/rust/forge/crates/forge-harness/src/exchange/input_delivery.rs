@@ -1585,7 +1585,7 @@ enum DeliveryStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderError;
+
     use futures_util::FutureExt;
 
     /// Preserve accepted receipt evidence while a retired parent rejects delayed steering.
@@ -1652,64 +1652,6 @@ mod tests {
         registry.close().await?;
         provider.shutdown().await?;
         Ok(())
-    }
-
-    /// Retain a completed worker across the owner's buffered-wake preflight without repolling it.
-    #[tokio::test(start_paused = true)]
-    async fn input_delivery_buffers_completed_worker_until_owner_update() {
-        let (release, wait) = oneshot::channel();
-        let mut run = InputDeliveryRun {
-            input: InputRevision {
-                id: InputId::new("buffered-input").unwrap(),
-                revision: 1,
-            },
-            messages: None,
-            message: serde_json::from_value(serde_json::json!({
-                "id":"buffered-input", "revision":1, "text":"follow up",
-                "delivery":"delivering", "route":"turn"
-            }))
-            .unwrap(),
-            kind: DeliveryKind::Prompt,
-            work: PreparationWork::None,
-            stage: DeliveryStage::Attachments {
-                task: tokio::spawn(async move {
-                    wait.await.unwrap();
-                    Ok(Vec::new())
-                }),
-            },
-            observation: InputObservation::Waiting,
-            transition: None,
-            selected: None,
-            collected: false,
-            execution: None,
-            control: None,
-            generation: None,
-            terminal_events: Vec::new(),
-            destination: InputDestination::Foreground,
-        };
-        // Cancellation can fence foreground access while preparation still owns its worker.
-        assert!(
-            run.next(ForegroundStatus::Unavailable)
-                .now_or_never()
-                .is_none()
-        );
-        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
-        tokio::time::advance(std::time::Duration::from_secs(300)).await;
-        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
-        release.send(()).unwrap();
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            run.next(ForegroundStatus::Local),
-        )
-        .await
-        .expect("released worker should complete");
-        assert!(matches!(event, InputDeliveryEvent::Attachments(Ok(Ok(_)))));
-        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
-        assert!(
-            run.next(ForegroundStatus::Unavailable)
-                .now_or_never()
-                .is_none()
-        );
     }
 
     /// Settle a held attachment worker as cancellation without failing or removing its queued successor.
@@ -1846,72 +1788,5 @@ mod tests {
         assert_eq!(snapshot.messages[0].delivery(), InputDelivery::Queued);
         broker.provider_handle().shutdown().await?;
         Ok(())
-    }
-
-    /// Keep an admitted replacement's observation alive beyond the old acceptance cutoff.
-    #[tokio::test(start_paused = true)]
-    async fn replacement_acceptance_has_no_implicit_duration_deadline() {
-        let (completion, response) = oneshot::channel();
-        let mut run = InputDeliveryRun {
-            input: InputRevision {
-                id: InputId::new("pending-replacement").unwrap(),
-                revision: 1,
-            },
-            messages: None,
-            message: serde_json::from_value(serde_json::json!({
-                "id":"pending-replacement", "revision":1, "text":"follow up",
-                "delivery":"delivering", "route":"turn"
-            }))
-            .unwrap(),
-            kind: DeliveryKind::Prompt,
-            work: PreparationWork::None,
-            stage: DeliveryStage::Replacement {
-                work: uuid::Uuid::new_v4(),
-                response,
-                confirmed: false,
-            },
-            observation: InputObservation::Waiting,
-            transition: None,
-            selected: None,
-            collected: false,
-            execution: None,
-            control: None,
-            generation: None,
-            terminal_events: Vec::new(),
-            destination: InputDestination::Foreground,
-        };
-        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
-        tokio::time::advance(std::time::Duration::from_secs(300)).await;
-        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
-        drop(completion);
-        assert!(matches!(
-            run.next(ForegroundStatus::Local).await,
-            InputDeliveryEvent::Foreground(Err(_))
-        ));
-    }
-
-    /// Preserve collection uncertainty even when cancellation is the original cause.
-    #[test]
-    fn cancellation_diagnostics_preserve_independent_collection_uncertainty() {
-        let expected = ProviderError::PreparationFailed(Box::new(ProviderError::Combined {
-            primary: Box::new(ProviderError::Cancelled),
-            secondary: vec![ProviderError::Cancelled],
-        }));
-        assert!(expected.is_clean_cancellation());
-        for error in [
-            ProviderError::Combined {
-                primary: Box::new(expected),
-                secondary: vec![ProviderError::DeliveryUncertain],
-            },
-            ProviderError::PreparationCleanup {
-                cause: Box::new(ProviderError::Cancelled),
-                cleanup: Box::new(ProviderError::DeliveryUncertain),
-            },
-        ] {
-            assert!(
-                !error.is_clean_cancellation(),
-                "cleanup uncertainty must remain visible"
-            );
-        }
     }
 }

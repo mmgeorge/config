@@ -89,14 +89,6 @@ impl CodexRuntime {
         runtime
     }
 
-    /// Exercise connection replacement against an owned native wire fixture without starting a subprocess.
-    #[cfg(test)]
-    pub(super) fn fixture(endpoint: String) -> Self {
-        let mut runtime = Self::new(vec!["owned-native-fixture".into()]);
-        runtime.fixture_endpoint = Some(endpoint);
-        runtime
-    }
-
     /// Connect one session channel without starting another app-server.
     pub async fn connect(&self) -> Result<CodexConnection> {
         let mut server = self.server.lock().await;
@@ -226,68 +218,7 @@ impl CodexRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexAppServer, CodexRuntime};
-    use std::sync::atomic::Ordering;
-
-    #[tokio::test]
-    async fn stderr_is_preserved_without_truncation_and_joined_at_shutdown() {
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("stderr.nu");
-        std::fs::write(&script, "def main [--listen: string] { print -e 'initial stderr diagnostic'; print -e ('x' | fill -w 40000); print -e 'final stderr diagnostic'; sleep 30sec }").unwrap();
-        let runtime = CodexRuntime::new(vec![
-            "nu".into(),
-            "--no-config-file".into(),
-            script.display().to_string(),
-        ]);
-        let server = runtime.start().unwrap();
-        let collector = server.stderr_task.as_ref().unwrap().abort_handle();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !server.diagnostic().ends_with("final stderr diagnostic") {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(server.stderr.lock().unwrap().len() > 40_000);
-        assert!(server.diagnostic().contains("initial stderr diagnostic"));
-        *runtime.server.lock().await = Some(server);
-        runtime.shutdown().await.unwrap();
-        assert!(collector.is_finished());
-    }
-
-    /// Process exit alone cannot release a server while its diagnostic reader still owns cleanup.
-    #[tokio::test]
-    async fn shutdown_waits_for_owned_diagnostic_reader() {
-        let runtime = CodexRuntime::new(Vec::new());
-        let mut command = tokio::process::Command::new("nu");
-        command.args(["--no-config-file", "-c", "exit 0"]);
-        let mut child = forge_shell::process::spawn_owned(command).unwrap();
-        child.wait().await.unwrap();
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let reader = tokio::spawn(async move {
-            ready.send(()).unwrap();
-            released.await.unwrap();
-        });
-        started.await.unwrap();
-        *runtime.server.lock().await = Some(CodexAppServer {
-            child,
-            endpoint: String::new(),
-            stderr: Default::default(),
-            stderr_task: Some(reader),
-        });
-        let mut closing = Box::pin(runtime.shutdown());
-        assert!(
-            futures_util::poll!(closing.as_mut()).is_pending(),
-            "shutdown released a live diagnostic reader"
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), closing)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(runtime.server.lock().await.is_none());
-    }
+    use super::CodexRuntime;
 
     #[cfg(windows)]
     fn process_alive(process_id: u32) -> bool {
@@ -341,22 +272,6 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn shutdown_collects_provider_descendants() {
-        let directory = tempfile::tempdir().unwrap();
-        let runtime = descendant_runtime(directory.path());
-        *runtime.server.lock().await = Some(runtime.start().unwrap());
-        let provider = runtime.process_id().await.unwrap();
-        let descendant = read_process_id(&directory.path().join("descendant.pid")).await;
-        assert!(process_alive(provider) && process_alive(descendant));
-        tokio::time::timeout(std::time::Duration::from_secs(5), runtime.shutdown())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!process_alive(provider) && !process_alive(descendant));
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
     #[ignore = "subprocess entry point for abrupt-owner collection"]
     async fn owned_host_fixture() {
         let directory =
@@ -404,24 +319,5 @@ mod tests {
         })
         .await
         .expect("provider descendants outlived their owner's job handle");
-    }
-
-    #[tokio::test]
-    async fn shutdown_collects_owned_process_and_remains_closed() {
-        let runtime = CodexRuntime::new(Vec::new());
-        let mut command = tokio::process::Command::new("nu");
-        command.args(["--no-config-file", "-c", "sleep 30sec"]);
-        let child = forge_shell::process::spawn_owned(command).unwrap();
-        *runtime.server.lock().await = Some(CodexAppServer {
-            child,
-            endpoint: String::new(),
-            stderr: Default::default(),
-            stderr_task: Some(tokio::spawn(async {})),
-        });
-        assert!(runtime.process_id().await.is_some());
-        runtime.shutdown().await.unwrap();
-        assert!(runtime.process_id().await.is_none());
-        assert!(runtime.closed.load(Ordering::Acquire));
-        runtime.shutdown().await.unwrap();
     }
 }

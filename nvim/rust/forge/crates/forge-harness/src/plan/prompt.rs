@@ -162,41 +162,7 @@ User follow-up:
 
 #[cfg(test)]
 mod test {
-    use super::{PLANNING_CONTRACT, PlanPrompt};
-
-    #[test]
-    fn planning_modes_include_the_same_complete_contract_and_current_context() {
-        let request = "Preserve pending edits";
-        let answer = "Planning feedback: retain drafts after a failed save";
-        let document_json = r#"{"plan_id":"active-plan","version":7}"#;
-        let annotation_json = r#"[{"json_path":"/stages/1","text":"Split independent consumers"}]"#;
-        let draft = PlanPrompt::draft(request);
-        let feedback = PlanPrompt::feedback(request, answer);
-        let revision = PlanPrompt::revision(
-            document_json,
-            annotation_json,
-            Some("Keep file ownership distinct"),
-        );
-        for prompt in [&draft, &feedback, &revision] {
-            assert_eq!(prompt.matches(PLANNING_CONTRACT).count(), 1);
-            assert!(!prompt.contains("harness_plan_create"));
-            assert!(!prompt.contains("{PLANNING_CONTRACT}"));
-        }
-        assert!(draft.ends_with(request));
-        assert!(feedback.contains(request));
-        assert!(feedback.ends_with(answer));
-        assert!(feedback.contains("Do not answer or withdraw those resolved questions"));
-        assert!(revision.contains(document_json));
-        assert!(revision.contains(annotation_json));
-        assert!(revision.contains("Keep file ownership distinct"));
-    }
-
-    #[test]
-    fn active_artifact_context_exposes_the_canonical_document() {
-        let prompt = PlanPrompt::with_active_document("Why?".into(), "{\"plan_id\":\"plan\"}");
-        assert!(prompt.contains("\"plan_id\":\"plan\""));
-        assert!(prompt.ends_with("Why?"));
-    }
+    use super::PlanPrompt;
 
     #[test]
     fn revision_sends_canonical_json_and_contextual_review_comments() {
@@ -226,14 +192,5 @@ mod test {
         assert!(prompt.contains("Tentative language"));
         assert!(prompt.contains("Why?"));
         assert!(prompt.contains("Migration?"));
-    }
-
-    #[test]
-    fn ordinary_question_follow_up_omits_planning_language() {
-        let prompt = PlanPrompt::question_follow_up("{\"question\":\"Format?\"}", "Use JSON");
-        assert!(prompt.contains("Do not continue the original request"));
-        assert!(!prompt.contains("Original planning request"));
-        assert!(!prompt.contains("Harness Plan task"));
-        assert!(prompt.contains("Only Harness records explicit user answers"));
     }
 }

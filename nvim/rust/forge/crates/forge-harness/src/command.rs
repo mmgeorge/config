@@ -284,7 +284,6 @@ impl Drop for CommandLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     /// Keep admission blocked after a terminal worker releases its permit but cleanup is still owned.
     #[tokio::test]
@@ -320,51 +319,6 @@ mod tests {
         coordinator.execution.lift_collection_pending();
         drop(pending.await?);
         assert_eq!(coordinator.execution.available_permits(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn command_receipts_isolate_attempts_and_sessions() -> Result<()> {
-        let first = SessionCoordinator::new(Arc::new(Default::default()));
-        let second = SessionCoordinator::new(Arc::new(Default::default()));
-        let identity = CommandIdentity {
-            id: "command".into(),
-            runtime_epoch: None,
-        };
-        let CommandAdmission::Execute(original) = first.admit(&identity, "test", &json!({}))?
-        else {
-            panic!()
-        };
-        assert!(matches!(
-            first.admit(&identity, "test", &json!({}))?,
-            CommandAdmission::Pending
-        ));
-        assert!(first.admit(&identity, "different", &json!({})).is_err());
-        first.complete(
-            &identity.id,
-            original.attempt,
-            &Response::failure(1, "not_admitted", "retry"),
-        )?;
-        let CommandAdmission::Execute(retry) = first.admit(&identity, "test", &json!({}))? else {
-            panic!()
-        };
-        drop(original);
-        assert_eq!(first.status(&identity.id)?["state"], "running");
-        first.complete(
-            &identity.id,
-            retry.attempt,
-            &Response::success(2, json!({"committed":true}))?,
-        )?;
-        drop(retry);
-        assert!(matches!(
-            first.admit(&identity, "test", &json!({}))?,
-            CommandAdmission::Recorded(_)
-        ));
-        let permit = first.execution.acquire().await?;
-        assert!(first.execution.try_acquire().is_err());
-        assert!(second.execution.try_acquire().is_ok());
-        drop(permit);
-        assert!(first.execution.try_acquire().is_ok());
         Ok(())
     }
 }

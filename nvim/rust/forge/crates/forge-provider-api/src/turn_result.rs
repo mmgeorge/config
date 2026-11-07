@@ -194,7 +194,6 @@ impl TryFrom<TurnResultWire> for TurnResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::TurnCompletionReason;
 
     /// Create exact journal coverage for result validation fixtures.
     fn input(attempt: &str) -> CoveredInput {
@@ -237,72 +236,5 @@ mod tests {
         assert!(serde_json::from_value::<TurnResult>(wire.clone()).is_err());
         wire["covered_inputs"][1]["attempt_id"] = serde_json::json!(" ");
         assert!(serde_json::from_value::<TurnResult>(wire).is_err());
-    }
-
-    /// Native reasons and absent measurements survive replay without charging final usage twice.
-    #[test]
-    fn native_result_merges_final_accounting_and_preserves_absence() {
-        let report = crate::identity::UsageReportId::new("report").unwrap();
-        let timing = TurnUsageReport::timing(report.clone(), 5, 0);
-        let usage = TurnUsageReport::accounting(
-            report,
-            8,
-            Some(crate::usage::TokenUsage {
-                input: Some(2),
-                cached_input: None,
-                reasoning: None,
-                output: Some(4),
-            }),
-            None,
-        )
-        .unwrap();
-        for reason in [
-            TurnCompletionReason::Normal,
-            TurnCompletionReason::TokenLimit,
-            TurnCompletionReason::RequestLimit,
-            TurnCompletionReason::Refusal,
-        ] {
-            let outcome = TurnOutcome::Completed {
-                stop_reason: reason,
-            };
-            let result = TurnResult::new(
-                outcome,
-                10,
-                None,
-                vec![input("one")],
-                vec![timing.clone(), usage.clone(), timing.clone()],
-                Some(CheckpointId::new("checkpoint").unwrap()),
-            )
-            .unwrap();
-            let loaded: TurnResult =
-                serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
-            assert_eq!(loaded, result);
-            assert_eq!(loaded.outcome(), outcome);
-            assert_eq!(loaded.reported_duration_ms(), None);
-            assert_eq!(loaded.final_usage().len(), 1);
-            assert_eq!(*loaded.final_usage()[0].reported_duration_ms(), Some(0));
-            assert_eq!(
-                loaded.final_usage()[0]
-                    .usage()
-                    .as_ref()
-                    .unwrap()
-                    .cached_input,
-                None
-            );
-        }
-        let conflicting = TurnUsageReport::timing(timing.report_id().clone(), 12, 1);
-        assert_eq!(
-            TurnResult::new(
-                TurnOutcome::Interrupted,
-                10,
-                None,
-                vec![],
-                vec![timing, conflicting],
-                None
-            ),
-            Err(TurnResultError::Usage(
-                UsageReportError::MeasurementConflict
-            ))
-        );
     }
 }

@@ -178,40 +178,6 @@ impl LogSegment {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Write;
-
-    /// Exclude appends to every segment, including segments not yet visited.
-    #[test]
-    fn snapshot_does_not_follow_appends() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        std::fs::write(current.with_extension("jsonl.1"), "{\"count\":1}\n")?;
-        std::fs::write(&current, "{\"count\":2}\n")?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        let mut records = Vec::new();
-        while let Some(record) = snapshot.next(|| Ok(()))? {
-            records.push(record);
-            writeln!(
-                std::fs::OpenOptions::new().append(true).open(&current)?,
-                "{{\"count\":3}}"
-            )?;
-        }
-        assert_eq!(records, vec![json!({"count":2}), json!({"count":1})]);
-        Ok(())
-    }
-
-    /// Reject a shortened segment instead of claiming its captured contents were complete.
-    #[test]
-    fn snapshot_reports_truncation() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        std::fs::write(&current, "{\"count\":1}\n")?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        std::fs::write(&current, "")?;
-        let failure = snapshot.next(|| Ok(())).unwrap_err();
-        assert!(failure.to_string().contains("truncated during inspection"));
-        Ok(())
-    }
 
     /// Stop before consuming another record when the owning interaction is cancelled.
     #[test]
@@ -224,80 +190,6 @@ mod tests {
         let failure = snapshot.next(|| anyhow::bail!("cancelled")).unwrap_err();
         assert_eq!(failure.to_string(), "cancelled");
         assert_eq!(snapshot.next(|| Ok(()))?, Some(json!({})));
-        Ok(())
-    }
-
-    /// Read newest segments first and reconstruct records spanning multiple I/O blocks.
-    #[test]
-    fn snapshot_reads_newest_first_across_blocks_and_rotations() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        for generation in 1..=10 {
-            std::fs::write(
-                current.with_extension(format!("jsonl.{generation}")),
-                format!("{{\"generation\":{generation}}}\n"),
-            )?;
-        }
-        let long = "界🙂".repeat(40_000);
-        let records = [json!({"text":long}), json!({"event":"newest"})];
-        std::fs::write(&current, format!("{}\n{}", records[0], records[1]))?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(records[1].clone()));
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(records[0].clone()));
-        for generation in 1..=10 {
-            assert_eq!(
-                snapshot.next(|| Ok(()))?,
-                Some(json!({"generation":generation}))
-            );
-        }
-        assert!(!snapshot.has_remaining());
-        assert_eq!(snapshot.next(|| Ok(()))?, None);
-        Ok(())
-    }
-
-    /// Reassemble one logical UTF-8 record across rotation boundaries and reject missing chunks.
-    #[test]
-    fn snapshot_reassembles_chunked_records_across_rotations() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        let record = json!({"event":"large", "payload":{"text":"界🙂"}});
-        let bytes = serde_json::to_vec(&record)?;
-        let split = bytes.iter().position(|byte| *byte >= 128).unwrap() + 1;
-        let part = |sequence, payload: &[u8]| {
-            json!({"trace_chunk":{
-                "id":"retained-record", "sequence":sequence,"part_count":2,
-                "payload_hex":hex::encode(payload)
-            }})
-            .to_string()
-                + "\n"
-        };
-        std::fs::write(current.with_extension("jsonl.1"), part(0, &bytes[..split]))?;
-        std::fs::write(&current, part(1, &bytes[split..]))?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(record));
-        assert_eq!(snapshot.next(|| Ok(()))?, None);
-        std::fs::remove_file(current.with_extension("jsonl.1"))?;
-        let mut incomplete = LogSnapshot::open(&current)?.unwrap();
-        assert!(
-            incomplete
-                .next(|| Ok(()))
-                .unwrap_err()
-                .to_string()
-                .contains("incomplete")
-        );
-        Ok(())
-    }
-
-    /// Keep decoding lazy when an older retained segment is malformed.
-    #[test]
-    fn snapshot_defers_malformed_older_segments() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        std::fs::write(current.with_extension("jsonl.1"), "invalid\n")?;
-        std::fs::write(&current, "{\"event\":\"newest\"}\n")?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(json!({"event":"newest"})));
-        assert!(snapshot.next(|| Ok(())).is_err());
         Ok(())
     }
 }

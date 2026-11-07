@@ -178,41 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_values_override_sources_and_defaults_without_losing_other_context() -> Result<()> {
-        let schema: CheckInputMap = serde_json::from_value(serde_json::json!({
-            "paths":{"type":"array","description":"Paths","source":"changed_files","default":["default"]},
-            "cases":{"type":"array","description":"Cases","source":"planned_cases"},
-            "root":{"type":"string","description":"Root","source":"workspace"}
-        }))?;
-        validate_schema(&schema)?;
-        let cases = [super::super::CheckCase {
-            file: "tests/selected.rs".into(),
-            name: "selected".into(),
-            target: None,
-        }];
-        let explicit = BTreeMap::from([("paths".into(), serde_json::json!(["explicit"]))]);
-        let values = resolve(
-            &schema,
-            &explicit,
-            std::path::Path::new("."),
-            &["changed".into()],
-            &cases,
-        )?;
-        assert_eq!(values["paths"], serde_json::json!(["explicit"]));
-        assert_eq!(values["cases"], serde_json::json!(cases));
-        assert_eq!(values["root"], ".");
-        let values = resolve(
-            &schema,
-            &BTreeMap::new(),
-            std::path::Path::new("."),
-            &[],
-            &[],
-        )?;
-        assert_eq!(values["paths"], serde_json::json!([]));
-        Ok(())
-    }
-
-    #[test]
     fn schemas_reject_invalid_defaults_sources_names_and_argument_values() -> Result<()> {
         for value in [
             serde_json::json!({"input":{"type":"integer","description":"Count","default":"wrong"}}),

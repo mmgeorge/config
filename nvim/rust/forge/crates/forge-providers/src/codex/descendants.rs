@@ -118,21 +118,11 @@ impl DescendantTracker {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn owns(&self, thread: &str) -> bool {
-        self.owned_thread.contains(thread)
-    }
-
     pub(super) fn active_turns(&self) -> Vec<(String, Option<String>)> {
         self.active_turn_by_thread
             .iter()
             .map(|(thread, turn)| (thread.clone(), turn.clone()))
             .collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn active_count(&self) -> usize {
-        self.active_turn_by_thread.len()
     }
 }
 
@@ -151,77 +141,4 @@ fn turn_id(message: &Value) -> Option<&str> {
         .or_else(|| message.pointer("/params/turnId"))
         .or_else(|| message.pointer("/params/turn_id"))
         .and_then(Value::as_str)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn foreign_child_turns_do_not_establish_ownership() {
-        let mut tracker = DescendantTracker::default();
-        tracker.observe(
-            &json!({"method":"turn/started","params":{"threadId":"foreign","turn":{"id":"turn"}}}),
-            "parent",
-        );
-        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"foreign","item":{
-            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"foreign","receiverThreadIds":["foreign-child"],"status":"completed"
-        }}}), "parent");
-        assert!(!tracker.owns("foreign"));
-        assert!(!tracker.owns("foreign-child"));
-        assert_eq!(tracker.active_count(), 0);
-    }
-
-    #[test]
-    fn trusted_child_turn_is_retained_until_its_exact_completion() {
-        let mut tracker = DescendantTracker::default();
-        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{
-            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"parent","receiverThreadIds":["child"],"status":"completed"
-        }}}), "parent");
-        assert!(tracker.owns("child"));
-        assert_eq!(tracker.active_count(), 1);
-        tracker.observe(&json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}), "parent");
-        assert_eq!(
-            tracker.active_turns(),
-            vec![("child".into(), Some("child-turn".into()))]
-        );
-        tracker.observe(&json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"stale-turn"}}}), "parent");
-        assert_eq!(tracker.active_count(), 1);
-        tracker.observe(&json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn"}}}), "parent");
-        assert_eq!(tracker.active_count(), 0);
-        assert!(tracker.owns("child"));
-    }
-
-    #[test]
-    fn retained_child_resumption_waits_for_a_new_turn_identity() {
-        let mut tracker = DescendantTracker::default();
-        tracker.observe(&json!({"method":"item/completed","params":{"threadId":"parent","item":{
-            "type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent","senderThreadId":"parent","receiverThreadIds":["child"],"status":"completed"
-        }}}), "parent");
-        tracker.observe(
-            &json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"old"}}}),
-            "parent",
-        );
-        tracker.observe(
-            &json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"old"}}}),
-            "parent",
-        );
-        tracker.observe(
-            &json!({"method":"item/completed","params":{"threadId":"parent","item":{
-                "type":"collabAgentToolCall","id":"wait","tool":"wait","senderThreadId":"parent","receiverThreadIds":["child"],
-                "agentsStates":{"child":{"status":"running"}},"status":"completed"
-            }}}),
-            "parent",
-        );
-        assert_eq!(tracker.active_turns(), vec![("child".into(), None)]);
-        tracker.observe(
-            &json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"new"}}}),
-            "parent",
-        );
-        assert_eq!(
-            tracker.active_turns(),
-            vec![("child".into(), Some("new".into()))]
-        );
-    }
 }

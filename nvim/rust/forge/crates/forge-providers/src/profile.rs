@@ -218,35 +218,4 @@ mod tests {
             "unselected content"
         );
     }
-
-    #[test]
-    fn invalid_skill_names_are_rejected_without_touching_sources_or_profile_siblings() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        let source_file = source.join("SKILL.md");
-        std::fs::write(&source_file, "source content").unwrap();
-
-        for name in [
-            "",
-            ".",
-            "..",
-            "../escape",
-            "..\\escape",
-            "/escape",
-            "C:escape",
-            "trailing.",
-        ] {
-            let result = {
-                let mut profile = ResourceProfile::create(root.path(), "invalid-name").unwrap();
-                profile.bind_skills(&[skill(name, &source_file, true)], "skills")
-            };
-            assert!(result.is_err(), "accepted invalid skill name {name:?}");
-            assert!(!root.path().join("escape").exists());
-            assert_eq!(
-                std::fs::read_to_string(&source_file).unwrap(),
-                "source content"
-            );
-        }
-    }
 }

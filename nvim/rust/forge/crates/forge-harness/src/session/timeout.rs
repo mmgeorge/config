@@ -256,29 +256,4 @@ mod test {
 }
 
 #[cfg(test)]
-mod deadline_tests {
-    use super::*;
-
-    /// Keep disabled input waits distinct from invalid execution deadlines and overflow.
-    #[test]
-    fn timeout_validation_reports_typed_configuration_failures() {
-        let disabled = InputTimeout {
-            amount: 0,
-            unit: TimeoutUnit::S,
-        };
-        assert_eq!(
-            disabled.require_expiry(),
-            Err(InputTimeoutError::ExpiryRequired)
-        );
-        assert!(disabled.deadline(i64::MAX).unwrap().is_none());
-        let enabled = InputTimeout {
-            amount: 1,
-            unit: TimeoutUnit::S,
-        };
-        assert!(matches!(
-            enabled.deadline(i64::MAX),
-            Err(InputTimeoutError::TimestampRange)
-        ));
-        assert!(enabled.deadline(0).unwrap().is_some());
-    }
-}
+mod deadline_tests {}

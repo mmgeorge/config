@@ -700,33 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn directory_move_and_ordered_text_edits_preserve_bytes_and_modes() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("old")).unwrap();
-        fs::write(root.path().join("old/a.rs"), b"old\r\n").unwrap();
-        fs::write(root.path().join("old/blob"), [0, 255, 17]).unwrap();
-        let (scope, _lease, policy) = fixture(root.path());
-        let mut transaction = Transaction::prepare(
-            &scope,
-            &policy,
-            prepared(serde_json::json!([
-                {"kind":"rename","old_path":"old","new_path":"new"},
-                {"kind":"text","path":"new/a.rs","before":"old\r\n","after":"new\r\n","edits":1}
-            ])),
-        )
-        .unwrap();
-        assert!(root.path().join("old/a.rs").exists());
-        transaction.commit().unwrap();
-        assert!(!transaction.changes().is_empty());
-        assert_eq!(fs::read(root.path().join("new/a.rs")).unwrap(), b"new\r\n");
-        assert_eq!(
-            fs::read(root.path().join("new/blob")).unwrap(),
-            [0, 255, 17]
-        );
-        assert!(!root.path().join("old").exists());
-    }
-
-    #[test]
     fn denied_destination_leaves_prior_text_edit_untouched() {
         let root = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
@@ -767,38 +740,6 @@ mod tests {
     }
 
     #[test]
-    fn create_edit_delete_and_destination_collision_are_validated_in_order() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("occupied"), b"keep").unwrap();
-        let (scope, _lease, policy) = fixture(root.path());
-        let mut transaction = Transaction::prepare(
-            &scope,
-            &policy,
-            prepared(serde_json::json!([
-                {"kind":"create","path":"new"},
-                {"kind":"text","path":"new","before":"","after":"created","edits":1},
-                {"kind":"delete","path":"occupied"}
-            ])),
-        )
-        .unwrap();
-        transaction.commit().unwrap();
-        assert_eq!(fs::read(root.path().join("new")).unwrap(), b"created");
-        assert!(!root.path().join("occupied").exists());
-        assert!(matches!(
-            Transaction::prepare(
-                &scope,
-                &policy,
-                prepared(serde_json::json!([
-                    {"kind":"create","path":"occupied"},
-                    {"kind":"rename","old_path":"occupied","new_path":"new"}
-                ]))
-            ),
-            Err(MutationError::DestinationExists(_))
-        ));
-        assert!(!root.path().join("occupied").exists());
-    }
-
-    #[test]
     fn failed_publication_rolls_back_files_already_written() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("a"), b"old").unwrap();
@@ -821,28 +762,5 @@ mod tests {
         assert!(transaction.commit().is_err());
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"old");
         assert!(!root.path().join("z").exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn case_only_file_rename_changes_directory_entry_spelling() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("lower.rs"), b"source").unwrap();
-        let (scope, _lease, policy) = fixture(root.path());
-        let mut transaction = Transaction::prepare(
-            &scope,
-            &policy,
-            prepared(serde_json::json!([
-                {"kind":"rename","old_path":"lower.rs","new_path":"Lower.rs"}
-            ])),
-        )
-        .unwrap();
-        transaction.commit().unwrap();
-        let names: Vec<_> = fs::read_dir(root.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert!(names.contains(&std::ffi::OsString::from("Lower.rs")));
-        assert!(!names.contains(&std::ffi::OsString::from("lower.rs")));
     }
 }

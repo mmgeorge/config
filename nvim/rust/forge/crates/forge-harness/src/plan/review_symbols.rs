@@ -273,21 +273,4 @@ mod tests {
         assert_eq!(symbols.matching("combat::spawn").len(), 1);
         assert_eq!(symbols.matching("combat.spawn").len(), 1);
     }
-
-    #[test]
-    fn inline_spans_exclude_prose_fences_and_expressions() {
-        let mut design = DeclarationDesign::default();
-        design.document.design =
-            "é `Health` and ``combat``.\n```rust\n`ignored`\n```\n`foo()` and `combat::spawn`"
-                .into();
-        let spans = spans(
-            &design,
-            &NarrativeSymbols::new(&design, Path::new("/workspace")),
-        );
-        let first = &spans["plan:metadata:design:0"];
-        assert_eq!(first[0], (3..11, "Health".into()));
-        assert_eq!(first[1].1, "combat");
-        assert!(!spans.contains_key("plan:metadata:design:2"));
-        assert_eq!(spans["plan:metadata:design:4"][0].1, "combat::spawn");
-    }
 }

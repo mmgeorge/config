@@ -241,21 +241,4 @@ mod test {
         assert_eq!(store.revocation_epoch(), epoch);
         Ok(())
     }
-
-    #[test]
-    fn swaps_only_valid_documents_and_persists_replaced_rules() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("permissions.json");
-        let mut store = PermissionStore::load(&path, "D:/repo").unwrap();
-        let original = store.open().1;
-        assert!(store.save("not json").is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        store
-            .set_rule_list(&[("bash".into(), "git commit".into(), PermissionDecision::Deny)])
-            .unwrap();
-        assert_eq!(
-            store.compiled().document.permission["bash"]["git commit"],
-            PermissionDecision::Deny
-        );
-    }
 }

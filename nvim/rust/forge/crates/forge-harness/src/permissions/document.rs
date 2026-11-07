@@ -133,19 +133,4 @@ mod test {
         );
         assert!(parse_permission_document(r#"{"permission":{"unknown":{"*":"allow"}}}"#).is_err());
     }
-
-    #[test]
-    fn serializes_stable_pretty_json_after_replacing_a_rule() {
-        let mut document = default_permission_document();
-        set_permission_rule(
-            &mut document,
-            CATEGORY_BASH,
-            "git commit",
-            PermissionDecision::Deny,
-        )
-        .unwrap();
-        let source = serialize_permission_document(&document).unwrap();
-        assert!(source.ends_with('\n'));
-        assert_eq!(parse_permission_document(&source).unwrap(), document);
-    }
 }

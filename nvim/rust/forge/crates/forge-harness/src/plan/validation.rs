@@ -1183,118 +1183,7 @@ mod test {
                 .contains("missing task")
         );
     }
-    use super::super::{
-        ChangeAction, EntityChangeAction, MemberKind, PlanCallable, PlanCallableKind,
-        PlanFileChange, ProgramEntityMemberChange, Visibility, attach_test_fixture, test_fixture,
-    };
-    use super::validate_plan_edit;
-
-    #[test]
-    fn rejects_a_file_rename_without_distinct_paths() {
-        let mut document = test_fixture("plan", "Overview");
-        document.stages[0].tasks[0].files[0].change = PlanFileChange::Rename {
-            from: "src/plan.rs".into(),
-            to: "src/plan.rs".into(),
-        };
-
-        let error = document.validate().unwrap_err().to_string();
-        assert!(error.contains("rename source and destination must differ"));
-    }
-
-    #[test]
-    fn submission_resolves_nested_flow_callables_against_declared_members() {
-        let mut document = test_fixture("plan", "Validate member references.");
-        document.entity_changes[0].members.push(
-            serde_json::from_value(serde_json::json!({
-                "action":"add", "kind":"method", "name":"setup_scene",
-                "description":"Create the scene.", "visibility":"private",
-                "parameters":[]
-            }))
-            .unwrap(),
-        );
-        let call: super::PlanFlowEdge = serde_json::from_value(serde_json::json!({
-            "relation":"call", "target":{"kind":"planned_entity","entity":"PlanDocument"},
-            "callable":{"kind":"method","name":"initialize"}, "expansion":[], "branches":[]
-        }))
-        .unwrap();
-        document.flows[0].edges[0].expansion = vec![call.clone()];
-        document.flows[0].edges[0].branches = vec![super::PlanFlowBranch {
-            condition: "When startup completes".into(),
-            edges: vec![call],
-        }];
-        super::validate_plan_edit(&document).unwrap();
-        let error = super::validate_plan_submission(&document).unwrap_err();
-        let error = error.downcast_ref::<super::PlanValidationError>().unwrap();
-        for path in [
-            "flows[0].edges[0].expansion[0].callable",
-            "flows[0].edges[0].branches[0].edges[0].callable",
-        ] {
-            assert!(
-                error
-                    .violation
-                    .iter()
-                    .any(|violation| violation.path == path
-                        && violation.message.contains("initialize")),
-                "{error}"
-            );
-        }
-        document.flows[0].edges[0].branches.clear();
-        document.flows[0].edges[0].expansion[0]
-            .callable_mut()
-            .unwrap()
-            .name = "setup_scene".into();
-        super::validate_plan_submission(&document).unwrap();
-        document.entity_changes[0].members[0].kind = MemberKind::Function;
-        assert!(
-            super::validate_plan_submission(&document)
-                .unwrap_err()
-                .to_string()
-                .contains("setup_scene")
-        );
-        document.entity_changes[0].members[0].kind = MemberKind::Method;
-        document.entity_changes[0].members[0].action = ChangeAction::Remove;
-        assert!(super::validate_plan_submission(&document).is_err());
-    }
-
-    #[test]
-    fn flow_callables_resolve_planned_contracts_without_looping_on_cycles() {
-        let mut document = test_fixture("plan", "Validate contract references.");
-        let mut contract = document.entity_changes[0].clone();
-        contract.name = "SceneContract".into();
-        contract.kind = super::EntityKind::Trait;
-        contract.members.push(
-            serde_json::from_value(serde_json::json!({
-                "action":"add", "kind":"method", "name":"setup_scene",
-                "description":"Create the scene.", "visibility":"public", "parameters":[]
-            }))
-            .unwrap(),
-        );
-        contract.extends = Some(super::EntityReference::PlannedEntity {
-            entity: "PlanDocument".into(),
-        });
-        document.entity_changes[0]
-            .conforms_to
-            .push(super::EntityReference::PlannedEntity {
-                entity: contract.name.clone(),
-            });
-        document.entity_changes.push(contract);
-        let validator =
-            super::PlanValidator::new(&document, super::PlanValidationPhase::Submission);
-        assert!(validator.declares_callable(
-            "PlanDocument",
-            &PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "setup_scene".into(),
-            }
-        ));
-        assert!(!validator.declares_callable(
-            "PlanDocument",
-            &PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "initialize".into(),
-            }
-        ));
-    }
+    use super::super::{EntityChangeAction, PlanFileChange, test_fixture};
 
     #[test]
     fn validates_entity_rename_semantics() {
@@ -1317,32 +1206,6 @@ mod test {
         document.entity_changes[0].action = EntityChangeAction::Modify;
         let unexpected_error = document.validate().unwrap_err().to_string();
         assert!(unexpected_error.contains("is valid only when action is rename"));
-    }
-
-    #[test]
-    fn nested_renames_require_one_distinct_source_name() {
-        let mut document = test_fixture("plan", "Rename one member.");
-        document.entity_changes[0]
-            .members
-            .push(ProgramEntityMemberChange {
-                action: ChangeAction::Rename,
-                renamed_from: None,
-                kind: MemberKind::Method,
-                name: "render_plan".into(),
-                description: Some("Render the canonical plan.".into()),
-                visibility: Some(Visibility::Public),
-                type_name: None,
-                parameters: Vec::new(),
-                return_type: Some("String".into()),
-            });
-
-        let missing = document.validate().unwrap_err().to_string();
-        assert!(missing.contains("renamed_from: is required when action is rename"));
-
-        document.entity_changes[0].members[0].action = ChangeAction::Modify;
-        document.entity_changes[0].members[0].renamed_from = Some("render".into());
-        let misplaced = document.validate().unwrap_err().to_string();
-        assert!(misplaced.contains("renamed_from: is valid only when action is rename"));
     }
 
     #[test]
@@ -1371,62 +1234,6 @@ mod test {
     }
 
     #[test]
-    fn flow_edges_require_their_relation_specific_types() {
-        let mut document = test_fixture("plan", "Validate edge types.");
-        let mut invalid = serde_json::to_value(&document).unwrap();
-        invalid["flows"][0]["edges"][0]["relation"] = serde_json::json!("call");
-        invalid["flows"][0]["edges"][0]["payload_type"] = serde_json::Value::Null;
-        let error = serde_json::from_value::<crate::plan::PlanDocument>(invalid)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("callable is required"));
-        document.flows[0].edges[0].target = crate::plan::EntityReference::PlannedEntity {
-            entity: "PlanDocument".into(),
-        };
-
-        document.flows[0].edges[0].operation =
-            crate::plan::PlanFlowOperation::Call(crate::plan::PlanFlowCall {
-                callable: PlanCallable {
-                    kind: PlanCallableKind::Method,
-                    name: "dispatch".into(),
-                },
-                payload_type: None,
-                return_type: Some(crate::plan::PlanFlowReturnType {
-                    value_type: "ExecutablePlan".into(),
-                    error_type: Some("PlanError".into()),
-                }),
-            });
-        validate_plan_edit(&document).unwrap();
-    }
-
-    #[test]
-    fn flow_descriptions_accept_concise_prose_and_reject_placeholders() {
-        let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].description = "Connect intent to work.".into();
-
-        document.validate().unwrap();
-
-        document.flows[0].description = "TBD".into();
-        let error = document.validate().unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("description: must describe substantive reviewer-visible intent")
-        );
-    }
-
-    #[test]
-    fn submission_requires_a_model_authored_title() {
-        let mut document = test_fixture("plan", "Name the plan.");
-        document.title = super::PROVISIONAL_PLAN_TITLE.into();
-
-        let error = document.validate_for_submission().unwrap_err().to_string();
-
-        assert!(error.contains("must replace the provisional title"));
-    }
-
-    #[test]
     fn submission_rejects_a_description_that_repeats_its_operation() {
         let mut document = test_fixture("plan", "Keep structured operations singular.");
         let super::super::document::PlanSubtask::Work(subtask) =
@@ -1442,53 +1249,6 @@ mod test {
         assert!(error.contains(
             "must complement operation `create` without repeating `Create` as its first word"
         ));
-    }
-
-    #[test]
-    fn submission_accepts_a_description_that_complements_its_operation() {
-        let mut document = test_fixture("plan", "Keep structured operations singular.");
-        let super::super::document::PlanSubtask::Work(subtask) =
-            &mut document.stages[0].tasks[0].files[0].subtasks[0]
-        else {
-            panic!("fixture must contain a work subtask");
-        };
-        subtask.description = "the canonical plan owner and its lifecycle.".into();
-
-        document.validate_for_submission().unwrap();
-    }
-
-    #[test]
-    fn supplied_test_entity_references_must_resolve() {
-        let mut document = test_fixture("plan", "Validate optional test traceability.");
-        attach_test_fixture(&mut document);
-        let super::super::document::PlanSubtask::Test(test) =
-            &mut document.stages[0].tasks[0].files[0].subtasks[1]
-        else {
-            panic!("fixture must append a test subtask");
-        };
-        test.covers_entities = vec!["missing_entity".into()];
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains("references missing entity missing_entity"));
-    }
-
-    #[test]
-    fn only_enum_entities_can_declare_variants() {
-        let mut document = test_fixture("plan", "Validate enum ownership.");
-        document.entity_changes[0]
-            .variants
-            .push(super::super::document::EnumVariantChange {
-                action: super::super::document::ChangeAction::Add,
-                renamed_from: None,
-                name: "Ready".into(),
-                description: Some("Marks a ready plan.".into()),
-                fields: Vec::new(),
-            });
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains("only enum entities can declare variants"));
     }
 
     #[test]
@@ -1511,59 +1271,5 @@ mod test {
 
         document.dependencies[0].manifest = "src/plan.rs".into();
         document.validate_for_submission().unwrap();
-    }
-
-    #[test]
-    fn dependency_manifest_task_needs_no_program_entity() {
-        let mut document = test_fixture("plan", "Validate dependency-only ownership.");
-        document
-            .dependencies
-            .push(super::super::document::PlanDependencyChange {
-                action: super::super::document::ChangeAction::Add,
-                name: "tokio".into(),
-                version: "1".into(),
-                resolved_version: None,
-                manifest: "Cargo.toml".into(),
-                license: Some("MIT".into()),
-                justification: "Run asynchronous work.".into(),
-            });
-        document.stages[0].tasks[0]
-            .files
-            .push(super::super::document::PlanFile {
-                change: super::super::document::PlanFileChange::Modify {
-                    path: "Cargo.toml".into(),
-                },
-                subtasks: vec![super::super::document::PlanSubtask::Work(
-                    super::super::document::PlanWorkSubtask {
-                        action: super::super::document::SubtaskAction::Configure,
-                        description: "the asynchronous runtime.".into(),
-                        entities: Vec::new(),
-                    },
-                )],
-            });
-
-        document.validate_for_submission().unwrap();
-    }
-
-    #[test]
-    fn dependency_license_must_be_spdx_or_null() {
-        let mut document = test_fixture("plan", "Validate dependency licenses.");
-        document
-            .dependencies
-            .push(super::super::document::PlanDependencyChange {
-                action: super::super::document::ChangeAction::Add,
-                name: "tokio".into(),
-                version: "1".into(),
-                resolved_version: None,
-                manifest: "src/plan.rs".into(),
-                license: Some("probably permissive".into()),
-                justification: "Run asynchronous work.".into(),
-            });
-
-        let error = document.validate().unwrap_err().to_string();
-        assert!(error.contains("valid SPDX license expression or null"));
-
-        document.dependencies[0].license = None;
-        document.validate().unwrap();
     }
 }

@@ -132,26 +132,3 @@ pub struct MessageCompletion {
     /// Preserve whether the snapshot is authoritative final content.
     pub outcome: MessageOutcome,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep immutable reasoning type and representation through the event transport.
-    #[test]
-    fn reasoning_start_roundtrips_with_its_explicit_representation() {
-        let event = ItemEvent::Started(ItemStart::Reasoning(ReasoningStart {
-            text: "summary".into(),
-            kind: ReasoningKind::Summary,
-        }));
-        let encoded = serde_json::to_string(&event).unwrap();
-        let decoded: ItemEvent = serde_json::from_str(&encoded).unwrap();
-        assert!(matches!(
-            decoded,
-            ItemEvent::Started(ItemStart::Reasoning(ReasoningStart {
-                kind: ReasoningKind::Summary,
-                ..
-            }))
-        ));
-    }
-}

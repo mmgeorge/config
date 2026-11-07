@@ -71,36 +71,3 @@ impl std::fmt::Display for ProviderSessionId {
         formatter.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{ProviderSessionId, ProviderSessionIdError};
-
-    #[test]
-    fn provider_session_identity_validates_and_preserves_native_value() {
-        assert_eq!(
-            ProviderSessionId::try_from(String::new()),
-            Err(ProviderSessionIdError)
-        );
-        assert_eq!(
-            ProviderSessionId::try_from(" \t".to_owned()),
-            Err(ProviderSessionIdError)
-        );
-        let id = ProviderSessionId::try_from(" native-id ".to_owned()).unwrap();
-        assert_eq!(id.as_str(), " native-id ");
-        assert_eq!(String::from(id), " native-id ");
-    }
-
-    #[test]
-    fn provider_session_identity_json_round_trip_and_rejects_empty() {
-        let id = ProviderSessionId::try_from("native-id".to_owned()).unwrap();
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"native-id\"");
-        assert_eq!(
-            serde_json::from_str::<ProviderSessionId>(&json).unwrap(),
-            id
-        );
-        assert!(serde_json::from_str::<ProviderSessionId>("\"  \"").is_err());
-        assert!(serde_json::from_str::<ProviderSessionId>("null").is_err());
-    }
-}

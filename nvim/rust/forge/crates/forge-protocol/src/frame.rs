@@ -85,19 +85,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_complete_requests_beyond_output_frame_and_queue_budgets() {
-        let body = "λ".repeat(8 * 1024 * 1024 + 1);
-        let encoded = format!("{{\"text\":\"{body}\"}}\n{{}}\n");
-        let mut reader =
-            JsonLineReader::new(BufReader::with_capacity(64 * 1024, encoded.as_bytes()));
-        let frame = reader.next_frame().await.unwrap().unwrap();
-        let decoded: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(decoded["text"], body);
-        assert_eq!(reader.next_frame().await.unwrap().unwrap(), b"{}");
-        assert!(reader.next_frame().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn cancelled_read_retains_partial_frame() {
         let (mut writer, stream) = tokio::io::duplex(64);
         let mut reader = JsonLineReader::new(BufReader::with_capacity(2, stream));

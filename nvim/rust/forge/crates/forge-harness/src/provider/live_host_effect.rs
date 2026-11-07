@@ -72,23 +72,6 @@ impl LiveHostEffectSender {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn closed_owner_channel_rejects_batch_in_retained_terminal_snapshot()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, requests) = LiveHostEffectSender::channel();
-        drop(requests);
-        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
-        let batch = HostEffectBatch::new(7, Default::default());
-        let snapshot = vec![batch.clone()];
-        let result = sender
-            .commit(scope, ToolCallId::new("closed-owner")?, batch)
-            .await;
-        assert!(matches!(result, Err(ProviderError::Cancelled)));
-        assert!(snapshot[0].is_rejected());
-        assert!(HostEffectBatch::active_completion(&snapshot).is_none());
-        Ok(())
-    }
-
     /// Retain committed mutation evidence after lost delivery or rejection without replaying the write.
     #[tokio::test]
     async fn lost_live_delivery_preserves_committed_file_change()

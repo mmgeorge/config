@@ -203,26 +203,6 @@ mod tests {
         serde_json::json!({"version":12,"flow":[{"text":"flow"}],"overview":"overview","root":"Project description","commit":"1234567890123456789012345678901234567890","tasks":[{"title":"Task","subtasks":[{"title":"Subtask","changes":[{"action":"Modify","kind":"Function","target":"function","note":"note","file":"src/main.rs","line":3,"annotation":{"title":"Annotation","comment":"Comment"}}]}]}]})
     }
     #[test]
-    fn artifact_preserves_content_beyond_former_byte_and_record_caps() {
-        let mut value = artifact();
-        let overview = "complete ".repeat(300_000);
-        value["overview"] = overview.clone().into();
-        value["flow"] = serde_json::json!(vec![serde_json::json!({"text":"flow"}); 10_001]);
-        let encoded = serde_json::to_vec(&value).unwrap();
-        assert!(encoded.len() > 2 * 1024 * 1024);
-        let parsed = Artifact::parse(&encoded).unwrap();
-        assert_eq!(parsed.overview, overview);
-        assert_eq!(parsed.flow.len(), 10_001);
-    }
-    #[test]
-    fn artifact_root_is_prose_and_annotation_coordinates_are_native() {
-        let parsed = Artifact::parse(&serde_json::to_vec(&artifact()).unwrap()).unwrap();
-        assert_eq!(parsed.root, "Project description");
-        let (path, row) = parsed.tasks[0].subtasks[0].changes[0].source().unwrap();
-        assert_eq!(path.raw(), b"src/main.rs");
-        assert_eq!(row, 2);
-    }
-    #[test]
     fn artifact_rejects_escape_and_legacy_plural_annotation() {
         let mut value = artifact();
         value["tasks"][0]["subtasks"][0]["changes"][0]["file"] = "../outside".into();

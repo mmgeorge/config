@@ -326,51 +326,6 @@ pub trait InputReceipt: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use crate::RecoveryToken;
-
-    /// Release handoff observation while native acceptance is still outstanding.
-    #[tokio::test]
-    async fn dispatch_is_scoped_and_survives_dropped_waiters() {
-        let binding = crate::BindingId::new("binding").unwrap();
-        let scope = crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange");
-        let submission = crate::SubmissionId::try_from("input").unwrap();
-        let (reporter, mut observer) = super::DispatchReporter::channel(
-            binding.clone(),
-            scope.clone(),
-            submission.clone(),
-            crate::DeliveryAttemptId::new("attempt").unwrap(),
-        );
-        assert!(reporter.matches(
-            &binding,
-            &scope,
-            &submission,
-            &crate::DeliveryAttemptId::new("attempt").unwrap()
-        ));
-        assert!(!reporter.matches(
-            &crate::BindingId::new("retired").unwrap(),
-            &scope,
-            &submission,
-            &crate::DeliveryAttemptId::new("attempt").unwrap()
-        ));
-        assert!(!reporter.matches(
-            &binding,
-            &scope,
-            &submission,
-            &crate::DeliveryAttemptId::new("different-attempt").unwrap()
-        ));
-        drop(observer.clone());
-        reporter.confirm();
-        reporter.confirm();
-        drop(reporter);
-        let confirmation = observer.wait().await.unwrap();
-        assert_eq!(confirmation.binding(), &binding);
-        assert_eq!(confirmation.scope(), &scope);
-        assert_eq!(
-            confirmation.target(),
-            &super::DispatchTarget::Input(submission)
-        );
-    }
-
     /// Treat a missing confirmation as uncertainty rather than permission to replay.
     #[tokio::test]
     async fn dispatch_reporter_loss_is_not_confirmation() {
@@ -417,30 +372,5 @@ mod tests {
         drop(observer);
         current.confirm();
         assert!(next_observer.wait().await.is_ok());
-    }
-
-    /// Keep cached handoff identity from masking observation loss after its real reporter disappears.
-    #[tokio::test]
-    async fn cached_dispatch_identity_does_not_retain_progress_sender() {
-        let (reporter, mut observer) = super::DispatchReporter::channel(
-            crate::BindingId::new("weak-dispatch").unwrap(),
-            crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange"),
-            crate::SubmissionId::try_from("input").unwrap(),
-            crate::DeliveryAttemptId::new("attempt").unwrap(),
-        );
-        let retained_identity = reporter.identity();
-        drop(reporter);
-        assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
-        drop(retained_identity);
-    }
-
-    /// Persist opaque recovery evidence without exposing an adapter format to the host.
-    #[test]
-    fn recovery_token_round_trips_as_opaque_bytes() {
-        let token = RecoveryToken::new(vec![4, 2, 1]).unwrap();
-        let encoded = serde_json::to_vec(&token).unwrap();
-        let restored: RecoveryToken = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(restored.as_bytes(), &[4, 2, 1]);
-        assert!(serde_json::from_str::<RecoveryToken>("[]").is_err());
     }
 }

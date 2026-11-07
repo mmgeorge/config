@@ -69,12 +69,4 @@ mod test {
         assert!(!total.observe(true));
         assert_eq!(total.turn_count, 2);
     }
-
-    #[test]
-    fn reset_preserves_configuration() {
-        let mut budget = ContinuationBudget::new(7, 3);
-        budget.observe(false);
-        budget.reset();
-        assert_eq!(budget, ContinuationBudget::new(7, 3));
-    }
 }

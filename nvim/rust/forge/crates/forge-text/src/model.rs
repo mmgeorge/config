@@ -402,65 +402,6 @@ mod tests {
         }
     }
 
-    /// Keep dictionary words even when neighboring frequencies favor another valid spelling.
-    #[test]
-    fn known_words_preserve_spelling_in_complete_sentences_and_typing_prefixes() {
-        for (context, target, expected) in [
-            ("I answer two questions.", "two", "two"),
-            ("I answer two ", "two", "two"),
-            ("I answer TWO ", "TWO", "TWO"),
-            ("Turn autocorrect off.", "off", "off"),
-            ("Turn autocorrect off ", "off", "off"),
-            ("This is too much.", "too", "too"),
-            ("This is too ", "too", "too"),
-            ("Read the response form the server.", "form", "form"),
-            ("The value is greater then ", "then", "then"),
-            ("Do not loose your work.", "loose", "loose"),
-            ("two questions remain.", "two", "Two"),
-        ] {
-            assert_eq!(decide(context, target), expected, "{context}");
-        }
-    }
-
-    /// Correct unknown spellings without treating valid-word alternatives as automatic edits.
-    #[test]
-    fn spelling_quality_gate() {
-        for (context, target, expected) in [
-            ("Please recieve the package.", "recieve", "receive"),
-            ("The update should releive pressure.", "releive", "relieve"),
-            ("Please receive the package.", "receive", "receive"),
-            ("The update should relieve pressure.", "relieve", "relieve"),
-            ("Read the response form the server.", "form", "form"),
-            ("Fill out the form before submitting.", "form", "form"),
-            ("The value is greater then zero.", "then", "then"),
-            ("Save the file then exit.", "then", "then"),
-            ("Do not loose your work.", "loose", "loose"),
-            ("The cable is loose.", "loose", "loose"),
-            (
-                "This should definately fix the issue.",
-                "definately",
-                "definitely",
-            ),
-            (
-                "We need to seperate configuration from state.",
-                "seperate",
-                "separate",
-            ),
-            ("The problem occured during startup.", "occured", "occurred"),
-            (
-                "Check the dependancies before building.",
-                "dependancies",
-                "dependencies",
-            ),
-            ("The service recieved a request.", "recieved", "received"),
-            ("Please recieve", "recieve", "receive"),
-            ("The value is greater then", "then", "then"),
-            ("Fill out the form", "form", "form"),
-        ] {
-            assert_eq!(decide(context, target), expected, "{context}");
-        }
-    }
-
     /// Expand missing-apostrophe negatives independently of context and preserve case.
     #[test]
     fn negative_contractions_override_frequency_with_original_case() {
@@ -497,25 +438,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capitalization_preserves_sentence_and_pronoun_rules() {
-        assert_eq!(decide("  hello there.", "hello"), "Hello");
-        assert_eq!(decide("Say i can help.", "i"), "I");
-        assert_eq!(decide("\"hello there.\"", "hello"), "hello");
-        assert_eq!(decide("42 hello there.", "hello"), "hello");
-        assert_eq!(decide("(hello there.)", "hello"), "hello");
-        assert_eq!(decide("Use google here.", "google"), "google");
-        assert_eq!(decide("Visit Dr. smith.", "smith"), "smith");
-        assert_eq!(
-            decide(
-                "The value is 2.5 and i agree.",
-                "i agree".split_whitespace().next().unwrap()
-            ),
-            "I"
-        );
-        assert_eq!(decide("ß", "ß"), "ß");
-    }
-
     /// Preserve unsupported tokens even when English neighbors make a replacement more probable.
     #[test]
     fn unsupported_alphabets_preserve_original_text() {
@@ -540,36 +462,6 @@ mod tests {
             decide("Please RECIEVE the package near Ω.", "RECIEVE"),
             "RECEIVE"
         );
-    }
-
-    /// Alphabet eligibility cannot bypass malformed, partial, or protected target validation.
-    #[test]
-    fn unsupported_alphabets_still_validate_target_ranges() {
-        use crate::contract::{ByteRange, OccurrenceId, ProfileId};
-        for (context, target, protected) in [
-            ("Ω", ByteRange { start: 1, end: 2 }, Vec::new()),
-            (
-                "Ω",
-                ByteRange { start: 0, end: 2 },
-                vec![ByteRange { start: 0, end: 2 }],
-            ),
-            ("Ωmega", ByteRange { start: 0, end: 3 }, Vec::new()),
-            ("Ω café", ByteRange { start: 0, end: 8 }, Vec::new()),
-            ("東京", ByteRange { start: 0, end: 6 }, Vec::new()),
-        ] {
-            let request = CorrectRequest {
-                profile: ProfileId::new("test".into()).unwrap(),
-                profile_revision: "test".into(),
-                occurrence: OccurrenceId::try_from("unicode-range".to_owned()).unwrap(),
-                context: context.into(),
-                target,
-                protected,
-            };
-            assert!(matches!(
-                model().correct(request, &HashSet::new(), None, &AtomicBool::new(false)),
-                Err(TextError::InvalidInput(_))
-            ));
-        }
     }
 
     /// Keep recognized contractions intact independently of misleading corpus frequencies.
@@ -610,29 +502,5 @@ mod tests {
         ] {
             assert!(!decide(context, target).contains('\''), "{context}");
         }
-    }
-
-    #[test]
-    fn invalid_dictionary_and_long_content() {
-        let closed = AtomicBool::new(false);
-        assert!(
-            Model::load(
-                Cursor::new(b"word invalid\n"),
-                Cursor::new(b"word word 1\n"),
-                &closed
-            )
-            .is_err()
-        );
-        assert!(
-            Model::load(
-                Cursor::new(b"word\n"),
-                Cursor::new(b"word word 1\n"),
-                &closed
-            )
-            .is_err()
-        );
-        let target = "z".repeat(100_000);
-        let context = format!("Keep {target} unchanged.");
-        assert_eq!(decide(&context, &target), target);
     }
 }

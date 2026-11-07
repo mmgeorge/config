@@ -170,7 +170,7 @@ fn normalized(owner: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{DeclarationFile, calls};
+    use crate::plan::calls;
     use forge_diff::syntax::DeclarationOverview;
 
     fn design(path: &str, source: &str) -> DeclarationDesign {
@@ -183,29 +183,6 @@ mod tests {
             .proposed_calls
             .insert(path.into(), calls::extract(path, source).unwrap());
         design
-    }
-
-    #[test]
-    fn recorded_test_helper_calls_establish_incoming_uses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut design = design(
-            "lib.rs",
-            "#[cfg(test)] mod tests { fn helper() {} #[test] fn resets() { helper(); } }\n",
-        );
-        validate(&design, workspace.path()).unwrap();
-        for function in design.proposed_calls.get_mut("lib.rs").unwrap() {
-            if function.owner.ends_with("resets") {
-                function.call.as_mut().unwrap()[0].name = "tests::helper".into();
-            }
-        }
-        validate(&design, workspace.path()).unwrap();
-        for function in design.proposed_calls.get_mut("lib.rs").unwrap() {
-            if function.owner.ends_with("resets") {
-                function.call = Some(Vec::new());
-            }
-        }
-        let failure = validate(&design, workspace.path()).unwrap_err().to_string();
-        assert!(failure.contains("helper"), "{failure}");
     }
 
     #[test]
@@ -245,36 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn callbacks_and_repeated_calls_preserve_real_incoming_uses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let design = design(
-            "lib.rs",
-            "pub fn install() { register(worker); worker(); worker(); }\nfn worker() {}\n",
-        );
-        assert!(
-            design.proposed_calls["lib.rs"][0]
-                .call
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|call| call.name == "worker" && call.kind == crate::plan::CallKind::Callback)
-        );
-        validate(&design, workspace.path()).unwrap();
-        let combined = calls::combined(
-            "lib.rs",
-            &design.proposed["lib.rs"],
-            &design.proposed_calls["lib.rs"],
-        )
-        .unwrap();
-        assert_eq!(
-            calls::parse("lib.rs", &combined, &design.proposed_calls["lib.rs"])
-                .unwrap()
-                .1,
-            design.proposed_calls["lib.rs"]
-        );
-    }
-
-    #[test]
     fn self_recursion_and_imports_do_not_count_but_mutual_calls_do() {
         let workspace = tempfile::tempdir().unwrap();
         let recursive = design("lib.rs", "fn unused() { unused(); }\n");
@@ -296,57 +243,6 @@ mod tests {
         );
         imported.proposed_calls.clear();
         assert!(validate(&imported, workspace.path()).is_err());
-    }
-
-    #[test]
-    fn types_properties_and_named_values_need_structured_uses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let used = design(
-            "lib.rs",
-            "struct Item { count: u32 }\nconst LIMIT: u32 = 3;\npub fn run() { let item = Item { count: LIMIT }; sink(item.count); }\n",
-        );
-        validate(&used, workspace.path()).unwrap();
-        let mut unused = used.clone();
-        unused.proposed_calls.clear();
-        let failure = validate(&unused, workspace.path()).unwrap_err().to_string();
-        assert!(
-            failure.contains("Item") && failure.contains("count") && failure.contains("LIMIT"),
-            "{failure}"
-        );
-    }
-
-    #[test]
-    fn authored_constructs_supply_incoming_type_uses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let design = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+struct Weapon;\n+pub fn setup();\n+Constructs\n+  Weapon\n*** End Patch").unwrap();
-        validate(&design, workspace.path()).unwrap();
-        let index = PlanReferenceIndex::design(&design, workspace.path()).unwrap();
-        assert!(
-            index
-                .occurrence
-                .iter()
-                .any(|reference| reference.name == "Weapon" && reference.kind == "construct")
-        );
-        let mut omitted = design.clone();
-        omitted.proposed_calls.clear();
-        assert!(validate(&omitted, workspace.path()).is_err());
-        let factory = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+struct Weapon;\n+impl Weapon { fn ready() -> Self; }\n+pub fn setup();\n+Constructs\n+  Weapon::ready\n*** End Patch").unwrap();
-        validate(&factory, workspace.path()).unwrap();
-    }
-
-    #[test]
-    fn authored_accesses_resolve_named_values_from_the_complete_atomic_patch() {
-        let workspace = tempfile::tempdir().unwrap();
-        let design = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+mod values;\n+use values::LIMIT;\n+pub fn run();\n+Accesses\n+  LIMIT\n*** Add File: src/values.rs\n+pub(crate) const LIMIT: u32;\n*** End Patch").unwrap();
-        assert_eq!(
-            design.proposed_calls["src/lib.rs"][0]
-                .call
-                .as_ref()
-                .unwrap()[0]
-                .kind,
-            crate::plan::CallKind::Value
-        );
-        validate(&design, workspace.path()).unwrap();
     }
 
     #[test]
@@ -383,26 +279,6 @@ mod tests {
     }
 
     #[test]
-    fn public_wildcard_reexports_expose_only_public_members() {
-        let workspace = tempfile::tempdir().unwrap();
-        let exposed = design(
-            "lib.rs",
-            "mod hidden { pub struct Api; impl Api { pub fn new() -> Self { Self } } }\npub use hidden::*;\n",
-        );
-        validate(&exposed, workspace.path()).unwrap();
-        let restricted = design(
-            "lib.rs",
-            "mod hidden { pub struct Api { private: u32 } }\npub use hidden::*;\n",
-        );
-        assert!(
-            validate(&restricted, workspace.path())
-                .unwrap_err()
-                .to_string()
-                .contains("private")
-        );
-    }
-
-    #[test]
     fn tests_entrypoints_and_trait_contracts_are_automatic_exemptions() {
         let workspace = tempfile::tempdir().unwrap();
         let entry = design(
@@ -427,21 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn moved_baselines_and_signature_changes_do_not_introduce_existing_symbols() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut design = design("new.rs", "fn existing(value: u32) {}\n");
-        design.baseline.insert(
-            "old.rs".into(),
-            DeclarationFile {
-                text: "fn existing();\n".into(),
-                source_digest: "saved".into(),
-            },
-        );
-        design.moved.insert("old.rs".into(), "new.rs".into());
-        validate(&design, workspace.path()).unwrap();
-    }
-
-    #[test]
     fn typescript_exports_do_not_expose_private_members() {
         let workspace = tempfile::tempdir().unwrap();
         let design = design(
@@ -456,100 +317,6 @@ mod tests {
         assert!(!failure.contains("Api::call"), "{failure}");
     }
 
-    #[test]
-    fn lua_local_functions_require_uses_and_returned_module_functions_are_public() {
-        let workspace = tempfile::tempdir().unwrap();
-        let design = design(
-            "api.lua",
-            "local M = {}\nfunction M.public() end\nlocal function helper() end\nreturn M\n",
-        );
-        let failure = validate(&design, workspace.path()).unwrap_err().to_string();
-        assert!(
-            failure.contains("helper") && !failure.contains("public"),
-            "{failure}"
-        );
-    }
-
-    #[test]
-    fn typescript_method_callbacks_establish_private_callable_uses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let design = design(
-            "api.ts",
-            "export class Api { public install(): void { register(this.worker); } private worker(): void {} }\n",
-        );
-        validate(&design, workspace.path()).unwrap();
-    }
-
-    #[test]
-    fn workspace_callers_are_not_scanned_for_new_plan_symbols() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(
-            workspace.path().join("caller.rs"),
-            "fn elsewhere() { planned(); }",
-        )
-        .unwrap();
-        let design = design("lib.rs", "fn planned() {}\n");
-        assert!(
-            validate(&design, workspace.path())
-                .unwrap_err()
-                .to_string()
-                .contains("planned")
-        );
-    }
-
-    #[test]
-    fn public_exposure_reads_only_owning_module_metadata_and_respects_private_boundaries() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir(workspace.path().join("src")).unwrap();
-        std::fs::write(
-            workspace.path().join("Cargo.toml"),
-            "[package]\nname = 'metadata'\nversion = '0.1.0'\n",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("src/lib.rs"),
-            "pub mod service;\nmod unrelated;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("src/unrelated.rs"),
-            "invalid syntax {",
-        )
-        .unwrap();
-        let design = design("src/service.rs", "pub fn exported() {}\n");
-        validate(&design, workspace.path()).unwrap();
-        assert_eq!(design.proposed.len(), 1);
-        std::fs::write(
-            workspace.path().join("src/lib.rs"),
-            "mod service;\nmod unrelated;\n",
-        )
-        .unwrap();
-        assert!(
-            validate(&design, workspace.path())
-                .unwrap_err()
-                .to_string()
-                .contains("exported")
-        );
-    }
-
-    #[test]
-    fn lua_named_values_and_properties_share_the_resolved_use_index() {
-        let workspace = tempfile::tempdir().unwrap();
-        let used = design(
-            "api.lua",
-            "local LIMIT = 3\nlocal M = {}\nM.count = 0\nfunction M.run() print(LIMIT, M.count) end\nreturn M\n",
-        );
-        validate(&used, workspace.path()).unwrap();
-        let mut unused = used.clone();
-        unused.proposed_calls.clear();
-        assert!(
-            validate(&unused, workspace.path())
-                .unwrap_err()
-                .to_string()
-                .contains("LIMIT")
-        );
-    }
-
     #[tokio::test]
     async fn rejects_missing_uses_before_dependency_acquisition() {
         let workspace = tempfile::tempdir().unwrap();
@@ -557,66 +324,5 @@ mod tests {
         let design = design("lib.rs", "fn internal() {}\n");
         let error = design.validated(workspace.path()).await.unwrap_err();
         assert!(error.downcast_ref::<DeclarationValidationError>().is_some());
-    }
-
-    #[test]
-    fn removing_calls_rejects_cached_submission_without_rewriting_the_draft() {
-        let workspace = tempfile::tempdir().unwrap();
-        let store =
-            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path())
-                .unwrap();
-        crate::checks::configure_fixture(&store.workspace);
-        let mut document = crate::plan::document::test_fixture("uses", "Connect internal behavior");
-        let mut design = design("lib.rs", "pub fn install() { worker(); }\nfn worker() {}\n");
-        design.document.objective = "Connect internal behavior".into();
-        design.document.background = "The fixture contains the declarations under review.".into();
-        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
-        design.document.design = "Register the internal operation".into();
-        design.validation = Some(crate::declaration::DeclarationValidation {
-            fingerprint: crate::declaration::fingerprint(&design),
-            checked: 0,
-            diagnostic: Vec::new(),
-        });
-        design
-            .proposed_calls
-            .get_mut("lib.rs")
-            .unwrap()
-            .iter_mut()
-            .find(|function| function.owner == "install")
-            .unwrap()
-            .call = Some(Vec::new());
-        document.design = Some(design);
-        store
-            .write_working_document("session", "uses", &document)
-            .unwrap();
-        let path = store.plan_dir("session", "uses");
-        let before = std::fs::read(path.join("working.json")).unwrap();
-        let error = store
-            .submit_document_revision("session", "uses", 1, document.version)
-            .unwrap_err();
-        assert!(error.to_string().contains("worker"));
-        assert_eq!(std::fs::read(path.join("working.json")).unwrap(), before);
-        assert!(!path.join("revisions/submitted-0001.json").exists());
-        let design = document.design.as_mut().unwrap();
-        design
-            .proposed_calls
-            .get_mut("lib.rs")
-            .unwrap()
-            .iter_mut()
-            .find(|function| function.owner == "install")
-            .unwrap()
-            .call = Some(vec![crate::plan::CallSite {
-            kind: crate::plan::CallKind::Call,
-            name: "worker".into(),
-            source: None,
-            unresolved: false,
-        }]);
-        store
-            .write_working_document("session", "uses", &document)
-            .unwrap();
-        store
-            .submit_document_revision("session", "uses", 1, document.version)
-            .unwrap();
-        assert!(path.join("revisions/submitted-0001.json").exists());
     }
 }

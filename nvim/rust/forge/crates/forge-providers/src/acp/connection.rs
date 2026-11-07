@@ -222,26 +222,6 @@ impl AcpCleanup {
             .push(resources);
     }
 
-    /// Inject a cleanup failure on the next native process without releasing its resources.
-    #[cfg(test)]
-    pub(super) fn fail_next_collection(&self, count: usize) {
-        self.injected_collection_failures
-            .store(count, Ordering::Release);
-    }
-
-    /// Count retained native processes or readers whose collection has not completed.
-    #[cfg(test)]
-    pub(super) fn pending_count(&self) -> usize {
-        self.resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|resource| {
-                matches!(resource, AcpResource::Native(_)) && !resource.is_collected()
-            })
-            .count()
-    }
-
     /// Retry process/readers first, then profiles and callback leases only after native collection.
     pub(super) async fn shutdown(&self) -> Result<(), forge_provider_api::ProviderError> {
         self.close_admission();
@@ -335,12 +315,6 @@ impl AcpProfile {
     /// Get the unchanged native profile path while its retained owner controls collection.
     pub(super) fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Inject a profile collection failure without discarding its retriable owner.
-    #[cfg(test)]
-    pub(super) fn fail_next_close(&self, count: usize) {
-        self.injected_failures.store(count, Ordering::Release);
     }
 
     /// Close the profile once and retain a failed close for the next cleanup attempt.

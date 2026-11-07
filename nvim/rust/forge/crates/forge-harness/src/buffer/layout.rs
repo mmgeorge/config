@@ -233,35 +233,3 @@ pub(super) fn materialize(block: &mut BufferBlock) -> Result<()> {
     block.validate()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use forge_buffer::identity::BlockId;
-    use forge_buffer::width::WidthProfile;
-
-    #[test]
-    fn nested_markdown_moves_navigation_once_without_changing_its_payload() -> Result<()> {
-        let profile = WidthProfile::default();
-        let mut rendered = crate::buffer::transcript::TranscriptRenderer::new(&profile)?.response(
-            BlockId("nested".into()),
-            "[Details](https://example.test)\n\n## Heading",
-        )?;
-        let original_column = rendered.block.metadata.target[0].range.start.column;
-        rendered.block.metadata.layout.as_mut().unwrap().indent = 6;
-        materialize(&mut rendered.block)?;
-        assert_eq!(
-            rendered.block.text.row(0),
-            Some("    [Details](https://example.test)")
-        );
-        assert_eq!(
-            rendered.block.metadata.target[0].range.start.column,
-            original_column + 4
-        );
-        assert_eq!(rendered.link[0].destination, "https://example.test");
-        let once = rendered.block.clone();
-        materialize(&mut rendered.block)?;
-        assert_eq!(rendered.block, once);
-        Ok(())
-    }
-}

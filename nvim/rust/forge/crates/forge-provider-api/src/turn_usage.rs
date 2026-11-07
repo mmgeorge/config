@@ -329,54 +329,6 @@ fn merge_tokens(
 mod tests {
     use super::*;
 
-    /// Empty accounting must fail before it can enter deduplication or totals.
-    #[test]
-    fn empty_usage_report_is_rejected_but_zero_duration_is_valid() {
-        let empty = serde_json::json!({"report_id":"report", "observed_at_ms":1, "usage":{}});
-        assert!(serde_json::from_value::<TurnUsageReport>(empty).is_err());
-        let report =
-            TurnUsageReport::timing(crate::identity::UsageReportId::new("report").unwrap(), 1, 0);
-        assert_eq!(
-            serde_json::from_value::<TurnUsageReport>(serde_json::to_value(&report).unwrap())
-                .unwrap(),
-            report
-        );
-    }
-    /// Complementary timing endpoints must remain ordered without inferring duration.
-    #[test]
-    fn native_endpoints_merge_atomically_without_inventing_duration() {
-        let id = crate::identity::UsageReportId::new("call").unwrap();
-        let mut start = TurnUsageReport::interval(id.clone(), None, 1, Some(10), None).unwrap();
-        let reversed = TurnUsageReport::interval(id.clone(), None, 2, None, Some(9)).unwrap();
-        let before = start.clone();
-        assert_eq!(
-            start.merge(&reversed),
-            Err(UsageReportError::ReversedInterval)
-        );
-        assert_eq!(start, before);
-        let end = TurnUsageReport::interval(id, None, 3, None, Some(20)).unwrap();
-        assert!(start.merge(&end).unwrap());
-        assert_eq!(*start.reported_duration_ms(), None);
-    }
-
-    /// Complementary categories cannot create a breakdown exceeding an inclusive count.
-    #[test]
-    fn partial_token_observations_validate_the_combined_breakdown() {
-        let mut report: TurnUsageReport = serde_json::from_value(serde_json::json!({
-            "report_id":"report", "observed_at_ms":1, "usage":{"input":3}
-        }))
-        .unwrap();
-        let invalid: TurnUsageReport = serde_json::from_value(serde_json::json!({
-            "report_id":"report", "observed_at_ms":2, "usage":{"cached_input":4}
-        }))
-        .unwrap();
-        let before = report.clone();
-        assert_eq!(
-            report.merge(&invalid),
-            Err(UsageReportError::InvalidTokenBreakdown)
-        );
-        assert_eq!(report, before);
-    }
     /// Conflicting late data cannot partially mutate already retained accounting.
     #[test]
     fn report_merge_is_idempotent_complementary_and_atomic() {

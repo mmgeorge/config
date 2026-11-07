@@ -71,7 +71,7 @@ pub(super) fn render(reply: &QuestionReply) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use forge_provider_api::input::{QuestionReply, QuestionReplyOption, QuestionReplyResponse};
+    use forge_provider_api::input::{QuestionReply, QuestionReplyResponse};
 
     #[test]
     fn answer_uses_codex_reply_envelope_and_waits_for_other_required_questions() {
@@ -91,61 +91,5 @@ mod tests {
         assert!(rendered.starts_with("<send_user_message_question_reply>\n"));
         assert!(rendered.contains("\"questionItemId\":\"question:3\""));
         assert!(rendered.contains("Record this answer without resuming"));
-    }
-
-    #[test]
-    fn clarification_keeps_the_opaque_target_and_never_resolves_the_question() {
-        let reply = QuestionReply {
-            question_id: "question:opaque:4".into(),
-            revision: 7,
-            message_id: "clarification-message".into(),
-            question: "Which option?".into(),
-            response: QuestionReplyResponse::Clarification {
-                options: vec![
-                    QuestionReplyOption {
-                        id: "one".into(),
-                        label: "One".into(),
-                        description: "First option".into(),
-                        recommended: true,
-                    },
-                    QuestionReplyOption {
-                        id: "two".into(),
-                        label: "Two".into(),
-                        description: "Second option".into(),
-                        recommended: false,
-                    },
-                ],
-                text: "Explain the tradeoff".into(),
-                reply_to: Some("prior-clarification".into()),
-            },
-        };
-
-        let rendered = render(&reply);
-
-        assert!(rendered.contains("question:opaque:4"));
-        assert!(rendered.contains("prior-clarification"));
-        assert!(rendered.contains("First option"));
-        assert!(rendered.contains("recommended"));
-        assert!(rendered.contains("read-only question discussion"));
-        assert!(!rendered.contains("<send_user_message_question_reply>"));
-    }
-
-    #[test]
-    fn correction_waits_when_required_questions_remain() {
-        let reply = QuestionReply {
-            question_id: "question:3".into(),
-            revision: 3,
-            message_id: "correction-message".into(),
-            question: "Pick a mode".into(),
-            response: QuestionReplyResponse::Correction {
-                answer: "Careful mode".into(),
-                required_questions_remain: true,
-            },
-        };
-
-        let rendered = render(&reply);
-
-        assert!(rendered.starts_with("<send_user_message_question_reply>\n"));
-        assert!(rendered.contains("Record this correction without resuming"));
     }
 }

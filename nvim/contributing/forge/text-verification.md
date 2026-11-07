@@ -26,26 +26,18 @@ Single-sentence contexts with 10, 100, 1,000, and 10,000 preceding words reached
 Run fixtures through the Lua runner, which gives each one a fresh Neovim. Native fixtures use the already-built host and never build it:
 
 ```nu
-nu .forge/checks/lua-tests.nu nvim/tests/forge/text_rejection.lua
+nu .forge/checks/lua-tests.nu nvim/tests/forge/text_context.lua
 ```
 
 | Fixture | Behavior checked |
 | --- | --- |
-| `text_rejection` | Target-only edits, immediate rejection, and ordinary Backspace |
-| `text_boundaries` | Punctuation, Tab, newline, capitalization, and paste exclusion |
 | `text_context` | UTF-8 offsets, inline and fenced code, paths, and a 4,096-line paragraph |
 | `text_eligibility` | Lua Tree-sitter comments, code exclusion, and native guards |
-| `text_mappings` | Existing mapping fallback and restoration |
-| `text_backspace_encoding` | The real Ultimate Autopair expression mapping, and repeated deletion |
-| `text_punctuation` | Removing spaces before typed punctuation, and protected inline code |
 | `text_wordlist`, `text_wordlist_host` | Asynchronous file loading, reload, and spelling protection |
-| `text_native_region` | Editable-region invalidation before draft capture |
 | `text_stale_reply`, `text_async_lifecycle` | Continued typing, reply order, and host replacement |
-| `text_lifecycle` | Navigation, owner disposal, macros, undo, and redo |
-| `text_completion` | Completion insertion followed by a typed delimiter |
 | `text_host` | Host initialization, wire decisions, and shutdown |
 | `text_sustained_input` | 120 consecutive corrections, and contexts up to 10,000 preceding words |
-| `harper_host`, `harper_scopes_host` | Harper diagnostics, fixes, coordinates, and a document past its 120 KB default cutoff |
+| `harper_scopes_host` | Harper diagnostics, fixes, coordinates, and a document past its 120 KB default cutoff |
 
 Rust tests run with `cargo nextest run --cargo-profile dev --locked -p forge-text --lib -E 'test(=<exact-test-name>)'`. Harper changes need no native rebuild.
 
@@ -53,4 +45,4 @@ Rust tests run with `cargo nextest run --cargo-profile dev --locked -p forge-tex
 
 The model deliberately leaves contextual errors unchanged when the original word is recognized. Unknown spellings still use frequency-based suggestions, so their automatic corrections can be wrong. Disabling `text_correction.enabled` cancels pending work and restores owned mappings without changing existing text.
 
-The Backspace fallback must follow the original mapping's `replace_keycodes` flag. Converting an expression mapping's result a second time produced the `word<80>kb` corruption that `text_backspace_encoding` now covers.
+The Backspace fallback must follow the original mapping's `replace_keycodes` flag. Converting an expression mapping's result a second time produces `word<80>kb` corruption.

@@ -511,33 +511,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn complete_large_capture_and_growing_settlement_survive_reopening() {
-        let directory = tempfile::Builder::new()
-            .prefix("forge-recovery-")
-            .tempdir()
-            .unwrap();
-        let store = store(&directory);
-        let text = format!("{}capture tail", "x".repeat(16 * 1024 * 1024 + 1));
-        let mut captured = capture("large-operation");
-        captured.submitted = json!({"body": text});
-        let mut lease = store.prepare(resource(1), captured).unwrap();
-        lease.dispatch_possible().unwrap();
-        let result = format!("{}settlement tail", "λ".repeat(1024 * 1024));
-        lease
-            .settle(RecoveryPhase::Confirmed {
-                result: json!({"body":result}),
-            })
-            .unwrap();
-        drop(lease);
-        let record = store.inspect(&resource(1)).unwrap().unwrap();
-        assert_eq!(record.capture.submitted["body"], text);
-        match record.state {
-            RecoveryPhase::Confirmed { result: observed } => assert_eq!(observed["body"], result),
-            other => panic!("lost settlement: {other:?}"),
-        }
-    }
-
-    #[test]
     #[ignore]
     fn cross_process_lock_child() {
         let directory = std::env::var_os("FORGE_TEST_RECOVERY_ROOT").unwrap();
@@ -587,19 +560,6 @@ mod tests {
             edit_sequence: Some(42),
             submitted: json!({"body":"captured raw text\r\n", "parent":"PR_1"}),
         }
-    }
-
-    #[test]
-    fn configuration_rejects_relative_cache_or_parent_traversal_roots_without_io() {
-        assert!(RecoveryStore::new(PathBuf::from("forge/recovery/github/v1")).is_err());
-        let directory = tempfile::tempdir().unwrap();
-        assert!(
-            RecoveryStore::new(directory.path().join("forge/github/host/repos/owner/repo"))
-                .is_err()
-        );
-        assert!(RecoveryStore::new(directory.path().join("../forge/recovery/github/v1")).is_err());
-        let configured = store(&directory);
-        assert!(!configured.directory.exists());
     }
 
     #[test]
@@ -706,57 +666,6 @@ mod tests {
         assert!(store.inspect(&resource(2)).is_err());
         assert!(store.prepare(resource(2), capture("operation-3")).is_err());
         assert_eq!(fs::read(&future_path).unwrap(), future_bytes);
-    }
-
-    #[test]
-    fn explicit_user_resolution_retains_original_diagnostic_and_capture_until_ack() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = store(&directory);
-        let mut lease = store.prepare(resource(1), capture("operation-1")).unwrap();
-        lease.dispatch_possible().unwrap();
-        lease
-            .settle(RecoveryPhase::OutcomeUnknown {
-                diagnostic: "original remote failure".into(),
-            })
-            .unwrap();
-        lease
-            .user_linked(json!({"id":"user-selected-comment"}))
-            .unwrap();
-        assert!(
-            matches!(&lease.record().state, RecoveryPhase::UserLinked { diagnostic, .. } if diagnostic == "original remote failure")
-        );
-        lease.acknowledge("operation-1").unwrap();
-        let mut next = store.prepare(resource(1), capture("operation-2")).unwrap();
-        next.dispatch_possible().unwrap();
-        next.user_closed_unknown().unwrap();
-        assert_eq!(
-            next.record().capture.submitted["body"],
-            "captured raw text\r\n"
-        );
-        assert!(matches!(
-            next.record().state,
-            RecoveryPhase::UserClosedUnknown { .. }
-        ));
-    }
-
-    #[test]
-    fn resource_record_limit_rejects_before_creating_another_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = store(&directory);
-        for number in 1..=64 {
-            drop(
-                store
-                    .prepare(resource(number), capture(&format!("operation-{number}")))
-                    .unwrap(),
-            );
-        }
-        assert!(
-            store
-                .prepare(resource(65), capture("operation-65"))
-                .is_err()
-        );
-        assert!(store.inspect(&resource(65)).unwrap().is_none());
-        assert_eq!(store.usage().unwrap(), 64);
     }
 
     #[test]

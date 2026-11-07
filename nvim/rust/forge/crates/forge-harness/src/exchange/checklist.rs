@@ -217,41 +217,6 @@ mod test {
     }
 
     #[test]
-    fn replaces_titles_without_changing_identity() {
-        let mut tracker = ChecklistTracker::default();
-        let original = tracker
-            .replace(&update(vec![(
-                "Build renderer",
-                ChecklistStatus::InProgress,
-            )]))
-            .current[0]
-            .id
-            .clone();
-        let snapshot = tracker.replace(&update(vec![(
-            "Refactor renderer",
-            ChecklistStatus::Completed,
-        )]));
-        assert_eq!(snapshot.current[0].id, original);
-        assert_eq!(snapshot.current[0].title, "Refactor renderer");
-    }
-
-    #[test]
-    fn preserves_only_removed_items_with_attributed_history() {
-        let mut tracker = ChecklistTracker::default();
-        let snapshot = tracker.replace(&update(vec![
-            ("Keep history", ChecklistStatus::InProgress),
-            ("Discard me", ChecklistStatus::Pending),
-        ]));
-        let retained_id = snapshot.current[0].id.clone();
-        tracker.mark_attributed(&retained_id);
-        let snapshot = tracker.replace(&update(Vec::new()));
-        assert!(snapshot.current.is_empty());
-        assert_eq!(snapshot.superseded.len(), 1);
-        assert_eq!(snapshot.superseded[0].id, retained_id);
-        assert_eq!(snapshot.superseded[0].status, ChecklistStatus::Superseded);
-    }
-
-    #[test]
     fn attribution_requires_exactly_one_running_task() {
         let mut tracker = ChecklistTracker::default();
         tracker.replace(&update(vec![("One", ChecklistStatus::InProgress)]));

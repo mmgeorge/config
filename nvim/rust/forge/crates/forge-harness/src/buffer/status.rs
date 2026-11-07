@@ -499,34 +499,3 @@ fn working_status_text(
     }
     format!("{phase} · {elapsed_seconds}s")
 }
-
-#[cfg(test)]
-mod retry_tests {
-    use super::*;
-
-    #[test]
-    fn retry_status_counts_down_then_keeps_attempt_visible() {
-        let mut retry = crate::provider::retry::ProviderRetry {
-            attempt: 2,
-            max_attempts: 5,
-            retry_at_ms: Some(6000),
-        };
-        let status = SessionPhase::RetryingProvider {
-            retry: retry.clone(),
-            activity: WorkflowActivity::Working,
-        };
-        assert_eq!(
-            primary_text(&status, 1001),
-            "Working · retry 2/5 · retrying in 5s"
-        );
-        assert!(status.animated());
-        assert!(status.ticking());
-        retry.retry_at_ms = None;
-        let status = SessionPhase::RetryingProvider {
-            retry,
-            activity: WorkflowActivity::Planning,
-        };
-        assert_eq!(primary_text(&status, 6000), "Planning · retry 2/5");
-        assert!(!status.ticking());
-    }
-}

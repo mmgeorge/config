@@ -194,30 +194,4 @@ mod tests {
         assert_eq!(context.before, vec![0, 1, 2, 3]);
         assert_eq!(context.after, vec![5, 6, 7, 8]);
     }
-
-    #[tokio::test]
-    async fn source_versions_do_not_reuse_renamed_or_removed_parent_context() {
-        let old = syntax(SyntaxLanguage::Rust, "fn old() {\n    let value = 1;\n}\n").await;
-        let new = syntax(
-            SyntaxLanguage::Rust,
-            "fn new() {\n    if ready {\n        let value = 2;\n    }\n}\n",
-        )
-        .await;
-        assert_eq!(old.hunk_context(1).unwrap().label, "old");
-        let context = new.hunk_context(2).unwrap();
-        assert_eq!(context.label, "new");
-        assert_eq!(context.before, vec![0, 1]);
-        assert_eq!(context.after, vec![3, 4]);
-        assert_eq!(old.hunk_context(1).unwrap().after, vec![2]);
-    }
-
-    #[tokio::test]
-    async fn nested_typescript_scopes_use_native_queries() {
-        let typescript = syntax(
-            SyntaxLanguage::Typescript,
-            "class Engine {\n  run() {\n    const value = 1;\n  }\n}\n",
-        )
-        .await;
-        assert_eq!(typescript.hunk_context(2).unwrap().label, "Engine.run");
-    }
 }

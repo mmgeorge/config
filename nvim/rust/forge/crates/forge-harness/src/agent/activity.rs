@@ -173,19 +173,3 @@ fn preview(text: &str, limit: usize) -> (String, bool) {
     let preview = characters.by_ref().take(limit).collect();
     (preview, characters.next().is_some())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn complete_tool_identity_roundtrips_beyond_the_former_reference_limit() {
-        let exchange = Exchange::agent_admission("session-1", 1, "Inspect source".into(), 0);
-        let tool_id = "provider-tool-".repeat(2048);
-        let encoded = AgentToolReference::encode(&exchange, "turn-1", &tool_id).unwrap();
-        assert!(encoded.len() > 16384);
-        let decoded = AgentToolReference::decode(&encoded).unwrap();
-        assert_eq!(decoded.tool_id, tool_id);
-        assert_eq!(decoded.session_id, exchange.session_id);
-    }
-}

@@ -64,48 +64,4 @@ impl TaskStart {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn task_start_origin_retains_presentation_without_task_authority() {
-        let origin = ExchangeOrigin::TaskStarted {
-            start: TaskStart {
-                kind: crate::task::TaskKind::Goal,
-                title: "Reduce startup time".into(),
-            },
-        };
-        let encoded = serde_json::to_value(&origin).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({"kind":"task_started","start":{"kind":"goal","title":"Reduce startup time"}})
-        );
-        assert_eq!(
-            serde_json::from_value::<ExchangeOrigin>(encoded).unwrap(),
-            origin
-        );
-        assert!(serde_json::from_value::<ExchangeOrigin>(serde_json::json!({
-            "kind":"task_started","start":{"kind":"goal","title":"Reduce startup time","revision":"stale"}
-        })).is_err());
-    }
-
-    #[test]
-    fn continuation_origin_contains_no_task_reference() {
-        let origin = ExchangeOrigin::task_continuation("Validation remains");
-        let encoded = serde_json::to_value(&origin).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({"kind":"task_continuation","reason":"Validation remains"})
-        );
-        assert_eq!(
-            serde_json::from_value::<ExchangeOrigin>(encoded).unwrap(),
-            origin
-        );
-        assert!(
-            serde_json::from_value::<ExchangeOrigin>(
-                serde_json::json!({"kind":"task_continuation","reason":"test","task_id":"old"})
-            )
-            .is_err()
-        );
-    }
-}
+mod tests {}

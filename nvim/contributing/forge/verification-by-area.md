@@ -8,17 +8,16 @@ Run Rust filters as `cargo nextest run --cargo-profile dev --locked -p <package>
 
 | Area | Rust filters (`forge-harness` unless noted) | Editor fixtures |
 | --- | --- | --- |
-| Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | `harness_package_checks`, `harness_automatic_checks`, `harness_check_queue_host`, `harness_check_repair_resume_host` |
+| Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | `harness_automatic_checks`, `harness_check_queue_host`, `harness_check_repair_resume_host` |
 | Plan review | `plan::` | `plan_review_document`, `plan_check_selection`, `plan_checks_host`, `plan_review_calls_host`, `plan_workspace_definition` |
 | Provider lifecycle | Exact selectors and package ownership below | `harness_prompt_lifecycle`, `harness_configuration_host` |
 | Input and queues | `broker::input_test::deferred_steering_cancellation_preserves_acceptance_boundary` | `harness_host` |
-| Transcript folds | None | `harness_message_folds_host`, `harness_markdown_folds` |
-| Prompt history | None | `harness_prompt_history` |
-| Agent LSP tools | None | `lsp_query`, `lsp_failures`, `lsp_source_transfer`, `lsp_startup`, `lsp_startup_roots`, `lsp_lazy_startup`, `lsp_workspace` |
+| Transcript folds | None | `harness_message_folds_host` |
+| Agent LSP tools | None | `lsp_query`, `lsp_startup`, `lsp_lazy_startup`, `lsp_workspace` |
 | Background generation | `background::tests`, `compaction`, and `commit_message::` in `forge` | `background_host`, `commit_settings_host` |
-| Configuration controls | None | `picker`, `picker_fields`, `harness_settings`, `harness_commit_settings`, `harness_settings_background_failure`, `commit_settings_host` |
-| Provider registry | None | `provider_registry_config_reload`, `commit_provider_preference` |
-| Harness tab labels | None | `harness_tabline_labels`, `harness_controller_native` |
+| Configuration controls | None | `picker`, `harness_settings`, `commit_settings_host` |
+| Provider registry | None | `provider_registry_config_reload` |
+| Harness tab labels | None | `harness_controller_native` |
 
 ## Project checks
 
@@ -28,7 +27,6 @@ The host fixtures use a temporary workspace, and each proves a different boundar
 
 | Fixture | Proves |
 | --- | --- |
-| `harness_package_checks` | Declared package and test inputs produce one invocation and capture output. |
 | `harness_automatic_checks` | The completion gate records one executed failure, one reused failure, a repair turn that stops without progress, and multi-check execution. |
 | `harness_check_queue_host` | Both timing choices, persistence, and validation after the final queued item is deleted. |
 | `harness_check_repair_resume_host` | A permission change that resumes an exchange keeps one exchange through its repair attempt. |
@@ -62,7 +60,6 @@ Set `forge_test_rust_analyzer` when rustup cannot find the analyzer. The fixture
 Rust fixture manifests are stored as `Cargo.toml.fixture` so the checked-in test
 sources do not become live Cargo workspaces. The shared fixture copier materializes
 them as `Cargo.toml` only in the temporary test directory and skips build output.
-`plan_navigation_fixture.lua` verifies this boundary.
 
 ## Provider lifecycle
 

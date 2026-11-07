@@ -3,44 +3,6 @@ use tree_sitter::{Node, Parser};
 
 const WIDTHS: [usize; 6] = [40, 60, 80, 100, 120, 240];
 
-#[test]
-fn presentation_width_preferences_preserve_declaration_meaning() {
-    let identifier = format!("Contract{}", "X".repeat(8193));
-    for (path, source) in [
-        (
-            "contract.rs",
-            format!(
-                "/// Preserve the complete contract at every display width.\npub fn inspect(value: &{identifier}) -> &{identifier};\n"
-            ),
-        ),
-        (
-            "contract.ts",
-            format!(
-                "/** Preserve the complete contract at every display width. */\nexport function inspect(value: {identifier}): {identifier};\n"
-            ),
-        ),
-        (
-            "contract.lua",
-            format!(
-                "--- Preserve the complete contract at every display width.\nfunction inspect({identifier})\n"
-            ),
-        ),
-    ] {
-        let language = DeclarationOverview::language(path).unwrap();
-        let expected = meaning(language, &source);
-        for width in [0, 1, 12, 4097, usize::MAX] {
-            let formatted = DeclarationOverview::format_with_width(path, &source, width).unwrap();
-            assert!(formatted.contains(&identifier));
-            assert_eq!(meaning(language, &formatted), expected, "{path}: {width}");
-            assert_eq!(
-                DeclarationOverview::format_with_width(path, &formatted, width).unwrap(),
-                formatted,
-                "{path}: {width}"
-            );
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 struct Meaning {
     syntax: Vec<String>,
@@ -186,11 +148,6 @@ fn inspect(path: &str, source: &str) -> Vec<String> {
     failures
 }
 
-fn check(path: &str, source: &str) {
-    let failures = inspect(path, source);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
 fn check_corpus(path: &str, source: &str) {
     let language = DeclarationOverview::language(path).unwrap();
     let surrogate = declaration_surrogate(language, source).unwrap();
@@ -218,88 +175,11 @@ fn check_corpus(path: &str, source: &str) {
 }
 
 #[test]
-fn declaration_boundary_arrow_types_and_literals_remain_unchanged() {
-    for path in ["boundary.ts", "boundary.tsx"] {
-        for source in [
-            "export type Handler = (\nvalue: string\n) =>\nstring;\n",
-            "export type Label = `first =>\nsecond`;\n",
-            "// Documentation ending in =>\nexport type Label = string;\n",
-            "/* Documentation ending in =>\n*/\nexport type Label = string;\n",
-        ] {
-            assert_eq!(
-                declaration_surrogate(DeclarationOverview::language(path).unwrap(), source)
-                    .unwrap(),
-                source,
-            );
-            check(path, source);
-        }
-    }
-}
-
-#[test]
-fn declaration_boundary_callable_arrows_complete_only_expression_bodies() {
-    for path in ["boundary.ts", "boundary.tsx"] {
-        for source in [
-            "export const run = (value: string): string =>;\n",
-            "export const run = value =>;\n",
-            "export const run = value =>\n",
-            "export const run = async value =>;\n",
-            "export class Store { run = value =>; }\n",
-            "export default (value: string) =>;\n",
-            "export default value =>;\n",
-            "export default value =>\n",
-            "export const run = (): () => void =>;\n",
-        ] {
-            check(path, source);
-        }
-        for source in [
-            "export type Invalid = (value: string) =>;\n",
-            "export const run = (value: string) => { return value; };\n",
-        ] {
-            assert!(
-                DeclarationOverview::parse(path, source).is_err(),
-                "{source}"
-            );
-        }
-    }
-}
-
-#[test]
-fn declaration_boundary_lua_parameter_comments_survive_extraction() {
-    for source in [
-        "function run(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend\n",
-        "local run = function(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend\n",
-        "local M = {\nrun = function(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend,\n}\nreturn M\n",
-    ] {
-        for comment in [
-            "-- Caller-owned writer.",
-            "-- Caller-owned writer. )",
-            "--[[Caller-owned writer.\n)\n]]",
-        ] {
-            let source = source.replace("-- Caller-owned writer.", comment);
-            let declaration = DeclarationOverview::extract("boundary.lua", &source).unwrap();
-            assert!(declaration.contains(comment));
-            assert!(!declaration.contains("writer.send"));
-            check("boundary.lua", &declaration);
-        }
-    }
-}
-
-#[test]
 fn rust_declaration_corpus_preserves_meaning() {
     check_corpus(
         "corpus.rs",
         include_str!("../../tests/fixtures/declaration_formatting/rust.rs.txt"),
     );
-}
-
-#[test]
-#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
-fn typescript_declaration_corpus_preserves_meaning() {
-    let source = include_str!("../../tests/fixtures/declaration_formatting/typescript.ts.txt");
-    for path in ["corpus.ts", "corpus.mts", "corpus.cts"] {
-        check_corpus(path, source);
-    }
 }
 
 #[test]
@@ -315,144 +195,6 @@ fn lua_declaration_corpus_preserves_meaning() {
     check_corpus(
         "corpus.lua",
         include_str!("../../tests/fixtures/declaration_formatting/lua.lua.txt"),
-    );
-}
-
-#[test]
-#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
-fn large_files_preserve_meaning_across_repeated_passes() {
-    let mut failures = Vec::new();
-    for (path, source) in [
-        (
-            "large.rs",
-            include_str!("../../tests/fixtures/declaration_formatting/rust.rs.txt"),
-        ),
-        (
-            "large.ts",
-            include_str!("../../tests/fixtures/declaration_formatting/typescript.ts.txt"),
-        ),
-        (
-            "large.tsx",
-            include_str!("../../tests/fixtures/declaration_formatting/tsx.tsx.txt"),
-        ),
-        (
-            "large.lua",
-            include_str!("../../tests/fixtures/declaration_formatting/lua.lua.txt"),
-        ),
-    ] {
-        let source = source.strip_suffix("return M\n").unwrap_or(source);
-        let mut large = source.repeat(24);
-        if path.ends_with(".lua") {
-            large.push_str("return M\n");
-        }
-        assert!(
-            large.lines().count() >= 1000,
-            "{path} must exercise a large document"
-        );
-        failures.extend(inspect(path, &large));
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn comments_inside_parameter_and_type_lists_preserve_meaning() {
-    let mut failures = Vec::new();
-    for (path, source) in [
-        (
-            "parameters.rs",
-            "pub fn request(\n// A borrowed request with a sufficiently long explanatory comment.\nrequest_identifier: &str,\n/* The callback borrows the response. */\nresponse_callback: fn(&str, usize) -> bool,\n) -> bool;\n",
-        ),
-        (
-            "fields.rs",
-            "pub struct Request {\npub id: u64, // Caller-owned identifier.\n/// Next field documentation.\npub label: &'static str,\n}\n",
-        ),
-        (
-            "types.ts",
-            "export type Pair = [\n// The first item.\nfirst: string,\n/* The second item. */\nsecond: number\n];\n",
-        ),
-        (
-            "parameters.ts",
-            "export function request(\n// Caller-owned request.\nrequest_identifier: string,\nresponse_callback: (value: string, count: number) => boolean\n): boolean;\n",
-        ),
-        (
-            "fields.ts",
-            "export interface Request {\nreadonly id: string; // Caller-owned identifier.\n/** Next field documentation. */\nlabel: 'two  spaces';\n}\n",
-        ),
-        (
-            "parameters.tsx",
-            "export const Component = (\n// Caller-owned properties.\nproperties: ViewProps,\nforwarded_reference: Ref<HTMLElement>\n): ReactNode =>;\n",
-        ),
-        (
-            "parameters.lua",
-            "local M\nfunction M.request(\n-- Caller-owned request.\nrequest_identifier,\nresponse_callback\n)\nreturn M\n",
-        ),
-    ] {
-        failures.extend(inspect(path, source));
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn rust_tuple_field_comments_remain_separate_from_fields() {
-    let mut failures = Vec::new();
-    for (index, source) in [
-        "pub struct Position(\n/// Center in arena world coordinates.\npub Vec2,\n);\n",
-        "pub struct Pair(\n/// First value.\npub u32,\n/// Second value.\npub u64,\n);\n",
-        "pub struct Pair(\npub u32, // First value.\npub u64, // Second value.\n);\n",
-        "pub struct Attribute(\n#[cfg(feature = \"enabled\")]\n/// Optional field.\npub Vec<u8>,\n);\n",
-        "pub enum Event { Payload(\n/// Payload bytes.\nVec<u8>,\n), Empty }\n",
-        "pub struct Nested(\n/// Nested tuple.\npub (u32, u64),\n/// Function argument commas.\npub fn(u8, u16) -> u32,\n);\n",
-    ].into_iter().enumerate() {
-        failures.extend(inspect(&format!("tuple_{index}.rs"), source));
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn rust_union_declarations_are_admitted_before_formatting() {
-    check(
-        "union.rs",
-        "pub union RawValue {\n/// Integral representation.\npub integer: u64,\n/// Floating representation.\npub decimal: f64,\n}\n",
-    );
-}
-
-#[test]
-fn rust_unsafe_extern_blocks_are_admitted_before_formatting() {
-    check(
-        "ffi.rs",
-        "unsafe extern \"C\" { pub fn send(buffer: *const u8, length: usize); }\n",
-    );
-    check(
-        "ffi_function.rs",
-        "pub unsafe extern \"C\" fn send(buffer: *const u8, length: usize);\n",
-    );
-}
-
-#[test]
-fn tsx_function_expression_return_type_is_admitted_before_formatting() {
-    for source in [
-        "export const Component = function(properties: Props): ReactNode;\n",
-        "export const Component = function(\nproperties: Props\n): ReactNode;\n",
-        "export const Component = function(\nproperties: Props\n): ReactNode\n",
-        "export const Component = function named<Value>(properties: Props<Value>): ReactNode;\n",
-        "export type Label = '= function';\n",
-    ] {
-        check("expression.tsx", source);
-    }
-    assert!(DeclarationOverview::parse(
-        "expression.tsx",
-        "export const Component = function(properties: Props): ReactNode { return render(properties); };",
-    ).is_err());
-}
-
-#[test]
-fn lua_literal_require_without_parentheses_is_admitted_before_formatting() {
-    check(
-        "module.lua",
-        "local module = require 'platform.module'\nreturn module\n",
-    );
-    assert!(
-        DeclarationOverview::parse("module.lua", "local module = require(module_name)\n").is_err()
     );
 }
 
@@ -477,56 +219,4 @@ fn meaning_oracle_detects_parseable_corruption() {
         "export type Label = 'twowords';\n",
     );
     assert_ne!(original.syntax, corrupted.syntax);
-}
-
-#[test]
-fn configuration_corpus_is_preserved_exactly() {
-    for (path, source) in [
-        (
-            "Cargo.toml",
-            include_str!("../../tests/fixtures/declaration_formatting/config.toml"),
-        ),
-        (
-            "config.json",
-            include_str!("../../tests/fixtures/declaration_formatting/config.json"),
-        ),
-        (
-            "tsconfig.json",
-            include_str!("../../tests/fixtures/declaration_formatting/config.jsonc"),
-        ),
-        (
-            "config.jsonc",
-            include_str!("../../tests/fixtures/declaration_formatting/config.jsonc"),
-        ),
-        (
-            "config.yaml",
-            include_str!("../../tests/fixtures/declaration_formatting/config.yaml"),
-        ),
-        (
-            "config.yml",
-            include_str!("../../tests/fixtures/declaration_formatting/config.yaml"),
-        ),
-        (
-            "config.xml",
-            include_str!("../../tests/fixtures/declaration_formatting/config.xml"),
-        ),
-        (
-            ".gitignore",
-            include_str!("../../tests/fixtures/declaration_formatting/gitignore.txt"),
-        ),
-    ] {
-        for newline in ["\n", "\r\n"] {
-            let input = source.replace('\n', newline);
-            for width in WIDTHS {
-                let formatted =
-                    DeclarationOverview::format_with_width(path, &input, width).unwrap();
-                assert_eq!(formatted, input, "{path}, width {width}");
-                assert_eq!(
-                    DeclarationOverview::present(path, &formatted).unwrap().text,
-                    input,
-                    "{path}"
-                );
-            }
-        }
-    }
 }

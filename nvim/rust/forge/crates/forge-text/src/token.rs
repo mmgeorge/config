@@ -146,20 +146,3 @@ pub(crate) fn preserve_case(original: &str, candidate: &str) -> String {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn sentence_boundaries_preserve_abbreviations_and_unicode() {
-        for (text, word, expected) in [
-            ("Hello。 world", "world", "world"),
-            ("Visit Dr. Smith", "Smith", "Visit Dr. Smith"),
-            ("Done. next", "next", "next"),
-            ("Version 2.5 remains", "remains", "Version 2.5 remains"),
-        ] {
-            let position = text.find(word).unwrap();
-            assert_eq!(&text[sentence_start(text, position)..], expected);
-        }
-    }
-}

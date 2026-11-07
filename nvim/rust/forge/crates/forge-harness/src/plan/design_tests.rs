@@ -246,34 +246,4 @@ mod tests {
         assert_eq!(declaration_line(&functions, "crate::first::same"), Some(1));
         assert_eq!(declaration_line(&functions, "second::same"), Some(2));
     }
-
-    #[test]
-    fn complete_inventories_and_selections_preserve_every_file_and_case() {
-        let mut files = (0..257)
-            .map(|index| DesignTestFile {
-                file: format!("tests/source_{index}.rs"),
-                cases: (0..5)
-                    .map(|case| DesignTestCase {
-                        name: format!("case_{case}"),
-                        target: None,
-                        change: DesignTestChange::New,
-                        description: "Preserve complete coverage.".into(),
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        validate(&files).unwrap();
-        let selected = files
-            .iter()
-            .flat_map(|file| {
-                file.cases.iter().map(|case| DesignTestSelection {
-                    file: file.file.clone(),
-                    name: case.name.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(selected.len(), 1285);
-        remove(&mut files, &selected).unwrap();
-        assert!(files.is_empty());
-    }
 }

@@ -44,13 +44,6 @@ impl Drop for TestOwner {
 }
 
 impl ProviderTestSession {
-    /// Attach an existing heterogeneous provider to the complete-result fixture.
-    pub fn from_dyn(provider: Arc<harness::provider::Provider>) -> anyhow::Result<Self> {
-        let directory = Arc::new(tempfile::tempdir()?);
-        let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
-        Self::from_dyn_with_directory(provider, directory, trace)
-    }
-
     /// Wrap a normalized native provider in the production bridge for isolated tests.
     pub fn from_native(native: Arc<super::fixture::EventFixtureProvider>) -> anyhow::Result<Self> {
         Self::from_registered(native.registration())
@@ -102,18 +95,6 @@ impl ProviderTestSession {
         })
     }
 
-    /// Read the exact cached active invocation without initializing or polling a provider binding.
-    /// Observe only work submitted through this fixture's registry; controllers retain their own registry.
-    pub(crate) fn active_invocation_scope(
-        &self,
-        owner: &ThreadOwner,
-    ) -> Result<Option<InvocationScope>, ProviderError> {
-        match self.registry.existing_owner(owner)? {
-            Some(engine) => engine.active_invocation_scope(),
-            None => Ok(None),
-        }
-    }
-
     /// Get the production provider interface for journal reconciliation.
     pub fn as_provider(&self) -> &harness::provider::Provider {
         self.provider.as_ref()
@@ -122,24 +103,6 @@ impl ProviderTestSession {
     /// Clone the production bridge for service or controller test constructors.
     pub fn provider_handle(&self) -> Arc<harness::provider::Provider> {
         self.provider.clone()
-    }
-
-    /// Install session observation before native initialization can emit updates.
-    pub async fn thread_open(
-        &self,
-        request: ProviderRequest,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        self.owner(request.owner()?).await?;
-        Ok(self.provider.thread_open(request).await?)
-    }
-
-    /// Steer through the same owner and reducer used for complete-result collection.
-    pub async fn steer_current(
-        &self,
-        owner: ThreadOwner,
-        input: harness::provider::SteeringInput,
-    ) -> Result<(), ProviderError> {
-        self.owner(owner).await?.engine.steer_current(input).await
     }
 
     /// Run bounded retry-policy attempts through the production session engine and bridge.
@@ -406,10 +369,6 @@ impl Clone for ProviderTestSession {
 /// Collect complete output above the session API without taking over its native reader.
 #[async_trait]
 pub trait ProviderTestExt {
-    async fn session_prompt_and_collect(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<ProviderOutput, ProviderError>;
     async fn session_prompt_and_wait(
         &self,
         request: ProviderRequest,
@@ -419,93 +378,11 @@ pub trait ProviderTestExt {
 
 #[async_trait]
 impl ProviderTestExt for ProviderTestSession {
-    async fn session_prompt_and_collect(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<ProviderOutput, ProviderError> {
-        self.execute(request, None).await
-    }
     async fn session_prompt_and_wait(
         &self,
         request: ProviderRequest,
         sink: HarnessEventSink,
     ) -> Result<ProviderCompletion, ProviderError> {
         Ok(self.execute(request, Some(sink)).await?.completion)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use harness::provider::{PromptMode, ProviderInput, ProviderLaunch, SteeringInput};
-
-    /// Reject steering after collection instead of starting an unowned successor invocation.
-    #[tokio::test]
-    async fn collected_result_rejects_late_steering_without_starting_successor()
-    -> anyhow::Result<()> {
-        let workspace = tempfile::tempdir()?;
-        let trace = Arc::new(harness::trace::TraceStore::open(workspace.path())?);
-        let provider: Arc<harness::provider::Provider> = harness::provider::build(
-            ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: Vec::new(),
-            },
-            harness::provider::approval::PermissionCoordinator::transient(workspace.path())?,
-            trace,
-            workspace.path().into(),
-        )?;
-        let fixture = ProviderTestSession::from_dyn(provider.clone())?;
-        let owner = ThreadOwner::root("collector");
-        let request = ProviderRequest {
-            dispatch: forge_provider_api::submission::DispatchTracker::default(),
-            execution_owner: Some(owner.clone()),
-            harness_session_id: "collector".into(),
-            workspace: workspace.path().to_string_lossy().into_owned(),
-            input: ProviderInput::from_text("hello"),
-            mode: PromptMode::Chat,
-            model: "default".into(),
-            effort: "default".into(),
-            context_window: None,
-            service_tier: Default::default(),
-            access: Default::default(),
-            approval_mode: harness::session::ApprovalMode::Ask,
-            provider_session_id: None,
-            submission: None,
-            acknowledged_child_reports: Vec::new(),
-            recovered_input: Vec::new(),
-            control_context: None,
-        };
-        fixture.session_prompt_and_collect(request.clone()).await?;
-        let catalog = harness::provider::ProviderCatalogRequest {
-            execution_owner: Some(owner.clone()),
-            harness_session_id: request.harness_session_id,
-            workspace: request.workspace,
-            provider_session_id: None,
-            access: Default::default(),
-            approval_mode: harness::session::ApprovalMode::Ask,
-        };
-        let receipt = fixture.store.prepare_steering(
-            &catalog,
-            ProviderInput::from_text("continue"),
-            forge_providers::registry::nonselectable_id()
-                .expect("registry supplies a nonselectable fixture identity"),
-        )?;
-        assert!(
-            fixture
-                .steer_current(
-                    owner,
-                    SteeringInput::User {
-                        text: "continue".into(),
-                        attachments: Vec::new(),
-                        submission: Some(receipt),
-                    },
-                )
-                .await
-                .is_err()
-        );
-        fixture.close().await?;
-        provider.shutdown().await?;
-        Ok(())
     }
 }

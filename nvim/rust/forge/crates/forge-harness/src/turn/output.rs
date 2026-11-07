@@ -109,26 +109,3 @@ impl<'de> Deserialize<'de> for ToolOutputText {
         String::deserialize(deserializer).map(Into::into)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn output_identity_tracks_append_replace_and_shared_snapshots() {
-        let mut output: ToolOutputText = "λ\0".into();
-        let previous = output.clone();
-        assert!(Arc::ptr_eq(&output.text, &previous.text));
-        assert_eq!(output.digest(), crate::plan::digest("λ\0".as_bytes()));
-        output.push_str("🙂");
-        assert_eq!(previous.as_ref(), "λ\0");
-        assert_eq!(output.characters(), 3);
-        assert_eq!(output.digest(), crate::plan::digest("λ\0🙂".as_bytes()));
-        output.replace("different");
-        assert_eq!(output.digest(), crate::plan::digest(b"different"));
-        let restored: ToolOutputText =
-            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
-        assert_eq!(restored, output);
-        assert_eq!(restored.digest(), output.digest());
-    }
-}

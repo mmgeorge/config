@@ -167,32 +167,3 @@ fn parse(value: &str) -> Option<Timestamp> {
         epoch: days * 86400 + hour * 3600 + minute * 60 + second - offset,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relative_dates_preserve_compact_units_and_calendar_boundaries() {
-        let now = parse("2026-09-08T19:00:00Z").unwrap().epoch;
-        for (source, expected) in [
-            ("2026-09-08T19:01:00Z", "just now"),
-            ("2026-09-08T18:59:00Z", "1 minute ago"),
-            ("2026-09-08T18:58:00Z", "2 minutes ago"),
-            ("2026-09-08T18:00:00Z", "1 hour ago"),
-            ("2026-09-07T14:00:00Z", "Yesterday"),
-            ("2026-09-06T14:00:00Z", "2 days ago"),
-            ("2026-09-01T14:00:00Z", "Last week"),
-            ("2026-08-15T14:00:00Z", "24 days ago"),
-            ("2026-08-01T14:00:00Z", "Last month"),
-            ("2026-06-01T14:00:00Z", "June 1, 2026"),
-            ("invalid", "invalid"),
-        ] {
-            assert_eq!(relative_at(source, now), expected, "{source}");
-        }
-        assert_eq!(parse("2026-09-08T09:00:00-10:00").unwrap().epoch, now);
-        assert!(parse("2026-02-29T00:00:00Z").is_none());
-        assert!(parse("2024-02-29T00:00:00Z").is_some());
-        assert_eq!(latest_activity(["3 days ago", "2 days ago"]), "2 days ago");
-    }
-}

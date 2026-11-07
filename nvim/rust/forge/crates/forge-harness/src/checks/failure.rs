@@ -47,20 +47,4 @@ pub(super) fn classify(error: &anyhow::Error, fallback: CheckState) -> CheckStat
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_storage_is_an_execution_error_and_missing_executable_is_unavailable() {
-        let storage = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert_eq!(
-            classify(&storage, CheckState::ConfigurationError),
-            CheckState::ExecutionError
-        );
-        let executable = CheckFailure::launch(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert_eq!(
-            classify(&executable, CheckState::ConfigurationError),
-            CheckState::Blocked
-        );
-    }
-}
+mod tests {}

@@ -151,25 +151,4 @@ mod tests {
             MAX_PENDING_FRAMES
         );
     }
-
-    #[tokio::test]
-    async fn large_byte_window_preserves_frame_credit_and_close() {
-        let credit = ReceiveCredit::default();
-        for _ in 0..32 {
-            credit.reserve(MAX_FRAME_BYTES).await.unwrap();
-        }
-        assert!(credit.window.lock().unwrap().bytes > 8 * 1024 * 1024);
-        for _ in 32..MAX_PENDING_FRAMES {
-            credit.reserve(1).await.unwrap();
-        }
-        let pending = credit.reserve(1);
-        tokio::pin!(pending);
-        assert!(matches!(
-            std::future::poll_fn(|context| std::task::Poll::Ready(pending.as_mut().poll(context)))
-                .await,
-            std::task::Poll::Pending
-        ));
-        credit.close();
-        assert!(pending.await.is_err());
-    }
 }

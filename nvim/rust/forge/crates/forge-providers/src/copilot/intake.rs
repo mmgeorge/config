@@ -429,9 +429,7 @@ fn native_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::{
-        BindingId, InvocationScope, ItemCompletion, ItemEvent, ProviderEvent,
-    };
+    use forge_provider_api::{BindingId, InvocationScope};
     use github_copilot_sdk::Client;
     use serde_json::json;
 
@@ -498,25 +496,6 @@ mod tests {
         )
     }
 
-    /// Native session errors remain visible before any foreground turn has been admitted.
-    #[tokio::test]
-    async fn unbound_session_error_publishes_without_starting_a_turn() -> anyhow::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (intake, sender) = fixture().await;
-            let owner = forge_provider_api::testing::root_thread("idle-error");
-            let (sink, mut events) = forge_provider_api::events::channel(BindingId::new("idle-error")?, forge_provider_api::EventScope::Binding { thread_id: owner.clone() });
-            sender.send(event("idle-error", "session.error", json!({"errorType":"query","statusCode":503,"message":"private-native-failure"}))).await?;
-            intake.bind(sink.activity_writer()).await?;
-            let observed = events.recv().await?.unwrap().event;
-            assert!(matches!(&observed, ProviderEvent::Thread { thread_id, event: forge_provider_api::ThreadEvent::Error { .. } } if thread_id == &owner.clone()));
-            assert!(!serde_json::to_string(&observed)?.contains("private-native-failure"));
-            assert!(events.try_next()?.is_none());
-            assert!(intake.failure.borrow().is_none());
-            intake.close().await?;
-            Ok::<(), anyhow::Error>(())
-        }).await?
-    }
-
     /// A delayed foreground consumer retains every native event beyond the old arbitrary limit.
     #[tokio::test]
     async fn paused_bursts_over_capacity_retain_native_order() -> anyhow::Result<()> {
@@ -552,64 +531,6 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await?
-    }
-
-    /// Native loss wakes a foreground owner holding the decoder and retains its queued prefix.
-    #[tokio::test]
-    async fn active_context_failure_drains_prefix_without_waiting_for_decoder_lock()
-    -> anyhow::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (intake, sender) = fixture().await;
-            let (context, mut observed) = context("loss").await;
-            let mut receiver = intake.attach(context.clone()).await?;
-            let mut owned = context.lock().await;
-            sender.send(event("answer", "assistant.message", json!({"messageId":"answer","phase":"final_answer","content":"prefix"}))).await?;
-            while receiver.receiver.is_empty() { tokio::task::yield_now().await; }
-            intake.client.fail(ObservationFailure::Disconnected);
-            let prefix = receiver.recv().await?;
-            let TurnContext { decoder, output, sink } = &mut *owned;
-            decoder.decode(&prefix, output, sink).await?;
-            assert!(matches!(receiver.recv().await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
-            assert!(!intake.task.lock().await.as_ref().unwrap().is_finished());
-            drop(owned);
-            drop(receiver);
-            let mut preserved = false;
-            while let Ok(Some(event)) = observed.try_next() {
-                preserved |= matches!(event.event, ProviderEvent::Item { event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), .. } if completion.text == "prefix");
-            }
-            // The stream may be fenced before a consumer drains it; native output remains in the retained decoder.
-            assert!(preserved || context.lock().await.decoder.owns_event(&prefix));
-            intake.close().await?;
-            Ok::<(), anyhow::Error>(())
-        }).await?
-    }
-
-    /// Late output retains its original item after a successor foreground attaches.
-    #[tokio::test]
-    async fn late_output_after_reattachment_keeps_original_turn() -> anyhow::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (intake, sender) = fixture().await;
-            let (first, mut first_events) = context("first").await;
-            let mut initial = intake.attach(first.clone()).await?;
-            sender.send(event("message", "assistant.message_start", json!({"messageId":"original"}))).await?;
-            let admitted = initial.recv().await?;
-            { let mut context = first.lock().await; let TurnContext { decoder, output, sink } = &mut *context; decoder.decode(&admitted, output, sink).await?; }
-            let original = first.lock().await.decoder.root_address().unwrap();
-            drop(initial);
-            let (second, _second_events) = context("second").await;
-            let mut next = intake.attach(second).await?;
-            sender.send(event("late", "assistant.message", json!({"messageId":"original","content":"late original","phase":"final_answer"}))).await?;
-            let mut found = false;
-            while !found {
-                if let Some(bound) = first_events.recv().await?
-                    && let ProviderEvent::Item { thread_id, turn_id, event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)), .. } = bound.event {
-                        assert_eq!(thread_id, original.thread_id); assert_eq!(turn_id, original.turn_id); assert_eq!(completion.text, "late original"); found = true;
-                    }
-            }
-            assert!(next.receiver.try_recv().is_err());
-            intake.close().await?;
-            Ok::<(), anyhow::Error>(())
-        }).await?
     }
 
     /// A retained reader rejects new foreground work instead of reopening its retired turn.

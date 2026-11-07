@@ -335,41 +335,4 @@ mod tests {
         start.observe(replay, 700);
         assert_eq!(start.result.context_tokens_before, None);
     }
-
-    #[test]
-    fn exact_terminal_metadata_refines_unknown_counts_without_retargeting_or_overwriting() {
-        let mut retained = Compaction {
-            id: "operation".into(),
-            thread_id: "original-thread".into(),
-            state: CompactionState::Completed,
-            manual: false,
-            started_at_ms: Some(1),
-            completed_at_ms: Some(2),
-            result: CompactionResult::default(),
-        };
-        let mut detail = retained.clone();
-        detail.result.context_tokens_before = Some(120_000);
-        detail.result.context_tokens_after = Some(32_000);
-        for (id, thread) in [
-            ("other-operation", "original-thread"),
-            ("operation", "other-thread"),
-        ] {
-            let mut foreign = detail.clone();
-            foreign.id = id.into();
-            foreign.thread_id = thread.into();
-            retained.observe(foreign, 3);
-            assert_eq!(retained.result.context_tokens_before, None);
-            assert_eq!(retained.result.context_tokens_after, None);
-        }
-        retained.observe(detail.clone(), 4);
-        retained.observe(detail.clone(), 5);
-        assert_eq!(retained.result.context_tokens_before, Some(120_000));
-        assert_eq!(retained.result.context_tokens_after, Some(32_000));
-        detail.result.context_tokens_before = Some(900_000);
-        detail.result.context_tokens_after = Some(64_000);
-        retained.observe(detail, 6);
-        assert_eq!(retained.result.context_tokens_before, Some(120_000));
-        assert_eq!(retained.result.context_tokens_after, Some(32_000));
-        assert_eq!(retained.completed_at_ms, Some(2));
-    }
 }

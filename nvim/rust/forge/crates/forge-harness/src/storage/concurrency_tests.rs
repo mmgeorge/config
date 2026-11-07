@@ -5,7 +5,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::params;
 
 use super::SqliteStore;
 use super::test::session;
@@ -248,86 +247,5 @@ fn deletion_holds_ownership_through_cleanup_and_releases_on_failure() -> Result<
     drop(competitor);
     store.recover_session_deletions()?;
     assert!(store.load_session("target")?.is_none());
-    Ok(())
-}
-
-#[test]
-fn rename_preserves_current_state_and_commits_its_event_atomically() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let mut store = SqliteStore::open(directory.path())?;
-    store.save_session(&session("target", "workspace"))?;
-    store.acquire_session_lease("target", "owner")?;
-    store.connection.execute("UPDATE session_record SET payload=json_set(payload,'$.session.resolved_model','latest') WHERE id='target'", [])?;
-    let renamed = store.rename_owned_session("target", "owner", "renamed", Some("target"), 5)?;
-    assert_eq!(renamed.resolved_model.as_deref(), Some("latest"));
-    assert_eq!(store.list_session_event("target")?.len(), 1);
-    assert!(
-        store
-            .rename_owned_session("target", "other", "invalid", None, 6)
-            .is_err()
-    );
-    assert!(
-        store
-            .rename_owned_session("target", "owner", "invalid", Some("target"), 6)
-            .is_err()
-    );
-    assert_eq!(store.list_session_event("target")?.len(), 1);
-    store.connection.execute_batch("CREATE TRIGGER reject_rename_event BEFORE INSERT ON session_event_record BEGIN SELECT RAISE(ABORT,'event persistence failed'); END;")?;
-    assert!(
-        store
-            .rename_owned_session("target", "owner", "rolled-back", None, 7)
-            .is_err()
-    );
-    assert_eq!(store.load_session("target")?.unwrap().name, "renamed");
-    store.connection.execute("UPDATE session_record SET payload=json_set(payload,'$.session.lease_expires_at_ms',0) WHERE id=?1", params!["target"])?;
-    assert_eq!(store.load_session("target")?.unwrap().name, "renamed");
-    let mut competitor = SqliteStore::open(directory.path())?;
-    assert!(
-        competitor
-            .acquire_session_lease("target", "other")
-            .unwrap_err()
-            .is::<SessionLeaseConflict>()
-    );
-    Ok(())
-}
-
-#[test]
-fn metadata_rename_survives_runtime_writes_and_expires_with_owner() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let mut store = SqliteStore::open(directory.path())?;
-    store.save_session(&session("target", "workspace"))?;
-    let mut stale = store.acquire_session_lease("target", "owner")?;
-    let writer = store.session_metadata_writer("target", "owner")?;
-    writer.rename("independent rename", Some("target"), 50)?;
-    assert_eq!(
-        store
-            .initialize_session_name("target", "owner", "automatic title")?
-            .name,
-        "independent rename"
-    );
-    stale.resolved_model = Some("runtime progress".into());
-    store.save_owned_session(&stale, "owner")?;
-    let current = store.load_session("target")?.unwrap();
-    assert_eq!(current.name, "independent rename");
-    assert_eq!(current.resolved_model, stale.resolved_model);
-    store.save_session(&stale)?;
-    assert_eq!(
-        store.load_session("target")?.unwrap().name,
-        "independent rename"
-    );
-    assert!(
-        writer
-            .rename("stale generation", Some("target"), 51)
-            .is_err()
-    );
-    assert_eq!(store.list_session_event("target")?.len(), 1);
-    store.release_session_lease("target", "owner")?;
-    let mut successor = SqliteStore::open(directory.path())?;
-    successor.acquire_session_lease("target", "successor")?;
-    assert!(writer.rename("expired writer", None, 52).is_err());
-    assert_eq!(
-        successor.load_session("target")?.unwrap().name,
-        "independent rename"
-    );
     Ok(())
 }

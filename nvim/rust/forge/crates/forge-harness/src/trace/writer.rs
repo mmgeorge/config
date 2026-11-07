@@ -122,11 +122,6 @@ enum Command {
     },
     Flush(Reply),
     Close(Reply),
-    #[cfg(test)]
-    Hold {
-        entered: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
-    },
 }
 
 /// Linearize one store's accepted records with its explicit close operation.
@@ -406,36 +401,6 @@ impl TraceWriter {
         result
     }
 
-    /// Hold the real filesystem owner after it acknowledges this ordered barrier.
-    #[cfg(test)]
-    pub(super) fn hold(
-        &self,
-        owner: Arc<super::store::TraceStore>,
-    ) -> TraceResult<TraceWriterHold> {
-        let (entered, entered_receiver) = mpsc::channel();
-        let (release, release_receiver) = mpsc::channel();
-        self.sender
-            .send(Command::Hold {
-                entered,
-                release: release_receiver,
-            })
-            .map_err(|_| TraceError::Closed)?;
-        entered_receiver.recv().map_err(|_| TraceError::Closed)?;
-        Ok(TraceWriterHold {
-            release,
-            _owner: owner,
-        })
-    }
-
-    /// Get bounded retained queue usage, including the record currently being written.
-    #[cfg(test)]
-    pub(super) fn pending(&self) -> (usize, usize) {
-        (
-            self.shared.record_count.load(Ordering::Acquire),
-            self.shared.bytes.load(Ordering::Acquire),
-        )
-    }
-
     /// Wait for a control operation outside the record hot path.
     fn control(&self, command: impl FnOnce(Reply) -> Command) -> TraceResult<()> {
         let (reply, receiver) = mpsc::channel();
@@ -450,22 +415,6 @@ impl Drop for TraceWriter {
     /// Collect the filesystem owner when explicit shutdown was omitted.
     fn drop(&mut self) {
         let _ = self.close();
-    }
-}
-
-/// Release a deterministic test barrier without borrowing the trace owner.
-#[cfg(test)]
-#[must_use]
-pub(crate) struct TraceWriterHold {
-    release: mpsc::Sender<()>,
-    _owner: Arc<super::store::TraceStore>,
-}
-
-#[cfg(test)]
-impl Drop for TraceWriterHold {
-    /// Release a held writer on all test exits.
-    fn drop(&mut self) {
-        let _ = self.release.send(());
     }
 }
 
@@ -698,12 +647,6 @@ impl Files {
                     // thread/command collection failures may fail host shutdown.
                     let _ = reply.send(Ok(()));
                     break;
-                }
-                #[cfg(test)]
-                Command::Hold { entered, release } => {
-                    let _ = entered.send(());
-                    let _ = release.recv();
-                    continue;
                 }
             };
             if let Err(error) = result {

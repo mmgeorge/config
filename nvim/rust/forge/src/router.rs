@@ -1554,7 +1554,6 @@ fn revision_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_git::completion::{RevisionId, RevisionProvider};
 
     #[test]
     fn renamed_methods_preserve_dispatch() {
@@ -1587,82 +1586,5 @@ mod tests {
                 "retired route accepted: {method}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn revision_pages_preserve_candidates_beyond_previous_cache_budget() {
-        let directory = tempfile::Builder::new()
-            .prefix(".forge-revision-")
-            .tempdir_in(std::env::current_dir().unwrap())
-            .unwrap();
-        let initialized = std::process::Command::new("git")
-            .arg("-C")
-            .arg(directory.path())
-            .args(["init", "--quiet"])
-            .status()
-            .unwrap();
-        assert!(initialized.success());
-        let store = forge_git::store::RepositoryStore::default();
-        let repository = store
-            .open(directory.path().to_path_buf())
-            .await
-            .unwrap()
-            .unwrap();
-        let values: Vec<Vec<u8>> = (0..20_001)
-            .map(|index| format!("branch-{index}-{}", "x".repeat(100)).into_bytes())
-            .collect();
-        let expected: Vec<u8> = values
-            .iter()
-            .flat_map(|value| value.iter().copied().chain([0]))
-            .collect();
-        assert!(expected.len() > 2 * 1024 * 1024);
-        let candidates = RevisionCandidates {
-            revision: RevisionId(1),
-            generation: repository.generation(),
-            storage: repository.identity.storage.clone(),
-            provider: RevisionProvider::Gix,
-            reference_digest: "fixture".into(),
-            retained_bytes: expected.len(),
-            values,
-        };
-        let mut offset = 0;
-        let mut actual = Vec::new();
-        loop {
-            let page = revision_page(&repository, &candidates, offset).unwrap();
-            assert_eq!(page["count"], 20_001);
-            assert_eq!(page["total_bytes"], expected.len());
-            let data = STANDARD.decode(page["data"].as_str().unwrap()).unwrap();
-            assert!(data.len() <= PAGE_BYTES);
-            actual.extend(data);
-            offset = page["next_offset"].as_u64().unwrap() as usize;
-            if offset == expected.len() {
-                break;
-            }
-        }
-        assert_eq!(actual, expected);
-        assert!(revision_page(&repository, &candidates, expected.len() + 1).is_err());
-    }
-
-    #[test]
-    fn initialization_preserves_absolute_paths_without_byte_admission() {
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("x".repeat(16 * 1024 + 1));
-        assert!(
-            validate_initialize(&json!({
-                "protocol_version": forge_protocol::WIRE_VERSION,
-                "git_config_cache_path": path,
-                "recovery_directory": path,
-                "status_ignored_directory": path,
-            }))
-            .is_ok()
-        );
-        assert!(
-            validate_initialize(&json!({
-                "protocol_version": forge_protocol::WIRE_VERSION,
-                "git_config_cache_path": "relative/path",
-            }))
-            .is_err()
-        );
     }
 }

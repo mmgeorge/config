@@ -180,13 +180,6 @@ impl TraceStore {
         !self.admission.is_closed() && self.writer.enabled()
     }
 
-    /// Hold the real writer after its entered acknowledgment for deterministic tests.
-    #[cfg(test)]
-    pub(crate) fn hold_writer(self: &Arc<Self>) -> TraceResult<super::writer::TraceWriterHold> {
-        self.ensure_open()?;
-        self.writer.hold(self.clone())
-    }
-
     /// Hold the next producer after capturing its logging epoch for deterministic races.
     #[cfg(test)]
     pub(crate) fn hold_serialization(
@@ -194,12 +187,6 @@ impl TraceStore {
     ) -> TraceResult<super::writer::TraceSerializationHold> {
         self.ensure_open()?;
         self.admission.hold_serialization(self.clone())
-    }
-
-    /// Get retained queue reservations for bounded-backlog regression assertions.
-    #[cfg(test)]
-    pub(super) fn pending(&self) -> (usize, usize) {
-        self.writer.pending()
     }
 
     /// Resolve the private path using the same traversal protection as the writer.

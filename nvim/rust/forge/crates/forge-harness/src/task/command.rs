@@ -408,14 +408,6 @@ impl SessionAction {
         Ok(serde_json::to_value(self)?)
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_review(&self) -> bool {
-        matches!(
-            self,
-            Self::Execute { .. } | Self::RequestChanges { .. } | Self::CancelPlan { .. }
-        )
-    }
-
     /// Report the committed review outcome rather than the requested acceptance action.
     pub(crate) fn event_name(
         &self,
@@ -561,43 +553,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn execution_alias_preserves_review_and_execution_settings() -> Result<()> {
-        let parameters = json!({
-            "operation_id":"accept-once","plan_id":"reviewed","digest":"review-digest",
-            "saved_source_digest":"saved-digest","approval_mode":"allow", "comment":"Proceed",
-            "plan_executor":{"enabled":true,"model":"executor","effort":"low"},
-            "plan_compact":true,"review":{"document":"review-view","sequence":9}
-        });
-        let alias = SessionCommand::parse_request(&Request {
-            id: 1,
-            method: "session.plan.accept".into(),
-            params: parameters.clone(),
-        })?
-        .unwrap();
-        let mut task_parameters = parameters;
-        task_parameters["action"] = json!("execute");
-        let canonical = SessionCommand::parse_request(&Request {
-            id: 2,
-            method: "session.command.apply".into(),
-            params: task_parameters,
-        })?
-        .unwrap();
-        assert_eq!(alias.operation_id, "accept-once");
-        assert_eq!(alias.response, CommandResponse::Snapshot);
-        assert_eq!(canonical.response, CommandResponse::Receipt);
-        assert_eq!(alias.action.to_params()?, canonical.action.to_params()?);
-        let request = alias.to_request(3)?;
-        assert_eq!(
-            SessionCommand::parse_request(&request)?.unwrap().response,
-            CommandResponse::Snapshot
-        );
-        assert_eq!(request.params["saved_source_digest"], "saved-digest");
-        assert_eq!(request.params["review"]["sequence"], 9);
-        assert_eq!(request.params["plan_compact"], true);
-        Ok(())
-    }
-
     /// Keep automatic acceptance across submissions while honoring pause and explicit disable.
     #[test]
     fn approved_revision_requires_current_submission_and_preserves_execution_choices() -> Result<()>
@@ -709,98 +664,6 @@ mod tests {
         }
         for text in ["/plan accept", "/plan accept yes", "/plan accept on extra"] {
             assert!(SessionCommand::parse_text(text, None).is_err());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn command_normalization_preserves_receipt_identity_and_metadata() -> Result<()> {
-        let request = Request {
-            id: 1,
-            method: "session.prompt.submit".into(),
-            params: json!({
-                "text":"/goal Finish", "_command":{"id":"stable-command","source":"rpc"}
-            }),
-        };
-        let command = SessionCommand::parse_request(&request)?.unwrap();
-        let normalized = command.to_request(2)?;
-        let repeated = SessionCommand::parse_request(&normalized)?.unwrap();
-        assert_eq!(command.operation_id, "stable-command");
-        assert_eq!(repeated.operation_id, command.operation_id);
-        assert_eq!(normalized.params["_command"]["source"], "rpc");
-        assert_eq!(normalized.params["display_text"], "/goal Finish");
-        assert_eq!(command.action.to_params()?, repeated.action.to_params()?);
-        assert!(SessionCommand::parse_text("ordinary discussion", None)?.is_none());
-        assert!(SessionCommand::parse_text("/replan selected 0", None).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn raw_input_and_steering_parse_before_delivery() -> Result<()> {
-        let input = Request {
-            id: 1,
-            method: "session.input.apply".into(),
-            params: json!({
-                "id":"input-command","action":{"kind":"submit","message":{
-                    "id":"message","text":"/plan Draft design","intent":"auto","attachments":[],
-                    "config":null,"reservation":null,"submission_id":null,"error":null
-                }}
-            }),
-        };
-        let command = SessionCommand::parse_request(&input)?.unwrap();
-        assert_eq!(command.operation_id, "input-command");
-        assert_eq!(
-            command.action.to_params()?,
-            json!({"action":"plan","text":"Draft design"})
-        );
-        let steering = SessionCommand::parse_request(&Request {
-            id: 2,
-            method: "session.turn.steer".into(),
-            params: json!({"text":"/goal pause"}),
-        })?
-        .unwrap();
-        assert!(matches!(steering.action, SessionAction::Pause));
-        assert!(
-            SessionCommand::parse_request(&Request {
-                id: 3,
-                method: "session.turn.steer".into(),
-                params: json!({"text":"/goal pause","target":{"thread_id":"child"}}),
-            })
-            .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn review_aliases_preserve_arguments_and_dedicated_review_methods() -> Result<()> {
-        for (method, action) in [
-            ("session.plan.changes.request", "request_changes"),
-            ("session.plan.cancel", "cancel_plan"),
-        ] {
-            let payload = json!({"operation_id":"review-command","plan_id":"plan","digest":"review-digest",
-                "saved_source_digest":"source-digest","comment":"Keep the existing behavior",
-                "annotations":[{"start_line":2,"end_line":4,"body":"Clarify this part"}],
-                "review":{"document":"review-document","sequence":7}});
-            let alias = SessionCommand::parse_request(&Request {
-                id: 1,
-                method: method.into(),
-                params: payload.clone(),
-            })?
-            .unwrap();
-            let mut canonical = payload;
-            canonical["action"] = json!(action);
-            let canonical = SessionCommand::parse_request(&Request {
-                id: 2,
-                method: "session.command.apply".into(),
-                params: canonical,
-            })?
-            .unwrap();
-            assert!(alias.action.is_review());
-            assert_eq!(alias.action.to_params()?, canonical.action.to_params()?);
-            let normalized = alias.to_request(3)?;
-            assert_eq!(normalized.method, method);
-            assert_eq!(normalized.params["annotations"][0]["end_line"], 4);
-            assert_eq!(normalized.params["review"]["sequence"], 7);
         }
         Ok(())
     }

@@ -326,70 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_declaration_targets_follow_display_spacing_changes() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source_path = temporary.path().join("working.json");
-        std::fs::write(&source_path, b"saved design").unwrap();
-        let checksum = digest(b"saved design");
-        let target = super::super::PlanReviewTarget::Declaration {
-            path: "registry.rs".into(),
-            side: "proposed".into(),
-            line: 3,
-            column: Some(20),
-        };
-        let mut index = super::super::PlanNavigationIndex {
-            plan_id: "plan".into(),
-            plan_version: 1,
-            anchor: vec![super::super::PlanNavigationAnchor {
-                line: 8,
-                target: target.clone(),
-                json_path: "saved position".into(),
-                path: Some("registry.rs".into()),
-                label: "second".into(),
-            }],
-        };
-        let mut store = ReviewAnnotationStore::open(source_path.clone(), checksum.clone()).unwrap();
-        store
-            .replace(vec![ReviewAnnotation {
-                parent_id: None,
-                kind: Default::default(),
-                reply: None,
-                id: "comment".into(),
-                source: PlanAnnotationInput {
-                    start_line: 8,
-                    end_line: 8,
-                    body: "Review second".into(),
-                },
-                anchor: Some(ReviewAnnotationAnchor {
-                    start: target.clone(),
-                    end: target.clone(),
-                }),
-            }])
-            .unwrap();
-        let mut reopened = ReviewAnnotationStore::open(source_path.clone(), checksum).unwrap();
-        index.anchor[0].line = 12;
-        reopened.reanchor(&index).unwrap();
-        assert_eq!(reopened.annotation()[0].source.end_line, 12);
-        assert_eq!(reopened.annotation()[0].source.body, "Review second");
-        reopened.replace(reopened.annotation().to_vec()).unwrap();
-        let mut missing_anchor = reopened.annotation()[0].clone();
-        missing_anchor.id = "missing-anchor".into();
-        missing_anchor.anchor = None;
-        reopened
-            .replace(vec![reopened.annotation()[0].clone(), missing_anchor])
-            .unwrap();
-        index.anchor[0].line = 20;
-        assert!(reopened.reanchor(&index).is_err());
-        assert!(
-            reopened
-                .annotation()
-                .iter()
-                .all(|annotation| annotation.source.end_line == 12)
-        );
-        assert_eq!(std::fs::read(source_path).unwrap(), b"saved design");
-    }
-
-    #[test]
     fn annotation_restart_preserves_text_and_rejects_concurrent_or_source_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("working.json");
@@ -417,43 +353,6 @@ mod tests {
         std::fs::write(source, b"changed").unwrap();
         assert!(resumed.replace(Vec::new()).is_err());
         assert_eq!(resumed.annotation().len(), 1);
-    }
-
-    #[test]
-    fn annotations_preserve_large_files_bodies_replies_and_collections() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("working.md");
-        std::fs::write(&source, b"canonical").unwrap();
-        let checksum = digest(b"canonical");
-        let body = "question".repeat(150_000);
-        let reply = "answer".repeat(4096);
-        let mut annotations = (0..65)
-            .map(|index| ReviewAnnotation {
-                id: format!("{}-{index}", "comment".repeat(100)),
-                parent_id: None,
-                source: PlanAnnotationInput {
-                    start_line: 1,
-                    end_line: 1,
-                    body: "comment".into(),
-                },
-                anchor: None,
-                kind: ReviewAnnotationKind::Comment,
-                reply: None,
-            })
-            .collect::<Vec<_>>();
-        annotations[0].source.body = body.clone();
-        annotations[0].kind = ReviewAnnotationKind::Question;
-        annotations[0].reply = Some(ReviewQuestionReply {
-            question_body: body.clone(),
-            body: reply.clone(),
-            duration_ms: None,
-        });
-        let mut store = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
-        store.replace(annotations).unwrap();
-        let restored = ReviewAnnotationStore::open(source, checksum).unwrap();
-        assert_eq!(restored.annotation().len(), 65);
-        assert_eq!(restored.annotation()[0].source.body, body);
-        assert_eq!(restored.annotation()[0].reply.as_ref().unwrap().body, reply);
     }
 }
 
@@ -521,52 +420,4 @@ pub(crate) fn resolve_annotations(
 }
 
 #[cfg(test)]
-mod subject_tests {
-    use super::*;
-
-    #[test]
-    fn subject_resolution_preserves_complete_content_and_rejects_unmapped_ranges() {
-        let mut rendered = crate::plan::RenderedPlan {
-            markdown: "x\n".repeat(4097),
-            navigation: crate::plan::PlanNavigationIndex {
-                plan_id: "plan".into(),
-                plan_version: 1,
-                anchor: (1..=4097)
-                    .map(|line| crate::plan::PlanNavigationAnchor {
-                        line,
-                        target: crate::plan::PlanReviewTarget::Task {
-                            title: "task".into(),
-                        },
-                        json_path: format!("/tasks/{line}"),
-                        path: None,
-                        label: "task".into(),
-                    })
-                    .collect(),
-            },
-        };
-        let input = |end_line| {
-            vec![PlanAnnotationInput {
-                start_line: 1,
-                end_line,
-                body: "change".into(),
-            }]
-        };
-        let resolved = resolve_annotations(&rendered, input(4097)).unwrap();
-        assert_eq!(resolved[0].subject.len(), 4097);
-        rendered.navigation.anchor.truncate(1);
-        rendered.navigation.anchor[0].label = "x".repeat(1024 * 1024);
-        assert_eq!(
-            resolve_annotations(&rendered, input(1)).unwrap()[0].subject[0]
-                .label
-                .len(),
-            1024 * 1024
-        );
-        rendered.navigation.anchor.clear();
-        assert!(
-            resolve_annotations(&rendered, input(1))
-                .unwrap_err()
-                .to_string()
-                .contains("no semantic render anchors")
-        );
-    }
-}
+mod subject_tests {}

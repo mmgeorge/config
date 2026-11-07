@@ -37,7 +37,7 @@ Catalog MCP entries contain string `id`, `name`, and `source`, optional `scope`,
 
 **Import previews** contain `source` (canonical path), `fingerprint` (opaque string), `revision` (settings revision), and `candidate` (array). Each candidate contains `id`, `name`, `kind` (`skill` or `mcp`), `source`, optional/null `transport` and `blocked`, and a `conflict` array of strings. A blocked candidate cannot be applied. Preview supports `kind: "mcp"` for JSON/TOML server configuration and `kind: "skills"` for native skill directories. Import scope is `global` or `workspace`, defaulting to `workspace`; `session` scope is rejected. A relative source path resolves against the selected workspace. It reads local files without importing credentials or launching resources. The [import implementation](../../../rust/forge/crates/forge-harness/src/settings/import.rs) owns fingerprint, provenance, and conflict validation. Apply rereads the source, rejects changed fingerprints/revisions and invalid selections, and saves selected resources disabled.
 
-Examples below come from [the isolated shared-API fixture](../../../../nvim/tests/forge/shared_api_examples.lua), which exercises every method without creating an interactive session. `/fixture` replaces its temporary root, and correlation IDs are renumbered for readability. Opaque IDs and fingerprints are retained from the corresponding responses and reused by later requests.
+Examples below were captured from an isolated run that exercised every method without creating an interactive session. `/fixture` replaces its temporary root, and correlation IDs are renumbered for readability. Opaque IDs and fingerprints are retained from the corresponding responses and reused by later requests.
 
 ## `agent.profile.get`
 

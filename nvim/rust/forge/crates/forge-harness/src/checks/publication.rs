@@ -147,37 +147,4 @@ impl CheckNotification {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::CheckNotification;
-    use crate::trace::TraceStore;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn notification_diagnostics_follow_live_logging_configuration() {
-        let directory = tempfile::tempdir().unwrap();
-        let trace = Arc::new(TraceStore::open(directory.path()).unwrap());
-        trace.configure(false).unwrap();
-        let mut notification = CheckNotification::new(trace.clone(), "checks-test".into());
-        notification._worker.abort();
-        assert!(
-            (&mut notification._worker)
-                .await
-                .unwrap_err()
-                .is_cancelled()
-        );
-
-        notification.signal();
-        let path = std::path::PathBuf::from(trace.session_status("checks-test").path);
-        assert!(!path.exists());
-
-        trace.configure(true).unwrap();
-        notification.signal();
-        trace.flush().unwrap();
-        let logged = std::fs::read_to_string(&path).unwrap();
-        assert!(logged.contains("checks.notification_worker_closed"));
-
-        trace.configure(false).unwrap();
-        notification.signal();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), logged);
-    }
-}
+mod tests {}

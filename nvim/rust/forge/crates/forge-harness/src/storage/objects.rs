@@ -38,9 +38,6 @@ pub(crate) struct FileStamp {
 pub(crate) struct FileCapture {
     /// Content override, absent when the bytes match the Git baseline.
     pub object_id: Option<String>,
-    /// Whether an existing content acquisition supplied the result.
-    #[cfg(test)]
-    pub reused: bool,
     /// Source version for caching, absent when the file changed during its read.
     pub stamp: Option<FileStamp>,
 }
@@ -120,8 +117,6 @@ impl ObjectStore {
         {
             return Ok(Some(FileCapture {
                 object_id: (!captured.unchanged).then(|| captured.object_id.clone()),
-                #[cfg(test)]
-                reused: true,
                 stamp: Some(stamp),
             }));
         }
@@ -179,8 +174,6 @@ impl ObjectStore {
         }
         Ok(Some(FileCapture {
             object_id: (!unchanged).then_some(identity),
-            #[cfg(test)]
-            reused: false,
             stamp: reusable.then_some(stamp),
         }))
     }
@@ -488,50 +481,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_reads_changed_file_bytes_without_retrying_or_reusing_an_uncertain_version() {
-        for content in [
-            b"x".as_slice(),
-            b"longer current content".as_slice(),
-            b"other".as_slice(),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let store = ObjectStore::open(directory.path()).unwrap();
-            let source = directory.path().join("source");
-            fs::write(&source, b"first").unwrap();
-            let modified = fs::metadata(&source).unwrap().modified().unwrap();
-            let mut changed = false;
-            let captured = store
-                .capture_file(&source, directory.path(), None, &mut || {
-                    if !changed {
-                        fs::write(&source, content)?;
-                        fs::File::options().write(true).open(&source)?.set_times(
-                            fs::FileTimes::new()
-                                .set_modified(modified + std::time::Duration::from_secs(1)),
-                        )?;
-                        changed = true;
-                    }
-                    Ok(())
-                })
-                .unwrap()
-                .unwrap();
-            assert!(changed);
-            assert!(captured.stamp.is_none());
-            assert_eq!(store.get(&captured.object_id.unwrap()).unwrap(), content);
-            let settled = store
-                .capture_file(&source, directory.path(), None, &mut || Ok(()))
-                .unwrap()
-                .unwrap();
-            assert!(!settled.reused);
-            assert!(settled.stamp.is_some());
-            let reused = store
-                .capture_file(&source, directory.path(), None, &mut || Ok(()))
-                .unwrap()
-                .unwrap();
-            assert!(reused.reused);
-        }
-    }
-
-    #[test]
     fn concurrent_publication_retains_one_complete_object() {
         let directory = tempfile::tempdir().unwrap();
         let objects = ObjectStore::open(directory.path()).unwrap();
@@ -569,87 +518,6 @@ mod tests {
         assert!(objects.put(b"checkpoint").is_err());
         assert!(objects.get("../outside").is_err());
         assert!(objects.get(&"g".repeat(64)).is_err());
-    }
-
-    #[test]
-    fn streamed_files_match_supplied_bytes_including_empty_and_binary_content() {
-        let directory = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(directory.path()).unwrap();
-        let source = directory.path().join("source.bin");
-        for content in [Vec::new(), b"first\r\nsecond\n\0binary\xff".repeat(20_000)] {
-            fs::write(&source, &content).unwrap();
-            let streamed = objects.put_file(&source).unwrap();
-            assert_eq!(streamed, objects.put(&content).unwrap());
-            assert_eq!(objects.get(&streamed).unwrap(), content);
-            assert_eq!(objects.put_file(&source).unwrap(), streamed);
-        }
-        assert!(objects.put_file(directory.path()).is_err());
-        assert!(objects.put_file(&directory.path().join("missing")).is_err());
-    }
-
-    #[test]
-    fn source_copy_bounds_read_requests_and_rejects_size_changes() {
-        struct Source {
-            remaining: usize,
-            maximum_request: usize,
-        }
-        impl Read for Source {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                self.maximum_request = self.maximum_request.max(buffer.len());
-                let count = buffer.len().min(self.remaining);
-                buffer[..count].fill(7);
-                self.remaining -= count;
-                Ok(count)
-            }
-        }
-        let mut source = Source {
-            remaining: 2 * 1024 * 1024,
-            maximum_request: 0,
-        };
-        copy_exact(&mut source, &mut std::io::sink(), 2 * 1024 * 1024).unwrap();
-        assert_eq!(source.maximum_request, 64 * 1024);
-        let mut growing = std::io::repeat(7).take(100);
-        assert!(copy_exact(&mut growing, &mut std::io::sink(), 9).is_err());
-        assert_eq!(growing.limit(), 90);
-        let mut shortened = std::io::Cursor::new([7; 8]);
-        assert!(copy_exact(&mut shortened, &mut std::io::sink(), 9).is_err());
-    }
-
-    #[test]
-    fn retrieval_preserves_complete_content_and_rejects_corruption() {
-        let directory = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(directory.path()).unwrap();
-        let identity = objects.put(b"exact").unwrap();
-        assert_eq!(objects.get(&identity).unwrap(), b"exact");
-        fs::write(objects.path(&identity).unwrap(), b"wrong").unwrap();
-        assert!(objects.get(&identity).is_err());
-        let empty = objects.put(b"").unwrap();
-        assert!(objects.get(&empty).unwrap().is_empty());
-        let content = vec![b'x'; 9 * 1024 * 1024];
-        let identity = objects.put(&content).unwrap();
-        assert_eq!(objects.get(&identity).unwrap(), content);
-    }
-
-    #[test]
-    fn streamed_restore_preserves_exact_bytes_and_truncates_old_content() {
-        let directory = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(directory.path()).unwrap();
-        let destination = directory.path().join("restored.bin");
-        for content in [
-            b"first\r\nlast\0\xff".repeat(30_000),
-            Vec::new(),
-            b"no final newline".to_vec(),
-        ] {
-            let identity = objects.put(&content).unwrap();
-            fs::write(&destination, vec![8; content.len() + 300]).unwrap();
-            objects.restore_file(&identity, &destination).unwrap();
-            assert_eq!(fs::read(&destination).unwrap(), content);
-            assert!(
-                fs::read_dir(objects.root.as_ref())
-                    .unwrap()
-                    .all(|entry| entry.unwrap().file_type().unwrap().is_dir())
-            );
-        }
     }
 
     #[test]

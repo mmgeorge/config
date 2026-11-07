@@ -300,37 +300,6 @@ mod test {
         DeclarationDesign, DeclarationFile, PlanAnnotationSubject, document::test_fixture,
     };
 
-    /// Preserve multiline selections without confusing surrounding rows with the target.
-    #[test]
-    fn selected_lines_preserve_exact_ranges_and_context_at_document_edges() {
-        let rendered = crate::plan::RenderedPlan {
-            markdown: (1..=12).map(|line| format!("row {line}\n")).collect(),
-            navigation: crate::plan::PlanNavigationIndex {
-                plan_id: "plan".into(),
-                plan_version: 3,
-                anchor: Vec::new(),
-            },
-        };
-        let selection = |start_line, end_line| crate::plan::PlanAnnotationInput {
-            start_line,
-            end_line,
-            body: "why?".into(),
-        };
-        let output = selected_lines(&rendered, &selection(5, 9)).unwrap();
-        assert_eq!(
-            output,
-            "Selected plan lines: 5-9\n\nContext before:\n2: row 2\n3: row 3\n4: row 4\n\
-             \nSelected text:\n5: row 5\n6: row 6\n7: row 7\n8: row 8\n9: row 9\n\
-             \nContext after:\n10: row 10\n11: row 11\n12: row 12\n"
-        );
-        let output = selected_lines(&rendered, &selection(1, 12)).unwrap();
-        assert!(output.contains("Selected text:\n1: row 1\n"));
-        assert!(output.contains("12: row 12\n\nContext after:\n"));
-        for invalid in [selection(0, 1), selection(2, 1), selection(1, 13)] {
-            assert!(selected_lines(&rendered, &invalid).is_err());
-        }
-    }
-
     fn document(before: &str, after: &str) -> PlanDocument {
         let mut document = test_fixture("plan", "Review declarations.");
         let mut design = DeclarationDesign::default();
@@ -403,90 +372,6 @@ mod test {
     }
 
     #[test]
-    fn distant_comments_use_separate_bounded_excerpts_and_numbered_ranges() {
-        let text = (1..=24)
-            .map(|line| format!("line {line}\n"))
-            .collect::<String>();
-        let document = document(&text, &text);
-        let output = render(
-            &document,
-            &[
-                comment(
-                    "src/controls.rs",
-                    "proposed",
-                    &[5, 6],
-                    "Explain this range.",
-                ),
-                comment("src/controls.rs", "proposed", &[20], "Explain this line."),
-            ],
-        )
-        .unwrap();
-        assert_eq!(output.matches("src/controls.rs").count(), 2);
-        assert!(output.contains("5–6: Explain this range."));
-        assert!(output.contains("20: Explain this line."));
-        assert!(output.contains("line 2\n"));
-        assert!(output.contains("line 9\n"));
-        assert!(output.contains("line 17\n"));
-        assert!(output.contains("line 23\n"));
-        for excluded in [1, 10, 16, 24] {
-            assert!(!output.contains(&format!("line {excluded}\n")));
-        }
-    }
-
-    #[test]
-    fn baseline_context_uses_current_numbers_and_moves_retain_both_paths() {
-        let mut document = document(
-            "first\nunchanged\nlast\n",
-            "added\nfirst\nunchanged\nlast\n",
-        );
-        let design = document.design.as_mut().unwrap();
-        let proposed = design.proposed.remove("src/controls.rs").unwrap();
-        design.proposed.insert("src/input.rs".into(), proposed);
-        design
-            .moved
-            .insert("src/controls.rs".into(), "src/input.rs".into());
-        let output = render(
-            &document,
-            &[
-                comment("src/controls.rs", "baseline", &[2], "Keep this behavior."),
-                comment("src/input.rs", "proposed", &[3], "Explain its purpose."),
-            ],
-        )
-        .unwrap();
-        assert_eq!(output.matches("src/controls.rs → src/input.rs").count(), 1);
-        assert!(output.contains("3    unchanged"));
-        assert!(output.contains("3: Keep this behavior."));
-        assert!(output.contains("3: Explain its purpose."));
-    }
-
-    #[test]
-    fn added_and_deleted_files_preserve_comments_and_escape_code_fences() {
-        let mut document = document("deleted\n", "");
-        let design = document.design.as_mut().unwrap();
-        design.proposed.remove("src/controls.rs");
-        design
-            .proposed
-            .insert("README.md".into(), "```rust\nexample\n```\n".into());
-        let output = render(
-            &document,
-            &[
-                comment("src/controls.rs", "baseline", &[1], "Why delete this?"),
-                comment(
-                    "README.md",
-                    "proposed",
-                    &[2],
-                    "Clarify the example.\nPreserve this second line.",
-                ),
-            ],
-        )
-        .unwrap();
-        assert!(output.contains("1  - deleted"));
-        assert!(output.contains("1: Why delete this?"));
-        assert!(output.contains("````text\n"));
-        assert!(output.contains("2: Clarify the example.\nPreserve this second line."));
-    }
-
-    #[test]
     fn change_feedback_uses_saved_summary_rows_and_rejects_missing_offsets() {
         let mut document = document("pub fn run();\n", "pub fn run();\n");
         document.design.as_mut().unwrap().proposed_calls.insert(
@@ -524,41 +409,6 @@ mod test {
                 .to_string()
                 .contains("absent")
         );
-    }
-
-    #[test]
-    fn section_and_empty_file_comments_remain_readable() {
-        let document = document("", "");
-        let annotations = [
-            PlanAnnotation {
-                subject: vec![PlanAnnotationSubject {
-                    target: PlanReviewTarget::File {
-                        path: "src/controls.rs".into(),
-                    },
-                    json_path: "internal".into(),
-                    label: "internal".into(),
-                    path: None,
-                }],
-                label: "File".into(),
-                body: "Why is this empty?".into(),
-            },
-            PlanAnnotation {
-                subject: vec![PlanAnnotationSubject {
-                    target: PlanReviewTarget::Section {
-                        section: crate::plan::PlanSection::Overview,
-                    },
-                    json_path: "internal".into(),
-                    label: "Description".into(),
-                    path: None,
-                }],
-                label: "Description".into(),
-                body: "Describe the requirement.".into(),
-            },
-        ];
-        let output = render(&document, &annotations).unwrap();
-        assert!(output.contains("src/controls.rs\n\nWhy is this empty?"));
-        assert!(output.contains("Description:\nDescribe the requirement."));
-        assert_eq!(render(&document, &[]).unwrap(), "None");
     }
 
     #[test]

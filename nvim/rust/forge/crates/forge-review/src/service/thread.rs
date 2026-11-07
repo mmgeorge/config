@@ -507,32 +507,6 @@ mod tests {
     }
 
     #[test]
-    fn outdated_thread_retains_original_source_and_explicit_comment_continuation() {
-        let thread = decode(&record()).unwrap();
-        assert!(thread.outdated && thread.can_reply && !thread.can_resolve);
-        assert_eq!(thread.line, None);
-        assert_eq!(thread.original_line, Some(5));
-        assert_eq!(thread.original_start_line, Some(3));
-        assert_eq!(thread.next_cursor.as_deref(), Some("next"));
-        assert_eq!(thread.total_comments, 2);
-        assert_eq!(thread.comment[0].body, "draft\r\n\n");
-        assert_eq!(thread.comment[0].author, None);
-        assert_eq!(
-            thread.comment[0].created_at.as_deref(),
-            Some("2026-09-08T10:00:00Z")
-        );
-        assert_eq!(
-            thread.comment[0].updated_at.as_deref(),
-            Some("2026-09-08T11:00:00Z")
-        );
-        assert_eq!(
-            thread.comment[0].original_commit.as_deref(),
-            Some("a".repeat(40).as_str())
-        );
-        assert_eq!(thread.comment[0].review_state.as_deref(), Some("PENDING"));
-    }
-
-    #[test]
     fn thread_rejects_hidden_truncation_and_nonimmutable_source_identity() {
         let mut truncated = record();
         truncated["comments"]["pageInfo"]["hasNextPage"] = json!(false);

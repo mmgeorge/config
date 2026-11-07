@@ -11,21 +11,8 @@ use tokio::sync::{Mutex, oneshot, watch};
 /// Retain the real worker until the fixture supplies a result or drops its native producer.
 pub(super) struct NativeTurnFixture {
     pub(super) start: NativeTurnStart,
-    result: oneshot::Sender<TurnResult>,
-    runner: crate::turn_runner::RetainedTurn,
-}
-
-impl NativeTurnFixture {
-    /// Collect the actual fixture driver and its canonical native result.
-    pub(super) async fn complete(self, result: TurnResult) {
-        self.result
-            .send(result)
-            .expect("fixture driver retains its result receiver");
-        self.runner
-            .join()
-            .await
-            .expect("fixture native collection succeeds");
-    }
+    _result: oneshot::Sender<TurnResult>,
+    _runner: crate::turn_runner::RetainedTurn,
 }
 
 struct Driver {
@@ -89,7 +76,7 @@ pub(super) async fn native_turn(
         start: started
             .await
             .expect("fixture driver publishes its start capability"),
-        result,
-        runner,
+        _result: result,
+        _runner: runner,
     }
 }

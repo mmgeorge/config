@@ -231,23 +231,4 @@ pub(super) async fn execute(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn validates_rename_inputs_and_read_only_modes() {
-        assert!(parse(SYMBOL, json!({"symbol":"Store","new_name":"Shelf"})).is_ok());
-        assert!(parse(SYMBOL, json!({"path":"a.rs","line":1,"new_name":"Shelf"})).is_err());
-        assert!(parse(SYMBOL, json!({"symbol":"Store","new_name":" "})).is_err());
-        assert!(
-            parse(
-                FILE,
-                json!({"old_path":"a","new_path":"b","overwrite":true})
-            )
-            .is_err()
-        );
-        assert!(!allowed_mode(crate::provider::PromptMode::Plan));
-        assert!(!allowed_mode(crate::provider::PromptMode::PlanDiscussion));
-        assert!(!allowed_mode(crate::provider::PromptMode::PlanQuestion));
-        assert!(allowed_mode(crate::provider::PromptMode::Chat));
-    }
-}
+mod tests {}

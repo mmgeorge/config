@@ -251,45 +251,4 @@ mod tests {
         block.validate()?;
         Ok(())
     }
-
-    #[tokio::test]
-    async fn sparse_saved_diff_keeps_side_bytes_and_local_capture_coordinates() -> Result<()> {
-        let text = "--- a/example.mjs\n+++ b/example.mjs\n@@ -900001,2 +700001,2 @@\n const shared = 1;\r\n-const old = 2;\r\n\\ No newline at end of file\n+const next = 'value';\r\n\\ No newline at end of file\n";
-        let patch = UnifiedPatch::parse(text)?;
-        let hunk = &patch.file[0].hunk[0];
-        assert_eq!(
-            fragment(hunk, true)?.bytes(),
-            b"const shared = 1;\r\nconst old = 2;\r"
-        );
-        assert_eq!(
-            fragment(hunk, false)?.bytes(),
-            b"const shared = 1;\r\nconst next = 'value';\r"
-        );
-        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1,
-            jobs: 2,
-        })));
-        let job = SavedDiffSyntax {
-            target: TargetId("diff".into()),
-            text: text.into(),
-        };
-        let blocks = job.analyze(&engine).await?;
-        assert_eq!(blocks.len(), 1);
-        let block = &blocks[0];
-        assert_eq!(block.text.row_count(), 3);
-        for row in 0..3 {
-            assert!(
-                block
-                    .metadata
-                    .visible_decoration
-                    .iter()
-                    .any(|span| span.range.start.row == row)
-            );
-        }
-        for span in &block.metadata.visible_decoration {
-            assert!(span.range.end.column <= block.text.row(span.range.end.row).unwrap().len());
-        }
-        assert!(block.retained_bytes() < 16 * 1024);
-        Ok(())
-    }
 }

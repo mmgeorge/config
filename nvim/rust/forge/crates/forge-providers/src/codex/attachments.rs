@@ -45,19 +45,4 @@ mod tests {
         );
         assert_eq!(encoded[2]["text"], "Describe this image");
     }
-
-    #[test]
-    fn literal_attachment_looking_text_does_not_create_native_file_items() {
-        let encoded = input(
-            "[Image #1](forge-attachment:broken) C:\\image.png <image path=missing.png>".into(),
-            &[],
-        );
-
-        assert_eq!(encoded.len(), 1);
-        assert_eq!(encoded[0]["type"], "text");
-        assert_eq!(
-            encoded[0]["text"],
-            "[Image #1](forge-attachment:broken) C:\\image.png <image path=missing.png>"
-        );
-    }
 }

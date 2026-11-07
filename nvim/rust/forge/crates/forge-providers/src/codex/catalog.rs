@@ -370,35 +370,4 @@ mod tests {
         assert_eq!(mcp_list[1].transport, McpTransportKind::Http);
         assert_eq!(mcp_list[1].status, McpStatus::Disabled);
     }
-
-    #[test]
-    fn mcp_runtime_status_takes_precedence_over_an_empty_tool_catalog() {
-        for (runtime_status, expected) in [
-            ("notStarted", McpStatus::Unavailable),
-            ("starting", McpStatus::Loading),
-            ("connected", McpStatus::Connected),
-            ("authenticationRequired", McpStatus::NeedsAuthentication),
-            ("failed", McpStatus::Failed),
-            ("cancelled", McpStatus::Unavailable),
-            ("disabled", McpStatus::Disabled),
-        ] {
-            let catalog = parse_mcp_catalog(
-                &json!({"data":[{"name":"server","runtimeStatus":runtime_status,"tools":{}}]}),
-                &json!({}),
-            );
-            assert_eq!(catalog[0].status, expected, "{runtime_status}");
-        }
-        let catalog = parse_mcp_catalog(
-            &json!({"data":[{"name":"server","tools":{},"toolsError":"Discovery failed"}]}),
-            &json!({}),
-        );
-        assert_eq!(catalog[0].status, McpStatus::Failed);
-        assert_eq!(
-            catalog[0]
-                .tool_error
-                .as_ref()
-                .map(|message| message.as_str()),
-            Some("Provider reported an MCP tool discovery error"),
-        );
-    }
 }

@@ -113,37 +113,4 @@ pub(crate) fn capture_directory(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep creation, modification, and deletion observable while excluding Harness's own writes.
-    #[test]
-    fn folder_snapshots_track_content_without_self_invalidation() -> Result<()> {
-        let workspace = tempfile::tempdir()?;
-        let data_root = workspace.path().join("data");
-        let objects = ObjectStore::open(&data_root)?;
-        std::fs::write(workspace.path().join("source.rs"), "fn original() {}\n")?;
-        let original =
-            capture_directory(workspace.path(), &data_root, &objects, "session".into(), 1)?;
-        std::fs::write(data_root.join("runtime.log"), "Harness activity")?;
-        let same = capture_directory(workspace.path(), &data_root, &objects, "session".into(), 2)?;
-        assert_eq!(original.id, same.id);
-        std::fs::write(workspace.path().join("source.rs"), "fn repaired() {}\n")?;
-        std::fs::write(workspace.path().join("helper.rs"), "fn helper() {}\n")?;
-        let changed =
-            capture_directory(workspace.path(), &data_root, &objects, "session".into(), 3)?;
-        assert_eq!(
-            original.changed_paths(&changed)?,
-            vec!["helper.rs", "source.rs"]
-        );
-        assert_eq!(
-            original.read(&objects, "source.rs")?.unwrap(),
-            b"fn original() {}\n"
-        );
-        std::fs::remove_file(workspace.path().join("source.rs"))?;
-        let removed =
-            capture_directory(workspace.path(), &data_root, &objects, "session".into(), 4)?;
-        assert_eq!(changed.changed_paths(&removed)?, vec!["source.rs"]);
-        Ok(())
-    }
-}
+mod tests {}

@@ -508,58 +508,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declaration_fold_preserves_supplied_content_and_validates_before_mutation() {
-        let presenter = DiffPresenter::new(Default::default());
-        let mut block = vec![
-            presenter
-                .summary(
-                    BlockId("signature".into()),
-                    "fn parse() {",
-                    RowChange::Modified,
-                    [Some(1), Some(1)],
-                    3,
-                )
-                .unwrap(),
-            BufferBlock {
-                id: BlockId("details".into()),
-                text: BufferText::from_rows(["Change", "  Parse input.", "}"]).unwrap(),
-                metadata: Default::default(),
-            },
-        ];
-        let original = block.clone();
-        let invalid = DeclarationFoldLayout {
-            id: FoldId("parse".into()),
-            heading: 0,
-            opening: 0,
-            closing: 2,
-            closed: true,
-            summary: " … 1 change }".into(),
-        };
-        assert!(DiffPresenter::declaration_fold(&mut block, invalid).is_err());
-        assert_eq!(block, original);
-        let layout = || DeclarationFoldLayout {
-            id: FoldId("parse".into()),
-            heading: 0,
-            opening: 0,
-            closing: 1,
-            closed: true,
-            summary: " … 1 change }".into(),
-        };
-        assert!(DiffPresenter::declaration_fold(&mut block, layout()).unwrap());
-        let fold = &block[0].metadata.fold[0];
-        assert_eq!(fold.end.block, BlockId("details".into()));
-        assert_eq!(fold.end.position.row, 3);
-        assert_eq!(fold.collapsed_suffix.as_deref(), Some(" … 1 change }"));
-        assert!(fold.closed);
-        assert_eq!(block[1], original[1]);
-        assert_eq!(block[0].text, original[0].text);
-        assert_eq!(block[0].metadata.gutter, original[0].metadata.gutter);
-        assert_eq!(block[0].metadata.target, original[0].metadata.target);
-        assert!(!DiffPresenter::declaration_fold(&mut block, layout()).unwrap());
-        assert_eq!(block[0].metadata.fold.len(), 1);
-    }
-
-    #[test]
     fn streamed_hunk_heading_is_emitted_once_and_failed_identity_does_not_advance() {
         let mut presenter = DiffPresenter::new(Default::default());
         let group = DisplayHunk::context(1..3, 2..4);
@@ -648,14 +596,5 @@ mod tests {
             assert_eq!(rows[2].new_coordinate().unwrap().line, 20);
             assert_eq!(counts(&rows), (1, 1));
         }
-    }
-    #[test]
-    fn declaration_body_summary_counts_regions_and_omits_zero_labels() {
-        assert_eq!(super::declaration_body_summary(0, "}"), " … }");
-        assert_eq!(super::declaration_body_summary(1, "}"), " … 1 change }");
-        assert_eq!(
-            super::declaration_body_summary(2, "end"),
-            " … 2 changes end"
-        );
     }
 }

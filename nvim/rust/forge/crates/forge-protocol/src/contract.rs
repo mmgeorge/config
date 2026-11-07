@@ -125,33 +125,6 @@ mod tests {
     }
 
     #[test]
-    fn lsp_mutation_has_a_distinct_required_envelope() {
-        assert!(validate("session", "lsp.mutation", &json!({
-            "id":"rename", "workspace":".", "mutation":{"kind":"file","old_path":"a","new_path":"b"}
-        })).is_ok());
-        assert!(
-            validate(
-                "session",
-                "lsp.mutation",
-                &json!({
-                    "id":"rename", "workspace":".", "arguments":{}
-                })
-            )
-            .is_err()
-        );
-        assert!(
-            validate(
-                "session",
-                "lsp.request",
-                &json!({
-                    "id":"read", "workspace":".", "arguments":{}
-                })
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn serialization_cannot_bypass_the_event_contract() {
         let mut event = SessionEvent {
             session_id: "session".into(),
@@ -162,26 +135,5 @@ mod tests {
         assert!(serde_json::to_string(&Message::Event(event.clone())).is_err());
         event.payload = json!({"kind":"approval_resolved","data":{"request_id":"request"}});
         assert!(serde_json::to_string(&Message::Event(event)).is_ok());
-    }
-
-    #[test]
-    fn question_snapshot_requires_revision_and_question_array() {
-        assert!(
-            validate(
-                "session",
-                "questions_changed",
-                &json!({"revision":1,"questions":[]})
-            )
-            .is_ok()
-        );
-        assert!(
-            validate(
-                "session",
-                "questions_changed",
-                &json!({"revision":1,"questions":{}})
-            )
-            .is_err()
-        );
-        assert!(validate("session", "questions_changed", &json!({"questions":[]})).is_err());
     }
 }

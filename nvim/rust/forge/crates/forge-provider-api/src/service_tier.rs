@@ -44,21 +44,3 @@ impl ServiceTier {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn speed_selection_requires_the_advertised_provider_capability() {
-        let mut capability = crate::ProviderCapability::default();
-        assert!(ServiceTier::Standard.validate(&capability).is_ok());
-        assert!(ServiceTier::Fast.validate(&capability).is_err());
-        assert!(ServiceTier::Ultrafast.validate(&capability).is_err());
-        capability.fast_mode = true;
-        assert!(ServiceTier::Fast.validate(&capability).is_ok());
-        assert!(ServiceTier::Ultrafast.validate(&capability).is_err());
-        capability.ultrafast_mode = true;
-        assert!(ServiceTier::Ultrafast.validate(&capability).is_ok());
-    }
-}

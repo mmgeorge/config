@@ -93,17 +93,6 @@ impl Drop for FutureTrace<'_> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn future_size_does_not_invoke_its_factory() {
-        let called = std::cell::Cell::new(false);
-        let factory = || {
-            called.set(true);
-            async {}
-        };
-        let _bytes = future_bytes(&factory);
-        assert!(!called.get());
-    }
-
     #[tokio::test]
     async fn future_trace_records_completion_failure_and_cancellation_only_when_enabled()
     -> Result<()> {

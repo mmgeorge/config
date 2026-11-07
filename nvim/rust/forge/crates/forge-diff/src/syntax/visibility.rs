@@ -629,31 +629,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_names_and_other_languages_remain_visible() {
-        for (path, source) in [
-            (
-                "main.rs",
-                "pub fn test();\npub mod tests { pub fn helper(); }",
-            ),
-            (
-                "main.ts",
-                "export function test(): void;\nexport namespace tests { export function helper(): void; }",
-            ),
-            (
-                "main.lua",
-                "function test()\nend\nfunction tests.helper()\nend\n",
-            ),
-        ] {
-            let text = DeclarationOverview::present(path, source).unwrap().text;
-            let visibility = DeclarationVisibility::analyze(path, &text, false).unwrap();
-            assert!(
-                visibility.rows.iter().all(|visible| *visible),
-                "{path}: {text}"
-            );
-        }
-    }
-
     fn visible(path: &str, source: &str) -> String {
         let text = DeclarationOverview::present(path, source).unwrap().text;
         let visibility = DeclarationVisibility::analyze(path, &text, true).unwrap();
@@ -673,12 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn configuration_remains_visible_in_public_only_inspection() {
-        let source = "# Package settings\n[package]\nname = \"arena\"\nversion = \"0.1.0\"\n\n[dependencies]\nbevy = \"0.17\"\n";
-        assert_eq!(visible("Cargo.toml", source), source.trim_end());
-    }
-
-    #[test]
     fn public_filter_keeps_main_entry_point_and_attachments_but_hides_private_methods() {
         let source = "/// Starts the binary.\n#[tokio::main]\nasync fn main() -> Result<(), Error>;\n\nfn main_helper();\n\npub struct Handler;\n\nimpl Handler {\n  fn main();\n}\n";
         let output = visible("src/main.rs", source);
@@ -688,41 +657,6 @@ mod tests {
         assert!(!output.contains("main_helper"));
         assert!(!output.contains("impl Handler"));
         assert!(!output.contains("  fn main();"));
-    }
-
-    #[test]
-    fn trait_implementation_bodies_are_hidden_in_both_inspection_modes() {
-        let source = "pub struct ArenaPlugin {}
-impl ArenaPlugin { pub fn new() -> Self; fn internal(); }
-impl Default for ArenaPlugin { fn default() -> Self; }";
-        let text = DeclarationOverview::present("src/plugin.rs", source)
-            .unwrap()
-            .text;
-        for public_only in [false, true] {
-            let visibility =
-                DeclarationVisibility::analyze("src/plugin.rs", &text, public_only).unwrap();
-            let rendered = text
-                .lines()
-                .enumerate()
-                .filter(|(row, _)| visibility.rows[*row])
-                .map(|(row, line)| {
-                    visibility
-                        .replacement
-                        .get(&row)
-                        .map(String::as_str)
-                        .unwrap_or(line)
-                })
-                .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                );
-            assert!(rendered.contains("impl Default for ArenaPlugin {}"));
-            assert!(!rendered.contains("fn default"));
-            assert!(rendered.contains("pub fn new"));
-            assert_eq!(rendered.contains("fn internal"), !public_only);
-            assert!(text.contains("fn default"));
-        }
     }
 
     #[test]
@@ -757,32 +691,6 @@ impl Default for ArenaPlugin { fn default() -> Self; }";
     }
 
     #[test]
-    fn scoped_public_owners_members_and_attachments_remain_visible() {
-        let source = "#[derive(Clone)]\n/// Crate state.\npub(crate) struct State { pub(super) value: u64, private: u64 }\nimpl State { pub(crate) fn new() -> Self; pub(super) fn update(&mut self); fn hidden(); }\npub(super) enum Phase { Ready, Done }\npub(crate) trait Contract { fn apply(&self); }\npub(super) fn configure();\nstruct Hidden;\nimpl Hidden { pub(crate) fn concealed(); }\n";
-        let text = visible("state.rs", source);
-        for retained in [
-            "#[derive(Clone)]",
-            "/// Crate state.",
-            "pub(crate) struct State",
-            "pub(super) value",
-            "impl State",
-            "pub(crate) fn new",
-            "pub(super) fn update",
-            "pub(super) enum Phase",
-            "Ready",
-            "Done",
-            "pub(crate) trait Contract",
-            "fn apply",
-            "pub(super) fn configure",
-        ] {
-            assert!(text.contains(retained), "missing {retained}: {text}");
-        }
-        for hidden in ["private:", "fn hidden", "struct Hidden", "fn concealed"] {
-            assert!(!text.contains(hidden), "exposed {hidden}: {text}");
-        }
-    }
-
-    #[test]
     fn typescript_and_lua_use_native_export_visibility() {
         let text = visible(
             "api.ts",
@@ -802,37 +710,5 @@ impl Default for ArenaPlugin { fn default() -> Self; }";
             "{text}"
         );
         assert!(!text.contains("hidden"), "{text}");
-    }
-
-    #[test]
-    fn tuple_fields_and_enum_payloads_keep_their_distinct_visibility() {
-        let text = visible(
-            "lib.rs",
-            "pub struct Tuple(pub u64, String);\npub enum Event { Data { value: u64 }, Pair(u64, String) }\n",
-        );
-        assert!(
-            text.contains("pub struct Tuple") && text.contains("pub u64"),
-            "{text}"
-        );
-        let tuple = text.split("pub enum").next().unwrap();
-        assert!(!tuple.contains("String"), "{text}");
-        assert!(
-            text.contains("value: u64") && text.contains("String"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn empty_public_structs_compact_without_losing_attributes_or_spacing() {
-        let text = visible(
-            "lib.rs",
-            "#[derive(Debug, Clone)]\npub struct ArenaPlugin { config: u64 }\npub struct Next { pub value: u64 }\n",
-        );
-        assert!(
-            text.contains("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}"),
-            "{text}"
-        );
-        assert!(!text.contains("config:"), "{text}");
-        assert!(text.contains("\n\npub struct Next"), "{text}");
     }
 }

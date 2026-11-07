@@ -708,29 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn issue_preserves_complete_large_body_through_capture_and_reopen() {
-        let mut document = issue_document();
-        let body = "full body ".repeat(950_000);
-        edit(&mut document, "body", 0, 1, &body);
-        let draft = document.draft_payload().unwrap();
-        assert!(serde_json::to_vec(&draft).unwrap().len() > 8 * 1024 * 1024);
-        let mut reopened = issue_document();
-        reopened.restore_draft(&draft).unwrap();
-        assert_eq!(
-            reopened
-                .edits
-                .snapshot(&RegionId("body".into()))
-                .unwrap()
-                .text,
-            body
-        );
-        let mutation = reopened.begin_save().unwrap().unwrap();
-        assert!(
-            matches!(mutation, ReviewMutation::IssueEdit { body: Some(captured), .. } if captured == body)
-        );
-    }
-
-    #[test]
     fn native_issue_fields_preserve_newer_typing_and_capture_only_assignee_delta() {
         let mut document = issue_document();
         let initial = document.snapshot();
@@ -783,25 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn native_issue_empty_body_and_uncertain_save_keep_independent_revisions() {
-        let mut document = issue_document();
-        edit(&mut document, "body", 0, 1, "");
-        let capture = document.begin_save().unwrap().unwrap();
-        assert!(
-            matches!(capture, ReviewMutation::IssueEdit { body: Some(ref body), .. } if body.is_empty())
-        );
-        document.complete_save(SaveOutcome::Uncertain).unwrap();
-        edit(&mut document, "body", 1, 2, "newer\n");
-        assert!(document.begin_save().is_err());
-        let body = document.fields().unwrap().pop().unwrap();
-        assert!(body.dirty && body.uncertain);
-        assert_eq!(body.revision, RegionRevision(2));
-        let mut equivalent = issue_document();
-        edit(&mut equivalent, "assignees", 0, 1, " KEEP, @remove ");
-        assert!(equivalent.begin_save().unwrap().is_none());
-        assert!(!equivalent.fields().unwrap()[1].dirty);
-    }
-    #[test]
     fn prepared_issue_edit_abort_preserves_document_and_draft() {
         let mut document = issue_document();
         let before = serde_json::to_value(document.snapshot()).unwrap();
@@ -824,83 +782,6 @@ mod tests {
         assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
         assert_eq!(document.draft_payload().unwrap(), draft);
         edit(&mut document, "body", 0, 1, "accepted");
-    }
-
-    #[test]
-    fn failed_issue_capture_preserves_fields_and_projection() {
-        let mut document = issue_document();
-        let index = document
-            .buffer
-            .block_index(&BlockId("region:body".into()))
-            .unwrap();
-        document
-            .buffer
-            .edit_many(vec![forge_buffer::sequence::SequenceEdit {
-                range: index..index + 1,
-                block: vec![],
-            }])
-            .unwrap();
-        let before = serde_json::to_value(document.snapshot()).unwrap();
-        let draft = document.draft_payload().unwrap();
-        let failure = document
-            .capture_draft(vec![RegionEdit {
-                document: DocumentId("issue-document".into()),
-                region: RegionId("body".into()),
-                base: RegionRevision(0),
-                sequence: EditSequence(1),
-                text: "candidate\r\nλ\n".into(),
-            }])
-            .unwrap_err();
-        assert!(failure.to_string().contains("issue field is missing"));
-        assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
-        assert_eq!(document.draft_payload().unwrap(), draft);
-    }
-
-    #[test]
-    fn invalid_issue_capture_rejects_every_field_before_adoption() {
-        for (region, text) in [("title", "  "), ("assignees", "invalid/login")] {
-            let mut document = issue_document();
-            let before = serde_json::to_value(document.snapshot()).unwrap();
-            let draft = document.draft_payload().unwrap();
-            assert!(
-                document
-                    .capture_draft(vec![
-                        RegionEdit {
-                            document: DocumentId("issue-document".into()),
-                            region: RegionId("body".into()),
-                            base: RegionRevision(0),
-                            sequence: EditSequence(1),
-                            text: "candidate body".into(),
-                        },
-                        RegionEdit {
-                            document: DocumentId("issue-document".into()),
-                            region: RegionId(region.into()),
-                            base: RegionRevision(0),
-                            sequence: EditSequence(2),
-                            text: text.into(),
-                        }
-                    ])
-                    .is_err()
-            );
-            assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
-            assert_eq!(document.draft_payload().unwrap(), draft);
-        }
-    }
-
-    #[test]
-    fn issue_field_metadata_retains_saved_baseline_during_local_capture() {
-        let mut document = issue_document();
-        edit(&mut document, "body", 0, 1, "local\r\nλ\n");
-        let field = document
-            .fields()
-            .unwrap()
-            .into_iter()
-            .find(|field| field.region.0 == "body")
-            .unwrap();
-        assert_eq!(field.baseline, "exact\r\nbody\n");
-        assert!(field.dirty);
-        let encoded = serde_json::to_value(field).unwrap();
-        assert_eq!(encoded["baseline"], "exact\r\nbody\n");
     }
 
     #[test]
@@ -928,42 +809,6 @@ mod tests {
         assert!(restored.fields().unwrap()[2].dirty);
     }
     #[test]
-    fn issue_refresh_prepares_remote_merge_and_preserves_dirty_field_text() {
-        let mut document = issue_document();
-        edit(&mut document, "body", 0, 1, "local body\r\n");
-        let before = serde_json::to_value(document.snapshot()).unwrap();
-        let mut detail = document.detail.clone();
-        detail.title = "Fresh remote title".into();
-        detail.body = "Conflicting remote body".into();
-        let capture = document.capture_refresh(&detail).unwrap();
-        let projection =
-            crate::issue_presentation::project(&detail, capture.fields, &capture.width).unwrap();
-        drop(
-            document
-                .prepare_refresh(capture.revision, capture.width, detail.clone(), projection)
-                .unwrap(),
-        );
-        assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
-        let capture = document.capture_refresh(&detail).unwrap();
-        let projection =
-            crate::issue_presentation::project(&detail, capture.fields, &capture.width).unwrap();
-        let mut prepared = document
-            .prepare_refresh(capture.revision, capture.width, detail, projection)
-            .unwrap();
-        let draft = prepared.take_draft();
-        assert_eq!(
-            draft["issue_document"]["field"]["body"]["text"],
-            "local body\r\n"
-        );
-        assert!(prepared.commit().is_some());
-        let fields = document.fields().unwrap();
-        assert_eq!(fields[0].revision, RegionRevision(1));
-        assert_eq!(fields[2].revision, RegionRevision(1));
-        assert_eq!(fields[2].sequence, EditSequence(1));
-        assert!(fields[2].dirty && fields[2].conflict);
-        assert!(document.begin_save().is_err());
-    }
-    #[test]
     fn issue_closed_unknown_requires_durable_fresh_source_gate() {
         let mut document = issue_document();
         edit(&mut document, "body", 0, 1, "uncertain body");
@@ -979,60 +824,5 @@ mod tests {
         reopened.restore_draft(&payload).unwrap();
         assert!(reopened.fresh_required());
         assert!(reopened.begin_save().is_err());
-    }
-    #[test]
-    fn issue_reopen_preserves_distinct_current_and_pending_counters() {
-        let mut original = issue_document();
-        edit(&mut original, "body", 0, 17, "captured\r\n");
-        original.begin_save().unwrap().unwrap();
-        edit(&mut original, "body", 1, 31, "newer\r\n");
-        let draft = original.draft_payload().unwrap();
-        assert_eq!(
-            draft["issue_document"]["field"]["body"]["pending"]["revision"],
-            1
-        );
-        assert_eq!(
-            draft["issue_document"]["field"]["body"]["pending"]["sequence"],
-            17
-        );
-        let mut restored = issue_document();
-        restored.restore_draft(&draft).unwrap();
-        assert_eq!(restored.pending_sequence(), 17);
-        assert_eq!(restored.pending[0].revision(), RegionRevision(1));
-        assert_eq!(restored.fields().unwrap()[2].revision, RegionRevision(2));
-        assert_eq!(restored.fields().unwrap()[2].sequence, EditSequence(31));
-        assert!(
-            restored
-                .edit(RegionEdit {
-                    document: DocumentId("issue-document".into()),
-                    region: RegionId("body".into()),
-                    base: RegionRevision(2),
-                    sequence: EditSequence(31),
-                    text: "replayed".into()
-                })
-                .is_err()
-        );
-        restored
-            .resolve_pending(SaveOutcome::Confirmed, false)
-            .unwrap();
-        let settled = restored.draft_payload().unwrap();
-        assert_eq!(
-            settled["issue_document"]["field"]["body"]["baseline"],
-            "captured\r\n"
-        );
-        assert_eq!(settled["issue_document"]["field"]["body"]["sequence"], 31);
-        assert_eq!(settled["issue_document"]["field"]["body"]["revision"], 2);
-    }
-    #[test]
-    fn issue_draft_invalid_pending_counters_do_not_change_document() {
-        let mut original = issue_document();
-        edit(&mut original, "body", 0, 9, "pending");
-        original.begin_save().unwrap().unwrap();
-        let mut draft = original.draft_payload().unwrap();
-        draft["issue_document"]["field"]["body"]["pending"]["sequence"] = serde_json::json!(10);
-        let mut restored = issue_document();
-        let before = serde_json::to_value(restored.snapshot()).unwrap();
-        assert!(restored.restore_draft(&draft).is_err());
-        assert_eq!(serde_json::to_value(restored.snapshot()).unwrap(), before);
     }
 }

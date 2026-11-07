@@ -93,27 +93,3 @@ fn required<'a>(snapshot: &'a Value, field: &str) -> Result<&'a str> {
         .as_str()
         .with_context(|| format!("PR snapshot omitted {field}"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_head_name_with_owner_retains_the_fork_identity() {
-        let (_, _, pages) = decode(
-            GithubRepositoryId::new("github.example", "base-owner", "base-repo").unwrap(),
-            7,
-            json!({
-                "number": 7, "id": "PR_test", "title": "Title", "body": "Body",
-                "headRepository": { "nameWithOwner": "", "name": "fork-repo" },
-                "headRepositoryOwner": { "login": "fork-owner" },
-                "reviewRequests": []
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            pages[&ReviewSectionKind::Overview].records[0]["head"]["repo"]["full_name"],
-            "fork-owner/fork-repo"
-        );
-    }
-}

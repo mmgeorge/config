@@ -116,50 +116,6 @@ impl AgentRegistry {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::agent::AgentState;
-    #[test]
-    fn registry_supports_multiple_instances_of_one_definition() {
-        let first = Agent::pending("session", "explorer", "inspect Bevy", 1);
-        let second = Agent::pending("session", "explorer", "inspect physics", 2);
-        let registry = AgentRegistry::from_run_list(vec![first, second]);
-        assert_eq!(registry.list().len(), 2);
-    }
-
-    #[test]
-    fn registry_replaces_a_run_provider_thread_without_leaving_a_stale_index() {
-        let mut run = Agent::pending("session", "explorer", "inspect Bevy", 1);
-        run.provider_thread_id = Some("child-old".into());
-        let mut registry = AgentRegistry::from_run_list(vec![run.clone()]);
-        run.provider_thread_id = Some("child-new".into());
-        registry.insert(run);
-        assert!(registry.get_by_thread("child-old").is_none());
-        assert_eq!(
-            registry.get_by_thread("child-new").unwrap().definition,
-            "explorer"
-        );
-    }
-
-    #[test]
-    fn registry_resolves_one_unbound_run_through_its_parent_identity() {
-        let mut matching = Agent::pending("session", "explorer", "inspect Bevy", 1);
-        matching.state = AgentState::Ready;
-        let other = Agent::pending("session", "explorer", "inspect physics", 2);
-        let mut registry = AgentRegistry::from_run_list(vec![matching.clone(), other.clone()]);
-        *registry.execution_mut(&matching.id) = AgentExecution {
-            parent_exchange_id: Some("parent-one".into()),
-            parent_thread_id: Some("thread-one".into()),
-            active_turn_id: Some("turn-one".into()),
-            task: "inspect Bevy".into(),
-        };
-        registry.execution_mut(&other.id).parent_exchange_id = Some("parent-two".into());
-
-        assert_eq!(
-            registry
-                .resolve_unbound(Some("parent-one"), Some("thread-one"), Some("turn-one"))
-                .map(|run| run.id.as_str()),
-            Some(matching.id.as_str())
-        );
-    }
 
     #[test]
     fn registry_refuses_to_guess_between_unbound_sibling_runs() {

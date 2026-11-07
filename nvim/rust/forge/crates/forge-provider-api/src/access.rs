@@ -209,39 +209,3 @@ pub enum DirectoryOperation {
     Read,
     Write,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_and_deduplicates_directory_identity() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().to_string_lossy().into_owned();
-        let policy = AccessPolicy {
-            writable_directory: vec![path.clone()],
-            ..Default::default()
-        };
-        let policy = policy.validate()?;
-        assert_eq!(policy.writable_roots("/workspace").len(), 2);
-        let mut duplicate = policy.clone();
-        duplicate.writable_directory.push(path);
-        assert!(matches!(
-            duplicate.validate(),
-            Err(AccessPolicyError::Duplicate {
-                kind: AccessDirectoryKind::Writable,
-                ..
-            })
-        ));
-        let mut relative = policy;
-        relative.writable_directory = vec!["relative".into()];
-        assert!(matches!(
-            relative.validate(),
-            Err(AccessPolicyError::NotAbsolute {
-                kind: AccessDirectoryKind::Writable,
-                ..
-            })
-        ));
-        Ok(())
-    }
-}

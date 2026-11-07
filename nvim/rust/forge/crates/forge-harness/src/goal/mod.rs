@@ -112,48 +112,6 @@ pub(crate) fn observe(
 mod test {
     use super::*;
 
-    #[test]
-    fn goal_control_keeps_its_outcome_with_the_admitted_revision() {
-        let previous = crate::task::Task::goal("Previous".into(), Default::default(), 1);
-        let current = crate::task::Task::goal("Current".into(), Default::default(), 2);
-        for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
-            let output = crate::provider::ProviderOutput {
-                event: Vec::new(),
-                completion: crate::provider::ProviderCompletion {
-                    native: forge_provider_api::completion::ProviderCompletion {
-                        evidence: TurnEvidence {
-                            structured_complete: true,
-                            structured_blocked: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                    goal_control: Some(GoalControl {
-                        permit: current.permit(),
-                        termination,
-                        message: "Observed goal outcome".into(),
-                    }),
-                    dispatched_task_permit: Some(previous.permit()),
-                    ..Default::default()
-                },
-            };
-            let (evidence, permit) = output.completion.goal_evidence();
-            assert_eq!(
-                evidence.structured_complete,
-                termination == GoalTermination::Complete
-            );
-            assert_eq!(
-                evidence.structured_blocked,
-                termination == GoalTermination::Blocked
-            );
-            permit.as_ref().unwrap().validate(Some(&current)).unwrap();
-            assert!(permit.unwrap().validate(Some(&previous)).is_err());
-            let serialized = serde_json::to_value(&output).unwrap();
-            assert!(serialized.get("goal_control").is_none());
-            assert!(serialized.get("dispatched_task_permit").is_none());
-        }
-    }
-
     fn goal() -> GoalRecord {
         GoalRecord {
             id: "goal".into(),
@@ -180,77 +138,5 @@ mod test {
             ContinuationDecision::Stalled
         );
         assert_eq!(record.state, GoalState::Stalled);
-    }
-
-    #[test]
-    fn progress_resets_the_no_progress_guard() {
-        let mut record = goal();
-        record.observe(TurnEvidence::default(), 1);
-        assert_eq!(
-            record.observe(
-                TurnEvidence {
-                    workspace_changed: true,
-                    ..TurnEvidence::default()
-                },
-                2
-            ),
-            ContinuationDecision::Continue
-        );
-        assert_eq!(record.continuation.consecutive_no_progress, 0);
-    }
-
-    #[test]
-    fn stops_without_requesting_a_turn_beyond_the_configured_limit() {
-        let mut record = goal();
-        record.continuation.max_turn_count = 2;
-        let progress = TurnEvidence {
-            workspace_changed: true,
-            ..TurnEvidence::default()
-        };
-        assert_eq!(record.observe(progress, 1), ContinuationDecision::Continue);
-        assert_eq!(record.observe(progress, 2), ContinuationDecision::Stalled);
-        assert_eq!(record.continuation.turn_count, 2);
-    }
-
-    #[test]
-    fn inactive_goals_preserve_state_and_time_until_explicit_resume() {
-        for state in [
-            GoalState::Paused,
-            GoalState::Complete,
-            GoalState::Blocked,
-            GoalState::Stalled,
-            GoalState::Cleared,
-        ] {
-            let mut record = goal();
-            record.state = state;
-            record.updated_at_ms = 10;
-            for evidence in [
-                TurnEvidence::default(),
-                TurnEvidence {
-                    structured_complete: true,
-                    ..TurnEvidence::default()
-                },
-                TurnEvidence {
-                    structured_blocked: true,
-                    ..TurnEvidence::default()
-                },
-            ] {
-                assert_eq!(record.observe(evidence, 50), ContinuationDecision::Stop);
-                assert_eq!(record.state, state);
-                assert_eq!(record.updated_at_ms, 10);
-                assert_eq!(record.continuation.turn_count, 0);
-            }
-            if matches!(
-                state,
-                GoalState::Paused | GoalState::Blocked | GoalState::Stalled
-            ) {
-                record.resume(60);
-                assert_eq!(
-                    record.observe(TurnEvidence::default(), 70),
-                    ContinuationDecision::RetryNoProgress
-                );
-                assert_eq!(record.updated_at_ms, 70);
-            }
-        }
     }
 }

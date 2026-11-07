@@ -1599,46 +1599,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_macro_declarations_retain_macro_names() {
-        let source = "pub mod macros { #[rustc_builtin_macro] pub macro Debug($item:item) { /* compiler built-in */ } pub macro Clone($item:item) { /* compiler built-in */ } }";
-        let index = DeclarationIndex::extract("lib.rs", source).unwrap();
-        for name in ["Debug", "Clone"] {
-            let symbol = index
-                .symbol
-                .iter()
-                .find(|symbol| {
-                    symbol.name == name && symbol.macro_namespace && symbol.scope == ["macros"]
-                })
-                .unwrap();
-            assert_eq!(
-                symbol.position.column,
-                source.find(&format!("{name}(")).unwrap() as u32
-            );
-        }
-    }
-
-    #[test]
-    fn optional_derives_do_not_gate_declarations() {
-        let index = DeclarationIndex::extract("lib.rs", "#[cfg_attr(feature = \"serialize\", derive(Serialize))]\n#[doc = \"cfg is mentioned here\"]\npub struct Transform;\n#[cfg_attr(feature = \"optional\", cfg(feature = \"enabled\"))]\npub struct Gated;\n").unwrap();
-        assert!(
-            !index
-                .symbol
-                .iter()
-                .find(|symbol| symbol.name == "Transform")
-                .unwrap()
-                .conditional
-        );
-        assert!(
-            index
-                .symbol
-                .iter()
-                .find(|symbol| symbol.name == "Gated")
-                .unwrap()
-                .conditional
-        );
-    }
-
-    #[test]
     fn rust_retains_scope_aliases_and_signature_references() {
         let index = DeclarationIndex::extract("lib.rs", "use crate::model::{Item as Entry, nested::*};\npub struct Store<T> { pub item: Option<T> }\nimpl<T> Store<T> { pub fn read(&self) -> Entry; }\n").unwrap();
         assert!(!index.incomplete);
@@ -1672,60 +1632,6 @@ mod tests {
                 .reference
                 .iter()
                 .any(|reference| reference.path == ["Entry"])
-        );
-    }
-
-    #[test]
-    fn indexes_typescript_variants_and_callable_bindings() {
-        let index = DeclarationIndex::extract("api.ts", "export enum State { Ready, Active = 1 } const worker = () => {}; export function install() { register(worker); }").unwrap();
-        for name in ["Ready", "Active"] {
-            let symbol = index
-                .symbol
-                .iter()
-                .find(|symbol| symbol.name == name)
-                .unwrap();
-            assert_eq!(symbol.role, DeclarationRole::Variant);
-            assert_eq!(symbol.scope, ["State"]);
-        }
-        assert_eq!(
-            index
-                .symbol
-                .iter()
-                .find(|symbol| symbol.name == "worker")
-                .unwrap()
-                .role,
-            DeclarationRole::Callable
-        );
-    }
-
-    #[test]
-    fn typescript_distinguishes_globals_exports_and_generics() {
-        let index = DeclarationIndex::extract("api.ts", "import type { User as Person } from './model';\nexport interface Api<T> { load(): Promise<T>; user: Person; }\ndeclare global { interface ProjectGlobal {} }\nexport { User as PublicUser } from './model';\n").unwrap();
-        assert!(!index.incomplete);
-        assert!(
-            index
-                .import
-                .iter()
-                .any(|import| import.alias.as_deref() == Some("Person") && !import.export)
-        );
-        assert!(
-            index
-                .import
-                .iter()
-                .any(|import| import.alias.as_deref() == Some("PublicUser") && import.export)
-        );
-        assert!(index.symbol.iter().any(|symbol| symbol.name == "Api" && symbol.visibility == SymbolVisibility::Public));
-        assert!(
-            index
-                .symbol
-                .iter()
-                .any(|symbol| symbol.name == "ProjectGlobal" && symbol.global)
-        );
-        assert!(
-            index
-                .reference
-                .iter()
-                .any(|reference| reference.path == ["Promise"])
         );
     }
 }

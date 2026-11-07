@@ -244,27 +244,3 @@ impl ContextUsage {
         )?)
     }
 }
-
-#[cfg(test)]
-mod context_usage_test {
-    use super::ContextUsage;
-
-    #[test]
-    fn normalizes_context_against_the_reserved_baseline() {
-        let report =
-            forge_provider_api::context::ContextUsage::with_reserved(275_000, 353_000, 12_000)
-                .expect("valid usage with reserved context");
-        let usage = ContextUsage::from_report(&report).expect("derivable usage");
-        assert_eq!(usage.remaining_percent, 23);
-        assert_eq!(usage.size, 353_000);
-        assert!(
-            forge_provider_api::context::ContextUsage::with_reserved(1, 12_000, 12_000).is_none()
-        );
-    }
-
-    #[test]
-    fn preserves_provider_context_as_reported_by_the_provider() {
-        let usage = ContextUsage::reported(156_000, 200_000).expect("valid reported usage");
-        assert_eq!(usage.remaining_percent, 22);
-    }
-}

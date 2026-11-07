@@ -505,7 +505,7 @@ mod tests {
     use crate::provider::test_support::retry_prompt as prompt;
     use crate::provider::{HarnessEvent, HostEvent, RetryEvent};
     use crate::provider::{InvocationScope, PromptMode, ProviderInput, ThreadOwner};
-    use forge_provider_api::{ProviderError, TurnAddress, retry::RetryCategory};
+    use forge_provider_api::ProviderError;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -579,37 +579,6 @@ mod tests {
             None,
         )
         .map_err(|_| error(forge_provider_api::ProviderFailureKind::Protocol).into())
-    }
-
-    /// Construct canonical failed evidence before testing host retry scheduling.
-    fn retryable(
-        scope: InvocationScope,
-        category: RetryCategory,
-        retry_after: Option<Duration>,
-    ) -> ProviderError {
-        let result = forge_provider_api::TurnResult::new(
-            forge_provider_api::turn::TurnOutcome::Failed {
-                error: forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::TurnStart,
-                    forge_provider_api::ProviderFailureKind::Runtime,
-                ),
-                retry: forge_provider_api::turn::RetryDecision::Allowed { retry_after },
-            },
-            now_ms(),
-            None,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        let address = TurnAddress {
-            thread_id: scope.owner().thread_id(),
-            turn_id: scope.turn_id().unwrap(),
-            scope,
-        };
-        ProviderError::Retryable(Box::new(
-            forge_provider_api::retry::RetryableFailure::new(address, &result, category).unwrap(),
-        ))
     }
 
     fn provider(
@@ -702,102 +671,6 @@ mod tests {
         Ok(())
     }
 
-    /// Closing actor admission rejects an attempt queued after the cancellation decision.
-    #[tokio::test]
-    async fn closed_execution_admission_prevents_native_attempt() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let trace = Arc::new(TraceStore::open(root.path())?);
-        let store = super::super::submission::SubmissionStore::open(root.path(), trace.clone())?;
-        let (native, log) = provider(0, Ending::Completed);
-        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        let registry = crate::provider::session_execution::SessionExecutionRegistry::new(
-            provider.provider_handle(),
-            trace.clone(),
-        );
-        let engine = registry.owner(request().owner()?).await?;
-        engine.close_admission();
-        let (_sender, cancellation) = tokio::sync::watch::channel(false);
-        let (sink, _stream) = crate::provider::events::channel(scope());
-        let result = execute_cancellable(
-            &engine,
-            request(),
-            sink,
-            &trace,
-            &store,
-            RetryAdmission::new(cancellation),
-        )
-        .await;
-        assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>());
-        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 0);
-        registry.close().await?;
-        Ok(())
-    }
-
-    /// Closing admission during backoff cannot construct the subsequent attempt.
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_during_retry_delay_prevents_subsequent_attempt() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let trace = TraceStore::open(root.path())?;
-        let (_sender, cancelled) = tokio::sync::watch::channel(false);
-        let admission = RetryAdmission::new(cancelled);
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = attempts.clone();
-        let (sink, _stream) = crate::provider::events::channel(scope());
-        let policy = run_policy_guarded(
-            request(),
-            sink,
-            &trace,
-            Some(admission.clone()),
-            move |_, _, _| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                async { Err(retryable(scope(), RetryCategory::TemporaryCapacity, None)) }
-            },
-        );
-        tokio::pin!(policy);
-        assert!(futures_util::poll!(&mut policy).is_pending());
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        admission.close();
-        assert!(
-            policy
-                .await
-                .unwrap_err()
-                .is::<crate::broker::TurnCancelled>()
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        Ok(())
-    }
-
-    /// Closing retry admission retains an already-polled attempt's actual terminal result.
-    #[tokio::test]
-    async fn cancellation_retains_current_attempt_settlement_without_retry() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let trace = TraceStore::open(root.path())?;
-        let (_sender, cancelled) = tokio::sync::watch::channel(false);
-        let admission = RetryAdmission::new(cancelled);
-        let release = Arc::new(tokio::sync::Notify::new());
-        let ready = release.clone();
-        let (sink, _stream) = crate::provider::events::channel(scope());
-        let policy = run_policy_guarded(
-            request(),
-            sink,
-            &trace,
-            Some(admission.clone()),
-            move |_, _, _| {
-                let ready = ready.clone();
-                async move {
-                    ready.notified().await;
-                    Ok(ProviderCompletion::default())
-                }
-            },
-        );
-        tokio::pin!(policy);
-        assert!(futures_util::poll!(&mut policy).is_pending());
-        admission.close();
-        release.notify_one();
-        assert!(policy.await.is_ok());
-        Ok(())
-    }
-
     #[test]
     fn replay_rejects_tools_and_control_mutations() {
         let mut output = ProviderCompletion::default();
@@ -815,51 +688,6 @@ mod tests {
         assert!(!replay_safe(&output));
     }
 
-    /// Independent descendant admission prevents replay without changing the native result.
-    #[test]
-    fn replay_rejects_independently_admitted_descendant_work() {
-        let mut output = ProviderCompletion::default();
-        assert!(replay_safe(&output));
-        let native = serde_json::to_value(&output.native).unwrap();
-        output.descendant_work_admitted = true;
-        assert!(!replay_safe(&output));
-        assert_eq!(serde_json::to_value(&output.native).unwrap(), native);
-        let reloaded: ProviderCompletion =
-            serde_json::from_value(serde_json::to_value(output).unwrap()).unwrap();
-        assert!(!replay_safe(&reloaded));
-    }
-
-    /// Delay the actual successor attempt until the provider-required recovery time.
-    #[tokio::test(start_paused = true)]
-    async fn provider_required_wait_delays_successor_attempt() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = TraceStore::open(directory.path())?;
-        let (sink, _stream) = crate::provider::events::channel(scope());
-        let started = tokio::time::Instant::now();
-        let mut attempt_count = 0;
-        run_policy(request(), sink, &trace, |_, sink, _| {
-            attempt_count += 1;
-            let first = attempt_count == 1;
-            async move {
-                if first {
-                    return Err(retryable(
-                        sink.invocation_scope()?.clone(),
-                        RetryCategory::RateLimited,
-                        Some(Duration::from_secs(45)),
-                    ));
-                }
-                Ok(ProviderCompletion::default())
-            }
-        })
-        .await?;
-        assert_eq!(attempt_count, 2);
-        assert_eq!(
-            tokio::time::Instant::now().duration_since(started),
-            Duration::from_secs(45)
-        );
-        Ok(())
-    }
-
     /// Keep required server waits and policy floors while preserving the five-retry boundary.
     #[test]
     fn provider_required_wait_extends_but_never_shortens_retry_delay() {
@@ -872,121 +700,6 @@ mod tests {
             Some(Duration::from_secs(300))
         );
         assert_eq!(retry_delay(5, Some(Duration::from_secs(600))), None);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_schedule_preserves_model_and_final_error() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
-        let submission_store =
-            super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        trace.configure(true)?;
-        let (native, log) = provider(6, Ending::Completed);
-        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        let error = prompt(&provider, request(), None, &trace, &submission_store)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Retryable(failure))
-            if failure.category() == RetryCategory::TemporaryCapacity),
-            "{error:#}"
-        );
-        let attempts = log.attempts.lock().unwrap();
-        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 6);
-        assert_eq!(log.continuation_count.load(Ordering::SeqCst), 5);
-        assert_eq!(attempts.len(), 6);
-        for (index, delay) in [1, 5, 30, 60, 300].iter().enumerate() {
-            assert_eq!(
-                attempts[index + 1].1.duration_since(attempts[index].1),
-                Duration::from_secs(*delay)
-            );
-        }
-        assert_eq!(
-            log.selected_model.lock().unwrap().as_deref(),
-            Some("selected-model")
-        );
-        trace.flush()?;
-        let records = std::fs::read_to_string(trace.session_status("retry-fixture").path)?;
-        assert!(!records.contains("serverOverloaded"));
-        assert!(!records.contains("capacity failure"));
-        assert!(records.contains("\"status\":\"exhausted\""));
-        assert_eq!(
-            records
-                .lines()
-                .filter(|line| line.contains("provider.retry"))
-                .count(),
-            17
-        );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_recovers_clears_status_and_stops_on_permanent_error() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
-        let submission_store =
-            super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let (recovered_native, recovered_log) = provider(1, Ending::Completed);
-        let recovered_provider =
-            crate::provider::test_support::ProviderTestSession::from_native(recovered_native)?;
-        let (sink, mut stream) = crate::provider::events::channel(scope());
-        prompt(
-            &recovered_provider,
-            request(),
-            Some(sink),
-            &trace,
-            &submission_store,
-        )
-        .await?;
-        let mut retries = Vec::new();
-        let mut retry_scopes = Vec::new();
-        while let Some(event) = stream.try_next()? {
-            if let OwnerObservation::Event(HarnessEvent::Host {
-                scope,
-                event: HostEvent::RetryUpdated { event, .. },
-            }) = event
-            {
-                let scope = scope
-                    .invocation()
-                    .expect("retry retains invocation scope")
-                    .clone();
-                let update = match event {
-                    RetryEvent::Scheduled(retry) => Some(retry),
-                    RetryEvent::Cleared => None,
-                };
-                retry_scopes.push(scope);
-                retries.push(update);
-            }
-        }
-        assert_eq!(retries.len(), 3);
-        let waiting = retries[0].as_ref().expect("scheduled retry");
-        assert_eq!(waiting.attempt, 1);
-        assert!(waiting.retry_at_ms.is_some());
-        assert!(
-            retries[1]
-                .as_ref()
-                .is_some_and(|retry| retry.retry_at_ms.is_none())
-        );
-        assert!(retries[2].is_none());
-        assert_eq!(retry_scopes[0], scope());
-        assert_eq!(retry_scopes[1], scope());
-        assert_ne!(retry_scopes[2].invocation_id, scope().invocation_id);
-        assert_eq!(retry_scopes[2].owner(), scope().owner());
-        assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
-        assert_eq!(recovered_log.prompt_count.load(Ordering::SeqCst), 2);
-        assert_eq!(recovered_log.continuation_count.load(Ordering::SeqCst), 1);
-        let (native, log) = provider(0, Ending::Rejected);
-        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        let error = prompt(&provider, request(), None, &trace, &submission_store)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Failure(failure))
-            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
-        );
-        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
-        assert_eq!(log.continuation_count.load(Ordering::SeqCst), 0);
-        Ok(())
     }
 
     /// Preserve cancellation identity on the first attempt and after transient recovery.

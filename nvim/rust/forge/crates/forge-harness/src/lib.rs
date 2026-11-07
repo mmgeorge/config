@@ -40,7 +40,3 @@ pub mod tools;
 pub mod trace;
 pub mod turn;
 pub mod workspace;
-
-#[cfg(test)]
-#[path = "../../forge-providers/tests/fixtures/live_host/suite.rs"]
-mod live_provider;

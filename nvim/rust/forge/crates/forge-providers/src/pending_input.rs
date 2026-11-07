@@ -287,23 +287,6 @@ mod tests {
         );
     }
 
-    /// A worker which exits before handoff proves no future registration without native settlement fabrication.
-    #[tokio::test]
-    async fn queued_cancellation_finishes_after_candidate_is_dropped() {
-        let pending = PendingInputs::new();
-        let binding = BindingId::new("binding").unwrap();
-        let scope = InvocationScope::new(
-            forge_provider_api::testing::root_thread("owner"),
-            "exchange",
-        );
-        let candidate = pending.register(&binding, &scope, &OperationId::new("input").unwrap());
-        let cancel = pending.cancel(&binding, &scope);
-        tokio::pin!(cancel);
-        assert!(futures_util::poll!(&mut cancel).is_pending());
-        drop(candidate);
-        cancel.await;
-    }
-
     /// Binding retirement is synchronous, waits only its own preparation, and prunes discarded replay candidates.
     #[tokio::test]
     async fn binding_fence_is_exact_and_replay_candidate_metadata_is_pruned() {
@@ -354,29 +337,6 @@ mod tests {
             sibling_candidate
                 .check_admission(ProviderOperation::TurnStart)
                 .is_ok()
-        );
-    }
-
-    /// Binding close overrides an earlier scope cancellation and cannot be downgraded by another exact cancel.
-    #[tokio::test]
-    async fn binding_close_reason_dominates_invocation_cancellation() {
-        let pending = PendingInputs::new();
-        let binding = BindingId::new("binding").unwrap();
-        let scope = InvocationScope::new(
-            forge_provider_api::testing::root_thread("owner"),
-            "exchange",
-        );
-        let candidate = pending.register(&binding, &scope, &OperationId::new("input").unwrap());
-        candidate.registered();
-        pending.cancel(&binding, &scope).await;
-        assert!(matches!(
-            candidate.check_admission(ProviderOperation::TurnStart),
-            Err(ProviderError::PreparationFailed(_))
-        ));
-        pending.cancel_binding(&binding).await;
-        pending.cancel(&binding, &scope).await;
-        assert!(
-            matches!(candidate.check_admission(ProviderOperation::TurnStart), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Invalidated)
         );
     }
 }

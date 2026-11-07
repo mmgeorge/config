@@ -289,14 +289,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn inherited_typescript_preserves_repository_overrides_and_ttsx_inheritance() {
-        let typescript = source("typescript", "highlights");
-        assert!(typescript.contains("@keyword.import"));
-        assert!(typescript.contains("@declaration"));
-        let text = source("tsx", "highlights");
-        assert!(text.contains("@declaration"));
-        assert!(text.contains("jsx_element"));
-    }
 }

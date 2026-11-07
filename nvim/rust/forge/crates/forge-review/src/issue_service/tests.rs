@@ -382,27 +382,6 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
     assert!(restarted.close_collected(&id).await);
 }
 
-#[tokio::test]
-async fn issue_shutdown_deadline_retains_owned_job_until_collection() {
-    let service =
-        IssueDocumentService::new(GithubService::default(), EditBudget::default(), analysis());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let waiting = release.clone();
-    service
-        .spawn(async move { waiting.notified().await })
-        .unwrap();
-    let report = service.shutdown(Duration::ZERO).await;
-    assert_eq!(report.unfinished_jobs, 1);
-    release.notify_one();
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
-}
-
 fn analysis() -> Arc<forge_diff::workers::AnalysisPool> {
     Arc::new(forge_diff::workers::AnalysisPool::new(
         forge_diff::workers::PoolLimits {

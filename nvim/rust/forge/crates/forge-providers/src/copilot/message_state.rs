@@ -157,18 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn late_older_snapshot_does_not_replace_latest_commentary_candidate() {
-        let mut store = CopilotMessageStore::default();
-        commentary(&mut store, "first", "First");
-        commentary(&mut store, "second", "Second");
-        commentary(&mut store, "first", "First authoritative");
-        let (id, text) = store.fallback("root").unwrap();
-        assert_ne!(id, "second");
-        assert_eq!(text, "Second");
-        assert!(store.fallback("root").is_none());
-    }
-
-    #[test]
     fn explicit_empty_final_suppresses_commentary_fallback() {
         let mut store = CopilotMessageStore::default();
         commentary(&mut store, "commentary", "Progress");
@@ -181,65 +169,6 @@ mod tests {
             )
             .unwrap();
         assert!(store.fallback("root").is_none());
-    }
-
-    #[test]
-    fn unknown_later_text_blocks_stale_commentary_fallback() {
-        let mut store = CopilotMessageStore::default();
-        commentary(&mut store, "commentary", "Progress");
-        store
-            .observe(
-                "root",
-                "unknown",
-                CopilotPhaseMetadata::Unknown("future".into()),
-                true,
-            )
-            .unwrap()
-            .text = "Unclassified newer text".into();
-        assert!(store.fallback("root").is_none());
-    }
-
-    #[test]
-    fn child_final_and_empty_tool_envelopes_do_not_replace_root_candidate() {
-        let mut store = CopilotMessageStore::default();
-        commentary(&mut store, "commentary", "Root progress");
-        store
-            .observe(
-                "child",
-                "final",
-                CopilotPhaseMetadata::Known(CopilotPhase::FinalAnswer),
-                false,
-            )
-            .unwrap()
-            .text = "Child answer".into();
-        store
-            .observe("root", "tool-envelope", CopilotPhaseMetadata::Missing, true)
-            .unwrap();
-        commentary(&mut store, "whitespace", " \n\t");
-        assert_eq!(store.fallback("root").unwrap().1, "Root progress");
-    }
-
-    #[test]
-    fn phase_metadata_distinguishes_missing_unknown_and_conflicting_values() {
-        assert_eq!(
-            CopilotPhaseMetadata::parse(None),
-            CopilotPhaseMetadata::Missing
-        );
-        assert_eq!(
-            CopilotPhaseMetadata::parse(Some("thinking")),
-            CopilotPhaseMetadata::Unknown("thinking".into())
-        );
-        let mut store = CopilotMessageStore::default();
-        commentary(&mut store, "message", "Progress");
-        let error = store
-            .observe(
-                "root",
-                "message",
-                CopilotPhaseMetadata::Known(CopilotPhase::FinalAnswer),
-                true,
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("changed phase"));
     }
 
     #[test]

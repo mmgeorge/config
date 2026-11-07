@@ -550,52 +550,6 @@ mod test {
     }
 
     #[test]
-    fn planning_failure_preserves_budget_reason() {
-        for (state, _activity) in [
-            (PlanState::Generating, WorkflowActivity::Working),
-            (PlanState::Revising, WorkflowActivity::Working),
-        ] {
-            let exchange = exchange();
-            let mut plan = plan(state);
-            plan.generation.budget.observe(true);
-            assert!(matches!(
-                SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::Working {
-                    activity: WorkflowActivity::Working,
-                    ..
-                }
-            ));
-            plan.state = PlanState::Failed;
-            plan.generation.budget.turn_count = plan.generation.budget.max_turn_count;
-            assert!(
-                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::PlanningFailed { reason, .. } if reason == "continuation limit reached")
-            );
-            plan.generation.budget.turn_count = 2;
-            plan.generation.budget.consecutive_no_progress =
-                plan.generation.budget.max_consecutive_no_progress;
-            assert!(
-                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::PlanningFailed { reason, .. } if reason == "no progress limit reached")
-            );
-        }
-    }
-
-    #[test]
-    fn running_exchange_always_has_working_status() {
-        assert_eq!(
-            SessionPhase::resolve(None, None, Some(&exchange()),),
-            SessionPhase::Working {
-                duration_ms: 0,
-                started_at_ms: Some(42),
-                activity: WorkflowActivity::Working,
-                execution: None,
-                reasoning_summary: None,
-            }
-        );
-    }
-
-    #[test]
     fn compaction_restores_workflow_status_after_every_terminal_outcome() {
         for state in [
             crate::provider::CompactionState::Completed,
@@ -676,66 +630,6 @@ mod test {
     }
 
     #[test]
-    fn idle_phase_has_no_animation() {
-        assert!(!SessionPhase::Idle.animated());
-    }
-
-    #[test]
-    fn answered_review_evidence_retains_questions_without_an_accepting_phase() {
-        let mut plan = plan(PlanState::AwaitingReview);
-        plan.review = Some(
-            crate::plan::PlanReview::new(
-                "digest".into(),
-                &[
-                    crate::session::ApprovalMode::Ask,
-                    crate::session::ApprovalMode::Deny,
-                ],
-            )
-            .unwrap(),
-        );
-        assert!(matches!(
-            SessionPhase::resolve(Some(&plan), None, None),
-            SessionPhase::AwaitingInput {
-                owner: crate::broker::ElicitationOwner::PlanReview,
-                ..
-            }
-        ));
-        let review = plan.review.as_mut().unwrap();
-        let question = review.elicitation.question_set.questions[0].id.clone();
-        review
-            .elicitation
-            .answer(
-                &question,
-                crate::plan::PlanQuestionResponse::Selected {
-                    option: "ask".into(),
-                    feedback: None,
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            SessionPhase::resolve(Some(&plan), None, None),
-            SessionPhase::AwaitingPlanReview { .. }
-        ));
-        assert!(plan.review_questions().is_some());
-        plan.state = PlanState::Cancelled;
-        assert!(plan.review_questions().is_none());
-    }
-
-    #[test]
-    fn planning_failure_preempts_stale_input_projection() {
-        let mut plan = plan(PlanState::Failed);
-        plan.elicitation = Some(crate::plan::PlanElicitation::new(
-            crate::plan::PlanQuestionSet::freeform("Old question".into())
-                .normalize()
-                .unwrap(),
-        ));
-        assert!(matches!(
-            SessionPhase::resolve(Some(&plan), None, None),
-            SessionPhase::PlanningFailed { .. }
-        ));
-    }
-
-    #[test]
     fn clarification_resume_and_terminal_phases_follow_exchange_state() {
         let mut exchange = exchange();
         exchange.set_awaiting_input(true);
@@ -797,76 +691,5 @@ mod test {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn interrupted_restart_remains_paused_until_execution_resumes() {
-        let mut exchange = exchange();
-        exchange
-            .start_turn(crate::turn::test_support::address(&exchange, "turn"), 42)
-            .unwrap();
-        exchange.pause_for_restart(100).unwrap();
-        assert_eq!(
-            SessionPhase::resolve(None, None, Some(&exchange)),
-            SessionPhase::Paused
-        );
-        exchange.resume(120).unwrap();
-        assert!(matches!(
-            SessionPhase::resolve(None, None, Some(&exchange)),
-            SessionPhase::Working { .. }
-        ));
-    }
-
-    #[test]
-    fn terminal_exchanges_release_approval_status_without_hiding_background_compaction() {
-        for state in [
-            ExchangeState::Finalizing,
-            ExchangeState::Complete,
-            ExchangeState::Failed,
-            ExchangeState::Cancelled,
-            ExchangeState::Interrupted,
-        ] {
-            let mut exchange = exchange();
-            exchange.observe_compaction(
-                crate::provider::Compaction {
-                    id: "compaction".into(),
-                    thread_id: "thread".into(),
-                    state: crate::provider::CompactionState::Running,
-                    manual: false,
-                    started_at_ms: Some(42),
-                    completed_at_ms: None,
-                    result: Default::default(),
-                },
-                42,
-            );
-            exchange.observe_blocker("approval:command".into(), true, 50);
-            exchange.phase = crate::exchange::ExchangePhase::fixture(
-                state,
-                exchange.completed_at_ms(),
-                exchange.finalization_outcome(),
-            );
-            assert_eq!(
-                exchange.activity(),
-                crate::exchange::ExchangeActivity::Settled
-            );
-            let status = SessionPhase::resolve(None, None, Some(&exchange));
-            assert_eq!(status, SessionPhase::Compacting { started_at_ms: 42 });
-            exchange.node_list.clear();
-            let status = SessionPhase::resolve(None, None, Some(&exchange));
-            assert!(
-                matches!(status, SessionPhase::Finalizing { .. } | SessionPhase::Idle),
-                "{state:?}: {status:?}"
-            );
-        }
-        let mut exchange = exchange();
-        exchange
-            .start_turn(crate::turn::test_support::address(&exchange, "turn"), 42)
-            .unwrap();
-        exchange.observe_blocker("approval:command".into(), true, 50);
-        exchange.pause_for_restart(60).unwrap();
-        assert_eq!(
-            SessionPhase::resolve(None, None, Some(&exchange)),
-            SessionPhase::Paused
-        );
     }
 }

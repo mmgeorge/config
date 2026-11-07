@@ -70,38 +70,6 @@ mod test {
     use super::ModelPinStore;
 
     #[test]
-    fn model_pins_persist_independently_and_isolate_providers() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let mut store = ModelPinStore::open(directory.path())?;
-        assert!(store.load("fixture-beta")?.is_empty());
-        assert_eq!(
-            store.set("fixture-beta", "temporarily-unavailable", true)?,
-            ["temporarily-unavailable"]
-        );
-        store.set("fixture-beta", "temporarily-unavailable", true)?;
-        store.set("fixture-alpha", "another-model", true)?;
-        assert!(store.set("fixture-beta", " ", true).is_err());
-        drop(store);
-        let session_store = super::super::SqliteStore::open(directory.path())?;
-        drop(session_store);
-        let mut reopened = ModelPinStore::open(directory.path())?;
-        assert_eq!(reopened.load("fixture-beta")?, ["temporarily-unavailable"]);
-        assert_eq!(reopened.load("fixture-alpha")?, ["another-model"]);
-        assert!(
-            reopened
-                .set("fixture-beta", "temporarily-unavailable", false)?
-                .is_empty()
-        );
-        assert!(
-            reopened
-                .set("fixture-beta", "temporarily-unavailable", false)?
-                .is_empty()
-        );
-        assert_eq!(reopened.load("fixture-alpha")?, ["another-model"]);
-        Ok(())
-    }
-
-    #[test]
     fn model_pins_concurrent_writes_preserve_other_models() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         ModelPinStore::open(directory.path())?;

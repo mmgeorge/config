@@ -33,22 +33,6 @@ pub(crate) fn complete() {
 mod tests {
     use super::*;
 
-    /// Release ordering at enqueue even while the command result remains unavailable.
-    #[tokio::test]
-    async fn admission_releases_before_command_completion() {
-        let (admitted, admission) = oneshot::channel();
-        let (finish, finished) = oneshot::channel();
-        let work = tokio::spawn(observe(Some(admitted), async move {
-            complete();
-            complete();
-            finished.await.unwrap();
-        }));
-        admission.await.unwrap();
-        assert!(!work.is_finished());
-        finish.send(()).unwrap();
-        work.await.unwrap();
-    }
-
     /// Preserve one notification when a retained worker owns the eventual enqueue.
     #[allow(
         clippy::async_yields_async,

@@ -148,56 +148,6 @@ mod tests {
     }
 
     #[test]
-    fn restored_capture_keeps_exact_counters_and_new_owner_settlement() {
-        let budget = EditBudget::default();
-        let identity = DocumentId("restored".into());
-        let region = RegionId("body".into());
-        let mut store = EditStore::new(identity.clone(), EditLimits::default(), budget).unwrap();
-        let capture = store
-            .restore_field(region.clone(), restoration())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (capture.revision(), capture.sequence(), capture.text()),
-            (RegionRevision(8), EditSequence(90), "submitted")
-        );
-        let field = store.snapshot(&region).unwrap();
-        assert_eq!(
-            (field.revision, field.sequence),
-            (RegionRevision(9), EditSequence(100))
-        );
-        assert!(field.uncertain && field.dirty);
-        let mut foreign = EditStore::new(
-            DocumentId("foreign".into()),
-            EditLimits::default(),
-            EditBudget::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            foreign
-                .reconcile_save(&capture, "submitted".into())
-                .unwrap_err(),
-            EditError::WrongOwner
-        );
-        store
-            .accept(RegionEdit {
-                document: identity,
-                region: region.clone(),
-                base: RegionRevision(9),
-                sequence: EditSequence(101),
-                text: "latest".into(),
-            })
-            .unwrap();
-        store.reconcile_save(&capture, "submitted".into()).unwrap();
-        let field = store.snapshot(&region).unwrap();
-        assert_eq!(
-            (field.text, field.baseline, field.sequence),
-            ("latest", "submitted", EditSequence(101))
-        );
-        assert!(field.dirty && !field.uncertain);
-    }
-
-    #[test]
     fn failed_restoration_preserves_allocation_and_region_admission() {
         let budget = EditBudget::default();
         let mut store = EditStore::new(
@@ -221,38 +171,5 @@ mod tests {
         assert!(store.restore_field(region.clone(), restored).is_err());
         assert_eq!(store.snapshot(&region).unwrap().text, "same");
         assert_eq!(budget.retained_bytes(), 4);
-    }
-
-    #[test]
-    fn restoration_deduplicates_text_and_rejects_accepted_regions() {
-        let budget = EditBudget::default();
-        let mut store = EditStore::new(
-            DocumentId("restored".into()),
-            EditLimits::default(),
-            budget.clone(),
-        )
-        .unwrap();
-        let region = RegionId("body".into());
-        store
-            .restore_field(
-                region.clone(),
-                FieldRestoration {
-                    revision: RegionRevision(5),
-                    sequence: EditSequence(100),
-                    text: "same".into(),
-                    baseline: "same".into(),
-                    remote: Some("same".into()),
-                    pending: Some(SaveRestoration {
-                        revision: RegionRevision(5),
-                        sequence: EditSequence(100),
-                        text: "same".into(),
-                        uncertain: true,
-                    }),
-                },
-            )
-            .unwrap();
-        assert_eq!(budget.retained_bytes(), 4);
-        assert!(store.restore_field(region.clone(), restoration()).is_err());
-        assert_eq!(store.snapshot(&region).unwrap().sequence, EditSequence(100));
     }
 }

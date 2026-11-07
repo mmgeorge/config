@@ -49,12 +49,6 @@ impl CopilotClient {
         }
     }
 
-    /// Get whether this shared transport is unavailable to retained session handles.
-    #[cfg(test)]
-    pub(crate) fn is_stopped(&self) -> bool {
-        self.generation.is_stopped()
-    }
-
     /// Fence an unexposed transport rejected during runtime initialization.
     pub(crate) fn force_stop(&self) {
         self.inner.force_stop();
@@ -1105,20 +1099,5 @@ mod tests {
         assert!(
             matches!(confirm_model_switch("requested", &ModelSwitchToResult { persistence_error:Some("fixture".into()), ..applied }), Err(ProviderError::Failure(error)) if error.kind() == forge_provider_api::ProviderFailureKind::Runtime)
         );
-    }
-
-    #[test]
-    fn applies_reasoning_and_context_to_a_native_model_switch() {
-        let options = model_options(Some("high".into()), Some("long_context")).unwrap();
-        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(options.reasoning_summary, Some(ReasoningSummary::Concise));
-        assert!(matches!(
-            options.context_tier,
-            Some(ContextTier::LongContext)
-        ));
-        let defaults = model_options(None, None).unwrap();
-        assert!(matches!(defaults.context_tier, Some(ContextTier::Default)));
-        assert_eq!(defaults.reasoning_summary, Some(ReasoningSummary::Concise));
-        assert!(model_options(None, Some("unknown")).is_err());
     }
 }

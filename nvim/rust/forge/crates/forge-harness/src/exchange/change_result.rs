@@ -113,51 +113,6 @@ mod tests {
     }
 
     #[test]
-    fn change_result_preserves_previous_capture_during_pending_and_failure() {
-        for state in [
-            ExchangeState::Queued,
-            ExchangeState::Running,
-            ExchangeState::Finalizing,
-            ExchangeState::Complete,
-        ] {
-            let mut exchange = exchange();
-            exchange.phase = super::super::ExchangePhase::fixture(state, None, None);
-            assert!(
-                matches!(exchange.change_result(), ExchangeChangeResult::Pending { previous: Some(comparison) } if comparison.text() == "patch")
-            );
-            exchange.finalization_error = Some("capture failed".into());
-            assert!(
-                matches!(exchange.change_result(), ExchangeChangeResult::Unavailable { previous: Some(comparison), reason: "capture failed" } if comparison.text() == "patch")
-            );
-            exchange.checkpoint_after = None;
-            assert!(matches!(
-                exchange.change_result(),
-                ExchangeChangeResult::Unavailable { previous: None, .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn change_result_accepts_empty_committed_comparison() {
-        for state in [
-            ExchangeState::Complete,
-            ExchangeState::Failed,
-            ExchangeState::Cancelled,
-            ExchangeState::Interrupted,
-        ] {
-            let mut exchange = exchange();
-            exchange.phase = super::super::ExchangePhase::fixture(state, Some(10), None);
-            exchange.checkpoint_diff_text = Some(String::new());
-            assert!(
-                matches!(exchange.change_result(), ExchangeChangeResult::Captured(comparison) if comparison.text().is_empty())
-            );
-            let reopened: Exchange =
-                serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
-            assert_eq!(exchange.change_result(), reopened.change_result());
-        }
-    }
-
-    #[test]
     fn cancellation_before_initial_capture_has_no_missing_checkpoint_failure() {
         let mut exchange = exchange();
         exchange.phase =

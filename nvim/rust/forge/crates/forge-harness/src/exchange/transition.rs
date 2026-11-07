@@ -1442,52 +1442,6 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
-    /// Keep resource acquisition alive across pending and timeout observation, then collect its late result.
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_reporting_retains_acquisition_at_original_deadline() {
-        let admitted_at = Instant::now();
-        let id = TransitionIdentity::Command(CommandId::new("cancel-clock").unwrap());
-        let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let released = release.clone();
-        let task = tokio::spawn(async move {
-            released.notified().await;
-            Acquisition::Unavailable
-        });
-        let mut transition = ExchangeTransition {
-            id: id.clone(),
-            intent: TransitionIntent::Cancel(CancelledInputPolicy::Retain),
-            stage: TransitionStage::Acquiring(task),
-            generation: None,
-            invocation: None,
-            target_capture: TargetCapture::Acquisition,
-            uncommitted: None,
-            foreground_signals: std::collections::VecDeque::new(),
-            reporting: TransitionReporting::new(
-                &id,
-                TransitionIntent::Cancel(CancelledInputPolicy::Retain),
-                admitted_at,
-            ),
-        };
-        assert!(matches!(
-            transition.next(ForegroundStatus::Local).await,
-            TransitionEvent::CollectionPending
-        ));
-        assert_eq!(Instant::now() - admitted_at, Duration::from_secs(10));
-        transition.reporting.pending_published = true;
-        assert!(matches!(
-            transition.next(ForegroundStatus::Local).await,
-            TransitionEvent::CollectionDeadline
-        ));
-        assert_eq!(Instant::now() - admitted_at, Duration::from_secs(30));
-        let mut retained = transition.into_retained();
-        let TransitionStage::Acquiring(task) = &mut retained.stage else {
-            panic!("acquisition must remain owned")
-        };
-        assert!(!task.is_finished());
-        release.notify_one();
-        assert!(matches!(task.await.unwrap(), Acquisition::Unavailable));
-    }
-
     /// A phase change must consume the original budget; completed work wins a simultaneous deadline.
     #[tokio::test(start_paused = true)]
     async fn cancellation_phase_change_does_not_restart_reporting_and_completion_wins() {

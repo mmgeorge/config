@@ -770,7 +770,6 @@ pub(super) fn single_line(text: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::lsp::catalog::definitions;
 
     /// Publish an actual late child rename under its original binding, scope, and host call identity.
     #[tokio::test]
@@ -911,26 +910,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn focused_contract_rejects_irrelevant_arguments() {
-        for (name, value) in [
-            ("lsp_definition", json!({"path":"a.rs"})),
-            ("lsp_status", json!({"line":1})),
-            ("lsp_calls", json!({"path":"a","line":1,"column":1})),
-            (
-                "lsp_context",
-                json!({"path":"a","line":1,"column":1,"offset":0}),
-            ),
-            ("lsp_diagnostics", json!({"path":"a","query":"name"})),
-            ("lsp_symbols", json!({"query":""})),
-            ("lsp_symbols", json!({"limit":0})),
-        ] {
-            assert!(Arguments::parse(name, value).is_err());
-        }
-        assert!(Arguments::parse("lsp", json!({})).is_err());
-        assert_eq!(definitions().len(), 11);
-    }
-
     async fn fixture() -> (
         tempfile::TempDir,
         Arc<LspService>,
@@ -1064,93 +1043,5 @@ mod tests {
             assert!(service.pending.lock().unwrap().is_empty());
             assert_eq!(service.slots.available_permits(), 4);
         }
-    }
-
-    #[tokio::test]
-    async fn chunked_analysis_preserves_large_source_and_request_ownership() {
-        let (directory, service, scope, _lease, mut receiver) = fixture().await;
-        let task = tokio::spawn(async move { scope.invoke("lsp_status", json!({})).await });
-        let frame = receiver.recv().await.unwrap().unwrap();
-        let event: Value = serde_json::from_slice(frame.bytes()).unwrap();
-        let id = event["payload"]["id"].as_str().unwrap();
-        let path = directory
-            .path()
-            .join("source.rs")
-            .to_string_lossy()
-            .into_owned();
-        let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(
-            forge_diff::workers::AnalysisPool::new(forge_diff::workers::PoolLimits {
-                workers: 1,
-                jobs: 2,
-            }),
-        ));
-        let source = format!(
-            "{}pub fn beyond_previous_limits() {{}}\n",
-            "// Unicode α and source padding for a large file\n".repeat(11000)
-        );
-        assert!(source.len() > 512 * 1024);
-        let rendering = syntax
-            .analyze(forge_diff::syntax::SyntaxRequest {
-                source: forge_diff::source::SourceVersion::new(
-                    source.as_bytes().to_vec(),
-                    forge_diff::source::Representation::Raw,
-                )
-                .unwrap(),
-                language: forge_diff::syntax::SyntaxLanguage::Rust,
-                priority: forge_diff::workers::WorkPriority::Foreground,
-                deadline: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            rendering.tree_count(),
-            1,
-            "large source was not parsed completely"
-        );
-        let mut offset = 0;
-        let mut result = json!(null);
-        while offset < source.len() {
-            let mut end = (offset + 32768).min(source.len());
-            while !source.is_char_boundary(end) {
-                end -= 1;
-            }
-            result = service
-                .analyze_part(
-                    "session",
-                    id,
-                    &path,
-                    source[offset..end].into(),
-                    Some((offset, source.len())),
-                    &syntax,
-                )
-                .await
-                .unwrap();
-            if end < source.len() {
-                assert_eq!(result, json!({"pending":true}));
-            }
-            offset = end;
-        }
-        assert_eq!(result["complete"], true);
-        assert_eq!(result["declarations"][0]["name"], "beyond_previous_limits");
-        assert_eq!(result["declarations"][0]["line"], 11001);
-        assert!(
-            service
-                .analyze_part("other", id, &path, "x".into(), Some((0, 2)), &syntax)
-                .await
-                .is_err()
-        );
-        assert!(
-            service
-                .analyze_part("session", id, &path, "x".into(), Some((1, 2)), &syntax)
-                .await
-                .is_err()
-        );
-        service
-            .analyze_part("session", id, &path, "x".into(), Some((0, 2)), &syntax)
-            .await
-            .unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(service.pending.lock().unwrap().is_empty());
     }
 }

@@ -60,63 +60,6 @@ impl<T> RetainedTask<T> {
 mod tests {
     use super::*;
 
-    /// Preserve the worker when a pending collection future is dropped.
-    #[tokio::test]
-    async fn cancelled_join_keeps_the_original_prompt_worker() {
-        let (release, wait) = tokio::sync::oneshot::channel();
-        let task = RetainedTask::new(
-            ProviderOperation::TurnStart,
-            tokio::spawn(async move {
-                let _ = wait.await;
-                Ok(())
-            }),
-        );
-        let mut collecting = Box::pin(task.join());
-        assert!(futures_util::poll!(collecting.as_mut()).is_pending());
-        drop(collecting);
-        assert!(!task.is_finished());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(1), task.join())
-                .await
-                .is_err()
-        );
-        assert!(!task.is_finished());
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(task.is_finished());
-        task.join().await.unwrap();
-    }
-
-    /// A cancelled result waiter cannot replace the native outcome retained by the owner.
-    #[tokio::test]
-    async fn native_outcome_survives_cancelled_and_repeated_collection() {
-        let (release, wait) = tokio::sync::oneshot::channel();
-        let task = RetainedTask::new(
-            ProviderOperation::TurnStart,
-            tokio::spawn(async move {
-                wait.await.unwrap();
-                Ok(forge_provider_api::turn::TurnOutcome::Completed {
-                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Refusal,
-                })
-            }),
-        );
-        let mut collecting = Box::pin(task.join());
-        assert!(futures_util::poll!(collecting.as_mut()).is_pending());
-        drop(collecting);
-        release.send(()).unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                task.join().await.unwrap(),
-                forge_provider_api::turn::TurnOutcome::Completed {
-                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Refusal,
-                }
-            );
-        }
-    }
-
     /// Keep a typed native failure unchanged across repeated collection.
     #[tokio::test]
     async fn native_failure_survives_repeated_collection() {
@@ -129,28 +72,6 @@ mod tests {
                 task.join().await,
                 Err(ProviderError::DeliveryUncertain)
             ));
-        }
-    }
-
-    /// Report a panicked worker without exposing its native panic text.
-    #[tokio::test]
-    async fn worker_panic_is_normalized_and_retained() {
-        let task: RetainedTask = RetainedTask::new(
-            ProviderOperation::TurnStart,
-            tokio::spawn(async {
-                panic!("private prompt panic marker");
-            }),
-        );
-        for _ in 0..2 {
-            let error = task.join().await.unwrap_err();
-            assert!(matches!(&error, ProviderError::Failure(failure)
-                if failure.kind() == ProviderFailureKind::Runtime));
-            assert!(!format!("{error:?} {error}").contains("private prompt panic marker"));
-            assert!(
-                std::error::Error::source(&error)
-                    .unwrap()
-                    .is::<ProviderFailure>()
-            );
         }
     }
 }

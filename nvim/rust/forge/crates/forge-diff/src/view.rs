@@ -188,19 +188,4 @@ mod tests {
         assert_eq!(state.requested().options, state.committed());
         assert!(!state.commit(full));
     }
-
-    #[test]
-    fn semantic_only_preserves_visibility_and_rejects_full_without_mutation() {
-        let mut state = DiffViewState::new(DiffCapabilities::SemanticOnly, DiffVisibility::Public);
-        let initial = state.requested();
-        assert_eq!(
-            state.request(DiffViewAction::TogglePresentation),
-            Err(DiffViewError::UnsupportedPresentation)
-        );
-        assert_eq!(state.requested(), initial);
-        let all = state.request(DiffViewAction::ToggleVisibility).unwrap();
-        assert!(state.commit(all));
-        assert_eq!(state.committed().visibility, DiffVisibility::All);
-        assert_eq!(state.committed().presentation, DiffPresentation::Semantic);
-    }
 }

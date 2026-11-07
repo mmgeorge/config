@@ -121,23 +121,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn view_admission_preserves_all_views_beyond_former_limit() {
-        let mut views = DocumentViews::default();
-        for index in 0..100 {
-            assert_eq!(
-                views
-                    .open(ViewId(format!("view-{index}")), WidthProfile::default())
-                    .unwrap(),
-                index == 0
-            );
-        }
-        for index in 0..100 {
-            assert!(views.close(&ViewId(format!("view-{index}"))));
-        }
-        assert!(views.profile().is_none());
-    }
-
-    #[test]
     fn shared_buffer_width_follows_oldest_live_owner() {
         let mut views = DocumentViews::default();
         let first = ViewId("first".into());

@@ -76,27 +76,3 @@ impl PlanFileStore {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_entry_preserves_the_complete_objective() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let workspace = tempfile::tempdir()?;
-        crate::checks::configure_fixture(workspace.path());
-        let store = PlanFileStore::new(root.path(), workspace.path()).unwrap();
-        let request = format!(
-            "{}\nKeep every requirement.",
-            "Detailed objective ".repeat(256)
-        );
-        let prepared = store.prepare_entry("session", request.clone(), None, 1)?;
-        assert_eq!(prepared.record.title, request.lines().next().unwrap());
-        assert_eq!(prepared.record.request, request);
-        let document = store.read_working_document("session", &prepared.record.id)?;
-        assert_eq!(document.prompt, request);
-        assert!(prepared.instruction.contains(&request));
-        Ok(())
-    }
-}

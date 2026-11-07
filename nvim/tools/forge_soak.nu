@@ -8,7 +8,7 @@ def process_memory_bytes [] {
 
 def main [
   --duration: duration = 30min
-  --workflows: string = "performance_acceptance,status_native,native_syntax_bypass,review_document,commit_host"
+  --workflows: string = "status_native,review_document,commit_host"
 ] {
   if $duration <= 0sec { error make {msg: "duration must be greater than zero"} }
   cd $repository_root

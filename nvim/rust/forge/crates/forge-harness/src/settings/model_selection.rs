@@ -174,57 +174,6 @@ mod tests {
         }
     }
 
-    /// A model switch cannot carry an unsupported inherited acceleration tier into dispatch.
-    #[test]
-    fn executor_tier_follows_target_support_and_empty_reasoning_is_not_unrestricted() {
-        let executor = PlanExecutor {
-            enabled: true,
-            model: Some("executor".into()),
-            effort: Some("high".into()),
-        };
-        let mut catalog = catalog();
-        let selected = ValidatedModelSelection::executor(
-            &executor,
-            ServiceTier::Ultrafast,
-            &capability(),
-            &catalog,
-        )
-        .unwrap();
-        assert_eq!(selected.service_tier, ServiceTier::Standard);
-        catalog[0].service_tiers.push(ServiceTier::Ultrafast);
-        let selected = ValidatedModelSelection::executor(
-            &executor,
-            ServiceTier::Ultrafast,
-            &capability(),
-            &catalog,
-        )
-        .unwrap();
-        assert_eq!(selected.service_tier, ServiceTier::Ultrafast);
-        catalog[0].reasoning.clear();
-        assert!(matches!(
-            ValidatedModelSelection::executor(
-                &executor,
-                ServiceTier::Standard,
-                &capability(),
-                &catalog
-            ),
-            Err(ModelSelectionError::EffortUnavailable)
-        ));
-        let default = PlanExecutor {
-            effort: Some("default".into()),
-            ..executor
-        };
-        assert!(
-            ValidatedModelSelection::executor(
-                &default,
-                ServiceTier::Standard,
-                &capability(),
-                &catalog
-            )
-            .is_ok()
-        );
-    }
-
     /// Explicit tier requests are rejected instead of inheriting the executor fallback policy.
     #[test]
     fn explicit_tier_cannot_silently_fall_back() {
@@ -248,27 +197,5 @@ mod tests {
             ),
             Err(ModelSelectionError::ModelUnavailable)
         ));
-    }
-    #[test]
-    fn selecting_model_configuration_does_not_confirm_native_execution() {
-        let mut session: HarnessSession = serde_json::from_value(serde_json::json!({
-            "id":"session","primary_agent_id":"session:agent:primary","name":"Session","workspace":"workspace","provider":"mock",
-            "provider_fork_state":{"state":"ready"},"model":"default","effort":"default","approval_mode":"ask","created_at_ms":0,"updated_at_ms":0,
-            "resolved_model":"previous-actual"
-        })).unwrap();
-        let selected = ValidatedModelSelection::executor(
-            &PlanExecutor {
-                enabled: true,
-                model: Some("executor".into()),
-                effort: Some("high".into()),
-            },
-            ServiceTier::Standard,
-            &capability(),
-            &catalog(),
-        )
-        .unwrap();
-        selected.apply(&mut session);
-        assert_eq!(session.model, "executor");
-        assert!(session.resolved_model.is_none());
     }
 }

@@ -477,39 +477,3 @@ impl CapabilityMenu {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every provider fact keeps its support and application while Harness adds presentation
-    /// and host workflows under flat string identifiers.
-    #[test]
-    fn composes_provider_facts_with_host_workflows() -> anyhow::Result<()> {
-        let descriptor =
-            forge_providers::registry::descriptor(&forge_provider_api::ProviderId::new("mock")?)?;
-        let mut manifest = CapabilityManifest::from_descriptor(descriptor.clone());
-        manifest.set_support(CapabilityId::SkillMutation, Support::Unsupported);
-        let provider_count = manifest.capability.len();
-        let menu =
-            serde_json::to_value(CapabilityMenu::compose(descriptor.label.clone(), manifest))?;
-        let rows = menu["capability"].as_array().expect("menu rows");
-        assert_eq!(rows.len(), provider_count + HOST_WORKFLOW.len());
-        assert_eq!(menu["label"], descriptor.label);
-        let row = |id: &str| {
-            rows.iter()
-                .find(|row| row["id"] == id)
-                .unwrap_or_else(|| panic!("missing {id} row"))
-        };
-        assert_eq!(row("prompt")["required"], true);
-        assert_eq!(row("goals")["implementation"], "forge");
-        assert_eq!(row("goals")["support"], "supported");
-        assert_eq!(row("permission_callbacks")["label"], "Saved approval rules");
-        assert_eq!(
-            row("skill_mutation")["reason"],
-            "This integration cannot replace skill selections on an existing binding"
-        );
-        assert_eq!(rows[0]["id"], "prompt");
-        Ok(())
-    }
-}

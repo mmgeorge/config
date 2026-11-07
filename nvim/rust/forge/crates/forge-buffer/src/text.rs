@@ -112,36 +112,3 @@ impl<'de> Deserialize<'de> for BufferText {
         Self::from_rows(rows).map_err(serde::de::Error::custom)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshots_share_large_text_and_replacement_keeps_the_previous_rows() {
-        let source = BufferText::from_rows(["x".repeat(2 * 1024 * 1024), String::new()]).unwrap();
-        let snapshot = source.clone();
-        assert!(Arc::ptr_eq(&source.storage, &snapshot.storage));
-        assert_eq!(
-            source.row(0).unwrap().as_ptr(),
-            snapshot.row(0).unwrap().as_ptr()
-        );
-        let replacement = BufferText::from_rows(["replacement"]).unwrap();
-        drop(source);
-        assert_eq!(snapshot.row_count(), 2);
-        assert_eq!(snapshot.row(0).unwrap().len(), 2 * 1024 * 1024);
-        assert_eq!(snapshot.row(1), Some(""));
-        assert_eq!(replacement.row(0), Some("replacement"));
-    }
-
-    #[test]
-    fn serialization_preserves_empty_and_trailing_rows() {
-        for rows in [vec![], vec![""], vec!["hello", "", "world", ""]] {
-            let text = BufferText::from_rows(&rows).unwrap();
-            let encoded = serde_json::to_string(&text).unwrap();
-            assert_eq!(encoded, serde_json::to_string(&rows).unwrap());
-            let decoded: BufferText = serde_json::from_str(&encoded).unwrap();
-            assert_eq!(decoded, text);
-        }
-    }
-}

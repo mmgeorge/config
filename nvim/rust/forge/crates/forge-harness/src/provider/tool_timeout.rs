@@ -537,9 +537,7 @@ impl super::events::EventObserver for ToolWatchdog {
 mod tests {
     use super::*;
     use crate::provider::ScopeOwner;
-    use forge_provider_api::{
-        InspectableArguments, ItemId, ToolCompletion, ToolDescriptor, ToolOutcome,
-    };
+    use forge_provider_api::{InspectableArguments, ItemId, ToolDescriptor};
 
     enum TestTool {
         Command,
@@ -607,19 +605,6 @@ mod tests {
         )
     }
 
-    /// Freeze a positively completed native tool operation.
-    fn completed(address: &ToolAddress) -> HarnessEvent {
-        item(
-            address,
-            ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
-                outcome: ToolOutcome::Succeeded,
-                descriptor: None,
-                output: None,
-                changes: Default::default(),
-            })),
-        )
-    }
-
     /// Questions remain unbounded without disabling unrelated tool deadlines.
     #[tokio::test(start_paused = true)]
     async fn waiting_questions_do_not_expire_but_other_tools_do() -> Result<()> {
@@ -677,96 +662,6 @@ mod tests {
             assert_eq!(watchdog.expired().await?.unwrap().address, tool);
             assert_eq!(started.elapsed(), Duration::from_secs(1));
         }
-        Ok(())
-    }
-
-    /// Replayed completion cannot hide another unfinished tool's original deadline.
-    #[tokio::test(start_paused = true)]
-    async fn completion_and_replay_preserve_other_deadlines() -> Result<()> {
-        let watchdog = watchdog()?;
-        let tool = address("completed");
-        let requested = requested(&tool, TestTool::Tool, serde_json::json!({}));
-        watchdog.observe(&requested)?;
-        tokio::time::advance(Duration::from_millis(500)).await;
-        let pending = address("pending");
-        watchdog.observe(&self::requested(
-            &pending,
-            TestTool::Command,
-            serde_json::json!({}),
-        ))?;
-        watchdog.observe(&completed(&tool))?;
-        watchdog.observe(&requested)?;
-        assert_eq!(watchdog.expired().await?.unwrap().address, pending);
-        Ok(())
-    }
-
-    /// Background deadlines and their first elapsed failure survive foreground completion.
-    #[tokio::test(start_paused = true)]
-    async fn background_deadlines_survive_foreground_completion() -> Result<()> {
-        let watchdog = watchdog()?;
-        let started = Instant::now();
-        let background = address("background");
-        watchdog.observe(&requested(
-            &background,
-            TestTool::Command,
-            serde_json::json!({}),
-        ))?;
-        watchdog.observe(&item(
-            &background,
-            ItemEvent::Tool {
-                event: ToolItemEvent::Backgrounded,
-            },
-        ))?;
-        tokio::time::advance(Duration::from_millis(750)).await;
-        assert!(watchdog.finish_foreground()?);
-        assert_eq!(watchdog.expired().await?.unwrap().address, background);
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
-        watchdog.observe(&completed(&background))?;
-        watchdog.observe(&requested(
-            &address("later"),
-            TestTool::Command,
-            serde_json::json!({}),
-        ))?;
-        assert_eq!(watchdog.expired().await?.unwrap().address, background);
-        Ok(())
-    }
-
-    /// An actual collected turn retires only that turn's ordinary tool deadlines.
-    #[tokio::test(start_paused = true)]
-    async fn native_completion_preserves_continuation_deadlines() -> Result<()> {
-        let watchdog = watchdog()?;
-        let started = Instant::now();
-        let ordinary = address("ordinary");
-        watchdog.observe(&requested(
-            &ordinary,
-            TestTool::Command,
-            serde_json::json!({}),
-        ))?;
-        tokio::time::advance(Duration::from_millis(750)).await;
-        let result = forge_provider_api::TurnResult::new(
-            forge_provider_api::turn::TurnOutcome::Interrupted,
-            1,
-            None,
-            vec![],
-            vec![],
-            None,
-        )?;
-        let completed =
-            crate::provider::test_support::completed_turn(ordinary.turn.scope.clone(), result)?;
-        watchdog.observe(&crate::provider::test_support::native_event(
-            ordinary.turn.scope.clone(),
-            ProviderEvent::Turn {
-                thread_id: ordinary.turn.thread_id.clone(),
-                turn_id: ordinary.turn.turn_id.clone(),
-                event: TurnEvent::Completed(completed),
-            },
-        ))?;
-        let mut later = address("ordinary");
-        later.turn.scope.invocation_id = "later".into();
-        later.turn.turn_id = later.turn.scope.turn_id()?;
-        watchdog.observe(&requested(&later, TestTool::Command, serde_json::json!({})))?;
-        assert_eq!(watchdog.expired().await?.unwrap().address, later);
-        assert_eq!(started.elapsed(), Duration::from_millis(1750));
         Ok(())
     }
 

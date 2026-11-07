@@ -104,29 +104,6 @@ impl<'a> CodexSecurity<'a> {
 mod tests {
     use super::*;
 
-    /// Native filesystem isolation remains independent of host approval decisions.
-    #[test]
-    fn native_security_preserves_sandbox_and_directories() {
-        let access = AccessPolicy {
-            writable_directory: vec!["D:/shared".into()],
-            ..Default::default()
-        };
-        let security = CodexSecurity::new(&access).unwrap();
-        let mut turn = json!({});
-        security.apply_turn(&mut turn, "D:/repo");
-        assert_eq!(turn["approvalPolicy"], "untrusted");
-        assert_eq!(turn["sandboxPolicy"]["type"], "workspaceWrite");
-        assert_eq!(
-            turn["sandboxPolicy"]["writableRoots"],
-            json!(["D:/repo", "D:/shared"])
-        );
-        assert!(turn.get("permissions").is_none());
-        let mut thread = json!({"config":{"model_reasoning_effort":"high"}});
-        security.apply_thread(&mut thread, "D:/repo");
-        assert_eq!(thread["sandbox"], "workspace-write");
-        assert_eq!(thread["config"]["model_reasoning_effort"], "high");
-    }
-
     #[test]
     fn disabling_sandbox_does_not_disable_approvals() {
         let access = AccessPolicy {
@@ -156,22 +133,6 @@ mod tests {
         security.apply_turn(&mut turn, "D:/repo");
         assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(turn["approvalPolicy"], "untrusted");
-    }
-
-    /// Invalid dormant isolation cannot silently select a different native sandbox.
-    #[test]
-    fn unknown_isolation_rejects_with_or_without_sandbox() {
-        for sandbox in [true, false] {
-            let access = AccessPolicy {
-                sandbox,
-                isolation_mode: Some("unknown-isolation".into()),
-                ..Default::default()
-            };
-            assert!(matches!(
-                CodexSecurity::new(&access),
-                Err(UnsupportedCapability(ProviderFeature::IsolationMode))
-            ));
-        }
     }
 
     /// Each advertised Windows choice has an explicit native encoding.

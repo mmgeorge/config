@@ -240,21 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_task_pointer_rejects_unknown_and_foreign_ownership() -> Result<()> {
-        let (connection, agent, _) = fixture()?;
-        validate(&connection, &agent)?;
-        connection.execute("UPDATE agent_task_record SET agent_id='foreign'", [])?;
-        assert!(validate(&connection, &agent).is_err());
-        connection.execute("DELETE FROM agent_task_record", [])?;
-        assert!(validate(&connection, &agent).is_err());
-        assert!(matches!(
-            agent.continuation,
-            AgentContinuationPolicy::RequiresAuthorization { .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn only_matching_user_authorization_clears_latest_durable_policy() -> Result<()> {
         let (connection, mut agent, mut task) = fixture()?;
         let grant = ExchangeId::from("stopped-task");

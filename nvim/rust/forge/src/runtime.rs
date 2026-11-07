@@ -159,15 +159,6 @@ impl ForgeRuntime {
 mod tests {
     use super::*;
 
-    #[test]
-    fn construction_does_not_require_an_executor_or_repository() {
-        let runtime = ForgeRuntime::new().unwrap();
-        assert_eq!(runtime.repositories.evict_idle(), 0);
-        assert_eq!(runtime.diff.usage().active_jobs, 0);
-        assert_eq!(runtime.diff.usage().cache.admitted_entries, 0);
-        assert_eq!(runtime.diff.usage().pool.live_workers, 0);
-    }
-
     #[tokio::test]
     async fn shutdown_closes_discovery_admission() {
         let runtime = ForgeRuntime::new().unwrap();

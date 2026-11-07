@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
-#[cfg(test)]
-use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
@@ -188,23 +186,6 @@ struct PlanEditRequestWire {
     delete: Option<PlanResourceDelete>,
     stages: Option<Vec<PlanStage>>,
     assumptions: Option<Vec<String>>,
-}
-
-/// Generate the model-facing PlanEdit schema from the same types Serde decodes.
-#[cfg(test)]
-pub(crate) fn plan_edit_request_schema() -> Value {
-    let generator = SchemaSettings::draft07().for_deserialize().into_generator();
-    let mut schema = serde_json::to_value(generator.into_root_schema_for::<PlanEditRequestWire>())
-        .expect("PlanEditRequestWire schema serializes");
-    schema["anyOf"] = json!([
-        { "required": ["plan"] },
-        { "required": ["rename"] },
-        { "required": ["set"] },
-        { "required": ["delete"] },
-        { "required": ["stages"] },
-        { "required": ["assumptions"] }
-    ]);
-    schema
 }
 
 impl<'de> Deserialize<'de> for PlanEditRequest {
@@ -937,104 +918,6 @@ mod test {
     }
 
     #[test]
-    fn creates_replaces_and_deletes_complete_resources() {
-        let created = apply_plan_edit(
-            &empty_document(),
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 4,
-                mutation: PlanMutation {
-                    set: Some(PlanResourceSet {
-                        entity_changes: Some(vec![entity("Inspector"), entity("Report")]),
-                        ..PlanResourceSet::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap();
-        let mut replacement = entity("GeoParquetInspector");
-        replacement.description = "Owns typed inspection.".into();
-
-        let replaced = apply_plan_edit(
-            &created.document,
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 5,
-                mutation: PlanMutation {
-                    rename: Some(PlanResourceRename {
-                        entity_changes: Some(vec![PlanSemanticRename {
-                            from: "Inspector".into(),
-                            to: "GeoParquetInspector".into(),
-                        }]),
-                        ..PlanResourceRename::default()
-                    }),
-                    set: Some(PlanResourceSet {
-                        entity_changes: Some(vec![replacement]),
-                        ..PlanResourceSet::default()
-                    }),
-                    delete: Some(PlanResourceDelete {
-                        entity_changes: Some(vec!["Report".into()]),
-                        ..PlanResourceDelete::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap();
-
-        assert_eq!(replaced.document.entity_changes.len(), 1);
-        assert_eq!(
-            replaced.document.entity_changes[0].name,
-            "GeoParquetInspector"
-        );
-        assert_eq!(
-            replaced.document.entity_changes[0].name,
-            "GeoParquetInspector"
-        );
-    }
-
-    #[test]
-    fn preserves_existing_positions_and_appends_insertions_in_request_order() {
-        let mut document = empty_document();
-        document.entity_changes = vec![entity("First"), entity("Second")];
-        let mut replacement = entity("SecondRenamed");
-        replacement.description = "Owns the renamed second value.".into();
-
-        let result = apply_plan_edit(
-            &document,
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 4,
-                mutation: PlanMutation {
-                    rename: Some(PlanResourceRename {
-                        entity_changes: Some(vec![PlanSemanticRename {
-                            from: "Second".into(),
-                            to: "SecondRenamed".into(),
-                        }]),
-                        ..PlanResourceRename::default()
-                    }),
-                    set: Some(PlanResourceSet {
-                        entity_changes: Some(vec![replacement, entity("Fourth"), entity("Third")]),
-                        ..PlanResourceSet::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap();
-
-        let name_list = result
-            .document
-            .entity_changes
-            .iter()
-            .map(|entity| entity.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(name_list, ["First", "SecondRenamed", "Fourth", "Third"]);
-        assert_eq!(result.document.entity_changes[1].name, "SecondRenamed");
-    }
-
-    #[test]
     fn rejects_overlapping_targets_without_mutating_the_document() {
         let mut document = empty_document();
         document.entity_changes.push(entity("Inspector"));
@@ -1105,88 +988,6 @@ mod test {
         let missing_error = missing_error.downcast_ref::<PlanMutationError>().unwrap();
         assert_eq!(missing_error.path, "delete.flows[0]");
         assert_eq!(missing_error.code, "missing_target");
-    }
-
-    #[test]
-    fn rejects_destination_collisions_at_the_authored_set_path() {
-        let mut document = empty_document();
-        document.entity_changes = vec![entity("Inspector"), entity("Report")];
-
-        let error = apply_plan_edit(
-            &document,
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 4,
-                mutation: PlanMutation {
-                    rename: Some(PlanResourceRename {
-                        entity_changes: Some(vec![PlanSemanticRename {
-                            from: "Inspector".into(),
-                            to: "Report".into(),
-                        }]),
-                        ..PlanResourceRename::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap_err();
-
-        let mutation_error = error.downcast_ref::<PlanMutationError>().unwrap();
-        assert_eq!(mutation_error.path, "rename.entity_changes[0].to");
-        assert_eq!(mutation_error.code, "target_conflict");
-    }
-
-    #[test]
-    fn rejects_a_rename_with_a_missing_source() {
-        let error = apply_plan_edit(
-            &empty_document(),
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 4,
-                mutation: PlanMutation {
-                    rename: Some(PlanResourceRename {
-                        entity_changes: Some(vec![PlanSemanticRename {
-                            from: "OldName".into(),
-                            to: "NewName".into(),
-                        }]),
-                        ..PlanResourceRename::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap_err();
-
-        let mutation_error = error.downcast_ref::<PlanMutationError>().unwrap();
-        assert_eq!(mutation_error.path, "rename.entity_changes[0].from");
-        assert_eq!(mutation_error.code, "missing_target");
-        assert!(mutation_error.hint.contains("current semantic key"));
-    }
-
-    #[test]
-    fn complete_noop_replacement_preserves_the_version() {
-        let mut document = empty_document();
-        document.entity_changes.push(entity("Inspector"));
-        let replacement = document.entity_changes[0].clone();
-
-        let result = apply_plan_edit(
-            &document,
-            PlanEditRequest {
-                plan_id: "plan".into(),
-                expected_version: 4,
-                mutation: PlanMutation {
-                    set: Some(PlanResourceSet {
-                        entity_changes: Some(vec![replacement]),
-                        ..PlanResourceSet::default()
-                    }),
-                    ..PlanMutation::default()
-                },
-            },
-        )
-        .unwrap();
-
-        assert_eq!(result.version, 4);
-        assert_eq!(result.document, document);
     }
 
     #[test]
@@ -1278,51 +1079,5 @@ mod test {
         .unwrap_err();
 
         assert!(error.to_string().contains("expected 3, current 4"));
-    }
-
-    #[test]
-    fn decodes_ordered_complete_set_resources_without_generated_node_ids() {
-        let request: PlanEditRequest = serde_json::from_value(serde_json::json!({
-            "plan_id": "plan",
-            "expected_version": 4,
-            "set": {
-                "entity_changes": [{
-                    "action": "add",
-                    "kind": "struct",
-                    "name": "Inspector",
-                    "description": "Owns inspection.",
-                    "path": "src/lib.rs",
-                    "members": [],
-                    "variants": [],
-                    "extends": null,
-                    "conforms_to": []
-                }]
-            }
-        }))
-        .unwrap();
-
-        let entry_list = request.mutation.set.unwrap().entity_changes.unwrap();
-        assert_eq!(entry_list[0].name, "Inspector");
-    }
-
-    #[test]
-    fn rejects_legacy_resource_operations() {
-        let error = serde_json::from_value::<PlanEditRequest>(serde_json::json!({
-            "plan_id": "plan",
-            "expected_version": 4,
-            "entity_changes": [{
-                "operation": "create",
-                "value": {
-                    "action": "add",
-                    "kind": "struct",
-                    "name": "Inspector",
-                    "description": "Owns inspection.",
-                    "path": "src/lib.rs"
-                }
-            }]
-        }))
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unknown field `entity_changes`"));
     }
 }

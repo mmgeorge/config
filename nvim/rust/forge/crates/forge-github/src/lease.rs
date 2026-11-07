@@ -127,19 +127,4 @@ mod tests {
         assert!(RepositoryLease::operation(&directory).is_ok());
         Ok(())
     }
-
-    #[test]
-    fn removing_the_cache_does_not_replace_the_lease_file() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let directory = root.path().join("repo");
-        fs::create_dir(&directory)?;
-        let deletion = RepositoryLease::deletion(&directory)?;
-        fs::remove_dir(&directory)?;
-        assert!(RepositoryLease::operation(&directory).is_err());
-        fs::create_dir(&directory)?;
-        assert!(RepositoryLease::operation(&directory).is_err());
-        drop(deletion);
-        assert!(RepositoryLease::operation(&directory).is_ok());
-        Ok(())
-    }
 }

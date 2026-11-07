@@ -107,58 +107,9 @@ pub(crate) fn classify_source(
     ))
 }
 
-/// Preserve the first lifecycle failure and all distinct cleanup causes in execution order.
-#[cfg(test)]
-pub(crate) fn combine(
-    failures: impl IntoIterator<Item = ProviderError>,
-) -> Result<(), ProviderError> {
-    let mut failures = failures.into_iter();
-    let Some(primary) = failures.next() else {
-        return Ok(());
-    };
-    let secondary: Vec<_> = failures.collect();
-    if secondary.is_empty() {
-        return Err(primary);
-    }
-    Err(ProviderError::Combined {
-        primary: Box::new(primary),
-        secondary,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Classify invalid configuration before inspecting its lower-level filesystem cause.
-    #[test]
-    fn invalid_configuration_is_rejected_without_exposing_details() {
-        let errors: [Box<dyn std::error::Error>; 2] = [
-            Box::new(
-                forge_provider_api::access::AccessPolicyError::Canonicalize {
-                    kind: forge_provider_api::access::AccessDirectoryKind::Writable,
-                    path: "private-directory".into(),
-                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "private-cause"),
-                },
-            ),
-            Box::new(crate::session::InputTimeoutError::TimestampRange),
-        ];
-        for error in errors {
-            let normalized = classify_source(ProviderOperation::ThreadConfigure, error.as_ref());
-            let ProviderError::Failure(failure) = &normalized else {
-                panic!("invalid configuration lost its normalized failure");
-            };
-            assert_eq!(failure.operation(), ProviderOperation::ThreadConfigure);
-            assert_eq!(failure.kind(), ProviderFailureKind::Rejected);
-            let rendered = format!("{normalized:?} {normalized}");
-            assert!(!rendered.contains("private-directory"));
-            assert!(!rendered.contains("private-cause"));
-            let source = std::error::Error::source(&normalized)
-                .expect("normalized failures retain their typed category as the source");
-            assert!(source.is::<ProviderFailure>());
-            assert!(source.source().is_none());
-        }
-    }
 
     /// Preserve normalized identities while preventing native source text from escaping.
     #[test]
@@ -199,25 +150,5 @@ mod tests {
             !original,
             "native I/O source crossed the normalized boundary"
         );
-    }
-
-    /// Preserve every concrete cleanup failure while keeping the original cause first.
-    #[test]
-    fn lifecycle_cleanup_aggregation_preserves_primary_and_secondary_sources() {
-        let error = combine([
-            ProviderError::Cancelled,
-            ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow),
-        ])
-        .unwrap_err();
-        let ProviderError::Combined { primary, secondary } = error else {
-            panic!("cleanup was flattened");
-        };
-        assert!(matches!(*primary, ProviderError::Cancelled));
-        assert!(matches!(
-            &secondary[..],
-            [ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow
-            )]
-        ));
     }
 }

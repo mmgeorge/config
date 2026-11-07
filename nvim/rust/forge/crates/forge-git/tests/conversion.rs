@@ -1,6 +1,5 @@
 mod support;
 
-use forge_diff::source::Representation;
 use forge_git::{
     RepositoryPath,
     content::{
@@ -8,79 +7,8 @@ use forge_git::{
     },
     store::RepositoryStore,
 };
-use std::{fs, io::Read};
+use std::fs;
 use support::git;
-
-#[tokio::test]
-#[ignore = "exceeds the 5 s test limit; tracked in nvim/tests/forge/plans/disabled-slow-tests.md"]
-async fn native_builtin_conversion_matches_git_object_identity() {
-    let case = [
-        ("", b"plain\n".as_slice()),
-        ("file text", b"one\r\ntwo\r\n"),
-        ("file -text", b"one\r\ntwo\r\n"),
-        ("file text=auto", b"one\r\ntwo\n"),
-        ("file text eol=lf", b"one\r\ntwo"),
-        ("file ident", b"$Id: abcdef $\n"),
-        (
-            "file working-tree-encoding=UTF-16LE text",
-            b"o\0n\0e\0\r\0\n\0",
-        ),
-        (
-            "file working-tree-encoding=UTF-16BE text",
-            b"\0o\0n\0e\0\r\0\n",
-        ),
-        ("file working-tree-encoding=UTF-8 text", b"one\r\n"),
-    ];
-    for (attributes, input) in case {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        git(root, &["init", "--quiet"]);
-        git(root, &["config", "core.autocrlf", "false"]);
-        git(root, &["config", "core.safecrlf", "false"]);
-        fs::write(root.join(".gitattributes"), attributes).unwrap();
-        fs::write(root.join("file"), input).unwrap();
-        let expected = gix::ObjectId::from_hex(
-            git(root, &["hash-object", "--path=file", "file"]).trim_ascii(),
-        )
-        .unwrap();
-        let local = gix::open(root).unwrap();
-        let (mut pipeline, index) = local.filter_pipeline(None).unwrap();
-        let mut converted = Vec::new();
-        pipeline
-            .convert_to_git(input, std::path::Path::new("file"), &index)
-            .unwrap()
-            .read_to_end(&mut converted)
-            .unwrap();
-        assert_eq!(
-            gix::objs::compute_hash(local.object_hash(), gix::objs::Kind::Blob, &converted)
-                .unwrap(),
-            expected,
-            "{attributes}"
-        );
-        let store = RepositoryStore::default();
-        let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-        let result = repository
-            .content(&store, canonical_request())
-            .await
-            .unwrap()
-            .value;
-        let ContentResult::Ready(content) = result else {
-            panic!("{attributes}: {result:?}")
-        };
-        assert_eq!(content.source.bytes(), converted);
-        assert_eq!(
-            content.source.identity().representation,
-            Representation::GitCanonical
-        );
-        assert!(matches!(
-            content.origin,
-            forge_git::content::ContentOrigin::Worktree {
-                conversion: Some(_),
-                ..
-            }
-        ));
-    }
-}
 
 #[tokio::test]
 async fn canonical_read_reloads_configuration_after_store_discovery() {

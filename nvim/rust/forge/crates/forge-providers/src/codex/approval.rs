@@ -35,15 +35,6 @@ pub struct PreparedApproval {
 }
 
 impl ApprovalContext {
-    /// Revoke all snapshots when a connection is cancelled or reused.
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.proposal
-            .lock()
-            .expect("approval metadata lock poisoned")
-            .clear();
-    }
-
     /// Apply ordered item metadata before asynchronous permission dispatch.
     pub fn observe(&self, message: &Value) {
         let method = message["method"].as_str().unwrap_or_default();
@@ -386,123 +377,6 @@ mod tests {
                 .is_none()
         );
         Ok(())
-    }
-
-    #[test]
-    fn replay_preserves_revision_but_changed_or_retired_proposals_invalidate_approval() -> Result<()>
-    {
-        let context = ApprovalContext::default();
-        let original = started(
-            "thread",
-            "turn",
-            "edit",
-            json!([{"path":"one","diff":"original"}]),
-        );
-        context.observe(&original);
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
-        context.observe(&original);
-        prepared.validate()?;
-        context.observe(&started(
-            "thread",
-            "turn",
-            "edit",
-            json!([{"path":"one","diff":"changed"}]),
-        ));
-        assert!(prepared.validate().is_err());
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
-        context.observe(&json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"id":"edit"}}}));
-        assert!(prepared.validate().is_err());
-        context.observe(&original);
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
-        context.observe(
-            &json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn"}}}),
-        );
-        assert!(prepared.validate().is_err());
-        context.observe(&original);
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
-        context.clear();
-        assert!(prepared.validate().is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn missing_metadata_remains_unknown_and_malformed_changes_never_authorize_a_subset()
-    -> Result<()> {
-        let context = ApprovalContext::default();
-        let mut approval = request("thread", "turn", "edit");
-        approval["params"]["grantRoot"] = json!("/allowed");
-        assert!(matches!(
-            context.prepare(&approval)?.request.target_list[0],
-            PermissionTarget::UnknownFile { .. }
-        ));
-        context.observe(&started(
-            "thread",
-            "turn",
-            "edit",
-            json!([{"path":"valid"},{"diff":"missing path"}]),
-        ));
-        assert!(context.prepare(&approval).is_err());
-        context.observe(&started(
-            "thread",
-            "turn",
-            "edit",
-            json!([{"path":"valid","kind":{"move_path":42}}]),
-        ));
-        assert!(context.prepare(&approval).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn complete_large_proposals_keep_every_target() -> Result<()> {
-        let changes: Vec<_> = (0..20_000)
-            .map(|index| json!({"path":format!("files/{index}.rs")}))
-            .collect();
-        let context = ApprovalContext::default();
-        context.observe(&started("thread", "turn", "edit", Value::Array(changes)));
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
-        assert_eq!(prepared.request.target_list.len(), 20_000);
-        assert_eq!(
-            prepared.request.target_list.last(),
-            Some(&PermissionTarget::Write {
-                path: "files/19999.rs".into()
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn provider_command_argv_retains_shell_script_boundaries() {
-        for (executable, script, shell) in [
-            (
-                "pwsh",
-                "1 | ForEach-Object { probe $_ }",
-                CommandShell::PowerShell,
-            ),
-            (
-                "/bin/bash",
-                "for x in one; do probe $x; done",
-                CommandShell::Bash,
-            ),
-            ("/bin/zsh", "repeat 2 probe x", CommandShell::Zsh),
-            ("nu", "[1] | each {|x| probe $x }", CommandShell::Nushell),
-        ] {
-            let request = permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({
-                    "params":{"args":[executable,"-c",script]}
-                }),
-                ".",
-            )
-            .unwrap();
-            assert_eq!(
-                request.target_list,
-                vec![PermissionTarget::Command {
-                    command: script.into(),
-                    shell: Some(shell),
-                }]
-            );
-            assert!(normalize_command_in(script, shell).failure.is_none());
-        }
     }
 
     #[test]

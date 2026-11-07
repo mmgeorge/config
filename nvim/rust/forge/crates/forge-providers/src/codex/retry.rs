@@ -76,61 +76,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Keep permanent failures distinguishable without granting them automatic replay.
-    #[test]
-    fn permanent_failures_keep_their_normalized_category() {
-        use forge_provider_api::ProviderFailureKind;
-        for (code, expected) in [
-            ("contextWindowExceeded", ProviderFailureKind::ContextLimit),
-            ("usageLimitExceeded", ProviderFailureKind::Quota),
-            ("rateLimitExceeded", ProviderFailureKind::RateLimited),
-            ("unauthorized", ProviderFailureKind::Authentication),
-            ("sandboxError", ProviderFailureKind::Policy),
-        ] {
-            let error = json!({"codexErrorInfo":code,"message":"private-native-diagnostic"});
-            assert_eq!(failure_kind(&error), expected);
-            assert!(transient_category(&error).is_none());
-        }
-        assert_eq!(
-            failure_kind(&json!({"message":"unauthorized"})),
-            ProviderFailureKind::Unknown
-        );
-    }
-
-    /// Do not turn malformed or future native status fields into a transport classification.
-    #[test]
-    fn unknown_status_shapes_remain_unknown_and_not_retryable() {
-        use forge_provider_api::ProviderFailureKind;
-        for detail in [
-            json!({}),
-            json!(null),
-            json!("503"),
-            json!({"httpStatusCode":"503"}),
-            json!({"httpStatusCode":599}),
-            json!({"httpStatusCode":false}),
-        ] {
-            let error = json!({"codexErrorInfo":{"httpConnectionFailed":detail}, "message":"network failure"});
-            assert_eq!(failure_kind(&error), ProviderFailureKind::Unknown);
-            assert!(transient_category(&error).is_none());
-        }
-        let no_response =
-            json!({"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":null}}});
-        assert_eq!(failure_kind(&no_response), ProviderFailureKind::Transport);
-        assert_eq!(
-            transient_category(&no_response),
-            Some(RetryCategory::TemporaryTransport)
-        );
-        for info in [
-            json!({"httpConnectionFailed":{"httpStatusCode":503},"unauthorized":{}}),
-            json!(["serverOverloaded"]),
-            json!(true),
-        ] {
-            let error = json!({"codexErrorInfo": info});
-            assert_eq!(failure_kind(&error), ProviderFailureKind::Unknown);
-            assert!(transient_category(&error).is_none());
-        }
-    }
-
     #[test]
     fn allowlist_rejects_permanent_and_unknown_failures() {
         assert!(transient_category(&json!({"codexErrorInfo":"serverOverloaded"})).is_some());

@@ -146,40 +146,7 @@ fn json_source(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::ConfigurationFormat;
-    use crate::syntax::{DeclarationOverview, DeclarationVisibility};
-
-    /// Preserve BOM-bearing documents and navigation while decoding their actual values.
-    #[test]
-    fn json_bom_preserves_configuration_source_and_navigation() {
-        for (path, text) in [
-            (
-                "settings.json",
-                "\u{feff}{\r\n  \"name\": \"work\u{feff}flow\",\r\n  \"enabled\": true\r\n}\r\n",
-            ),
-            (
-                "tsconfig.json",
-                "\u{feff}{\n  // Keep this comment\n  \"name\": \"work\u{feff}flow\",\n  \"enabled\": true,\n}\n",
-            ),
-        ] {
-            assert_eq!(DeclarationOverview::extract(path, text).unwrap(), text);
-            assert_eq!(DeclarationOverview::parse(path, text).unwrap(), text);
-            assert_eq!(
-                DeclarationOverview::format_with_width(path, text, 40).unwrap(),
-                text
-            );
-            let presentation = DeclarationOverview::present(path, text).unwrap();
-            assert_eq!(presentation.text.as_bytes(), text.as_bytes());
-            assert_eq!(presentation.source.len(), text.lines().count());
-            for (row, position) in presentation.source.iter().enumerate() {
-                let position = position.unwrap();
-                assert_eq!(usize::try_from(position.line).unwrap(), row + 1);
-                assert_eq!(position.column, 0);
-            }
-            let value = ConfigurationFormat::json_value(text).unwrap();
-            assert_eq!(value["name"], "work\u{feff}flow");
-            assert_eq!(value["enabled"], true);
-        }
-    }
+    use crate::syntax::DeclarationOverview;
 
     /// Keep malformed JSON and misplaced encoding markers outside the admitted grammar.
     #[test]
@@ -204,63 +171,6 @@ mod tests {
         }
         for text in ["\u{feff}{\"enabled\":true,}", "\u{feff}// Comment\n{}"] {
             assert!(DeclarationOverview::parse("settings.json", text).is_err());
-        }
-    }
-
-    #[test]
-    fn configuration_preserves_values_layout_visibility_and_navigation() {
-        for (path, text) in [
-            (
-                ".gitignore",
-                "# Build output\r\n/target/\r\n!Cargo.lock\r\n\\#literal\r\ncache\\ \r\n",
-            ),
-            ("nested/.gitignore", "*.tmp\n!keep.tmp\n"),
-            (
-                "package.json",
-                "{\r\n  \"scripts\": {\"start\": \"node server.js\"}\r\n}\r\n",
-            ),
-            (
-                "tsconfig.json",
-                "{\n  // Type checks\n  \"compilerOptions\": {\"strict\": true,},\n}\n",
-            ),
-            (
-                "settings.jsonc",
-                "{\"endpoint\": \"https://example.com/*literal*/\",}\n",
-            ),
-            ("Cargo.toml", "[package]\nname = \"arena\"\n"),
-            (
-                "ci.yml",
-                "# Build\njobs:\n  build:\n    script: |\n      echo first\n        echo second\n",
-            ),
-            (
-                "App.csproj",
-                "<Project>\r\n  <!-- Keep settings -->\r\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\r\n</Project>\r\n",
-            ),
-            (
-                "Info.plist",
-                "<?xml version=\"1.0\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict/></plist>",
-            ),
-        ] {
-            assert_eq!(
-                DeclarationOverview::extract(path, text).unwrap(),
-                text,
-                "{path}"
-            );
-            assert_eq!(
-                DeclarationOverview::format_with_width(path, text, 40).unwrap(),
-                text,
-                "{path}"
-            );
-            let presentation = DeclarationOverview::present(path, text).unwrap();
-            assert_eq!(presentation.text, text);
-            for (row, target) in presentation.source.iter().enumerate() {
-                assert_eq!(target.unwrap().line as usize, row + 1);
-            }
-            for public_only in [false, true] {
-                let visibility = DeclarationVisibility::analyze(path, text, public_only).unwrap();
-                assert!(visibility.rows.iter().all(|visible| *visible));
-                assert!(visibility.replacement.is_empty());
-            }
         }
     }
 

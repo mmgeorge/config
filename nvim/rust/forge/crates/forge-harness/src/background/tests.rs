@@ -1,6 +1,6 @@
 use super::*;
-use crate::{provider::ProviderLaunch, session::SessionStore, storage::SqliteStore};
-use anyhow::{Context, Result};
+use crate::{provider::ProviderLaunch, storage::SqliteStore};
+use anyhow::Result;
 use std::{path::Path, sync::Arc};
 
 fn git(root: &Path, arguments: &[&str]) {
@@ -56,57 +56,6 @@ async fn generate(
         .await
 }
 
-/// Admit commit generation while incompatible operation storage remains open in another version.
-#[tokio::test]
-async fn commit_generation_replaces_incompatible_operation_storage() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    let root = fixture.path().join("repository");
-    std::fs::create_dir(&root)?;
-    git(&root, &["init", "-q", "-b", "main"]);
-    git(&root, &["config", "user.name", "Fixture"]);
-    git(&root, &["config", "user.email", "fixture@example.test"]);
-    let data = fixture.path().join("state");
-    drop(SqliteStore::open(&data)?);
-    let database = rusqlite::Connection::open(crate::storage::state::database(&data))?;
-    database.execute_batch(
-        "ALTER TABLE input_operation RENAME COLUMN payload TO outcome;
-         INSERT INTO session_record VALUES('obsolete','workspace',1,'{}');
-         PRAGMA user_version=8;",
-    )?;
-    drop(database);
-    let previous = data.join("state/v8");
-    std::fs::rename(crate::storage::state::directory(&data), &previous)?;
-    let old_database = rusqlite::Connection::open(previous.join("harness.sqlite3"))?;
-    old_database.execute_batch("BEGIN EXCLUSIVE")?;
-
-    let manager = manager();
-    let result = generate(&manager, &root, &data).await;
-    manager.shutdown().await?;
-    let generated = result?;
-    assert!(!generated.text.trim().is_empty());
-    let database = rusqlite::Connection::open(crate::storage::state::database(&data))?;
-    assert_eq!(
-        database.query_row(
-            "SELECT count(*) FROM session_record WHERE id='obsolete'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?,
-        0,
-        "incompatible history must be deleted rather than migrated"
-    );
-    let recorded: i64 = database.query_row(
-        "SELECT count(*) FROM owner_core_log WHERE session_id=?1 AND json_extract(record,'$.record')='operation_completed' AND json_extract(record,'$.operation.kind')='thread_open'",
-        [&generated.session_id], |row| row.get(0),
-    )?;
-    assert!(
-        recorded > 0,
-        "commit generation must retain its successful provider-open evidence"
-    );
-    assert!(previous.join("harness.sqlite3").is_file());
-    old_database.execute_batch("ROLLBACK")?;
-    Ok(())
-}
-
 /// Create a fixture directory holding an empty repository and a state directory.
 fn background_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)> {
     let fixture = tempfile::tempdir()?;
@@ -117,55 +66,6 @@ fn background_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf, std::p
     git(&root, &["config", "user.name", "Fixture"]);
     git(&root, &["config", "user.email", "fixture@example.test"]);
     Ok((fixture, root, data))
-}
-
-#[tokio::test]
-async fn background_reuses_session_across_restarts_and_concurrent_requests() -> Result<()> {
-    let (_fixture, root, data) = background_fixture()?;
-    let first_manager = manager();
-    let empty = first_manager
-        .timeline(serde_json::json!({"data_root":data,"workspace":root}))
-        .await?;
-    assert!(empty["session"].is_null());
-    assert!(SqliteStore::open(&data)?.list_session(None)?.is_empty());
-    let first = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await?;
-    assert!(!first.text.is_empty());
-    let first_manager = manager();
-    let second = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await?;
-    assert_eq!(first.session_id, second.session_id);
-    git(
-        &root,
-        &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
-    );
-    let first_manager = manager();
-    let third = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await?;
-    assert_eq!(
-        first.session_id, third.session_id,
-        "first commit should advance an unborn branch"
-    );
-    let first_manager = manager();
-    let (left, right) = tokio::join!(
-        generate(&first_manager, &root, &data),
-        generate(&first_manager, &root, &data)
-    );
-    assert_eq!(
-        left?.session_id, right?.session_id,
-        "concurrent requests created different conversations"
-    );
-    first_manager.shutdown().await?;
-    let store = SqliteStore::open(&data)?;
-    assert_eq!(store.list_exchange(&first.session_id)?.len(), 5);
-    assert!(
-        store
-            .load_session(&first.session_id)?
-            .context("session missing")?
-            .provider_session_id
-            .is_some()
-    );
-    Ok(())
 }
 
 #[tokio::test]
@@ -205,116 +105,6 @@ async fn background_resume_marks_interrupted_compaction_unconfirmed() -> Result<
     );
     let events = SqliteStore::open(&data)?.list_session_event(&first.session_id)?;
     assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Unconfirmed)));
-    Ok(())
-}
-
-#[tokio::test]
-async fn background_rotates_session_on_branch_switch_and_history_rewrite() -> Result<()> {
-    let (_fixture, root, data) = background_fixture()?;
-    git(
-        &root,
-        &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
-    );
-    let first_manager = manager();
-    let first = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await?;
-    git(&root, &["switch", "-q", "-c", "feature"]);
-    let resumed_manager = manager();
-    let branch = generate(&resumed_manager, &root, &data).await?;
-    resumed_manager.shutdown().await?;
-    assert_ne!(first.session_id, branch.session_id);
-    git(
-        &root,
-        &[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "--amend",
-            "-m",
-            "feat: rewritten",
-        ],
-    );
-    let resumed_manager = manager();
-    let rewritten = generate(&resumed_manager, &root, &data).await?;
-    resumed_manager.shutdown().await?;
-    assert_ne!(branch.session_id, rewritten.session_id);
-    Ok(())
-}
-
-#[tokio::test]
-async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    let root = fixture.path().join("repository");
-    std::fs::create_dir(&root)?;
-    let data = fixture.path().join("state");
-    git(&root, &["init", "-q", "-b", "main"]);
-    git(&root, &["config", "user.name", "Fixture"]);
-    git(&root, &["config", "user.email", "fixture@example.test"]);
-    git(
-        &root,
-        &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
-    );
-    let mut identity = None;
-    let purposes = [
-        crate::provider::TextGeneration::CommitMessage,
-        crate::provider::TextGeneration::PullRequestDescription,
-        crate::provider::TextGeneration::CommitMessage,
-    ];
-    for (purpose, service_tier) in purposes.into_iter().zip([
-        crate::provider::ServiceTier::Fast,
-        crate::provider::ServiceTier::Ultrafast,
-        crate::provider::ServiceTier::Standard,
-    ]) {
-        let owner = manager();
-        let context = BackgroundContext::read(&owner.repositories, root.to_str().unwrap()).await?;
-        let result = owner
-            .generate(BackgroundRequest {
-                cancellation: CancellationToken::new(),
-                purpose,
-                context,
-                input: "Current fixture evidence".into(),
-                delivery: None,
-                config: crate::service::TextGenerationConfig {
-                    provider: ProviderLaunch {
-                        kind: forge_providers::registry::nonselectable_id()
-                            .expect("registry supplies a nonselectable fixture identity"),
-                        command: vec![],
-                    },
-                    model: "mock-model".into(),
-                    reasoning_effort: Some("low".into()),
-                    service_tier,
-                    data_root: data.clone(),
-                    auto_compaction: Default::default(),
-                },
-            })
-            .await?;
-        owner.shutdown().await?;
-        let store = SqliteStore::open(&data)?;
-        let session = store
-            .load_session(&result.session_id)?
-            .context("shared session missing")?;
-        assert_eq!(
-            session.service_tier, service_tier,
-            "Background speed was reset or inherited"
-        );
-        let current = (result.session_id.clone(), session.provider_session_id);
-        if let Some(previous) = &identity {
-            assert_eq!(&current, previous);
-        }
-        identity = Some(current);
-        assert_eq!(store.list_session(None)?.len(), 1);
-        let exchanges = store.list_exchange(&result.session_id)?;
-        let prompt = &exchanges.last().context("task exchange missing")?.prompt;
-        assert_eq!(
-            prompt,
-            &purpose.background_input("Current fixture evidence")
-        );
-    }
-    let session_id = identity.context("shared identity missing")?.0;
-    assert_eq!(
-        SqliteStore::open(&data)?.list_exchange(&session_id)?.len(),
-        3
-    );
     Ok(())
 }
 

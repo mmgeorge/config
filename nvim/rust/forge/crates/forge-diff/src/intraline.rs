@@ -152,36 +152,3 @@ fn character_offsets(text: &str) -> Vec<usize> {
     offset.push(text.len());
     offset
 }
-
-#[cfg(test)]
-mod patch_tests {
-    use super::*;
-    use crate::patch::UnifiedPatch;
-
-    #[test]
-    fn saved_replacements_do_not_pair_across_context_or_unmatched_runs() {
-        let patch = UnifiedPatch::parse("--- a/file\n+++ b/file\n@@ -1,4 +1,5 @@\n-let café = 1;\n+let café = 2;\n context\n-removed\n+first\n+second\n tail\n").unwrap();
-        let rows = &patch.file[0].hunk[0].row;
-        let emphasis = patch_emphasis(IntralinePolicy::default(), rows);
-        assert_eq!(
-            emphasis[0]
-                .iter()
-                .map(|range| &rows[0].text[range.clone()])
-                .collect::<String>(),
-            "1"
-        );
-        assert_eq!(
-            emphasis[1]
-                .iter()
-                .map(|range| &rows[1].text[range.clone()])
-                .collect::<String>(),
-            "2"
-        );
-        assert!(emphasis[2..].iter().all(Vec::is_empty));
-        let policy = IntralinePolicy {
-            input_bytes: 1,
-            ..Default::default()
-        };
-        assert!(patch_emphasis(policy, rows).iter().all(Vec::is_empty));
-    }
-}

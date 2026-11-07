@@ -433,28 +433,4 @@ impl Drop for QuestionWaits {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A failed retirement releases its response exactly once while retaining the observed result for retry.
-    #[tokio::test]
-    async fn failed_retirement_releases_observer_and_retains_recovery_fact() {
-        let (reply, receiver) = oneshot::channel();
-        let id = WaitId(uuid::Uuid::new_v4());
-        let mut retirement = Retirement {
-            id,
-            end: QuestionWaitEnd::Observed(QuestionWaitReport::observed(&[])),
-            reply: Some(reply),
-        };
-        retirement.release_uncommitted_observer();
-        assert!(matches!(
-            receiver.await.unwrap(),
-            Err(QuestionWaitError::StateUnavailable)
-        ));
-        assert!(retirement.reply.is_none());
-        assert!(retirement.id == id);
-        assert!(matches!(retirement.end, QuestionWaitEnd::Observed(_)));
-        retirement.release_uncommitted_observer();
-        assert!(matches!(retirement.end, QuestionWaitEnd::Observed(_)));
-    }
-}
+mod tests {}

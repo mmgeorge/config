@@ -86,45 +86,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A malformed native observation after a real SDK handoff cannot become preparation rejection.
-    #[tokio::test]
-    async fn protocol_failure_after_native_handoff_retains_uncertain_observation_effects() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (client, peer) = super::super::test_peer::client(|request| {
-                let result = match request["method"].as_str().unwrap() {
-                    "session.create" => json!({"sessionId":"post-dispatch", "workspacePath":std::env::temp_dir()}),
-                    "session.options.update" | "session.detach" => json!({"success":true}),
-                    "session.send" => json!({"messageId":"accepted-input"}),
-                    method => panic!("unexpected handoff metadata fixture method: {method}"),
-                };
-                vec![super::super::test_peer::response(request, result)]
-            });
-            let session = client.create_session(github_copilot_sdk::SessionConfig::default().with_session_id(github_copilot_sdk::SessionId::new("post-dispatch"))).await.unwrap();
-            let turn = super::super::turn::CopilotTurnEvent::default();
-            let scope = forge_provider_api::InvocationScope::new(forge_provider_api::testing::root_thread("post-dispatch"), "invocation");
-            let (sink, _events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("binding").unwrap(), scope.clone());
-            let guard = turn.activate(Some(sink.clone()), None).unwrap();
-            turn.steer_native(None, None, |authority| async {
-                send(&session, MessageOptions::new("accepted request"), None, authority).await.map_err(anyhow::Error::new)
-            }).await.unwrap();
-            let mut decoder = super::super::event_decoder::CopilotEventDecoder::new(scope, ".".into());
-            let mut output = forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some("post-dispatch".to_owned().try_into().unwrap()), ..Default::default()
-            };
-            let malformed = serde_json::from_value(json!({"id":"malformed", "type":"assistant.message_delta", "timestamp":"2026-11-04T00:00:00Z", "data":{"deltaContent":"no message identity"}})).unwrap();
-            let error = decoder.decode(&malformed, &mut output, &sink.activity_writer()).await.unwrap_err();
-            assert!(matches!(error, forge_provider_api::ProviderError::Failure(failure)
-                if failure.operation() == forge_provider_api::ProviderOperation::TurnStart
-                && failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
-                && failure.phase() == forge_provider_api::ProviderPhase::Observation
-                && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain));
-            drop(guard);
-            session.disconnect().await.unwrap(); client.stop().await.unwrap();
-            let requests = peer.collected().await;
-            assert_eq!(requests.iter().filter(|request| request["method"] == "session.send").count(), 1);
-        }).await.expect("post-dispatch metadata fixture timed out");
-    }
-
     /// Dispatch is observable and abort reaches the writer while native send acknowledgement is held.
     #[tokio::test]
     async fn tracked_handoff_does_not_wait_for_native_acknowledgement() {

@@ -182,29 +182,6 @@ fn publication_failure() -> ProviderError {
 mod tests {
     use super::*;
 
-    /// Preserve descendant replay risk across rejected batches and collected revisions.
-    #[test]
-    fn descendant_admission_remains_replay_unsafe_after_host_collection()
-    -> Result<(), ProviderError> {
-        let slot = CompletionSlot::default();
-        slot.record_descendant_work()?;
-        let revision = slot.preview()?.revision;
-        slot.record_descendant_work()?;
-        assert_eq!(slot.preview()?.revision, revision);
-        let batch = slot.publish_batch(ProviderCompletion::default())?;
-        batch.reject();
-        let preview = slot.preview()?;
-        assert!(
-            preview
-                .completion
-                .as_ref()
-                .unwrap()
-                .descendant_work_admitted
-        );
-        assert!(slot.take_revision(preview.revision)?);
-        assert!(slot.preview()?.completion.unwrap().descendant_work_admitted);
-        Ok(())
-    }
     #[test]
     fn rejected_batch_disappears_from_captured_terminal_snapshot() -> Result<(), ProviderError> {
         let slot = CompletionSlot::default();

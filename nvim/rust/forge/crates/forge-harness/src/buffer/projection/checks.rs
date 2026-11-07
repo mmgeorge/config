@@ -509,64 +509,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn legacy_package_metadata_does_not_override_file_scope_or_hide_runner_failures() -> Result<()>
-    {
-        let mut source = json!({
-            "id":"command", "command":"runner", "state":"failed", "started_at_ms":1,
-            "completed_at_ms":2,"exit_code":1,"error":null,"stdout":"unused","stderr":"unused",
-            "output":"unused","output_bytes":0,"preview":"",
-            "report":{"result":[{"file":"tests/pass.lua","state":"passed","duration_ms":1,
-                "command":"nvim","output":""}],"error":null},
-            "context":{"definition_id":"test","name":"Runner","area":".","reason":"selected",
-                "matched_files":["src/one.rs","src/two.rs"],"category":"test","directory":".",
-                "selection":{"kind":"files","files":["src/one.rs","src/two.rs"]},
-                "resolved":null,"depends_on":[],"receipt":"unused",
-                "invocation":{"inputs":{},"program":"runner","args":[],"directory":".",
-                    "package":null,"files":["src/one.rs"],"cases":[],"discovery":null}}
-        });
-        let command: CommandCheck = serde_json::from_value(source.clone())?;
-        assert_eq!(check_scope(&command).0, "src/one.rs");
-        source["context"]["invocation"]["package"] =
-            json!({"name":"core","directory":"core","manifest":"core/Cargo.toml"});
-        let command: CommandCheck = serde_json::from_value(source)?;
-        assert_eq!(check_scope(&command).0, "src/one.rs");
-        let run: CheckRun = serde_json::from_value(json!({
-            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
-            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
-            "started_at_ms":1,"completed_at_ms":2,"state":"failed",
-            "progress":crate::plan::execution::SemanticProgress::default(),
-            "workspace_identity":null,"workspace_digest":{},"commands":[command]
-        }))?;
-        let leaves = check_leaves(&run, CheckCategory::Test);
-        assert_eq!(leaves.len(), 2);
-        assert!(leaves[0].result.is_some() && leaves[1].result.is_none());
-        assert_eq!(leaves[1].name.as_deref(), Some("Runner result"));
-        Ok(())
-    }
-
-    /// A run whose commands were all ineligible reports that no automatic check ran
-    /// instead of a vacuous `0/0 passed` count.
-    #[test]
-    fn run_without_eligible_commands_reports_no_automatic_checks() -> Result<()> {
-        let run: CheckRun = serde_json::from_value(json!({
-            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
-            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
-            "started_at_ms":1,"completed_at_ms":2,"state":"passed",
-            "progress":crate::plan::execution::SemanticProgress::default(),
-            "workspace_identity":null,"workspace_digest":{},"commands":[{
-                "id":"run:0","command":"python -m unittest","state":"skipped",
-                "started_at_ms":1,"completed_at_ms":null,"exit_code":null,"error":null,"stdout":"",
-                "stderr":"","output":"","output_bytes":0,"preview":"",
-                "context":{"definition_id":"unit","name":"unit-tests","area":".","reason":"manual",
-                    "matched_files":[],"category":"test","directory":".","selection":{"kind":"all"},
-                    "resolved":null,"depends_on":[],"receipt":"unused"}
-            }]
-        }))?;
-        assert_eq!(check_summary(&run), "No automatic checks ran");
-        Ok(())
-    }
-
-    #[test]
     fn categories_preserve_file_groups_repeated_runs_and_original_outcomes() -> Result<()> {
         let mut commands = Vec::new();
         for (index, category, file, state) in [

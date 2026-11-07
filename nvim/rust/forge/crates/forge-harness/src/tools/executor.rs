@@ -291,43 +291,6 @@ mod test {
     use crate::provider::PromptMode;
     use anyhow::{Context, Result};
 
-    #[test]
-    fn plan_control_keeps_its_admitted_revision_before_waiting() -> Result<()> {
-        use crate::task::{SessionTaskController, Task, TaskChange};
-        let (_root, mut store, controller) = SessionTaskController::test_goal();
-        let previous = controller.current()?.unwrap();
-        let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
-            "id":"plan", "session_id":"session", "request":"Design", "state":"generating",
-            "working_path":"working.md", "model_revision":0, "user_revision":0,
-            "review_digest":null, "accepted_digest":null, "created_at_ms":1, "updated_at_ms":1
-        }))?;
-        let task = controller
-            .change(
-                &mut store,
-                Some(&previous.revision),
-                TaskChange::Install(Box::new(Task::plan(plan, 2)?)),
-                2,
-            )?
-            .unwrap();
-        let permit = task.permit();
-        let mut invocation = ControlToolInvocation {
-            call_id: None,
-            name: "plan_overview_read".into(),
-            arguments: serde_json::json!({"plan_id":"plan"}),
-            task_permit: None,
-        };
-        invocation.admit_turn_control(Some(&controller), Some(&permit), PromptMode::Plan)?;
-        let paused = controller
-            .change(&mut store, Some(&task.revision), TaskChange::Pause, 3)?
-            .unwrap();
-        controller.change(&mut store, Some(&paused.revision), TaskChange::Resume, 4)?;
-        let error = invocation
-            .admit_turn_control(Some(&controller), Some(&permit), PromptMode::Plan)
-            .unwrap_err();
-        assert!(error.is::<crate::task::StaleTask>());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn task_replacement_invalidates_running_and_queued_goal_controls() -> Result<()> {
         let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();

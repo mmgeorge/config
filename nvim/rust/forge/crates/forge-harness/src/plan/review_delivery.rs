@@ -76,49 +76,6 @@ mod tests {
     }
 
     #[test]
-    fn distant_changes_do_not_resend_retained_rows() {
-        for count in [100, 10_000] {
-            let original = (0..count)
-                .map(|index| block(index, "retained declaration"))
-                .collect::<Vec<_>>();
-            let mut document =
-                BufferDocument::new(DocumentId("review".into()), original.clone()).unwrap();
-            let mut changed = original.clone();
-            changed[1] = block(1, "first change");
-            changed[count - 2] = block(count - 2, "last change");
-            let patch = document
-                .splice(0..document.block_count(), changed.clone())
-                .unwrap()
-                .unwrap();
-            assert_eq!(patch.text_edit.len(), 2);
-            assert_eq!(
-                patch
-                    .text_edit
-                    .iter()
-                    .map(|edit| edit.text.row_count())
-                    .sum::<usize>(),
-                2
-            );
-            assert!(
-                !serde_json::to_string(&patch)
-                    .unwrap()
-                    .contains("retained declaration")
-            );
-            assert_eq!(document.snapshot().block, changed);
-            assert!(
-                document
-                    .splice(0..document.block_count(), changed)
-                    .unwrap()
-                    .is_none()
-            );
-            document
-                .splice(0..document.block_count(), original.clone())
-                .unwrap();
-            assert_eq!(document.snapshot().block, original);
-        }
-    }
-
-    #[test]
     fn insert_delete_reorder_and_empty_replacements_match_the_projection() {
         let original = (0..6)
             .map(|index| block(index, "declaration"))

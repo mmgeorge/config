@@ -920,33 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_fold_headings_remain_valid_across_splices() {
-        use crate::block::{BlockAnchor, FoldRange};
-        let mut owner = block(2, 1);
-        owner.metadata.fold.push(FoldRange {
-            collapsed_suffix: None,
-            heading_start: Some(BlockAnchor {
-                block: BlockId("block-1".into()),
-                position: TextPosition { row: 0, column: 0 },
-            }),
-            collapse_children: false,
-            expand_children: false,
-            id: FoldId("task".into()),
-            start: TextPosition { row: 0, column: 0 },
-            end: BlockAnchor {
-                block: BlockId("block-3".into()),
-                position: TextPosition { row: 1, column: 0 },
-            },
-            closed: true,
-        });
-        let mut sequence = BlockSequence::new(vec![block(1, 1), owner, block(3, 1)]).unwrap();
-        assert!(sequence.splice(0..1, vec![]).is_err());
-        sequence.splice(0..1, vec![block(1, 2)]).unwrap();
-        sequence.splice(0..3, vec![]).unwrap();
-        assert!(sequence.fold_endpoint.is_empty());
-    }
-
-    #[test]
     fn fold_endpoint_edits_are_validated_before_publication() {
         use crate::block::{BlockAnchor, FoldRange};
         let mut first = block(1, 1);

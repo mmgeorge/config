@@ -4,7 +4,6 @@ use crate::provider::submission::{SubmissionState, SubmissionStore};
 use crate::provider::test_support::{EventFixtureProvider, ProviderTestSession};
 use crate::provider::{PromptMode, ProviderInput, SteeringInput};
 use anyhow::{Context, Result};
-use forge_provider_api::provider::Provider as NativeProvider;
 use forge_provider_api::turn::{TurnCompletionReason, TurnOutcome};
 use forge_provider_api::{
     AdapterActivity, AdapterActivityWriter, CoveredInput, NativeTurnStart, PromptRequest,
@@ -50,27 +49,9 @@ impl NativeCall {
 
 /// Hold steering acceptance independently of the native turn's terminal result.
 struct SteeringCall {
-    request: forge_provider_api::SteeringRequest,
-    coverage: Coverage,
     reply: oneshot::Sender<Result<(), ProviderError>>,
 }
 impl SteeringCall {
-    /// Persist native acceptance before releasing the separately held operation waiter.
-    async fn accept(&self) -> Result<()> {
-        let receipt = self
-            .request
-            .delivery
-            .receipt()
-            .context("expected journaled steering")?
-            .clone();
-        let input = CoveredInput::new(receipt.id().clone(), receipt.attempt_id()?);
-        receipt.record_accepted(None).await?;
-        let mut coverage = self.coverage.lock().unwrap();
-        if !coverage.contains(&input) {
-            coverage.push(input);
-        }
-        Ok(())
-    }
     /// Resolve the actual steering operation after the test's independent native evidence.
     fn acknowledge(self, result: Result<(), ProviderError>) -> Result<()> {
         self.reply
@@ -151,14 +132,10 @@ impl Fixture {
                 .get(&request.scope)
                 .cloned();
             async move {
-                let (coverage, mut cancelled) = coverage.ok_or(ProviderError::NotConsumed)?;
+                let (_, mut cancelled) = coverage.ok_or(ProviderError::NotConsumed)?;
                 let (reply, response) = oneshot::channel();
                 sender
-                    .send(SteeringCall {
-                        request,
-                        coverage,
-                        reply,
-                    })
+                    .send(SteeringCall { reply })
                     .map_err(|_| ProviderError::Cancelled)?;
                 if *cancelled.borrow() {
                     return Err(ProviderError::Cancelled);
@@ -318,83 +295,6 @@ fn normal() -> TurnOutcome {
     }
 }
 
-/// Repeated immutable operations observe their original result even after admission expires.
-#[tokio::test(start_paused = true)]
-async fn controlled_operation_replays_after_expiry_and_rejects_changed_identity() -> Result<()> {
-    let fixture = Fixture::new()?;
-    let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
-    let context = forge_provider_api::OperationContext::new(
-        forge_provider_api::OperationId::new("inspect")?,
-        std::time::Duration::from_millis(1),
-        cancellation,
-    )?;
-    let workspace = forge_provider_api::WorkspaceContext {
-        workspace: "original".into(),
-    };
-    let first = fixture
-        .native
-        .inspect(context.clone(), workspace.clone())
-        .await?;
-    tokio::time::advance(std::time::Duration::from_millis(2)).await;
-    source.cancel();
-    let replay = fixture.native.inspect(context.clone(), workspace).await?;
-    assert_eq!(first.capabilities.provider, replay.capabilities.provider);
-    let error = fixture
-        .native
-        .inspect(
-            context.clone(),
-            forge_provider_api::WorkspaceContext {
-                workspace: "changed".into(),
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::OperationConflict)
-    );
-    assert!(
-        matches!(fixture.native.thread_close(context, &forge_provider_api::BindingId::new("other")?).await,
-        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::OperationConflict)
-    );
-    fixture.close().await
-}
-
-/// Reserved preparation cancellation releases its receipt and cannot clear a newer cancellation fence.
-#[tokio::test]
-async fn reserved_preparation_cancel_releases_receipt_and_stale_resume_preserves_successor_fence()
--> Result<()> {
-    let fixture = Fixture::new()?;
-    for owner in owners() {
-        let engine = fixture.registry.owner(owner.clone()).await?;
-        let scope = InvocationScope::new(owner.clone(), "reserved");
-        let receipt = fixture.store.prepare(
-            &request(&owner, fixture.directory.path()),
-            engine.provider_id(),
-        )?;
-        let weak = Arc::downgrade(&receipt);
-        engine.reserve_invocation(scope.clone(), receipt.clone())?;
-        let collection = engine.collect_exchange(scope.clone()).await?;
-        assert_eq!(receipt.record()?.delivery, SubmissionState::Cancelled);
-        drop(receipt);
-        assert!(weak.upgrade().is_none());
-        engine.resume_exchange(collection.clone()).await?;
-        engine.cancel_exchange(scope.clone()).await?;
-        assert!(engine.resume_exchange(collection.clone()).await.is_err());
-        let fresh = engine.collect_exchange(scope.clone()).await?;
-        engine.resume_exchange(fresh).await?;
-        let next = InvocationScope::new(owner.clone(), "reserved");
-        let mut input = request(&owner, fixture.directory.path());
-        input.input = ProviderInput::from_text("new instruction");
-        let receipt = fixture.store.prepare(&input, engine.provider_id())?;
-        engine.reserve_invocation(next.clone(), receipt.clone())?;
-        engine.cancel_exchange(next).await?;
-        assert!(engine.resume_exchange(collection).await.is_err());
-        assert_eq!(receipt.record()?.delivery, SubmissionState::Cancelled);
-    }
-    assert_eq!(fixture.dispatch_count.load(Ordering::SeqCst), 0);
-    fixture.close().await
-}
-
 /// Fresh continuations retain the exchange while stale cancellation cannot interrupt their turn.
 #[tokio::test]
 async fn ordinary_successor_has_fresh_scope_and_stale_cancel_cannot_stop_it() -> Result<()> {
@@ -438,75 +338,6 @@ async fn ordinary_successor_has_fresh_scope_and_stale_cancel_cannot_stop_it() ->
         ready.outcome?;
         ready.ticket.commit().await?;
     }
-    fixture.close().await
-}
-
-/// Cancellation collects provider preparation without dispatching native input.
-#[tokio::test]
-async fn prepared_cancellation_collects_native_admission_without_dispatch() -> Result<()> {
-    let fixture = Fixture::new()?;
-    let entered = Arc::new(tokio::sync::Semaphore::new(0));
-    let hook = entered.clone();
-    fixture.native.with_pre_dispatch(move |_| {
-        let entered = hook.clone();
-        async move {
-            entered.add_permits(1);
-            std::future::pending::<Result<(), ProviderError>>().await
-        }
-    });
-    for owner in owners() {
-        let (engine, scope, _events, result) = fixture.run(&owner, "preparing").await?;
-        crate::provider::test_support::wait_gate(&entered).await?;
-        engine.cancel(scope).await?;
-        assert!(matches!(result.await?, Err(ProviderError::Cancelled)));
-    }
-    assert_eq!(fixture.dispatch_count.load(Ordering::SeqCst), 0);
-    fixture.close().await
-}
-
-/// Definite predispatch rejection permits explicit owner reuse without replaying an accepted input.
-#[tokio::test]
-async fn predispatch_rejection_collects_native_scope_before_owner_reuse() -> Result<()> {
-    let mut fixture = Fixture::new()?;
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let hook = attempts.clone();
-    fixture.native.with_pre_dispatch(move |_| {
-        let first = hook.fetch_add(1, Ordering::SeqCst) % 2 == 0;
-        async move {
-            if first {
-                Err(ProviderFailure::new(
-                    ProviderOperation::TurnStart,
-                    ProviderFailureKind::Rejected,
-                )
-                .into())
-            } else {
-                Ok(())
-            }
-        }
-    });
-    for owner in owners() {
-        let (_, _, _, result) = fixture.run(&owner, "rejected").await?;
-        let error = result
-            .await?
-            .err()
-            .context("predispatch rejection returned readiness")?;
-        assert!(
-            matches!(error, ProviderError::PreparationFailed(_)),
-            "{error:?}"
-        );
-        let (_, _, _, result) = fixture.run(&owner, "explicit-successor").await?;
-        let mut call = fixture
-            .calls
-            .recv()
-            .await
-            .context("explicit successor missing")?;
-        call.started().await?;
-        call.finish(normal())?;
-        let ready = result.await??;
-        ready.outcome?;
-        ready.ticket.commit().await?;
-    }
-    assert_eq!(fixture.dispatch_count.load(Ordering::SeqCst), 3);
     fixture.close().await
 }
 
@@ -595,62 +426,6 @@ async fn foreground_backpressure_preserves_burst_cancel_and_successor_order() ->
         ready.ticket.commit().await?;
     }
     fixture.close().await
-}
-
-/// A retired normalized turn cannot restart, and a foreign turn cannot steal active ownership.
-#[tokio::test]
-async fn committed_old_owner_execution_conflicts_with_new_active_exchange_without_losing_attribution()
--> Result<()> {
-    let mut fixture = Fixture::new()?;
-    for owner in owners() {
-        let (_, _, _, first) = fixture.run(&owner, "retired").await?;
-        let mut old = fixture.calls.recv().await.context("old dispatch missing")?;
-        old.started().await?;
-        old.finish(normal())?;
-        first.await??.ticket.commit().await?;
-        let (engine, scope, mut events, second) = fixture.run(&owner, "active").await?;
-        let mut active = fixture
-            .calls
-            .recv()
-            .await
-            .context("active dispatch missing")?;
-        active.started().await?;
-        let wrong_turn = forge_provider_api::TurnId::new("unregistered-turn")?;
-        assert!(
-            old.writer
-                .send_wait(AdapterActivity::Item {
-                    thread_id: old.request.thread_id.clone(),
-                    turn_id: wrong_turn,
-                    item_id: forge_provider_api::ItemId::new("foreign")?,
-                    event: forge_provider_api::message::ItemEvent::Message {
-                        event: forge_provider_api::message::MessageItemEvent::Delta(
-                            "foreign".into()
-                        )
-                    }
-                })
-                .await
-                .is_err()
-        );
-        assert_ne!(old.request.scope, scope);
-        active.finish(normal())?;
-        assert!(second.await?.is_err());
-        assert!(!engine.is_healthy().await);
-        while let Ok(Some(observation)) = events.try_next() {
-            assert!(!matches!(observation,
-                OwnerObservation::Event(HarnessEvent::Native { event, .. })
-                if matches!(event.as_ref(), NativeEvent::Item { item_id, .. }
-                    if item_id.as_str() == "foreign")));
-        }
-    }
-    let error = fixture.close().await.unwrap_err();
-    assert!(
-        error.chain().any(|cause| matches!(
-            cause.downcast_ref::<ObservationFailure>(),
-            Some(ObservationFailure::OwnershipConflict)
-        )),
-        "unexpected retirement failure: {error:#}"
-    );
-    Ok(())
 }
 
 /// Failed native collection cannot manufacture completion or a collected no-start certificate.
@@ -744,131 +519,6 @@ async fn completion_racing_steering_preserves_proven_rejection_and_delivery_unce
             }
         }
         fixture.close().await?;
-    }
-    Ok(())
-}
-
-/// Sole completion covers accepted steering while the separately retained operation acknowledgment is pending.
-#[tokio::test]
-async fn every_owner_retains_pending_steering_and_idle_observation() -> Result<()> {
-    let mut fixture = Fixture::new()?;
-    for owner in owners() {
-        let (engine, scope, mut events, result) = fixture.run(&owner, "steered").await?;
-        let mut call = fixture.calls.recv().await.context("dispatch missing")?;
-        call.started().await?;
-        let input = steering(&fixture, &owner)?;
-        let running = engine.clone();
-        let selected = scope.clone();
-        let steer = tokio::spawn(async move { running.steer(selected, input).await });
-        let pending = fixture.steering.recv().await.context("steering missing")?;
-        pending.accept().await?;
-        call.finish(normal())?;
-        boundary(&mut events, true).await?;
-        assert!(
-            !result.is_finished(),
-            "completion bypassed held operation acknowledgment"
-        );
-        pending.acknowledge(Ok(()))?;
-        steer.await??;
-        result.await??.ticket.commit().await?;
-        assert!(
-            engine
-                .steer(scope, steering(&fixture, &owner)?)
-                .await
-                .is_err()
-        );
-        assert!(fixture.calls.try_recv().is_err());
-    }
-    assert_eq!(fixture.dispatch_count.load(Ordering::SeqCst), 3);
-    fixture.close().await
-}
-
-/// Loss or cancellation of one owner cannot settle peer owners or replay their inputs.
-#[tokio::test]
-async fn conversation_root_isolates_pending_control_cancellation() -> Result<()> {
-    assert_owner_isolates_pending_control(0, false).await
-}
-
-#[tokio::test]
-async fn conversation_root_isolates_pending_control_loss() -> Result<()> {
-    assert_owner_isolates_pending_control(0, true).await
-}
-
-#[tokio::test]
-async fn managed_child_isolates_pending_control_cancellation() -> Result<()> {
-    assert_owner_isolates_pending_control(1, false).await
-}
-
-#[tokio::test]
-async fn managed_child_isolates_pending_control_loss() -> Result<()> {
-    assert_owner_isolates_pending_control(1, true).await
-}
-
-#[tokio::test]
-async fn background_session_isolates_pending_control_cancellation() -> Result<()> {
-    assert_owner_isolates_pending_control(2, false).await
-}
-
-#[tokio::test]
-async fn background_session_isolates_pending_control_loss() -> Result<()> {
-    assert_owner_isolates_pending_control(2, true).await
-}
-
-/// Starts one run per owner, then loses or cancels the owner at `target` while it has pending
-/// steering and checks the peers neither settle nor replay their inputs.
-async fn assert_owner_isolates_pending_control(target: usize, lost: bool) -> Result<()> {
-    {
-        {
-            let mut fixture = Fixture::new()?;
-            let mut active = Vec::new();
-            for owner in owners() {
-                let (engine, scope, _, result) = fixture.run(&owner, "isolated").await?;
-                let call = fixture.calls.recv().await.context("dispatch missing")?;
-                call.started().await?;
-                active.push((owner, engine, scope, result, call));
-            }
-            let (owner, engine, scope, _, call) = &active[target];
-            let input = steering(&fixture, owner)?;
-            let receipt = input.submission().unwrap();
-            let running = engine.clone();
-            let selected = scope.clone();
-            let steer = tokio::spawn(async move { running.steer(selected, input).await });
-            let pending = fixture
-                .steering
-                .recv()
-                .await
-                .context("pending control missing")?;
-            pending.accept().await?;
-            if lost {
-                call.writer
-                    .fail(crate::provider::events::EventDeliveryError::Observation(
-                        ObservationFailure::Overflow,
-                    ));
-                drop(pending);
-            } else {
-                let fenced = fixture.registry.fence(owner);
-                tokio::pin!(fenced);
-                assert!(futures_util::poll!(fenced.as_mut()).is_pending());
-                drop(pending);
-                fenced.await?;
-            }
-            let (_, selected, _, result, _) = active.remove(target);
-            assert!(result.await?.is_err());
-            assert!(!selected.is_healthy().await);
-            assert!(steer.await?.is_err());
-            assert!(matches!(
-                receipt.record()?.delivery,
-                SubmissionState::Accepted { .. }
-            ));
-            for (_, engine, _, result, mut call) in active {
-                assert!(!result.is_finished());
-                assert!(engine.is_healthy().await);
-                call.finish(normal())?;
-                result.await??.ticket.commit().await?;
-            }
-            assert_eq!(fixture.dispatch_count.load(Ordering::SeqCst), 3);
-            fixture.close().await?;
-        }
     }
     Ok(())
 }

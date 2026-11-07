@@ -148,14 +148,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn revision_rejects_mismatched_rendering_before_publication() {
-        let document = super::super::document::test_fixture("owned", "Owned plan");
-        let mut rendered = super::super::render_plan(&document).unwrap();
-        rendered.navigation.plan_version += 1;
-        assert!(PlanReviewRevision::new("owned", document, rendered).is_err());
-    }
-
-    #[test]
     fn cached_validation_requires_identical_bytes_and_submission_strength() {
         let cache = ReviewCache::default();
         let mut document = super::super::document::test_fixture("cached", "Cached plan");

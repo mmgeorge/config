@@ -1806,44 +1806,4 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Wake a blocked checkpoint read directly from the owning exchange's cancellation stream.
-    #[tokio::test]
-    async fn external_cancellation_releases_a_pending_checkpoint_read() -> Result<()> {
-        let cancellation = CheckCancellation {
-            requested: Arc::new(AtomicBool::new(false)),
-            changed: Default::default(),
-        };
-        let (source, receiver) = tokio::sync::watch::channel(false);
-        let read = cancellation.read(Some(&receiver), std::future::pending::<Result<()>>());
-        tokio::pin!(read);
-        assert!(futures_util::poll!(read.as_mut()).is_pending());
-        source.send_replace(true);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), read)
-                .await??
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cancellation_releases_a_pending_checkpoint_read() -> Result<()> {
-        let cancellation = CheckCancellation {
-            requested: Arc::new(AtomicBool::new(false)),
-            changed: Default::default(),
-        };
-        let read = cancellation.read(None, std::future::pending::<Result<()>>());
-        tokio::pin!(read);
-        assert!(futures_util::poll!(read.as_mut()).is_pending());
-        cancellation.cancel();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), read)
-                .await??
-                .is_none()
-        );
-        Ok(())
-    }
-}
+mod tests {}

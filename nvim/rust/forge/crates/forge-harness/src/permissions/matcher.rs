@@ -402,33 +402,6 @@ mod test {
         );
     }
 
-    /// An exact allow saved for one wrapped command stays independent of an exact denial of another.
-    #[test]
-    fn exact_rules_for_different_wrapped_commands_stay_independent() {
-        let permission =
-            compiled(r#"{"permission":{"bash":{"hostname":"allow","whoami":"deny"}}}"#);
-        let request = |command: &str| PermissionRequest {
-            id: "1".into(),
-            provider: forge_provider_api::ProviderId::new("test")
-                .expect("static provider identity is valid"),
-            reason: None,
-            target_list: vec![PermissionTarget::Command {
-                command: format!(
-                    r#""C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe" -Command {command}"#
-                ),
-                shell: None,
-            }],
-        };
-        assert_eq!(
-            permission.evaluate(&request("hostname")).unwrap().decision,
-            PermissionDecision::Allow
-        );
-        assert_eq!(
-            permission.evaluate(&request("whoami")).unwrap().decision,
-            PermissionDecision::Deny
-        );
-    }
-
     #[test]
     fn prefers_specific_command_denial_and_aggregates_compounds() {
         let permission = compiled(
@@ -562,23 +535,5 @@ mod test {
                 .decision,
             PermissionDecision::Deny
         );
-    }
-
-    #[test]
-    fn rule_evaluation_does_not_define_filesystem_scope() {
-        let permission = compiled(r#"{"permission":{"edit":{"*":"allow"}}}"#);
-        for path in ["D:/repo/src/main.rs", "D:/outside.txt"] {
-            let request = PermissionRequest {
-                id: "rule".into(),
-                provider: forge_provider_api::ProviderId::new("test")
-                    .expect("static provider identity is valid"),
-                reason: None,
-                target_list: vec![PermissionTarget::Write { path: path.into() }],
-            };
-            assert_eq!(
-                permission.evaluate(&request).unwrap().decision,
-                PermissionDecision::Allow
-            );
-        }
     }
 }

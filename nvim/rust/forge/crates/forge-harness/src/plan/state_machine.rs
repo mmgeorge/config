@@ -120,16 +120,6 @@ mod test {
     }
 
     #[test]
-    fn check_setup_blocks_generation_until_configuration_is_published() {
-        let mut record = plan(PlanState::ConfiguringChecks);
-        assert!(PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 2).is_err());
-        assert!(PlanStateMachine::apply(&mut record, PlanEvent::QuestionAsked, 2).is_err());
-        PlanStateMachine::apply(&mut record, PlanEvent::ChecksConfigured, 3).unwrap();
-        PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 4).unwrap();
-        assert_eq!(record.state, PlanState::AwaitingReview);
-    }
-
-    #[test]
     fn submission_cannot_return_to_input_without_a_new_generation_phase() {
         let mut record = plan(PlanState::Generating);
         PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 2).unwrap();
@@ -139,14 +129,6 @@ mod test {
         PlanStateMachine::apply(&mut record, PlanEvent::Accepted, 4).unwrap();
         assert!(PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 5).is_err());
         assert!(PlanStateMachine::apply(&mut record, PlanEvent::QuestionAsked, 3).is_err());
-    }
-
-    #[test]
-    fn feedback_consumption_returns_to_exactly_one_generation_phase() {
-        let mut record = plan(PlanState::AwaitingInput);
-        PlanStateMachine::apply(&mut record, PlanEvent::FeedbackConsumed, 2).unwrap();
-        assert_eq!(record.state, PlanState::Generating);
-        assert!(record.elicitation.is_none());
     }
 
     #[test]

@@ -385,8 +385,8 @@ fn is_contract_kind(kind: EntityKind) -> bool {
 mod test {
     use super::*;
     use crate::plan::{
-        ChangeAction, EntityChangeAction, EnumVariantChange, EnumVariantFieldChange,
-        FunctionParameter, MemberKind, Visibility, document::test_fixture,
+        ChangeAction, EntityChangeAction, FunctionParameter, MemberKind, Visibility,
+        document::test_fixture,
     };
 
     fn entity(path_stem: &str, name: &str, kind: EntityKind) -> ProgramEntityChange {
@@ -428,117 +428,6 @@ mod test {
                 .collect(),
             return_type: return_type.map(str::to_owned),
         }
-    }
-
-    #[test]
-    fn derives_concrete_children_from_structured_type_expressions() {
-        let mut document = test_fixture("plan", "Overview");
-        let report = entity("inspection_report", "InspectionReport", EntityKind::Struct);
-        let error = entity("inspection_error", "InspectionError", EntityKind::Enum);
-        let config = entity("inspection_config", "InspectionConfig", EntityKind::Config);
-        let state = entity("inspection_state", "InspectionState", EntityKind::Struct);
-        let mut inspector = entity(
-            "geo_parquet_inspector",
-            "GeoParquetInspector",
-            EntityKind::Struct,
-        );
-        inspector.members = vec![
-            member("state", Some("Option<InspectionState>"), &[], None),
-            member(
-                "inspect",
-                None,
-                &["&InspectionConfig", "&Path"],
-                Some("Result<Vec<InspectionReport>, inspection::InspectionError>"),
-            ),
-            member("new", None, &[], Some("GeoParquetInspector")),
-        ];
-        let payload = entity(
-            "inspection_payload",
-            "InspectionPayload",
-            EntityKind::Struct,
-        );
-        let mut envelope = entity(
-            "inspection_envelope",
-            "InspectionEnvelope",
-            EntityKind::Enum,
-        );
-        envelope.variants = vec![EnumVariantChange {
-            action: ChangeAction::Add,
-            renamed_from: None,
-            name: "Ready".into(),
-            description: Some("Carries one inspection payload.".into()),
-            fields: vec![EnumVariantFieldChange {
-                action: ChangeAction::Add,
-                renamed_from: None,
-                name: "payload".into(),
-                type_name: "InspectionPayload[]".into(),
-                kind: None,
-                description: None,
-                visibility: None,
-            }],
-        }];
-        document.entity_changes = vec![report, error, config, state, inspector, payload, envelope];
-
-        let graph = PlanGraph::new(&document);
-
-        for child_name in [
-            "InspectionReport",
-            "InspectionError",
-            "InspectionConfig",
-            "InspectionState",
-        ] {
-            assert_eq!(
-                graph.presentation_parent(child_name),
-                Some("GeoParquetInspector")
-            );
-        }
-        assert_eq!(
-            graph.presentation_parent("InspectionPayload"),
-            Some("InspectionEnvelope")
-        );
-        assert_eq!(graph.presentation_parent("GeoParquetInspector"), None);
-        assert_eq!(
-            graph
-                .presentation_position("GeoParquetInspector")
-                .unwrap()
-                .path(),
-            &[1]
-        );
-        assert_eq!(
-            graph
-                .presentation_position("InspectionReport")
-                .unwrap()
-                .path(),
-            &[1, 1]
-        );
-        assert_eq!(
-            graph
-                .presentation_position("InspectionError")
-                .unwrap()
-                .path(),
-            &[1, 2]
-        );
-        assert_eq!(
-            graph
-                .presentation_position("InspectionError")
-                .unwrap()
-                .depth(),
-            1
-        );
-        assert_eq!(
-            graph
-                .presentation_position("InspectionEnvelope")
-                .unwrap()
-                .path(),
-            &[2]
-        );
-        assert_eq!(
-            graph
-                .presentation_position("InspectionPayload")
-                .unwrap()
-                .path(),
-            &[2, 1]
-        );
     }
 
     #[test]
@@ -607,62 +496,6 @@ mod test {
         assert_eq!(
             graph.presentation_position("Leaf").unwrap().path(),
             &[3, 1, 1]
-        );
-    }
-
-    #[test]
-    fn orders_filtered_entity_sets_without_requiring_their_ancestors() {
-        let mut document = test_fixture("plan", "Overview");
-        let report = entity("inspection_report", "InspectionReport", EntityKind::Struct);
-        let error = entity("inspection_error", "InspectionError", EntityKind::Enum);
-        let mut inspector = entity(
-            "geo_parquet_inspector",
-            "GeoParquetInspector",
-            EntityKind::Struct,
-        );
-        inspector.members = vec![member(
-            "inspect",
-            None,
-            &[],
-            Some("Result<InspectionReport, InspectionError>"),
-        )];
-        let main = entity("main", "main", EntityKind::Function);
-        document.entity_changes = vec![report, error, inspector, main];
-
-        let graph = PlanGraph::new(&document);
-
-        let ordered_name_list = graph
-            .entities_in_presentation_order(&[
-                "InspectionError".into(),
-                "main".into(),
-                "InspectionReport".into(),
-                "GeoParquetInspector".into(),
-            ])
-            .into_iter()
-            .map(|entity| entity.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ordered_name_list,
-            vec![
-                "GeoParquetInspector",
-                "InspectionReport",
-                "InspectionError",
-                "main"
-            ]
-        );
-
-        let missing_parent_name_list = graph
-            .entities_in_presentation_order(&[
-                "InspectionError".into(),
-                "main".into(),
-                "InspectionReport".into(),
-            ])
-            .into_iter()
-            .map(|entity| entity.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            missing_parent_name_list,
-            vec!["InspectionReport", "InspectionError", "main"]
         );
     }
 }

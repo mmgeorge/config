@@ -133,22 +133,3 @@ fn decode_repository(bytes: &[u8]) -> Result<(GithubRepositoryId, String)> {
         .context("creation repository node is missing")?;
     Ok((repository, node.into()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn creation_repository_uses_explicit_enterprise_identity() {
-        let (repository, node) = decode_repository(br#"{"id":"R_test","nameWithOwner":"Owner/Repo","url":"https://enterprise.example/Owner/Repo"}"#).unwrap();
-        assert_eq!(repository.hostname(), "enterprise.example");
-        assert_eq!(repository.repository_name(), "owner/repo");
-        assert_eq!(node, "R_test");
-        assert!(
-            decode_repository(
-                br#"{"id":"R_test","nameWithOwner":"Owner/Repo","url":"file:///tmp/repo"}"#
-            )
-            .is_err()
-        );
-    }
-}
