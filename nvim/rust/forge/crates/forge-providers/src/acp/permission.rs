@@ -151,7 +151,7 @@ fn native_tool_targets(native_tool: Option<&str>, tool: &Value) -> Vec<Permissio
         && let Some(host_tools) = tool["rawInput"]["query"]
             .as_str()
             .and_then(|query| query.trim().strip_prefix("select:"))
-            .map(|selection| {
+            .and_then(|selection| {
                 selection
                     .split(',')
                     .map(|selected| {
@@ -164,7 +164,6 @@ fn native_tool_targets(native_tool: Option<&str>, tool: &Value) -> Vec<Permissio
                     })
                     .collect::<Option<Vec<_>>>()
             })
-            .flatten()
             .filter(|host_tools| !host_tools.is_empty())
     {
         return host_tools

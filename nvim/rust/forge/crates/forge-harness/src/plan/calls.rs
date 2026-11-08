@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::declaration::DeclarationDiagnosticKind;
 use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::{
     DeclarationCalls, DeclarationOverview, DeclarationPosition, DeclarationPresentation,
@@ -167,6 +168,16 @@ impl ReferenceEvidence {
     }
 }
 
+/// One reference-section entry and the byte columns its text occupies on a rendered row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CallRowTarget {
+    pub owner: String,
+    pub name: String,
+    pub kind: CallKind,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Maps display rows to saved declarations and call identities.
 pub(crate) struct CallPresentation {
     visibility: [OnceLock<forge_diff::syntax::DeclarationVisibility>; 2],
@@ -175,8 +186,13 @@ pub(crate) struct CallPresentation {
     /// Signature-only text used by declaration analysis before synthetic bodies are rendered.
     pub plain: String,
     pub declaration: DeclarationPresentation,
-    pub call_row: BTreeMap<usize, (String, String, CallKind)>,
+    /// Reference-section entries on each rendered row. Review rows group Accesses entries
+    /// by declaring type, so one row can carry several entries at distinct columns.
+    pub call_row: BTreeMap<usize, Vec<CallRowTarget>>,
     pub behavior_row: BTreeMap<usize, (String, u32, &'static str)>,
+    /// Behavior and reference sections keyed by heading row, with their exclusive end row and
+    /// heading name.
+    pub section: BTreeMap<usize, (usize, &'static str)>,
     /// Rendered body boundaries keyed by their final signature row.
     pub body: BTreeMap<usize, CallBody>,
     pub plain_row: Vec<usize>,
@@ -406,6 +422,54 @@ pub(crate) fn algorithm_reference(
     resolve_algorithm_reference(path, &function, body, reference)
 }
 
+/// Whether the Algorithm invocation at a review column names a `Calls` or `Constructs` entry.
+/// Abstract operations such as `delta(time)` describe behavior without naming plan declarations,
+/// so review highlighting must not present them as calls into the plan.
+pub(crate) fn declared_algorithm_call(
+    path: &str,
+    function: &forge_diff::syntax::DeclarationCallable,
+    body: &FunctionBody,
+    offset: u32,
+    row: &str,
+    column: usize,
+) -> bool {
+    let Some(FunctionBehavior::Algorithm(algorithm)) = &body.behavior else {
+        return false;
+    };
+    let Some(source) = offset
+        .checked_sub(1)
+        .and_then(|offset| algorithm.lines().nth(offset as usize))
+    else {
+        return false;
+    };
+    let Some(indent) = row
+        .len()
+        .checked_sub(source.len())
+        .filter(|_| row.ends_with(source))
+    else {
+        return false;
+    };
+    let Some(column) = column.checked_sub(indent).map(|column| column + 1) else {
+        return false;
+    };
+    let Ok(Some(reference)) =
+        forge_diff::syntax::algorithm_reference(algorithm, offset as usize, column)
+    else {
+        return false;
+    };
+    let Ok(Some(AlgorithmTarget::Reference(target))) =
+        resolve_algorithm_reference(path, function, body, reference)
+    else {
+        return false;
+    };
+    body.call.iter().flatten().any(|call| {
+        matches!(
+            call.kind,
+            CallKind::Call | CallKind::Callback | CallKind::Construct
+        ) && call.name.replace("::", ".") == target.name.replace("::", ".")
+    })
+}
+
 /// Resolve a parsed segment consistently for navigation, validation, and rename.
 pub(crate) fn resolve_algorithm_reference(
     path: &str,
@@ -612,7 +676,8 @@ pub(crate) fn present(
         + result
             .call_row
             .values()
-            .map(|(owner, name, _)| owner.capacity() + name.capacity() + 128)
+            .flatten()
+            .map(|target| target.owner.capacity() + target.name.capacity() + 128)
             .sum::<usize>()
         + result
             .behavior_row
@@ -644,6 +709,68 @@ pub(crate) fn present(
     Ok(result)
 }
 
+/// One rendered reference row and the entries it shows, each with its byte span in `text`.
+struct ReferenceRow {
+    text: String,
+    entry: Vec<(String, CallKind, usize, usize)>,
+}
+
+/// Group Accesses entries into one `Type { member, ... }` row per declaring type, in order of
+/// first appearance. A bare type entry folds into its type's row; a type with no members keeps
+/// a row of its own. The type is the leading path through its first capitalized segment, so
+/// `Transform::translation::xy` shows as `translation::xy` within `Transform`.
+fn grouped_access_rows(targets: &[(&str, CallKind)]) -> Vec<ReferenceRow> {
+    let mut group = Vec::<(
+        String,
+        Option<(String, CallKind)>,
+        Vec<(String, String, CallKind)>,
+    )>::new();
+    for (name, kind) in targets {
+        let separator = if name.contains("::") { "::" } else { "." };
+        let segments = name.split(separator).collect::<Vec<_>>();
+        let key_length = segments
+            .iter()
+            .position(|segment| segment.chars().next().is_some_and(char::is_uppercase))
+            .map_or(1, |index| index + 1)
+            .min(segments.len());
+        let key = segments[..key_length].join(separator);
+        let member = segments[key_length..].join(separator);
+        let index = match group.iter().position(|(existing, _, _)| *existing == key) {
+            Some(index) => index,
+            None => {
+                group.push((key.clone(), None, Vec::new()));
+                group.len() - 1
+            }
+        };
+        if member.is_empty() {
+            group[index].1 = Some((name.to_string(), *kind));
+        } else {
+            group[index].2.push((member, name.to_string(), *kind));
+        }
+    }
+    group
+        .into_iter()
+        .map(|(key, bare, members)| {
+            let mut text = key.clone();
+            let mut entry = bare
+                .map(|(name, kind)| vec![(name, kind, 0, key.len())])
+                .unwrap_or_default();
+            if !members.is_empty() {
+                text.push_str(" { ");
+                for (index, (member, name, kind)) in members.into_iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    entry.push((name, kind, text.len(), text.len() + member.len()));
+                    text.push_str(&member);
+                }
+                text.push_str(" }");
+            }
+            ReferenceRow { text, entry }
+        })
+        .collect()
+}
+
 pub(crate) fn insert(
     path: &str,
     text: &str,
@@ -672,6 +799,7 @@ pub(crate) fn insert(
             },
             call_row: BTreeMap::new(),
             behavior_row: BTreeMap::new(),
+            section: BTreeMap::new(),
             body: BTreeMap::new(),
             plain_row: (0..text.lines().count()).collect(),
             declaration_row: (0..text.lines().count()).map(|row| (row, row)).collect(),
@@ -695,6 +823,7 @@ pub(crate) fn insert(
     let mut source = Vec::new();
     let mut call_row = BTreeMap::new();
     let mut behavior_row = BTreeMap::new();
+    let mut section = BTreeMap::new();
     let mut body = BTreeMap::new();
     let mut declaration_row = BTreeMap::new();
     let lua = path.ends_with(".lua");
@@ -721,6 +850,7 @@ pub(crate) fn insert(
                 let heading = declaration_row[&(function.line as usize - 1)];
                 let body_indent = if review { "  " } else { "" };
                 if let Some(behavior) = &calls.behavior {
+                    let behavior_heading = source.len();
                     for (offset, summary) in std::iter::once(behavior.label())
                         .chain(behavior.text().lines())
                         .enumerate()
@@ -742,6 +872,7 @@ pub(crate) fn insert(
                             column: function.column,
                         });
                     }
+                    section.insert(behavior_heading, (source.len(), behavior.label()));
                 }
                 for kind in [
                     ReferenceCategory::Calls,
@@ -783,21 +914,44 @@ pub(crate) fn insert(
                         ReferenceCategory::Constructs => "Constructs",
                     };
                     output.push_str(&format!("{indent}{body_indent}{heading}\n"));
+                    let reference_heading = source.len();
                     source.push(DeclarationPosition {
                         line: function.line,
                         column: function.column,
                     });
-                    for (name, semantic_kind) in targets {
+                    let rows = if review && kind == ReferenceCategory::Accesses {
+                        grouped_access_rows(&targets)
+                    } else {
+                        targets
+                            .iter()
+                            .map(|(name, kind)| ReferenceRow {
+                                text: (*name).to_owned(),
+                                entry: vec![(name.to_string(), *kind, 0, name.len())],
+                            })
+                            .collect()
+                    };
+                    for row in rows {
+                        let prefix = format!("{indent}{body_indent}  ");
                         call_row.insert(
                             source.len(),
-                            (function.owner.clone(), name.to_owned(), semantic_kind),
+                            row.entry
+                                .into_iter()
+                                .map(|(name, kind, start, end)| CallRowTarget {
+                                    owner: function.owner.clone(),
+                                    name,
+                                    kind,
+                                    start: prefix.len() + start,
+                                    end: prefix.len() + end,
+                                })
+                                .collect(),
                         );
-                        output.push_str(&format!("{indent}{body_indent}  {name}\n"));
+                        output.push_str(&format!("{prefix}{}\n", row.text));
                         source.push(DeclarationPosition {
                             line: function.line,
                             column: function.column,
                         });
                     }
+                    section.insert(reference_heading, (source.len(), heading));
                 }
                 if review {
                     body.insert(
@@ -833,6 +987,7 @@ pub(crate) fn insert(
         },
         call_row,
         behavior_row,
+        section,
         body,
         plain_row,
         declaration_row,
@@ -884,8 +1039,15 @@ enum BodySection {
     References(ReferenceCategory, Vec<(String, CallKind)>),
 }
 
-/// Require algorithms for new callables at submission while keeping draft edits incomplete.
-pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()> {
+/// Check every behavior section at submission and return all violations together, so one
+/// rejection carries every correction the planning model must make.
+/// Bookkeeping rules apply only to repository declarations: fields and constructions of
+/// dependency, standard-library, and prelude types need no reference section entries.
+pub(super) fn validate_behaviors(
+    design: &super::DeclarationDesign,
+    resolver: &mut crate::declaration::DeclarationResolver,
+) -> Result<Vec<crate::declaration::DeclarationDiagnostic>> {
+    let mut diagnostics = Vec::new();
     for (path, text) in &design.proposed {
         let original_path = design
             .moved
@@ -906,6 +1068,11 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
         let proposed = DeclarationCalls::extract(path, text, true)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         for function in proposed {
+            let mut callable = CallableDiagnostics {
+                path,
+                function: &function,
+                diagnostics: &mut diagnostics,
+            };
             let body = design
                 .proposed_calls
                 .get(path)
@@ -914,85 +1081,235 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
                 .find(|body| body.owner == function.owner);
             let behavior = body.and_then(|body| body.behavior.as_ref());
             if original_owner.contains(function.owner.as_str()) {
-                ensure!(
-                    !matches!(behavior, Some(FunctionBehavior::Algorithm(_))),
-                    "{path}: existing callable {} uses Change, not Algorithm",
-                    function.owner
+                if matches!(behavior, Some(FunctionBehavior::Algorithm(_))) {
+                    callable.push(
+                        DeclarationDiagnosticKind::BehaviorBlock,
+                        &function.owner,
+                        format!(
+                            "existing callable {} uses Change, not Algorithm",
+                            function.owner
+                        ),
+                    );
+                }
+                continue;
+            }
+            let (Some(body), Some(FunctionBehavior::Algorithm(algorithm))) = (body, behavior)
+            else {
+                callable.push(
+                    DeclarationDiagnosticKind::BehaviorBlock,
+                    &function.owner,
+                    format!(
+                        "new callable {} requires a nonempty Algorithm block",
+                        function.owner
+                    ),
                 );
-            } else {
-                ensure!(
-                    matches!(behavior, Some(FunctionBehavior::Algorithm(text)) if !text.trim().is_empty()),
-                    "{path}: new callable {} requires a nonempty Algorithm block",
-                    function.owner
+                continue;
+            };
+            if algorithm.trim().is_empty() {
+                callable.push(
+                    DeclarationDiagnosticKind::BehaviorBlock,
+                    &function.owner,
+                    format!(
+                        "new callable {} requires a nonempty Algorithm block",
+                        function.owner
+                    ),
                 );
-                if let (Some(body), Some(FunctionBehavior::Algorithm(text))) = (body, behavior) {
-                    let invocations =
-                        forge_diff::syntax::validate_algorithm(text).map_err(|error| {
-                            anyhow::anyhow!("{path}: {}: {error:?}", function.owner)
-                        })?;
-                    for reference in forge_diff::syntax::algorithm_references(text)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?
-                        .into_iter()
-                        .filter(|reference| {
-                            reference.last
-                                && !reference.first
-                                && !reference.invocation
-                                && !reference.construction_field
-                        })
-                    {
-                        let line = reference.line;
-                        let column = reference.column;
-                        let Some(AlgorithmTarget::Reference(target)) =
-                            resolve_algorithm_reference(path, &function, body, reference)?
-                        else {
-                            continue;
-                        };
-                        ensure!(
-                            body.call
-                                .iter()
-                                .flatten()
-                                .any(|call| call.name.replace("::", ".")
-                                    == target.name.replace("::", ".")
-                                    && matches!(call.kind, CallKind::Property | CallKind::Value)),
-                            "{path}: {}: Algorithm line {line}, column {column}: field {} requires a matching Accesses target",
-                            function.owner,
-                            target.name
+                continue;
+            }
+            let invocations = match forge_diff::syntax::validate_algorithm(algorithm) {
+                Ok(invocations) => invocations,
+                Err(forge_diff::syntax::AlgorithmValidationError::Invalid(violations)) => {
+                    for violation in violations {
+                        callable.push(
+                            DeclarationDiagnosticKind::AlgorithmSyntax,
+                            &function.owner,
+                            violation.to_string(),
                         );
                     }
-                    for construction in body
-                        .call
-                        .iter()
-                        .flatten()
-                        .filter(|call| call.kind == CallKind::Construct)
-                    {
-                        let matching = invocations
-                            .iter()
-                            .filter(|invocation| invocation.name == construction.name)
-                            .collect::<Vec<_>>();
-                        ensure!(
-                            !matching.is_empty(),
-                            "{path}: {}: Algorithm must explicitly construct {} using {}(field = value) or {}() for a marker",
-                            function.owner,
-                            construction.name,
-                            construction.name,
-                            construction.name
+                    continue;
+                }
+                Err(error) => anyhow::bail!("{path}: {}: {error}", function.owner),
+            };
+            let references = forge_diff::syntax::algorithm_references(algorithm)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let mut missing_access = Vec::<(String, Vec<usize>)>::new();
+            for reference in references.into_iter().filter(|reference| {
+                reference.last
+                    && !reference.first
+                    && !reference.invocation
+                    && !reference.construction_field
+            }) {
+                let (line, column) = (reference.line, reference.column);
+                let target = match resolve_algorithm_reference(path, &function, body, reference) {
+                    Ok(Some(AlgorithmTarget::Reference(target))) => target,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        callable.push(
+                            DeclarationDiagnosticKind::AlgorithmReference,
+                            &function.owner,
+                            format!("Algorithm line {line}, column {column}: {error}"),
                         );
-                        for invocation in matching {
-                            ensure!(
-                                !invocation.has_positional_argument,
-                                "{path}: {}: Algorithm line {}, column {}: construction {} requires named arguments (field = value)",
-                                function.owner,
-                                invocation.line,
-                                invocation.column,
-                                construction.name
-                            );
-                        }
+                        continue;
                     }
+                };
+                let Some(required) = required_access(resolver, path, &function.owner, &target.name)
+                else {
+                    continue;
+                };
+                let recorded = body.call.iter().flatten().any(|call| {
+                    matches!(call.kind, CallKind::Property | CallKind::Value)
+                        && covers_access(&call.name, &required)
+                });
+                if !recorded {
+                    match missing_access
+                        .iter_mut()
+                        .find(|(field, _)| *field == required)
+                    {
+                        Some((_, lines)) if lines.contains(&line) => {}
+                        Some((_, lines)) => lines.push(line),
+                        None => missing_access.push((required, vec![line])),
+                    }
+                }
+            }
+            for (field, lines) in missing_access {
+                let lines = lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                callable.push(
+                    DeclarationDiagnosticKind::AlgorithmAccess,
+                    &field,
+                    format!("field {field} used on Algorithm line {lines} requires a matching Accesses target"),
+                );
+            }
+            for construction in body
+                .call
+                .iter()
+                .flatten()
+                .filter(|call| call.kind == CallKind::Construct && !call.unresolved)
+            {
+                let resolution = resolver.construct(path, &function.owner, &construction.name);
+                if !resolver.repository_declaration(&resolution) {
+                    continue;
+                }
+                let matching = invocations
+                    .iter()
+                    .filter(|invocation| {
+                        invocation.name.replace("::", ".") == construction.name.replace("::", ".")
+                    })
+                    .collect::<Vec<_>>();
+                if matching.is_empty() {
+                    callable.push(
+                        DeclarationDiagnosticKind::AlgorithmConstruction,
+                        &construction.name,
+                        format!(
+                            "Algorithm must explicitly construct {name} using {name}(field = value), {name}(value) for a tuple type, or {name}() for a marker",
+                            name = construction.name
+                        ),
+                    );
+                    continue;
+                }
+                if resolver.field_shape(&resolution) == Some(forge_diff::syntax::FieldShape::Tuple)
+                {
+                    continue;
+                }
+                for invocation in matching
+                    .into_iter()
+                    .filter(|invocation| invocation.has_positional_argument)
+                {
+                    callable.push(
+                        DeclarationDiagnosticKind::AlgorithmConstruction,
+                        &construction.name,
+                        format!(
+                            "Algorithm line {}, column {}: construction {} requires named arguments (field = value)",
+                            invocation.line, invocation.column, construction.name
+                        ),
+                    );
                 }
             }
         }
     }
-    Ok(())
+    Ok(diagnostics)
+}
+
+/// Collects one callable's diagnostics at its signature, the closest file position an
+/// Algorithm-relative location has.
+struct CallableDiagnostics<'context> {
+    path: &'context str,
+    function: &'context forge_diff::syntax::DeclarationCallable,
+    diagnostics: &'context mut Vec<crate::declaration::DeclarationDiagnostic>,
+}
+
+impl CallableDiagnostics<'_> {
+    fn push(&mut self, kind: DeclarationDiagnosticKind, reference: &str, reason: String) {
+        self.diagnostics
+            .push(crate::declaration::DeclarationDiagnostic {
+                path: self.path.to_owned(),
+                line: self.function.line,
+                column: self.function.column,
+                reference: if reference == self.function.owner {
+                    reference.to_owned()
+                } else {
+                    format!("{}: {reference}", self.function.owner)
+                },
+                error: true,
+                reason,
+                kind,
+            });
+    }
+}
+
+/// Select the field path an Algorithm reference must record in Accesses, or None when the
+/// reference leaves repository declarations before reaching a member.
+/// `Velocity::vector::x` requires `Velocity::vector` because `x` belongs to an external vector
+/// type, and `Transform::translation` requires nothing because `Transform` is external.
+/// A repository type with an unresolvable member still requires its first member, so the
+/// declaration resolver reports the misspelled entry.
+fn required_access(
+    resolver: &mut crate::declaration::DeclarationResolver,
+    path: &str,
+    owner: &str,
+    name: &str,
+) -> Option<String> {
+    let separator = if path.ends_with(".rs") { "::" } else { "." };
+    let segments = name.split(separator).collect::<Vec<_>>();
+    let root = resolver.value(path, owner, segments.first()?);
+    if !resolver.repository_declaration(&root) {
+        return matches!(
+            root,
+            crate::declaration::DeclarationResolution::Invalid { .. }
+                | crate::declaration::DeclarationResolution::Ambiguous { .. }
+        )
+        .then(|| name.to_owned());
+    }
+    let mut required = None;
+    for end in 2..=segments.len() {
+        let prefix = segments[..end].join(separator);
+        let mut resolution = resolver.property(path, owner, &prefix);
+        if !resolver.repository_declaration(&resolution) {
+            resolution = resolver.value(path, owner, &prefix);
+        }
+        if resolver.repository_declaration(&resolution) {
+            required = Some(prefix);
+            continue;
+        }
+        if required.is_none() {
+            required = Some(prefix);
+        }
+        break;
+    }
+    required
+}
+
+/// An Accesses entry covers a required field when it names that field or a member within it.
+fn covers_access(recorded: &str, required: &str) -> bool {
+    let recorded = recorded.replace("::", ".");
+    let required = required.replace("::", ".");
+    recorded == required
+        || recorded
+            .strip_prefix(&required)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 #[derive(Default)]
@@ -1314,4 +1631,231 @@ pub(crate) fn parse(
             .unwrap_or(usize::MAX)
     });
     Ok((declaration, output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallKind, CallSite, FunctionBehavior, FunctionBody, validate_behaviors};
+    use crate::declaration::{DeclarationDiagnosticKind, DeclarationResolver};
+    use crate::plan::DeclarationDesign;
+
+    const DECLARATIONS: &str = "use bevy::prelude::*;
+
+#[derive(Component)]
+struct Velocity(Vec2);
+
+#[derive(Component)]
+struct Player {
+  speed: f32,
+}
+
+#[derive(Resource)]
+struct RunSession {
+  score: u32,
+}
+
+/// Spawn the player entity.
+fn spawn_player(commands: Commands);
+
+/// Move the player and record the score.
+fn move_player(player: &Player, transform: &mut Transform, session: &RunSession);
+
+/// Report the score.
+fn report_score(session: &RunSession);
+";
+
+    fn body(owner: &str, algorithm: &str, construct: &[&str]) -> FunctionBody {
+        FunctionBody {
+            evidence: None,
+            owner: owner.into(),
+            behavior: Some(FunctionBehavior::Algorithm(algorithm.into())),
+            call: Some(
+                construct
+                    .iter()
+                    .map(|name| CallSite {
+                        kind: CallKind::Construct,
+                        name: (*name).into(),
+                        source: None,
+                        unresolved: false,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn review_groups_accesses_by_type_with_a_column_per_entry() {
+        let mut body = body("report_score", "record(session.score)", &[]);
+        body.call = Some(
+            [
+                ("RunPhase", CallKind::Value),
+                ("RunSession::phase", CallKind::Property),
+                ("RunSession::score", CallKind::Property),
+                ("RunPhase::Active", CallKind::Value),
+                ("Transform::translation::xy", CallKind::Property),
+            ]
+            .into_iter()
+            .map(|(name, kind)| CallSite {
+                kind,
+                name: name.into(),
+                source: None,
+                unresolved: false,
+            })
+            .collect(),
+        );
+        let review = super::insert("src/main.rs", DECLARATIONS, &[body.clone()], true, false)
+            .expect("review presentation");
+        let rows = review.declaration.text.lines().collect::<Vec<_>>();
+        let accesses = rows
+            .iter()
+            .position(|row| row.trim() == "Accesses")
+            .expect("Accesses heading");
+        assert_eq!(
+            rows[accesses + 1..accesses + 4]
+                .iter()
+                .map(|row| row.trim())
+                .collect::<Vec<_>>(),
+            [
+                "RunPhase { Active }",
+                "RunSession { phase, score }",
+                "Transform { translation::xy }",
+            ]
+        );
+        assert_eq!(
+            review.section.get(&accesses),
+            Some(&(accesses + 4, "Accesses"))
+        );
+        let session = &review.call_row[&(accesses + 2)];
+        assert_eq!(
+            session
+                .iter()
+                .map(|target| (
+                    target.name.as_str(),
+                    &rows[accesses + 2][target.start..target.end]
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("RunSession::phase", "phase"),
+                ("RunSession::score", "score")
+            ]
+        );
+        let phase = &review.call_row[&(accesses + 1)];
+        assert_eq!(
+            phase
+                .iter()
+                .map(|target| (
+                    target.name.as_str(),
+                    &rows[accesses + 1][target.start..target.end]
+                ))
+                .collect::<Vec<_>>(),
+            [("RunPhase", "RunPhase"), ("RunPhase::Active", "Active")]
+        );
+        let editable = super::insert("src/main.rs", DECLARATIONS, &[body], false, false)
+            .expect("editable presentation");
+        assert!(editable.declaration.text.contains(
+            "  RunSession::phase
+"
+        ));
+    }
+
+    #[test]
+    fn only_reference_section_calls_are_declared_algorithm_calls() {
+        let function =
+            forge_diff::syntax::DeclarationCalls::extract("src/main.rs", DECLARATIONS, true)
+                .expect("declarations")
+                .into_iter()
+                .find(|function| function.owner == "report_score")
+                .expect("callable");
+        let mut report = body(
+            "report_score",
+            "publish(session.score)
+total <- delta(time)",
+            &[],
+        );
+        report.call.as_mut().expect("references").push(CallSite {
+            kind: CallKind::Call,
+            name: "publish".into(),
+            source: None,
+            unresolved: false,
+        });
+        assert!(super::declared_algorithm_call(
+            "src/main.rs",
+            &function,
+            &report,
+            1,
+            "    publish(session.score)",
+            4,
+        ));
+        assert!(!super::declared_algorithm_call(
+            "src/main.rs",
+            &function,
+            &report,
+            2,
+            "    total <- delta(time)",
+            13,
+        ));
+    }
+
+    #[test]
+    fn one_pass_reports_every_repository_violation_and_exempts_external_types() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        let mut design = DeclarationDesign::default();
+        design
+            .proposed
+            .insert("src/main.rs".into(), DECLARATIONS.into());
+        design.proposed_calls.insert(
+            "src/main.rs".into(),
+            vec![
+                body(
+                    "spawn_player",
+                    "velocity ← Velocity((0, 0))\nplayer ← Player(speed = 5)\nlabel ← Text2d(\"score\")\nspawn(commands, [velocity, player, label])",
+                    &["Velocity", "Player", "Text2d"],
+                ),
+                body(
+                    "move_player",
+                    "transform.translation ← transform.translation + player.speed\ntotal <- session.score\nif total mod 2 = 0\n  record(total)",
+                    &[],
+                ),
+                body(
+                    "report_score",
+                    "process candidate now\nlimit ← ← 2",
+                    &[],
+                ),
+            ],
+        );
+        let mut resolver =
+            DeclarationResolver::planned(workspace.path(), &design, false).expect("resolver");
+        let mut reported = validate_behaviors(&design, &mut resolver)
+            .expect("validation")
+            .into_iter()
+            .map(|diagnostic| (diagnostic.kind, diagnostic.reference))
+            .collect::<Vec<_>>();
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![
+                (
+                    DeclarationDiagnosticKind::AlgorithmSyntax,
+                    "report_score".to_owned()
+                ),
+                (
+                    DeclarationDiagnosticKind::AlgorithmSyntax,
+                    "report_score".to_owned()
+                ),
+                (
+                    DeclarationDiagnosticKind::AlgorithmAccess,
+                    "move_player: Player::speed".to_owned()
+                ),
+                (
+                    DeclarationDiagnosticKind::AlgorithmAccess,
+                    "move_player: RunSession::score".to_owned()
+                ),
+            ]
+        );
+    }
 }

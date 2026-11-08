@@ -852,6 +852,7 @@ fn append_fold(
         heading_start: None,
         collapse_children: false,
         expand_children: false,
+        heading_marker: false,
         id: FoldId(format!("walkthrough:{id}")),
         start: TextPosition {
             row: header.text.row_count().saturating_sub(1),

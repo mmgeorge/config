@@ -433,6 +433,7 @@
     "mcp": {
       "*": "ask",
       "docs/*": "allow",
+      "github/*": "allow",
       "sem/*": "allow",
       "terminal-mcp/*": "allow"
     },
@@ -440,6 +441,7 @@
       "*": "allow"
     },
     "tool": {
+      "*": "allow",
       "lsp_overview": "allow"
     },
     "webfetch": {

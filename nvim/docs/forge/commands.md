@@ -699,7 +699,8 @@ Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
 New functions and methods contain an `Algorithm` block in academic pseudocode.
 Algorithm blocks highlight control keywords, assignment and comparison operators, literals,
-and identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
+and identifiers. Only calls that name a `Calls` or `Constructs` entry use call coloring;
+abstract operations such as `delta(time)` read as plain identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
 Write operations as calls such as `spawn_square(...)`. Prose statements, prose expressions,
 and adjacent operands without an operator are rejected at submission. Use comma-separated
 tuples and lists, and keep each complete statement on one line.
@@ -711,11 +712,25 @@ then Calls, Constructs, and Accesses resolve shortened names. Ambiguous matches 
 candidate names without moving the cursor. Jump-back returns to the original Algorithm token.
 Unlisted unqualified lowercase calls represent abstract operations and have no declaration
 navigation target. They do not require implementation functions or new `Calls` entries.
-Write constructions explicitly as `Projectile(damage = 1)` or `CombatEntity()` for a marker.
-Each `Constructs` entry must match an invocation in the Algorithm, using its exact qualified
-name and named arguments. Keep construction separate from the operation that queues or inserts it.
-Submission checks statement syntax and indentation, including branch and loop
-structure, and reports the callable and failing line. Drafts can remain incomplete while edited.
+Every declaration a plan introduces, including enum variants and struct fields, needs a
+documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
+Assign with `←` or `<-`, compute remainders with `%` or `mod`, and loop with
+`for each item in items` or `for item in items`.
+Each behavior and reference heading in PlanReview folds its section, and the caret before the heading
+shows its state: `▾` open, `▸` closed. Constructs and Accesses start closed; Algorithm, Change, and
+Calls start open. Folding changes only the display.
+PlanReview shows each type's Accesses entries on one row, such as
+`RunSession { phase, score }`. Go to definition on a member jumps to that member, and
+on the type name jumps to the type when the type itself is listed.
+Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
+struct or variant, or `CombatEntity()` for a marker. Each `Constructs` entry for a repository type
+must match an invocation in the Algorithm with its qualified name, using named arguments unless
+the type is a tuple. Keep construction separate from the operation that queues or inserts it.
+Repository fields read or written in the Algorithm need `Accesses` entries. Members of dependency,
+standard-library, and prelude types, such as Bevy's `Transform::translation`, need no entries.
+Submission checks statement syntax and indentation, including branch and loop structure, and
+reports every violation in one response, each with the callable, the Algorithm line, and the
+rejected text. Drafts can remain incomplete while edited.
 Modified functions use `Change` for behavioral deltas in one or two succinct
 sentences. Expand a function to read its behavior and reference sections.
 Collapsed signatures omit the `[changed]` suffix.

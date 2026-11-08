@@ -1237,6 +1237,7 @@ fn lua_symbol(
         conditional: false,
         global: false,
         parameter: false,
+        field_shape: None,
     })
 }
 

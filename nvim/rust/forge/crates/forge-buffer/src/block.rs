@@ -104,6 +104,9 @@ pub struct FoldRange {
     #[serde(default)]
     /// Open descendant folds when this heading is explicitly opened.
     pub expand_children: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Show a ▸ or ▾ open-state marker immediately before the heading row's text.
+    pub heading_marker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

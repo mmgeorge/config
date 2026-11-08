@@ -14,7 +14,7 @@ Express the complete algorithm at the highest useful level and as compactly as p
 Use structured, language-independent notation. Free-form prose is not valid in statements, conditions, arguments, or assignment values. Keep explanations in `#` comments or declaration descriptions.
 
 - Combine assignments and control flow with named abstract operations such as `spawn_square(...)` or `select_earliest(...)`. Prefer one clear operation over several mechanical steps.
-- Use `←` for assignment and `=` for equality consistently. Indent the bodies of `if`, `otherwise`, `for each`, and `while`. Use `return` and `continue` when needed.
+- Use `←` for assignment and `=` for equality consistently. The validator also accepts `<-` for assignment. Indent the bodies of `if`, `otherwise`, `for each`, and `while`. Use `return` and `continue` when needed.
 - Write language-independent operations. Omit native-language braces, semicolons, redundant types, allocation syntax, and other incidental implementation details.
 - Prefer `for each` over indexed iteration unless the index affects behavior.
 - Use abstract collections and standard operations without implementing their internals. State ordering, uniqueness, or multiple-value properties when needed.
@@ -25,15 +25,15 @@ Use structured, language-independent notation. Free-form prose is not valid in s
 
 Put each complete statement on one line. Use assignments, operation calls, indented control flow, `return`, `break`, and `continue`. Use `break` and `continue` only inside loops. Bare identifiers and prose such as `process candidate` are not operation statements: write `process(candidate)`.
 
-Expressions contain identifiers, qualified references (`player.position`, `Store::new`), calls, numeric and quoted string literals, `none`, `true`, `false`, or `null`. Combine them with arithmetic, comparison, logical (`and`, `or`, `not`), membership (`in`, `∈`, `∉`), or set (`∪`, `∩`) operators. Use comma-separated tuples `(x, y)`, lists `[player, speed]`, and indexing `items[index]`. Assign only to a reference or indexed element. Write loop bindings as `for each item in items` or `for each (key, value) in entries`.
+Expressions contain identifiers, qualified references (`player.position`, `Store::new`), calls, numeric and quoted string literals, `none`, `true`, `false`, or `null`. Combine them with arithmetic (`+`, `-`, `×` or `*`, `÷` or `/`, and `%` or `mod` for remainder), comparison, logical (`and`, `or`, `not`), membership (`in`, `∈`, `∉`), or set (`∪`, `∩`) operators. Use comma-separated tuples `(x, y)`, lists `[player, speed]`, and indexing `items[index]`. Assign only to a reference or indexed element. Write loop bindings as `for each item in items` or `for each (key, value) in entries`.
 
-Abstract operations describe behavior without requiring repository functions. Use lowercase descriptive names, and do not invent declarations or add them to `Calls` merely to make pseudocode look executable. Concrete references belong in `Calls`, `Constructs`, and `Accesses` when known. Preserve selection criteria and failure behavior in explicit arguments or control flow rather than hiding them behind vague operation names.
+Abstract operations describe behavior without requiring repository functions. Review highlighting colors only calls listed in `Calls` or `Constructs`, so an abstract operation never needs an entry to look complete. Use lowercase descriptive names, and do not invent declarations or add them to `Calls` merely to make pseudocode look executable. Concrete references belong in `Calls`, `Constructs`, and `Accesses` when known. Preserve selection criteria and failure behavior in explicit arguments or control flow rather than hiding them behind vague operation names.
 
 ## Explicit construction
 
-Write each constructed value as `Type(field = value, ...)`, using the declared type name and explicit field values. Write zero-field markers as `Type()`. Use the exact qualified factory name for factory construction, such as `Store::new(config = config)`. Keep construction separate from operations that enqueue, spawn, insert, or publish the value. Do not hide construction inside phrases such as "queue a shot with damage".
+Write each constructed value as `Type(field = value, ...)`, using the declared type name and explicit field values. Construct tuple structs and tuple variants positionally, as `Velocity(direction)`. Write zero-field markers as `Type()`. Use the exact qualified factory name for factory construction, such as `Store::new(config = config)`. Keep construction separate from operations that enqueue, spawn, insert, or publish the value. Do not hide construction inside phrases such as "queue a shot with damage".
 
-When an Algorithm has a `Constructs` list, give every listed target an explicit construction site with the same name. Ordinary helper calls may use positional arguments. Reusing an existing value or shared asset does not construct it again. Keep Change blocks focused on their behavioral delta rather than repeating a full algorithm.
+When an Algorithm has a `Constructs` list, give every listed repository target an explicit construction site with the same name. Dependency and standard-library types need no construction site, and their fields need no `Accesses` entries. Do not reshape a declaration, such as turning a tuple struct into a named-field struct, to suit the pseudocode. Ordinary helper calls may use positional arguments. Reusing an existing value or shared asset does not construct it again. Keep Change blocks focused on their behavioral delta rather than repeating a full algorithm.
 
 The values and the operation that consumes them remain separately visible:
 

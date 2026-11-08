@@ -3296,6 +3296,7 @@ impl TimelineRenderer<'_> {
             heading_start: None,
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
             id: FoldId(identity.into()),
             start: TextPosition { row: 0, column: 0 },
             end: anchor,

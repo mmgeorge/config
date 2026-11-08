@@ -11,6 +11,7 @@ mod artifact_recovery;
 mod audit;
 mod comment_lint;
 pub(crate) mod conformance;
+mod documentation;
 pub(crate) mod implementation_report;
 mod usage;
 pub(crate) use design::workspace_source;
@@ -1436,8 +1437,9 @@ impl PlanFileStore {
         if let Some(design) = &document.design {
             let formatted = design.formatted()?;
             formatted.check_workspace(&self.workspace)?;
-            comment_lint::validate(design)?;
-            usage::validate(&formatted, &self.workspace)?;
+            crate::declaration::DeclarationValidationError::ensure_empty(
+                design.authored_diagnostics(&formatted, &self.workspace)?,
+            )?;
             document.design = Some(formatted);
         }
         document.validate_for_submission()?;
@@ -1509,8 +1511,9 @@ impl PlanFileStore {
             .as_ref()
             .context("execution revision requires semantic design")?
             .formatted()?;
-        comment_lint::validate(&design)?;
-        usage::validate(&design, &self.workspace)?;
+        crate::declaration::DeclarationValidationError::ensure_empty(
+            design.authored_diagnostics(&design, &self.workspace)?,
+        )?;
         design
             .validation
             .as_ref()

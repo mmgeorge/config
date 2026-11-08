@@ -13,8 +13,11 @@
 //! Before comparing, the output is normalized so the recording is stable across runs:
 //! microsecond timings (`*_us` keys) become zero, every UUID inside a string becomes
 //! `00000000-0000-0000-0000-000000000001`, `...-000000000002` and so on in order of first
-//! appearance, and `workspace` paths become `<workspace>`. Replacing only the UUID keeps the
-//! structure of identifiers such as `review-<uuid>-1`, which Lua code parses.
+//! appearance, `workspace` paths become `<workspace>`, and wall-clock ages such as
+//! `1089 days ago` become `<relative time>`. Replacing only the UUID keeps the structure of
+//! identifiers such as `review-<uuid>-1`, which Lua code parses. Ages are measured from the
+//! current time to a fixture commit's fixed timestamp, so they grow while the payload stays
+//! the same.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -93,9 +96,20 @@ fn normalize_value(value: &Value, identifiers: &mut HashMap<String, String>) -> 
                 .map(|item| normalize_value(item, identifiers))
                 .collect(),
         ),
+        Value::String(text) if is_relative_age(text) => Value::String("<relative time>".into()),
         Value::String(text) => Value::String(replace_uuids(text, identifiers)),
         other => other.clone(),
     }
+}
+
+/// Matches the complete `<count> <unit> ago` text that Status renders for a commit's age.
+fn is_relative_age(text: &str) -> bool {
+    let mut words = text.split(' ');
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (Some(count), Some("seconds" | "minutes" | "hours" | "days"), Some("ago"), None)
+            if !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+    )
 }
 
 /// Replaces each UUID in `text` with a placeholder that is stable for the whole fixture.

@@ -51,6 +51,80 @@ pub struct DeclarationDiagnostic {
     pub reference: String,
     pub error: bool,
     pub reason: String,
+    /// Rule family that rejected the reference, selecting its tool code and correction hint.
+    #[serde(default)]
+    pub kind: DeclarationDiagnosticKind,
+}
+
+/// Rule families reported together at submission, each with its own correction.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq, Ord, PartialOrd,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclarationDiagnosticKind {
+    /// A declaration, import, or reference list entry that does not resolve as written.
+    #[default]
+    Reference,
+    /// Algorithm text the pseudocode grammar or block structure rejects.
+    AlgorithmSyntax,
+    /// A repository field used by an Algorithm without a matching Accesses entry.
+    AlgorithmAccess,
+    /// A Constructs entry without a matching explicit construction in the Algorithm.
+    AlgorithmConstruction,
+    /// A callable whose behavior section kind does not match whether it is new.
+    BehaviorBlock,
+    /// An Algorithm reference with no unique declaring type or reference list entry.
+    AlgorithmReference,
+    /// A plan documentation comment that breaks a planning comment rule.
+    DeclarationComment,
+    /// A declaration the plan introduces without a documentation comment.
+    MissingDocumentation,
+}
+
+impl DeclarationDiagnosticKind {
+    /// Stable violation code returned to planning tools.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Reference => "invalid_declaration_reference",
+            Self::AlgorithmSyntax => "invalid_algorithm_syntax",
+            Self::AlgorithmAccess => "missing_algorithm_access",
+            Self::AlgorithmConstruction => "invalid_algorithm_construction",
+            Self::BehaviorBlock => "invalid_behavior_block",
+            Self::AlgorithmReference => "invalid_algorithm_reference",
+            Self::DeclarationComment => "invalid_declaration_comment",
+            Self::MissingDocumentation => "missing_declaration_documentation",
+        }
+    }
+
+    /// Correction the planning model applies before submitting the same version again.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Reference => {
+                "Patch the declaration or its import, then submit the current version again."
+            }
+            Self::AlgorithmSyntax => {
+                "Rewrite the reported Algorithm text as assignments, calls, and control flow; keep explanations in # comments."
+            }
+            Self::AlgorithmAccess => {
+                "Add the reported field to the callable's Accesses section, or remove the field use from the Algorithm."
+            }
+            Self::AlgorithmConstruction => {
+                "Construct the reported target in the Algorithm with Type(field = value), Type(value) for a tuple type, or Type() for a marker, or remove it from Constructs."
+            }
+            Self::BehaviorBlock => {
+                "Use an Algorithm block for a new callable and a Change block for an existing callable."
+            }
+            Self::AlgorithmReference => {
+                "Qualify the reference with its declaring type so exactly one reference section entry matches it."
+            }
+            Self::DeclarationComment => {
+                "Rewrite the reported comment, then submit the current version again."
+            }
+            Self::MissingDocumentation => {
+                "Add a documentation comment directly above each reported declaration, including enum variants and fields."
+            }
+        }
+    }
 }
 
 /// Generated submission evidence, never authored by the planning model.
@@ -87,18 +161,26 @@ impl std::fmt::Display for DeclarationValidationError {
 
 impl std::error::Error for DeclarationValidationError {}
 
+impl DeclarationValidationError {
+    /// Fail with every error diagnostic in file order, or succeed when there are none.
+    pub(crate) fn ensure_empty(diagnostic: Vec<DeclarationDiagnostic>) -> Result<()> {
+        let mut diagnostic = diagnostic
+            .into_iter()
+            .filter(|diagnostic| diagnostic.error)
+            .collect::<Vec<_>>();
+        if diagnostic.is_empty() {
+            return Ok(());
+        }
+        diagnostic.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        Err(Self { diagnostic }.into())
+    }
+}
+
 impl DeclarationValidation {
     pub fn ensure_valid(&self) -> Result<()> {
-        let errors = self
-            .diagnostic
-            .iter()
-            .filter(|diagnostic| diagnostic.error)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(DeclarationValidationError { diagnostic: errors }.into());
-        }
-        Ok(())
+        DeclarationValidationError::ensure_empty(self.diagnostic.clone())
     }
     pub fn warnings(&self) -> Vec<crate::plan::PlanViolation> {
         self.diagnostic
@@ -229,6 +311,33 @@ impl DeclarationResolver {
             })
             .map(|symbol| symbol.role)
     }
+    /// Whether a resolved target is declared by this repository rather than a dependency, the
+    /// standard library, or an unchecked prelude. Planning bookkeeping applies only to the former.
+    pub(crate) fn repository_declaration(&self, resolution: &DeclarationResolution) -> bool {
+        matches!(resolution, DeclarationResolution::Resolved { destination }
+            if destination.proposed || Path::new(&destination.path).starts_with(&self.workspace))
+    }
+
+    /// Inspect the field layout of one resolved struct or enum variant.
+    pub(crate) fn field_shape(
+        &self,
+        resolution: &DeclarationResolution,
+    ) -> Option<forge_diff::syntax::FieldShape> {
+        let DeclarationResolution::Resolved { destination } = resolution else {
+            return None;
+        };
+        self.file
+            .get(Path::new(&destination.path))?
+            .index
+            .symbol
+            .iter()
+            .find(|symbol| {
+                symbol.position.line == destination.line
+                    && symbol.position.column == destination.column
+            })
+            .and_then(|symbol| symbol.field_shape)
+    }
+
     /// Resolve declarations exclusively from saved plan files without consulting workspace sources.
     pub(crate) fn planned(
         workspace: &Path,
@@ -570,6 +679,7 @@ impl DeclarationResolver {
                 reference: String::new(),
                 error: false,
                 reason: warning.clone(),
+                kind: DeclarationDiagnosticKind::Reference,
             });
         }
         for file in files {
@@ -1757,5 +1867,6 @@ fn record(
         reference: reference.into(),
         error,
         reason,
+        kind: DeclarationDiagnosticKind::Reference,
     });
 }

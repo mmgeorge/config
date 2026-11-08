@@ -165,11 +165,11 @@
       "files": [
         {
           "path": "README.md",
-          "sha256": "5612413dd6f4317a390b8a3036e69fe673d3522d706572404b7b5527e19c2a92"
+          "sha256": "20aab536b847e80ea9793b88b591b9ce615ba18320777c47fce70574f292fbc2"
         },
         {
           "path": "grammar.js",
-          "sha256": "bb78b26a891674dd250ec48e15287e107b67c95101fe6f091ffa7dd2be66aba2"
+          "sha256": "9775c3a04b0a8b11e33e56f6c6ae6944325f940a45171eb1748c898b5bfe857a"
         },
         {
           "path": "tree-sitter.json",
@@ -177,7 +177,7 @@
         },
         {
           "path": "src/grammar.json",
-          "sha256": "911870d731639296f14583f60f629bb0517e4a32512b657482a9f282b2b1a568"
+          "sha256": "107f884764aa3751a7cfe5d026affb15cc765f6912d9afe7dd9a1b5eab06471c"
         },
         {
           "path": "src/node-types.json",
@@ -185,7 +185,7 @@
         },
         {
           "path": "src/parser.c",
-          "sha256": "ce4adbe17273f29413ba1d14571e938be578ff96200a66ae08c1863c352ef14a"
+          "sha256": "01b0f7ade346277a76feb20b5b1a92d6147ba26c2989bd2074bbd85b9520c298"
         },
         {
           "path": "src/tree_sitter/alloc.h",

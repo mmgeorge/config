@@ -211,8 +211,16 @@
           "value": "for"
         },
         {
-          "type": "STRING",
-          "value": "each"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "each"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "FIELD",
@@ -336,8 +344,22 @@
           }
         },
         {
-          "type": "STRING",
-          "value": "←"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "←"
+            },
+            {
+              "type": "ALIAS",
+              "content": {
+                "type": "STRING",
+                "value": "<-"
+              },
+              "named": false,
+              "value": "←"
+            }
+          ]
         },
         {
           "type": "FIELD",
@@ -1027,6 +1049,10 @@
                     {
                       "type": "STRING",
                       "value": "%"
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "mod"
                     }
                   ]
                 },

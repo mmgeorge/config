@@ -1265,15 +1265,16 @@ impl ReadOnlyPlanReview {
             reference.kind.as_str(),
             "call" | "property" | "callback" | "value" | "construct"
         ) {
-            presentation
-                .call_row
-                .iter()
-                .find_map(|(row, (owner, name, kind))| {
-                    (owner == &reference.owner
-                        && name == &reference.name
-                        && kind.label() == reference.kind)
-                        .then_some(*row)
-                })
+            presentation.call_row.iter().find_map(|(row, targets)| {
+                targets
+                    .iter()
+                    .any(|target| {
+                        target.owner == reference.owner
+                            && target.name == reference.name
+                            && target.kind.label() == reference.kind
+                    })
+                    .then_some(*row)
+            })
         } else {
             None
         }

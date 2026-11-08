@@ -118,6 +118,7 @@ pub(crate) fn project(
                     heading_start: None,
                     collapse_children: false,
                     expand_children: false,
+                    heading_marker: false,
                     id: FoldId("plan:execution:report".into()),
                     start: TextPosition { row: 0, column: 0 },
                     end: BlockAnchor {
@@ -320,6 +321,7 @@ pub(crate) fn project(
             heading_start: None,
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
             id: FoldId(format!("plan:heading:{source_row}")),
             start: TextPosition { row: 0, column: 0 },
             end,
@@ -386,6 +388,7 @@ pub(crate) fn project(
                 heading_start,
                 collapse_children: false,
                 expand_children: false,
+                heading_marker: false,
                 id: FoldId(fold_id),
                 start: TextPosition { row: 0, column: 0 },
                 end: endpoint,
@@ -416,6 +419,7 @@ pub(crate) fn project(
             id: FoldId(format!("plan:file-tree:{source_start}")),
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
             start: TextPosition { row: 0, column: 0 },
             end: endpoint,
             closed: true,
@@ -443,8 +447,45 @@ pub(super) fn append_semantic_style(
                 if *offset == 0 { "Normal" } else { "@comment" },
             );
         }
-        PlanReviewTarget::Call { name, kind, .. } => {
-            let Some(start) = text.find(name) else { return };
+        PlanReviewTarget::Call { name, .. } => {
+            let Some(start) = text.find(name.as_str()) else {
+                return;
+            };
+            append_semantic_span(metadata, target, text, start..start + name.len());
+        }
+        _ => append_semantic_span(metadata, target, text, 0..text.len()),
+    }
+}
+
+/// Color the type that opens a grouped `Type { member, ... }` reference row.
+pub(super) fn append_group_type_style(metadata: &mut BlockMetadata, text: &str) {
+    let start = text.len() - text.trim_start().len();
+    if let Some(end) = text.find(" { ")
+        && text[start..end]
+            .rsplit([':', '.'])
+            .next()
+            .and_then(|name| name.chars().next())
+            .is_some_and(char::is_uppercase)
+    {
+        append_range(metadata, start, end, "@type");
+    }
+}
+
+/// Color one target on a rendered row. A reference entry occupies `span`, coloring qualifying
+/// segments as types or modules and its final segment by the reference kind; other targets
+/// style the whole row and ignore `span`.
+pub(super) fn append_semantic_span(
+    metadata: &mut BlockMetadata,
+    target: &PlanReviewTarget,
+    text: &str,
+    span: std::ops::Range<usize>,
+) {
+    match target {
+        PlanReviewTarget::Call { kind, .. } => {
+            let Some(name) = text.get(span.clone()) else {
+                return;
+            };
+            let start = span.start;
             let member = name.rfind([':', '.', '#']).map_or(0, |column| column + 1);
             let mut cursor = 0;
             while cursor < member {

@@ -139,6 +139,59 @@ pub fn algorithm_references(source: &str) -> Result<Vec<AlgorithmReference>, Syn
     }
 }
 
+/// One located Algorithm violation, positioned within the Algorithm block itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlgorithmDiagnostic {
+    /// One-based line within the Algorithm content.
+    pub line: usize,
+    /// One-based UTF-8 byte column within the Algorithm content.
+    pub column: usize,
+    /// Correction-oriented description of the violation.
+    pub message: String,
+}
+
+impl std::fmt::Display for AlgorithmDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Algorithm line {}, column {}: {}",
+            self.line, self.column, self.message
+        )
+    }
+}
+
+/// Distinguish authored pseudocode violations from parser infrastructure failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AlgorithmValidationError {
+    /// Every violation found in one pass, in source order.
+    Invalid(Vec<AlgorithmDiagnostic>),
+    /// The parser could not run, so the source was not judged.
+    Syntax(SyntaxError),
+}
+
+impl From<SyntaxError> for AlgorithmValidationError {
+    fn from(error: SyntaxError) -> Self {
+        Self::Syntax(error)
+    }
+}
+
+impl std::fmt::Display for AlgorithmValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(diagnostics) => {
+                let rendered = diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                formatter.write_str(&rendered.join("; "))
+            }
+            Self::Syntax(error) => write!(formatter, "Algorithm parsing failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for AlgorithmValidationError {}
+
 #[derive(Clone, Copy)]
 struct Block {
     indent: usize,
@@ -147,26 +200,29 @@ struct Block {
     looping: bool,
 }
 
+/// Statement kind, indentation, line, and whether it opens a conditional body.
+type PreviousStatement<'tree> = (&'tree str, usize, usize, bool);
+
 /// Validate pseudocode structure and return its explicit invocation sites.
-/// Returns a line-and-column diagnostic without modifying the source.
+/// Reports every parse and structure violation at once without modifying the source.
 /// Operations require calls, and expressions exclude natural-language prose.
-pub fn validate_algorithm(source: &str) -> Result<Vec<AlgorithmInvocation>, SyntaxError> {
+pub fn validate_algorithm(
+    source: &str,
+) -> Result<Vec<AlgorithmInvocation>, AlgorithmValidationError> {
+    let language = SyntaxLanguage::Algorithm.grammar();
     let mut parser = Parser::new();
     parser
-        .set_language(&SyntaxLanguage::Algorithm.grammar())
+        .set_language(&language)
         .map_err(|error| SyntaxError::Language(error.to_string()))?;
     let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
-    if let Some(node) = first_error(tree.root_node()) {
-        let position = node.start_position();
-        return Err(diagnostic(
-            position.row + 1,
-            position.column + 1,
-            "invalid structured pseudocode: use assignments, calls, and control flow; prose belongs in # comments",
-        ));
+    let parse_diagnostics = parse_errors(tree.root_node(), source);
+    if !parse_diagnostics.is_empty() {
+        return Err(AlgorithmValidationError::Invalid(parse_diagnostics));
     }
+    let mut diagnostics = Vec::new();
     let mut cursor = tree.root_node().walk();
     let mut blocks = Vec::<Block>::new();
-    let mut previous = None::<(&str, usize, usize, bool)>;
+    let mut previous = None::<PreviousStatement<'_>>;
     let mut count = 0;
     for statement in tree.root_node().named_children(&mut cursor) {
         if statement.kind() == "comment" {
@@ -175,99 +231,109 @@ pub fn validate_algorithm(source: &str) -> Result<Vec<AlgorithmInvocation>, Synt
         let position = statement.start_position();
         let line = position.row + 1;
         let indent = position.column;
-        let line_start = source[..statement.start_byte()]
-            .rfind('\n')
-            .map_or(0, |position| position + 1);
-        if source[line_start..statement.start_byte()].contains('\t') {
-            return Err(diagnostic(line, 1, "use spaces for indentation"));
-        }
         let kind = statement.kind();
-        if kind == "section_header" {
-            return Err(diagnostic(
-                line,
-                indent + 1,
-                "Algorithm headings belong outside the block",
-            ));
-        }
-        if let Some((previous_kind, previous_indent, previous_line, conditional)) = previous {
-            let opens = opens_block(previous_kind);
-            if indent > previous_indent {
-                if !opens {
-                    return Err(diagnostic(
-                        line,
-                        indent + 1,
-                        "only if, otherwise, for each, and while open an indented body",
-                    ));
-                }
-                blocks.push(Block {
-                    indent: previous_indent,
-                    body_indent: indent,
-                    conditional,
-                    looping: matches!(previous_kind, "for_statement" | "while_statement"),
-                });
-            } else if opens {
-                return Err(diagnostic(
-                    previous_line,
-                    previous_indent + 1,
-                    "control statement requires an indented body",
-                ));
-            }
-        } else if indent != 0 {
-            return Err(diagnostic(
-                line,
-                indent + 1,
-                "first statement must start at the block's base indentation",
-            ));
-        }
-        let mut closed = None;
-        while blocks.last().is_some_and(|block| indent <= block.indent) {
-            closed = blocks.pop();
-        }
-        if indent != blocks.last().map_or(0, |block| block.body_indent) {
-            return Err(diagnostic(
-                line,
-                indent + 1,
-                "indentation must match an enclosing body",
-            ));
-        }
-        if kind == "otherwise_statement" && !closed.is_some_and(|block| block.conditional) {
-            return Err(diagnostic(
-                line,
-                indent + 1,
-                "otherwise must follow an if body at the same indentation",
-            ));
-        }
-        if matches!(kind, "break_statement" | "continue_statement")
-            && !blocks.iter().any(|block| block.looping)
-        {
-            return Err(diagnostic(
-                line,
-                indent + 1,
-                "break and continue require an enclosing loop",
-            ));
-        }
         let conditional = kind == "if_statement"
             || kind == "otherwise_statement"
                 && statement.child_by_field_name("condition").is_some();
-        previous = Some((kind, indent, line, conditional));
         count += 1;
+        let line_start = source[..statement.start_byte()]
+            .rfind('\n')
+            .map_or(0, |position| position + 1);
+        let tab_indented = source[line_start..statement.start_byte()].contains('\t');
+        if let Some(message) = statement_violation(
+            tab_indented,
+            kind,
+            indent,
+            previous,
+            &mut blocks,
+            &mut diagnostics,
+        ) {
+            diagnostics.push(diagnostic(line, indent + 1, message));
+        }
+        previous = Some((kind, indent, line, conditional));
     }
     if let Some((kind, indent, line, _)) = previous
         && opens_block(kind)
     {
-        return Err(diagnostic(
+        diagnostics.push(diagnostic(
             line,
             indent + 1,
             "control statement requires an indented body",
         ));
     }
     if count == 0 {
-        return Err(diagnostic(1, 1, "at least one statement is required"));
+        diagnostics.push(diagnostic(1, 1, "at least one statement is required"));
     }
-    invocations(tree.root_node(), source)
+    let invocations = invocations(tree.root_node(), source, &mut diagnostics);
+    if diagnostics.is_empty() {
+        Ok(invocations)
+    } else {
+        diagnostics.sort_by_key(|diagnostic| (diagnostic.line, diagnostic.column));
+        Err(AlgorithmValidationError::Invalid(diagnostics))
+    }
 }
 
-fn invocations(root: Node<'_>, source: &str) -> Result<Vec<AlgorithmInvocation>, SyntaxError> {
+/// Check one statement against the enclosing block stack. The stack is updated even when the
+/// statement is rejected, so later statements are judged against the evident intended structure.
+fn statement_violation(
+    tab_indented: bool,
+    kind: &str,
+    indent: usize,
+    previous: Option<PreviousStatement<'_>>,
+    blocks: &mut Vec<Block>,
+    diagnostics: &mut Vec<AlgorithmDiagnostic>,
+) -> Option<&'static str> {
+    if tab_indented {
+        return Some("use spaces for indentation");
+    }
+    if kind == "section_header" {
+        return Some("Algorithm headings belong outside the block");
+    }
+    if let Some((previous_kind, previous_indent, previous_line, conditional)) = previous {
+        let opens = opens_block(previous_kind);
+        if indent > previous_indent {
+            if !opens {
+                return Some("only if, otherwise, for each, and while open an indented body");
+            }
+            blocks.push(Block {
+                indent: previous_indent,
+                body_indent: indent,
+                conditional,
+                looping: matches!(previous_kind, "for_statement" | "while_statement"),
+            });
+        } else if opens {
+            diagnostics.push(diagnostic(
+                previous_line,
+                previous_indent + 1,
+                "control statement requires an indented body",
+            ));
+        }
+    } else if indent != 0 {
+        return Some("first statement must start at the block's base indentation");
+    }
+    let mut closed = None;
+    while blocks.last().is_some_and(|block| indent <= block.indent) {
+        closed = blocks.pop();
+    }
+    if indent != blocks.last().map_or(0, |block| block.body_indent) {
+        return Some("indentation must match an enclosing body");
+    }
+    if kind == "otherwise_statement" && !closed.is_some_and(|block| block.conditional) {
+        return Some("otherwise must follow an if body at the same indentation");
+    }
+    if matches!(kind, "break_statement" | "continue_statement")
+        && !blocks.iter().any(|block| block.looping)
+    {
+        return Some("break and continue require an enclosing loop");
+    }
+    None
+}
+
+fn invocations(
+    root: Node<'_>,
+    source: &str,
+    diagnostics: &mut Vec<AlgorithmDiagnostic>,
+) -> Vec<AlgorithmInvocation> {
     let mut result = Vec::new();
     let mut cursor = root.walk();
     loop {
@@ -289,7 +355,7 @@ fn invocations(root: Node<'_>, source: &str) -> Result<Vec<AlgorithmInvocation>,
                         .expect("named argument has a name");
                     if !field.insert(&source[name.byte_range()]) {
                         let position = name.start_position();
-                        return Err(diagnostic(
+                        diagnostics.push(diagnostic(
                             position.row + 1,
                             position.column + 1,
                             "duplicate named argument",
@@ -316,7 +382,7 @@ fn invocations(root: Node<'_>, source: &str) -> Result<Vec<AlgorithmInvocation>,
                 break;
             }
             if !cursor.goto_parent() {
-                return Ok(result);
+                return result;
             }
         }
     }
@@ -329,18 +395,36 @@ fn opens_block(kind: &str) -> bool {
     )
 }
 
-fn diagnostic(line: usize, column: usize, message: &str) -> SyntaxError {
-    SyntaxError::Query(format!("Algorithm line {line}, column {column}: {message}"))
+fn diagnostic(line: usize, column: usize, message: impl Into<String>) -> AlgorithmDiagnostic {
+    AlgorithmDiagnostic {
+        line,
+        column,
+        message: message.into(),
+    }
 }
 
-fn first_error(root: Node<'_>) -> Option<Node<'_>> {
+/// Describe the first outermost ERROR or MISSING node on each line by the exact text it rejected,
+/// so a correction never depends on guessing which token the parser refused.
+fn parse_errors(root: Node<'_>, source: &str) -> Vec<AlgorithmDiagnostic> {
+    let mut result = Vec::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
-        if node.is_error() || node.is_missing() {
-            return Some(node);
+        let failed = node.is_error() || node.is_missing();
+        let position = node.start_position();
+        // Recovery after the first error on a line yields more errors that restate it.
+        if failed
+            && result
+                .last()
+                .is_none_or(|previous: &AlgorithmDiagnostic| previous.line != position.row + 1)
+        {
+            result.push(diagnostic(
+                position.row + 1,
+                position.column + 1,
+                parse_error_message(node, source),
+            ));
         }
-        if cursor.goto_first_child() {
+        if !failed && cursor.goto_first_child() {
             continue;
         }
         loop {
@@ -348,8 +432,124 @@ fn first_error(root: Node<'_>) -> Option<Node<'_>> {
                 break;
             }
             if !cursor.goto_parent() {
-                return None;
+                return result;
             }
         }
+    }
+}
+
+fn parse_error_message(node: Node<'_>, source: &str) -> String {
+    if node.is_missing() {
+        return format!("expected `{}`", node.kind());
+    }
+    let rejected = source[node.byte_range()]
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let mut message = format!("unexpected `{rejected}`");
+    let words = rejected.split_whitespace().collect::<Vec<_>>();
+    if words.len() > 1
+        && words.iter().all(|word| {
+            word.chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        })
+    {
+        message.push_str(
+            "; write operations as calls such as `process(item)` and explanations as # comments",
+        );
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlgorithmValidationError, validate_algorithm};
+
+    fn messages(source: &str) -> Vec<String> {
+        match validate_algorithm(source) {
+            Ok(_) => Vec::new(),
+            Err(AlgorithmValidationError::Invalid(diagnostics)) => diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.to_string())
+                .collect(),
+            Err(AlgorithmValidationError::Syntax(error)) => panic!("parser failed: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn ascii_arrow_assigns_like_the_unicode_arrow() {
+        assert_eq!(messages("speed <- base * 2"), Vec::<String>::new());
+        assert_eq!(messages("speed ← base * 2"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mod_is_a_remainder_operator_and_remains_an_identifier() {
+        assert_eq!(
+            messages("if wave mod interval = 0\n  spawn(wave)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            messages("if wave % interval = 0\n  spawn(wave)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(messages("mod ← 3"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn for_loops_accept_python_style_headers() {
+        assert_eq!(
+            messages(
+                "for projectile in projectiles:
+  advance(projectile)"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            messages(
+                "for each projectile in projectiles
+  advance(projectile)"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn one_parse_error_is_reported_per_line() {
+        let reported = messages(
+            "destroyed ? ? overlapping the enemy
+score ← 1",
+        );
+        assert_eq!(reported.len(), 1, "{reported:#?}");
+    }
+
+    #[test]
+    fn less_than_negative_condition_is_not_an_assignment() {
+        assert_eq!(
+            messages("if speed <-1\n  stop(speed)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn every_independent_violation_is_reported_with_its_text() {
+        let reported = messages("score ← 1\nprocess candidate now\nlimit ← ← 2");
+        assert_eq!(reported.len(), 2, "{reported:#?}");
+        assert!(reported[0].starts_with("Algorithm line 2"), "{reported:#?}");
+        assert!(
+            reported[0].contains("`process candidate now`"),
+            "{reported:#?}"
+        );
+        assert!(reported[0].contains("# comments"), "{reported:#?}");
+        assert!(reported[1].starts_with("Algorithm line 3"), "{reported:#?}");
+        assert!(reported[1].contains("unexpected `←`"), "{reported:#?}");
+    }
+
+    #[test]
+    fn structural_violations_are_collected_together() {
+        let reported = messages("break\nscore ← 1\n    total ← 2");
+        assert_eq!(reported.len(), 2, "{reported:#?}");
+        assert!(reported[0].contains("break and continue require an enclosing loop"));
+        assert!(reported[1].contains("only if, otherwise, for each, and while open"));
     }
 }

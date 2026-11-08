@@ -175,6 +175,13 @@ local function project(owner)
         end
       end
       for _, fold in ipairs(item.fold) do
+        if fold.heading_marker then
+          local heading = text[fold.start.row + 1] or ""
+          metadata.gutter[#metadata.gutter + 1] = {
+            position = { row = fold.start.row, column = #heading:match("^%s*") }, placement = "inline", priority = 200,
+            chunk = { { text = (fold.closed and "▸" or "▾") .. " ", capture = "Normal" } },
+          }
+        end
         local marker = metadata.node_marker
         if marker then
           local marker_row = mapped_row(spans, marker.row)

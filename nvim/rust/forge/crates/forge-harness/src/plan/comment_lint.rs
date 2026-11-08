@@ -4,10 +4,10 @@ use anyhow::{Context, Result};
 use forge_diff::syntax::{DeclarationOverview, DeclarationPosition};
 
 use super::DeclarationDesign;
-use crate::declaration::{DeclarationDiagnostic, DeclarationValidationError};
+use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 
 /// Reject newly authored comment openings without imposing new rules on captured source.
-pub(super) fn validate(design: &DeclarationDesign) -> Result<()> {
+pub(super) fn diagnostics(design: &DeclarationDesign) -> Result<Vec<DeclarationDiagnostic>> {
     let mut diagnostic = Vec::new();
     let moved_origin = design
         .moved
@@ -51,14 +51,11 @@ pub(super) fn validate(design: &DeclarationDesign) -> Result<()> {
                 reference: "Returns".into(),
                 error: true,
                 reason: "Plan comments must not start with 'Returns'. Use 'Get' instead.".into(),
+                kind: DeclarationDiagnosticKind::DeclarationComment,
             });
         }
     }
-    if diagnostic.is_empty() {
-        Ok(())
-    } else {
-        Err(DeclarationValidationError { diagnostic }.into())
-    }
+    Ok(diagnostic)
 }
 
 struct PlanComment {

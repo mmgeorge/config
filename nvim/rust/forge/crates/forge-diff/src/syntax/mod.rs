@@ -3,8 +3,8 @@
 mod algorithm;
 mod assets;
 pub use algorithm::{
-    AlgorithmInvocation, AlgorithmReference, algorithm_reference, algorithm_references,
-    validate_algorithm,
+    AlgorithmDiagnostic, AlgorithmInvocation, AlgorithmReference, AlgorithmValidationError,
+    algorithm_reference, algorithm_references, validate_algorithm,
 };
 mod configuration;
 mod context;
@@ -21,7 +21,8 @@ pub use declaration_calls::{
 pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 pub use declaration_index::{
     DeclarationImport, DeclarationIndex, DeclarationIndexTiming, DeclarationMemberOwner,
-    DeclarationModule, DeclarationReference, DeclarationRole, DeclarationSymbol, SymbolVisibility,
+    DeclarationModule, DeclarationReference, DeclarationRole, DeclarationSymbol, FieldShape,
+    SymbolVisibility,
 };
 mod visibility;
 pub use configuration::ConfigurationFormat;

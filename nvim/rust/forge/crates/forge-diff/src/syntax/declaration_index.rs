@@ -44,6 +44,34 @@ pub struct DeclarationSymbol {
     pub conditional: bool,
     pub global: bool,
     pub parameter: bool,
+    /// Field layout of a Rust struct or enum variant, absent for every other declaration.
+    pub field_shape: Option<FieldShape>,
+}
+
+/// How a Rust struct or enum variant is constructed, which decides whether a construction
+/// names its fields or passes them by position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldShape {
+    /// `struct Player { speed: f32 }`, constructed with `field = value` arguments.
+    Named,
+    /// `struct Velocity(Vec2);`, constructed with positional arguments.
+    Tuple,
+    /// `struct Marker;`, constructed without arguments.
+    Unit,
+}
+
+/// Classify a struct or variant by its body node, leaving other declarations unshaped.
+fn field_shape(node: Node<'_>) -> Option<FieldShape> {
+    if !matches!(node.kind(), "struct_item" | "enum_variant") {
+        return None;
+    }
+    Some(
+        match node.child_by_field_name("body").map(|body| body.kind()) {
+            Some("ordered_field_declaration_list") => FieldShape::Tuple,
+            Some("field_declaration_list") => FieldShape::Named,
+            _ => FieldShape::Unit,
+        },
+    )
 }
 
 /// One identifier path used by a declaration, excluding executable bodies.
@@ -379,6 +407,7 @@ fn lua_symbol_walk(
                     conditional: false,
                     global: !private,
                     parameter: false,
+                    field_shape: None,
                 });
             }
             continue;
@@ -449,6 +478,7 @@ fn lua_symbol_walk(
                     conditional: false,
                     global: public,
                     parameter: false,
+                    field_shape: None,
                 });
             }
             continue;
@@ -924,6 +954,7 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
                 conditional,
                 global: false,
                 parameter: false,
+                field_shape: None,
             });
             continue;
         }
@@ -998,6 +1029,7 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
                         conditional,
                         global: global || !rust && !index.external_module && scope.is_empty(),
                         parameter,
+                        field_shape: field_shape(node),
                     });
                     if matches!(
                         kind,
@@ -1054,6 +1086,7 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
                 conditional,
                 global: false,
                 parameter: true,
+                field_shape: None,
             });
             continue;
         }
@@ -1113,6 +1146,7 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
                 conditional,
                 global: false,
                 parameter: true,
+                field_shape: None,
             });
         }
         if kind == "trait_item" {
@@ -1130,6 +1164,7 @@ fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut Decl
                 conditional,
                 global: false,
                 parameter: true,
+                field_shape: None,
             });
         }
         if matches!(
@@ -1353,6 +1388,7 @@ fn rust_attribute(
                     conditional,
                     global: false,
                     parameter: false,
+                    field_shape: None,
                 });
             }
         }

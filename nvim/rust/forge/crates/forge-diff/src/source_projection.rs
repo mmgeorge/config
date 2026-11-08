@@ -734,6 +734,7 @@ impl SourceDiffProjection {
             closed: !self.expanded.contains(&signature.identity),
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
         });
         Ok(())
     }

@@ -70,6 +70,7 @@ pub(super) fn prepare(block: &mut BufferBlock, width: &WidthProfile) -> Result<(
             collapsed_suffix: None,
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
         });
         super::transcript::TranscriptRenderer::fold_marker(block);
     }

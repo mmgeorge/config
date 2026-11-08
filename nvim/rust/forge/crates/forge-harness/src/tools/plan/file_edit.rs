@@ -13,12 +13,16 @@ pub(super) fn definition() -> ControlToolDefinition {
                 an atomic patch using *** Begin Patch, Add File, Update File, Delete File, Move to, @@, and *** \
                 End Patch. Paths are project-relative. Source files contain semantic structure: signatures, \
                 comments, and Calls/Constructs/Accesses; never executable bodies. New callables require a \
-                nonempty Algorithm; use the academic-pseudocode skill. Modified callables use a \
+                nonempty Algorithm; load the academic-pseudocode skill before writing one. Algorithm \
+                statements are one per line: assignments with ←, calls such as process(item), if/otherwise, \
+                for each item in items, while, and return; explanations belong only in # comments. \
+                Modified callables use a \
                 one-to-two-sentence Change, even when the signature stays the same. Place behavior and reference \
                 sections directly below the signature. Use a standalone heading and indented content, for example:\n\
                 pub fn existing();\nChange\n  Preserve the existing result while recording the update.\n\
                 pub fn added();\nAlgorithm\n  return none\n\
-                Comment declarations, without starting comments with \
+                Document every new declaration, including enum variants and fields, with a doc comment \
+                (/// in Rust), without starting comments with \
                 Returns. Keep unchanged references; omitted reference sections mean unknown, and empty sections \
                 mean none. New internal declarations need a recorded use. Configuration files retain complete \
                 contents. Read existing files with plan_file_read first and omit displayed line numbers from \

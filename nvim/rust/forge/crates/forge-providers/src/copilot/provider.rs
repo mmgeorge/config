@@ -3459,7 +3459,7 @@ impl CopilotProvider {
             .map_err(|cause| cause.for_operation(ProviderOperation::TurnSteer))?;
         let input = forge_provider_api::input::MessageInput {
             prompt: {
-                let prompt = match request.input {
+                match request.input {
                     forge_provider_api::PromptInput::Text(text) => text,
                     forge_provider_api::PromptInput::Skill { name, arguments } => {
                         format!("Use skill {name} with arguments: {arguments}")
@@ -3481,8 +3481,7 @@ impl CopilotProvider {
                         };
                         format!("Answer to the question {:?}: {answer}", reply.question)
                     }
-                };
-                prompt
+                }
             },
             attachments: request.attachments,
         };

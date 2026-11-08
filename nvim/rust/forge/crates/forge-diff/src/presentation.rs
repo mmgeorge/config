@@ -153,6 +153,7 @@ impl DiffPresenter {
             closed: layout.closed,
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
         });
         Ok(true)
     }

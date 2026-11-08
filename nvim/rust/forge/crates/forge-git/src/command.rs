@@ -62,10 +62,7 @@ pub fn read_command_with_expiry(
     collect_command(
         command,
         limits,
-        None,
-        None,
-        false,
-        None,
+        CommandStreams::default(),
         |_| deadline_expired(),
         check,
     )
@@ -93,20 +90,14 @@ pub fn read_command_pair(
             collect_async(
                 first,
                 limits,
-                None,
-                None,
-                false,
-                None,
+                CommandStreams::default(),
                 &mut first_deadline_expired,
                 &mut first_check,
             ),
             collect_async(
                 second,
                 limits,
-                None,
-                None,
-                false,
-                None,
+                CommandStreams::default(),
                 &mut second_deadline_expired,
                 &mut second_check,
             ),
@@ -136,10 +127,12 @@ pub fn progress_command(
     collect_command(
         command,
         limits,
-        input,
-        progress,
-        false,
-        None,
+        CommandStreams {
+            input: input.map(ToOwned::to_owned),
+            progress: progress.cloned(),
+            diagnostic: false,
+            destination: None,
+        },
         timeout_elapsed(limits),
         check,
     )
@@ -156,10 +149,12 @@ pub fn diagnostic_command(
     collect_command(
         command,
         limits,
-        input,
-        progress,
-        true,
-        None,
+        CommandStreams {
+            input: input.map(ToOwned::to_owned),
+            progress: progress.cloned(),
+            diagnostic: true,
+            destination: None,
+        },
         timeout_elapsed(limits),
         check,
     )
@@ -175,10 +170,10 @@ pub fn file_command(
     collect_command(
         command,
         limits,
-        None,
-        None,
-        false,
-        Some(destination),
+        CommandStreams {
+            destination: Some(destination),
+            ..CommandStreams::default()
+        },
         timeout_elapsed(limits),
         check,
     )
@@ -189,13 +184,20 @@ fn timeout_elapsed(limits: CommandLimits) -> impl FnMut(Duration) -> bool {
     move |elapsed| elapsed >= limits.timeout
 }
 
+/// Per-invocation stream wiring for a bounded command: optional stdin bytes, a progress sink,
+/// whether stream lines are reported as diagnostics, and an optional file that receives stdout.
+#[derive(Default)]
+struct CommandStreams {
+    input: Option<Vec<u8>>,
+    progress: Option<CommandProgressSink>,
+    diagnostic: bool,
+    destination: Option<std::fs::File>,
+}
+
 fn collect_command(
     command: &mut Command,
     limits: CommandLimits,
-    input: Option<&[u8]>,
-    progress: Option<&CommandProgressSink>,
-    diagnostic: bool,
-    destination: Option<std::fs::File>,
+    streams: CommandStreams,
     mut deadline_expired: impl FnMut(Duration) -> bool,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
@@ -205,20 +207,8 @@ fn collect_command(
     );
     check()?;
     let command = std::mem::replace(command, Command::new(""));
-    let input = input.map(ToOwned::to_owned);
-    let progress = progress.cloned();
     command_runtime()?.block_on(async move {
-        collect_async(
-            command,
-            limits,
-            input,
-            progress,
-            diagnostic,
-            destination,
-            &mut deadline_expired,
-            &mut check,
-        )
-        .await
+        collect_async(command, limits, streams, &mut deadline_expired, &mut check).await
     })
 }
 
@@ -245,13 +235,16 @@ fn command_runtime() -> Result<tokio::runtime::Handle> {
 async fn collect_async(
     command: Command,
     limits: CommandLimits,
-    input: Option<Vec<u8>>,
-    progress: Option<CommandProgressSink>,
-    diagnostic: bool,
-    destination: Option<std::fs::File>,
+    streams: CommandStreams,
     deadline_expired: &mut impl FnMut(Duration) -> bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Output> {
+    let CommandStreams {
+        input,
+        progress,
+        diagnostic,
+        destination,
+    } = streams;
     let started = Instant::now();
     let mut wrapped = CommandWrap::from(tokio::process::Command::from(command));
     wrapped

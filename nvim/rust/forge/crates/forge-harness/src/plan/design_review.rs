@@ -247,7 +247,52 @@ pub(super) fn project(
         if context {
             omitted += 1;
         }
-        if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
+        let line_anchor = navigation
+            .anchor
+            .iter()
+            .filter(|anchor| anchor.line == index as u32 + 1)
+            .collect::<Vec<_>>();
+        if let Some(anchor) = line_anchor.last().copied() {
+            // Reference rows record each entry's columns; grouped Accesses rows hold several.
+            let mut entry_span = line_anchor
+                .iter()
+                .filter_map(|anchor| {
+                    anchor
+                        .columns
+                        .map(|[start, end]| ((*anchor).clone(), start as usize, end as usize))
+                })
+                .collect::<Vec<_>>();
+            // A grouped row names its type even when only members are listed; that name jumps to
+            // the type declaration rather than to a member.
+            let row_text = row.text.row(0).unwrap_or_default();
+            let type_start = row_text.len() - row_text.trim_start().len();
+            if let Some(type_end) = row_text.find(" { ")
+                && !entry_span.iter().any(|(_, start, _)| *start == type_start)
+                && let Some((
+                    PlanNavigationAnchor {
+                        target:
+                            PlanReviewTarget::Call {
+                                path, side, owner, ..
+                            },
+                        ..
+                    },
+                    _,
+                    _,
+                )) = entry_span.first()
+            {
+                let mut type_anchor = entry_span[0].0.clone();
+                type_anchor.target = PlanReviewTarget::Call {
+                    path: path.clone(),
+                    side: side.clone(),
+                    owner: owner.clone(),
+                    name: row_text[type_start..type_end].to_owned(),
+                    kind: super::CallKind::Value,
+                };
+                type_anchor.columns = Some([type_start as u32, type_end as u32]);
+                type_anchor.label =
+                    format!("{path}: {owner}: type {}", &row_text[type_start..type_end]);
+                entry_span.insert(0, (type_anchor, type_start, type_end));
+            }
             if matches!(
                 anchor.target,
                 PlanReviewTarget::Call { .. } | PlanReviewTarget::Behavior { .. }
@@ -257,34 +302,56 @@ pub(super) fn project(
                 .iter()
                 .any(|decoration| decoration.capture.ends_with(".algorithm"))
             {
-                super::review_projection::append_semantic_style(
-                    &mut row.metadata,
-                    &anchor.target,
-                    row.text.row(0).unwrap_or_default(),
-                );
-                if let PlanReviewTarget::Call {
-                    path,
-                    side,
-                    name,
-                    kind,
-                    ..
-                } = &anchor.target
-                    && matches!(kind, super::CallKind::Value | super::CallKind::Construct)
-                    && let Some(reference) = row.metadata.visible_decoration.last_mut()
-                {
-                    match narrative_symbols.capture(path, side, name) {
-                        Some("@type") => reference.capture = "ForgeWalkthroughType".into(),
-                        Some("@function") if *kind == super::CallKind::Construct => {
-                            reference.capture = if name.contains([':', '.']) {
-                                "@function.method.call"
-                            } else {
-                                "@function.call"
-                            }
-                            .into();
-                        }
-                        _ => (),
+                let text = row.text.row(0).unwrap_or_default().to_owned();
+                if entry_span.is_empty() {
+                    super::review_projection::append_semantic_style(
+                        &mut row.metadata,
+                        &anchor.target,
+                        &text,
+                    );
+                    restyle_narrative_reference(
+                        &mut row.metadata,
+                        &anchor.target,
+                        &narrative_symbols,
+                    );
+                } else {
+                    super::review_projection::append_group_type_style(&mut row.metadata, &text);
+                    for (entry, start, end) in entry_span
+                        .iter()
+                        .filter(|(entry, _, _)| line_anchor.iter().any(|anchor| **anchor == *entry))
+                    {
+                        super::review_projection::append_semantic_span(
+                            &mut row.metadata,
+                            &entry.target,
+                            &text,
+                            *start..*end,
+                        );
+                        restyle_narrative_reference(
+                            &mut row.metadata,
+                            &entry.target,
+                            &narrative_symbols,
+                        );
                     }
                 }
+            }
+            for (entry, start, end) in &entry_span {
+                let id = TargetId(format!("plan:declaration:{}:{start}", row.id.0));
+                row.metadata.target.push(TargetRange {
+                    id: id.clone(),
+                    range: TextRange {
+                        start: TextPosition {
+                            row: 0,
+                            column: *start,
+                        },
+                        end: TextPosition {
+                            row: 0,
+                            column: *end,
+                        },
+                    },
+                });
+                let mut entry = entry.clone();
+                entry.line = if context { 0 } else { entry.line - omitted };
+                target.insert(id, entry);
             }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
             row.metadata.target.push(TargetRange {
@@ -498,6 +565,8 @@ fn rows(
         }
     }
     let mut block = Vec::new();
+    let mut algorithm_callables =
+        HashMap::<(String, String), Vec<forge_diff::syntax::DeclarationCallable>>::new();
     let mut display_row = HashMap::<(String, String, usize), usize>::new();
     let mut navigation = PlanNavigationIndex {
         plan_id: document.plan_id.clone(),
@@ -546,6 +615,7 @@ fn rows(
             Some((added, removed)),
         )?);
         navigation.anchor.push(PlanNavigationAnchor {
+            columns: None,
             line: block.len() as u32,
             target: PlanReviewTarget::File { path: path.clone() },
             json_path: format!("/design/proposed/{}", pointer(path)),
@@ -620,14 +690,15 @@ fn rows(
                         row_text,
                     )?;
                 }
-                if presentation
+                if let Some((owner, offset, _)) = presentation
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|file| file.behavior_row.get(&line))
-                    .is_some_and(|(_, _, category)| *category == "Algorithm")
+                    .filter(|(_, _, category)| *category == "Algorithm")
                     && let Some(handle) = syntax
                         .get(&(source_path.clone(), side.into()))
                         .and_then(|syntax| syntax.algorithm.as_ref())
                 {
+                    let algorithm_start = metadata.visible_decoration.len();
                     forge_diff::projection::append_syntax_row(
                         &mut metadata,
                         handle,
@@ -635,6 +706,56 @@ fn rows(
                         0,
                         row_text,
                     )?;
+                    let (declarations, bodies) = if side == "baseline" {
+                        (
+                            design
+                                .baseline
+                                .get(source_path)
+                                .map(|file| file.text.as_str()),
+                            &design.baseline_calls,
+                        )
+                    } else {
+                        (
+                            design.proposed.get(source_path).map(String::as_str),
+                            &design.proposed_calls,
+                        )
+                    };
+                    let callables = algorithm_callables
+                        .entry((source_path.clone(), side.to_owned()))
+                        .or_insert_with(|| {
+                            declarations
+                                .and_then(|text| {
+                                    forge_diff::syntax::DeclarationCalls::extract(
+                                        source_path,
+                                        text,
+                                        true,
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default()
+                        });
+                    let function = callables.iter().find(|function| function.owner == *owner);
+                    let body = bodies
+                        .get(source_path)
+                        .into_iter()
+                        .flatten()
+                        .find(|body| body.owner == *owner);
+                    let mut index = 0;
+                    metadata.visible_decoration.retain(|decoration| {
+                        index += 1;
+                        index <= algorithm_start
+                            || decoration.capture != "@function.call.algorithm"
+                            || function.zip(body).is_some_and(|(function, body)| {
+                                super::calls::declared_algorithm_call(
+                                    source_path,
+                                    function,
+                                    body,
+                                    *offset,
+                                    row_text,
+                                    decoration.range.start.column,
+                                )
+                            })
+                    });
                 }
                 if inspection
                     && !visibility
@@ -709,11 +830,21 @@ fn rows(
                         row_text,
                     ));
                 }
-                if let Some((owner, name, kind)) = presentation
+                let call_targets = presentation
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|file| file.call_row.get(&line))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for super::calls::CallRowTarget {
+                    owner,
+                    name,
+                    kind,
+                    start,
+                    end,
+                } in call_targets
                 {
                     navigation.anchor.push(PlanNavigationAnchor {
+                        columns: Some([*start as u32, *end as u32]),
                         line: block.len() as u32,
                         target: PlanReviewTarget::Call {
                             kind: *kind,
@@ -741,6 +872,7 @@ fn rows(
                     .and_then(|file| file.behavior_row.get(&line))
                 {
                     navigation.anchor.push(PlanNavigationAnchor {
+                        columns: None,
                         line: block.len() as u32,
                         target: PlanReviewTarget::Behavior {
                             path: source_path.clone(),
@@ -777,6 +909,12 @@ fn rows(
                 &display_row,
                 &file.hunk,
             )?;
+            section_folds(
+                &mut block,
+                [file.old_path.as_ref(), file.new_path.as_ref()],
+                &presentation,
+                &display_row,
+            );
         }
         fold(&mut block, start, &id)?;
         if contextual_path.contains(path) {
@@ -794,6 +932,7 @@ fn rows(
             0,
         )?);
         navigation.anchor.push(PlanNavigationAnchor {
+            columns: None,
             line: 1,
             target: PlanReviewTarget::Section {
                 section: super::PlanSection::Files,
@@ -842,6 +981,7 @@ fn rows(
                     && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index))
                 {
                     section_anchor.push(PlanNavigationAnchor {
+                        columns: None,
                         line: overview.len() as u32,
                         target: PlanReviewTarget::Check { id: (*id).clone() },
                         json_path: "/design/document/checks".into(),
@@ -873,6 +1013,7 @@ fn rows(
                 anchor.line += offset;
             }
             section_anchor.push(PlanNavigationAnchor {
+                columns: None,
                 line: changes_start as u32 + 1,
                 target: PlanReviewTarget::Section {
                     section: super::PlanSection::Files,
@@ -926,6 +1067,7 @@ fn rows(
         fold(&mut overview, start, &fold_id)?;
         for line in start as u32 + 1..=overview.len() as u32 {
             section_anchor.push(PlanNavigationAnchor {
+                columns: None,
                 line,
                 target: PlanReviewTarget::Section { section },
                 json_path: format!("/design/document/{name}"),
@@ -1210,6 +1352,7 @@ pub(super) fn test_inventory(
         0,
     )?];
     let mut anchors = vec![PlanNavigationAnchor {
+        columns: None,
         line: 1,
         target: PlanReviewTarget::Section {
             section: super::PlanSection::Tests,
@@ -1284,6 +1427,7 @@ pub(super) fn test_inventory(
         });
         block.push(presenter.file(BlockId(id.clone()), change, &file.file, Some(counts))?);
         anchors.push(PlanNavigationAnchor {
+            columns: None,
             line: block.len() as u32,
             target: PlanReviewTarget::Section {
                 section: super::PlanSection::Tests,
@@ -1357,6 +1501,7 @@ pub(super) fn test_inventory(
             }
             for line in case_start + 1..=block.len() {
                 anchors.push(PlanNavigationAnchor {
+                    columns: None,
                     line: line as u32,
                     target: PlanReviewTarget::TestCase {
                         path: file.file.clone(),
@@ -1372,6 +1517,38 @@ pub(super) fn test_inventory(
     }
     fold(&mut block, 0, "plan:section:tests")?;
     Ok((block, anchors))
+}
+
+/// Recolor a value or construction reference by the narrative symbol it names, so types and
+/// factories keep the coloring their declarations use elsewhere in the review.
+fn restyle_narrative_reference(
+    metadata: &mut forge_buffer::block::BlockMetadata,
+    anchor: &PlanReviewTarget,
+    narrative_symbols: &super::review_symbols::NarrativeSymbols,
+) {
+    if let PlanReviewTarget::Call {
+        path,
+        side,
+        name,
+        kind,
+        ..
+    } = anchor
+        && matches!(kind, super::CallKind::Value | super::CallKind::Construct)
+        && let Some(reference) = metadata.visible_decoration.last_mut()
+    {
+        match narrative_symbols.capture(path, side, name) {
+            Some("@type") => reference.capture = "ForgeWalkthroughType".into(),
+            Some("@function") if *kind == super::CallKind::Construct => {
+                reference.capture = if name.contains([':', '.']) {
+                    "@function.method.call"
+                } else {
+                    "@function.call"
+                }
+                .into();
+            }
+            _ => (),
+        }
+    }
 }
 
 fn declaration_folds(
@@ -1438,6 +1615,71 @@ fn declaration_folds(
         installed.push((opening, closing));
     }
     Ok(())
+}
+
+/// Fold each behavior and reference section below its heading, marking the heading with its
+/// open state. Constructs and Accesses start closed because reviewers open that bookkeeping on
+/// demand, while Algorithm, Change, and Calls start open.
+fn section_folds(
+    block: &mut [BufferBlock],
+    paths: [Option<&String>; 2],
+    presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
+    display_row: &HashMap<(String, String, usize), usize>,
+) {
+    for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
+        let Some(path) = path else { continue };
+        let Some(source) = presentation.get(&(path.clone(), side.into())) else {
+            continue;
+        };
+        for (heading_row, (end, heading)) in &source.section {
+            let Some(opening) = display_row
+                .get(&(path.clone(), side.into(), *heading_row))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(closing) = end
+                .checked_sub(1)
+                .and_then(|last| display_row.get(&(path.clone(), side.into(), last)))
+                .copied()
+            else {
+                continue;
+            };
+            if closing <= opening
+                || block[opening]
+                    .metadata
+                    .fold
+                    .iter()
+                    .any(|fold| fold.id.0.starts_with("plan:section:"))
+            {
+                continue;
+            }
+            let end = BlockAnchor {
+                block: block[closing].id.clone(),
+                position: TextPosition {
+                    row: block[closing].text.row_count(),
+                    column: 0,
+                },
+            };
+            block[opening]
+                .metadata
+                .fold
+                .push(forge_buffer::block::FoldRange {
+                    collapsed_suffix: None,
+                    id: FoldId(format!(
+                        "plan:section:{}:{side}:{heading_row}",
+                        super::digest(path.as_bytes())
+                    )),
+                    heading_start: None,
+                    start: TextPosition { row: 0, column: 0 },
+                    end,
+                    closed: matches!(*heading, "Constructs" | "Accesses"),
+                    collapse_children: false,
+                    expand_children: false,
+                    heading_marker: true,
+                });
+        }
+    }
 }
 
 fn call_folds(
@@ -1815,6 +2057,7 @@ fn declaration_anchor(
     text: &str,
 ) -> PlanNavigationAnchor {
     PlanNavigationAnchor {
+        columns: None,
         line: display_line,
         target: PlanReviewTarget::Declaration {
             path: path.into(),

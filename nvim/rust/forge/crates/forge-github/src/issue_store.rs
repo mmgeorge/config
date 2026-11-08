@@ -651,11 +651,11 @@ fn write_issue_indexes(
 ) -> Result<()> {
     for term in issue_terms(issue) {
         let key = index_key(repo, &term, issue.number);
-        terms.insert(key.as_str(), &issue.number)?;
+        terms.insert(key.as_str(), issue.number)?;
     }
     for label in issue_labels(issue) {
         let key = index_key(repo, &label, issue.number);
-        labels.insert(key.as_str(), &issue.number)?;
+        labels.insert(key.as_str(), issue.number)?;
     }
     Ok(())
 }

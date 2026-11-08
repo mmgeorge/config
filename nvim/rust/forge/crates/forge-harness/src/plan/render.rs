@@ -166,6 +166,9 @@ pub enum PlanReviewTarget {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanNavigationAnchor {
     pub line: u32,
+    /// Byte columns of the anchored entry when one rendered line carries several entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<[u32; 2]>,
     pub target: PlanReviewTarget,
     pub json_path: String,
     pub path: Option<String>,
@@ -247,6 +250,7 @@ impl PlanRenderer {
     ) {
         let value = value.into();
         let mut anchor = PlanNavigationAnchor {
+            columns: None,
             line: 0,
             target,
             json_path: json_path.into(),

@@ -5,13 +5,16 @@ use anyhow::Result;
 use forge_diff::syntax::DeclarationRole;
 
 use super::{DeclarationDesign, references::PlanReferenceIndex};
-use crate::declaration::{DeclarationDiagnostic, DeclarationValidationError};
+use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 
 /// Reject new internal declarations without resolved incoming uses at submission time.
-pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<()> {
-    let index = PlanReferenceIndex::design(design, workspace)?;
+pub(super) fn diagnostics(
+    design: &DeclarationDesign,
+    index: &PlanReferenceIndex,
+    workspace: &Path,
+) -> Result<Vec<DeclarationDiagnostic>> {
     if index.introduced.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let external = crate::declaration::exposure::symbols(workspace, design)?;
     let mut incoming = BTreeMap::<String, BTreeSet<(String, String, String)>>::new();
@@ -147,14 +150,11 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
                 reference: owner,
                 error: true,
                 reason: format!("New internal {role} has no recorded incoming use. {repair}"),
+                kind: DeclarationDiagnosticKind::Reference,
             });
         }
     }
-    if diagnostic.is_empty() {
-        Ok(())
-    } else {
-        Err(DeclarationValidationError { diagnostic }.into())
-    }
+    Ok(diagnostic)
 }
 
 fn normalized(owner: &str) -> String {

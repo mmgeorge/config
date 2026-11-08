@@ -292,41 +292,6 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
     Ok(roots)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn annotation_restart_preserves_text_and_rejects_concurrent_or_source_changes() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("working.json");
-        std::fs::write(&source, b"canonical").unwrap();
-        let checksum = digest(b"canonical");
-        let mut first = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
-        let mut stale = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
-        let annotation = vec![ReviewAnnotation {
-            parent_id: None,
-            kind: Default::default(),
-            reply: None,
-            anchor: None,
-            id: "comment".into(),
-            source: PlanAnnotationInput {
-                start_line: 1,
-                end_line: 2,
-                body: "literal ** text\n".into(),
-            },
-        }];
-        first.replace(annotation.clone()).unwrap();
-        first.replace(annotation.clone()).unwrap();
-        assert!(stale.replace(annotation.clone()).is_err());
-        let mut resumed = ReviewAnnotationStore::open(source.clone(), checksum).unwrap();
-        assert_eq!(resumed.annotation()[0].source.body, "literal ** text\n");
-        std::fs::write(source, b"changed").unwrap();
-        assert!(resumed.replace(Vec::new()).is_err());
-        assert_eq!(resumed.annotation().len(), 1);
-    }
-}
-
 pub(crate) fn resolve_annotations(
     rendered: &super::RenderedPlan,
     annotation_input: Vec<PlanAnnotationInput>,
@@ -388,4 +353,39 @@ pub(crate) fn resolve_annotations(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(annotation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotation_restart_preserves_text_and_rejects_concurrent_or_source_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("working.json");
+        std::fs::write(&source, b"canonical").unwrap();
+        let checksum = digest(b"canonical");
+        let mut first = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
+        let mut stale = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
+        let annotation = vec![ReviewAnnotation {
+            parent_id: None,
+            kind: Default::default(),
+            reply: None,
+            anchor: None,
+            id: "comment".into(),
+            source: PlanAnnotationInput {
+                start_line: 1,
+                end_line: 2,
+                body: "literal ** text\n".into(),
+            },
+        }];
+        first.replace(annotation.clone()).unwrap();
+        first.replace(annotation.clone()).unwrap();
+        assert!(stale.replace(annotation.clone()).is_err());
+        let mut resumed = ReviewAnnotationStore::open(source.clone(), checksum).unwrap();
+        assert_eq!(resumed.annotation()[0].source.body, "literal ** text\n");
+        std::fs::write(source, b"changed").unwrap();
+        assert!(resumed.replace(Vec::new()).is_err());
+        assert_eq!(resumed.annotation().len(), 1);
+    }
 }

@@ -437,9 +437,11 @@ impl HarnessBroker {
             .query_context(&self.provider_catalog_request()?)
             .await?;
         // ACP agents negotiate their model catalog per binding, so workspace discovery before
-        // the first binding is unsupported. The binding validates the inherited settings when
-        // it opens, so an unsupported workspace catalog leaves them unchanged.
+        // the first binding can be unsupported, and an agent without model selection advertises
+        // no catalog at all. The binding validates the inherited settings when it opens, so an
+        // unsupported or empty workspace catalog leaves them unchanged.
         let models = match self.provider.model_list(context).await {
+            Ok(models) if models.is_empty() => return Ok(()),
             Ok(models) => models,
             Err(crate::provider::ProviderError::Unsupported(_)) => return Ok(()),
             Err(error) => return Err(error.into()),

@@ -28,10 +28,10 @@ pub(crate) fn automatic_session_name(session_title: &str) -> String {
 mod cancellation_test;
 #[cfg(test)]
 mod change_results_test;
-#[cfg(test)]
-mod model_label_test;
 mod checkpoint_settlement;
 mod checks;
+#[cfg(test)]
+mod model_label_test;
 pub(crate) use checkpoint_settlement::FinalCheckpointCommit;
 mod compaction;
 mod configuration;

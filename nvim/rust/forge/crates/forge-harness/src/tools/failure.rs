@@ -55,6 +55,9 @@ struct ControlToolFailure<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     active_version: Option<u64>,
     violation: Vec<ControlToolViolation>,
+    /// Correction hint for each violation code, stated once instead of on every violation.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    code_hint: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry: Option<ControlToolRetry>,
 }
@@ -309,7 +312,7 @@ pub(crate) fn control_tool_failure_json(
     error: &(dyn Error + 'static),
     document: Option<&PlanDocument>,
 ) -> String {
-    let (phase, code, violation) = if let Some(argument_error) =
+    let (phase, code, mut violation) = if let Some(argument_error) =
         find_error::<ControlToolArgumentError>(error)
     {
         (
@@ -342,13 +345,26 @@ pub(crate) fn control_tool_failure_json(
     } else if let Some(validation_error) =
         find_error::<crate::declaration::DeclarationValidationError>(error)
     {
-        (failure_phase(invocation), "declaration_validation_failed".to_owned(), validation_error.diagnostic.iter().map(|diagnostic| ControlToolViolation {
-                path:format!("{}:{}:{}", diagnostic.path, diagnostic.line, diagnostic.column + 1),
-                code:"invalid_declaration_reference".into(),
-                message:format!("{}: {}", diagnostic.reference, diagnostic.reason),
-                expected_shape:None,
-                hint:Some("Patch the declaration or its import, then submit the current version again.".into()),
-            }).collect())
+        (
+            failure_phase(invocation),
+            "declaration_validation_failed".to_owned(),
+            validation_error
+                .diagnostic
+                .iter()
+                .map(|diagnostic| ControlToolViolation {
+                    path: format!(
+                        "{}:{}:{}",
+                        diagnostic.path,
+                        diagnostic.line,
+                        diagnostic.column + 1
+                    ),
+                    code: diagnostic.kind.code().into(),
+                    message: format!("{}: {}", diagnostic.reference, diagnostic.reason),
+                    expected_shape: None,
+                    hint: Some(diagnostic.kind.hint().into()),
+                })
+                .collect(),
+        )
     } else if let Some(question_error) = find_error::<crate::exchange::QuestionEventError>(error) {
         (
             failure_phase(invocation),
@@ -411,7 +427,9 @@ pub(crate) fn control_tool_failure_json(
         action: "correct_and_retry",
         expected_version: active_version,
     });
+    let code_hint = hoist_code_hints(&mut violation);
     let failure = ControlToolFailure {
+        code_hint,
         ok: false,
         tool: invocation.name.as_str(),
         phase,
@@ -435,6 +453,35 @@ pub(crate) fn control_tool_failure_json(
         })
         .to_string()
     })
+}
+
+/// Move hints shared by every violation of a code to one entry per code, so a rejection with many
+/// violations of one kind does not repeat the same correction text for each of them.
+fn hoist_code_hints(
+    violation: &mut [ControlToolViolation],
+) -> std::collections::BTreeMap<String, String> {
+    let mut code_hint = std::collections::BTreeMap::<String, Option<String>>::new();
+    for item in violation.iter() {
+        let Some(hint) = &item.hint else { continue };
+        code_hint
+            .entry(item.code.clone())
+            .and_modify(|shared| {
+                if shared.as_ref() != Some(hint) {
+                    *shared = None;
+                }
+            })
+            .or_insert_with(|| Some(hint.clone()));
+    }
+    let code_hint = code_hint
+        .into_iter()
+        .filter_map(|(code, hint)| hint.map(|hint| (code, hint)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for item in violation.iter_mut() {
+        if code_hint.contains_key(&item.code) {
+            item.hint = None;
+        }
+    }
+    code_hint
 }
 
 /// Locate a typed cause through tool and domain context wrappers.

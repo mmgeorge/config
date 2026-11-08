@@ -366,6 +366,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             collapsed_suffix: None,
             collapse_children: false,
             expand_children: false,
+            heading_marker: false,
         });
         block.metadata.node = Some(NodeState::new(
             identity,

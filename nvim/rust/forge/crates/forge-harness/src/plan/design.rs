@@ -107,6 +107,21 @@ impl DeclarationDesign {
         self.validated_revision(workspace).await
     }
 
+    /// Collect every rule the planning model must satisfy in authored declarations: comment
+    /// wording on this design, then documentation and incoming use on its formatted form,
+    /// whose positions match the shared reference index.
+    pub(super) fn authored_diagnostics(
+        &self,
+        formatted: &Self,
+        workspace: &Path,
+    ) -> Result<Vec<crate::declaration::DeclarationDiagnostic>> {
+        let index = super::references::PlanReferenceIndex::design(formatted, workspace)?;
+        let mut authored = super::comment_lint::diagnostics(self)?;
+        authored.extend(super::documentation::diagnostics(formatted, &index)?);
+        authored.extend(super::usage::diagnostics(formatted, &index, workspace)?);
+        Ok(authored)
+    }
+
     /// Validate a new target without replacing the immutable pre-execution baseline.
     pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<ValidatedDesign> {
         let mut design = self.formatted()?;
@@ -125,9 +140,9 @@ impl DeclarationDesign {
             );
         }
         design.check_configuration = Some(configuration);
-        super::comment_lint::validate(self)?;
-        super::usage::validate(&design, workspace)?;
-        super::calls::validate_behaviors(&design)?;
+        // Authored-rule diagnostics wait for the resolver so one rejection reports them with
+        // every reference failure instead of one rule family per submission.
+        let mut authored = self.authored_diagnostics(&design, workspace)?;
         let paths = design
             .proposed
             .keys()
@@ -152,8 +167,11 @@ impl DeclarationDesign {
         design.validate()?;
         let mut resolver =
             crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
+        authored.extend(super::calls::validate_behaviors(&design, &mut resolver)?);
         let report = resolver.validate(&design);
-        report.ensure_valid()?;
+        crate::declaration::DeclarationValidationError::ensure_empty(
+            report.diagnostic.iter().cloned().chain(authored).collect(),
+        )?;
         design.check_preview = crate::checks::preview_plan(workspace, &design).await?;
         design.check_preview_source = design.check_preview_fingerprint()?;
         Ok(ValidatedDesign { design, report })

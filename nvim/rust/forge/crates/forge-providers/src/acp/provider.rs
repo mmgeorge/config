@@ -3265,6 +3265,22 @@ fn with_operation(operation: ProviderOperation, error: ProviderError) -> Provide
     }
 }
 
+/// Return the compaction Claude reported as completed or failed after `/compact`.
+///
+/// A failed compaction leaves the conversation unchanged, so the binding stays usable. When
+/// Claude reports neither outcome, the conversation state is unknown and the binding is invalidated.
+fn settled_compaction(
+    latest: Option<forge_provider_api::Compaction>,
+) -> Option<forge_provider_api::Compaction> {
+    latest.filter(|compaction| {
+        matches!(
+            compaction.state,
+            forge_provider_api::CompactionState::Completed
+                | forge_provider_api::CompactionState::Failed
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3328,20 +3344,4 @@ mod tests {
             ));
         }
     }
-}
-
-/// Return the compaction Claude reported as completed or failed after `/compact`.
-///
-/// A failed compaction leaves the conversation unchanged, so the binding stays usable. When
-/// Claude reports neither outcome, the conversation state is unknown and the binding is invalidated.
-fn settled_compaction(
-    latest: Option<forge_provider_api::Compaction>,
-) -> Option<forge_provider_api::Compaction> {
-    latest.filter(|compaction| {
-        matches!(
-            compaction.state,
-            forge_provider_api::CompactionState::Completed
-                | forge_provider_api::CompactionState::Failed
-        )
-    })
 }
