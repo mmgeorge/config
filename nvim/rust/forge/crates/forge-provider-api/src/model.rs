@@ -183,8 +183,6 @@ pub struct ProviderIntegration {
     pub background_generation: bool,
     pub isolated_generation: bool,
     pub terminal_termination: bool,
-    pub runtime_setup: bool,
-    pub authentication: bool,
     pub native_agent_suppression: bool,
     pub mcp_runtime_status: bool,
     pub mcp_tool_catalog: bool,

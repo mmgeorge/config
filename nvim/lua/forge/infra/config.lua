@@ -20,6 +20,7 @@
 ---@field status_diff_viewport_overscan integer
 ---@field about_auto_generate boolean
 ---@field background_generation table<string, ForgeBackgroundSelection> Per-provider settings for Background generation.
+---@field background_provider? string Provider for Background generation until `/config` saves another; nil uses the registry default.
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .forge.json may override it
 ---@field harness ForgeHarnessConfig

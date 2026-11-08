@@ -70,9 +70,9 @@ Read or update persisted background-generation preferences.
 | `settings` | Optional preferences object, omitted/null means read | Complete preferences to persist. |
 | `expected_revision` | Optional unsigned integer | Required with `settings`, ignored for reads. Must match the shared settings revision. |
 
-A preferences object has two required fields: `auto_compaction: {enabled: boolean, threshold_tokens: integer}` and `models`, an object keyed by provider name. Each model value contains required nonblank `model`, optional/null `thinking`, and optional `service_tier`, defaulting to `"default"`. Thinking accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Service tier accepts `default`, `fast`, or `ultrafast`. Provider names must be nonblank and cannot be `gemini`. Unknown fields fail decoding. The auto-compaction policy validates its positive threshold.
+A preferences object has two required fields, `auto_compaction: {enabled: boolean, threshold_tokens: integer}` and `models`, an object keyed by provider name, and an optional `provider` naming the Background provider. `provider` is independent of any interactive chat and must name a registry provider that supports Background sessions; settings saved before the field existed decode without it. Each model value contains required nonblank `model`, optional/null `thinking`, and optional `service_tier`, defaulting to `"default"`. Thinking accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Service tier accepts `default`, `fast`, or `ultrafast`. Provider names must be nonblank and cannot be `gemini`. Unknown fields fail decoding. The auto-compaction policy validates its positive threshold.
 
-The result is `{revision, settings}`. Saved auto-compaction replaces the fallback policy, and saved model selections override matching default provider keys. An untouched store reports revision zero. Updates atomically save the provider preferences and advance the settings revision. No progress or asynchronous provider events accompany the response. This method performs local storage I/O and never contacts a provider or edits an interactive task. Invalid preferences and stale revisions leave the previous settings usable. After an unknown write outcome, read the current revision before deciding whether to update again.
+The result is `{revision, settings}`. Saved auto-compaction replaces the fallback policy, and saved model selections override matching default provider keys. `settings.provider` is always present: the saved provider, else the fallback's, else the registry default (Codex, or the first selectable provider that supports Background sessions). An unsupported saved provider fails the request instead of being reset. An untouched store reports revision zero. Updates atomically save the provider preferences and advance the settings revision. No progress or asynchronous provider events accompany the response. This method performs local storage I/O and never contacts a provider or edits an interactive task. Invalid preferences and stale revisions leave the previous settings usable. After an unknown write outcome, read the current revision before deciding whether to update again.
 
 An untouched store reads as follows; [the settings source](../../../rust/forge/src/runtime/commit_message/settings.rs) defines the defaults:
 
@@ -81,7 +81,7 @@ An untouched store reads as follows; [the settings source](../../../rust/forge/s
 ```
 
 ```json
-{"id":11,"result":{"revision":0,"settings":{"auto_compaction":{"enabled":true,"threshold_tokens":128000},"models":{"codex":{"model":"gpt-6-luna","thinking":"low","service_tier":"default"}}}}}
+{"id":11,"result":{"revision":0,"settings":{"auto_compaction":{"enabled":true,"threshold_tokens":128000},"provider":"codex","models":{"codex":{"model":"gpt-6-luna","thinking":"low","service_tier":"default"}}}}}
 ```
 
-An editor must discard an obsolete response when its settings owner has closed or switched providers. The revision guards writes, not delivery to a replacement view.
+An editor must discard an obsolete response when its settings owner has closed. The revision guards writes, not delivery to a replacement view.

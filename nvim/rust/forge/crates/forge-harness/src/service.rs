@@ -2048,52 +2048,6 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    let _setup_admission = if method == RuntimeMethod::SessionProviderAuthenticate {
-        let control = Arc::clone(&controller.coordinator.control)
-            .try_acquire_owned()
-            .context("Provider setup cannot run while cleanup is pending")?;
-        let execution = Arc::clone(&controller.coordinator.execution)
-            .try_acquire_owned()
-            .context("Finish active work before provider setup or authentication")?;
-        Some((control, execution))
-    } else {
-        None
-    };
-    if method == RuntimeMethod::SessionProviderSetup {
-        let result = controller
-            .provider_handle()
-            .inspect(forge_provider_api::catalog::WorkspaceContext {
-                workspace: controller.catalog_request.read().await.workspace.clone(),
-            })
-            .await?;
-        message_sink
-            .send_response(Response::success(request.id, result)?)
-            .await?;
-        return Ok(());
-    }
-    if method == RuntimeMethod::SessionProviderAuthenticate {
-        let method = request.params["method"]
-            .as_str()
-            .context("authentication method is required")?
-            .to_owned();
-        controller
-            .provider_handle()
-            .authenticate(
-                forge_provider_api::catalog::WorkspaceContext {
-                    workspace: controller.catalog_request.read().await.workspace.clone(),
-                },
-                method,
-            )
-            .await?;
-        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                json!({"authenticated":true}),
-            )?)
-            .await?;
-        return Ok(());
-    }
     if method == RuntimeMethod::SessionProviderCapabilitiesGet {
         let provider = controller.provider_handle();
         let manifest = tokio::time::timeout(

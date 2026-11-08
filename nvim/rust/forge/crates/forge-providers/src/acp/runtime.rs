@@ -1,21 +1,16 @@
 use super::AcpKind as ProviderKind;
 use anyhow::{Result, ensure};
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const MANAGED_CLAUDE_VERSION: &str = "0.99.1";
 const MANAGED_ANTIGRAVITY_VERSION: &str = "1.4.5";
 
-#[derive(Serialize)]
-/// Reports installation independently of authentication and provider session state.
+/// Reports the resolved adapter launch independently of provider session state.
 pub struct RuntimeStatus {
     pub available: bool,
-    pub managed: bool,
-    pub adapter_version: Option<String>,
     pub command: Vec<String>,
     pub environment: BTreeMap<String, String>,
-    #[serde(skip)]
     native_command: Option<Vec<String>>,
 }
 
@@ -149,8 +144,6 @@ impl AcpRuntime {
         {
             return RuntimeStatus {
                 available: true,
-                managed: true,
-                adapter_version: Some(self.managed_version().into()),
                 command,
                 environment,
                 native_command,
@@ -158,8 +151,6 @@ impl AcpRuntime {
         }
         RuntimeStatus {
             available: program.is_some(),
-            managed: false,
-            adapter_version: None,
             command,
             environment,
             native_command,

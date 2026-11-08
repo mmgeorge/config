@@ -1007,22 +1007,6 @@ Requires nonempty `text` and accepts attachment selections in [PromptDraft](runt
 
 The native coordinator also accepts `queued: true` for owned queued delivery and internal prompt-admission metadata. UI callers should use [session.input.apply](#sessioninputapply) for queued text, preserving message/document identity rather than constructing that internal metadata. Provider events and document updates can precede the terminal response. Attachment, ownership, admission, provider, and finalization errors remain explicit. A response failure is not evidence that no durable input or partial provider output exists.
 
-## `session.provider.authenticate`
-
-Run the chosen provider authentication method.
-
-- **Context:** Explicit existing session/provider.
-- **Input:** method identifying an offered authentication action.
-- **Result and effects:** Returns authentication completion status.
-- **Boundary:** Authentication can require external interaction and is admitted separately from active work.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `none`.
-
-### Contract
-
-Requires `method` (provider authentication method string). Returns `{ "authenticated": true }` after the selected provider's authentication flow completes. It uses this session's captured catalog request, may launch interactive/provider authentication work, and invalidates cached MCP discovery afterward. It requires idle execution and no pending cleanup, and rejects either condition before contacting the provider. Unsupported methods, cancellation, provider failures, and missing credentials are errors. It does not submit a user prompt or grant unrelated command permissions.
-
 ## `session.provider.capabilities.get`
 
 Read the selected provider's capability manifest.
@@ -1037,7 +1021,7 @@ Read the selected provider's capability manifest.
 
 ### Contract
 
-No parameter fields. Returns [CapabilityManifest](runtime-schemas.md#capabilitymanifest), containing backend identity/label, schema revision, optional provider version, runtime availability/reason, notices, and capability entries. Each capability reports support independently of current provider availability. Discovery has a 30-second service deadline and may contact the provider. It does not run a user prompt or emit request progress. Unsupported operations must remain visible as unsupported rather than being inferred from a missing menu item.
+No parameter fields. Returns [CapabilityManifest](runtime-schemas.md#capabilitymanifest), containing backend identity/label, schema revision, optional provider version, notices, and capability entries. Each capability reports support independently of current provider availability. Discovery has a 30-second service deadline and may contact the provider. It does not run a user prompt or emit request progress. Unsupported operations must remain visible as unsupported rather than being inferred from a missing menu item.
 
 ## `session.provider.mcp.list`
 
@@ -1053,7 +1037,7 @@ Read MCP configuration/capabilities in the selected provider context.
 
 ### Contract
 
-No parameter fields. Returns an array of [McpDefinition](runtime-schemas.md#mcpdefinition), including each server's normalized state and available tool metadata. The session caches discovery under an MCP revision, which setup/authentication and resource changes invalidate. Server configuration can appear before handshake completion. Disabled, loading, connected, authentication-required, failed, and unavailable states are distinct. It may contact the provider or its servers but does not invoke a tool, mutate configuration, or emit request progress. Apply the result only to the originating session/provider generation.
+No parameter fields. Returns an array of [McpDefinition](runtime-schemas.md#mcpdefinition), including each server's normalized state and available tool metadata. The session caches discovery under an MCP revision, which resource changes invalidate. Server configuration can appear before handshake completion. Disabled, loading, connected, authentication-required, failed, and unavailable states are distinct. It may contact the provider or its servers but does not invoke a tool, mutate configuration, or emit request progress. Apply the result only to the originating session/provider generation.
 
 ## `session.provider.mock_response`
 
@@ -1086,22 +1070,6 @@ List models available through the selected session's provider.
 ### Contract
 
 No parameter fields. Returns an array of [BackendModel](runtime-schemas.md#backendmodel), with provider-advertised reasoning/context controls and saved workspace preferences applied. Discovery may contact or launch the configured provider and has a 30-second service deadline. Resolving a default selection can emit session events before the response. No prompt or request-progress stream is produced. Catalog failure is explicit, not an empty-success fallback.
-
-## `session.provider.setup`
-
-Inspect the installed provider integration.
-
-- **Context:** Explicit existing session/provider.
-- **Input:** The explicit session/provider context.
-- **Result and effects:** Returns setup outcome.
-- **Boundary:** Provider inspection performs a handshake without installing software or creating a conversation.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `none`.
-
-### Contract
-
-Calls the selected provider's inspection operation and returns normalized `runtime.kind` (`available`, `missing`, `incompatible`, or `unavailable`), `origin` (`configured` or `managed`), independent `versions.provider` and `versions.adapter` observations, and `authentication` choices. Version observations are `known` with a version, `not_reported`, or `failed` with a normalized failure category. Authentication carries an opaque method ID, label, description, and either a provider-managed interaction or a terminal launch specification. Probe failure does not hide otherwise available authentication methods. It never installs software or sends model input. Because inspection changes no native state, it runs alongside active work and pending cleanup and leaves MCP discovery intact. Unsupported providers return typed errors; unavailable runtimes return their typed status.
 
 ## `session.provider.skill.list`
 

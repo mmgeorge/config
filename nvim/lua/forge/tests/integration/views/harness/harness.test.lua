@@ -20,7 +20,7 @@ local repository = git_repository.create({ path = workspace })
 repository.run({ "commit", "-q", "--allow-empty", "-m", "feat: initial" })
 vim.fn.writefile({ "local value = true" }, workspace .. "/example.lua")
 local client = host.start({ data = root, config = root, schedule_ensure = false }).client
-require("forge").setup({ harness = { provider = "mock" }, background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
+require("forge").setup({ harness = { provider = "mock" }, background_provider = "mock", background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local state = require("forge.session").harness
 local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
@@ -65,6 +65,39 @@ repository.run({ "switch", "-q", "-c", "feature" })
 local branch = call("repository.generation", params)
 assert(branch.session_id ~= first.session_id, "branch switch reused obsolete context")
 errors:assert_none()
+assert(host.stop(), "Host did not stop")
+end
+-- The Background provider is its own saved setting: a chat provider that cannot run Background
+-- sessions must not leak into Background settings or decide which provider generates.
+T["background_provider_independent"] = function()
+local root = temp.directory("background-provider")
+local workspace = root .. "/repository"
+local repository = git_repository.create({ path = workspace })
+repository.run({ "commit", "-q", "--allow-empty", "-m", "feat: initial" })
+vim.fn.writefile({ "local value = true" }, workspace .. "/example.lua")
+host.start({ data = root, config = root, schedule_ensure = false })
+require("forge").setup({ harness = { provider = "antigravity" }, background_provider = "mock",
+  background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
+vim.fn.chdir(workspace)
+local client = require("forge.client")
+local snapshot, failure, done
+require("forge.integrations.background_settings").request(nil, nil, function(value, error)
+  snapshot, failure, done = value, error, true
+end)
+wait_until(function() return done end, "Background settings did not settle", { timeout_ms = 4000 })
+assert(snapshot, "Background settings failed under an unsupported chat provider: " .. tostring(failure))
+assert(snapshot.settings.provider == "mock", vim.inspect(snapshot.settings))
+assert(snapshot.settings.models.antigravity == nil, "the chat provider leaked into Background settings")
+local selection = require("forge.integrations.background_settings").selection(snapshot)
+local generation = assert(client.generation_get_config(selection))
+assert(generation.provider.kind == "mock", "generation followed the chat provider")
+local result, generation_failure, generated
+client.request({ method = "repository.generation", params = { operation = "generate", workspace = workspace,
+  comparison = "head", generation = generation } }, function(value, error)
+  result, generation_failure, generated = value, error, true
+end)
+wait_until(function() return generated end, "Background generation did not settle", { timeout_ms = 4000 })
+assert(result and result.message and result.message ~= "", tostring(generation_failure))
 assert(host.stop(), "Host did not stop")
 end
 T["access_preferences"] = function()

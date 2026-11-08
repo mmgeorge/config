@@ -868,8 +868,6 @@ pub enum CapabilityId {
     FileDiff,
     BackgroundTermination,
     IsolatedGeneration,
-    RuntimeSetup,
-    Authentication,
     NativeAgentSuppression,
     SkillMutation,
     McpMutation,

@@ -164,17 +164,6 @@ impl Provider for StartupProvider {
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn inspect(
-        &self,
-        context: forge_provider_api::OperationContext,
-        _: forge_provider_api::catalog::WorkspaceContext,
-    ) -> std::result::Result<forge_provider_api::ProviderSetup, ProviderError> {
-        context.check_admission(ProviderOperation::Inspect)?;
-        Err(startup_failure(
-            ProviderOperation::Inspect,
-            ProviderFailureKind::Rejected,
-        ))
-    }
     async fn shutdown(
         &self,
         context: forge_provider_api::OperationContext,

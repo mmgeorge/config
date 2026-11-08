@@ -1237,42 +1237,6 @@ impl ProviderBridge {
         Ok(self.binding_for(&request).await?.provider_session_id)
     }
 
-    /// Inspect runtime discovery without changing a live binding.
-    pub async fn inspect(
-        &self,
-        context: forge_provider_api::WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        self.ensure_admission(ProviderOperation::Inspect)?;
-        self.native
-            .inspect(
-                OperationControl::fresh(ProviderOperation::Inspect)?.context(),
-                context,
-            )
-            .await
-    }
-
-    /// Authenticate only through an explicitly advertised method.
-    pub async fn authenticate(
-        &self,
-        context: forge_provider_api::WorkspaceContext,
-        method: String,
-    ) -> Result<(), ProviderError> {
-        self.ensure_admission(ProviderOperation::Authenticate)?;
-        let method = forge_provider_api::AuthenticationMethodId::new(method).map_err(|_| {
-            failure(
-                ProviderOperation::Authenticate,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        self.native
-            .authenticate(
-                OperationControl::fresh(ProviderOperation::Authenticate)?.context(),
-                context,
-                method,
-            )
-            .await
-    }
-
     /// Read negotiated owner state, using registry baseline before a binding exists.
     pub async fn capabilities(
         &self,

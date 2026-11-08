@@ -159,7 +159,7 @@ Register `function(event, update, generation)` for the supplied document identit
 
 ### `generation_get_config(selection)`
 
-Resolve backend launch data, model, reasoning effort, service tier, compaction preferences, and storage path without launching a provider. An explicit `selection` accepts `model`, optional `reasoning_effort`, optional `service_tier` (`default`, `fast`, or `ultrafast`), and optional `auto_compaction`. Omission uses configured background-generation preferences and the initiating UI's selected backend. Return values are `config` on success or `nil, failure` for an unknown backend or invalid model selection.
+Resolve backend launch data, model, reasoning effort, service tier, compaction preferences, and storage path without launching a provider. An explicit `selection` accepts optional `provider`, `model`, optional `reasoning_effort`, optional `service_tier` (`default`, `fast`, or `ultrafast`), and optional `auto_compaction`. Background consumers build it with `background_settings.selection(snapshot)`, which carries the saved Background provider. Omitting `provider` or the whole selection falls back to the initiating UI's selected backend and its configured background-generation preferences; only callers that need just the storage path rely on that fallback. Return values are `config` on success or `nil, failure` for an unknown backend or invalid model selection.
 
 ### `generation_request(params, callback, on_model, selection)`
 

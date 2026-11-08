@@ -1095,7 +1095,7 @@ T["navigation"] = function()
     }, capability = { model_selection = true, effort_selection = true, native_compact = true, os_sandbox = true } }
     local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
     local pending_response, pending_background
-    local preferences = { auto_compaction = { enabled = true, threshold_tokens = 128000 },
+    local preferences = { provider = "fixture_alpha", auto_compaction = { enabled = true, threshold_tokens = 128000 },
       models = { fixture_alpha = { model = "first", thinking = "low" } } }
     client.request = function(request, callback)
       if request.method == "host.trace.status" then callback({ enabled = false, path = vim.fn.tempname() })
@@ -1103,6 +1103,12 @@ T["navigation"] = function()
         { id = "first", reasoning = { "low", "high" }, default_reasoning = "low" },
         { id = "second", reasoning = { "low", "high" }, default_reasoning = "low" },
       })
+      elseif request.method == "session.agent.model.list" then
+        assert(request.params.provider == "fixture_alpha", "Background catalog ignored the saved provider")
+        callback({ capability = {}, models = {
+          { id = "first", reasoning = { "low", "high" }, default_reasoning = "low" },
+          { id = "second", reasoning = { "low", "high" }, default_reasoning = "low" },
+        } })
       elseif request.method == "session.configure" then
         state.ask_model = vim.deepcopy(request.params.ask_model)
         callback({ ask_model = state.ask_model })

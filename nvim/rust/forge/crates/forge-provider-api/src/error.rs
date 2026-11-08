@@ -24,10 +24,8 @@ pub enum ProviderOperation {
     InputReconcile,
     /// Retract an explicitly authorized exact cancelled input.
     InputRetract,
-    /// Discover installation and runtime support without mutation.
+    /// Read provider catalogs, versions, or baseline support without mutation.
     Inspect,
-    /// Execute explicitly selected credential setup.
-    Authenticate,
     /// Collect all provider-owned work and shared runtimes.
     Shutdown,
     /// Read normalized opaque model choices.
@@ -194,7 +192,17 @@ impl ProviderFailure {
 
 impl std::fmt::Display for ProviderFailure {
     /// Render a normalized failure classification for diagnostics.
+    ///
+    /// Forge has no sign-in flow of its own, so an authentication failure names the remedy:
+    /// the user signs in through the provider's own CLI.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind == ProviderFailureKind::Authentication {
+            return write!(
+                formatter,
+                "provider {:?} failed: the provider CLI is not signed in. Sign in with that CLI                  (for example, run `claude` and log in for Claude Code), then retry",
+                self.operation
+            );
+        }
         write!(
             formatter,
             "provider {:?} failed: {:?}",

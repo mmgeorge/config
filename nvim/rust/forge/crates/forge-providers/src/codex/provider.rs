@@ -8,7 +8,7 @@ use super::{
 use async_trait::async_trait;
 use forge_provider_api::{
     AdapterActivity, OperationContext, ProviderError, ProviderFailure, ProviderModel,
-    catalog::{McpQuery, QueryContext, WorkspaceContext},
+    catalog::{McpQuery, QueryContext},
     error::{ProviderFailureKind, ProviderOperation},
     events::{self, ProviderEventSink, ProviderEventStream},
     generation::ReasoningSelection,
@@ -40,7 +40,6 @@ pub struct CodexProvider {
     bindings: Arc<Mutex<HashMap<BindingId, Arc<CodexBinding>>>>,
     owners: Arc<Mutex<HashMap<forge_provider_api::ThreadId, BindingId>>>,
     catalog: Arc<Mutex<Option<CatalogConnection>>>,
-    catalog_version: Arc<Mutex<forge_provider_api::VersionObservation>>,
     discovery: Arc<Mutex<Vec<Arc<NativeRpc>>>>,
     shutdown_failure: Arc<Mutex<Option<ProviderError>>>,
     shutdown_lock: Arc<Mutex<()>>,
@@ -71,9 +70,6 @@ impl CodexProvider {
             bindings: Arc::new(Mutex::new(HashMap::new())),
             owners: Arc::new(Mutex::new(HashMap::new())),
             catalog: Arc::new(Mutex::new(None)),
-            catalog_version: Arc::new(Mutex::new(
-                forge_provider_api::VersionObservation::NotReported,
-            )),
             discovery: Arc::new(Mutex::new(Vec::new())),
             shutdown_failure: Arc::new(Mutex::new(None)),
             shutdown_lock: Arc::new(Mutex::new(())),
@@ -102,7 +98,6 @@ impl CodexProvider {
         if catalog.is_none() {
             let runtime = self.runtime.clone();
             let discovery = self.discovery.clone();
-            let version = self.catalog_version.clone();
             let command = self.command.clone();
             let native = super::operations::current();
             *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
@@ -120,7 +115,6 @@ impl CodexProvider {
                     let reported = initialized.get("userAgent").and_then(Value::as_str).and_then(|agent| agent.split_whitespace().next()).and_then(|product| product.split_once('/').map(|(_, version)| version));
                     let requirement = forge_provider_api::version::RuntimeRequirement::new(crate::registry::select("codex").expect("Codex is registered"), PathBuf::from(&command[0]), semver::Version::new(0, 164, 0));
                     requirement.validate(reported).map_err(ProviderError::from)?;
-                    *version.lock().await = reported.map_or(forge_provider_api::VersionObservation::NotReported, |version| forge_provider_api::VersionObservation::Known { version: version.to_owned() });
                     rpc.notify("initialized", Value::Null).await
                 }.await;
                     if let Err(primary) = initialized {
@@ -2053,69 +2047,6 @@ impl CodexProvider {
         combine_errors(errors)
     }
 
-    /// Inspect installation and native discovery without starting any conversation or login.
-    async fn inspect_runtime(
-        &self,
-        _workspace: WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        let executable = self
-            .command
-            .first()
-            .and_then(|program| forge_shell::process::executable(program));
-        let (runtime, version, capabilities) = if executable.is_none() {
-            (
-                forge_provider_api::RuntimeAvailability::Missing,
-                forge_provider_api::VersionObservation::NotReported,
-                codex_capabilities(),
-            )
-        } else {
-            match self.catalog_connection().await {
-                Ok(rpc) => {
-                    let version = self.catalog_version.lock().await.clone();
-                    let reported = match &version {
-                        forge_provider_api::VersionObservation::Known { version } => {
-                            Some(version.as_str())
-                        }
-                        forge_provider_api::VersionObservation::NotReported
-                        | forge_provider_api::VersionObservation::Failed { .. } => None,
-                    };
-                    match rpc
-                        .request(
-                            "getAuthStatus",
-                            json!({"includeToken":false,"refreshToken":false}),
-                            ProviderOperation::Inspect,
-                        )
-                        .await
-                    {
-                        Ok(status) => (
-                            forge_provider_api::RuntimeAvailability::Available,
-                            version.clone(),
-                            negotiated_capabilities(reported, Some(&status)),
-                        ),
-                        Err(error) => {
-                            let (runtime, observed) = inspection_failure(&error);
-                            (runtime, observed, negotiated_capabilities(reported, None))
-                        }
-                    }
-                }
-                Err(error) => {
-                    let (runtime, version) = inspection_failure(&error);
-                    (runtime, version, codex_capabilities())
-                }
-            }
-        };
-        Ok(forge_provider_api::ProviderSetup {
-            runtime,
-            origin: forge_provider_api::RuntimeOrigin::Configured,
-            versions: forge_provider_api::RuntimeVersions {
-                provider: version,
-                adapter: forge_provider_api::VersionObservation::NotReported,
-            },
-            authentication: Vec::new(),
-            capabilities,
-        })
-    }
-
     /// Revoke all binding callback admission before collecting jobs, exclusive runtimes, and shared discovery.
     async fn shutdown_native(&self) -> Result<(), ProviderError> {
         self.closed.store(true, Ordering::Release);
@@ -2403,7 +2334,6 @@ impl CodexProvider {
                     forge_provider_api::FailureDisposition::Uncertain,
                 ),
                 ProviderOperation::Inspect
-                | ProviderOperation::Authenticate
                 | ProviderOperation::InputReconcile
                 | ProviderOperation::ModelList
                 | ProviderOperation::SkillList
@@ -3133,73 +3063,6 @@ impl Provider for CodexProvider {
                             .map_err(|error| {
                                 operation_error(error, ProviderOperation::InputRetract)
                             })
-                    })
-                    .await
-                },
-                move |reason| cleanup_provider.operation_interruption(native, target, reason),
-            )
-            .await
-    }
-
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::Inspect);
-        let payload = workspace.clone();
-        let target = CleanupTarget::None;
-        let provider = self.clone();
-        let cleanup_provider = self.clone();
-        let worker_native = native.clone();
-        self.records
-            .inspect
-            .observe(
-                context,
-                ProviderOperation::Inspect,
-                payload,
-                async move {
-                    super::operations::scope(worker_native, async move {
-                        super::operations::check()?;
-                        provider
-                            .inspect_runtime(workspace)
-                            .await
-                            .map_err(|error| operation_error(error, ProviderOperation::Inspect))
-                    })
-                    .await
-                },
-                move |reason| cleanup_provider.operation_interruption(native, target, reason),
-            )
-            .await
-    }
-
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-        method: forge_provider_api::AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        let native =
-            super::operations::NativeContext::new(context.clone(), ProviderOperation::Authenticate);
-        let payload = (workspace.clone(), method.clone());
-        let target = CleanupTarget::None;
-        let cleanup_provider = self.clone();
-        let worker_native = native.clone();
-        self.records
-            .authenticate
-            .observe(
-                context,
-                ProviderOperation::Authenticate,
-                payload,
-                async move {
-                    super::operations::scope(worker_native, async move {
-                        super::operations::check()?;
-                        Err(forge_provider_api::capability::UnsupportedCapability(
-                            forge_provider_api::capability::ProviderFeature::Authentication,
-                        )
-                        .into())
-                        .map_err(|error| operation_error(error, ProviderOperation::Authenticate))
                     })
                     .await
                 },
@@ -3945,57 +3808,6 @@ struct PendingFork {
 enum CatalogConnection {
     Starting(tokio::task::JoinHandle<Result<Arc<NativeRpc>, ProviderError>>),
     Ready(Arc<NativeRpc>),
-}
-
-/// Preserve normalized version and runtime availability when discovery cannot open its native connection.
-fn inspection_failure(
-    error: &ProviderError,
-) -> (
-    forge_provider_api::RuntimeAvailability,
-    forge_provider_api::VersionObservation,
-) {
-    use forge_provider_api::version::{RuntimeProbeFailure, RuntimeVersionError};
-    use forge_provider_api::{RuntimeAvailability as Availability, VersionObservation as Version};
-    match error {
-        ProviderError::RuntimeVersion(RuntimeVersionError::Unsupported { detected, .. }) => (
-            Availability::Incompatible,
-            Version::Known {
-                version: detected.to_string(),
-            },
-        ),
-        ProviderError::RuntimeVersion(RuntimeVersionError::Missing { .. }) => {
-            (Availability::Incompatible, Version::NotReported)
-        }
-        ProviderError::RuntimeVersion(RuntimeVersionError::Malformed { .. }) => (
-            Availability::Incompatible,
-            Version::Failed {
-                failure: ProviderFailureKind::Protocol,
-            },
-        ),
-        ProviderError::RuntimeVersion(RuntimeVersionError::Probe { failure, .. }) => (
-            Availability::Unavailable,
-            Version::Failed {
-                failure: match failure {
-                    RuntimeProbeFailure::PermissionDenied => ProviderFailureKind::Authorization,
-                    RuntimeProbeFailure::Unavailable => ProviderFailureKind::Transport,
-                    RuntimeProbeFailure::TimedOut { .. } => ProviderFailureKind::Timeout,
-                },
-            },
-        ),
-        ProviderError::Combined { primary, .. } => inspection_failure(primary),
-        ProviderError::Failure(failure) => (
-            Availability::Unavailable,
-            Version::Failed {
-                failure: failure.kind(),
-            },
-        ),
-        _ => (
-            Availability::Unavailable,
-            Version::Failed {
-                failure: ProviderFailureKind::Unknown,
-            },
-        ),
-    }
 }
 
 /// Retain the first typed destructive-mutation failure and revoke every new binding admission.
@@ -6252,7 +6064,6 @@ fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderE
         (
             ProviderOperation::ThreadOpen
             | ProviderOperation::Inspect
-            | ProviderOperation::Authenticate
             | ProviderOperation::ModelList
             | ProviderOperation::SkillList
             | ProviderOperation::McpList

@@ -136,10 +136,13 @@ Forge reads their content. This applies to automatic drafts, staged regeneration
 generation, and pull-request descriptions, including untracked files and renamed LFS
 paths. LFS-only changes produce no generation request.
 
-Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
-default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
-provides a **Background model** section in **Models** for model, thinking, supported
-speed, automatic compaction, and token threshold choices. Choices persist across restarts. Gemini is not part
+Commit generation uses a persistent, tool-free **Background session** whose provider is
+chosen separately from the active chat, so a Claude Code chat can generate commits with
+Codex and the reverse. The Background provider defaults to Codex. Codex and Copilot default
+to `gpt-6-luna` with low thinking, and Claude Code defaults to `haiku` with low thinking.
+`/config` provides a **Background model** section in **Models** for provider, model,
+thinking, supported speed, automatic compaction, and token threshold choices. The model
+list follows the selected provider. Choices persist across restarts. Gemini is not part
 of this workflow. Other AI features retain their existing adapters.
 
 Background **Speed** is independent of Main and applies to subsequent Background
@@ -164,8 +167,11 @@ without changing the active chat or sending model input. Use **Tab** to expand r
 to select an earlier conversation, **c** for its compaction configuration, and **q** to close.
 Opening the command before any generation does not create a session.
 
+`background_provider` sets the Background provider until `/config` saves another choice.
+
 ```lua
 require("forge").setup({
+  background_provider = "codex",
   background_generation = {
     codex = { model = "gpt-6-luna", reasoning_effort = "low", service_tier = "fast" },
     copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
@@ -548,10 +554,14 @@ Enter activates a setting, Space also toggles booleans, and Left/Right cycle cho
 Press `?` for the full key help. A fixed two-line area describes the selected setting.
 Category and field selection survive resizing, updates, and returns from child editors.
 
-**Models** contains Main, Ask, and Background model sections. Main and Background
+**Models** contains Main, Ask, and Background model sections. Main and Background each
+start with a **Provider** field that decides which models the section lists. Activating
+Main's Provider switches the chat's provider by starting a new chat or resuming one, the
+same flow as `/provider`. Background's Provider cycles with Left/Right among providers that
+support Background sessions and leaves the chat unchanged. Main and Background
 include their own Compact toggle and threshold: 64k, 128k, 256k, or 512k. Once the provider
 reports the main model's context window, the Main threshold offers only values below it.
-Main and Ask list the current session's models. A Background settings failure
+Ask lists the current session's models. A Background settings failure
 disables only the Background rows.
 Ask serves Plan Review questions created with `A` and defaults to the main planning
 model. Turn on **Override** to select a separate model, thinking level, and speed.
@@ -607,8 +617,10 @@ step through `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m` to `60m`.
 The endpoints do not wrap.
 **System** contains Thoughts under Display and Logging under Debug.
 Use `/checks edit on/off` to control check-authoring permission.
-Unsupported controls explain their restriction, and provider setup and Windows
-sandbox options appear only where applicable.
+Unsupported controls explain their restriction, and Windows sandbox options appear
+only where applicable. Forge has no sign-in flow: sign in through each provider's own
+CLI, such as running `claude` and logging in. A signed-out provider reports that its CLI
+is not signed in.
 
 The model picker, configuration page, and winbar name each model by the
 provider's display name, such as `Opus 5.5`, when the provider publishes one.
@@ -807,9 +819,8 @@ the diff or requesting a description. Conflicts stop the workflow with "Merge
 conflicts. Resolve them before creating the PR." The check leaves your branch,
 index, and working files unchanged.
 
-PR descriptions use Harness with the same **Background model** and **Background thinking**
-settings in `/config` as commits. Codex and Copilot both default to `gpt-6-luna` with
-low thinking. PR descriptions and commits share one persistent, branch-aware Background
+PR descriptions use Harness with the same Background provider, model, thinking, and
+speed settings in `/config` as commits. PR descriptions and commits share one persistent, branch-aware Background
 session and its compaction policy. Each request supplies its own output instructions.
 Both appear in `:ForgeDebugBackgroundTimeline`. Provider failures stop PR creation and
 appear in a notification.

@@ -17,7 +17,7 @@ if vim.g.forge_commit_settings_phase then
     callback({ ok = true, path = executable })
     return function() end
   end }
-  require("forge").setup({ harness = { provider = "mock" },
+  require("forge").setup({ harness = { provider = "mock" }, background_provider = "mock",
     background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
   vim.fn.chdir(workspace)
   local client = require("forge.client")
@@ -43,6 +43,7 @@ if vim.g.forge_commit_settings_phase then
   settings.open(state, { window_list = { state.transcript_win, state.composer_win }, control_win = state.composer_win })
   wait_until(function() local model = option("background-model") return model and not model.disabled_reason end, "Background controls did not load", { timeout_ms = 4000, errors = errors })
   local expected = stage == "save" and "low" or "medium"
+  assert(option("background-provider").value == "Mock", vim.inspect(option("background-provider")))
   assert(option("background-model").value:find("mock-model", 1, true))
   assert(option("background-thinking").value:find(expected, 1, true), vim.inspect(option("background-thinking")))
   assert(option("background-speed").value == (stage == "save" and "default" or "fast"))
@@ -60,6 +61,7 @@ if vim.g.forge_commit_settings_phase then
   client.generation_request = function(_, callback, _, selection)
     local generation = assert(client.generation_get_config(selection))
     assert(generation.service_tier == "fast", "saved Background speed did not reach generation")
+    assert(generation.provider.kind == "mock", "saved Background provider did not reach generation")
     callback({ state = "ready", message = "test: use saved preferences" })
   end
   local generated

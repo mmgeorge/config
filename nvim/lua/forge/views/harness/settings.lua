@@ -19,6 +19,7 @@ local configuration_category_list = {
 }
 
 local configuration_field_description = {
+  ["main-provider"] = "Provider for this chat. Switching starts a new chat or resumes one from that provider.",
   ["main-model"] = "Used for chat, planning, and execution.",
   ["main-thinking"] = "How much reasoning the main model uses.",
   ["main-speed"] = "Service tier for main-model requests.",
@@ -26,6 +27,7 @@ local configuration_field_description = {
   ["ask-model"] = "Model used for Ask requests when Override is enabled.",
   ["ask-thinking"] = "How much reasoning the Ask model uses.",
   ["ask-speed"] = "Service tier for Ask requests.",
+  ["background-provider"] = "Provider for background requests such as commit messages, independent of this chat.",
   ["background-model"] = "Used for background requests.",
   ["background-thinking"] = "How much reasoning the background model uses.",
   ["background-speed"] = "Service tier for background-model requests.",
@@ -48,8 +50,6 @@ local configuration_field_description = {
   ["lsp-tools"] = "Allow the assistant to use language-server tools.",
   ["session-tools"] = "Allow the assistant to search and read session history.",
   ["status-thoughts"] = "Show model thoughts in the status display.",
-  ["provider"] = "Choose the provider used by this session.",
-  ["provider-setup"] = "Configure or sign in to this provider.",
   ["logging"] = "Record Harness trace events for debugging.",
 }
 
@@ -77,7 +77,6 @@ local function configuration_pages(row_list)
         previous.fields[#previous.fields + 1] = field
       else
         local label = field.label and field.label ~= "Enabled" and field.label or row.label
-        if field.id == "provider-setup" then label = "Provider setup" end
         field.label = nil
         page.option_list[#page.option_list + 1] = {
           id = field.id, section = row.section, label = label, fields = { field },
@@ -651,9 +650,7 @@ function M.open(state, host, resume_state)
               service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and active.service_tier or "default" },
               reopen)
           end })
-      elseif id == "provider-setup" then
-        require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
-      elseif id == "provider" then
+      elseif id == "main-provider" then
         require("forge.views.harness.controller").select_provider()
       elseif id:match("^main%-") then
         change_main(id, 1)
@@ -665,7 +662,7 @@ function M.open(state, host, resume_state)
       local policy = access.policy(active)
       local supported = access.supports_sandbox(active, state.capability)
       local background = commit and commit:fields() or {}
-      local background_fields = { background.model, background.thinking }
+      local background_fields = { background.provider, background.model, background.thinking }
       if background.speed then background_fields[#background_fields + 1] = background.speed end
       local capability = state.capability or {}
       ---@param id string
@@ -683,6 +680,7 @@ function M.open(state, host, resume_state)
       local catalog_disabled = not main_catalog.model_list and (main_catalog.failure or "Loading models") or nil
       local ask_disabled = not ask.model and "Enable Override to change Ask settings." or catalog_disabled
       local main = {
+        field("main-provider", "action", cli or "Unknown", "Provider"),
         field("main-model", "choice", active.model
           and require("forge.views.harness.model_options").label(main_catalog.model_list, active.model) or "Default", nil,
           not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
@@ -709,10 +707,6 @@ function M.open(state, host, resume_state)
         sandbox[#sandbox + 1] = field("isolation-mode", "choice", policy.isolation_mode or "default", "Isolation mode",
           nil, not supported or not policy.sandbox)
         sandbox[#sandbox].description = windows_description
-      end
-      local provider_configuration = {}
-      if capability.integration and (capability.integration.runtime_setup or capability.integration.authentication) then
-        provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Provider setup / sign in…", nil)
       end
       ---@param category string
       ---@param id string
@@ -787,10 +781,6 @@ function M.open(state, host, resume_state)
             row("system", "status-thoughts", "Display", "Thoughts", {
               field("status-thoughts", "toggle", active.status_thoughts == true, "Enabled"),
             }),
-            row("system", "provider", "Provider", "Connection", {
-              field("provider", "action", cli or "Unknown", nil),
-            }),
-            row("system", "provider-configuration", "Provider", "Configuration", provider_configuration),
             row("system", "logging", "Debug", "Logging", {
               field("logging", "toggle", status.enabled == true, "Enabled"),
             }),
@@ -831,8 +821,7 @@ function M.open(state, host, resume_state)
       session.activate_harness(previous)
     end
     commit = require("forge.views.harness.background_configuration").new({
-      provider = active.provider, session_id = session_id, host = host,
-      capability = function() return state.capability or {} end,
+      session_id = session_id, host = host,
       current = current,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
       reopen = reopen,

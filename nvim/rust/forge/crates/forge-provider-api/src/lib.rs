@@ -94,10 +94,6 @@ pub use completion::TurnMetrics;
 
 pub mod capability;
 pub mod provider;
-pub use provider::{
-    AuthenticationInteraction, AuthenticationMethod, AuthenticationMethodId,
-    AuthenticationMethodIdError, CompactionRequest, ProviderSetup, RuntimeAvailability,
-    RuntimeOrigin, RuntimeVersions, TerminalLaunch, VersionObservation,
-};
+pub use provider::CompactionRequest;
 
 pub use testing::TestMessageContent;

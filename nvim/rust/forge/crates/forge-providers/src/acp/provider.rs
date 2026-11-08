@@ -226,15 +226,6 @@ struct AcpOperations {
         (BindingId, forge_provider_api::InputRetractRequest),
         forge_provider_api::InputRetractOutcome,
     >,
-    inspect:
-        Store<forge_provider_api::catalog::WorkspaceContext, forge_provider_api::ProviderSetup>,
-    authenticate: Store<
-        (
-            forge_provider_api::catalog::WorkspaceContext,
-            forge_provider_api::provider::AuthenticationMethodId,
-        ),
-        (),
-    >,
     shutdown: Store<(), ()>,
     models:
         Store<forge_provider_api::catalog::QueryContext, Vec<forge_provider_api::ProviderModel>>,
@@ -265,8 +256,6 @@ impl AcpOperations {
             steer: Store::registered(identities.clone()),
             reconcile: Store::registered(identities.clone()),
             retract: Store::registered(identities.clone()),
-            inspect: Store::registered(identities.clone()),
-            authenticate: Store::registered(identities.clone()),
             shutdown: Store::registered(identities.clone()),
             models: Store::registered(identities.clone()),
             skills: Store::registered(identities.clone()),
@@ -313,12 +302,6 @@ impl AcpOperations {
             failures.push(error);
         }
         if let Err(error) = self.retract.join_all_except(id).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.inspect.join_all_except(id).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.authenticate.join_all_except(id).await {
             failures.push(error);
         }
         if let Err(error) = self.models.join_all_except(id).await {
@@ -602,11 +585,6 @@ impl AcpProvider {
             }
             Err(error) => Err(error),
         }
-    }
-
-    /// Get immutable registry metadata without native work.
-    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
-        crate::registry::descriptor(&self.kind.id()).expect("ACP kind is registered")
     }
 
     /// Get the exact retained binding generation without opening a replacement.
@@ -1527,260 +1505,6 @@ impl AcpProvider {
         })
     }
 
-    /// Inspect installation and authentication methods through a disposable native handshake.
-    async fn inspect_runtime(
-        &self,
-        context: OperationContext,
-        request: forge_provider_api::catalog::WorkspaceContext,
-        cleanup: super::connection::AcpCleanup,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        let status = self.runtime.status();
-        let provider_version = match status.provider_version(&context).await {
-            Ok(Some(version)) => forge_provider_api::VersionObservation::Known { version },
-            Ok(None) => forge_provider_api::VersionObservation::NotReported,
-            Err(ProviderError::Failure(error)) => forge_provider_api::VersionObservation::Failed {
-                failure: error.kind(),
-            },
-            Err(_) => forge_provider_api::VersionObservation::Failed {
-                failure: ProviderFailureKind::Unknown,
-            },
-        };
-        let origin = if status.managed {
-            forge_provider_api::RuntimeOrigin::Managed
-        } else {
-            forge_provider_api::RuntimeOrigin::Configured
-        };
-        let mut versions = forge_provider_api::RuntimeVersions {
-            provider: provider_version,
-            adapter: status.adapter_version.clone().map_or(
-                forge_provider_api::VersionObservation::NotReported,
-                |version| forge_provider_api::VersionObservation::Known { version },
-            ),
-        };
-        if !status.available {
-            return Ok(forge_provider_api::ProviderSetup {
-                runtime: forge_provider_api::RuntimeAvailability::Missing,
-                origin,
-                versions,
-                authentication: Vec::new(),
-                capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                    self.descriptor(),
-                ),
-            });
-        }
-        let initialized = match self
-            .initialize_handshake(&status, &request.workspace, &cleanup)
-            .await
-        {
-            Ok(initialized) => initialized,
-            Err(ProviderError::RuntimeVersion(error)) => {
-                versions.adapter = match error {
-                    forge_provider_api::version::RuntimeVersionError::Unsupported {
-                        detected,
-                        ..
-                    } => forge_provider_api::VersionObservation::Known {
-                        version: detected.to_string(),
-                    },
-                    forge_provider_api::version::RuntimeVersionError::Missing { .. } => {
-                        forge_provider_api::VersionObservation::NotReported
-                    }
-                    forge_provider_api::version::RuntimeVersionError::Malformed { .. } => {
-                        forge_provider_api::VersionObservation::Failed {
-                            failure: ProviderFailureKind::Protocol,
-                        }
-                    }
-                    forge_provider_api::version::RuntimeVersionError::Probe { .. } => {
-                        forge_provider_api::VersionObservation::Failed {
-                            failure: ProviderFailureKind::Initialization,
-                        }
-                    }
-                };
-                return Ok(forge_provider_api::ProviderSetup {
-                    runtime: forge_provider_api::RuntimeAvailability::Incompatible,
-                    origin,
-                    versions,
-                    authentication: Vec::new(),
-                    capabilities:
-                        forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                            self.descriptor(),
-                        ),
-                });
-            }
-            Err(_) => {
-                return Ok(forge_provider_api::ProviderSetup {
-                    runtime: forge_provider_api::RuntimeAvailability::Unavailable,
-                    origin,
-                    versions,
-                    authentication: Vec::new(),
-                    capabilities:
-                        forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                            self.descriptor(),
-                        ),
-                });
-            }
-        };
-        let authentication = initialized["authMethods"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|method| {
-                let id = forge_provider_api::provider::AuthenticationMethodId::new(
-                    method["id"].as_str()?,
-                )
-                .ok()?;
-                let terminal = method["type"] == "terminal";
-                let interaction = if terminal {
-                    let program = status.command.first().map(PathBuf::from)?;
-                    let arguments = status
-                        .command
-                        .iter()
-                        .skip(1)
-                        .cloned()
-                        .chain(
-                            method["args"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                        )
-                        .collect();
-                    forge_provider_api::provider::AuthenticationInteraction::Terminal {
-                        launch: forge_provider_api::provider::TerminalLaunch {
-                            program,
-                            arguments,
-                            environment: status.environment.clone(),
-                            working_directory: Some(PathBuf::from(&request.workspace)),
-                        },
-                    }
-                } else {
-                    forge_provider_api::provider::AuthenticationInteraction::ProviderManaged
-                };
-                Some(forge_provider_api::provider::AuthenticationMethod {
-                    id,
-                    label: method["name"].as_str().unwrap_or("Sign in").to_owned(),
-                    description: method["description"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    interaction,
-                })
-            })
-            .collect();
-        if let Some(version) = initialized
-            .pointer("/agentInfo/version")
-            .and_then(serde_json::Value::as_str)
-        {
-            versions.adapter = forge_provider_api::VersionObservation::Known {
-                version: version.to_owned(),
-            };
-        }
-        Ok(forge_provider_api::ProviderSetup {
-            runtime: forge_provider_api::RuntimeAvailability::Available,
-            origin,
-            versions,
-            authentication,
-            capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                self.descriptor(),
-            ),
-        })
-    }
-
-    /// Authenticate through an explicitly advertised provider-managed method.
-    async fn authenticate_runtime(
-        &self,
-        request: forge_provider_api::catalog::WorkspaceContext,
-        method: forge_provider_api::provider::AuthenticationMethodId,
-        cleanup: super::connection::AcpCleanup,
-    ) -> Result<(), ProviderError> {
-        let status = self.runtime.status();
-        if !status.available {
-            return Err(failure(
-                ProviderOperation::Authenticate,
-                ProviderFailureKind::Runtime,
-            ));
-        }
-        let profile =
-            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
-        let state = Arc::new(AcpSessionState::new_binding(
-            self.kind,
-            self.admission.clone(),
-        ));
-        let connection = super::AcpConnection::launch_retained(
-            super::AcpLaunch {
-                command: &status.command,
-                environment: &status.environment,
-                workspace: &request.workspace,
-                profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
-            },
-            state,
-            &cleanup,
-        )
-        .await
-        .map_err(|_| {
-            failure(
-                ProviderOperation::Authenticate,
-                ProviderFailureKind::Transport,
-            )
-        })?;
-        let result = async {
-            let initialized = connection
-                .request("initialize", initialize_params())
-                .await
-                .map_err(|_| {
-                    failure(
-                        ProviderOperation::Authenticate,
-                        ProviderFailureKind::Protocol,
-                    )
-                })?;
-            let selected = initialized["authMethods"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|candidate| candidate["id"].as_str() == Some(method.as_str()))
-                .ok_or_else(|| {
-                    failure(
-                        ProviderOperation::Authenticate,
-                        ProviderFailureKind::Rejected,
-                    )
-                })?;
-            if selected["type"] == "terminal" {
-                // Terminal authentication is owned by the normalized setup interaction;
-                // this provider operation must not launch or impersonate that action.
-                return Err(forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::TerminalAuthentication,
-                )
-                .into());
-            }
-            connection
-                .request(
-                    "authenticate",
-                    serde_json::json!({"methodId":method.as_str()}),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|_| {
-                    failure(
-                        ProviderOperation::Authenticate,
-                        ProviderFailureKind::Transport,
-                    )
-                })
-        }
-        .await;
-        let collected = cleanup
-            .shutdown()
-            .await
-            .map_err(|error| with_operation(ProviderOperation::Authenticate, error));
-        match (result, collected) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(cause), Ok(())) | (Ok(()), Err(cause)) => Err(cause),
-            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
-                cause: Box::new(cause),
-                cleanup: Box::new(cleanup),
-            }),
-        }
-    }
-
     /// Close every producer before joining retained native operations and pending opens.
     async fn shutdown_provider(&self, operation_id: OperationId) -> Result<(), ProviderError> {
         self.admission.store(false, Ordering::Release);
@@ -2210,69 +1934,6 @@ impl AcpProvider {
             }),
         }
     }
-
-    /// Inspect native initialization capabilities and always collect its temporary process.
-    async fn initialize_handshake(
-        &self,
-        runtime: &super::runtime::RuntimeStatus,
-        workspace: &str,
-        cleanup: &super::connection::AcpCleanup,
-    ) -> Result<serde_json::Value, ProviderError> {
-        let profile =
-            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
-        let connection = super::AcpConnection::launch_retained(
-            super::AcpLaunch {
-                command: &runtime.command,
-                environment: &runtime.environment,
-                workspace,
-                profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
-            },
-            Arc::new(AcpSessionState::new_binding(
-                self.kind,
-                self.admission.clone(),
-            )),
-            cleanup,
-        )
-        .await
-        .map_err(|_| {
-            failure(
-                ProviderOperation::ThreadOpen,
-                ProviderFailureKind::Transport,
-            )
-        })?;
-        let requirement = super::conversation::runtime_requirement(
-            self.kind,
-            runtime
-                .command
-                .first()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "ACP".into()),
-        )?;
-        let result = async {
-            let initialized = connection
-                .request("initialize", initialize_params())
-                .await
-                .map_err(|_| {
-                    failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
-                })?;
-            super::conversation::validate_initialization(&requirement, &initialized)?;
-            Ok(initialized)
-        }
-        .await;
-        let collected = cleanup
-            .shutdown()
-            .await
-            .map_err(|error| with_operation(ProviderOperation::Inspect, error));
-        match (result, collected) {
-            (Ok(initialized), Ok(())) => Ok(initialized),
-            (Err(cause), Ok(())) => Err(cause),
-            (Ok(_), Err(cleanup)) => Err(cleanup),
-            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
-                cause: Box::new(cause),
-                cleanup: Box::new(cleanup),
-            }),
-        }
-    }
 }
 
 #[async_trait]
@@ -2625,78 +2286,6 @@ impl forge_provider_api::provider::Provider for AcpProvider {
             .await
     }
 
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: forge_provider_api::catalog::WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        let provider = self.clone();
-        let worker_context = context.clone();
-        let payload = workspace.clone();
-        let cleanup = self.cleanup.scope();
-        let interrupt_cleanup = cleanup.clone();
-        self.operations
-            .inspect
-            .observe(
-                context,
-                ProviderOperation::Inspect,
-                payload,
-                async move {
-                    provider
-                        .inspect_runtime(worker_context, workspace, cleanup)
-                        .await
-                },
-                move |interruption| {
-                    interrupt_cleanup.close_admission();
-                    Interruption::new(
-                        interruption.failure(
-                            ProviderOperation::Inspect,
-                            ProviderPhase::Observation,
-                            FailureDisposition::Unchanged,
-                        ),
-                        async move { interrupt_cleanup.shutdown().await },
-                    )
-                },
-            )
-            .await
-    }
-
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: forge_provider_api::catalog::WorkspaceContext,
-        method: forge_provider_api::provider::AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        let provider = self.clone();
-        let payload = (workspace.clone(), method.clone());
-        let cleanup = self.cleanup.scope();
-        let interrupt_cleanup = cleanup.clone();
-        self.operations
-            .authenticate
-            .observe(
-                context,
-                ProviderOperation::Authenticate,
-                payload,
-                async move {
-                    provider
-                        .authenticate_runtime(workspace, method, cleanup)
-                        .await
-                },
-                move |interruption| {
-                    interrupt_cleanup.close_admission();
-                    Interruption::new(
-                        interruption.failure(
-                            ProviderOperation::Authenticate,
-                            ProviderPhase::Observation,
-                            FailureDisposition::Uncertain,
-                        ),
-                        async move { interrupt_cleanup.shutdown().await },
-                    )
-                },
-            )
-            .await
-    }
-
     async fn shutdown(&self, context: OperationContext) -> Result<(), ProviderError> {
         let provider = self.clone();
         let cleanup_provider = self.clone();
@@ -2883,7 +2472,7 @@ fn initialize_params() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion":1,
         "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-        "clientCapabilities":{"auth":{"terminal":true},"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}
+        "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}
     })
 }
 

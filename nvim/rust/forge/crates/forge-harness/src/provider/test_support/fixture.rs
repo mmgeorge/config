@@ -4,7 +4,7 @@ use crate::provider::{ScopeOwner, ThreadOwner};
 use forge_provider_api::retained_operation::{IdentityRegistry, Interruption, Store};
 use forge_provider_api::{
     capability::{CapabilityManifest, ProviderFeature, UnsupportedCapability},
-    catalog::{McpDefinition, McpQuery, QueryContext, WorkspaceContext},
+    catalog::{McpDefinition, McpQuery, QueryContext},
     events::{self, ProviderEventSink},
     provider::Provider,
     *,
@@ -63,8 +63,6 @@ struct FixtureOperations {
     steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
     reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
     retract: Store<(BindingId, InputRetractRequest), InputRetractOutcome>,
-    inspect: Store<WorkspaceContext, provider::ProviderSetup>,
-    authenticate: Store<(WorkspaceContext, AuthenticationMethodId), ()>,
     shutdown: Store<(), ()>,
     models: Store<QueryContext, Vec<ProviderModel>>,
     skills: Store<QueryContext, Vec<catalog::SkillDefinition>>,
@@ -89,8 +87,6 @@ impl Default for FixtureOperations {
             steer: Store::registered(identities.clone()),
             reconcile: Store::registered(identities.clone()),
             retract: Store::registered(identities.clone()),
-            inspect: Store::registered(identities.clone()),
-            authenticate: Store::registered(identities.clone()),
             shutdown: Store::registered(identities.clone()),
             models: Store::registered(identities.clone()),
             skills: Store::registered(identities.clone()),
@@ -113,8 +109,6 @@ impl FixtureOperations {
         self.steer.close_admission();
         self.reconcile.close_admission();
         self.retract.close_admission();
-        self.inspect.close_admission();
-        self.authenticate.close_admission();
         self.models.close_admission();
         self.skills.close_admission();
         self.mcp.close_admission();
@@ -135,8 +129,6 @@ impl FixtureOperations {
             self.steer.join_all().await,
             self.reconcile.join_all().await,
             self.retract.join_all().await,
-            self.inspect.join_all().await,
-            self.authenticate.join_all().await,
             self.models.join_all().await,
             self.skills.join_all().await,
             self.mcp.join_all().await,
@@ -1315,21 +1307,6 @@ impl EventFixtureProvider {
         })
     }
 
-    async fn inspect_inner(
-        &self,
-        context: OperationContext,
-        _workspace: WorkspaceContext,
-    ) -> Result<provider::ProviderSetup, ProviderError> {
-        context.check_admission(ProviderOperation::Inspect)?;
-        Ok(provider::ProviderSetup {
-            runtime: provider::RuntimeAvailability::Available,
-            origin: provider::RuntimeOrigin::Managed,
-            versions: provider::RuntimeVersions::default(),
-            authentication: Vec::new(),
-            capabilities: CapabilityManifest::from_descriptor(self.descriptor.clone()),
-        })
-    }
-
     async fn shutdown_inner(&self, context: OperationContext) -> Result<(), ProviderError> {
         self.closed.store(true, Ordering::Release);
         self.operations.close_admission();
@@ -1758,65 +1735,6 @@ impl Provider for EventFixtureProvider {
                             ProviderOperation::InputRetract,
                             ProviderPhase::Observation,
                             FailureDisposition::Uncertain,
-                        ),
-                        async { Ok(()) },
-                    )
-                },
-            )
-            .await
-    }
-
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-    ) -> Result<provider::ProviderSetup, ProviderError> {
-        let owner = self
-            .myself
-            .upgrade()
-            .expect("fixture operation starts through its live Arc owner");
-        let work_context = context.clone();
-        let payload = workspace.clone();
-        self.operations
-            .inspect
-            .observe(
-                context,
-                ProviderOperation::Inspect,
-                payload,
-                async move { owner.inspect_inner(work_context, workspace).await },
-                |reason| {
-                    Interruption::new(
-                        reason.failure(
-                            ProviderOperation::Inspect,
-                            ProviderPhase::Observation,
-                            FailureDisposition::Unchanged,
-                        ),
-                        async { Ok(()) },
-                    )
-                },
-            )
-            .await
-    }
-
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-        method: AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        self.operations
-            .authenticate
-            .observe(
-                context,
-                ProviderOperation::Authenticate,
-                (workspace, method),
-                async { Err(UnsupportedCapability(ProviderFeature::Authentication).into()) },
-                |reason| {
-                    Interruption::new(
-                        reason.failure(
-                            ProviderOperation::Authenticate,
-                            ProviderPhase::Admission,
-                            FailureDisposition::Unchanged,
                         ),
                         async { Ok(()) },
                     )

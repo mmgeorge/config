@@ -232,7 +232,6 @@ impl AcpHandler for IgnoreCallbacks {
 /// Port of the deterministic native-wire peer: one handler instance serves one connection.
 fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
     let mut held_prompt: Option<Value> = None;
-    let mut held_authentication: Option<Value> = None;
     Box::new(move |request| {
         let method = request["method"].as_str().unwrap_or_default();
         let mut outgoing = Vec::new();
@@ -250,15 +249,6 @@ fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
             && let Some(prompt_id) = held_prompt.take()
         {
             outgoing.push(json!({"id":prompt_id,"result":{"stopReason":"end_turn"}}));
-        }
-        if method == "authenticate" && mode == "held_auth" {
-            held_authentication = Some(request_id);
-            return outgoing;
-        }
-        if method == "fixture/release_auth"
-            && let Some(authentication_id) = held_authentication.take()
-        {
-            outgoing.push(json!({"id":authentication_id,"result":{}}));
         }
         if method == "initialize" {
             let session_capabilities = match mode.as_str() {
@@ -278,6 +268,13 @@ fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
                 "agentInfo":{"version":"99.0.0"},
                 "agentCapabilities":capabilities,
             });
+        }
+        if (method == "session/new" || method == "session/load") && mode == "auth_required" {
+            outgoing.push(json!({
+                "id":request_id,
+                "error":{"code":-32000,"message":"Authentication required"},
+            }));
+            return outgoing;
         }
         if method == "session/load" && mode == "load_applied_error" {
             outgoing.push(json!({
@@ -555,6 +552,42 @@ fn resume_request(fixture: &WireFixture, owner: &str) -> forge_provider_api::Ses
         system_instructions: String::new(),
         trace: Arc::new(IgnoreTrace),
     }
+}
+
+/// A login-required rejection at open stays an authentication failure, so the user is told to
+/// sign in through the provider CLI instead of seeing a generic startup failure.
+#[tokio::test]
+async fn login_required_open_reports_authentication() {
+    use forge_provider_api::provider::Provider;
+    let fixture = WireFixture::start("auth_required").await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+    let provider = super::provider::AcpProvider::new(
+        forge_provider_api::ProviderId::new("antigravity").unwrap(),
+        fixture.command.clone(),
+        fixture._directory.path().join("runtime"),
+    )
+    .unwrap();
+    let rejected = provider
+        .thread_open(
+            operation_context(),
+            resume_request(&fixture, "signed-out-owner"),
+        )
+        .await
+        .err()
+        .expect("a signed-out runtime cannot open a conversation");
+    let failure = match rejected {
+        ProviderError::Failure(failure) => failure,
+        ProviderError::PreparationCleanup { cause, .. } => match *cause {
+            ProviderError::Failure(failure) => failure,
+            other => panic!("unexpected open failure: {other:?}"),
+        },
+        other => panic!("unexpected open failure: {other:?}"),
+    };
+    assert_eq!(
+        failure.kind(),
+        forge_provider_api::ProviderFailureKind::Authentication
+    );
+    assert!(failure.to_string().contains("not signed in"));
 }
 
 /// Concurrent resumes cannot obtain two writable bindings for one native history.

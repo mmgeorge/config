@@ -8,35 +8,31 @@ local model_options = require("forge.views.harness.model_options")
 local threshold = require("forge.views.harness.compaction_threshold")
 
 ---@class ForgeBackgroundConfigurationOptions
----@field provider string
----@field session_id string
+---@field session_id string Root session that owns catalog requests for any Background provider.
 ---@field host table
----@field capability fun(): table
 ---@field current fun(): boolean
 ---@field changed fun()
 ---@field reopen fun()
 
+---@class ForgeBackgroundModelCatalog
+---@field models ForgeHarnessModel[]
+---@field capability {fast_mode?: boolean, ultrafast_mode?: boolean}
+
 ---@class ForgeBackgroundConfiguration
 ---@field options ForgeBackgroundConfigurationOptions
 ---@field snapshot? ForgeBackgroundSettings
----@field model_list? ForgeHarnessModel[]
+---@field catalog? ForgeBackgroundModelCatalog Model catalog of `catalog_key`, the provider it was read for.
 ---@field catalog_key? string
 ---@field pending boolean
 ---@field failure? string
 ---@field revision integer
----@field fields fun(self: ForgeBackgroundConfiguration): table<string, ForgePickerField>
----@field change fun(self: ForgeBackgroundConfiguration, id: string, direction: integer): boolean
----@field open fun(self: ForgeBackgroundConfiguration, id: string): boolean
----@field load_models fun(self: ForgeBackgroundConfiguration)
----@field model fun(self: ForgeBackgroundConfiguration): ForgeBackgroundModel?
----@field descriptor fun(self: ForgeBackgroundConfiguration): table?
----@field save fun(self: ForgeBackgroundConfiguration, preferences: ForgeBackgroundPreferences, back?: boolean)
----@field preferences fun(self: ForgeBackgroundConfiguration): ForgeBackgroundPreferences
----@field select_model fun(self: ForgeBackgroundConfiguration, model: string, thinking?: string, back?: boolean)
----@field speed_values fun(self: ForgeBackgroundConfiguration): string[]
 
-function BackgroundConfiguration:speed_values()
-  return model_options.speeds(self:descriptor(), self.options.capability())
+--- Report whether a provider can run tool-free Background sessions.
+---@param descriptor ForgeHarnessProviderConfig
+---@return boolean
+local function supports_background(descriptor)
+  return descriptor.background_generation ~= nil
+    or ((descriptor.capability or {}).integration or {}).background_generation == true
 end
 
 ---@param options ForgeBackgroundConfigurationOptions
@@ -53,43 +49,72 @@ function BackgroundConfiguration.new(options)
   return self
 end
 
-function BackgroundConfiguration:load_models()
-  if not self.snapshot then return end
-  local key = self.options.provider
-  if self.catalog_key == key then return end
-  self.catalog_key, self.model_list = key, nil
-  self.revision = self.revision + 1
-  local revision = self.revision
-  local function accept(models, failure)
-    if not self.options.current() or revision ~= self.revision then return end
-    if failure then
-      self.failure = failure
-      notifications.error(failure, "Background models")
-    else
-      self.failure, self.model_list = nil, models
-    end
-    self.options.changed()
-  end
-  client.request({ session_id = self.options.session_id, method = "session.provider.model.list", params = {} }, accept)
+---@return string?
+function BackgroundConfiguration:provider()
+  return self.snapshot and store.provider(self.snapshot)
 end
 
+--- Read the selected provider's catalog through the root session, which can list any provider.
+---@param on_loaded? fun(catalog: ForgeBackgroundModelCatalog)
+function BackgroundConfiguration:load_models(on_loaded)
+  local provider = self:provider()
+  if not provider then return end
+  if self.catalog_key == provider then
+    if on_loaded and self.catalog then on_loaded(self.catalog) end
+    return
+  end
+  self.catalog_key, self.catalog = provider, nil
+  self.revision = self.revision + 1
+  local revision = self.revision
+  client.request({ session_id = self.options.session_id, method = "session.agent.model.list", params = { provider = provider } },
+    function(catalog, failure)
+      if not self.options.current() or revision ~= self.revision then return end
+      if not failure and (type(catalog) ~= "table" or type(catalog.models) ~= "table") then
+        failure = "Invalid model catalog for " .. provider
+      end
+      if failure then
+        self.failure = failure
+        notifications.error(failure, "Background models")
+      else
+        self.failure, self.catalog = nil, catalog
+        if on_loaded then on_loaded(catalog) end
+      end
+      self.options.changed()
+    end)
+end
+
+---@return ForgeHarnessModel[]?
+function BackgroundConfiguration:model_list()
+  return self.catalog and self.catalog.models
+end
+
+---@return ForgeBackgroundModel?
 function BackgroundConfiguration:model()
-  if not self.snapshot then return end
-  return store.model(self.snapshot, self.options.provider)
+  local provider = self:provider()
+  return provider and self.snapshot.settings.models[provider] or nil
 end
 
 function BackgroundConfiguration:descriptor()
   local selected = self:model()
-  return model_options.find(self.model_list, selected and selected.model)
+  return model_options.find(self:model_list(), selected and selected.model)
+end
+
+---@return string[]
+function BackgroundConfiguration:speed_values()
+  return model_options.speeds(self:descriptor(), self.catalog and self.catalog.capability or {})
 end
 
 function BackgroundConfiguration:fields()
   local selected = self:model()
+  local provider = self:provider()
   local disabled = self.pending and "Saving Background settings" or not self.snapshot and (self.failure or "Loading Background settings") or nil
-  local catalog_disabled = disabled or not self.model_list and (self.failure or "Loading Background models") or nil
+  local catalog_disabled = disabled or not self.catalog and (self.failure or "Loading Background models") or nil
   local policy = self.snapshot and self.snapshot.settings.auto_compaction
   local fields = {
-    model = { id = "background-model", kind = "choice", value = selected and selected.model or "Loading…",
+    provider = { id = "background-provider", kind = "choice", label = "Provider",
+      value = provider and model_options.provider_label(provider) or "Loading…", disabled_reason = disabled },
+    model = { id = "background-model", kind = "choice",
+      value = selected and model_options.label(self:model_list(), selected.model) or (self.snapshot and "Choose a model" or "Loading…"),
       disabled_reason = catalog_disabled },
     thinking = { id = "background-thinking", kind = "choice", label = "Thinking", value = selected and selected.thinking or "Default",
       disabled_reason = catalog_disabled },
@@ -98,7 +123,7 @@ function BackgroundConfiguration:fields()
     threshold = { id = "background-threshold", kind = "choice", label = "Threshold", value = threshold.label(policy and policy.threshold_tokens or 128000),
       disabled_reason = disabled, muted = not (policy and policy.enabled) },
   }
-  local capability = self.options.capability()
+  local capability = self.catalog and self.catalog.capability or {}
   if #self:speed_values() > 1 or (capability.fast_mode or capability.ultrafast_mode)
     and selected and selected.service_tier and selected.service_tier ~= "default" then
     local tier = selected and selected.service_tier or "default"
@@ -109,6 +134,8 @@ function BackgroundConfiguration:fields()
   return fields
 end
 
+---@param preferences ForgeBackgroundPreferences
+---@param back? boolean
 function BackgroundConfiguration:save(preferences, back)
   if self.pending then return end
   self.pending = true
@@ -132,28 +159,72 @@ function BackgroundConfiguration:save(preferences, back)
   end)
 end
 
+---@return ForgeBackgroundPreferences
 function BackgroundConfiguration:preferences()
-  local preferences = vim.deepcopy(self.snapshot.settings)
+  return vim.deepcopy(self.snapshot.settings)
+end
+
+--- Save one model choice for `provider`, keeping only a speed the chosen model supports.
+---@param preferences ForgeBackgroundPreferences
+---@param provider string
+---@param catalog ForgeBackgroundModelCatalog
+---@param model string
+---@param thinking? string
+---@return ForgeBackgroundPreferences
+local function with_model(preferences, provider, catalog, model, thinking)
+  local choice = preferences.models[provider] or {}
+  preferences.models[provider] = choice
+  choice.model, choice.thinking = model, thinking
+  local speeds = model_options.speeds(model_options.find(catalog.models, model), catalog.capability or {})
+  if not vim.tbl_contains(speeds, choice.service_tier or "default") then choice.service_tier = "default" end
   return preferences
 end
 
+---@param model string
+---@param thinking? string
+---@param back? boolean
 function BackgroundConfiguration:select_model(model, thinking, back)
-  local preferences = self:preferences()
-  local key = self.options.provider
-  preferences.models[key] = preferences.models[key] or {}
-  preferences.models[key].model = model
-  preferences.models[key].thinking = thinking
-  local speeds = model_options.speeds(model_options.find(self.model_list, model), self.options.capability())
-  if not vim.tbl_contains(speeds, preferences.models[key].service_tier or "default") then
-    preferences.models[key].service_tier = "default"
-  end
-  self:save(preferences, back)
+  self:save(with_model(self:preferences(), self:provider(), self.catalog, model, thinking), back)
 end
 
+--- Switch the Background provider. A provider with a saved model keeps it; otherwise the
+--- catalog's default model is chosen before saving, so the host never stores a provider
+--- without a model to run.
+---@param direction integer
+function BackgroundConfiguration:change_provider(direction)
+  local current = self:provider()
+  local provider = model_options.cycle(model_options.providers(supports_background, current), current, direction)
+  if not provider or provider == current then return end
+  local preferences = self:preferences()
+  preferences.provider = provider
+  if preferences.models[provider] then self:save(preferences) return end
+  self.pending = true
+  self.options.changed()
+  client.request({ session_id = self.options.session_id, method = "session.agent.model.list", params = { provider = provider } },
+    function(catalog, failure)
+      if not self.options.current() then return end
+      self.pending = false
+      local model = not failure and type(catalog) == "table"
+        and (model_options.find(catalog.models, "default") or (catalog.models or {})[1]) or nil
+      if not model then
+        notifications.error(failure or ("No models available for " .. provider), "Background models")
+        self.options.changed()
+        return
+      end
+      self:save(with_model(preferences, provider, catalog, model.id, model.default_reasoning or (model.reasoning or {})[1]))
+    end)
+end
+
+---@param id string
+---@param direction integer
+---@return boolean handled
 function BackgroundConfiguration:change(id, direction)
   if not id:match("^background%-") then return false end
   if not self.snapshot or self.pending then return true end
-  if id == "background-compact" then
+  local model_list = self:model_list()
+  if id == "background-provider" then
+    self:change_provider(direction)
+  elseif id == "background-compact" then
     local preferences = self:preferences()
     preferences.auto_compaction.enabled = not preferences.auto_compaction.enabled
     self:save(preferences)
@@ -161,43 +232,46 @@ function BackgroundConfiguration:change(id, direction)
     local preferences = self:preferences()
     preferences.auto_compaction.threshold_tokens = threshold.change(preferences.auto_compaction.threshold_tokens, direction)
     self:save(preferences)
-  elseif id == "background-model" and self.model_list and #self.model_list > 0 then
-    local position = 1
-    for index, model in ipairs(self.model_list) do if model.id == self:model().model then position = index end end
-    local model = self.model_list[(position - 1 + direction) % #self.model_list + 1]
+  elseif id == "background-model" and model_list and #model_list > 0 then
+    local selected = self:model()
+    local ids = vim.tbl_map(function(model) return model.id end, model_list)
+    local model = model_options.find(model_list, model_options.cycle(ids, selected and selected.model, direction))
     self:select_model(model.id, model.default_reasoning or model.reasoning and model.reasoning[1])
   elseif id == "background-thinking" then
     local model = self:descriptor()
     local values = model and model.reasoning or {}
     if #values == 0 then return true end
-    local position = math.max(1, vim.fn.index(values, tostring(self:model().thinking)) + 1)
-    self:select_model(model.id, values[(position - 1 + direction) % #values + 1])
+    self:select_model(model.id, model_options.cycle(values, self:model().thinking, direction))
   elseif id == "background-speed" then
     local values = self:speed_values()
     if #values == 1 then return true end
     local preferences = self:preferences()
-    local choice = preferences.models[self.options.provider]
-    local position = math.max(1, vim.fn.index(values, choice.service_tier or "default") + 1)
-    choice.service_tier = values[(position - 1 + direction) % #values + 1]
+    local choice = preferences.models[self:provider()]
+    choice.service_tier = model_options.cycle(values, choice.service_tier or "default", direction)
     self:save(preferences)
   end
   return true
 end
 
+---@param id string
+---@return boolean handled
 function BackgroundConfiguration:open(id)
   if not id:match("^background%-") then return false end
   if not self.snapshot or self.pending then return true end
+  if id == "background-provider" then return self:change(id, 1) end
   if id == "background-model" then
-    if not self.model_list or #self.model_list == 0 then return true end
-    local models = vim.deepcopy(self.model_list)
+    local model_list = self:model_list()
+    if not model_list or #model_list == 0 then return true end
+    local selected = self:model()
+    local models = vim.deepcopy(model_list)
     for _, model in ipairs(models) do
       model.context_window = {}
-      if model.id == self:model().model then model.selected_reasoning = tostring(self:model().thinking) end
+      if selected and model.id == selected.model then model.selected_reasoning = tostring(selected.thinking) end
     end
     picker.close(false)
     require("forge.views.harness.model_picker").open({ host = self.options.host, model_list = models,
-      provider = self.options.provider,
-      current_model = self:model().model, is_current = self.options.current, on_close = self.options.reopen,
+      provider = self:provider(),
+      current_model = selected and selected.model, is_current = self.options.current, on_close = self.options.reopen,
       on_confirm = function(value)
         picker.close(false)
         self:select_model(value.model, value.effort, true)
@@ -217,16 +291,17 @@ function BackgroundConfiguration:open(id)
   end
   local options = {}
   local model = self:descriptor()
+  local selected = self:model()
   for _, value in ipairs(model and model.reasoning or {}) do options[#options + 1] = { id = value, label = value } end
   if #options == 0 then return true end
   local selected_index = 1
-  for index, option in ipairs(options) do if option.id == tostring(self:model().thinking) then selected_index = index end end
+  for index, option in ipairs(options) do if selected and option.id == tostring(selected.thinking) then selected_index = index end end
   picker.close(false)
   picker.open({ owner = "harness-" .. id, host = self.options.host,
     page_list = { { id = id, title = "Background thinking", option_list = options, selected_index = selected_index, footer = "Enter select  q back" } },
     on_close = self.options.reopen, on_confirm = function(result)
       picker.close(false)
-      self:select_model(self:model().model, result.option.id, true)
+      self:select_model(model.id, result.option.id, true)
     end })
   return true
 end

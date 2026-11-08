@@ -192,7 +192,10 @@ const REGISTRATIONS: &[RegistryEntry] = &[
         selectable: true,
         aliases: &[],
         command: &["claude-agent-acp"],
-        background_generation: None,
+        background_generation: Some(BackgroundGenerationDefaults {
+            model: "haiku",
+            reasoning_effort: "low",
+        }),
     },
     RegistryEntry {
         id: "antigravity",
@@ -381,8 +384,7 @@ fn capability(id: &str) -> ProviderCapability {
             let claude = id == "claude";
             ProviderCapability {
                 integration: ProviderIntegration {
-                    runtime_setup: true,
-                    authentication: true,
+                    background_generation: claude,
                     tracked_submission: true,
                     native_agent_suppression: claude,
                     resource_target: Some(

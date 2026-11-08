@@ -116,7 +116,6 @@ pub(crate) fn operation_timeout(operation: ProviderOperation) -> Option<Duration
         }
         ProviderOperation::ThreadOpen
         | ProviderOperation::ThreadConfigure
-        | ProviderOperation::Authenticate
         | ProviderOperation::Inspect
         | ProviderOperation::ModelList
         | ProviderOperation::SkillList
@@ -362,8 +361,7 @@ pub(super) async fn observe_owned<T>(
                 | ProviderOperation::ThreadFork
                 | ProviderOperation::ThreadCompact
                 | ProviderOperation::TurnInterrupt
-                | ProviderOperation::TerminalTerminate
-                | ProviderOperation::Authenticate => {
+                | ProviderOperation::TerminalTerminate => {
                     forge_provider_api::FailureDisposition::Uncertain
                 }
                 ProviderOperation::ThreadOpen

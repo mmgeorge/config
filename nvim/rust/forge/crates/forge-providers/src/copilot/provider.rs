@@ -3,7 +3,7 @@ use super::runtime::CopilotRuntime;
 use super::sessions::{CopilotSessions, PreparedSession, SessionReuse, SessionSelection};
 use super::turn::CopilotTurnEvent;
 use async_trait::async_trait;
-use forge_provider_api::catalog::{McpQuery, QueryContext, WorkspaceContext};
+use forge_provider_api::catalog::{McpQuery, QueryContext};
 use forge_provider_api::control::{ProviderTools, ToolCall};
 use forge_provider_api::events::{self, ProviderEventSink, ProviderEventStream};
 use forge_provider_api::generation::ReasoningSelection;
@@ -70,14 +70,6 @@ struct Operations {
         (BindingId, InputRetractRequest),
         InputRetractOutcome,
     >,
-    inspect: forge_provider_api::retained_operation::Store<
-        WorkspaceContext,
-        forge_provider_api::ProviderSetup,
-    >,
-    authenticate: forge_provider_api::retained_operation::Store<
-        (WorkspaceContext, forge_provider_api::AuthenticationMethodId),
-        (),
-    >,
     shutdown: forge_provider_api::retained_operation::Store<(), ()>,
     models: forge_provider_api::retained_operation::Store<
         QueryContext,
@@ -120,10 +112,6 @@ impl Operations {
                 identities.clone(),
             ),
             retract: forge_provider_api::retained_operation::Store::registered(identities.clone()),
-            inspect: forge_provider_api::retained_operation::Store::registered(identities.clone()),
-            authenticate: forge_provider_api::retained_operation::Store::registered(
-                identities.clone(),
-            ),
             shutdown: forge_provider_api::retained_operation::Store::registered(identities.clone()),
             models: forge_provider_api::retained_operation::Store::registered(identities.clone()),
             skills: forge_provider_api::retained_operation::Store::registered(identities.clone()),
@@ -172,12 +160,6 @@ impl Operations {
             failures.push(error);
         }
         if let Err(error) = self.retract.join_all_except(excluded).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.inspect.join_all_except(excluded).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.authenticate.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.models.join_all_except(excluded).await {
@@ -2081,50 +2063,6 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        let resource = InterruptedResource::Observe;
-        let payload = workspace.clone();
-        let provider = self.clone();
-        self.observe(
-            &self.operations.inspect,
-            context,
-            ProviderOperation::Inspect,
-            payload,
-            resource,
-            async move { provider.inspect_runtime(workspace).await },
-        )
-        .await
-    }
-
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-        method: forge_provider_api::AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        let resource = InterruptedResource::Observe;
-        let payload = (workspace.clone(), method.clone());
-
-        self.observe(
-            &self.operations.authenticate,
-            context,
-            ProviderOperation::Authenticate,
-            payload,
-            resource,
-            async move {
-                Err(forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::Authentication,
-                )
-                .into())
-            },
-        )
-        .await
-    }
-
     async fn shutdown(&self, context: OperationContext) -> Result<(), ProviderError> {
         let resource = InterruptedResource::RetainNative;
         let payload = ();
@@ -2304,7 +2242,6 @@ impl CopilotProvider {
                         | ProviderOperation::InputReconcile
                         | ProviderOperation::InputRetract
                         | ProviderOperation::Inspect
-                        | ProviderOperation::Authenticate
                         | ProviderOperation::ModelList
                         | ProviderOperation::SkillList
                         | ProviderOperation::McpList
@@ -2495,53 +2432,6 @@ impl CopilotProvider {
         Ok(SubmissionEvidence::Accepted {
             receipt: Some(recovered_receipt),
             provider_session_id: Some(provider_session_id),
-        })
-    }
-
-    async fn inspect_runtime(
-        &self,
-        context: WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        super::operation::check()?;
-        let result = self.runtime.client(&context.workspace).await;
-        let (runtime, version) = match &result {
-            Ok(_) => (
-                forge_provider_api::RuntimeAvailability::Available,
-                self.runtime.validated_version().await.map_or(
-                    forge_provider_api::VersionObservation::NotReported,
-                    |version| forge_provider_api::VersionObservation::Known { version },
-                ),
-            ),
-            Err(ProviderError::RuntimeVersion(
-                forge_provider_api::version::RuntimeVersionError::Unsupported { detected, .. },
-            )) => (
-                forge_provider_api::RuntimeAvailability::Incompatible,
-                forge_provider_api::VersionObservation::Known {
-                    version: detected.to_string(),
-                },
-            ),
-            Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::Runtime => (
-                forge_provider_api::RuntimeAvailability::Missing,
-                forge_provider_api::VersionObservation::NotReported,
-            ),
-            Err(error) => (
-                forge_provider_api::RuntimeAvailability::Unavailable,
-                forge_provider_api::VersionObservation::Failed {
-                    failure: super::error::trace_failure_kind(error),
-                },
-            ),
-        };
-        Ok(forge_provider_api::ProviderSetup {
-            runtime,
-            origin: forge_provider_api::RuntimeOrigin::Configured,
-            versions: forge_provider_api::RuntimeVersions {
-                provider: version,
-                adapter: forge_provider_api::VersionObservation::NotReported,
-            },
-            authentication: Vec::new(),
-            capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                self.descriptor(),
-            ),
         })
     }
 

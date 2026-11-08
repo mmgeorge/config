@@ -23,7 +23,7 @@ T["commit"] = function()
 
   local background_settings = require("forge.integrations.background_settings")
   background_settings.request = function(_, _, callback)
-    callback({ settings = { models = {
+    callback({ settings = { provider = "fixture_alpha", models = {
       fixture_alpha = { model = "fixture-model", thinking = "low" },
       fixture_beta = { model = "fixture-model", thinking = "low" },
     }, auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -155,7 +155,7 @@ T["commit_large_output"] = function()
   local original_execute = git_write.execute
   local background_settings = require("forge.integrations.background_settings")
   background_settings.request = function(_, _, callback)
-    callback({ settings = { models = {
+    callback({ settings = { provider = "fixture_alpha", models = {
       fixture_alpha = { model = "fixture-model", thinking = "low" },
       fixture_beta = { model = "fixture-model", thinking = "low" },
     }, auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -345,7 +345,7 @@ T["commit_scope"] = function()
   vim.fn.writefile({ "scope-unstaged" }, fixture .. "/tracked.txt")
   vim.fn.writefile({ "scope-untracked" }, fixture .. "/untracked.txt")
   vim.fn.writefile({ "scope-ignored" }, fixture .. "/ignored.txt")
-  require("forge.infra.config").setup({ harness = { provider = "mock" },
+  require("forge.infra.config").setup({ harness = { provider = "mock" }, background_provider = "mock",
     background_generation = { mock = { model = "mock-model", reasoning_effort = "low",
       auto_compaction = { enabled = false, threshold_tokens = 128000 } } } })
   local about = generate()

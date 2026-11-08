@@ -243,18 +243,6 @@ fn provider_row_text(id: CapabilityId) -> ProviderRowText {
                 "Generation must not append to the main provider conversation",
             )
         },
-        CapabilityId::RuntimeSetup => provider_row(
-            "Setup",
-            "Install supported provider runtime",
-            Forge,
-            "Uses provider-advertised setup and sign-in methods, preserving native credentials",
-        ),
-        CapabilityId::Authentication => provider_row(
-            "Setup",
-            "Sign in from Forge",
-            Forge,
-            "Uses provider-advertised setup and sign-in methods, preserving native credentials",
-        ),
         CapabilityId::NativeAgentSuppression => provider_row(
             "Provider",
             "Disable provider-native agent tools",

@@ -1,11 +1,11 @@
 use forge_provider_api::{
-    AuthenticationMethodId, BindingId, CancelRequest, CompactionRequest, CompactionResult,
-    ConfiguredSession, InputAcceptance, InputReconcileRequest, InputRetractOutcome,
-    InputRetractRequest, OpenedSession, OperationContext, OperationId, PromptRequestIdentity,
-    ProviderError, ProviderForkResult, ProviderModel, ProviderOperation, ProviderSetup,
-    SessionConfiguration, SessionForkRequest, SessionRequestIdentity, SteeringAcceptance,
-    SteeringRequestIdentity, SubmissionEvidence, TurnInterruptResult,
-    catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition, WorkspaceContext},
+    BindingId, CancelRequest, CompactionRequest, CompactionResult, ConfiguredSession,
+    InputAcceptance, InputReconcileRequest, InputRetractOutcome, InputRetractRequest,
+    OpenedSession, OperationContext, OperationId, PromptRequestIdentity, ProviderError,
+    ProviderForkResult, ProviderModel, ProviderOperation, SessionConfiguration, SessionForkRequest,
+    SessionRequestIdentity, SteeringAcceptance, SteeringRequestIdentity, SubmissionEvidence,
+    TurnInterruptResult,
+    catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition},
     retained_operation::{IdentityRegistry, Store},
     terminal::{TerminalId, TerminalInventory},
 };
@@ -41,10 +41,6 @@ pub(super) struct Records {
     pub(super) reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
     /// Retain authorized destructive history mutation dispositions.
     pub(super) retract: Store<(BindingId, InputRetractRequest), InputRetractOutcome>,
-    /// Retain normalized installation and credential discovery observations.
-    pub(super) inspect: Store<WorkspaceContext, ProviderSetup>,
-    /// Retain explicitly selected authentication method outcomes.
-    pub(super) authenticate: Store<(WorkspaceContext, AuthenticationMethodId), ()>,
     /// Retain provider-wide collection without joining peer shutdown jobs recursively.
     pub(super) shutdown: Store<(), ()>,
     /// Retain read-only opaque model choices.
@@ -74,8 +70,6 @@ impl Records {
             steer: Store::registered(registry.clone()),
             reconcile: Store::registered(registry.clone()),
             retract: Store::registered(registry.clone()),
-            inspect: Store::registered(registry.clone()),
-            authenticate: Store::registered(registry.clone()),
             shutdown: Store::registered(registry.clone()),
             models: Store::registered(registry.clone()),
             skills: Store::registered(registry.clone()),
@@ -91,23 +85,8 @@ impl Records {
         let mut failures = Vec::new();
         macro_rules! collect { ($($store:ident),*) => { $(if let Err(error) = self.$store.join_all_except(id).await { failures.push(error); })* }; }
         collect!(
-            open,
-            configure,
-            fork,
-            compact,
-            close,
-            cancel,
-            submit,
-            steer,
-            reconcile,
-            retract,
-            inspect,
-            authenticate,
-            models,
-            skills,
-            mcp,
-            terminals,
-            terminate
+            open, configure, fork, compact, close, cancel, submit, steer, reconcile, retract,
+            models, skills, mcp, terminals, terminate
         );
         match failures.split_first() {
             None => Ok(()),

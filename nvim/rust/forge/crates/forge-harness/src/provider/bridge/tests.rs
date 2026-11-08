@@ -423,18 +423,6 @@ impl NativeProvider for BridgeFixtureProvider {
         ))
     }
 
-    async fn inspect(
-        &self,
-        operation: forge_provider_api::OperationContext,
-        _: forge_provider_api::WorkspaceContext,
-    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
-        operation.check_admission(ProviderOperation::Inspect)?;
-        Err(provider_failure(
-            ProviderOperation::Inspect,
-            ProviderFailureKind::Runtime,
-        ))
-    }
-
     async fn shutdown(
         &self,
         operation: forge_provider_api::OperationContext,

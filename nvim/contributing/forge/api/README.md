@@ -131,12 +131,10 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.preview` | [session](session.md#sessionpreview) | Required explicit session ID |
 | `session.prompt.history.record` | [session](session.md#sessionprompthistoryrecord) | Required explicit session ID |
 | `session.prompt.submit` | [session](session.md#sessionpromptsubmit) | Required explicit session ID |
-| `session.provider.authenticate` | [session](session.md#sessionproviderauthenticate) | Required explicit session ID |
 | `session.provider.capabilities.get` | [session](session.md#sessionprovidercapabilitiesget) | Required explicit session ID |
 | `session.provider.mcp.list` | [session](session.md#sessionprovidermcplist) | Required explicit session ID |
 | `session.provider.mock_response` | [session](session.md#sessionprovidermock_response) | Required explicit session ID |
 | `session.provider.model.list` | [session](session.md#sessionprovidermodellist) | Required explicit session ID |
-| `session.provider.setup` | [session](session.md#sessionprovidersetup) | Required explicit session ID |
 | `session.provider.skill.list` | [session](session.md#sessionproviderskilllist) | Required explicit session ID |
 | `session.question.answer` | [session](session.md#sessionquestionanswer) | Required explicit session ID |
 | `session.question.continue` | [session](session.md#sessionquestioncontinue) | Required explicit session ID |

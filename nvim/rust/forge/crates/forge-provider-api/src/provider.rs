@@ -1,11 +1,10 @@
 //! Provider-neutral operations implemented by native provider owners.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     capability::{ProviderFeature, UnsupportedCapability},
-    catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition, WorkspaceContext},
+    catalog::{McpDefinition, McpQuery, QueryContext, SkillDefinition},
     terminal::{TerminalId, TerminalInventory},
     *,
 };
@@ -34,7 +33,7 @@ use crate::{
 /// Native settlement does not await Harness-owned exchange jobs. Background terminals have
 /// separate binding ownership until explicit termination or full close.
 ///
-/// Fresh open, submit, cancel, automatic settlement, close, shutdown, and inspect are core
+/// Fresh open, submit, cancel, automatic settlement, close, and shutdown are core
 /// obligations. Optional operations or modes may reject as unsupported before mutation.
 /// Resume, isolated text, configuration changes, fork, compact, steering, and retraction
 /// require their full advertised contracts. Exact no-op configuration may succeed without
@@ -183,30 +182,6 @@ pub trait Provider: Send + Sync + 'static {
         Err(UnsupportedCapability(ProviderFeature::NativeTurnRollback).into())
     }
 
-    /// Read installation, versions, advertised authentication methods, and discoverable runtime support.
-    /// Do not log in, change credentials, configure an existing binding, or start model execution.
-    /// Runtime discovery is independent of capabilities negotiated for a particular live binding.
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-    ) -> Result<ProviderSetup, ProviderError>;
-
-    /// Execute one explicitly selected advertised method in the supplied workspace/runtime context.
-    /// Credential changes may require interaction. Invalidate stale discovery and inspect again;
-    /// do not replace live binding capabilities with unnegotiated discovery flags. Unsupported
-    /// methods reject before credential mutation or launching an interaction.
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-        method: AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        context.check_admission(ProviderOperation::Authenticate)?;
-        let _ = (workspace, method);
-        Err(UnsupportedCapability(ProviderFeature::Authentication).into())
-    }
-
     /// Close provider admission and collect every binding, pending open, utility operation, and shared runtime.
     /// Use the same binding-close semantics, including temporary-history removal and independent
     /// phase attempts. Success requires actual native/resource collection, not merely joined wrapper
@@ -277,179 +252,6 @@ pub trait Provider: Send + Sync + 'static {
         context.check_admission(ProviderOperation::TerminalTerminate)?;
         let _ = (binding, terminal);
         Err(UnsupportedCapability(ProviderFeature::BackgroundTermination).into())
-    }
-}
-
-/// Identify a provider-issued authentication method advertised by runtime inspection.
-/// Hosts round-trip this opaque value with the matching workspace/runtime selection. A later
-/// inspection may invalidate stale choices; constructing a token does not authorize login.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct AuthenticationMethodId(String);
-
-impl AuthenticationMethodId {
-    /// Create an opaque nonempty method identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, AuthenticationMethodIdError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(AuthenticationMethodIdError);
-        }
-        Ok(Self(value))
-    }
-
-    /// Get the opaque method identity for round-tripping to its owning provider.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for AuthenticationMethodId {
-    type Error = AuthenticationMethodIdError;
-
-    /// Validate deserialized authentication identities through the constructor.
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<AuthenticationMethodId> for String {
-    /// Encode the opaque method identity for host transport.
-    fn from(value: AuthenticationMethodId) -> Self {
-        value.0
-    }
-}
-
-/// Reject an empty authentication method identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AuthenticationMethodIdError;
-
-impl std::fmt::Display for AuthenticationMethodIdError {
-    /// Describe the invalid authentication identity at the boundary.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("authentication method identity is empty")
-    }
-}
-
-impl std::error::Error for AuthenticationMethodIdError {}
-
-/// Own one read-only installation and discovery snapshot.
-/// Authentication methods are advertisements, not permission to execute them. Runtime support
-/// remains distinct from the effective capabilities returned by an opened binding.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderSetup {
-    /// Report whether a compatible runtime is installed and available.
-    pub runtime: RuntimeAvailability,
-    /// Identify how the inspected runtime was selected.
-    pub origin: RuntimeOrigin,
-    /// Report executable and adapter versions independently of runtime readiness.
-    pub versions: RuntimeVersions,
-    /// Advertise supported authentication methods.
-    pub authentication: Vec<AuthenticationMethod>,
-    /// Discoverable baseline support; this is not negotiated live-binding state.
-    pub capabilities: crate::capability::CapabilityManifest,
-}
-
-/// Report whether the selected provider runtime can be used.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RuntimeAvailability {
-    /// A compatible selected runtime installation was positively found.
-    Available,
-    /// No selected runtime installation was found.
-    Missing,
-    /// The installed runtime does not meet the adapter's protocol/version requirements.
-    Incompatible,
-    /// Inspection could not establish a usable runtime for a reason other than absence or compatibility.
-    Unavailable,
-}
-
-/// Distinguish an explicitly configured runtime from a retained managed installation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeOrigin {
-    /// The host explicitly supplied the selected executable or adapter command.
-    Configured,
-    /// The integration selected its retained managed installation.
-    Managed,
-}
-
-/// Preserve independently observed runtime components without exposing probe output.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct RuntimeVersions {
-    /// Installed model-provider executable, when the adapter can inspect it.
-    pub provider: VersionObservation,
-    /// Separately installed protocol adapter, when one is required.
-    pub adapter: VersionObservation,
-}
-
-/// Describe a version probe without carrying native error text or process output.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VersionObservation {
-    /// A normalized installed component version was positively observed.
-    Known {
-        /// Provider-issued version text for display; callers do not parse protocol behavior from it.
-        version: String,
-    },
-    /// The component does not expose an independently discoverable version.
-    #[default]
-    NotReported,
-    /// Version inspection failed without exposing native process output.
-    Failed {
-        /// Normalized cause of the failed probe.
-        failure: crate::ProviderFailureKind,
-    },
-}
-
-/// Describe one opaque authentication method to a setup caller.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AuthenticationMethod {
-    /// Opaque method identity passed back to `authenticate`.
-    pub id: AuthenticationMethodId,
-    /// User-facing method label.
-    pub label: String,
-    /// User-facing explanation of the interaction.
-    pub description: String,
-    /// Identify whether setup opens a terminal or delegates interaction to the provider.
-    pub interaction: AuthenticationInteraction,
-}
-
-/// Identify the normalized authentication interaction surface.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AuthenticationInteraction {
-    /// The adapter owns any interaction required by the explicitly selected method.
-    ProviderManaged,
-    /// The host presents an adapter-authored terminal action after explicit authentication selection.
-    Terminal {
-        /// Credential-bearing launch values for the selected interaction; never a command to parse.
-        launch: TerminalLaunch,
-    },
-}
-
-/// Carry an opaque native launch specification for a terminal authentication action.
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TerminalLaunch {
-    /// Select the executable already resolved by the owning provider.
-    pub program: std::path::PathBuf,
-    /// Preserve provider-authored arguments without asking the host to parse them.
-    pub arguments: Vec<String>,
-    /// Carry ephemeral environment values needed for the selected interaction.
-    pub environment: std::collections::BTreeMap<String, String>,
-    /// Run the command in the workspace selected for setup.
-    pub working_directory: Option<std::path::PathBuf>,
-}
-
-impl std::fmt::Debug for TerminalLaunch {
-    /// Hide ephemeral authentication arguments and environment values from diagnostics.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TerminalLaunch")
-            .field("program", &self.program)
-            .field("arguments", &"[redacted]")
-            .field("environment", &self.environment.keys().collect::<Vec<_>>())
-            .field("working_directory", &self.working_directory)
-            .finish()
     }
 }
 

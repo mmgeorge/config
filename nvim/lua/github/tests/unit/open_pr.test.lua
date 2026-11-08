@@ -127,10 +127,10 @@ T["open_pr"] = function()
   })
   package.loaded["ai"] = { generate = function() error("PR generation bypassed Harness") end }
   package.loaded["forge.integrations.background_settings"] = {
-    request = function(_, _, callback) callback({ settings = {} }) end,
-    model = function(_, provider)
-      eq(provider, "fixture_beta", { fail_reason = "PR generation lost the selected provider" })
-      return { model = "test-background-model", thinking = "low" }
+    request = function(_, _, callback) callback({ settings = { provider = "fixture_gamma" } }) end,
+    selection = function(snapshot)
+      return { provider = snapshot.settings.provider, model = "test-background-model", reasoning_effort = "low" },
+        { model = "test-background-model", thinking = "low" }
     end,
   }
   vim.notify = function(message) notices[#notices + 1] = tostring(message) end
@@ -145,6 +145,7 @@ T["open_pr"] = function()
         assert(params.workspace == root and params.comparison == "pull_request", "PR generation lost workspace")
         assert(params.head == captured_head, "PR generation lost its captured HEAD")
         assert(params.generation ~= nil and params.generation.reasoning_effort == "low", "PR generation lost Harness configuration")
+        eq(params.generation.provider.kind, "fixture_gamma", { fail_reason = "PR generation ignored the saved Background provider" })
         generated_model = params.generation.model
         generated_prompt = params.input
         if generation_failure then callback(nil, generation_failure) return end

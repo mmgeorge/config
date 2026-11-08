@@ -19,20 +19,11 @@ Selection.__index = Selection
 
 local function provider_choices()
   local result = { "inherit" }
-  local provider_ids = {}
-  for provider, descriptor in pairs(client.provider_map()) do
-    if descriptor.selectable ~= false then provider_ids[#provider_ids + 1] = provider end
-  end
-  table.sort(provider_ids)
-  for _, provider in ipairs(provider_ids) do result[#result + 1] = provider end
+  vim.list_extend(result, model_options.providers())
   return result
 end
 
-local function cycle(values, value, direction)
-  local position = direction > 0 and 0 or 1
-  for index, candidate in ipairs(values) do if candidate == value then position = index break end end
-  return values[(position - 1 + direction) % #values + 1]
-end
+local cycle = model_options.cycle
 
 ---@param catalog ForgeSubagentModelCatalog
 ---@param value string

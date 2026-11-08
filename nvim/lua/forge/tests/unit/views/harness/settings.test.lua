@@ -39,11 +39,16 @@ T["settings"] = function()
     plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
   }
   local commit_settings = require("forge.integrations.background_settings")
-  commit_settings.request = function(_, _, callback)
-    callback({ revision = 0,
-      settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { fixture_alpha = { model = "mock-model", thinking = "low" },
-        fixture_beta = { model = "mock-model", thinking = "low" },
-        fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } } })
+  local background_preferences = { provider = "fixture_alpha", auto_compaction = { enabled = true, threshold_tokens = 128000 },
+    models = { fixture_alpha = { model = "mock-model", thinking = "low" },
+      fixture_beta = { model = "mock-model", thinking = "low" },
+      fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } }
+  local background_revision = 0
+  commit_settings.request = function(_, preferences, callback)
+    if preferences then
+      background_preferences, background_revision = vim.deepcopy(preferences), background_revision + 1
+    end
+    callback({ revision = background_revision, settings = vim.deepcopy(background_preferences) })
   end
   client.request = function(request_specification, callback)
     local session_id = request_specification.session_id
@@ -54,7 +59,14 @@ T["settings"] = function()
     assert(context == "required" and session_id == "settings-session"
       or context ~= "required" and (session_id == nil or session_id == "settings-session"))
     assert(method == "host.trace.status" or method == "host.trace.configure" or method == "session.trace.clear"
-      or method == "session.configure" or method == "session.provider.model.list" or method == "session.check.editing.set")
+      or method == "session.configure" or method == "session.provider.model.list" or method == "session.check.editing.set"
+      or method == "session.agent.model.list")
+    if method == "session.agent.model.list" then
+      callback({ capability = { fast_mode = true }, models = {
+        { id = "mock-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast" } },
+      } })
+      return
+    end
     if method == "session.provider.model.list" then
       callback({
         { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium", service_tiers = { "fast", "ultrafast" } },
@@ -419,8 +431,18 @@ T["settings"] = function()
   eq(find("writable-directories").section, "Access")
   eq(find("sandbox").section, "Sandbox")
   if vim.fn.has("win32") == 1 then assert(find("isolation-mode").section == "Sandbox") end
-  key("provider", "<Left>")
+  key("main-provider", "<Left>")
   assert(picker.is_open("harness-config"), "Left opened an action")
+  eq(find("main-provider").section, "Main model")
+  assert(not pcall(find, "provider") and not pcall(find, "provider-setup"), "System kept provider rows")
+  local system_rows = vim.tbl_map(function(row) return row.id end, picker._state_for_test().spec.page_list[5].option_list)
+  eq(system_rows, { "status-thoughts", "logging" })
+  -- The Background provider is a saved preference of its own; changing it leaves the chat alone.
+  eq(find("background-provider").section, "Background model")
+  key("background-provider", "<Right>")
+  eq(background_preferences.provider, "fixture_beta")
+  eq(configured_session.provider, "fixture_alpha")
+  eq(find("background-provider").fields[1].value, "Fixture 2")
   picker.close()
   configured_session.provider, configured_session.provider_label = "fixture_beta", "Fixture Beta"
   state.capability.os_sandbox = false

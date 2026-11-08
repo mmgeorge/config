@@ -521,9 +521,7 @@ local function generate_description(cwd, head_commit, context, callback)
   local settings = require("forge.integrations.background_settings")
   local function resolved(snapshot, failure)
     if not snapshot then callback(nil, failure or "Missing Background settings") return end
-    local generation, configuration_failure = client.generation_get_config()
-    if not generation then callback(nil, configuration_failure) return end
-    local choice = settings.model(snapshot, generation.provider.kind)
+    local selection = settings.selection(snapshot)
     client.generation_request({
       operation = "pull_request", workspace = cwd, comparison = "pull_request", head = head_commit,
       input = pr_system_prompt .. "\n\n" .. context,
@@ -536,7 +534,7 @@ local function generate_description(cwd, head_commit, context, callback)
       callback(description, decode_failure)
     end, function(model)
       show_progress("Generating PR description with " .. model .. "...")
-    end, { model = choice.model, reasoning_effort = choice.thinking, auto_compaction = snapshot.settings.auto_compaction })
+    end, selection)
   end
   settings.request(nil, nil, function(...)
     local ok, failure = pcall(resolved, ...)

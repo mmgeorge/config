@@ -1138,12 +1138,6 @@
       "admission": "ordinary",
       "recovery": "session_command"
     },
-    "session.provider.authenticate": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "none"
-    },
     "session.provider.capabilities.get": {
       "session_context": "required",
       "readiness": "runtime",
@@ -1163,12 +1157,6 @@
       "recovery": "none"
     },
     "session.provider.model.list": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "none"
-    },
-    "session.provider.setup": {
       "session_context": "required",
       "readiness": "runtime",
       "admission": "ordinary",

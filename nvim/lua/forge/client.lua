@@ -27,6 +27,7 @@ local max_active_requests, reserved_control_requests = 256, 4
 ---@alias ForgeSubscriber fun(event: string, payload: any, session_id?: string)
 
 ---@class ForgeBackgroundSelection
+---@field provider? string Background provider; omitted means the active chat's provider.
 ---@field model string
 ---@field reasoning_effort? string
 ---@field service_tier? 'default'|'fast'|'ultrafast'
@@ -1106,7 +1107,7 @@ end
 function M.generation_get_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
-  local provider = selected and selected.provider or harness_config.provider
+  local provider = selection and selection.provider or selected and selected.provider or harness_config.provider
   local configured = M.provider_map()[provider]
   if not configured then return nil, "Unknown Harness provider: " .. tostring(provider) end
   selection = selection or (config.options.background_generation or {})[provider]
@@ -1116,7 +1117,8 @@ function M.generation_get_config(selection)
   ---@type ForgeTextGenerationConfig
   local generation = {
     provider = { kind = provider, command = vim.deepcopy(configured.command or {}) },
-    model = selection and selection.model or (selected and selected.model or harness_config.model),
+    model = selection and selection.model
+      or (selected and selected.provider == provider and selected.model or harness_config.model),
     reasoning_effort = selection and selection.reasoning_effort,
     service_tier = selection and selection.service_tier or "default",
     auto_compaction = selection and selection.auto_compaction,

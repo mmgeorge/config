@@ -58,9 +58,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     if cancelled or M._states ~= lifetime or (is_current and not is_current()) then return end
     if not snapshot then callback(nil, failure) return end
     local client = require("forge.client")
-    local generation, configuration_failure = client.generation_get_config()
-    if not generation then callback(nil, configuration_failure) return end
-    local choice = require("forge.integrations.background_settings").model(snapshot, generation.provider.kind)
+    local selection, choice = require("forge.integrations.background_settings").selection(snapshot)
     local function publish_model(label)
       local speed = choice.service_tier
       on_model((label:match("[^\r\n]*") or label) .. (speed and speed ~= "default" and (" · " .. speed) or ""))
@@ -71,9 +69,7 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
       ignored_paths = ignored or {} }
     if M._provider and M._provider.request_async then cancel_request = M._provider.request_async(params, receive)
     else
-      cancel_request = client.generation_request(params, receive, publish_model, { model = choice.model,
-        reasoning_effort = choice.thinking, service_tier = choice.service_tier,
-        auto_compaction = snapshot.settings.auto_compaction })
+      cancel_request = client.generation_request(params, receive, publish_model, selection)
     end
   end
   require("forge.integrations.background_settings").request(nil, nil, function(...)

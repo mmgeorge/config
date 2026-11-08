@@ -53,16 +53,6 @@ impl CopilotRuntime {
         }
     }
 
-    /// Get the version validated for the retained native process without probing or starting it.
-    pub async fn validated_version(&self) -> Option<String> {
-        match self.client.lock().await.as_ref() {
-            Some(RuntimeClient::Ready { _validation, .. }) => {
-                Some(_validation.version().to_string())
-            }
-            Some(RuntimeClient::Unvalidated(_)) | None => None,
-        }
-    }
-
     pub fn close_admission(&self) {
         self.closed.store(true, Ordering::Release);
     }

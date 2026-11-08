@@ -2112,15 +2112,15 @@ function M.select_provider()
   end
   local current = state.session and state.session.provider or config.options.harness.provider
   local option_list = {}
-  for provider, provider_config in pairs(client.provider_map()) do
-    if provider_config.selectable ~= false then
-      option_list[#option_list + 1] = {
-        id = provider,
-        label = provider_config.label,
-        detail = (provider_config.detail or provider_config.label) .. (provider == current and " (current)" or ""),
-        value = provider,
-      }
-    end
+  local provider_map = client.provider_map()
+  for _, provider in ipairs(require("forge.views.harness.model_options").providers()) do
+    local provider_config = provider_map[provider]
+    option_list[#option_list + 1] = {
+      id = provider,
+      label = provider_config.label,
+      detail = (provider_config.detail or provider_config.label) .. (provider == current and " (current)" or ""),
+      value = provider,
+    }
   end
   table.sort(option_list, function(left, right) return left.label < right.label end)
   open_choice_picker(state, "Select Harness", nil, option_list,

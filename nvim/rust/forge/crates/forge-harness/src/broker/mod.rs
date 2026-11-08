@@ -3579,8 +3579,6 @@ impl HarnessBroker {
             | RuntimeMethod::SettingsSkillSetEnabled
             | RuntimeMethod::SessionProviderMcpList
             | RuntimeMethod::SessionProviderCapabilitiesGet
-            | RuntimeMethod::SessionProviderAuthenticate
-            | RuntimeMethod::SessionProviderSetup
             | RuntimeMethod::SettingsGet
             | RuntimeMethod::SettingsUpdate
             | RuntimeMethod::SettingsImportPreview

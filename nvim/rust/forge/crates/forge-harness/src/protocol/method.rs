@@ -53,10 +53,6 @@ pub enum RuntimeMethod {
     SessionProviderMockResponse,
     #[serde(rename = "session.provider.capabilities.get")]
     SessionProviderCapabilitiesGet,
-    #[serde(rename = "session.provider.authenticate")]
-    SessionProviderAuthenticate,
-    #[serde(rename = "session.provider.setup")]
-    SessionProviderSetup,
     #[serde(rename = "settings.get")]
     SettingsGet,
     #[serde(rename = "settings.update")]

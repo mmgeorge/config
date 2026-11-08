@@ -91,10 +91,6 @@ pub enum CapabilityId {
     BackgroundTermination,
     /// Text generation in an isolated history that never appends to the main conversation.
     IsolatedGeneration,
-    /// Runtime installation/version inspection.
-    RuntimeSetup,
-    /// Explicit provider authentication interaction.
-    Authentication,
     /// Enforcement of host-owned delegation authority.
     NativeAgentSuppression,
     /// Skill enablement applied through complete session configuration.
@@ -158,7 +154,7 @@ impl CapabilityManifest {
     /// Adapters refine binding-specific support and its revision before publishing effective snapshots;
     /// registry metadata alone does not prove that a runtime negotiated optional support.
     pub fn from_descriptor(descriptor: ProviderDescriptor) -> Self {
-        use CapabilityApplication::{Idle, Immediate, Settled};
+        use CapabilityApplication::{Immediate, Settled};
         let flags = &descriptor.capability;
         let integration = &flags.integration;
         let mut capability: Vec<Capability> = [
@@ -230,12 +226,6 @@ impl CapabilityManifest {
                 CapabilityId::IsolatedGeneration,
                 integration.isolated_generation,
                 Immediate,
-            ),
-            (CapabilityId::RuntimeSetup, integration.runtime_setup, Idle),
-            (
-                CapabilityId::Authentication,
-                integration.authentication,
-                Idle,
             ),
             (
                 CapabilityId::NativeAgentSuppression,
@@ -328,12 +318,6 @@ pub struct UnsupportedCapability(pub ProviderFeature);
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFeature {
-    /// Runtime installation and version inspection.
-    RuntimeSetup,
-    /// Explicit provider credential setup.
-    Authentication,
-    /// Terminal-based authentication interaction.
-    TerminalAuthentication,
     /// Complete normalized resource selection.
     ResourceSelection,
     /// Separate durable native history fork.

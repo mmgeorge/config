@@ -903,81 +903,6 @@ impl Provider for MockProvider {
             .await
     }
 
-    async fn inspect(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-    ) -> Result<ProviderSetup, ProviderError> {
-        let payload = workspace.clone();
-        let operation = MockOperation::new(context.clone());
-        let native_operation = operation.clone();
-        let native = self.clone();
-
-        self.operations
-            .inspect
-            .observe(
-                context,
-                ProviderOperation::Inspect,
-                payload,
-                async move {
-                    let completed = native_operation.clone();
-                    let result = native.inspect_native(native_operation, workspace).await;
-                    completed.complete();
-                    result
-                },
-                move |reason| {
-                    let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::Inspect);
-                    Interruption::new(observation, async move {
-                        match dispatched {
-                            NativeDispatch::Preparing => Ok(()),
-                            NativeDispatch::Dispatched => Ok(()),
-                        }
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn authenticate(
-        &self,
-        context: OperationContext,
-        workspace: WorkspaceContext,
-        method: AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        let payload = (workspace.clone(), method.clone());
-        let operation = MockOperation::new(context.clone());
-        let native_operation = operation.clone();
-        let native = self.clone();
-
-        self.operations
-            .authenticate
-            .observe(
-                context,
-                ProviderOperation::Authenticate,
-                payload,
-                async move {
-                    let completed = native_operation.clone();
-                    let result = native
-                        .authenticate_native(native_operation, workspace, method)
-                        .await;
-                    completed.complete();
-                    result
-                },
-                move |reason| {
-                    let (observation, dispatched) =
-                        operation.interrupt(reason, ProviderOperation::Authenticate);
-                    Interruption::new(observation, async move {
-                        match dispatched {
-                            NativeDispatch::Preparing => Ok(()),
-                            NativeDispatch::Dispatched => Ok(()),
-                        }
-                    })
-                },
-            )
-            .await
-    }
-
     async fn shutdown(&self, context: OperationContext) -> Result<(), ProviderError> {
         let payload = ();
         let operation = MockOperation::new(context.clone());
@@ -1885,31 +1810,6 @@ impl MockProvider {
         Ok(outcome)
     }
 
-    async fn inspect_native(
-        &self,
-        operation: MockOperation,
-        _context: catalog::WorkspaceContext,
-    ) -> Result<provider::ProviderSetup, ProviderError> {
-        operation.dispatch(ProviderOperation::Inspect)?;
-        Ok(provider::ProviderSetup {
-            runtime: provider::RuntimeAvailability::Available,
-            origin: provider::RuntimeOrigin::Configured,
-            versions: Default::default(),
-            authentication: Vec::new(),
-            capabilities: mock_capabilities(),
-        })
-    }
-
-    async fn authenticate_native(
-        &self,
-        operation: MockOperation,
-        _workspace: WorkspaceContext,
-        _method: AuthenticationMethodId,
-    ) -> Result<(), ProviderError> {
-        operation.admit(ProviderOperation::Authenticate)?;
-        Err(capability::UnsupportedCapability(capability::ProviderFeature::Authentication).into())
-    }
-
     async fn shutdown_native(&self, operation: MockOperation) -> Result<(), ProviderError> {
         let _shutdown = self.shutdown_lock.lock().await;
         operation.dispatch(ProviderOperation::Shutdown)?;
@@ -2104,8 +2004,6 @@ struct MockOperations {
     turn_steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
     input_reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
     input_retract: Store<(BindingId, InputRetractRequest), InputRetractOutcome>,
-    inspect: Store<WorkspaceContext, ProviderSetup>,
-    authenticate: Store<(WorkspaceContext, AuthenticationMethodId), ()>,
     shutdown: Store<(), ()>,
     model_list: Store<QueryContext, Vec<ProviderModel>>,
     skill_list: Store<QueryContext, Vec<catalog::SkillDefinition>>,
@@ -2129,8 +2027,6 @@ impl MockOperations {
             turn_steer: Store::registered(identities.clone()),
             input_reconcile: Store::registered(identities.clone()),
             input_retract: Store::registered(identities.clone()),
-            inspect: Store::registered(identities.clone()),
-            authenticate: Store::registered(identities.clone()),
             shutdown: Store::registered(identities.clone()),
             model_list: Store::registered(identities.clone()),
             skill_list: Store::registered(identities.clone()),
@@ -2172,12 +2068,6 @@ impl MockOperations {
             failures.push(error);
         }
         if let Err(error) = self.input_retract.join_all_except(excluded).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.inspect.join_all_except(excluded).await {
-            failures.push(error);
-        }
-        if let Err(error) = self.authenticate.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.model_list.join_all_except(excluded).await {

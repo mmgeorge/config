@@ -24,7 +24,11 @@ T["ai_commit"] = function()
     request = function(_, _, callback)
       callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
     end,
-    model = function() return { model = "fixture-model", thinking = "low", service_tier = "fast" } end,
+    selection = function(snapshot)
+      local choice = { model = "fixture-model", thinking = "low", service_tier = "fast" }
+      return { provider = "fixture_beta", model = choice.model, reasoning_effort = choice.thinking,
+        service_tier = choice.service_tier, auto_compaction = snapshot.settings.auto_compaction }, choice
+    end,
   }
   local notices = notify.capture()
 
@@ -291,8 +295,9 @@ T["ai_commit"] = function()
     package.loaded["forge.client"] = {
       request = function() error("Commit generation initialized a conversation") end,
       generation_get_config = generation_get_config,
-      generation_request = function(params, callback, on_model)
+      generation_request = function(params, callback, on_model, selection)
         eq(params.model, nil, { fail_reason = "fallback hardcoded a provider or model" })
+        eq(selection.provider, "fixture_beta", { fail_reason = "generation ignored the saved Background provider" })
         on_model("selected-model (fixture_alpha)")
         callback({ state = "ready", message = "fix: use recent Harness\n\nPreserve the body." })
       end,

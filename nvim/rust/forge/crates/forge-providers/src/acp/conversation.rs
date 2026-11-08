@@ -178,8 +178,17 @@ impl AcpConversation {
                 instructions,
                 fork_targets: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
-            Err(_) => {
-                let cause = acp_failure(forge_provider_api::ProviderFailureKind::Initialization);
+            Err(error) => {
+                // Keep a login-required rejection distinct so the user learns to sign in
+                // through the provider CLI instead of seeing a generic startup failure.
+                let kind = match error.downcast_ref::<AcpConnectionError>() {
+                    Some(AcpConnectionError::Remote {
+                        failure: Some(super::connection::AcpRemoteFailure::AuthenticationRequired),
+                        ..
+                    }) => forge_provider_api::ProviderFailureKind::Authentication,
+                    _ => forge_provider_api::ProviderFailureKind::Initialization,
+                };
+                let cause = acp_failure(kind);
                 state.invalidate_binding(cause.clone()).await;
                 transport.retain_failure(cause.clone()).await;
                 match transport.shutdown().await {
