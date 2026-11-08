@@ -9,10 +9,9 @@ use crate::pull_request::{
     PullRequestMutation, PullRequestMutationOutcome, PullRequestState, PullRequestTarget,
 };
 
-mod gh;
-pub use gh::{
-    CreationContext, GhClient, GhDirectory, PendingReviewExpected, ReviewSubmissionContext,
-};
+mod api;
+pub(crate) use api::rest_prefix;
+pub use api::{CreationContext, GithubClient, PendingReviewExpected, ReviewSubmissionContext};
 
 /// Read-only issue page request. Incremental refresh includes closed issues in either scope.
 #[derive(Clone, Debug)]
@@ -73,7 +72,7 @@ impl std::fmt::Display for RemoteFailure {
 
 impl std::error::Error for RemoteFailure {}
 
-/// Injectable remote requests. Implementations retain subprocess cleanup until completion.
+/// Injectable remote requests. Dropping a returned future cancels its request.
 pub trait GithubRemote: Send + Sync {
     /// Reads the authenticated account identity used to validate a durable mutation capture.
     fn read_actor(
@@ -96,7 +95,6 @@ pub trait GithubRemote: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<PullRequestState, RemoteFailure>> + Send + '_>>;
 
     /// Performs exactly one write attempt and distinguishes proven rejection from uncertainty.
-    /// The future must not complete before its native request has terminated and been collected.
     fn mutate_pull_request(
         &self,
         target: PullRequestTarget,

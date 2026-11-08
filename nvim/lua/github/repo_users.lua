@@ -1,5 +1,4 @@
 ---@class GithubRepoUsersFetchOptions
----@field cwd string?
 ---@field repo string
 ---@field ttl_seconds? integer
 ---@field callback fun(result: { ok: boolean, contributors?: table[], metadata?: table, message?: string })
@@ -16,7 +15,6 @@ function M.fetch_async(opts)
   if not owner then opts.callback({ ok = false, message = "Invalid GitHub repository" }) return end
   local params = {
     cache_directory = directory,
-    directory = opts.cwd or vim.fn.getcwd(),
     request = { repository = { hostname = hostname, owner = owner, name = name }, ttl_seconds = opts.ttl_seconds },
   }
   local completed = false

@@ -62,7 +62,6 @@ struct IssueRequest {
 #[serde(deny_unknown_fields)]
 struct IssueSyncRequest {
     database: PathBuf,
-    directory: PathBuf,
     request: SyncRequest,
     #[serde(default)]
     progress: bool,
@@ -72,7 +71,6 @@ struct IssueSyncRequest {
 #[serde(deny_unknown_fields)]
 struct IssueDetailParams {
     database: PathBuf,
-    directory: PathBuf,
     request: IssueDetailRequest,
 }
 
@@ -80,21 +78,18 @@ struct IssueDetailParams {
 #[serde(deny_unknown_fields)]
 struct MetadataParams {
     cache_directory: PathBuf,
-    directory: PathBuf,
     request: MetadataRequest,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PullRequestParams {
-    directory: PathBuf,
     request: PullRequestRequest,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommentParams {
-    directory: PathBuf,
     target: CommentTarget,
     request: CommentOperation,
 }
@@ -878,10 +873,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubReviewDocumentOpen => {
                 let params: ReviewOpenParams = serde_json::from_value(request.params)?;
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let snapshot = match (params.target, params.repository, params.number) {
                     (Some(target), None, None) => {
                         self.host
@@ -916,10 +908,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubReviewDocumentFileGet => {
                 let params: ReviewFileParams = serde_json::from_value(request.params)?;
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let result = self
                     .host
                     .review
@@ -938,10 +927,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubReviewDocumentThreadGet => {
                 let params: ReviewThreadParams = serde_json::from_value(request.params)?;
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let result = self
                     .host
                     .review
@@ -1046,10 +1032,7 @@ impl HostRouter {
                         initial,
                     )?;
                 }
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 self.host
                     .review
                     .header(&params.document, params.directory, remote)
@@ -1064,10 +1047,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubReviewDocumentLoad => {
                 let params: ReviewLoadParams = serde_json::from_value(request.params)?;
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let diagnostic = self
                     .host
                     .review
@@ -1083,10 +1063,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubReviewDocumentSectionGet => {
                 let params: ReviewSectionParams = serde_json::from_value(request.params)?;
-                let remote = self
-                    .host
-                    .github_remote
-                    .for_directory(params.directory.clone())?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let result = self
                     .host
                     .review
@@ -1140,7 +1117,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubRepositoryMetadata => {
                 let params: MetadataParams = serde_json::from_value(request.params)?;
-                let remote = self.host.github_remote.for_directory(params.directory)?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let metadata = self
                     .host
                     .github
@@ -1150,7 +1127,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubComment => {
                 let params: CommentParams = serde_json::from_value(request.params)?;
-                let remote = self.host.github_remote.for_directory(params.directory)?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let result = self
                     .host
                     .github
@@ -1160,7 +1137,7 @@ impl HostRouter {
             }
             RoutedMethod::GithubPullRequest => {
                 let params: PullRequestParams = serde_json::from_value(request.params)?;
-                let remote = self.host.github_remote.for_directory(params.directory)?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let result = self
                     .host
                     .github
@@ -1175,7 +1152,7 @@ impl HostRouter {
                     &params.request.repository.repository_name(),
                     std::time::Duration::from_secs(1),
                 )?;
-                let remote = self.host.github_remote.for_directory(params.directory)?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let detail = self
                     .host
                     .github
@@ -1190,7 +1167,7 @@ impl HostRouter {
                     &params.request.repository.repository_name(),
                     std::time::Duration::from_secs(1),
                 )?;
-                let remote = self.host.github_remote.for_directory(params.directory)?;
+                let remote = std::sync::Arc::clone(&self.host.github_remote);
                 let (sender, mut progress) = tokio::sync::watch::channel(SyncProgress::default());
                 let mut observing = params.progress;
                 let sync = self.host.github.sync(

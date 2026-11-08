@@ -241,7 +241,7 @@ function M.ensure_metadata(cwd, repo, opts)
   if in_flight[request_key] then return end
   local context = {}
   in_flight[request_key] = context
-  require("github.repo_users").fetch_async({ cwd = cwd, repo = normalized,
+  require("github.repo_users").fetch_async({ repo = normalized,
     ttl_seconds = opts and opts.ttl_seconds, callback = function(result)
     if in_flight[request_key] ~= context then return end
     in_flight[request_key] = nil

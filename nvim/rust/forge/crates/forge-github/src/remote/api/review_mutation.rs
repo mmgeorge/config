@@ -1,87 +1,45 @@
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{future::Future, pin::Pin};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{GhClient, GhDirectory, classify_failure, diagnostic, remote_result};
+use super::{ApiRequest, GithubClient, remote_result, request_not_sent};
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 use crate::review_mutation::{
     GithubReviewWriteRemote, ReviewMutation, ReviewMutationOutcome, ReviewMutationRequest,
 };
 
-impl GithubReviewWriteRemote for GhClient {
+impl GithubReviewWriteRemote for GithubClient {
     fn plan_review_write(
         &self,
         request: ReviewMutationRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ReviewMutation>, RemoteFailure>> + Send + '_>> {
-        Box::pin(self.plan_review_write_at(self.directory.clone(), request))
+        Box::pin(self.plan_review_write_at(request))
     }
     fn read_review_write_result(
         &self,
         request: ReviewMutationRequest,
         remote_id: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteFailure>> + Send + '_>> {
-        Box::pin(self.read_review_write_result_at(self.directory.clone(), request, remote_id))
+        Box::pin(self.read_review_write_result_at(request, remote_id))
     }
     fn validate_review_write(
         &self,
         request: ReviewMutationRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), RemoteFailure>> + Send + '_>> {
-        Box::pin(self.validate_review_write_at(self.directory.clone(), request))
+        Box::pin(self.validate_review_write_at(request))
     }
     fn mutate_review(
         &self,
         request: ReviewMutationRequest,
     ) -> Pin<Box<dyn Future<Output = ReviewMutationOutcome> + Send + '_>> {
-        Box::pin(self.mutate_review_at(self.directory.clone(), request))
+        Box::pin(self.mutate_review_at(request))
     }
 }
 
-impl GithubReviewWriteRemote for GhDirectory {
-    fn plan_review_write(
-        &self,
-        request: ReviewMutationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ReviewMutation>, RemoteFailure>> + Send + '_>> {
-        Box::pin(
-            self.client
-                .plan_review_write_at(self.directory.clone(), request),
-        )
-    }
-    fn read_review_write_result(
-        &self,
-        request: ReviewMutationRequest,
-        remote_id: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteFailure>> + Send + '_>> {
-        Box::pin(self.client.read_review_write_result_at(
-            self.directory.clone(),
-            request,
-            remote_id,
-        ))
-    }
-    fn validate_review_write(
-        &self,
-        request: ReviewMutationRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), RemoteFailure>> + Send + '_>> {
-        Box::pin(
-            self.client
-                .validate_review_write_at(self.directory.clone(), request),
-        )
-    }
-    fn mutate_review(
-        &self,
-        request: ReviewMutationRequest,
-    ) -> Pin<Box<dyn Future<Output = ReviewMutationOutcome> + Send + '_>> {
-        Box::pin(
-            self.client
-                .mutate_review_at(self.directory.clone(), request),
-        )
-    }
-}
-
-impl GhClient {
+impl GithubClient {
     async fn plan_review_write_at(
         &self,
-        directory: PathBuf,
         request: ReviewMutationRequest,
     ) -> Result<Vec<ReviewMutation>, RemoteFailure> {
         use crate::pull_request::{
@@ -145,7 +103,6 @@ impl GhClient {
         };
         let observed = self
             .read_pr(
-                directory,
                 PullRequestTarget {
                     repository: request.resource.repository.clone(),
                     number: request.resource.number,
@@ -189,7 +146,6 @@ impl GhClient {
 
     async fn read_review_write_result_at(
         &self,
-        directory: PathBuf,
         request: ReviewMutationRequest,
         remote_id: u64,
     ) -> Result<Value, RemoteFailure> {
@@ -201,10 +157,7 @@ impl GhClient {
                 "repos/{}/pulls/{remote_id}",
                 request.resource.repository.repository_name()
             );
-            let value = remote_result(
-                self.review_json_at(directory, &request, endpoint, "GET", None)
-                    .await,
-            )?;
+            let value = remote_result(self.review_json_at(&request, endpoint, "GET", None).await)?;
             if value.get("number").and_then(Value::as_u64) != Some(remote_id) {
                 return Err(invalid("selected PR creation identity changed"));
             }
@@ -221,7 +174,7 @@ impl GhClient {
                 number: remote_id,
                 node_id: node_id.clone(),
             };
-            let observed = self.read_pr(directory, target, true).await?;
+            let observed = self.read_pr(target, true).await?;
             return validate_confirmation(
                 serde_json::to_value(observed).expect("serialize PR observation"),
                 &request,
@@ -239,14 +192,8 @@ impl GhClient {
                 return Err(invalid("selected issue recovery identity changed"));
             }
             let value = remote_result(
-                self.review_json_at(
-                    directory,
-                    &request,
-                    format!("{prefix}/issues/{number}"),
-                    "GET",
-                    None,
-                )
-                .await,
+                self.review_json_at(&request, format!("{prefix}/issues/{number}"), "GET", None)
+                    .await,
             )?;
             if request.parent_node_id.as_ref().is_some_and(|identity| {
                 value.get("node_id").and_then(Value::as_str) != Some(identity)
@@ -281,10 +228,7 @@ impl GhClient {
                 ));
             }
         };
-        let value = remote_result(
-            self.review_json_at(directory.clone(), &request, endpoint, "GET", None)
-                .await,
-        )?;
+        let value = remote_result(self.review_json_at(&request, endpoint, "GET", None).await)?;
         if value.get("id").and_then(Value::as_u64) != Some(remote_id)
             || value
                 .get(parent_field)
@@ -298,14 +242,12 @@ impl GhClient {
             ));
         }
         let value = validate_confirmation(value, &request)?;
-        self.validate_submitted_members_at(directory, &request, &value)
-            .await?;
+        self.validate_submitted_members_at(&request, &value).await?;
         Ok(value)
     }
 
     async fn validate_submitted_members_at(
         &self,
-        directory: PathBuf,
         request: &ReviewMutationRequest,
         value: &Value,
     ) -> Result<(), RemoteFailure> {
@@ -322,7 +264,6 @@ impl GhClient {
                 .ok_or_else(|| invalid("submitted review omitted identity"))?;
             let observed = self
                 .pending_members_at(
-                    directory,
                     &request.resource.repository,
                     request.resource.number,
                     review,
@@ -355,43 +296,27 @@ impl GhClient {
 
     async fn review_json_at(
         &self,
-        directory: PathBuf,
         request: &ReviewMutationRequest,
         endpoint: String,
         method: &'static str,
         body: Option<Value>,
     ) -> Result<Result<Value, RemoteFailure>> {
-        let encoded = body.map(|body| serde_json::to_vec(&body)).transpose()?;
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.resource.repository.hostname().into(),
-            "--method".into(),
-            method.into(),
-            endpoint.into(),
-        ];
-        self.run_native(directory, argument, encoded, 4096, |output| {
-            if !output.status.success() {
-                return Err(classify_failure(diagnostic(&String::from_utf8_lossy(
-                    if output.stderr.is_empty() {
-                        &output.stdout
-                    } else {
-                        &output.stderr
-                    },
-                ))));
-            }
-            if output.stdout.is_empty() {
+        let method = reqwest::Method::from_bytes(method.as_bytes())?;
+        let hostname = request.resource.repository.hostname();
+        let api_request = match (endpoint.as_str(), &body) {
+            ("graphql", Some(payload)) => ApiRequest::graphql(hostname, payload),
+            (_, Some(body)) => ApiRequest::get(hostname, endpoint)
+                .with_method(method)
+                .with_json(body),
+            (_, None) => ApiRequest::get(hostname, endpoint).with_method(method),
+        };
+        self.send(api_request, |response| {
+            let body = response.into_success()?;
+            if body.is_empty() {
                 return Ok(Value::Null);
             }
-            let value: Value = serde_json::from_slice(&output.stdout)
-                .map_err(|error| invalid(error.to_string()))?;
-            if value
-                .get("errors")
-                .and_then(Value::as_array)
-                .is_some_and(|error| !error.is_empty())
-            {
-                return Err(invalid("GraphQL write returned errors"));
-            }
+            let value: Value =
+                serde_json::from_slice(&body).map_err(|error| invalid(error.to_string()))?;
             Ok(value)
         })
         .await
@@ -399,7 +324,6 @@ impl GhClient {
 
     async fn validate_review_write_at(
         &self,
-        directory: PathBuf,
         request: ReviewMutationRequest,
     ) -> Result<(), RemoteFailure> {
         request
@@ -416,7 +340,7 @@ impl GhClient {
         } = &request.mutation
         {
             let repository = remote_result(
-                self.review_json_at(directory.clone(), &request, prefix.clone(), "GET", None)
+                self.review_json_at(&request, prefix.clone(), "GET", None)
                     .await,
             )?;
             if repository.get("node_id").and_then(Value::as_str) != Some(repository_node_id) {
@@ -424,10 +348,8 @@ impl GhClient {
             }
             for (branch, expected) in [(base, None), (head, Some(head_commit))] {
                 let endpoint = format!("{prefix}/git/ref/heads/{}", encode_component(branch));
-                let observed = remote_result(
-                    self.review_json_at(directory.clone(), &request, endpoint, "GET", None)
-                        .await,
-                )?;
+                let observed =
+                    remote_result(self.review_json_at(&request, endpoint, "GET", None).await)?;
                 if observed.get("ref").and_then(Value::as_str)
                     != Some(format!("refs/heads/{branch}").as_str())
                     || observed.pointer("/object/type").and_then(Value::as_str) != Some("commit")
@@ -448,7 +370,6 @@ impl GhClient {
         ) {
             let thread = remote_result(
                 self.review_json_at(
-                    directory,
                     &request,
                     format!("notifications/threads/{number}"),
                     "GET",
@@ -475,7 +396,6 @@ impl GhClient {
         );
         let parent = remote_result(
             self.review_json_at(
-                directory.clone(),
                 &request,
                 format!(
                     "{prefix}/{}/{number}",
@@ -529,7 +449,6 @@ impl GhClient {
         if let Some((id, conversation, owned)) = comment {
             let observed = remote_result(
                 self.review_json_at(
-                    directory.clone(),
                     &request,
                     format!(
                         "{prefix}/{}/comments/{id}",
@@ -569,7 +488,6 @@ impl GhClient {
         {
             let observed = remote_result(
                 self.review_json_at(
-                    directory.clone(),
                     &request,
                     format!("{prefix}/pulls/{number}/reviews/{id}"),
                     "GET",
@@ -590,7 +508,7 @@ impl GhClient {
             } = request.mutation
             {
                 let observed = self
-                    .pending_members_at(directory.clone(), &request.resource.repository, number, id)
+                    .pending_members_at(&request.resource.repository, number, id)
                     .await?;
                 if &observed != captured {
                     return Err(invalid(
@@ -605,7 +523,7 @@ impl GhClient {
         {
             let body = json!({"query":"query($id:ID!){node(id:$id){... on PullRequestReview{id state author{... on User{id}} pullRequest{number repository{nameWithOwner}}}}}","variables":{"id":review_node_id}});
             let observed = remote_result(
-                self.review_json_at(directory, &request, "graphql".into(), "POST", Some(body))
+                self.review_json_at(&request, "graphql".into(), "POST", Some(body))
                     .await,
             )?;
             let review = observed
@@ -634,11 +552,7 @@ impl GhClient {
         Ok(())
     }
 
-    async fn mutate_review_at(
-        &self,
-        directory: PathBuf,
-        request: ReviewMutationRequest,
-    ) -> ReviewMutationOutcome {
+    async fn mutate_review_at(&self, request: ReviewMutationRequest) -> ReviewMutationOutcome {
         use crate::pull_request::{
             PullRequestEdit, PullRequestMutation, PullRequestMutationOutcome, PullRequestTarget,
         };
@@ -672,7 +586,7 @@ impl GhClient {
                 number: request.resource.number,
                 node_id: node_id.clone(),
             };
-            return match self.mutate_pr(directory, target, mutation).await {
+            return match self.mutate_pr(target, mutation).await {
                 PullRequestMutationOutcome::Confirmed(state) => match validate_confirmation(
                     serde_json::to_value(state).expect("serialize PR state"),
                     &request,
@@ -694,7 +608,7 @@ impl GhClient {
                 number: request.resource.number,
                 node_id: node_id.clone(),
             };
-            return match self.read_pr(directory, target, false).await {
+            return match self.read_pr(target, false).await {
                 Ok(result) => ReviewMutationOutcome::Confirmed(
                     serde_json::to_value(result).expect("serialize PR state"),
                 ),
@@ -879,18 +793,13 @@ impl GhClient {
         };
         let response = self
             .review_json_at(
-                directory.clone(),
                 &request,
                 endpoint,
                 method,
                 (!body.is_null()).then_some(body),
             )
             .await;
-        let not_started = response.as_ref().err().is_some_and(|error| {
-            error
-                .downcast_ref::<forge_git::read_pool::ReadAdmissionError>()
-                .is_some()
-        });
+        let not_started = response.as_ref().err().is_some_and(request_not_sent);
         let response = match remote_result(response) {
             Ok(_)
                 if matches!(
@@ -900,7 +809,6 @@ impl GhClient {
             {
                 remote_result(
                     self.review_json_at(
-                        directory.clone(),
                         &request,
                         format!("{pull}/requested_reviewers"),
                         "GET",
@@ -913,10 +821,7 @@ impl GhClient {
         };
         match response {
             Ok(value) => match validate_confirmation(value, &request) {
-                Ok(value) => match self
-                    .validate_submitted_members_at(directory, &request, &value)
-                    .await
-                {
+                Ok(value) => match self.validate_submitted_members_at(&request, &value).await {
                     Ok(()) => ReviewMutationOutcome::Confirmed(value),
                     Err(failure) => ReviewMutationOutcome::OutcomeUnknown(failure),
                 },

@@ -33,7 +33,6 @@ struct CreationContextParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewSubmissionContextParams {
-    directory: PathBuf,
     repository: GithubRepositoryId,
     number: u64,
     pending_review_id: Option<u64>,
@@ -50,14 +49,12 @@ struct NotificationPageParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActorParams {
-    directory: PathBuf,
     repository: GithubRepositoryId,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewMutateParams {
-    directory: PathBuf,
     request: ReviewMutationRequest,
 }
 
@@ -70,7 +67,6 @@ struct RecoveryInspectParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryResolveParams {
-    directory: PathBuf,
     resource: RecoveryResource,
     operation_id: String,
     resolution: RecoveryResolution,
@@ -106,12 +102,15 @@ pub(super) async fn route(
     Ok(match operation {
         GithubRoute::PullRequestCreationContext => {
             let params: CreationContextParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory)?;
-            serde_json::to_value(remote.creation_context().await?)?
+            serde_json::to_value(
+                host.github_remote
+                    .creation_context(params.directory)
+                    .await?,
+            )?
         }
         GithubRoute::NotificationList => {
             let params: NotificationPageParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory.clone())?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(
                 host.github
                     .notification_page(params.directory, remote, params.request)
@@ -120,7 +119,7 @@ pub(super) async fn route(
         }
         GithubRoute::ReviewSubmissionContext => {
             let params: ReviewSubmissionContextParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory)?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(
                 remote
                     .submission_context(
@@ -134,12 +133,12 @@ pub(super) async fn route(
         }
         GithubRoute::ActorGet => {
             let params: ActorParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory)?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(remote.read_actor(params.repository).await?)?
         }
         GithubRoute::ReviewMutate => {
             let params: ReviewMutateParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory)?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(host.github.review_mutation(remote, params.request).await?)?
         }
         GithubRoute::RecoveryInspect => {
@@ -148,7 +147,7 @@ pub(super) async fn route(
         }
         GithubRoute::RecoveryResolve => {
             let params: RecoveryResolveParams = serde_json::from_value(params)?;
-            let remote = host.github_remote.for_directory(params.directory)?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(
                 host.github
                     .recovery_resolve(

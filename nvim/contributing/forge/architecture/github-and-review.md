@@ -4,13 +4,17 @@ A remote GitHub write can succeed while its response is lost, and two writers to
 
 This chapter covers remote execution, storage, and issues. [Pull request review](pull-request-review.md) covers PR creation, review documents, and comments.
 
-## Native `gh` execution
+## GitHub HTTP client
 
-Every GitHub read and write runs through one `GhClient` owned by `ForgeRuntime`. At most four `gh` processes run across all checkouts. Each request passes explicit hostname routing and GraphQL variables through an owned temporary input file, under a 120-second deadline.
+Every GitHub read and write runs through one `GithubClient` owned by `ForgeRuntime`, which sends REST and GraphQL requests over a pooled HTTPS connection. At most four requests run at once across all checkouts. Each request names its host explicitly, maps it to `api.github.com` or the Enterprise `/api/v3/` and `/api/graphql` roots, and has a 120-second deadline. Dropping a request future cancels the request, so shutdown only rejects new requests and waits for admitted ones to finish.
 
-`process-wrap` contains each command in a Windows Job Object or a Unix process group. Cancellation or deadline expiry terminates that container, waits for exit, and drains both streams before releasing admission. Windows `KillOnDrop` also covers an unexpected host exit, and a Unix process group has no equivalent after forced host death.
+`gh` serves only as the credential source. `TokenStore` runs `gh auth token --hostname <host>` once per host and caches the result, so Forge inherits `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, or the user's `gh auth login` without reading credential storage itself. A 401 response discards that host's token and retries the request once with a fresh one. The retry is safe for writes, because GitHub rejects an unauthenticated request before acting on it. A missing login fails as `Unauthorized` and names `gh auth login`.
 
-Decoders keep complete collections without count limits and treat an empty collection as success. Missing fields, malformed JSON, invalid pagination, GraphQL errors, and command failures stay errors, with categories for rate limits, missing repositories, authentication, and local Busy admission. Failure diagnostics keep at most 64 KiB, and that budget never applies to successful content.
+Responses are classified from documented signals rather than message text: 401 is `Unauthorized`; 429, or 403 with an exhausted `x-ratelimit-remaining` or a `retry-after` header, is `RateLimited`; 404 is `NotFound`; and the GraphQL error types `RATE_LIMITED` and `NOT_FOUND` map the same way. Any other failure status, or a GraphQL response that reports errors, is `Transport`. A request that fails during admission, token lookup, or connection establishment is marked not sent, and a mutation that fails that way is `Rejected`. Any later failure leaves the write `Uncertain`, which the remote queue holds for reconciliation. The two REST collections that `gh --paginate` used to merge follow `Link: rel="next"` within the API host; every other collection pages through its own cursor.
+
+Decoders keep complete collections without count limits and treat an empty collection as success. Missing fields, malformed JSON, invalid pagination, and failed responses stay errors. Failure diagnostics keep at most 64 KiB, and that budget never applies to successful content.
+
+`github.pull_request.creation.context` resolves the repository from the checkout's Git remotes, as `gh` does: a remote marked `gh-resolved = base` wins, then `upstream`, `github`, and `origin`. It reads the canonical name and node identity through GraphQL.
 
 ## Repository storage and leases
 
@@ -32,7 +36,7 @@ A process can die between a page commit and snapshot publication. Every preload 
 
 ## Issue details and metadata
 
-`github.detail` reads one issue through `gh issue view`, persists it under the repository lease, and returns a normalized `DetailRecord`. The decoder keeps every comment, label, assignee, and project item, and rejects mismatched repository or issue URLs. Lua shares one pending fetch per issue and may show a cached detail while refreshing.
+`github.detail` reads one issue through GraphQL, following every label, assignee, project item, and comment page, persists it under the repository lease, and returns a normalized `DetailRecord`. The decoder keeps every comment, label, assignee, and project item, and rejects mismatched repository or issue URLs. Lua shares one pending fetch per issue and may show a cached detail while refreshing.
 
 The issue buffer `forge://issue/` uses `acwrite`, so `:write` produces an explicit field capture. Typing sends no request, and closing a dirty buffer hides it, so reopening restores unsaved text.
 

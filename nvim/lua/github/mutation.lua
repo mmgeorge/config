@@ -23,7 +23,6 @@ local M = {}
 ---@field confirmed_steps? table[]
 
 ---@class GithubMutationOptions
----@field directory string
 ---@field repo string
 ---@field number integer
 ---@field kind 'pull_request'|'issue'|'notification'|'repository'|nil
@@ -70,12 +69,12 @@ local function settle_capture(settle, record, callback)
   if not ok then finish("Captured draft settlement failed: " .. tostring(failure)) end
 end
 
-function M.submission_context(directory, repo, number, pending_review_id, expected, callback)
+function M.submission_context(repo, number, pending_review_id, expected, callback)
   local owner, name = tostring(repo):match("^([^/]+)/([^/]+)$")
   if not owner then callback(nil, "Invalid review repository") return end
   local hostname = require("github.repo_cache").hostname()
   request("github.review.submission.context", {
-    directory = directory, repository = { hostname = hostname, owner = owner, name = name },
+    repository = { hostname = hostname, owner = owner, name = name },
     number = number, pending_review_id = pending_review_id, expected = expected,
   }, function(context, failure)
     if require("github.repo_cache").hostname() ~= hostname then callback(nil, "GitHub hostname changed during review capture")
@@ -110,7 +109,7 @@ function M.run(options, callback)
     notify(failure)
     callback(record, failure)
   end
-  request("github.actor.get", { directory = options.directory, repository = repository }, function(actor, failure)
+  request("github.actor.get", { repository = repository }, function(actor, failure)
     if failure then fail(failure) return end
     if type(actor) ~= "table" or type(actor.node_id) ~= "string" or actor.node_id == "" then
       fail("Forge returned invalid authenticated GitHub identity")
@@ -118,7 +117,7 @@ function M.run(options, callback)
     end
     if require("github.repo_cache").hostname() ~= hostname then fail("GitHub hostname changed before mutation capture") return end
     capture.actor_node_id = actor.node_id
-    request("github.review.mutate", { directory = options.directory, request = capture }, function(record, mutation_failure)
+    request("github.review.mutate", { request = capture }, function(record, mutation_failure)
       if mutation_failure then
         request("github.recovery.inspect", { resource = capture.resource }, function(recovery, inspection_failure)
           fail(mutation_failure .. (inspection_failure and (". Recovery inspection failed: " .. inspection_failure)
@@ -168,11 +167,10 @@ function M.run(options, callback)
   end)
 end
 
----@param directory string
 ---@param record GithubMutationRecord
 ---@param settle fun(record:GithubMutationRecord):table|nil
 ---@param callback fun(record:GithubMutationRecord|nil, failure:string|nil)
-function M.resolve(directory, record, settle, callback, settle_async)
+function M.resolve(record, settle, callback, settle_async)
   local terminal = record.state.phase == "confirmed" or record.state.phase == "rejected"
     or record.state.phase == "user_linked" or record.state.phase == "user_closed_unknown"
   local choices = terminal and { "Keep retained settlement", "Retry durable settlement" }
@@ -218,7 +216,7 @@ function M.resolve(directory, record, settle, callback, settle_async)
       end
       if resolution == nil then finish_resolution(record) return end
       request("github.recovery.resolve", {
-        directory = directory, resource = record.resource, operation_id = record.capture.operation_id, resolution = resolution,
+        resource = record.resource, operation_id = record.capture.operation_id, resolution = resolution,
       }, finish_resolution)
     end
     if choice == "Retry durable settlement" then resolve(nil)

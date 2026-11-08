@@ -18,7 +18,6 @@ use crate::runtime::ForgeRuntime;
 enum IssueRequest {
     Open {
         document: DocumentId,
-        directory: PathBuf,
         database: PathBuf,
         repository: GithubRepositoryId,
         number: u64,
@@ -60,7 +59,6 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
     Ok(match serde_json::from_value(params)? {
         IssueRequest::Open {
             document,
-            directory,
             database,
             repository,
             number,
@@ -70,7 +68,7 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
                 &repository.repository_name(),
                 Duration::from_secs(1),
             )?;
-            let remote = host.github_remote.for_directory(directory)?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(
                 host.issues
                     .open(document, store, repository, number, remote)

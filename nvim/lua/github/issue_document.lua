@@ -507,7 +507,7 @@ function M.rebind(state, callback)
   if not state.active or state.rebinding or not state.replica then return false end
   state.rebinding = true
   local binding = { document = "issue:" .. tostring(vim.uv.hrtime()), notice = state.notice }
-  request(binding, "open", { document = binding.document, directory = state.directory,
+  request(binding, "open", { document = binding.document,
     database = state.database, repository = vim.deepcopy(state.repository), number = state.number,
   }, function(result, failure)
     state.rebinding = false
@@ -603,7 +603,7 @@ function M.open(options)
   local state = {
     active = true, document = "issue:" .. tostring(vim.uv.hrtime()), cache_key = cache_key,
     repository = repository, number = assert(options.number),
-    directory = options.cwd or vim.fn.getcwd(), window = window,
+    window = window,
     origin = vim.api.nvim_win_get_buf(window), is_current = options.is_current,
     on_open = options.on_open, view = {}, columns = columns,
     notice = options.on_error or function(message)
@@ -614,7 +614,7 @@ function M.open(options)
   local database = options.database or vim.fs.joinpath(
     require("github.repo_cache").repo_dir(repository_name, repository.hostname), "issues", "issues.redb")
   state.database = database
-  request(state, "open", { document = state.document, directory = state.directory,
+  request(state, "open", { document = state.document,
     database = database, repository = repository, number = state.number,
   }, function(result, failure)
     if failure or type(result) ~= "table" or type(result.snapshot) ~= "table"

@@ -13,11 +13,10 @@
 
 local M = {}
 
----@param cwd string
 ---@param target GithubPullRequestTarget
 ---@param desired 'DRAFT'|'OPEN'|'CLOSED'
 ---@param callback fun(result:GithubPullRequestResult)
-function M.transition_async(cwd, target, desired, callback)
+function M.transition_async(target, desired, callback)
   if type(target.node_id) ~= "string" or target.node_id == ""
     or (desired ~= "DRAFT" and desired ~= "OPEN" and desired ~= "CLOSED") then
     local failure = "Invalid captured GitHub pull request transition"
@@ -26,7 +25,7 @@ function M.transition_async(cwd, target, desired, callback)
     return
   end
   require("github.mutation").run({
-    directory = cwd, repo = target.repo, number = target.number,
+    repo = target.repo, number = target.number,
     mutation = { operation = "pull_request_transition", node_id = target.node_id, desired = desired },
   }, function(record, failure)
     local observed = record and record.state and record.state.result

@@ -323,7 +323,6 @@ Select `operation = "open"`. The native declaration is in [IssueRequest](../../.
 | --- | --- | --- |
 | `operation` | `"open"` | Required discriminator |
 | `document` | `DocumentId` | Required |
-| `directory` | `PathBuf` | Required |
 | `database` | `PathBuf` | Required |
 | `repository` | `GithubRepositoryId` | Required |
 | `number` | `u64` | Required |

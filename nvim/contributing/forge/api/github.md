@@ -9,7 +9,7 @@ All calls inherit the [request lifecycle and failure contract](lua-client.md#req
 Read the authenticated GitHub actor for a repository.
 
 - **Context:** GitHub resource; no session envelope.
-- **Input:** directory and repository.
+- **Input:** repository.
 - **Result and effects:** Returns actor identity.
 - **Boundary:** Authentication/network errors do not imply an unauthenticated empty actor.
 - **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
@@ -18,14 +18,14 @@ Read the authenticated GitHub actor for a repository.
 
 ### Contract
 
-Requires `directory` (local command context) and `repository` ([GithubRepositoryId](github-schemas.md#githubrepositoryid)). Returns [RemoteActor](github-schemas.md#remoteactor), containing `login` and authenticated `node_id`. The remote identity belongs to the requested hostname. This can launch the configured GitHub CLI and perform a network read. It does not change GitHub state or emit request progress. Invalid repository identity, missing authentication, remote failure, and malformed actor responses fail explicitly.
+Requires `repository` ([GithubRepositoryId](github-schemas.md#githubrepositoryid)). Returns [RemoteActor](github-schemas.md#remoteactor), containing `login` and authenticated `node_id`. The remote identity belongs to the requested hostname. This performs a network read and, on first use of a host, reads its token through `gh auth token`. It does not change GitHub state or emit request progress. Invalid repository identity, missing authentication, remote failure, and malformed actor responses fail explicitly.
 
 ## `github.comment`
 
 Change or reconcile a selected GitHub comment.
 
 - **Context:** GitHub/cache resource; no session envelope.
-- **Input:** directory, target, and typed CommentOperation.
+- **Input:** target and typed CommentOperation.
 - **Result and effects:** Returns the comment-operation result.
 - **Boundary:** Use the comment target and durable recovery identity for uncertain outcomes.
 - **Inspected source:** [`nvim/rust/forge/src/router.rs`](../../../rust/forge/src/router.rs).
@@ -36,7 +36,7 @@ Change or reconcile a selected GitHub comment.
 
 ### Contract
 
-Requires `directory`, `target` ([CommentTarget](github-schemas.md#commenttarget)), and `request` ([CommentOperation](github-schemas.md#commentoperation)). `edit` supplies body text and a stable receipt, `delete` supplies a stable receipt, and `reconcile` reads the captured target. Returns [CommentResult](github-schemas.md#commentresult), discriminated by `outcome`: confirmed/reconciled results carry optional comment state, while rejected/unknown results carry a message. A null state can confirm deletion.
+Requires `target` ([CommentTarget](github-schemas.md#commenttarget)), and `request` ([CommentOperation](github-schemas.md#commentoperation)). `edit` supplies body text and a stable receipt, `delete` supplies a stable receipt, and `reconcile` reads the captured target. Returns [CommentResult](github-schemas.md#commentresult), discriminated by `outcome`: confirmed/reconciled results carry optional comment state, while rejected/unknown results carry a message. A null state can confirm deletion.
 
 Mutations validate the PR/comment identities and authenticated ownership, serialize remote work, and preserve uncertain outcomes. A successful transport response with `outcome_unknown` is not permission to repeat the mutation. Reconcile the captured target and receipt first. It can perform network writes and durable recovery work but emits no request-progress stream. Invalid captures, conflicting ownership, authentication, remote rejection, and uncertain dispatch remain distinguishable.
 
@@ -45,7 +45,7 @@ Mutations validate the PR/comment identities and authenticated ownership, serial
 Open or operate on a native issue document.
 
 - **Context:** GitHub issue document; no session envelope.
-- **Input:** operation selects open, snapshot, save, refresh, view, close_view, act, resolve, or close; open includes document, directory, database, repository, and number.
+- **Input:** operation selects open, snapshot, save, refresh, view, close_view, act, resolve, or close; open includes document, database, repository, and number.
 - **Result and effects:** Returns document delivery, save/action/recovery outcome, or collection result.
 - **Boundary:** save/act/resolve can mutate remote or durable draft state and require captured identities.
 - **Inspected source:** [`nvim/rust/forge/src/router/issue_routes.rs`](../../../rust/forge/src/router/issue_routes.rs).
@@ -56,7 +56,7 @@ Open or operate on a native issue document.
 
 ### Contract
 
-Uses the `operation` discriminator and exact [IssueRequest](operation-schemas.md) fields. `open` supplies a document ID, directory, database, repository, and number, acquires the issue, and returns [IssueOpen](review-schemas.md#issueopen). `snapshot` returns the retained IssueOpen without refetching. `save` supplies document and optional capture array and returns [IssueSave](review-schemas.md#issuesave). `refresh` returns [IssueUpdate](review-schemas.md#issueupdate), and `resolve` returns [IssueSave](review-schemas.md#issuesave); resolve requires the retained operation ID and [RecoveryResolution](github-schemas.md#recoveryresolution). `view` supplies document/view/width, and `close_view` supplies document/view; both return an optional buffer patch. `act` supplies [DocumentInput](repository-schemas.md#documentinput) and returns [IssueEffect](review-schemas.md#issueeffect). `close` returns `{ "collected": boolean }` after document collection.
+Uses the `operation` discriminator and exact [IssueRequest](operation-schemas.md) fields. `open` supplies a document ID, database, repository, and number, acquires the issue, and returns [IssueOpen](review-schemas.md#issueopen). `snapshot` returns the retained IssueOpen without refetching. `save` supplies document and optional capture array and returns [IssueSave](review-schemas.md#issuesave). `refresh` returns [IssueUpdate](review-schemas.md#issueupdate), and `resolve` returns [IssueSave](review-schemas.md#issuesave); resolve requires the retained operation ID and [RecoveryResolution](github-schemas.md#recoveryresolution). `view` supplies document/view/width, and `close_view` supplies document/view; both return an optional buffer patch. `act` supplies [DocumentInput](repository-schemas.md#documentinput) and returns [IssueEffect](review-schemas.md#issueeffect). `close` returns `{ "collected": boolean }` after document collection.
 
 Open/refresh read remote issue data and maintain the local cache. Save can publish edited fields, while resolve settles a captured uncertain mutation. Captured edits must belong to this document. Preserve newer local edits, conflict/uncertainty flags, and recovery identity until resolved. View operations change local layout only. Inputs use document/view/target/sequence ownership, and stale inputs fail. Closing does not cancel already admitted remote work. Invalid variants, unknown document ownership, conflicting remote operations, malformed content, and I/O failures remain explicit. There is no request-progress stream.
 
@@ -65,7 +65,7 @@ Open/refresh read remote issue data and maintain the local cache. Save can publi
 Fetch or refresh a selected issue's detail.
 
 - **Context:** GitHub/cache resource; no session envelope.
-- **Input:** database, directory, and typed IssueDetailRequest.
+- **Input:** database and typed IssueDetailRequest.
 - **Result and effects:** Returns issue detail.
 - **Boundary:** Remote/cache errors remain explicit.
 - **Inspected source:** [`nvim/rust/forge/src/router.rs`](../../../rust/forge/src/router.rs).
@@ -76,7 +76,7 @@ Fetch or refresh a selected issue's detail.
 
 ### Contract
 
-Requires `database`, `directory`, and `request` ([IssueDetailRequest](github-schemas.md#issuedetailrequest)). The request identifies the repository and an issue number greater than zero and no larger than the signed 32-bit range. Returns [DetailRecord](github-schemas.md#detailrecord), whose `item` contains the complete [IssueDetail](github-schemas.md#issuedetail) and whose `fetched_at` is Unix time in seconds.
+Requires `database` and `request` ([IssueDetailRequest](github-schemas.md#issuedetailrequest)). The request identifies the repository and an issue number greater than zero and no larger than the signed 32-bit range. Returns [DetailRecord](github-schemas.md#detailrecord), whose `item` contains the complete [IssueDetail](github-schemas.md#issuedetail) and whose `fetched_at` is Unix time in seconds.
 
 The service verifies repository/issue identity, performs the remote read, and commits identical content to the local detail cache before returning. It holds repository operation ownership against cache deletion. The remote read has a 120-second deadline. Invalid identity, a busy/deleting store, remote failure, and cache commit failure are explicit. It does not publish a remote mutation or emit request progress.
 
@@ -105,7 +105,7 @@ Only the selected local operation executes. Upserts change cached data, publicat
 Synchronize an issue store with GitHub.
 
 - **Context:** GitHub/cache resource; no session envelope.
-- **Input:** database, directory, typed SyncRequest, and progress boolean defaulting false.
+- **Input:** database, typed SyncRequest, and progress boolean defaulting false.
 - **Result and effects:** Returns synchronization outcome and optional request-correlated progress.
 - **Boundary:** Progress is not final completion; sync writes the local issue cache.
 - **Inspected source:** [`nvim/rust/forge/src/router.rs`](../../../rust/forge/src/router.rs).
@@ -116,7 +116,7 @@ Synchronize an issue store with GitHub.
 
 ### Contract
 
-Requires `database`, `directory`, and `request` ([SyncRequest](github-schemas.md#syncrequest)). `progress` is optional and defaults to false. The request supplies repository identity, scope, output snapshot path, and optional `manual` (false by default). Returns [SyncOutcome](github-schemas.md#syncoutcome): whether a refresh occurred and the fetched-record/page counts. A recent nonmanual request can skip refresh through the ten-minute freshness rule.
+Requires `database` and `request` ([SyncRequest](github-schemas.md#syncrequest)). `progress` is optional and defaults to false. The request supplies repository identity, scope, output snapshot path, and optional `manual` (false by default). Returns [SyncOutcome](github-schemas.md#syncoutcome): whether a refresh occurred and the fetched-record/page counts. A recent nonmanual request can skip refresh through the ten-minute freshness rule.
 
 Synchronization reads remote pages, commits local issue/cache state, and publishes the requested completion snapshot. With `progress: true`, request events named `github.issue.sync.progress` carry [SyncProgress](github-schemas.md#syncprogress) and the originating `request_id`. Progress is a latest-state stream, so intermediate updates can coalesce. The terminal response establishes completion even if the final progress update was coalesced. Local ownership, storage/publication, authentication, rate, remote, and decoding failures remain explicit. This does not mutate remote issues.
 
@@ -161,7 +161,7 @@ Requires `directory` and `request` ([NotificationReadRequest](github-schemas.md#
 Change or reconcile a pull request.
 
 - **Context:** GitHub/cache resource; no session envelope.
-- **Input:** directory and a PullRequestRequest selecting transition, edit, reconcile, or reconcile_edit for its target.
+- **Input:** a PullRequestRequest selecting transition, edit, reconcile, or reconcile_edit for its target.
 - **Result and effects:** Returns the pull-request operation outcome.
 - **Boundary:** This is a mutation/reconciliation dispatcher, not a get-only endpoint.
 - **Inspected source:** [`nvim/rust/forge/src/router.rs`](../../../rust/forge/src/router.rs).
@@ -172,7 +172,7 @@ Change or reconcile a pull request.
 
 ### Contract
 
-Requires `directory` and `request` ([PullRequestRequest](github-schemas.md#pullrequestrequest)). The request carries the PR target and selects transition, edit, or their reconciliation operations. The nested `request` uses [PullRequestOperation](github-schemas.md#pullrequestoperation) and captures the intended state/text. Returns [PullRequestResult](github-schemas.md#pullrequestresult), including `ok`, the outcome, and optional observed state or text.
+Requires `request` ([PullRequestRequest](github-schemas.md#pullrequestrequest)). The request carries the PR target and selects transition, edit, or their reconciliation operations. The nested `request` uses [PullRequestOperation](github-schemas.md#pullrequestoperation) and captures the intended state/text. Returns [PullRequestResult](github-schemas.md#pullrequestresult), including `ok`, the outcome, and optional observed state or text.
 
 The service serializes work for the remote PR, validates identity and current state, and retains uncertain delivery. A terminal transport response can report an unknown remote outcome. Reconciliation reads the captured remote target before another write is authorized. This can mutate GitHub and durable recovery state. It emits no request progress. Invalid identities, competing ownership, unavailable authentication, changed remote state, rejection, and transport uncertainty remain explicit.
 
@@ -190,7 +190,7 @@ Collect the repository/branch context required for PR creation.
 
 ### Contract
 
-Requires `directory` (local repository path). Returns [CreationContext](github-schemas.md#creationcontext): validated remote repository identity, repository node ID, current branch, and head commit. The operation reads repository metadata through the configured GitHub CLI and reads the branch/commit through Git. It does not create a pull request, modify Git state, or emit request progress. Missing repository context, detached/invalid branch or commit data, authentication, remote, and decoding failures remain errors.
+Requires `directory` (local repository path). Returns [CreationContext](github-schemas.md#creationcontext): validated remote repository identity, repository node ID, current branch, and head commit. The operation selects the base remote from the Git remotes, reads repository metadata through GraphQL, and reads the branch/commit through Git. It does not create a pull request, modify Git state, or emit request progress. Missing repository context, detached/invalid branch or commit data, authentication, remote, and decoding failures remain errors.
 
 ## `github.recovery.acknowledge`
 
@@ -247,7 +247,7 @@ Requires `resource` ([RecoveryResource](github-schemas.md#recoveryresource)). Re
 Apply an explicit recovery resolution.
 
 - **Context:** GitHub resource; no session envelope.
-- **Input:** directory, resource, operation_id, and typed resolution.
+- **Input:** resource, operation_id, and typed resolution.
 - **Result and effects:** Returns the resolved recovery record.
 - **Boundary:** Resolution can inspect or link remote outcomes and must preserve the captured operation identity.
 - **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
@@ -256,7 +256,7 @@ Apply an explicit recovery resolution.
 
 ### Contract
 
-Requires `directory` (local GitHub command context), `resource`, `operation_id` (string matching the retained capture), and `resolution` ([RecoveryResolution](github-schemas.md#recoveryresolution)). `link` requires positive integer `remote_id` and reads/verifies that remote result. `close_unknown` records the user's decision to close uncertainty without asserting non-delivery. `not_dispatched` is valid only while the record is still prepared and cannot override possible dispatch.
+Requires `resource`, `operation_id` (string matching the retained capture), and `resolution` ([RecoveryResolution](github-schemas.md#recoveryresolution)). `link` requires positive integer `remote_id` and reads/verifies that remote result. `close_unknown` records the user's decision to close uncertainty without asserting non-delivery. `not_dispatched` is valid only while the record is still prepared and cannot override possible dispatch.
 
 Returns the updated [RecoveryRecord](github-schemas.md#recoveryrecord). Resolution obtains resource ownership and persists the outcome. Linking can contact GitHub; it does not execute the original write again. Changed operation/resource identities, failed remote verification, lost ownership, and invalid phase transitions fail. It emits no request progress. Settle any editable draft before acknowledging the terminal record.
 
@@ -265,7 +265,7 @@ Returns the updated [RecoveryRecord](github-schemas.md#recoveryrecord). Resoluti
 Read cached or refreshed repository contributor metadata.
 
 - **Context:** GitHub/cache resource; no session envelope.
-- **Input:** cache_directory, directory, and MetadataRequest with repository and ttl_seconds.
+- **Input:** cache_directory and MetadataRequest with repository and ttl_seconds.
 - **Result and effects:** Returns repository metadata and contributor-read failure information where represented.
 - **Boundary:** The TTL controls cache freshness rather than changing repository identity.
 - **Inspected source:** [`nvim/rust/forge/src/router.rs`](../../../rust/forge/src/router.rs).
@@ -276,7 +276,7 @@ Read cached or refreshed repository contributor metadata.
 
 ### Contract
 
-Requires `directory`, `cache_directory`, and `request` ([MetadataRequest](github-schemas.md#metadatarequest)). The cache directory must end in `<encoded-hostname>/repos/<owner>/<name>` matching the requested repository, case-insensitively. Hostname bytes outside ASCII letters, digits, dots, and hyphens use uppercase percent encoding. The request contains repository identity and optional `ttl_seconds`, defaulting to 600. Returns [RepositoryMetadata](github-schemas.md#repositorymetadata): repo/hostname identity, fetch time, contributors, and any per-source failures. The operation uses a valid fresh local cache or reads remote contributor sources and updates that cache. A partially successful result can include `failure` entries and must not be presented as complete contributor discovery. Invalid cache identity, unavailable ownership, total remote failure, and storage errors remain explicit. It performs no remote write and emits no request progress.
+Requires `cache_directory` and `request` ([MetadataRequest](github-schemas.md#metadatarequest)). The cache directory must end in `<encoded-hostname>/repos/<owner>/<name>` matching the requested repository, case-insensitively. Hostname bytes outside ASCII letters, digits, dots, and hyphens use uppercase percent encoding. The request contains repository identity and optional `ttl_seconds`, defaulting to 600. Returns [RepositoryMetadata](github-schemas.md#repositorymetadata): repo/hostname identity, fetch time, contributors, and any per-source failures. The operation uses a valid fresh local cache or reads remote contributor sources and updates that cache. A partially successful result can include `failure` entries and must not be presented as complete contributor discovery. Invalid cache identity, unavailable ownership, total remote failure, and storage errors remain explicit. It performs no remote write and emits no request progress.
 
 ## `github.review.document.batch.begin`
 
@@ -723,7 +723,7 @@ Requires `resource` and `draft` (object). The draft must include `repo` (`owner/
 Execute a captured GitHub review mutation.
 
 - **Context:** GitHub resource; no session envelope.
-- **Input:** directory and typed ReviewMutationRequest.
+- **Input:** typed ReviewMutationRequest.
 - **Result and effects:** Returns the mutation record/outcome.
 - **Boundary:** Retain the operation identity when remote acceptance is uncertain.
 - **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
@@ -732,7 +732,7 @@ Execute a captured GitHub review mutation.
 
 ### Contract
 
-Requires `directory` (local GitHub command context) and `request` ([ReviewMutationRequest](github-schemas.md#reviewmutationrequest)). The request captures resource, stable operation ID, authenticated actor node ID, optional parent node ID, optional edit sequence/draft target, and exactly one tagged [ReviewMutation](github-schemas.md#reviewmutation). The linked declaration enumerates every accepted operation and its fields.
+Requires `request` ([ReviewMutationRequest](github-schemas.md#reviewmutationrequest)). The request captures resource, stable operation ID, authenticated actor node ID, optional parent node ID, optional edit sequence/draft target, and exactly one tagged [ReviewMutation](github-schemas.md#reviewmutation). The linked declaration enumerates every accepted operation and its fields.
 
 Returns a durable [RecoveryRecord](github-schemas.md#recoveryrecord), including captured intent, confirmed partial steps, and the resulting phase. The service obtains per-resource ownership, writes intent before possible dispatch, validates remote actor/context, and performs the selected GitHub mutation. A transport-successful response may still report rejected or unknown outcome. An existing unsettled record blocks another write for that resource. Do not change the operation ID to bypass it.
 
@@ -743,7 +743,7 @@ The call can perform network writes and local persistence. It emits no request-p
 Read current remote context before submitting a review.
 
 - **Context:** GitHub resource; no session envelope.
-- **Input:** directory, repository, number, optional pending_review_id, and expected comment/review items.
+- **Input:** repository, number, optional pending_review_id, and expected comment/review items.
 - **Result and effects:** Returns submission context for validating the pending review.
 - **Boundary:** Changed remote state must be reconciled before submitting captured drafts.
 - **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
@@ -752,7 +752,7 @@ Read current remote context before submitting a review.
 
 ### Contract
 
-Requires `directory`, `repository` ([GithubRepositoryId](github-schemas.md#githubrepositoryid)), `number` (positive integer through the signed 32-bit range), and `expected` (array of [PendingReviewExpected](github-schemas.md#pendingreviewexpected)). `pending_review_id` is optional/null, or a positive integer. Each expected member has a unique positive `id` and exact `body` text.
+Requires `repository` ([GithubRepositoryId](github-schemas.md#githubrepositoryid)), `number` (positive integer through the signed 32-bit range), and `expected` (array of [PendingReviewExpected](github-schemas.md#pendingreviewexpected)). `pending_review_id` is optional/null, or a positive integer. Each expected member has a unique positive `id` and exact `body` text.
 
 Returns [ReviewSubmissionContext](github-schemas.md#reviewsubmissioncontext): actor node ID, current PR head commit, optional pending review ID, and captured pending comments. It reads remote identity and review membership, verifies that the review remains pending and belongs to the actor, and compares exact member identities/text. Changed head identity, actor, state, or membership fails instead of authorizing a stale submission. The call does not submit the review or emit request progress.
 

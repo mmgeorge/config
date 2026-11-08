@@ -1,12 +1,12 @@
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{future::Future, pin::Pin};
 
 use serde_json::{Value, json};
 
-use super::{GhClient, GhDirectory, classify_failure, diagnostic, remote_result};
+use super::{ApiRequest, GithubClient, remote_result};
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 use crate::review_api::{GithubReviewRemote, ReviewPage, ReviewReadRequest, ReviewSection};
 
-impl GithubReviewRemote for GhClient {
+impl GithubReviewRemote for GithubClient {
     fn read_commit_detail(
         &self,
         request: crate::review_source::ReviewCommitDetailRequest,
@@ -17,7 +17,7 @@ impl GithubReviewRemote for GhClient {
                 + '_,
         >,
     > {
-        Box::pin(self.read_commit_detail_at(self.directory.clone(), request))
+        Box::pin(self.read_commit_detail_at(request))
     }
     fn read_source(
         &self,
@@ -29,7 +29,7 @@ impl GithubReviewRemote for GhClient {
                 + '_,
         >,
     > {
-        Box::pin(self.read_source_at(self.directory.clone(), request))
+        Box::pin(self.read_source_at(request))
     }
     fn read_comparison(
         &self,
@@ -41,64 +41,13 @@ impl GithubReviewRemote for GhClient {
                 + '_,
         >,
     > {
-        Box::pin(self.read_comparison_at(self.directory.clone(), request))
+        Box::pin(self.read_comparison_at(request))
     }
     fn read_review(
         &self,
         request: ReviewReadRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ReviewPage, RemoteFailure>> + Send + '_>> {
-        Box::pin(self.read_review_at(self.directory.clone(), request))
-    }
-}
-
-impl GithubReviewRemote for GhDirectory {
-    fn read_commit_detail(
-        &self,
-        request: crate::review_source::ReviewCommitDetailRequest,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<crate::review_source::ReviewCommitDetail, RemoteFailure>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(
-            self.client
-                .read_commit_detail_at(self.directory.clone(), request),
-        )
-    }
-    fn read_source(
-        &self,
-        request: crate::review_source::ReviewSourceRequest,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<crate::review_source::ReviewSource, RemoteFailure>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(self.client.read_source_at(self.directory.clone(), request))
-    }
-    fn read_comparison(
-        &self,
-        request: crate::review_source::ReviewComparisonRequest,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<crate::review_source::ReviewComparison, RemoteFailure>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(
-            self.client
-                .read_comparison_at(self.directory.clone(), request),
-        )
-    }
-    fn read_review(
-        &self,
-        request: ReviewReadRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ReviewPage, RemoteFailure>> + Send + '_>> {
-        Box::pin(self.client.read_review_at(self.directory.clone(), request))
+        Box::pin(self.read_review_at(request))
     }
 }
 
@@ -215,97 +164,74 @@ impl RestPage {
     }
 }
 
-impl GhClient {
+impl GithubClient {
     async fn read_review_at(
         &self,
-        directory: PathBuf,
         request: ReviewReadRequest,
     ) -> Result<ReviewPage, RemoteFailure> {
         request
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
-        let mut argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.repository.hostname().into(),
-        ];
-        let (encoded, response) = match ReviewOperation::from_section(&request.view, request.number)
-        {
-            ReviewOperation::Graph(view) => {
-                let thread = match &view {
-                    GraphReview::ThreadComments { thread_node_id } => json!(thread_node_id),
-                    _ => Value::Null,
-                };
-                let encoded = json!({"query":view.query(),"variables":{
-                    "owner":request.repository.owner(), "name":request.repository.name(),
-                    "number":request.number, "cursor":request.cursor, "thread":thread
-                }})
-                .to_string()
-                .into_bytes();
-                argument.push("graphql".into());
-                (Some(encoded), ReviewResponse::Graph(view))
-            }
-            ReviewOperation::Rest { path, kind } => {
-                let page = RestPage::parse(request.cursor.as_deref())?;
-                let prefix = format!("repos/{}/{path}", request.repository.repository_name());
-                let (endpoint, response) = match kind {
-                    RestReview::Object => (prefix, ReviewResponse::Object),
-                    RestReview::Collection { filter } => (
-                        format!("{prefix}?per_page=100&page={}{filter}", page.0),
-                        ReviewResponse::Collection(page),
-                    ),
-                    RestReview::Diff => {
-                        argument.extend([
-                            "--header".into(),
-                            "Accept: application/vnd.github.diff".into(),
-                        ]);
-                        (prefix, ReviewResponse::Diff)
-                    }
-                };
-                argument.push(endpoint.into());
-                (None, response)
-            }
-        };
-        remote_result(
-            self.run_native(directory, argument, encoded, 4096, move |output| {
-                if !output.status.success() {
-                    return Err(classify_failure(diagnostic(&String::from_utf8_lossy(
-                        if output.stderr.is_empty() {
-                            &output.stdout
-                        } else {
-                            &output.stderr
-                        },
-                    ))));
+        let hostname = request.repository.hostname();
+        let (api_request, response) =
+            match ReviewOperation::from_section(&request.view, request.number) {
+                ReviewOperation::Graph(view) => {
+                    let thread = match &view {
+                        GraphReview::ThreadComments { thread_node_id } => json!(thread_node_id),
+                        _ => Value::Null,
+                    };
+                    let payload = json!({"query":view.query(),"variables":{
+                        "owner":request.repository.owner(), "name":request.repository.name(),
+                        "number":request.number, "cursor":request.cursor, "thread":thread
+                    }});
+                    (
+                        ApiRequest::graphql(hostname, &payload),
+                        ReviewResponse::Graph(view),
+                    )
                 }
-                match response {
-                    ReviewResponse::Diff => {
-                        let diff = String::from_utf8(output.stdout)
-                            .map_err(|error| invalid(error.to_string()))?;
-                        Ok(ReviewPage {
-                            records: vec![json!({"diff":diff})],
-                            next_cursor: None,
-                            complete: true,
-                        })
+                ReviewOperation::Rest { path, kind } => {
+                    let page = RestPage::parse(request.cursor.as_deref())?;
+                    let prefix = format!("repos/{}/{path}", request.repository.repository_name());
+                    match kind {
+                        RestReview::Object => {
+                            (ApiRequest::get(hostname, prefix), ReviewResponse::Object)
+                        }
+                        RestReview::Collection { filter } => (
+                            ApiRequest::get(
+                                hostname,
+                                format!("{prefix}?per_page=100&page={}{filter}", page.0),
+                            ),
+                            ReviewResponse::Collection(page),
+                        ),
+                        RestReview::Diff => (
+                            ApiRequest::get(hostname, prefix)
+                                .with_accept("application/vnd.github.diff"),
+                            ReviewResponse::Diff,
+                        ),
                     }
-                    ReviewResponse::Object => {
-                        let value: Value = serde_json::from_slice(&output.stdout)
-                            .map_err(|error| invalid(error.to_string()))?;
-                        Ok(ReviewPage {
-                            records: vec![value],
-                            next_cursor: None,
-                            complete: true,
-                        })
-                    }
-                    ReviewResponse::Collection(page) => {
-                        let value: Value = serde_json::from_slice(&output.stdout)
-                            .map_err(|error| invalid(error.to_string()))?;
-                        decode_collection(value, page)
-                    }
-                    ReviewResponse::Graph(view) => {
-                        let value: Value = serde_json::from_slice(&output.stdout)
-                            .map_err(|error| invalid(error.to_string()))?;
-                        decode_graph(value, &request, view)
-                    }
+                }
+            };
+        remote_result(
+            self.send(api_request, move |api_response| match response {
+                ReviewResponse::Diff => {
+                    let diff = String::from_utf8(api_response.into_success()?)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    Ok(ReviewPage {
+                        records: vec![json!({"diff":diff})],
+                        next_cursor: None,
+                        complete: true,
+                    })
+                }
+                ReviewResponse::Object => Ok(ReviewPage {
+                    records: vec![api_response.into_json()?],
+                    next_cursor: None,
+                    complete: true,
+                }),
+                ReviewResponse::Collection(page) => {
+                    decode_collection(api_response.into_json()?, page)
+                }
+                ReviewResponse::Graph(view) => {
+                    decode_graph(api_response.into_json()?, &request, view)
                 }
             })
             .await,

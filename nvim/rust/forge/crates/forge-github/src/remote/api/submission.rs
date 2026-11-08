@@ -1,9 +1,7 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{GhClient, GhDirectory, remote_result};
+use super::{ApiRequest, GithubClient, remote_result};
 use crate::{
     model::GithubRepositoryId,
     remote::{GithubRemote, RemoteFailure, RemoteFailureKind},
@@ -26,7 +24,7 @@ pub struct ReviewSubmissionContext {
     pub pending_comment: Vec<PendingReviewMember>,
 }
 
-impl GhDirectory {
+impl GithubClient {
     pub async fn submission_context(
         &self,
         repository: GithubRepositoryId,
@@ -45,10 +43,7 @@ impl GhDirectory {
         }
         let actor = self.read_actor(repository.clone()).await?;
         let prefix = format!("repos/{}/pulls/{number}", repository.repository_name());
-        let parent = self
-            .client
-            .submission_json_at(self.directory.clone(), &repository, prefix.clone())
-            .await?;
+        let parent = self.submission_json_at(&repository, prefix.clone()).await?;
         if parent.get("number").and_then(Value::as_u64) != Some(number) {
             return Err(invalid("review submission parent identity changed"));
         }
@@ -61,12 +56,7 @@ impl GhDirectory {
         drop(parent);
         let pending_comment = if let Some(review) = pending_review_id {
             let observed = self
-                .client
-                .submission_json_at(
-                    self.directory.clone(),
-                    &repository,
-                    format!("{prefix}/reviews/{review}"),
-                )
+                .submission_json_at(&repository, format!("{prefix}/reviews/{review}"))
                 .await?;
             if observed.get("id").and_then(Value::as_u64) != Some(review)
                 || observed.get("state").and_then(Value::as_str) != Some("PENDING")
@@ -75,9 +65,7 @@ impl GhDirectory {
             {
                 return Err(invalid("pending review identity, state, or actor changed"));
             }
-            self.client
-                .pending_members_at(self.directory.clone(), &repository, number, review)
-                .await?
+            self.pending_members_at(&repository, number, review).await?
         } else {
             Vec::new()
         };
@@ -102,26 +90,16 @@ impl GhDirectory {
     }
 }
 
-impl GhClient {
+impl GithubClient {
     async fn submission_json_at(
         &self,
-        directory: PathBuf,
         repository: &GithubRepositoryId,
         endpoint: String,
     ) -> Result<Value, RemoteFailure> {
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            repository.hostname().into(),
-            endpoint.into(),
-        ];
         remote_result(
-            self.run_native(
-                directory,
-                argument,
-                None,
-                8 * 1024 * 1024,
-                super::source::response,
+            self.send(
+                ApiRequest::get(repository.hostname(), endpoint),
+                super::ApiResponse::into_json,
             )
             .await,
         )
@@ -129,7 +107,6 @@ impl GhClient {
 
     pub(super) async fn pending_members_at(
         &self,
-        directory: PathBuf,
         repository: &GithubRepositoryId,
         number: u64,
         review: u64,
@@ -138,33 +115,24 @@ impl GhClient {
         let mut seen = std::collections::HashSet::new();
         let mut page = 1u64;
         loop {
-            let argument = vec![
-                "api".into(),
-                "--hostname".into(),
-                repository.hostname().into(),
+            let api_request = ApiRequest::get(
+                repository.hostname(),
                 format!(
                     "repos/{}/pulls/{number}/reviews/{review}/comments?per_page=100&page={page}",
                     repository.repository_name()
-                )
-                .into(),
-            ];
+                ),
+            );
             let members = remote_result(
-                self.run_native(
-                    directory.clone(),
-                    argument,
-                    None,
-                    8 * 1024 * 1024,
-                    |output| {
-                        let value = super::source::response(output)?;
-                        let record = value.as_array().ok_or_else(|| {
-                            invalid("pending review comments are not a collection")
-                        })?;
-                        record
-                            .iter()
-                            .map(decode_member)
-                            .collect::<Result<Vec<_>, _>>()
-                    },
-                )
+                self.send(api_request, |response| {
+                    let value: Value = response.into_json()?;
+                    let record = value
+                        .as_array()
+                        .ok_or_else(|| invalid("pending review comments are not a collection"))?;
+                    record
+                        .iter()
+                        .map(decode_member)
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .await,
             )?;
             let complete = members.len() < 100;

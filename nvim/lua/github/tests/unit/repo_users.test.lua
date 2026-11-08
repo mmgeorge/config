@@ -26,10 +26,10 @@ T["metadata"] = function()
   local pending, observed
   users._set_runner_for_test(function(params, callback) observed, pending = params, callback end)
   local calls, result = 0, nil
-  users.fetch_async({ repo = "Owner/Repo", cwd = directory, ttl_seconds = 7, callback = function(value)
+  users.fetch_async({ repo = "Owner/Repo", ttl_seconds = 7, callback = function(value)
     calls, result = calls + 1, value
   end })
-  assert(observed.cache_directory == cache.repo_dir("Owner/Repo") and observed.directory == directory)
+  assert(observed.cache_directory == cache.repo_dir("Owner/Repo") and observed.directory == nil)
   assert(observed.request.repository.hostname == cache.hostname() and observed.request.ttl_seconds == 7)
   local metadata = { repo = "owner/repo", hostname = cache.hostname(), fetched_at = os.time(), contributors = {} }
   pending(metadata, nil)

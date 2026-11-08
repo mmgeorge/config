@@ -29,19 +29,9 @@ setup = "git-template"
 # pushes them over the default limit.
 
 # Stdio suites: these tests launch the built `forge` executable and talk to it over stdio,
-# because the stdio contract is what they verify. Each pays host process startup, and the GitHub
-# tests among them also launch the compiled `gh` fixture once per request.
+# because the stdio contract is what they verify. Each pays host process startup.
 [[profile.default.overrides]]
 filter = "package(forge) & (binary(repository_stdio) | binary(harness_broker_stdio))"
-slow-timeout = { period = "10s", terminate-after = 1 }
-
-# `gh` client suite: these tests verify the `gh` process contract, which covers arguments, input
-# files, admission and reaping abandoned children. Each test process compiles
-# `tests/fixtures/gh.rs` with `rustc` once, about a second before the first request, then launches
-# it per request. Replacing `gh` with an in-process HTTP client removes this exception; see
-# `octo-plan-followup.md` at the repository root.
-[[profile.default.overrides]]
-filter = "package(forge-github) & binary(gh_client)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
 # Git writer suite: the writer's contract is how real Git applies its config, index and worktree

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_git::store::RepositoryStore;
-use forge_github::{remote::GhClient, service::GithubService};
+use forge_github::{remote::GithubClient, service::GithubService};
 use forge_harness::service::HarnessService;
 use forge_review::service::ReviewService;
 
@@ -29,7 +29,7 @@ pub struct ForgeRuntime {
     pub harness: HarnessService,
     pub github: GithubService,
     pub review: ReviewService,
-    pub github_remote: Arc<GhClient>,
+    pub github_remote: Arc<GithubClient>,
     pub requests: Arc<crate::host::RequestTaskStore>,
 }
 
@@ -72,7 +72,7 @@ impl ForgeRuntime {
             forge_review::edit::EditBudget::default(),
             diff.analysis_pool(),
         );
-        let github_remote = Arc::new(GhClient::new("gh".into(), std::env::current_dir()?)?);
+        let github_remote = Arc::new(GithubClient::new("gh".into())?);
         Ok(Self {
             writes,
             generation,

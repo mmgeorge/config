@@ -30,7 +30,7 @@ function M.context(directory, callback)
   end)
 end
 
-function M.create(directory, context, base, metadata, callback)
+function M.create(context, base, metadata, callback)
   local mutation = { operation = "pull_request_create", repository_node_id = context.repository_node_id,
     title = metadata.title, body = metadata.body, base = base, head = context.branch,
     head_commit = context.head_commit, draft = true }
@@ -59,10 +59,10 @@ function M.create(directory, context, base, metadata, callback)
         if inspection_failure then callback(nil, inspection_failure) return end
         local mutations = require("github.mutation")
         if type(record) == "table" then
-          mutations.resolve(directory, record, settle, completed)
+          mutations.resolve(record, settle, completed)
           return
         end
-        mutations.run({ directory = directory, repo = repo, kind = "repository", number = 0,
+        mutations.run({ repo = repo, kind = "repository", number = 0,
           edit_sequence = draft.creation.sequence, draft_target = "pr:create", mutation = mutation, settle = settle }, completed)
       end)
     end)

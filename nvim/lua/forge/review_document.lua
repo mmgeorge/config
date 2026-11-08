@@ -574,7 +574,7 @@ end
 load_actor = function(state)
   if state.actor_loading or not state.repository then return end
   state.actor_loading = true
-  request(state, "github.actor.get", { directory = state.directory, repository = state.repository }, function(actor, failure)
+  request(state, "github.actor.get", { repository = state.repository }, function(actor, failure)
     state.actor_loading = false
     if failure or type(actor) ~= "table" or type(actor.login) ~= "string" or actor.login == "" then
       if state.pending_operation and state.pending_operation.kind == "save" then state.pending_operation = nil end

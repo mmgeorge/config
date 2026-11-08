@@ -43,7 +43,7 @@ Long-running work must not publish into retired views or release resource owners
 | [Status](status.md) | Status documents, index writes, and mutation admission |
 | [Checkpoints](checkpoints.md) | Capture, change attribution, the object store, and restoration |
 | [Commit messages](commit-messages.md) | Commit context, excerpts, and Background conversations |
-| [GitHub services](github-and-review.md) | Native `gh` execution, storage, issues, and the remote queue |
+| [GitHub services](github-and-review.md) | The GitHub HTTP client, storage, issues, and the remote queue |
 | [Pull request review](pull-request-review.md) | PR creation, review documents, comments, and batched review |
 
 ## Source entry points

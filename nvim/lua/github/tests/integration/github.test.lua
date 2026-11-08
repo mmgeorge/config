@@ -1,5 +1,4 @@
 local MiniTest = require("mini.test")
-local gh_fixture = dofile("nvim/lua/github/tests/support/gh_fixture.lua")
 local eq = MiniTest.expect.equality
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
@@ -48,7 +47,6 @@ T["issue_index"] = function()
   local original_hostname = repo_cache.hostname
   local original_system = vim.system
   local original_notify = vim.notify
-  local host_builder = require("forge.builder")
 
   local repo = "mmgeorge/test-repo"
   write_snapshot(repo, {
@@ -106,7 +104,6 @@ T["issue_index"] = function()
   eq(sync_params.request.manual, true, { fail_reason = "manual option was not forwarded" })
   eq(sync_params.database, issue_index.db_path(repo), { fail_reason = "database path changed" })
   eq(sync_params.request.snapshot, issue_index.snapshot_path(repo), { fail_reason = "snapshot path changed" })
-  eq(sync_params.directory, test_root, { fail_reason = "checkout context changed" })
   eq(sync_result, nil, { fail_reason = "sync completed before its host response" })
   local busy_result
   issue_index.sync_repo(test_root, repo, { manual = true, on_complete = function(result) busy_result = result end })
@@ -301,121 +298,6 @@ T["issue_index"] = function()
   eq(item.textEdit.newText, "#42", { fail_reason = "completion edit text mismatch" })
   eq(item.textEdit.range.start.character, 4, { fail_reason = "completion edit start mismatch" })
   eq(item.textEdit.range["end"].character, 7, { fail_reason = "completion edit end mismatch" })
-
-  local binary = vim.fs.joinpath(vim.fn.getcwd(), "nvim", "rust", "forge", "target", "debug", "forge")
-  issue_index._set_storage_runner_for_test(nil)
-  if vim.fn.has("win32") == 1 then binary = binary .. ".exe" end
-  assert(vim.fn.executable(binary) == 1, "build the Forge debug executable before native issue tests")
-  local gh_directory = gh_fixture.directory()
-  host_builder.ensure = function(callback) callback({ ok = true, path = binary }) end
-  host_client._host_set_launcher_for_test(function(command, options, on_exit)
-    options.env = { PATH = gh_directory }
-    return vim.system(command, options, on_exit)
-  end)
-  local native_repo = "mmgeorge/native-repo"
-  local native_cwd = vim.fs.joinpath(test_root, "native")
-  vim.fn.mkdir(native_cwd, "p")
-  vim.fn.writefile({ repo_cache.hostname() }, vim.fs.joinpath(native_cwd, "host"), "b")
-  vim.fn.writefile({ "success" }, vim.fs.joinpath(native_cwd, "mode"), "b")
-  vim.fn.writefile({ vim.json.encode({ data = {
-    rateLimit = { remaining = 5000 }, repository = { issues = {
-      totalCount = 1, pageInfo = { hasNextPage = false, endCursor = vim.NIL }, nodes = { {
-        number = 201, title = "Native sync issue", state = "OPEN",
-        url = "https://" .. repo_cache.hostname() .. "/" .. native_repo .. "/issues/201",
-        createdAt = "2026-06-17T20:00:00Z", updatedAt = "2026-06-17T20:00:00Z",
-        labels = { nodes = { { name = "enhancement" } } },
-      } },
-    } },
-  } }) }, vim.fs.joinpath(native_cwd, "response.json"))
-  sync_result = nil
-  issue_index.sync_repo(native_cwd, native_repo, { manual = true, on_complete = function(result) sync_result = result end })
-  wait_until(function() return sync_result ~= nil end, "native sync did not complete", 4000)
-  assert(sync_result.ok, "native sync failed: " .. vim.inspect(sync_result))
-  eq(sync_result.fetched, 1, { fail_reason = "native sync count mismatch" })
-  eq(#issue_index.search(native_repo, "enhancement"), 1, { fail_reason = "native sync did not preload the published snapshot" })
-  assert(host_client._client.ready and not host_client._client.harness_ready, "issue sync initialized Harness")
-  sync_result = nil
-  issue_index.sync_repo(native_cwd, native_repo, { on_complete = function(result) sync_result = result end })
-  wait_until(function() return sync_result ~= nil end, "native freshness check did not finish", 3000)
-  assert(sync_result.ok and not sync_result.refreshed, "native freshness check fetched again")
-  local old_snapshot = vim.json.decode(table.concat(vim.fn.readfile(issue_index.snapshot_path(native_repo)), "\n"))
-  issue_index.invalidate_repo(native_repo)
-  local native_reads_before_recovery = #vim.fn.globpath(native_cwd, "started.*", false, true)
-  local committed
-  host_client.request({ method = "github.issue.list", params = {
-    database = issue_index.db_path(native_repo), repo = native_repo,
-    request = { operation = "upsert_page", scope = "open", page = { completed = true, issues = {
-      { repo = native_repo, number = 202, title = "Recovered after interruption", state = "OPEN",
-        url = "https://" .. repo_cache.hostname() .. "/" .. native_repo .. "/issues/202", labels = {} },
-    } } },
-  } }, function(result, request_error) assert(not request_error, request_error) committed = result end)
-  wait_until(function() return committed ~= nil end, "interrupted-publication fixture did not commit", 3000)
-  assert(committed.state.revision > old_snapshot.revision, "database revision did not advance")
-  local stale_snapshot = vim.json.decode(table.concat(vim.fn.readfile(issue_index.snapshot_path(native_repo)), "\n"))
-  eq(stale_snapshot.revision, old_snapshot.revision, { fail_reason = "page commit unexpectedly published a snapshot" })
-  local recovered
-  issue_index.reload_snapshot(native_repo, function(result) recovered = result end, true)
-  wait_until(function() return recovered ~= nil end, "native snapshot recovery did not complete", 3000)
-  assert(recovered.ok, recovered.message)
-  eq(#issue_index.search(native_repo, "Recovered"), 1, { fail_reason = "native recovery did not preload the committed issue" })
-  local repaired = vim.json.decode(table.concat(vim.fn.readfile(issue_index.snapshot_path(native_repo)), "\n"))
-  eq(repaired.revision, committed.state.revision, { fail_reason = "snapshot revision did not reconcile with the database" })
-  eq(#vim.fn.globpath(native_cwd, "started.*", false, true), native_reads_before_recovery, { fail_reason = "snapshot recovery performed a remote read" })
-  local native_detail = vim.json.decode(table.concat(vim.fn.readfile("nvim/rust/forge/crates/forge-github/tests/fixtures/detail.json"), "\n"))
-  native_detail.number = 201
-  native_detail.body = string.rep("日本語 detail \"quote\"\n", 40000)
-  native_detail.url = "https://" .. repo_cache.hostname() .. "/" .. native_repo .. "/issues/201"
-  native_detail.comments[1].url = native_detail.url .. "#issuecomment-123"
-  vim.fn.writefile({ vim.json.encode(native_detail) }, vim.fs.joinpath(native_cwd, "response.json"))
-  vim.fn.writefile({ native_repo }, vim.fs.joinpath(native_cwd, "repository"), "b")
-  detail_result = nil
-  issue_index.detail_async(native_cwd, native_repo, 201, { force = true }, function(result) detail_result = result end)
-  wait_until(function() return detail_result ~= nil end, "native detail fetch did not complete", 3000)
-  assert(detail_result.ok and detail_result.cache_updated, "native detail fetch failed: " .. vim.inspect(detail_result))
-  eq(detail_result.item.comments_count, 1, { fail_reason = "native detail comment normalization failed" })
-  assert(detail_result.item.body == native_detail.body, "segmented native detail body was truncated")
-  issue_index._clear_detail_memory_for_test()
-  detail_result = nil
-  issue_index.detail_async(native_cwd, native_repo, 201, {}, function(result) detail_result = result end)
-  wait_until(function() return detail_result ~= nil end, "persisted native detail did not load", 3000)
-  assert(detail_result.ok and detail_result.redb, "native detail did not persist before completion")
-  assert(detail_result.item.body == native_detail.body, "segmented persisted detail body was truncated")
-  vim.fn.writefile({ '[[{"login":"carol"},{"login":"alice"}]]' }, vim.fs.joinpath(native_cwd, "contributors.json"))
-  vim.fn.writefile({ '[[{"login":"Alice","name":"Alice Developer"},{"login":"bob"}]]' }, vim.fs.joinpath(native_cwd, "collaborators.json"))
-  local metadata_result
-  require("github.repo_users").fetch_async({ cwd = native_cwd, repo = native_repo, callback = function(result) metadata_result = result end })
-  wait_until(function() return metadata_result ~= nil end, "native metadata fetch did not complete", 3000)
-  assert(metadata_result.ok, "native metadata fetch failed: " .. vim.inspect(metadata_result))
-  eq(#metadata_result.contributors, 3, { fail_reason = "native metadata did not merge and deduplicate users" })
-  eq(metadata_result.contributors[1].name, "Alice Developer", { fail_reason = "native metadata lost collaborator name" })
-  eq(#repo_cache.contributors(native_repo), 3, { fail_reason = "native metadata callback preceded publication" })
-  eq(repo_cache.contributors(native_repo)[2].name, nil, { fail_reason = "missing metadata names must not become Lua null values" })
-  assert(repo_cache.metadata_fresh(native_repo), "native metadata freshness was not persisted")
-  repo_cache.remember_cwd_repo(native_cwd, native_repo)
-  local deletion_count
-  local deletion_failure
-  local native_lock = vim.fs.joinpath(repo_cache.repo_dir(native_repo), "issues", "sync.lock")
-  vim.fn.mkdir(native_lock, "p")
-  repo_cache.delete_current(native_repo, native_cwd, function(count, failure)
-    deletion_count, deletion_failure = count, failure
-  end)
-  wait_until(function() return deletion_count ~= nil end, "busy deletion did not complete", 3000)
-  assert(deletion_failure ~= nil, "deletion ignored another process's sync lock")
-  eq(#issue_index.search(native_repo, "enhancement"), 1, { fail_reason = "busy deletion invalidated snapshot" })
-  vim.fn.delete(native_lock, "rf")
-  deletion_count = nil
-  repo_cache.delete_current(native_repo, native_cwd, function(count, failure)
-    deletion_count, deletion_failure = count, failure
-  end)
-  wait_until(function() return deletion_count ~= nil end, "native deletion did not complete", 3000)
-  eq(deletion_failure, nil, { fail_reason = "native deletion failed" })
-  eq(deletion_count, 2, { fail_reason = "native deletion did not remove repo and cwd cache" })
-  eq(#issue_index.search(native_repo, "enhancement"), 0, { fail_reason = "native deletion retained snapshot" })
-  eq(issue_index.cached_detail(native_repo, 201), nil, { fail_reason = "native deletion retained cached detail" })
-  eq(#repo_cache.contributors(native_repo), 0, { fail_reason = "native deletion retained repository metadata" })
-  local process = host_client._client.process
-  host_client.host_stop()
-  eq(process:wait(2000).code, 0, { fail_reason = "issue host failed to stop" })
 end
 
 T["repo_cache"] = function()

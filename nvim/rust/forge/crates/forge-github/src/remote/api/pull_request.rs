@@ -1,11 +1,6 @@
-use std::{path::PathBuf, process::Output};
-
 use serde::Deserialize;
 
-use super::{
-    GhClient, GraphFailure, append_diagnostic, append_graph_failures, classify_failure, diagnostic,
-    remote_result,
-};
+use super::{ApiRequest, ApiResponse, GithubClient, remote_result, request_not_sent};
 use crate::pull_request::{
     PullRequestMutation, PullRequestMutationOutcome, PullRequestState, PullRequestTarget,
 };
@@ -16,8 +11,6 @@ const STATE_QUERY: &str = "query($owner:String!, $name:String!, $number:Int!, $i
 #[derive(Deserialize)]
 struct StateResponse {
     data: Option<StateData>,
-    #[serde(default)]
-    errors: Vec<GraphFailure>,
 }
 
 #[derive(Deserialize)]
@@ -32,10 +25,9 @@ struct StateContainer {
     pull_request: Option<PullRequestState>,
 }
 
-impl GhClient {
+impl GithubClient {
     pub(super) async fn read_pr(
         &self,
-        directory: PathBuf,
         target: PullRequestTarget,
         include_text: bool,
     ) -> Result<PullRequestState, RemoteFailure> {
@@ -47,22 +39,13 @@ impl GhClient {
         }
         let owner = target.repository.owner();
         let name = target.repository.name();
-        let encoded = serde_json::to_vec(&serde_json::json!({
+        let payload = serde_json::json!({
             "query": STATE_QUERY, "variables": { "owner": owner, "name": name, "number": target.number, "includeText": include_text }
-        })).expect("serialize bounded PR query");
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            target.repository.hostname().into(),
-            "graphql".into(),
-        ];
+        });
         remote_result(
-            self.run_native(
-                directory,
-                argument,
-                Some(encoded),
-                target.node_id.capacity() + 1024,
-                move |output| decode_state(output, &target, false, include_text),
+            self.send(
+                ApiRequest::graphql(target.repository.hostname(), &payload),
+                move |response| decode_state(response, &target, false, include_text),
             )
             .await,
         )
@@ -70,7 +53,6 @@ impl GhClient {
 
     pub(super) async fn mutate_pr(
         &self,
-        directory: PathBuf,
         target: PullRequestTarget,
         mutation: PullRequestMutation,
     ) -> PullRequestMutationOutcome {
@@ -113,31 +95,17 @@ impl GhClient {
         let query = format!(
             "mutation($input:{input}!) {{ transition: {field}(input:$input) {{ pullRequest {{ id number state isDraft{content} }} }} }}"
         );
-        let encoded = serde_json::to_vec(&serde_json::json!({
+        let payload = serde_json::json!({
             "query": query, "variables": { "input": variables }
-        }))
-        .expect("serialize bounded PR mutation");
+        });
         drop(variables);
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            target.repository.hostname().into(),
-            "graphql".into(),
-        ];
         let result = self
-            .run_native(
-                directory,
-                argument,
-                Some(encoded),
-                target.node_id.capacity() + 1024,
-                move |output| decode_state(output, &target, true, include_text),
+            .send(
+                ApiRequest::graphql(target.repository.hostname(), &payload),
+                move |response| decode_state(response, &target, true, include_text),
             )
             .await;
-        let rejected = result.as_ref().err().is_some_and(|failure| {
-            failure
-                .downcast_ref::<forge_git::read_pool::ReadAdmissionError>()
-                .is_some()
-        });
+        let rejected = result.as_ref().err().is_some_and(request_not_sent);
         match remote_result(result) {
             Ok(observed) => PullRequestMutationOutcome::Confirmed(observed),
             Err(failure) if rejected => PullRequestMutationOutcome::Rejected(failure),
@@ -147,34 +115,12 @@ impl GhClient {
 }
 
 fn decode_state(
-    output: Output,
+    response: ApiResponse,
     target: &PullRequestTarget,
     mutation: bool,
     include_text: bool,
 ) -> Result<PullRequestState, RemoteFailure> {
-    let decoded = serde_json::from_slice::<StateResponse>(&output.stdout);
-    if !output.status.success() {
-        let mut message = diagnostic(&format!(
-            "gh exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-        if let Ok(response) = decoded {
-            append_graph_failures(&mut message, &response.errors);
-        } else {
-            append_diagnostic(&mut message, &String::from_utf8_lossy(&output.stdout));
-        }
-        return Err(classify_failure(message));
-    }
-    let response = decoded.map_err(|failure| RemoteFailure {
-        kind: RemoteFailureKind::InvalidResponse,
-        message: diagnostic(&format!("gh returned invalid PR state JSON: {failure}")),
-    })?;
-    if !response.errors.is_empty() {
-        let mut message = String::new();
-        append_graph_failures(&mut message, &response.errors);
-        return Err(classify_failure(message));
-    }
+    let response: StateResponse = response.into_json()?;
     let observed = response
         .data
         .and_then(|data| {
@@ -187,7 +133,7 @@ fn decode_state(
         .and_then(|container| container.pull_request)
         .ok_or_else(|| RemoteFailure {
             kind: RemoteFailureKind::InvalidResponse,
-            message: "gh returned no pull request state".into(),
+            message: "GitHub returned no pull request state".into(),
         })?;
     observed.validate(target).map_err(|failure| RemoteFailure {
         kind: RemoteFailureKind::InvalidResponse,
@@ -196,7 +142,7 @@ fn decode_state(
     if include_text && (observed.title.is_none() || observed.body.is_none()) {
         return Err(RemoteFailure {
             kind: RemoteFailureKind::InvalidResponse,
-            message: "gh omitted requested PR text".into(),
+            message: "GitHub omitted requested PR text".into(),
         });
     }
     Ok(observed)

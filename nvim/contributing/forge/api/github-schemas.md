@@ -407,7 +407,7 @@ pub struct IssueDetailRequest {
 
 ## CreationContext
 
-Source: [remote/gh/creation.rs](../../../rust/forge/crates/forge-github/src/remote/gh/creation.rs).
+Source: [remote/api/creation.rs](../../../rust/forge/crates/forge-github/src/remote/api/creation.rs).
 
 ```rust
 #[derive(Debug, Serialize)]
@@ -421,7 +421,7 @@ pub struct CreationContext {
 
 ## PendingReviewExpected
 
-Source: [remote/gh/submission.rs](../../../rust/forge/crates/forge-github/src/remote/gh/submission.rs).
+Source: [remote/api/submission.rs](../../../rust/forge/crates/forge-github/src/remote/api/submission.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -434,7 +434,7 @@ pub struct PendingReviewExpected {
 
 ## ReviewSubmissionContext
 
-Source: [remote/gh/submission.rs](../../../rust/forge/crates/forge-github/src/remote/gh/submission.rs).
+Source: [remote/api/submission.rs](../../../rust/forge/crates/forge-github/src/remote/api/submission.rs).
 
 ```rust
 #[derive(Clone, Debug, Serialize)]

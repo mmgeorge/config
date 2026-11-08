@@ -2,7 +2,6 @@ local M = {}
 
 ---@class GithubIssueSyncRequest
 ---@field database string
----@field directory string
 ---@field progress boolean
 ---@field request {repository: {hostname: string, owner: string, name: string}, scope: "open"|"all", manual: boolean, snapshot: string}
 ---@alias GithubIssueSyncResult {ok: true, refreshed: boolean, fetched: integer, pages: integer}|{ok: false, message: string}
@@ -20,7 +19,6 @@ local M = {}
 ---@field on_complete? fun(result: GithubIssueSyncResult)
 ---@class GithubIssueDetailRequest
 ---@field database string
----@field directory string
 ---@field request {repository: {hostname: string, owner: string, name: string}, number: integer}
 
 local detail_stale_after_seconds = 2 * 60
@@ -652,7 +650,7 @@ local function fetch_detail_async(cwd, repo, number)
     end
     local owner, name = repo:match("^([^/]+)/([^/]+)$")
     ---@type GithubIssueDetailRequest
-    local params = { database = database, directory = directory,
+    local params = { database = database,
       request = { repository = { hostname = hostname, owner = owner, name = name }, number = number } }
     local accepted, request_failure = pcall(function()
       if detail_runner_for_test then detail_runner_for_test(params, complete)
@@ -1042,7 +1040,7 @@ function M.sync_repo(cwd, repo, opts)
     local owner, name = normalized:match("^([^/]+)/([^/]+)$")
     ---@type GithubIssueSyncRequest
     local params = {
-      database = database, directory = context.cwd, progress = progress_enabled,
+      database = database, progress = progress_enabled,
       request = {
         repository = { hostname = hostname, owner = owner, name = name },
         scope = opts.scope == "all" and "all" or "open", manual = opts.manual == true,

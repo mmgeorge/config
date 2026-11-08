@@ -210,9 +210,12 @@ fn decode_record(raw: Value, hostname: &str) -> Result<NotificationRecord> {
             )
         })
         .or_else(|| {
-            subject_endpoint
-                .as_ref()
-                .map(|route| format!("{}{route}", api_prefix(&repository)))
+            subject_endpoint.as_ref().map(|route| {
+                format!(
+                    "{}{route}",
+                    crate::remote::rest_prefix(repository.hostname())
+                )
+            })
         });
     Ok(NotificationRecord {
         id,
@@ -241,14 +244,6 @@ fn text<'value>(value: &'value Value, path: &str) -> Result<&'value str> {
     Ok(text)
 }
 
-fn api_prefix(repository: &GithubRepositoryId) -> String {
-    if repository.hostname() == "github.com" {
-        "https://api.github.com/".to_owned()
-    } else {
-        format!("https://{}/api/v3/", repository.hostname())
-    }
-}
-
 fn endpoint(value: &Value, path: &str, repository: &GithubRepositoryId) -> Result<Option<String>> {
     let Some(value) = value.pointer(path).filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -259,7 +254,7 @@ fn endpoint(value: &Value, path: &str, repository: &GithubRepositoryId) -> Resul
     if value.is_empty() {
         return Ok(None);
     }
-    let prefix = api_prefix(repository);
+    let prefix = crate::remote::rest_prefix(repository.hostname());
     let route = value
         .strip_prefix(&prefix)
         .context("notification endpoint belongs to another host")?;
@@ -302,7 +297,7 @@ impl NotificationDetailRequest {
             self.record.subject_endpoint.as_ref()
         };
         let selected = selected.context("notification has no API source")?;
-        let prefix = api_prefix(&self.record.repository);
+        let prefix = crate::remote::rest_prefix(self.record.repository.hostname());
         endpoint(
             &serde_json::json!({"endpoint": format!("{prefix}{selected}")}),
             "/endpoint",

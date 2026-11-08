@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Output;
 
 use serde::Deserialize;
 
-use super::{GhClient, append_diagnostic, classify_failure, diagnostic, remote_result};
+use super::{ApiRequest, ApiResponse, GithubClient, append_diagnostic, diagnostic, remote_result};
 use crate::metadata::{RepositoryUser, RepositoryUsers, validate_user};
 use crate::model::GithubRepositoryId;
 use crate::remote::{RemoteFailure, RemoteFailureKind};
@@ -15,32 +13,24 @@ struct UserResponse {
     name: Option<String>,
 }
 
-impl GhClient {
+impl GithubClient {
     pub(super) async fn read_users(
         &self,
-        directory: PathBuf,
         repository: GithubRepositoryId,
     ) -> Result<RepositoryUsers, RemoteFailure> {
         let mut user_map: BTreeMap<String, RepositoryUser> = BTreeMap::new();
         let mut failure = Vec::new();
         let mut successful = 0;
         for source in ["contributors", "collaborators"] {
-            let argument = vec![
-                "api".into(),
-                "--hostname".into(),
-                repository.hostname().into(),
+            let request = ApiRequest::get(
+                repository.hostname(),
                 format!(
-                    "/repos/{}/{source}?per_page=100",
+                    "repos/{}/{source}?per_page=100",
                     repository.repository_name()
-                )
-                .into(),
-                "--paginate".into(),
-                "--slurp".into(),
-            ];
-            match remote_result(
-                self.run_native(directory.clone(), argument, None, 0, decode_users)
-                    .await,
-            ) {
+                ),
+            )
+            .all_pages();
+            match remote_result(self.send(request, decode_users).await) {
                 Ok(users) => {
                     successful += 1;
                     for user in users {
@@ -74,20 +64,11 @@ impl GhClient {
     }
 }
 
-fn decode_users(output: Output) -> Result<Vec<RepositoryUser>, RemoteFailure> {
-    if !output.status.success() {
-        let mut message = diagnostic(&format!(
-            "gh exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-        append_diagnostic(&mut message, &String::from_utf8_lossy(&output.stdout));
-        return Err(classify_failure(message));
-    }
+fn decode_users(response: ApiResponse) -> Result<Vec<RepositoryUser>, RemoteFailure> {
     let pages: Vec<Vec<UserResponse>> =
-        serde_json::from_slice(&output.stdout).map_err(|failure| {
+        serde_json::from_slice(&response.into_success()?).map_err(|failure| {
             invalid(&format!(
-                "gh returned invalid repository user JSON: {failure}"
+                "GitHub returned invalid repository user JSON: {failure}"
             ))
         })?;
     let mut users = Vec::new();

@@ -17,7 +17,7 @@ T["mutation"] = function()
   end)
   local result, failure, completed
   local options = {
-    directory = vim.fn.getcwd(), repo = "owner/repo", number = 7,
+    repo = "owner/repo", number = 7,
     mutation = { operation = "conversation_create", body = "captured\r\ntext" }, edit_sequence = 42,
     draft_target = "local-comment-1",
     settle = function(record)
@@ -89,7 +89,7 @@ T["mutation"] = function()
     callback(next_route == "github.recovery.resolve" and recovery or {})
   end)
   local function resolve()
-    mutation.resolve(vim.fn.getcwd(), recovery, function() end, function(value, diagnostic) recovery_result = value or diagnostic end)
+    mutation.resolve(recovery, function() end, function(value, diagnostic) recovery_result = value or diagnostic end)
   end
   resolve()
   eq(vim.bo.filetype, "ForgeChoicePopup")

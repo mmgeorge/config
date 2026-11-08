@@ -46,7 +46,7 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
             workspace,
             hostname,
         } => {
-            let remote = host.github_remote.for_directory(workspace.clone())?;
+            let remote = std::sync::Arc::clone(&host.github_remote);
             serde_json::to_value(
                 host.notifications
                     .open(document, workspace, hostname, remote)

@@ -111,7 +111,6 @@ Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.r
 #[serde(deny_unknown_fields)]
 struct IssueSyncRequest {
     database: PathBuf,
-    directory: PathBuf,
     request: SyncRequest,
     #[serde(default)]
     progress: bool,
@@ -127,7 +126,6 @@ Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.r
 #[serde(deny_unknown_fields)]
 struct IssueDetailParams {
     database: PathBuf,
-    directory: PathBuf,
     request: IssueDetailRequest,
 }
 ```
@@ -141,7 +139,6 @@ Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.r
 #[serde(deny_unknown_fields)]
 struct MetadataParams {
     cache_directory: PathBuf,
-    directory: PathBuf,
     request: MetadataRequest,
 }
 ```
@@ -154,7 +151,6 @@ Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.r
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PullRequestParams {
-    directory: PathBuf,
     request: PullRequestRequest,
 }
 ```
@@ -167,7 +163,6 @@ Decoder source: [nvim/rust/forge/src/router.rs](../../../rust/forge/src/router.r
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommentParams {
-    directory: PathBuf,
     target: CommentTarget,
     request: CommentOperation,
 }
@@ -564,7 +559,6 @@ Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forg
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewSubmissionContextParams {
-    directory: PathBuf,
     repository: GithubRepositoryId,
     number: u64,
     pending_review_id: Option<u64>,
@@ -593,7 +587,6 @@ Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forg
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActorParams {
-    directory: PathBuf,
     repository: GithubRepositoryId,
 }
 ```
@@ -606,7 +599,6 @@ Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forg
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewMutateParams {
-    directory: PathBuf,
     request: ReviewMutationRequest,
 }
 ```
@@ -631,7 +623,6 @@ Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forg
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryResolveParams {
-    directory: PathBuf,
     resource: RecoveryResource,
     operation_id: String,
     resolution: RecoveryResolution,

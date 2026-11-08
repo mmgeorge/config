@@ -1,8 +1,6 @@
-use std::{path::PathBuf, process::Output};
-
 use serde_json::{Value, json};
 
-use super::{GhClient, classify_failure, diagnostic, remote_result};
+use super::{ApiRequest, GithubClient, remote_result};
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 use crate::review_source::{
     ReviewCommitDetail, ReviewCommitDetailRequest, ReviewCommitFile, ReviewComparison,
@@ -11,31 +9,26 @@ use crate::review_source::{
 
 const SOURCE_QUERY: &str = "query($owner:String!,$name:String!,$commit:String!,$expression:String!){repository(owner:$owner,name:$name){commit:object(expression:$commit){__typename oid} source:object(expression:$expression){__typename oid ... on Blob{byteSize}}}}";
 
-impl GhClient {
+impl GithubClient {
     pub(super) async fn read_commit_detail_at(
         &self,
-        directory: PathBuf,
         request: ReviewCommitDetailRequest,
     ) -> Result<ReviewCommitDetail, RemoteFailure> {
         request
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.repository.hostname().into(),
+        let api_request = ApiRequest::get(
+            request.repository.hostname(),
             format!(
                 "repos/{}/commits/{}",
                 request.repository.repository_name(),
                 request.commit
-            )
-            .into(),
-            "--paginate".into(),
-            "--slurp".into(),
-        ];
+            ),
+        )
+        .all_pages();
         remote_result(
-            self.run_native(directory, argument, None, 1024 * 1024, move |output| {
-                decode_commit_pages(response(output)?, &request.commit)
+            self.send(api_request, move |response| {
+                decode_commit_pages(response.into_json()?, &request.commit)
             })
             .await,
         )
@@ -43,7 +36,6 @@ impl GhClient {
 
     pub(super) async fn read_source_at(
         &self,
-        directory: PathBuf,
         request: ReviewSourceRequest,
     ) -> Result<ReviewSource, RemoteFailure> {
         request
@@ -53,25 +45,15 @@ impl GhClient {
         let (owner, name) = repository_name
             .split_once('/')
             .ok_or_else(|| invalid("repository omits owner"))?;
-        let body = serde_json::to_vec(&json!({"query":SOURCE_QUERY,"variables":{
+        let payload = json!({"query":SOURCE_QUERY,"variables":{
             "owner":owner,"name":name,"commit":request.commit,
             "expression":format!("{}:{}", request.commit, request.path)
-        }}))
-        .map_err(|error| invalid(error.to_string()))?;
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.repository.hostname().into(),
-            "graphql".into(),
-        ];
+        }});
         let commit = request.commit.clone();
         let identity = remote_result(
-            self.run_native(
-                directory.clone(),
-                argument,
-                Some(body),
-                4096,
-                move |output| decode_identity(response(output)?, &commit),
+            self.send(
+                ApiRequest::graphql(request.repository.hostname(), &payload),
+                move |response| decode_identity(response.into_json()?, &commit),
             )
             .await,
         )?;
@@ -82,21 +64,17 @@ impl GhClient {
                 bytes: Vec::new(),
             });
         };
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.repository.hostname().into(),
-            "--header".into(),
-            "Accept: application/vnd.github.raw+json".into(),
+        let api_request = ApiRequest::get(
+            request.repository.hostname(),
             format!(
                 "repos/{}/git/blobs/{blob}",
                 request.repository.repository_name()
-            )
-            .into(),
-        ];
+            ),
+        )
+        .with_accept("application/vnd.github.raw+json");
         let bytes = remote_result(
-            self.run_native(directory, argument, None, 0, move |output| {
-                let bytes = response_bytes(output)?;
+            self.send(api_request, move |response| {
+                let bytes = response.into_success()?;
                 if bytes.len() != size {
                     return Err(invalid("Git blob size changed from immutable metadata"));
                 }
@@ -113,27 +91,23 @@ impl GhClient {
 
     pub(super) async fn read_comparison_at(
         &self,
-        directory: PathBuf,
         request: ReviewComparisonRequest,
     ) -> Result<ReviewComparison, RemoteFailure> {
         request
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
-        let argument = vec![
-            "api".into(),
-            "--hostname".into(),
-            request.repository.hostname().into(),
+        let api_request = ApiRequest::get(
+            request.repository.hostname(),
             format!(
                 "repos/{}/compare/{}...{}?per_page=1",
                 request.repository.repository_name(),
                 request.base,
                 request.head
-            )
-            .into(),
-        ];
+            ),
+        );
         remote_result(
-            self.run_native(directory, argument, None, 4096, move |output| {
-                let value = response(output)?;
+            self.send(api_request, move |response| {
+                let value: Value = response.into_json()?;
                 let base = value.pointer("/base_commit/sha").and_then(Value::as_str);
                 let merge_base = value
                     .pointer("/merge_base_commit/sha")
@@ -315,23 +289,6 @@ fn decode_identity(value: Value, commit: &str) -> Result<Option<(String, usize)>
             invalid("source byteSize is missing or exceeds this platform's addressable size")
         })?;
     Ok(Some((blob.into(), size)))
-}
-
-pub(super) fn response(output: Output) -> Result<Value, RemoteFailure> {
-    serde_json::from_slice(&response_bytes(output)?).map_err(|error| invalid(error.to_string()))
-}
-
-fn response_bytes(output: Output) -> Result<Vec<u8>, RemoteFailure> {
-    if !output.status.success() {
-        return Err(classify_failure(diagnostic(&String::from_utf8_lossy(
-            if output.stderr.is_empty() {
-                &output.stdout
-            } else {
-                &output.stderr
-            },
-        ))));
-    }
-    Ok(output.stdout)
 }
 
 fn invalid(message: impl Into<String>) -> RemoteFailure {

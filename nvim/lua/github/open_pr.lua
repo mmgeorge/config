@@ -603,7 +603,7 @@ end
 
 local function create_pr(cwd, context, selected_base_branch, metadata)
   show_progress("Creating draft PR...")
-  require("github.pr_creation").create(cwd, context, selected_base_branch, metadata, function(created, err)
+  require("github.pr_creation").create(context, selected_base_branch, metadata, function(created, err)
     if err then
       fail_progress("Failed to create PR: " .. err)
       return
