@@ -136,6 +136,3 @@ fn table_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
         |row| row.get(0),
     )
 }
-
-#[cfg(test)]
-mod tests {}

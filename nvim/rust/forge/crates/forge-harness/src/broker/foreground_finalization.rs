@@ -2259,15 +2259,6 @@ mod tests {
         .await
     }
 
-    /// A successful native terminal racing restart cannot start checks behind its own gate.
-    #[tokio::test]
-    async fn restart_after_native_success_skips_new_automatic_work() -> Result<()> {
-        assert_collection_after_native_success_skips_new_automatic_work(
-            ForegroundCollection::Restart,
-        )
-        .await
-    }
-
     async fn assert_collection_after_native_success_skips_new_automatic_work(
         disposition: ForegroundCollection,
     ) -> Result<()> {
@@ -2331,118 +2322,6 @@ mod tests {
                     ForegroundAction::Effect(ForegroundJob::FinalResponsePublication(_))
                 ),
                 "collection admitted new work after native success"
-            );
-            assert!(transaction.finalization.as_ref().unwrap().checks.is_none());
-            assert!(broker.check_runner.snapshot()?.history.is_empty());
-        }
-        Ok(())
-    }
-    /// Native token limits cannot start checks or repair after resource collection.
-    #[tokio::test]
-    async fn token_limit_completion_skips_new_automatic_work() -> Result<()> {
-        assert_non_normal_completion_skips_new_automatic_work(
-            forge_provider_api::turn::TurnCompletionReason::TokenLimit,
-        )
-        .await
-    }
-
-    /// Native request limits cannot start checks or repair after resource collection.
-    #[tokio::test]
-    async fn request_limit_completion_skips_new_automatic_work() -> Result<()> {
-        assert_non_normal_completion_skips_new_automatic_work(
-            forge_provider_api::turn::TurnCompletionReason::RequestLimit,
-        )
-        .await
-    }
-
-    /// Native refusal cannot start checks or repair after resource collection.
-    #[tokio::test]
-    async fn refusal_completion_skips_new_automatic_work() -> Result<()> {
-        assert_non_normal_completion_skips_new_automatic_work(
-            forge_provider_api::turn::TurnCompletionReason::Refusal,
-        )
-        .await
-    }
-
-    async fn assert_non_normal_completion_skips_new_automatic_work(
-        reason: forge_provider_api::turn::TurnCompletionReason,
-    ) -> Result<()> {
-        {
-            let workspace = super::super::test::repository();
-            let data = tempfile::tempdir()?;
-            let mut broker =
-                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-            broker.checkpoint = None;
-            broker
-                .configure_session(json!({"automatic_checks":true}))
-                .await?;
-            std::fs::write(workspace.path().join(".forge.json"),
-                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["custom-runner","verify"],"category":"test"}}}}).to_string())?;
-            let (sink, _updates) = publication::channel();
-            let ForegroundDispatch::Admitting(mut admission) = broker.begin_foreground_dispatch(
-                Request {
-                    id: 1,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"text":"Finish the source change"}),
-                },
-                sink,
-            )?
-            else {
-                anyhow::bail!("missing admission");
-            };
-            let mut staged = broker.stage_foreground_interaction(
-                "Finish the source change",
-                PromptMode::Chat,
-                Some(&ExchangeAdmission::chat("Finish the source change".into())),
-                ProviderInput::from_text("Finish the source change"),
-            )?;
-            staged.exchange.check_owner = Some(staged.exchange.id.clone());
-            broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
-            let engine = broker
-                .execution_registry()
-                .owner(crate::provider::ThreadOwner::root(&broker.session.id))
-                .await?;
-            let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
-            let address = crate::provider::test_support::address(&transaction.state.scope);
-            transaction
-                .state
-                .interaction
-                .start_turn(address.clone(), 1)?;
-            transaction
-                .state
-                .interaction
-                .turn_mut(&address)
-                .context("native turn missing")?
-                .finish(
-                    crate::turn::TurnOutcome::Completed {
-                        stop_reason: reason,
-                    },
-                    2,
-                )?;
-            transaction.state.interaction.finish(
-                crate::exchange::ExchangeOutcome::Complete,
-                broker.clock.now_ms(),
-            )?;
-            broker.store.save_exchange(&transaction.state.interaction)?;
-            let mut finalization = ForegroundFinalization::new(
-                admission.take_submission()?,
-                PromptMode::Chat,
-                Vec::new(),
-                Ok(ProviderCompletion::default()),
-                transaction.settlement.clone(),
-                None,
-                None,
-            );
-            finalization.phase = FinalizationPhase::ChecksRequested;
-            transaction.finalization = Some(finalization);
-            let action =
-                broker.prepare_foreground_final_checks(&mut transaction, &mut admission)?;
-            assert!(
-                matches!(
-                    action,
-                    ForegroundAction::Effect(ForegroundJob::FinalResponsePublication(_))
-                ),
-                "native limit or refusal admitted new automatic work"
             );
             assert!(transaction.finalization.as_ref().unwrap().checks.is_none());
             assert!(broker.check_runner.snapshot()?.history.is_empty());

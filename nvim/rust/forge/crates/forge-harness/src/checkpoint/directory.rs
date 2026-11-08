@@ -111,6 +111,3 @@ pub(crate) fn capture_directory(
         created_at_ms: now_ms,
     })
 }
-
-#[cfg(test)]
-mod tests {}

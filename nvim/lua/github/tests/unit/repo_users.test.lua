@@ -1,17 +1,28 @@
--- Unit tests for `github.repo_users` (repo_users.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "metadata", run = function()
-vim.loader.enable(false)
-local users = require("github.repo_users")
-local cache = require("github.repo_cache")
-local directory = vim.fn.tempname()
-local original_notify = vim.notify
-local notifications = 0
-vim.notify = function() notifications = notifications + 1 end
-cache.set_data_dir_for_test(directory)
+-- Unit tests for `github.repo_users` (repo_users.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local eq = MiniTest.expect.equality
 
-local ok, failure = xpcall(function()
+local T = MiniTest.new_set({
+  hooks = isolation.hooks({
+    post_case = function()
+      local cache = package.loaded["github.repo_cache"]
+      if cache then cache.set_data_dir_for_test(nil) end
+    end,
+  }),
+})
+
+T["metadata"] = function()
+  local users = require("github.repo_users")
+  local cache = require("github.repo_cache")
+  local directory = temp.directory("cache")
+  local changed_directory = temp.directory("cache-changed")
+  local notifications = notify.capture()
+  cache.set_data_dir_for_test(directory)
+
   local pending, observed
   users._set_runner_for_test(function(params, callback) observed, pending = params, callback end)
   local calls, result = 0, nil
@@ -24,7 +35,7 @@ local ok, failure = xpcall(function()
   pending(metadata, nil)
   pending(nil, "late failure")
   assert(calls == 1 and result.ok and result.metadata == metadata)
-  assert(vim.uv.fs_stat(cache.metadata_path("Owner/Repo")) == nil, "Lua wrote host-owned metadata")
+  eq(vim.uv.fs_stat(cache.metadata_path("Owner/Repo")), nil, { fail_reason = "Lua wrote host-owned metadata" })
 
   for _, invalid in ipairs({ {}, { repo = "foreign/repo", fetched_at = os.time(), contributors = {} },
     { repo = "Owner/Repo", hostname = "foreign.example", fetched_at = os.time(), contributors = {} },
@@ -37,7 +48,7 @@ local ok, failure = xpcall(function()
   pending(nil, "permission denied")
   assert(not result.ok and result.message == "permission denied")
   users.fetch_async({ repo = "Owner/Repo", callback = function(value) result = value end })
-  cache.set_data_dir_for_test(directory .. "-changed")
+  cache.set_data_dir_for_test(changed_directory)
   pending(metadata, nil)
   assert(not result.ok and result.message:find("context changed", 1, true))
   cache.set_data_dir_for_test(directory)
@@ -49,24 +60,13 @@ local ok, failure = xpcall(function()
   users._set_runner_for_test(function(_, callback) dispatched, pending = dispatched + 1, callback end)
   cache.ensure_metadata(directory, "Owner/Repo", { remember_cwd = false })
   cache.ensure_metadata(directory, "Owner/Repo", { remember_cwd = false })
-  assert(dispatched == 1, "metadata requests were not coalesced")
+  eq(dispatched, 1, { fail_reason = "metadata requests were not coalesced" })
   pending(nil, "remote metadata failed")
-  assert(vim.wait(1000, function() return notifications == 1 end, 1))
+  wait_until(function() return #notifications == 1 end, "failed metadata request did not notify")
   cache.ensure_metadata(directory, "Owner/Repo", { remember_cwd = false })
-  assert(dispatched == 2, "failed metadata request retained admission")
+  eq(dispatched, 2, { fail_reason = "failed metadata request retained admission" })
   pending(metadata, nil)
-  assert(cache.repo_for_cwd(directory) == nil, "explicit metadata request overwrote cwd mapping")
-end, debug.traceback)
-
-users._set_runner_for_test(nil)
-cache.set_data_dir_for_test(nil)
-vim.notify = original_notify
-if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
+  eq(cache.repo_for_cwd(directory), nil, { fail_reason = "explicit metadata request overwrote cwd mapping" })
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

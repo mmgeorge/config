@@ -413,6 +413,3 @@ struct TimeoutFields {
     approval_timeout: Option<InputTimeout>,
     tool_timeout: Option<InputTimeout>,
 }
-
-#[cfg(test)]
-mod tests {}

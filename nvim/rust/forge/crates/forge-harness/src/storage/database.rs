@@ -99,30 +99,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Restore the production busy timeout when a contention test releases its override.
-#[cfg(test)]
-pub(crate) struct BusyTimeoutOverride {
-    previous: Option<Duration>,
-}
-
-#[cfg(test)]
-impl Drop for BusyTimeoutOverride {
-    fn drop(&mut self) {
-        BUSY_TIMEOUT_OVERRIDE.with(|slot| slot.set(self.previous));
-    }
-}
-
-/// Make history handles opened on this thread report contention after `timeout`.
-///
-/// Contention tests use a zero timeout so a held external lock fails the write at once instead
-/// of waiting for the production timeout to elapse.
-#[cfg(test)]
-pub(crate) fn override_busy_timeout(timeout: Duration) -> BusyTimeoutOverride {
-    BusyTimeoutOverride {
-        previous: BUSY_TIMEOUT_OVERRIDE.with(|slot| slot.replace(Some(timeout))),
-    }
-}
-
 fn busy_timeout() -> Duration {
     #[cfg(test)]
     if let Some(timeout) = BUSY_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {

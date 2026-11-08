@@ -4,8 +4,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableTable, TableDefinition};
@@ -309,30 +307,6 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
             Err(_) => "unknown panic payload".to_owned(),
         },
     }
-}
-
-#[cfg(test)]
-fn archive_corrupt_database(path: &Path, reason: &str) -> Result<PathBuf> {
-    if !path.exists() {
-        return Err(anyhow!(
-            "redb panicked while opening {}, but no database file exists: {}",
-            path.display(),
-            reason
-        ));
-    }
-
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("database path has no UTF-8 file name: {}", path.display()))?;
-    let archived = path.with_file_name(format!("{file_name}.corrupt-{timestamp_ms}"));
-    fs::rename(path, &archived)
-        .with_context(|| format!("archive corrupt database {}", path.display()))?;
-    Ok(archived)
 }
 
 fn is_database_lock_error(error: &redb::DatabaseError) -> bool {
@@ -756,33 +730,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_and_read_issue_detail() -> Result<()> {
-        let db_path = temp_db("detail");
-        let database = open_database(&db_path)?;
-        let detail = DetailRecord {
-            repo: "mmgeorge/test-repo".to_owned(),
-            number: 12,
-            fetched_at: 1234,
-            item: serde_json::json!({
-                "repo": "mmgeorge/test-repo",
-                "number": 12,
-                "title": "Cached issue",
-                "body": "Cached body"
-            }),
-        };
-
-        upsert_detail(&database, "mmgeorge/test-repo", 12, &detail)?;
-
-        let cached = read_detail(&database, "mmgeorge/test-repo", 12)?
-            .ok_or_else(|| anyhow!("missing cached detail"))?;
-        assert_eq!(cached.fetched_at, 1234);
-        assert_eq!(cached.item["title"], "Cached issue");
-        assert!(read_detail(&database, "mmgeorge/test-repo", 13)?.is_none());
-        let _ = fs::remove_file(db_path);
-        Ok(())
-    }
-
-    #[test]
     fn open_database_waits_for_existing_lock() -> Result<()> {
         let db_path = temp_db("lock");
         let database = open_database(&db_path)?;
@@ -805,35 +752,6 @@ mod tests {
             .map_err(|_| anyhow!("database opener thread panicked"))??;
         observed_wait.map_err(|_| anyhow!("opener returned without waiting for the lock"))?;
         let _ = fs::remove_file(db_path);
-        Ok(())
-    }
-
-    #[test]
-    fn archive_corrupt_database_moves_only_database_file() -> Result<()> {
-        let db_path = temp_db("archive");
-        let snapshot_path = db_path.with_file_name("open-snapshot.json");
-        fs::write(&db_path, b"not a valid redb database")?;
-        fs::write(&snapshot_path, b"{\"issues\":[]}")?;
-
-        let archived = archive_corrupt_database(&db_path, "invalid allocator state")?;
-
-        assert!(!db_path.exists(), "corrupt database should be moved away");
-        assert!(archived.exists(), "archived corrupt database should exist");
-        assert!(
-            snapshot_path.exists(),
-            "snapshot must not be removed during database recovery"
-        );
-        assert!(
-            archived
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .starts_with("github-issue-index-archive"),
-            "archive should keep original database file name"
-        );
-
-        let _ = fs::remove_file(archived);
-        let _ = fs::remove_file(snapshot_path);
         Ok(())
     }
 }

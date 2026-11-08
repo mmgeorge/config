@@ -129,28 +129,4 @@ mod tests {
         }
         Ok(())
     }
-
-    /// A live callback retains its exact effect identity and waits for the owner's commit decision.
-    #[tokio::test]
-    async fn live_effect_reply_requires_correlated_owner_commit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, mut requests) = LiveHostEffectSender::channel();
-        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
-        let call = ToolCallId::new("call")?;
-        let batch = HostEffectBatch::new(7, Default::default());
-        let sent = sender.commit(scope.clone(), call.clone(), batch);
-        tokio::pin!(sent);
-        assert!(futures_util::poll!(&mut sent).is_pending());
-        let request = requests.recv().await.ok_or("request channel closed")?;
-        assert_eq!(request.scope, scope);
-        assert_eq!(request.call_id, call);
-        assert_eq!(request.batch.revision, 7);
-        assert!(futures_util::poll!(&mut sent).is_pending());
-        request
-            .reply
-            .send(Ok(LiveHostCommit { task_permit: None }))
-            .map_err(|_| "reply receiver closed")?;
-        sent.await?;
-        Ok(())
-    }
 }

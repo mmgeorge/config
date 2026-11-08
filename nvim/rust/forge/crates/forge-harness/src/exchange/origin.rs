@@ -62,6 +62,3 @@ impl TaskStart {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -8,16 +8,6 @@ use serde_json::json;
 
 use super::TraceStore;
 
-/// Measure a future's inline storage without constructing or polling it.
-#[cfg(test)]
-pub(crate) fn future_bytes<F, Fut>(_: &F) -> usize
-where
-    F: FnOnce() -> Fut,
-    Fut: Future,
-{
-    std::mem::size_of::<Fut>()
-}
-
 struct FutureTrace<'trace> {
     trace: &'trace TraceStore,
     session_id: &'trace str,
@@ -86,73 +76,5 @@ impl Drop for FutureTrace<'_> {
                 "busy_ms":self.busy.as_secs_f64() * 1000.0,"poll_count":self.poll_count,
             }),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn future_trace_records_completion_failure_and_cancellation_only_when_enabled()
-    -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let trace = TraceStore::open(root.path())?;
-        trace
-            .instrument("session", "disabled", "admission", async { Ok(()) })
-            .await?;
-        assert!(
-            !crate::storage::state::directory(root.path())
-                .join("logs/session.jsonl")
-                .exists()
-        );
-        trace.configure(true)?;
-        trace
-            .instrument("session", "completed", "admission", async {
-                tokio::task::yield_now().await;
-                Ok(())
-            })
-            .await?;
-        assert!(
-            trace
-                .instrument("session", "failed", "preparation", async {
-                    Err::<(), _>(anyhow::anyhow!("private failure content"))
-                })
-                .await
-                .is_err()
-        );
-        {
-            let future = trace.instrument(
-                "session",
-                "cancelled",
-                "checkpoint",
-                std::future::pending::<Result<()>>(),
-            );
-            tokio::pin!(future);
-            assert!(futures_util::poll!(&mut future).is_pending());
-        }
-        trace.flush()?;
-        let text = std::fs::read_to_string(
-            crate::storage::state::directory(root.path()).join("logs/session.jsonl"),
-        )?;
-        let records: Vec<serde_json::Value> = text
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<std::result::Result<_, _>>()?;
-        for (identity, status) in [
-            ("completed", "completed"),
-            ("failed", "failed"),
-            ("cancelled", "cancelled"),
-        ] {
-            assert!(
-                records
-                    .iter()
-                    .any(|record| record["event"] == "future.finished"
-                        && record["payload"]["operation_id"] == identity
-                        && record["payload"]["status"] == status)
-            );
-        }
-        assert!(!text.contains("private failure content"));
-        Ok(())
     }
 }

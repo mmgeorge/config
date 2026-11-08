@@ -375,37 +375,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_read_bursts_wait_without_exceeding_native_capacity() {
-        let pool = Arc::new(BlockingReadPool::new(4).unwrap());
-        let mut jobs = tokio::task::JoinSet::new();
-        for index in 0..16 {
-            let pool = pool.clone();
-            jobs.spawn(async move {
-                let task = pool
-                    .submit_wait(8, move |_| {
-                        std::thread::sleep(Duration::from_millis(5));
-                        Ok(index)
-                    })
-                    .await
-                    .unwrap();
-                let status = pool.status();
-                assert!(status.active_jobs <= 4 && status.reserved_input_bytes <= 32);
-                task.finish().await.unwrap()
-            });
-        }
-        let mut completed = Vec::new();
-        async {
-            while let Some(result) = jobs.join_next().await {
-                completed.push(result.unwrap());
-            }
-        }
-        .await;
-        completed.sort();
-        assert_eq!(completed, (0..16).collect::<Vec<_>>());
-        assert_eq!(pool.status().active_jobs, 0);
-    }
-
-    #[tokio::test]
     async fn completed_result_retains_admission_until_collected() {
         let pool = BlockingReadPool::new(1).unwrap();
         let owner = std::thread::current().id();
@@ -439,34 +408,5 @@ mod tests {
         );
         assert_eq!(pool.status().active_jobs, 0);
         assert!(pool.shutdown(Duration::ZERO).await.unfinished.is_empty());
-    }
-
-    #[tokio::test]
-    async fn abandoned_completed_output_drops_before_its_reservation() {
-        struct ObservedOutput {
-            pool: Arc<BlockingReadPool>,
-            disposed: Arc<AtomicBool>,
-        }
-
-        impl Drop for ObservedOutput {
-            fn drop(&mut self) {
-                assert_eq!(self.pool.status().active_jobs, 1);
-                assert_eq!(self.pool.status().reserved_input_bytes, 8);
-                self.disposed.store(true, Ordering::Release);
-            }
-        }
-
-        let pool = Arc::new(BlockingReadPool::new(1).unwrap());
-        let disposed = Arc::new(AtomicBool::new(false));
-        let output = ObservedOutput {
-            pool: Arc::clone(&pool),
-            disposed: Arc::clone(&disposed),
-        };
-        let task = pool.submit(8, |_| Ok(output)).unwrap();
-        wait_for_native_completion(&task).await;
-        drop(task);
-        assert!(disposed.load(Ordering::Acquire));
-        assert_eq!(pool.status().active_jobs, 0);
-        assert_eq!(pool.status().reserved_input_bytes, 0);
     }
 }

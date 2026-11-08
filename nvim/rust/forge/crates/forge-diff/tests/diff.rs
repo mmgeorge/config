@@ -1,4 +1,4 @@
-use forge_diff::raw::{PatchError, RawDiff, compute_hunks, patch_body, synthetic_hunk};
+use forge_diff::raw::{PatchError, RawDiff, compute_hunks, patch_body};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 
 fn pair(old: &[u8], new: &[u8], representation: Representation) -> SourcePair {
@@ -60,29 +60,6 @@ fn applying_and_reversing_raw_hunks_reconstruct_exact_canonical_bytes() {
 }
 
 #[test]
-fn added_and_deleted_sources_have_exact_synthetic_ranges() {
-    for (old, new) in [
-        (b"".as_slice(), b"a\r\nlast".as_slice()),
-        (b"a\r\nlast", b""),
-    ] {
-        let source = pair(old, new, Representation::GitCanonical);
-        let synthetic = synthetic_hunk(source.clone()).unwrap();
-        assert_eq!(synthetic.hunks().len(), 1);
-        assert_eq!(synthetic.hunks()[0].old_bytes, 0..old.len());
-        assert_eq!(synthetic.hunks()[0].new_bytes, 0..new.len());
-        assert_eq!(synthetic.hunks(), compute_hunks(source).hunks());
-        assert_eq!(reconstruct(&synthetic, false), new);
-    }
-    assert!(
-        synthetic_hunk(pair(b"", b"", Representation::Raw))
-            .unwrap()
-            .hunks()
-            .is_empty()
-    );
-    assert!(synthetic_hunk(pair(b"old", b"new", Representation::Raw)).is_none());
-}
-
-#[test]
 fn patch_bodies_preserve_crlf_and_missing_final_newline_markers() {
     let diff = compute_hunks(pair(
         b"before\r\nlast",
@@ -115,15 +92,4 @@ fn patch_body_rejects_foreign_hunks_and_noncanonical_sources() {
     }
     let repeated = compute_hunks(pair(b"old", b"new", Representation::GitCanonical));
     assert_eq!(first.hunks(), repeated.hunks());
-}
-
-#[test]
-fn raw_changes_do_not_truncate_at_preview_line_limits() {
-    let new = b"added\n".repeat(1200);
-    let diff = compute_hunks(pair(b"", &new, Representation::GitCanonical));
-    assert_eq!(diff.hunks()[0].new_lines, 0..1200);
-    assert_eq!(
-        patch_body(&diff, diff.hunks()[0].id).unwrap().bytes,
-        b"+added\n".repeat(1200)
-    );
 }

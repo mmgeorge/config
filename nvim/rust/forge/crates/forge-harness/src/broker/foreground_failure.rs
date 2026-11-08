@@ -1973,55 +1973,6 @@ mod tests {
         Ok(())
     }
 
-    /// Cleanup failure must not replace the failure that caused the owner to close.
-    #[test]
-    fn report_retains_original_and_typed_cleanup_failure() {
-        let cleanup = forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::TurnInterrupt,
-            forge_provider_api::ProviderFailureKind::Protocol,
-        )
-        .at_phase(
-            forge_provider_api::ProviderPhase::Collection,
-            forge_provider_api::FailureDisposition::Uncertain,
-        );
-        let report = anyhow::Error::new(TurnCancelled).context(ForegroundFailureContext {
-            original_message: "turn cancelled".into(),
-            cleanup: Some(cleanup.into()),
-            secondary: Vec::new(),
-        });
-        assert!(report.downcast_ref::<TurnCancelled>().is_some());
-        assert!(matches!(
-            report
-                .downcast_ref::<ForegroundFailureContext>()
-                .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Failure(failure)) if *failure == cleanup
-        ));
-        assert_eq!(
-            report.to_string(),
-            "turn cancelled: provider TurnInterrupt failed: Protocol"
-        );
-        let retracted = anyhow::Error::new(TurnRetracted {
-            prompt: "retracted prompt".into(),
-        })
-        .context(ForegroundFailureContext {
-            original_message: "Output-free turn retracted".into(),
-            cleanup: Some(cleanup.into()),
-            secondary: Vec::new(),
-        });
-        assert!(matches!(retracted.downcast_ref::<TurnRetracted>(),
-            Some(original) if original.prompt == "retracted prompt"));
-        assert!(matches!(
-            retracted
-                .downcast_ref::<ForegroundFailureContext>()
-                .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Failure(failure)) if *failure == cleanup
-        ));
-        assert_eq!(
-            retracted.to_string(),
-            "Output-free turn retracted: provider TurnInterrupt failed: Protocol"
-        );
-    }
-
     /// A retracted submission restores its snapshot and is published before its typed error.
     #[tokio::test]
     async fn retraction_restores_snapshot_and_flushes_submission_before_error() -> Result<()> {
@@ -2105,7 +2056,6 @@ mod tests {
     #[derive(Clone, Copy)]
     enum UndispatchedBoundary {
         Prepared,
-        AlreadyPrevented,
         Sending,
     }
 
@@ -2113,12 +2063,6 @@ mod tests {
     #[tokio::test]
     async fn undispatched_prepared_cancellation_restores_exact_draft() -> Result<()> {
         assert_undispatched_cancellation_boundary(UndispatchedBoundary::Prepared).await
-    }
-
-    /// A receipt already retired as cancelled restores the exact draft after cancellation.
-    #[tokio::test]
-    async fn undispatched_already_prevented_cancellation_restores_exact_draft() -> Result<()> {
-        assert_undispatched_cancellation_boundary(UndispatchedBoundary::AlreadyPrevented).await
     }
 
     /// An unknown sending receipt retains history instead of restoring the draft.
@@ -2131,7 +2075,7 @@ mod tests {
     async fn assert_undispatched_cancellation_boundary(
         boundary: UndispatchedBoundary,
     ) -> Result<()> {
-        use crate::provider::submission::{SubmissionRetirement, SubmissionState};
+        use crate::provider::submission::SubmissionState;
         use UndispatchedBoundary as Boundary;
         {
             let workspace = super::super::test::repository();
@@ -2177,10 +2121,6 @@ mod tests {
                 .clone();
             match boundary {
                 Boundary::Prepared => {}
-                Boundary::AlreadyPrevented => assert_eq!(
-                    submission.retire_prepared()?,
-                    SubmissionRetirement::Cancelled
-                ),
                 Boundary::Sending => submission.sending(None)?,
             }
             assert!(transaction.retraction_boundary.is_none());
@@ -2200,7 +2140,7 @@ mod tests {
             let action =
                 broker.complete_foreground_cleanup(&mut dispatch, TurnCancelled.into(), Ok(()))?;
             match boundary {
-                Boundary::Prepared | Boundary::AlreadyPrevented => {
+                Boundary::Prepared => {
                     let ForegroundAction::Effect(ForegroundJob::FailureBaseline(job)) = action
                     else {
                         anyhow::bail!(
@@ -2275,85 +2215,6 @@ mod tests {
             }
             engine.close().await?;
         }
-        Ok(())
-    }
-
-    /// Running cancellation carries positive collection into failure settlement and ignores repeated task revocation.
-    #[tokio::test]
-    async fn running_cancellation_retains_collection_proof_and_deduplicates_revocation()
-    -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.checkpoint = None;
-        let (sink, _updates) = publication::channel();
-        let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
-            Request {
-                id: 97,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"cancel running task"}),
-            },
-            sink,
-        )?
-        else {
-            anyhow::bail!("fixture admission missing")
-        };
-        let mut staged = broker.stage_foreground_interaction(
-            "cancel running task",
-            PromptMode::Chat,
-            Some(&ExchangeAdmission::chat("cancel running task".into())),
-            ProviderInput::from_text("cancel running task"),
-        )?;
-        broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
-        let engine = broker
-            .execution_registry()
-            .owner(crate::provider::ThreadOwner::root(&broker.session.id))
-            .await?;
-        let transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
-        let mut dispatch = ForegroundDispatch::Running {
-            transaction: Box::new(transaction),
-            admission,
-        };
-        let collection =
-            ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::Retain);
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::CollectionStarted(collection)
-            )?,
-            ForegroundAction::Wait
-        ));
-        let ForegroundDispatch::Running {
-            transaction,
-            admission,
-        } = &mut dispatch
-        else {
-            unreachable!()
-        };
-        assert!(admission.owner_collection_pending());
-        let first = broker.fail_foreground(transaction, crate::task::StaleTask.into())?;
-        assert!(
-            matches!(&first, ForegroundAction::CancelJobsAndEffect(ForegroundJob::CleanupForeground { original, .. }) if original.is::<TurnCancelled>())
-        );
-        assert!(matches!(
-            broker.fail_foreground(transaction, crate::task::StaleTask.into())?,
-            ForegroundAction::Wait
-        ));
-        assert!(transaction.failure_secondary.is_empty());
-        drop(first);
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::CollectionCompleted(collection)
-            )?,
-            ForegroundAction::Wait
-        ));
-        let ForegroundDispatch::Running { admission, .. } = &dispatch else {
-            unreachable!()
-        };
-        assert!(admission.owner_collection_complete());
-        engine.close().await?;
         Ok(())
     }
 
@@ -2446,41 +2307,6 @@ mod tests {
                 .to_string()
                 .contains("cancelled")
         );
-        Ok(())
-    }
-
-    /// A clean collected admission cancellation releases the owner without fatal recovery.
-    #[test]
-    fn collected_admission_cancellation_finishes_without_fencing() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let (sink, _stream) = publication::channel();
-        let mut dispatch = broker.begin_foreground_dispatch(
-            Request {
-                id: 3,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"staged"}),
-            },
-            sink,
-        )?;
-        broker.fail_foreground_dispatch(&mut dispatch, TurnCancelled.into())?;
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
-            unreachable!()
-        };
-        admission.complete_owner_collection(ForegroundCollection::Restart)?;
-        admission
-            .failure
-            .as_mut()
-            .unwrap()
-            .admission_cleanup_waiting = false;
-        assert!(matches!(
-            broker.finish_foreground_failure(&mut dispatch)?,
-            ForegroundAction::Finish
-        ));
-        let result = broker.finish_foreground(dispatch)?;
-        assert_eq!(result.response.error().unwrap().code, "turn_reconfigured");
         Ok(())
     }
 

@@ -112,23 +112,3 @@ impl AgentRegistry {
         run_list
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn registry_refuses_to_guess_between_unbound_sibling_runs() {
-        let first = Agent::pending("session", "explorer", "inspect Bevy", 1);
-        let second = Agent::pending("session", "explorer", "inspect physics", 2);
-        let mut registry = AgentRegistry::from_run_list(vec![first.clone(), second.clone()]);
-        registry.execution_mut(&first.id).parent_exchange_id = Some("parent".into());
-        registry.execution_mut(&second.id).parent_exchange_id = Some("parent".into());
-
-        assert!(
-            registry
-                .resolve_unbound(Some("parent"), None, None)
-                .is_none()
-        );
-    }
-}

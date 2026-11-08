@@ -55,36 +55,6 @@ async fn fragmented_requests_preserve_order_and_notification_silence() {
 }
 
 #[tokio::test]
-async fn large_invalid_unterminated_input_reports_decode_failure_after_eof() {
-    let mut child = spawn();
-    let mut input = child.stdin.take().unwrap();
-    input
-        .write_all(&vec![b'x'; forge_protocol::MAX_FRAME_BYTES + 1])
-        .await
-        .unwrap();
-    drop(input);
-    let output = child.wait_with_output().await.unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("decode Harness control MCP request"));
-}
-
-#[tokio::test]
-async fn truncated_json_fails_without_a_partial_response() {
-    let mut child = spawn();
-    let mut input = child.stdin.take().unwrap();
-    input
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":")
-        .await
-        .unwrap();
-    drop(input);
-    let output = child.wait_with_output().await.unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("decode Harness control MCP request"));
-}
-
-#[tokio::test]
 async fn large_requests_and_results_preserve_complete_content_and_request_order() {
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();

@@ -230,6 +230,3 @@ impl SqliteStore {
         self.refresh_admission_membership(session_id)
     }
 }
-
-#[cfg(test)]
-mod tests {}

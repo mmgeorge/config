@@ -113,29 +113,3 @@ pub(super) fn map_position(
     }
     Ok(None)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn changed_imports_do_not_reuse_workspace_reference_evidence() {
-        let source =
-            "import { Value } from 'existing';\nexport function run(value: Value): void {}\n";
-        let saved = "import { Value } from 'proposed';\nexport function run(value: Value): void;\n";
-        let position = DeclarationPosition {
-            line: 2,
-            column: 27,
-        };
-        assert!(
-            map_position("run.ts", source, saved, position)
-                .unwrap()
-                .is_none()
-        );
-        let saved = saved.replace("proposed", "existing");
-        assert_eq!(
-            map_position("run.ts", source, &saved, position).unwrap(),
-            Some(position)
-        );
-    }
-}

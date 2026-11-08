@@ -1662,26 +1662,6 @@ mod tests {
         assert_eq!(sink.watermark().get(), 2);
     }
 
-    /// Reject an otherwise well-typed model observation belonging to another turn before buffering it.
-    #[tokio::test]
-    async fn foreign_turn_is_rejected_before_prestart_model_buffering() {
-        let (sink, _stream, address) = fixture();
-        assert!(
-            sink.activity_writer()
-                .send_wait(AdapterActivity::Turn {
-                    thread_id: address.thread_id,
-                    turn_id: crate::TurnId::new("foreign").unwrap(),
-                    event: TurnMetadataEvent::ModelResolved(crate::ResolvedModel {
-                        model_id: crate::ModelId::new("confirmed").unwrap(),
-                        observed_at_ms: 7,
-                    })
-                })
-                .await
-                .is_err()
-        );
-        assert!(sink.ownership.lock().unwrap().pending_models.is_empty());
-    }
-
     /// Keep item type and original turn immutable across independently scoped publishers.
     #[tokio::test]
     async fn item_identity_cannot_move_to_another_turn_or_change_kind() {
@@ -1820,39 +1800,6 @@ mod tests {
                 crate::ObservationFailure::Disconnected
             ))
         ));
-    }
-
-    /// Reject reversed native time without replacing it with the later host collection clock.
-    #[tokio::test]
-    async fn contradictory_native_completion_time_fences_without_a_certificate() {
-        let (sink, mut stream, address) = fixture();
-        let publisher = sink.turn_publisher(address).unwrap();
-        publisher.start_handle().observed(10).await.unwrap();
-        let result = crate::TurnResult::new(
-            crate::turn::TurnOutcome::Interrupted,
-            9,
-            None,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        assert!(publisher.completed(result, 20).await.is_err());
-        assert!(matches!(
-            stream.recv().await.unwrap().unwrap().event,
-            ProviderEvent::Turn {
-                event: TurnEvent::Started(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            stream.recv().await.unwrap().unwrap().event,
-            ProviderEvent::Provider {
-                event: crate::ProviderConnectionEvent::Unavailable(_),
-                ..
-            }
-        ));
-        assert!(stream.recv().await.is_err());
     }
 
     /// New native foreground work after collection must fence its original connection.

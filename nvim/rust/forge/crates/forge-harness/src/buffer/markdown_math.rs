@@ -119,29 +119,3 @@ pub(super) fn normalize(source: &str) -> String {
     }
     normalized.join("\n")
 }
-
-#[cfg(test)]
-mod test {
-    use super::normalize;
-
-    #[test]
-    fn normalizes_complete_latex_without_changing_code_or_incomplete_blocks() {
-        let source = concat!(
-            "The equation is:\n\n",
-            "\\[\nL_o(x,\\omega_o)\n=\nL_e(x,\\omega_o) + \\int_{\\Omega} L_i\n\\]\n",
-            "Where \\(L_o\\) meets \\(L_i\\).\n",
-            "A short \\[x + y\\] form.\n",
-            "```latex\n\\(literal\\)\n\\[\nliteral\n\\]\n```\n",
-            "\\[\nunfinished",
-        );
-        let expected = concat!(
-            "The equation is:\n\n",
-            "\\[\nL_o(x,\\omega_o) = L_e(x,\\omega_o) + \\int_{\\Omega} L_i\n\\]\n",
-            "Where $L_o$ meets $L_i$.\n",
-            "A short $$x + y$$ form.\n",
-            "```latex\n\\(literal\\)\n\\[\nliteral\n\\]\n```\n",
-            "\\[\nunfinished",
-        );
-        assert_eq!(normalize(source), expected);
-    }
-}

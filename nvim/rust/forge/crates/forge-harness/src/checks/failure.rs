@@ -45,6 +45,3 @@ pub(super) fn classify(error: &anyhow::Error, fallback: CheckState) -> CheckStat
         fallback
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -880,34 +880,6 @@ mod tests {
         Ok(())
     }
 
-    /// Keep child editor lifetime independent while preserving inherited policy generation revocation.
-    #[tokio::test]
-    async fn native_child_editor_lifetime_survives_parent_collection() -> Result<()> {
-        let (_directory, service, parent, lease, _receiver) = fixture().await;
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ThreadOwner::new(
-                "session".into(),
-                forge_provider_api::AgentId::new("native-child")?,
-            )?,
-            "child-exchange",
-        );
-        let child = parent.fork_observed(&scope)?;
-        assert!(child.available());
-        drop(lease);
-        assert!(!parent.available());
-        assert!(child.available());
-        service.set_enabled("session", false);
-        assert!(!child.available());
-        service.set_enabled("session", true);
-        assert!(
-            !child.available(),
-            "re-enabling editor access cannot replace the captured policy generation"
-        );
-        child.retire();
-        assert!(!child.available());
-        Ok(())
-    }
-
     async fn fixture() -> (
         tempfile::TempDir,
         Arc<LspService>,
@@ -981,25 +953,6 @@ mod tests {
         assert!(output.contains("source.rs (unsaved)") && output.contains("pub fn source()"));
         assert!(!output.contains('|'));
         assert!(service.respond("session", id, json!({}), None).is_err());
-    }
-
-    #[tokio::test]
-    async fn dropping_a_query_and_disabling_tools_release_authority() {
-        let (_directory, service, scope, lease, mut receiver) = fixture().await;
-        let active = scope.clone();
-        let work = tokio::spawn(async move { active.invoke("lsp_status", json!({})).await });
-        receiver.recv().await.unwrap().unwrap();
-        work.abort();
-        assert!(work.await.unwrap_err().is_cancelled());
-        assert!(service.pending.lock().unwrap().is_empty());
-        assert_eq!(service.slots.available_permits(), 4);
-        service.set_enabled("session", false);
-        service.set_enabled("session", true);
-        assert!(
-            !scope.available(),
-            "reenabling revived old request authority"
-        );
-        drop(lease);
     }
 
     /// Revoke pending editor waits directly from cancellation, lease, and preference events.

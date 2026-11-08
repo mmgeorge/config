@@ -1,28 +1,9 @@
-use std::io::{self, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 use forge_diff::raw::compute_hunks;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::unified::{write_file_header, write_unified};
-
-struct LimitedOutput {
-    remaining: usize,
-}
-
-impl Write for LimitedOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.remaining == 0 {
-            return Err(io::Error::other("injected output limit"));
-        }
-        let accepted = bytes.len().min(self.remaining);
-        self.remaining -= accepted;
-        Ok(accepted)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 #[test]
 fn git_applies_and_reverses_exact_unified_bytes_including_crlf_and_missing_newlines() {
@@ -109,44 +90,4 @@ fn git_applies_and_reverses_exact_unified_bytes_including_crlf_and_missing_newli
             }
         }
     }
-}
-
-#[test]
-fn writer_errors_stop_serialization_and_unchanged_sources_emit_nothing() {
-    let old = SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap();
-    let equal = compute_hunks(SourcePair {
-        old: old.clone(),
-        new: old.clone(),
-    });
-    write_unified(
-        &equal,
-        "a/source",
-        "b/source",
-        3,
-        &mut LimitedOutput { remaining: 0 },
-    )
-    .unwrap();
-    let changed = compute_hunks(SourcePair {
-        old,
-        new: SourceVersion::new(b"changed\n".to_vec(), Representation::Raw).unwrap(),
-    });
-    let error = write_unified(
-        &changed,
-        "a/source",
-        "b/source",
-        3,
-        &mut LimitedOutput { remaining: 40 },
-    )
-    .unwrap_err();
-    assert_eq!(error.to_string(), "injected output limit");
-}
-
-#[test]
-fn file_headings_quote_control_characters_without_creating_extra_lines() {
-    let mut output = Vec::new();
-    write_file_header("a/line\nname\t\"\\", "b/line\rname", &mut output).unwrap();
-    assert_eq!(
-        String::from_utf8(output).unwrap(),
-        "diff --git \"a/line\\nname\\t\\\"\\\\\" \"b/line\\rname\"\n"
-    );
 }

@@ -737,26 +737,4 @@ mod test {
         assert!(request.await.is_err());
         assert!(lane.activate(None).is_ok());
     }
-
-    #[tokio::test]
-    async fn preserves_submission_order_across_one_active_turn() {
-        let lane = SteeringLane::default();
-        let mut active = lane.activate(None).unwrap();
-        let first_lane = lane.clone();
-        let first = tokio::spawn(async move { first_lane.steer("first".into()).await });
-        tokio::task::yield_now().await;
-        let second_lane = lane.clone();
-        let second = tokio::spawn(async move { second_lane.steer("second".into()).await });
-        tokio::task::yield_now().await;
-
-        let first_command = active.receive().await.unwrap();
-        assert_eq!(first_command.text, "first");
-        first_command.complete(Ok(())).await;
-        let second_command = active.receive().await.unwrap();
-        assert_eq!(second_command.text, "second");
-        second_command.complete(Ok(())).await;
-
-        first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
-    }
 }

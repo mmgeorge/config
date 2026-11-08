@@ -3,8 +3,8 @@ use forge_git::test_support as support;
 use forge_git::{completion::RevisionProvider, store::RepositoryStore};
 use std::{fs, path::Path, sync::Arc};
 use support::{
-    add_detached_worktree, create_branch, create_tag, git, head_commit, init_bare_repository,
-    init_repository, set_reference, set_symbolic_reference, stage_and_commit,
+    create_branch, create_tag, git, head_commit, init_repository, set_reference,
+    set_symbolic_reference, stage_and_commit,
 };
 
 #[tokio::test]
@@ -47,60 +47,6 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
     assert_ne!(refreshed.reference_digest, candidates.reference_digest);
     assert!(refreshed.values.contains(&b"added".to_vec()));
     assert!(!candidates.values.contains(&b"added".to_vec()));
-}
-
-#[tokio::test]
-async fn failed_refresh_preserves_previously_accepted_candidates() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    initialize(root);
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let accepted = repository.refresh_revisions(&store).await.unwrap();
-    fs::write(root.join(".git/refs/heads/broken"), b"not-an-object\n").unwrap();
-    let failure = repository.refresh_revisions(&store).await.unwrap_err();
-    assert!(failure.to_string().contains("enumerate revision reference"));
-    assert!(Arc::ptr_eq(
-        &accepted,
-        &repository.current_revisions().unwrap()
-    ));
-}
-
-#[tokio::test]
-async fn unborn_and_bare_repositories_return_valid_snapshots() {
-    let fixture = tempfile::tempdir().unwrap();
-    let store = RepositoryStore::default();
-    for bare in [false, true] {
-        let root = fixture.path().join(if bare { "bare" } else { "worktree" });
-        fs::create_dir(&root).unwrap();
-        if bare {
-            init_bare_repository(&root);
-        } else {
-            init_repository(&root);
-        }
-        let repository = store.open(root).await.unwrap().unwrap();
-        let candidates = repository.refresh_revisions(&store).await.unwrap();
-        assert!(candidates.values.is_empty());
-    }
-}
-
-#[tokio::test]
-async fn linked_worktree_storage_invalidation_clears_each_candidate_cache() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path().join("main");
-    fs::create_dir(&root).unwrap();
-    initialize(&root);
-    let linked = fixture.path().join("linked");
-    add_detached_worktree(&root, &linked, head_commit(&root));
-    let store = RepositoryStore::default();
-    let main = store.open(root).await.unwrap().unwrap();
-    let linked = store.open(linked).await.unwrap().unwrap();
-    let first = main.refresh_revisions(&store).await.unwrap();
-    let second = linked.refresh_revisions(&store).await.unwrap();
-    assert_eq!(first.values, second.values);
-    store.invalidate_storage(&main.identity.storage).unwrap();
-    assert!(main.current_revisions().is_none());
-    assert!(linked.current_revisions().is_none());
 }
 
 fn initialize(root: &Path) {

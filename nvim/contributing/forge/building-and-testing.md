@@ -74,7 +74,7 @@ Test fixtures must use the current public check configuration. Task-specific ena
 
 ## Lua tests
 
-Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run a unit test file or one of its scenarios by name, an integration fixture by path, a suite, or the default selection of every test. [Editor tests](editor-tests.md) describes the unit and integration test layout:
+Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner runs each unit test file as one mini.test shard and each integration case in its own headless Neovim, in parallel, and fails any case still running after five seconds as a timeout, killing its whole process tree. Host fixtures launch the built executable, so build it first. Run a unit test file or one of its cases by name, an integration fixture by path, a suite, or the default selection of every test. [Editor tests](editor-tests.md) describes the unit and integration test layout:
 
 ```nu
 nu .forge/checks/lua-tests.nu client::admission_queue

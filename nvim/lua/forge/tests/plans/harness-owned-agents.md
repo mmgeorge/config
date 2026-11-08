@@ -309,6 +309,9 @@ Interactive Terminal MCP inspection used a dedicated 120-column, 40-row terminal
 nvim -u NONE --cmd "set rtp+=D:/config/nvim" --cmd "lua vim.g.forge_profile_form_interactive = true" -c "luafile D:/config/nvim/lua/forge/tests/integration/views/harness/harness.test.lua"
 ```
 
+The test file no longer has the `forge_profile_form_interactive` manual mode, so this command
+records how the inspection ran and no longer reproduces it.
+
 The form occupied one full-page window in its own tab. Moving to Provider and pressing Right
 displayed the existing arrow control and a dirty marker. Native insertion edited Instructions
 in place. Ctrl-S cleared the dirty markers, and q returned to profile selection. This fixture

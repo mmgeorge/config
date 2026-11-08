@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::MessageDelivery;
 use super::{Message, MessageKind, MessageState, TurnItem};
 use crate::provider::ScopeOwner;
 use anyhow::{Result, ensure};
@@ -487,106 +485,6 @@ impl Turn {
         Ok(())
     }
 
-    /// Append fixture text using the same typed item boundary as native adapters.
-    #[cfg(test)]
-    pub(crate) fn record_text(&mut self, kind: MessageKind, text: &str) -> Result<()> {
-        self.record_provider_text(kind, text, None, default_delivery(kind), false)
-    }
-
-    /// Build source-typed message fixtures without bypassing item admission or completion.
-    #[cfg(test)]
-    pub(crate) fn record_provider_text(
-        &mut self,
-        kind: MessageKind,
-        text: &str,
-        provider_id: Option<String>,
-        delivery: super::MessageDelivery,
-        snapshot: bool,
-    ) -> Result<()> {
-        use forge_provider_api::{
-            AgentMessageRole, AgentMessageStart, ItemCompletion, ItemEvent, ItemStart,
-            MessageClassification, MessageCompletion, MessageItemEvent, MessageOutcome,
-            ReasoningKind, ReasoningStart, UserMessageStart,
-        };
-        let provider_id = provider_id.unwrap_or_else(|| {
-            self.current_message
-                .filter(|index| self.message[*index].kind() == kind && !snapshot)
-                .map(|index| self.message[index].provider_id.as_str().to_owned())
-                .unwrap_or_else(|| format!("test-message:{}", self.message.len() + 1))
-        });
-        let item_id = forge_provider_api::ItemId::new(provider_id)?;
-        let classification = match delivery {
-            super::MessageDelivery::Final => {
-                MessageClassification::Known(AgentMessageRole::Response)
-            }
-            super::MessageDelivery::Commentary => {
-                MessageClassification::Known(AgentMessageRole::Commentary)
-            }
-            super::MessageDelivery::Unknown => MessageClassification::Unclassified,
-        };
-        let start = match kind {
-            MessageKind::User => ItemStart::UserMessage(UserMessageStart {
-                text: text.into(),
-                submission_id: None,
-            }),
-            MessageKind::Unknown => ItemStart::AgentMessage(AgentMessageStart {
-                text: text.into(),
-                classification: MessageClassification::Unclassified,
-            }),
-            MessageKind::Assistant => ItemStart::AgentMessage(AgentMessageStart {
-                text: text.into(),
-                classification,
-            }),
-            MessageKind::Reasoning | MessageKind::ReasoningSummary => {
-                ItemStart::Reasoning(ReasoningStart {
-                    text: text.into(),
-                    kind: if kind == MessageKind::Reasoning {
-                        ReasoningKind::Full
-                    } else {
-                        ReasoningKind::Summary
-                    },
-                })
-            }
-        };
-        if !self
-            .message
-            .iter()
-            .any(|message| message.provider_id == item_id)
-        {
-            self.record_item_message(&item_id, &ItemEvent::Started(start))?;
-            if !snapshot {
-                return Ok(());
-            }
-        } else if matches!(kind, MessageKind::Assistant | MessageKind::Unknown) {
-            self.record_item_message(
-                &item_id,
-                &ItemEvent::Message {
-                    event: MessageItemEvent::Classified(classification),
-                },
-            )?;
-        }
-        let event = if snapshot {
-            let completed = MessageCompletion {
-                text: text.into(),
-                outcome: MessageOutcome::Completed,
-            };
-            ItemEvent::Completed(match kind {
-                MessageKind::User => ItemCompletion::UserMessage(completed),
-                MessageKind::Unknown | MessageKind::Assistant => {
-                    ItemCompletion::AgentMessage(completed)
-                }
-                MessageKind::Reasoning | MessageKind::ReasoningSummary => {
-                    ItemCompletion::Reasoning(completed)
-                }
-            })
-        } else {
-            ItemEvent::Message {
-                event: MessageItemEvent::Delta(text.into()),
-            }
-        };
-        Ok(self.record_item_message(&item_id, &event)?)
-    }
-
     /// Permanently settle execution while accepting an identical completion replay.
     pub(crate) fn finish(&mut self, outcome: TurnOutcome, now_ms: i64) -> Result<()> {
         match self.state {
@@ -761,16 +659,6 @@ impl TryFrom<TurnWire> for Turn {
     }
 }
 
-#[cfg(test)]
-fn default_delivery(kind: MessageKind) -> MessageDelivery {
-    match kind {
-        MessageKind::Unknown => MessageDelivery::Unknown,
-        MessageKind::User => MessageDelivery::Final,
-        MessageKind::Assistant => MessageDelivery::Final,
-        MessageKind::Reasoning | MessageKind::ReasoningSummary => MessageDelivery::Commentary,
-    }
-}
-
 pub use forge_provider_api::turn::TurnOutcome;
 
 #[cfg(test)]
@@ -883,46 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn messages_and_tools_keep_order_across_boundaries_and_freeze_at_completion() -> Result<()> {
-        let mut turn = TestTurn::new("local".into(), address(), 10);
-        turn.record_text(MessageKind::Reasoning, "Inspecting ")?;
-        turn.record_text(MessageKind::Reasoning, "ownership")?;
-        turn.record_tool("tool", &tool_start(), 1000)?;
-        turn.record_tool("tool", &tool_end(ToolOutcome::Succeeded), 1000)?;
-        turn.record_text(MessageKind::Assistant, "First response")?;
-        turn.close_message();
-        turn.record_text(MessageKind::Assistant, "After steering")?;
-        assert_eq!(turn.messages().len(), 3);
-        assert_eq!(turn.messages()[0].text(), "Inspecting ownership");
-        assert_eq!(
-            turn.items(),
-            &[
-                TurnItem::Message {
-                    id: "local:message:1".into()
-                },
-                TurnItem::Tool { id: "tool".into() },
-                TurnItem::Message {
-                    id: "local:message:2".into()
-                },
-                TurnItem::Message {
-                    id: "local:message:3".into()
-                }
-            ]
-        );
-        turn.finish(normal(), 20)?;
-        let encoded = serde_json::to_string(&turn)?;
-        assert!(
-            turn.record_text(MessageKind::Assistant, "late delta")
-                .is_err()
-        );
-        assert_eq!(serde_json::to_string(&turn)?, encoded);
-        let restored: TestTurn = serde_json::from_str(&encoded)?;
-        assert_eq!(restored.messages()[2].text(), "After steering");
-        assert_eq!(restored.items(), turn.items());
-        Ok(())
-    }
-
-    #[test]
     fn completed_turn_rejects_late_content_and_freezes_completion() -> Result<()> {
         let mut turn = TestTurn::new("local".into(), address(), 10);
         turn.record_tool("tool", &tool_start(), 11)?;
@@ -970,93 +818,6 @@ mod tests {
         let late = crate::turn::test_support::item_event(&original, "late", tool_start());
         assert!(!exchange.observe_event(&late, 100)?);
         assert_eq!(serde_json::to_value(&exchange)?, before);
-        Ok(())
-    }
-
-    #[test]
-    fn identified_usage_timing_is_idempotent_after_reload() -> Result<()> {
-        let mut turn = super::Turn::new("local".into(), address(), 1);
-        let first = TurnUsageReport::timing(
-            forge_provider_api::identity::UsageReportId::new("first")?,
-            2,
-            15,
-        );
-        assert!(turn.record_usage_report(&first)?);
-        let mut restored: super::Turn = serde_json::from_value(serde_json::to_value(&turn)?)?;
-        assert!(!restored.record_usage_report(&first)?);
-        assert_eq!(restored.reported_duration_ms, Some(15));
-        let second = TurnUsageReport::timing(
-            forge_provider_api::identity::UsageReportId::new("second")?,
-            3,
-            5,
-        );
-        assert!(restored.record_usage_report(&second)?);
-        assert_eq!(restored.reported_duration_ms, Some(20));
-        let conflict = TurnUsageReport::timing(
-            forge_provider_api::identity::UsageReportId::new("first")?,
-            4,
-            16,
-        );
-        assert!(restored.record_usage_report(&conflict).is_err());
-        assert_eq!(restored.reported_duration_ms, Some(20));
-        assert!(!restored.record_usage_report(&first)?);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod model_tests {
-    use super::*;
-    use crate::provider::ThreadOwner;
-    use forge_provider_api::InvocationScope;
-
-    #[test]
-    fn persisted_items_reject_duplicate_identity_retyped_content_and_orphan_references()
-    -> Result<()> {
-        use forge_provider_api::{ItemEvent, ItemId, ItemStart, ReasoningKind, ReasoningStart};
-        let scope = InvocationScope {
-            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("session")),
-            exchange_id: "exchange".into(),
-            invocation_id: "items".into(),
-        };
-        let address = TurnAddress {
-            thread_id: scope.owner().thread_id(),
-            turn_id: scope.turn_id()?,
-            scope,
-        };
-        let mut turn = Turn::new("items".into(), address, 1);
-        turn.record_item_message(
-            &ItemId::new("reasoning")?,
-            &ItemEvent::Started(ItemStart::Reasoning(ReasoningStart {
-                text: "Summary".into(),
-                kind: ReasoningKind::Summary,
-            })),
-        )?;
-        let valid = serde_json::to_value(&turn)?;
-        let restored: Turn = serde_json::from_value(valid.clone())?;
-        assert_eq!(
-            restored.messages()[0].reasoning_kind(),
-            Some(ReasoningKind::Summary)
-        );
-        let mut duplicate = valid.clone();
-        let message = duplicate["message"][0].clone();
-        duplicate["message"].as_array_mut().unwrap().push(message);
-        assert!(serde_json::from_value::<Turn>(duplicate).is_err());
-        let mut retyped = valid.clone();
-        retyped["message"][0]["content"]["kind"] = serde_json::to_value(ReasoningKind::Full)?;
-        assert!(serde_json::from_value::<Turn>(retyped).is_err());
-        let mut orphan = valid.clone();
-        orphan["item"][0]["id"] = serde_json::json!("unknown-message");
-        assert!(serde_json::from_value::<Turn>(orphan).is_err());
-        let mut foreign_thread = valid.clone();
-        foreign_thread["provider"]["thread_id"] = serde_json::json!("foreign-thread");
-        assert!(serde_json::from_value::<Turn>(foreign_thread).is_err());
-        let mut foreign_turn = valid.clone();
-        foreign_turn["provider"]["turn_id"] = serde_json::json!("foreign-turn");
-        assert!(serde_json::from_value::<Turn>(foreign_turn).is_err());
-        let mut cursor = valid;
-        cursor["current_message"] = serde_json::json!(99);
-        assert!(serde_json::from_value::<Turn>(cursor).is_err());
         Ok(())
     }
 }

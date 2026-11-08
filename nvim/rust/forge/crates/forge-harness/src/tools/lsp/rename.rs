@@ -229,6 +229,3 @@ pub(super) async fn execute(
         message: result,
     })
 }
-
-#[cfg(test)]
-mod tests {}

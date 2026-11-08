@@ -1,45 +1,39 @@
--- Integration tests for the `harness` area. Each scenario row runs in its own headless Neovim:
--- `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`. Tests that launch the Forge host
--- assume `rust-build` has produced a current executable.
-local scenarios = {
-  { name = "background", run = function()
-vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
-vim.loader.enable(false)
-local root = vim.fn.tempname()
+local MiniTest = require("mini.test")
+local eq = MiniTest.expect.equality
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
+local host = dofile("nvim/lua/forge/tests/support/host.lua")
+local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
+local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/tests/fixtures/check_tool.lua", ":p"))
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["background"] = function()
+local root = temp.directory("background")
 local workspace = root .. "/repository"
-vim.fn.mkdir(workspace, "p")
-local function git(arguments)
-  local command = { "git", "-C", workspace }
-  vim.list_extend(command, arguments)
-  local result = vim.system(command, { text = true, timeout = 10000 }):wait()
-  assert(result.code == 0, result.stderr)
-end
-git({ "init", "-q", "-b", "main" })
-git({ "config", "user.name", "Fixture" })
-git({ "config", "user.email", "fixture@example.test" })
-git({ "commit", "-q", "--allow-empty", "-m", "feat: initial" })
+local repository = git_repository.create({ path = workspace })
+repository.run({ "commit", "-q", "--allow-empty", "-m", "feat: initial" })
 vim.fn.writefile({ "local value = true" }, workspace .. "/example.lua")
-local executable = require("forge.builder").binary_path()
-local stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and root or stdpath(kind) end
-package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = executable }) return function() end end }
+local client = host.start({ data = root, config = root, schedule_ensure = false }).client
 require("forge").setup({ harness = { provider = "mock" }, background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
-local errors = {}
-require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
+local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
 local function call(method, params)
   local result, failure, done
   client.request({ method = method, params = params }, function(value, error) result, failure, done = value, error, true end)
-  assert(vim.wait(20000, function() return done end, 10), method .. " timed out")
+  wait_until(function() return done end, method .. " timed out", { timeout_ms = 4000 })
   assert(not failure, tostring(failure) .. "\n" .. tostring(client._client.stderr) .. "\n" .. vim.inspect(errors))
   return result
 end
 local generation, generation_failure
 client.generation_config(function(value, failure) generation, generation_failure = value, failure end)
-assert(vim.wait(20000, function() return generation ~= nil or generation_failure ~= nil end, 10))
+wait_until(function() return generation ~= nil or generation_failure ~= nil end, "generation configuration did not settle", { timeout_ms = 4000 })
 assert(generation, generation_failure)
 local preview = call("repository.generation", { operation = "preview", workspace = workspace, comparison = "head" })
 assert(preview.prompt.user:find("Current Background task: commit_message", 1, true))
@@ -61,56 +55,37 @@ snapshot = call("background.session.document", query)
 assert(snapshot.settings.desired.auto_compaction.threshold_tokens == 64000)
 query.auto_compaction, query.expected_revision = nil, nil
 require("forge").open_background_timeline()
-assert(vim.wait(10000, function()
+wait_until(function()
   return vim.api.nvim_buf_get_name(0):match("ForgeBackground")
-    and table.concat(vim.api.nvim_buf_get_lines(0,0,-1,false), "\n"):find("Mock response",1,true)
-end, 10), "Background timeline did not render")
+    and buffer.text(0):find("Mock response",1,true)
+end, "Background timeline did not render", { timeout_ms = 4000 })
 assert(vim.bo.modifiable == false, "Background timeline is editable")
 assert(state.session == nil, "Debug timeline selected interactive Harness")
-git({ "switch", "-q", "-c", "feature" })
+repository.run({ "switch", "-q", "-c", "feature" })
 local branch = call("repository.generation", params)
 assert(branch.session_id ~= first.session_id, "branch switch reused obsolete context")
-assert(#errors == 0, table.concat(errors, "\n"))
-client.host_stop()
-assert(vim.wait(10000, function() return not client._client.process end, 10), "Host did not stop")
-print("background host: persistence, branch rotation, overrides, independent timeline and read-only rendering passed")
-vim.cmd("qa!")
-  end },
-  { name = "access_preferences", run = function()
-vim.loader.enable(false)
-local root = vim.fs.normalize(vim.fn.getcwd())
-local workspace, data = vim.fn.tempname(), vim.fn.tempname()
-assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
-vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
-local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
--- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
-executable = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
-local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
-vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
-local errors = {}
-vim.notify = function(message, level)
-  if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
+errors:assert_none()
+assert(host.stop(), "Host did not stop")
 end
-package.loaded["forge.builder"] = { ensure = function(callback)
-  vim.schedule(function() callback({ ok = true, path = executable }) end)
-  return function() end
-end }
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
+T["access_preferences"] = function()
+local workspace = temp.directory("workspace")
+git_repository.run(workspace, { "init" })
+vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+local data = temp.directory("data")
+local errors = notify.capture({ min_level = vim.log.levels.ERROR })
+local client = host.start({ data = data, config = data }).client
 local state = require("forge.session").harness
-local controller = require("forge.views.harness.controller")
-local function await(predicate, message)
-  assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10), message .. " " .. vim.inspect({
+local function wait_context()
+  return vim.inspect({
     approval_mode = state.session and state.session.approval_mode, task_operation = state.task_operation,
     approval_timeout = state.session and state.session.approval_timeout,
-  }))
-  assert(#errors == 0, table.concat(errors, "\n"))
+  })
 end
+local wait_options = { timeout_ms = 4000, errors = errors, context = wait_context }
 local function request(method, params)
   local result, failure, done
   client.request({ method = method, params = params, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, error) result, failure, done = value, error, true end)
-  await(function() return done end, method .. " did not settle")
+  wait_until(function() return done end, method .. " did not settle", wait_options)
   assert(not failure, failure)
   return result
 end
@@ -132,124 +107,95 @@ local function change(id, key)
   selected.instance.state.page_index = selected.page_index
   selected.instance.state.selected_index_by_page[selected.page.id] = selected.index
   picker.update(selected.instance.spec)
-  local mapping = vim.api.nvim_buf_call(selected.instance.buf, function() return vim.fn.maparg(key, "n", false, true) end)
-  mapping.callback()
+  keymap.invoke(key, { buffer = selected.instance.buf })
 end
 local function open_settings()
   settings.open(state, { window_list = { state.transcript_win, state.composer_win }, control_win = state.composer_win })
-  await(function() return picker.is_open("harness-config") end, "configuration did not open")
+  wait_until(function() return picker.is_open("harness-config") end, "configuration did not open", wait_options)
 end
-local success, failure = xpcall(function()
-  vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
-  require("forge.views.harness").open()
-  await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
-  assert(not state.capability.os_sandbox and not state.session.access.sandbox)
-  open_settings()
-  assert(field("sandbox").value.muted and not field("sandbox").value.disabled_reason)
-  change("sandbox", "<CR>")
-  await(function() return state.access_preference.sandbox and field("sandbox").value.value end, "muted sandbox preference did not save")
-  assert(not state.session.access.sandbox, "mock provider enabled OS isolation")
-  picker.close(false)
-  open_settings()
-  assert(field("sandbox").value.value and field("sandbox").value.muted, "reopening lost the selected preference")
-  assert(not pcall(field, "isolation-mode"), "Mock must not invent provider isolation modes")
-  change("readable-directories", "<CR>")
-  await(function() return vim.bo.buftype == "acwrite" end, "directory editor did not open")
-  local directory_buffer = vim.api.nvim_get_current_buf()
-  local directory_row = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.api.nvim_buf_set_text(directory_buffer, directory_row, 0, directory_row, 0, { workspace })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = directory_buffer })
-  vim.cmd("write")
-  await(function() return #state.access_preference.readable_directory == 1 and not vim.bo[directory_buffer].modified end,
-    "directory preference did not save")
+vim.api.nvim_set_current_dir(workspace)
+require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
+require("forge.views.harness").open()
+wait_until(function() return state.presentation and state.presentation.ready end, "Harness did not open", wait_options)
+assert(not state.capability.os_sandbox and not state.session.access.sandbox)
+open_settings()
+assert(field("sandbox").value.muted and not field("sandbox").value.disabled_reason)
+change("sandbox", "<CR>")
+wait_until(function() return state.access_preference.sandbox and field("sandbox").value.value end,
+  "muted sandbox preference did not save", wait_options)
+assert(not state.session.access.sandbox, "mock provider enabled OS isolation")
+picker.close(false)
+open_settings()
+assert(field("sandbox").value.value and field("sandbox").value.muted, "reopening lost the selected preference")
+assert(not pcall(field, "isolation-mode"), "Mock must not invent provider isolation modes")
+change("readable-directories", "<CR>")
+wait_until(function() return vim.bo.buftype == "acwrite" end, "directory editor did not open", wait_options)
+local directory_buffer = vim.api.nvim_get_current_buf()
+local directory_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+vim.api.nvim_buf_set_text(directory_buffer, directory_row, 0, directory_row, 0, { workspace })
+vim.api.nvim_exec_autocmds("TextChanged", { buffer = directory_buffer })
+vim.cmd("write")
+wait_until(function() return #state.access_preference.readable_directory == 1 and not vim.bo[directory_buffer].modified end,
+  "directory preference did not save", wait_options)
+assert(state.access_preference.sandbox and not state.session.access.sandbox,
+  "directory editing overwrote the saved sandbox preference")
+keymap.invoke("q")
+wait_until(function() return picker.is_open("harness-config") end, "directory editor did not return to configuration", wait_options)
+for _, mode in ipairs({ "deny", "allow", "ask" }) do
+  change("approval-mode", "<Right>")
+  wait_until(function() return state.session.approval_mode == mode and not require("forge.views.harness.activity").busy(state) end,
+    "tool approval mode did not apply: " .. mode, wait_options)
   assert(state.access_preference.sandbox and not state.session.access.sandbox,
-    "directory editing overwrote the saved sandbox preference")
-  vim.fn.maparg("q", "n", false, true).callback()
-  await(function() return picker.is_open("harness-config") end, "directory editor did not return to configuration")
-  for _, mode in ipairs({ "deny", "allow", "ask" }) do
-    change("approval-mode", "<Right>")
-    await(function() return state.session.approval_mode == mode and not require("forge.views.harness.activity").busy(state) end,
-      "tool approval mode did not apply: " .. mode)
-    assert(state.access_preference.sandbox and not state.session.access.sandbox,
-      "approval mode overwrote saved sandbox preference or effective access")
-  end
-  for _ = 1, 3 do change("approval_timeout", "<Right>") end
-  -- Timeout edits are ordinary session configuration now; the confirmed session value is the
-  -- settled state, and the picker must show the same final selection.
-  await(function() return state.session.approval_timeout.amount == 13 end,
-    "rapid timeout edits did not retain both final values")
-  local shown = vim.wait(5000, function() return field("approval_timeout").value.value == "13m" end, 10)
-  assert(shown, "configuration picker shows " .. tostring(field("approval_timeout").value.value)
-    .. " after the host confirmed 13m")
-  local selected = request("settings.get", {})
-  assert(selected.desired.approval_timeout.amount == 13)
-  assert(selected.desired.access.sandbox and not state.session.access.sandbox)
-  assert(request("session.task.get", {}) == nil, "configuration started a task")
-  picker.close(false)
-  require("forge.views.harness.workspace").release(state)
-  assert(state.presentation.close())
-end, debug.traceback)
+    "approval mode overwrote saved sandbox preference or effective access")
+end
+for _ = 1, 3 do change("approval_timeout", "<Right>") end
+-- Timeout edits are ordinary session configuration now; the confirmed session value is the
+-- settled state, and the picker must show the same final selection.
+wait_until(function() return state.session.approval_timeout.amount == 13 end,
+  "rapid timeout edits did not retain both final values", wait_options)
+wait_until(function() return field("approval_timeout").value.value == "13m" end,
+  "configuration picker does not show the host-confirmed 13m",
+  { timeout_ms = 4000, context = function() return "shown: " .. tostring(field("approval_timeout").value.value) end })
+local selected = request("settings.get", {})
+assert(selected.desired.approval_timeout.amount == 13)
+assert(selected.desired.access.sandbox and not state.session.access.sandbox)
+assert(request("session.task.get", {}) == nil, "configuration started a task")
 picker.close(false)
 require("forge.views.harness.workspace").release(state)
-client.host_stop()
-local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
-vim.api.nvim_set_current_dir(root)
-vim.fn.stdpath, vim.notify = original_stdpath, original_notify
-vim.fn.delete(workspace, "rf")
-vim.fn.delete(data, "rf")
-assert(success and collected, failure or "Harness host was not collected")
-print("harness_access_preferences_host: passed")
-vim.cmd("qa!")
-  end },
-  { name = "check_shortcuts", run = function()
-vim.loader.enable(false)
-local check_tool = dofile(vim.fn.getcwd() .. "/nvim/lua/forge/tests/fixtures/check_tool.lua")
-vim.opt.runtimepath:prepend(vim.fs.normalize(vim.fn.getcwd()) .. "/nvim")
-local workspace, data = vim.fn.tempname(), vim.fn.tempname()
-vim.fn.mkdir(workspace, "p")
-vim.fn.mkdir(data, "p")
-local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
--- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
-binary = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
-local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
-package.loaded["forge.builder"] = { ensure = function(callback)
-  vim.schedule(function() callback({ ok = true, path = binary }) end)
-  return function() end
-end }
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
+assert(state.presentation.close())
+picker.close(false)
+require("forge.views.harness.workspace").release(state)
+assert(host.stop(), "Harness host was not collected")
+end
+T["check_shortcuts"] = function()
+local check_tool = dofile(check_tool_path)
+local workspace = temp.directory("workspace")
+local client = host.start().client
 local state = require("forge.session").harness
-local errors = {}
-require("forge.infra.notifications").error = function(message) errors[#errors + 1] = debug.traceback(message, 2) end
+local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
 local function request(method, params)
   local done, result, failure
   client.request({ method = method, params = params or {}, session_id = require("forge.event_contract").method_policy(method).session_context ~= "none" and assert(require("forge.session").harness.session).id or nil }, function(value, problem) result, failure, done = value, problem, true end)
-  assert(vim.wait(10000, function() return done end, 10), method .. " timed out")
+  wait_until(function() return done end, method .. " timed out", { timeout_ms = 4000 })
   assert(not failure, method .. ": " .. tostring(failure))
   return result
 end
 local function rows()
-  return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  return buffer.text(state.transcript_buf)
 end
 -- Live check progress belongs to the status split; completed results stay in the transcript.
 local function status_rows()
   local status = state.presentation and state.presentation.status_view
   return table.concat(status and status.content and status.content.lines or {}, "\n")
 end
-local function press(key)
-  vim.api.nvim_set_current_win(state.composer_win)
-  local mapping = vim.fn.maparg(key, "n", false, true)
-  assert(type(mapping.callback) == "function", "shortcut is not installed: " .. key)
-  mapping.callback()
-end
 local function start_check()
   local run_id = check_tool.start(request, { check = { "slow" } }).run_id
-  assert(vim.wait(5000, function()
+  wait_until(function()
     return state.checks_running and state.active_check_run == run_id and status_rows():find("Shortcut check is running", 1, true)
-  end, 10), "check did not become active: " .. vim.inspect({ run_id = run_id, checks_running = state.checks_running,
-    active_check_run = state.active_check_run, errors = errors, status = status_rows(), transcript = rows() }))
+  end, "check did not become active", { timeout_ms = 4000, context = function()
+    return vim.inspect({ run_id = run_id, checks_running = state.checks_running,
+      active_check_run = state.active_check_run, errors = errors, status = status_rows(), transcript = rows() })
+  end })
   return run_id
 end
 local function settled()
@@ -258,60 +204,54 @@ local function settled()
     and #state.queue == 0 and #state.pending_steer == 0 and #(state.pending_submit or {}) == 0
 end
 local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
+  buffer.set(state.composer_buf, { text })
 end
-local succeeded, failure = xpcall(function()
-  vim.fn.writefile({ vim.json.encode({ checks = {
-  ["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "test" } }
+vim.fn.writefile({ vim.json.encode({ checks = {
+["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "test" } }
 } }) }, workspace .. "/.forge.json")
-  vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false,
-    harness = { provider = "mock", providers = { mock = { command = { "mock" }, selectable = true } } } })
-  require("forge.views.harness").open()
-  assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timed out")
-  request("session.configure", { shell = "nushell" })
-  local run_id = start_check()
-  compose("")
-  press("<C-c>")
-  assert(vim.wait(3000, function() return not state.checks_running end, 10),
-    "Ctrl-C did not stop the check: " .. vim.inspect({ operation = state.cleanup_operation_id, notice = state.execution_notice }))
-  assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
-  assert(vim.wait(3000, settled, 10), "Ctrl-C did not settle its pause")
-  for _, pause_first in ipairs({ false, true }) do
-    run_id = start_check()
-    if pause_first then
-      compose("")
-      press("<C-c>")
-      -- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
-      assert(state.cleanup_operation_id, "Ctrl-C did not start a pause")
-    end
-    local text = pause_first and "Replacement during pause" or "Replacement during check"
-    compose(text)
-    press("<C-s>")
-    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "",
-      "Ctrl-S did not capture the replacement")
-    assert(vim.wait(5000, function() return settled() and rows():find(text, 1, true) end, 10),
-      "Ctrl-S did not complete its replacement: " .. vim.inspect({ operation = state.cleanup_operation_id,
+vim.api.nvim_set_current_dir(workspace)
+require("forge").setup({ diff_logging = false, harness_logging = false,
+  harness = { provider = "mock", providers = { mock = { command = { "mock" }, selectable = true } } } })
+require("forge.views.harness").open()
+wait_until(function() return state.session ~= nil end, "startup timed out", { timeout_ms = 4000 })
+request("session.configure", { shell = "nushell" })
+local run_id = start_check()
+compose("")
+keymap.invoke("<C-c>", { window = state.composer_win })
+wait_until(function() return not state.checks_running end, "Ctrl-C did not stop the check", { timeout_ms = 3000,
+  context = function() return vim.inspect({ operation = state.cleanup_operation_id, notice = state.execution_notice }) end })
+assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
+wait_until(settled, "Ctrl-C did not settle its pause", { timeout_ms = 3000 })
+for _, pause_first in ipairs({ false, true }) do
+  run_id = start_check()
+  if pause_first then
+    compose("")
+    keymap.invoke("<C-c>", { window = state.composer_win })
+    -- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
+    assert(state.cleanup_operation_id, "Ctrl-C did not start a pause")
+  end
+  local text = pause_first and "Replacement during pause" or "Replacement during check"
+  compose(text)
+  keymap.invoke("<C-s>", { window = state.composer_win })
+  assert(buffer.line(state.composer_buf, 1) == "",
+    "Ctrl-S did not capture the replacement")
+  wait_until(function() return settled() and rows():find(text, 1, true) end,
+    "Ctrl-S did not complete its replacement", { timeout_ms = 4000, context = function()
+      return vim.inspect({ operation = state.cleanup_operation_id,
         drafts = state.input.drafts, notice = state.execution_notice, busy = require("forge.views.harness.activity").busy(state),
         pause_first = pause_first, input = request("session.input.get"), queue = state.queue,
         steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
-        transcript = rows() }))
-    assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
-    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "Ctrl-S left the submitted draft")
-  end
-end, debug.traceback)
+        transcript = rows() })
+    end })
+  assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
+  assert(buffer.line(state.composer_buf, 1) == "", "Ctrl-S left the submitted draft")
+end
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.host_stop()
-local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
-vim.fn.stdpath = original_stdpath
-assert(succeeded and collected, failure or "host did not stop")
-assert(#errors == 0, table.concat(errors, "\n"))
-print("harness_check_shortcuts_host: passed")
-vim.cmd("qa!")
-  end },
-  { name = "control_responsiveness", run = function()
-vim.loader.enable(false)
+assert(host.stop(), "host did not stop")
+errors:assert_none()
+end
+T["control_responsiveness"] = function()
 local controller = require("forge.views.harness.controller")
 local state = require("forge.session").harness
 local client = require("forge.client")
@@ -321,40 +261,33 @@ local settings = require("forge.views.harness.settings")
 local catalog = require("forge.views.harness.provider_catalog")
 local notifications = require("forge.infra.notifications")
 local original_submit, original_drain = controller.submit, controller.drain
-local original_configure, original_record = controller.configure, history.record
-local original_request = client.request
-local original_transition = controller.task_transition
-local original_error = notifications.error
-local composer = vim.api.nvim_create_buf(false, true)
+local original_configure = controller.configure
+local composer = buffer.scratch()
 state.session = { id = "responsive", provider = "mock", model = "test", effort = "medium" }
 state.composer_buf, state.composer_win = composer, vim.api.nvim_get_current_win()
 dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, true)
 state.queue = {}
 local routed, configured = {}, {}
-local success, failure = xpcall(function()
+do
   controller.submit = function()
-    routed[#routed + 1] = table.concat(vim.api.nvim_buf_get_lines(composer, 0, -1, false), "\n")
+    routed[#routed + 1] = buffer.text(composer)
   end
   controller.drain, history.record = function() end, function() end
   local controls = { "/config", "/effort", "/effort high", "/model", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
     "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions",
     "/task refresh", "/agents on", "/agents edit", "/provider", "/questions" }
   for _, command in ipairs(controls) do
-    vim.api.nvim_buf_set_lines(composer, 0, -1, false, { command })
+    buffer.set(composer, { command })
     controller.queue_submit()
     assert(routed[#routed] == command, command .. " was queued as provider text")
     assert(#state.queue == 0, command .. " waited behind active work")
   end
   controller.submit, controller.drain = original_submit, original_drain
-  client.request = function(request_specification, callback)
-  local method = request_specification.method
-
-    if method == "host.trace.status" then callback({ enabled = false })
-    elseif method == "background.settings" then
-      callback({ revision = 0, settings = request_specification.params.defaults })
-    elseif method == "session.provider.model.list" then callback({})
-    else error(method) end
-  end
+  mock_client.respond({
+    ["host.trace.status"] = { enabled = false },
+    ["background.settings"] = function(spec, callback) callback({ revision = 0, settings = spec.params.defaults }) end,
+    ["session.provider.model.list"] = {},
+  })
   controller.configure = function(params, completed)
     configured[#configured + 1] = { params = params, completed = completed }
   end
@@ -378,25 +311,21 @@ local success, failure = xpcall(function()
   configured[2].completed(true)
   assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   picker.close()
-  local requested = 0
-  client.request = function() requested = requested + 1 end
+  local discovery_requests = mock_client.record()
   state.model_provider, state.model_list = "mock", { { id = "test", reasoning = { "low", "medium", "high" } } }
   local delivered = false
   catalog.models(false, function(models) delivered = models[1].id == "test" end)
-  assert(delivered and requested == 0, "warm model controls waited for provider discovery")
+  assert(delivered and #discovery_requests == 0, "warm model controls waited for provider discovery")
   state.capability = { model_selection = true }
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, composer)
   catalog.clear()
   state.model_list, state.model_provider = nil, nil
   local model_response
-  client.request = function(request_specification, callback)
-  local method = request_specification.method
-
-    if method == "provider.model.pin.list" then callback({})
-    elseif method == "session.provider.model.list" then model_response = callback
-    else error(method) end
-  end
+  mock_client.respond({
+    ["provider.model.pin.list"] = {},
+    ["session.provider.model.list"] = function(_, callback) model_response = callback end,
+  })
   controller.select_model()
   assert(picker._state_for_test().spec.page_list[1].empty_text == "Loading models...",
     "cold model selection did not open immediately")
@@ -417,11 +346,10 @@ local success, failure = xpcall(function()
   -- The session owner's FIFO orders configuration against active work, so Lua sends each
   -- change immediately and completes it from that change's own acknowledgement.
   local configuration_request = {}
-  client.request = function(request_specification, callback)
-    assert(request_specification.method == "session.configure", request_specification.method)
-    assert(request_specification.session_id == state.session.id)
-    configuration_request[#configuration_request + 1] = { params = request_specification.params, callback = callback }
-  end
+  mock_client.respond({ ["session.configure"] = function(spec, callback)
+    assert(spec.session_id == state.session.id)
+    configuration_request[#configuration_request + 1] = { params = spec.params, callback = callback }
+  end })
   local applied
   controller.configure({ effort = "high" }, function(result) applied = result end)
   assert(#configuration_request == 1 and configuration_request[1].params.effort == "high",
@@ -476,26 +404,13 @@ local success, failure = xpcall(function()
       resource .. " allowed an older completion to replace a newer selection")
     picker.close()
   end
-end, debug.traceback)
-controller.submit, controller.drain = original_submit, original_drain
-controller.configure, history.record = original_configure, original_record
-client.request = original_request
-controller.task_transition = original_transition
-notifications.error = original_error
-if picker.is_open() then picker.close() end
-vim.api.nvim_buf_delete(composer, { force = true })
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("harness_control_responsiveness: passed")
-vim.cmd("qa!")
-  end },
-  { name = "controller_native", run = function()
-vim.loader.enable(false)
+end
+end
+T["controller_native"] = function()
+local activity_fixture = dofile("nvim/lua/forge/tests/support/activity.lua")
 local client = require("forge.client")
 local session = require("forge.session")
 local controller = require("forge.views.harness.controller")
-local original_request, original_subscribe, original_generation = client.request, client.session_events_subscribe, client.host_get_generation
-local original_accepting = client.host_is_accepting
-local original_completion = package.loaded["blink.cmp"]
 local original_plan_question = package.loaded["forge.views.harness.plan_question"]
 local completion_visible = false
 package.loaded["blink.cmp"] = { hide = function() completion_visible = false end }
@@ -590,10 +505,10 @@ client.request = function(request_specification, callback)
     vim.schedule(function() callback(result) end)
   else vim.schedule(function() callback({ patch = {} }) end) end
 end
-local success, failure = xpcall(function()
+do
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab = require("forge.views.harness.layout").open("native-controller")
   state.session = { id = "native-controller", provider = "mock", provider_label = "Mock CLI", model = "mock", resolved_model = "mock", approval_mode = "ask" }
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
+  buffer.set(state.composer_buf, { "native draft" })
   state.initial_snapshot_pending = true
   controller.attach()
   controller.render()
@@ -604,7 +519,7 @@ local success, failure = xpcall(function()
     "startup displayed stale permissions or model: " .. pending_title)
   controller.activate_snapshot({ session = state.session, access_abbreviation = "rxwx" })
   assert(not state.initial_snapshot_pending, "initial snapshot did not release startup presentation")
-  assert(vim.wait(1000, function() return state.presentation and state.presentation.ready end))
+  wait_until(function() return state.presentation and state.presentation.ready end, "Harness presentation did not become ready")
   local previous_status = state.status
   local approval = { owner = "plan_review", plan_id = "review-plan", elicitation = {
     revision = 1, answer_revision = 1, question_set = { id = "approval-questions", questions = {
@@ -687,13 +602,13 @@ local success, failure = xpcall(function()
   stale.runtime_epoch, stale.timeline_revision, stale.snapshot_revision = "ordering", 9, 19
   reads[1](stale)
   assert(completed == 0 and not state.sync_error, "an older snapshot failed pending callers")
-  assert(vim.wait(500, function() return #reads == 2 end, 1))
+  wait_until(function() return #reads == 2 end, "snapshot reconciliation did not issue a second state read")
   stale.timeline_revision, stale.snapshot_revision = 10, 20
   reads[2](stale)
   assert(completed == 1 and not state.sync_error, "snapshot reconciliation lost a waiting caller")
   state.runtime_epoch, state.timeline_revision, state.snapshot_revision = nil, 0, 0
   client.request = original_state_request
-  assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
+  assert(buffer.line(state.transcript_buf, 1) == "Native transcript")
   local approval_view = require("forge.views.harness.approval")
   local permission = { request_id = "navigation", execution_kind = "managed", targets = { {
     target_id = "command", title = "Run command", detail = "whoami.exe /groups", commands = {},
@@ -715,25 +630,26 @@ local success, failure = xpcall(function()
   receive("state_invalidated", {}, "native-controller")
   local stale_snapshot = pending_snapshot
   receive("provider_event", { kind = "approval_requested", data = permission }, "native-controller")
-  assert(vim.wait(1000, approval_view.is_open), "approval did not open")
+  wait_until(approval_view.is_open, "approval did not open")
   stale_snapshot(approval_snapshot({}))
-  assert(#state.approval == 1 and vim.wait(500, function() return pending_snapshot ~= stale_snapshot end, 1),
+  assert(#state.approval == 1, "a snapshot captured before approval erased the pending request")
+  wait_until(function() return pending_snapshot ~= stale_snapshot end,
     "a snapshot captured before approval erased the pending request")
   pending_snapshot(approval_snapshot({ permission }))
-  vim.fn.maparg("q", "n", false, true).callback()
+  keymap.invoke("q")
   assert(not approval_view.is_open() and #state.approval == 1, "q must only dismiss the approval window")
   vim.api.nvim_set_current_win(state.transcript_win)
   local timeline_window = vim.api.nvim_get_current_win()
   receive("state_invalidated", {}, "native-controller")
   pending_snapshot(approval_snapshot({ permission }))
-  vim.wait(30, function() return false end)
+  vim.wait(30, function() return false end, 5)
   assert(not approval_view.is_open() and vim.api.nvim_get_current_win() == timeline_window,
     "snapshot refresh reopened a dismissed approval and stole timeline focus")
   local notice = require("forge.views.harness.health").notice(state)
   assert(notice == nil, "dismissed approval replaced the native lifecycle status")
   controller.reopen_question()
   assert(approval_view.is_open(), "explicit reopen must restore the pending approval")
-  vim.fn.maparg("q", "n", false, true).callback()
+  keymap.invoke("q")
   receive("provider_event", { kind = "approval_cancelled", data = { request_id = permission.request_id } }, "native-controller")
   assert(#state.approval == 0 and not state.dismissed_approval_id)
   client.request = snapshot_request
@@ -837,7 +753,7 @@ local success, failure = xpcall(function()
     { use_tabline = true, maxwidth = 200 }).str
   assert(tab_title:find("123456789012345678901234567890", 1, true) and not tab_title:find("extra", 1, true),
     "tab must show only the first 30 session-name characters")
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  activity_fixture.set_busy(state, true)
   local long_timeline = { "Native transcript" }
   for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 80 do
     long_timeline[#long_timeline + 1] = "Earlier response " .. index
@@ -859,12 +775,12 @@ local success, failure = xpcall(function()
   state.pending_steer = { { text = "steering update" } }
   hold_staging = true
   controller.refresh_winbar()
-  assert(vim.wait(1000, function() return staging_reply ~= nil end))
+  wait_until(function() return staging_reply ~= nil end, "staging request did not reach the host")
   local composer_height = vim.api.nvim_win_get_height(state.composer_win)
   local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
   assert(#vim.api.nvim_buf_get_extmarks(state.composer_buf, queue_namespace, 0, -1, {}) == 0,
     "staging remained in the editable composer")
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "typing draft" })
+  buffer.set(state.composer_buf, { "typing draft" })
   state.queue[#state.queue].text = "latest queued update"
   controller.refresh_winbar()
   assert(staging_count == 1, "staging changes were not coalesced during an active request")
@@ -874,9 +790,9 @@ local success, failure = xpcall(function()
   staging_reply({ updated = true })
   assert(vim.api.nvim_win_get_height(state.composer_win) == composer_height,
     "refreshing staging resized the composer")
-  assert(vim.wait(1000, function()
+  wait_until(function()
     return vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == state.queue[#state.queue].text
-  end), "timeline staging is missing")
+  end, "timeline staging is missing")
   assert(staged_request.queue[1] == "queued follow-up" and staged_request.steering[1] == "steering update",
     "staging request lost its messages")
   assert(staging_count == 2, "selection failure did not flush the latest staged messages")
@@ -890,9 +806,9 @@ local success, failure = xpcall(function()
   local reading_view = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
   state.queue[#state.queue].text = "queue update while reading history"
   controller.refresh_winbar()
-  assert(vim.wait(1000, function()
+  wait_until(function()
     return vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == state.queue[#state.queue].text
-  end), "queue refresh did not publish while reading history")
+  end, "queue refresh did not publish while reading history")
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(state.transcript_win), { 1, 2 }),
     "staging refresh displaced intentional transcript browsing")
   assert(vim.deep_equal(vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview), reading_view),
@@ -900,11 +816,11 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_get_current_win() == state.transcript_win,
     "staging refresh moved focus from the history reader")
   state.queue, state.pending_steer = {}, {}
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
+  buffer.set(state.composer_buf, { "native draft" })
   controller.refresh_winbar()
-  assert(vim.wait(1000, function()
+  wait_until(function()
     return vim.api.nvim_buf_line_count(state.transcript_buf) == #timeline_source
-  end), "cleared messages remained staged")
+  end, "cleared messages remained staged")
   controller.configure({ status_thoughts = true })
   controller.configure({ status_thoughts = false })
   assert(#status_thought_request == 2 and #goal_request == 0,
@@ -964,7 +880,7 @@ local success, failure = xpcall(function()
     end
   end
   state.access_abbreviation, state.check_editing = "rxw", false
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
+  activity_fixture.set_busy(state, false)
   for _, status in ipairs({ "paused", "blocked" }) do
     state.session.active_task.execution.record.state = status
     state.session.active_task.status = status
@@ -1000,21 +916,21 @@ local success, failure = xpcall(function()
   vim.cmd("vsplit")
   local secondary = vim.api.nvim_get_current_win()
   state.presentation.refresh_views()
-  assert(vim.wait(1000, function() return state.presentation.views[secondary] ~= nil end))
+  wait_until(function() return state.presentation.views[secondary] ~= nil end, "secondary window did not become a Harness view")
   assert(vim.wo[secondary].breakindent and vim.wo[secondary].breakindentopt
     == require("forge.views.harness.layout").transcript_wrapping.options,
     "secondary Harness view did not retain continuation indentation")
   vim.api.nvim_win_set_cursor(original_window, { 1, 3 })
   vim.api.nvim_win_set_cursor(secondary, { 1, 5 })
   controller.jump_prompt(1)
-  assert(vim.wait(1000, function() return navigated ~= nil and vim.api.nvim_win_get_cursor(secondary)[2] == 0 end))
+  wait_until(function() return navigated ~= nil and vim.api.nvim_win_get_cursor(secondary)[2] == 0 end, "prompt navigation did not move the secondary view")
   assert(navigated.view == state.presentation.views[secondary].id)
   assert(vim.api.nvim_win_get_cursor(original_window)[2] == 3, "secondary navigation moved the initiating window")
   vim.api.nvim_win_close(original_window, true)
-  assert(vim.wait(1000, function() return state.presentation.views[original_window] == nil end))
+  wait_until(function() return state.presentation.views[original_window] == nil end, "closed window remained a Harness view")
   assert(not state.presentation.closed and state.presentation.views[secondary])
   local sync_before_submission = sync_count
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
+  activity_fixture.set_busy(state, false)
   vim.api.nvim_set_current_win(state.composer_win)
   completion_visible = true
   controller.submit()
@@ -1024,34 +940,32 @@ local success, failure = xpcall(function()
     "idle Ctrl-S entered a queue instead of submitting directly")
   assert(not require("forge.views.harness").provider_switch_available(),
     "direct submission lost the pending-input provider-switch guard")
-  assert(vim.wait(2500, function() return sync_count > sync_before_submission end, 20),
-    "optimistic submission did not refresh the native transcript")
+  wait_until(function() return sync_count > sync_before_submission end,
+    "optimistic submission did not refresh the native transcript", { timeout_ms = 2500 })
   assert(#staged_request.queue == 0 and #staged_request.steering == 0, "idle submission flashed in the visual queue")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
+  assert(buffer.line(state.composer_buf, 1) == "")
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "simulated admission failure" })
   assert(#state.input.drafts == 1, "failed input draft was not retained")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft")
+  assert(buffer.line(state.composer_buf, 1) == "native draft")
   local input_state = require("forge.views.harness.input_state")
   local failed_id = state.input.drafts[1].id
-  local retry_key = vim.fn.maparg("<M-r>", "i", false, true)
-  assert(type(retry_key.callback) == "function", "retry input shortcut is missing")
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "newer unsent draft" })
-  retry_key.callback()
+  buffer.set(state.composer_buf, { "newer unsent draft" })
+  keymap.invoke("<M-r>", { mode = "i" })
   assert(submitted.action.message.id == failed_id, "retry shortcut changed message identity")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "newer unsent draft",
+  assert(buffer.line(state.composer_buf, 1) == "newer unsent draft",
     "retry shortcut overwrote newer typing")
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "still rejected" })
   input_state.discard_rejected(state, state.input.drafts[1].id)
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit queued followup" })
+  activity_fixture.set_busy(state, true)
+  buffer.set(state.composer_buf, { "explicit queued followup" })
   controller.queue_submit()
   local queued_message = vim.deepcopy(submitted.action.message)
   queued_message.revision = 1
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = { queued_message }, removed = {} })
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "steer the current turn" })
+  buffer.set(state.composer_buf, { "steer the current turn" })
   controller.steer_submit()
   local steering_message = vim.deepcopy(submitted.action.message)
   steering_message.revision, steering_message.delivery, steering_message.route = 1, "delivering", "steering"
@@ -1059,13 +973,13 @@ local success, failure = xpcall(function()
     suspended = false, upsert = { steering_message }, removed = {} })
   assert(steering_message.intent == "auto" and #state.queue == 1 and #state.pending_steer == 1,
     "Ctrl-S behind a queued message joined the explicit queue")
-  assert(vim.wait(2500, function()
-    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  wait_until(function()
+    local text = buffer.text(state.transcript_buf)
     local steering = text:find("Steering active turn", 1, true)
     local queue = text:find("Queued follow-up inputs", 1, true)
     return steering and queue and steering < queue and text:find("steer the current turn", 1, true)
       and text:find("explicit queued followup", 1, true)
-  end, 20), "the separate steering section did not render above the explicit queue")
+  end, "the separate steering section did not render above the explicit queue", { timeout_ms = 2500 })
   steering_message.delivery = "delivering"
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
     upsert = { steering_message }, removed = {} }, "native-controller")
@@ -1076,15 +990,15 @@ local success, failure = xpcall(function()
   assert(#state.pending_steer == 0 and #state.queue == 1, "steering acceptance changed the explicit queue")
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
     upsert = {}, removed = { steering_message.id, queued_message.id } }, "native-controller")
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
+  buffer.set(state.composer_buf, { "" })
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
   generation = 2
   controller.render()
-  assert(vim.wait(1000, function() return state.presentation and state.presentation.ready and state.presentation.host_generation == 2 end))
+  wait_until(function() return state.presentation and state.presentation.ready and state.presentation.host_generation == 2 end, "presentation did not reopen on the new host generation")
   assert(initial[2].initial == nil, "new host received an unsent draft")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft after host collection")
+  assert(buffer.line(state.composer_buf, 1) == "draft after host collection")
   submitted = nil
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
+  activity_fixture.set_busy(state, false)
   state.queue = { "queued while finalizing" }
   state.status = { kind = "finalizing", exchange_id = "exchange-1", error = "cleanup pending" }
   controller.render()
@@ -1094,8 +1008,8 @@ local success, failure = xpcall(function()
   assert(#state.queue == 1 and submitted == nil, "Lua independently dispatched host-owned input")
   state.queue = {}
   state.selected_agent_run_id = nil
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  activity_fixture.set_busy(state, true)
+  activity_fixture.set_busy(state, true)
   controller.cancel_turn()
   assert(cancellation_callback and require("forge.views.harness.activity").busy(state), "cancellation cleared busy state before settlement")
   cancellation_callback({})
@@ -1122,7 +1036,7 @@ local success, failure = xpcall(function()
     child_request[#child_request + 1] = { method = method, params = params }
     if method == "session.agent.interrupt" then callback({ status = "interrupting" }) end
   end
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  activity_fixture.set_busy(state, true)
   state.capability.native_steer = true
   state.selected_agent_run_id = "child"
   state.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
@@ -1130,17 +1044,17 @@ local success, failure = xpcall(function()
     turn = { { state = { kind = "running" }, provider = { thread_id = "child-thread", turn_id = "child-turn" } } } }
   state.timeline = { { kind = "agent_lifecycle", run = state.agent.run[1], exchange = { child_exchange }, agent = {} } }
   state.agent.summary = { child = { state = "running", target = { thread_id = "child-thread", turn_id = "child-turn" } } }
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
+  buffer.set(state.composer_buf, { "" })
   controller.cancel_turn()
   assert(child_request[1].method == "session.agent.interrupt" and child_request[1].params.target == "child")
   assert(not state.cancel_requested, "settled child cancellation retained the parent cancellation flag")
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "child instruction" })
+  buffer.set(state.composer_buf, { "child instruction" })
   controller.steer_submit()
   assert(child_request[2].method == "session.agent.message.send" and child_request[2].params.target == "child")
   state.cancel_requested = false
   child_exchange.state = "complete"
   state.agent.summary.child = { state = "complete" }
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
+  buffer.set(state.composer_buf, { "" })
   controller.cancel_turn()
   assert(child_request[#child_request].method == "session.agent.interrupt" and child_request[#child_request].params.target == "child",
     "completed-child interruption must remain scoped to the child")
@@ -1166,13 +1080,13 @@ local success, failure = xpcall(function()
   child_permission.execution_owner = {session_id="native-controller",agent_id="child"}
   state.selected_agent_run_id = "different-child"
   receive("provider_event", {kind="approval_requested",data=child_permission},"native-controller")
-  assert(vim.wait(1000,approval_view.is_open))
+  wait_until(approval_view.is_open, "child approval did not open")
   picker_instance = picker._state_for_test()
   local approval_page = picker_state.page(picker_instance.state,picker_instance.spec)
   assert(approval_page.content_list[1].text == "Agent parser-review · Fixture Alpha",
     "approval must identify its requesting child")
   local interrupt_key = require("forge.shared.keymaps").view_keys_for("harness","cancel")[1]
-  vim.fn.maparg(interrupt_key,"n",false,true).callback()
+  keymap.invoke(interrupt_key)
   assert(child_request[#child_request].params.target == "child",
     "approval interruption must ignore the selected timeline and target its owner")
   receive("provider_event", {kind="approval_cancelled",data={request_id=child_permission.request_id}},"native-controller")
@@ -1181,8 +1095,8 @@ local success, failure = xpcall(function()
   root_permission.request_id = "root-approval"
   root_permission.execution_owner = {session_id="native-controller",agent_id="native-controller:agent:primary"}
   receive("provider_event", {kind="approval_requested",data=root_permission},"native-controller")
-  assert(vim.wait(1000,approval_view.is_open))
-  vim.fn.maparg(interrupt_key,"n",false,true).callback()
+  wait_until(approval_view.is_open, "root approval did not open")
+  keymap.invoke(interrupt_key)
   assert(child_request[#child_request].method == "session.turn.cancel",
     "root approval interruption must remain root-owned while a child is selected")
   receive("provider_event", {kind="approval_cancelled",data={request_id=root_permission.request_id}},"native-controller")
@@ -1209,24 +1123,24 @@ local success, failure = xpcall(function()
   require("forge.views.harness.workspace").release(state)
   state.presentation.close()
   state.presentation = nil
-  state.composer_buf = vim.api.nvim_create_buf(false, true)
+  state.composer_buf = buffer.scratch()
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  activity_fixture.set_busy(state, true)
   state.active_wait, state.selected_agent_run_id = {}, "child"
   state.queue = {}
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit follow-up" })
+  buffer.set(state.composer_buf, { "explicit follow-up" })
   require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller.command_set())
-  vim.fn.maparg("<C-q>", "i", false, true).callback()
+  keymap.invoke("<C-q>", { mode = "i" })
   assert(state.queue[1].text == "explicit follow-up", "queue key steered an active wait or selected child")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
-  assert(vim.fn.maparg("<C-s>", "i", false, true).desc == "Submit the composer")
+  assert(buffer.line(state.composer_buf, 1) == "")
+  assert(keymap.get("<C-s>", { mode = "i" }).desc == "Submit the composer")
   state.active_wait = nil
   state.selected_agent_run_id = nil
-  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  activity_fixture.set_busy(state, true)
   state.queue = { "keep queued work" }
   for _, command in ipairs({ "pause", "clear" }) do
-    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/goal " .. command })
+    buffer.set(state.composer_buf, { "/goal " .. command })
     controller.submit()
     assert(goal_request[#goal_request] and goal_request[#goal_request].params.action == command,
       "goal control was queued behind active work")
@@ -1237,9 +1151,6 @@ local success, failure = xpcall(function()
   end
   receive("goal_changed", { state = "cleared" }, "native-controller")
   local profiles = require("forge.views.harness.subagent_profiles")
-  local original_profile_open, original_spawn, original_spawn_picker = profiles.open, controller.spawn_agent, controller.open_spawn_picker
-  local original_agents, original_select = controller.open_agent_picker, controller.select_agent
-  local original_configure = controller.configure
   local routed = {}
   profiles.open = function(selected_state, _, profile) assert(selected_state == state) routed = { "edit", profile } end
   controller.spawn_agent = function(profile, text) routed = { "spawn", profile, text } end
@@ -1264,52 +1175,36 @@ local success, failure = xpcall(function()
     { "/agents", { "agents" } },
     { "/agents main", { "select", "main" } },
   }) do
-    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { command[1] })
+    buffer.set(state.composer_buf, { command[1] })
     controller.submit()
     assert(vim.deep_equal(routed, command[2]), "incorrect route for " .. command[1])
-    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
+    assert(buffer.line(state.composer_buf, 1) == "")
     assert(#state.queue == 1 and state.queue[1] == "keep queued work", "agent command was queued as a prompt")
   end
   for _, text in ipairs({ "/agent edit", "/agent edit reviewer" }) do
     routed = {}
-    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
+    buffer.set(state.composer_buf, { text })
     controller.submit()
     assert(vim.tbl_isempty(routed), "singular agent command must not route")
-    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == text)
+    assert(buffer.line(state.composer_buf, 1) == text)
     assert(#state.queue == 1 and state.queue[1] == "keep queued work", "singular agent command was queued")
   end
-  profiles.open, controller.spawn_agent, controller.open_spawn_picker = original_profile_open, original_spawn, original_spawn_picker
-  controller.open_agent_picker, controller.select_agent = original_agents, original_select
-  controller.configure = original_configure
-end, debug.traceback)
-if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
-client.request, client.session_events_subscribe, client.host_get_generation = original_request, original_subscribe, original_generation
-client.host_is_accepting = original_accepting
-package.loaded["blink.cmp"] = original_completion
-package.loaded["forge.views.harness.plan_question"] = original_plan_question
-if not success then
-  print(failure)
-  vim.cmd("cquit 1")
 end
-print("harness_controller_native: passed")
-  end },
-  { name = "gutter_selection", run = function()
-vim.loader.enable(false)
+end
+T["gutter_selection"] = function()
 local runtime = vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p"))
-local host = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
-assert(host > 0)
----@param source string
----@param arguments? table
-local function run(source, arguments)
-  return vim.rpcrequest(host, "nvim_exec_lua", source, arguments or {})
-end
-local success, failure = xpcall(function()
-  vim.rpcrequest(host, "nvim_ui_attach", 72, 28, { rgb = true })
+local child = MiniTest.new_child_neovim()
+child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+MiniTest.finally(function() pcall(child.stop) end)
+local run = child.lua
+do
+  child.api.nvim_ui_attach(72, 28, { rgb = true })
   run([[vim.api.nvim__inspect_cell(1, 0, 0)]])
   run([[
     local runtime = ...
     vim.opt.rtp:prepend(runtime)
-    vim.loader.enable(false)
+    _G.keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+    _G.wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
     vim.o.laststatus, vim.o.showtabline, vim.o.showmode, vim.o.ruler = 0, 0, false, false
     vim.api.nvim_set_hl(0, "Normal", { fg = 0xffffff, bg = 0x000000 })
     vim.api.nvim_set_hl(0, "Visual", { bg = 0x123456 })
@@ -1378,12 +1273,12 @@ local success, failure = xpcall(function()
       vim.api.nvim_exec_autocmds("CursorMoved", { buffer = state.transcript_buf })
     end
     _G.escape = function()
-      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+      keymap.feed("<Esc>", "nx")
       vim.api.nvim_exec_autocmds("ModeChanged", {})
     end
     _G.start = function(row)
       move(row)
-      vim.fn.maparg("W", "n", false, true).callback()
+      keymap.invoke("W")
       assert(vim.api.nvim_get_mode().mode == "V")
     end
     vim.wo[state.transcript_win].winbar = ""
@@ -1414,7 +1309,7 @@ local success, failure = xpcall(function()
     end
     escape()
     assert(presentation.transcript.gutter_selection == nil)
-    vim.fn.maparg("<Space>l", "x", false, true).callback()
+    keymap.invoke("<Space>l", { mode = "x" })
     assert(prior_copy_count == 1)
     start(3)
     move(6)
@@ -1424,7 +1319,7 @@ local success, failure = xpcall(function()
         winid = state.transcript_win, use_statuscol_lnum = row,
       }).str
     end
-    vim.fn.maparg("<Space>l", "x", false, true).callback()
+    keymap.invoke("<Space>l", { mode = "x" })
     assert(clipboard.kind == "V")
     for index = 1, 4 do
       local layout = require("forge.gutter").bounds(presentation.transcript, index + 2)
@@ -1468,15 +1363,15 @@ local success, failure = xpcall(function()
     assert(vim.fn.maparg("W", "n", false, true).buffer ~= 1, "composer binds gutter selection")
     escape()
     vim.api.nvim_set_current_win(state.transcript_win)
-    vim.fn.maparg("?", "n", false, true).callback()
+    keymap.invoke("?")
     local help = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), "\n")
     assert(help:find("W", 1, true) and help:find("including the diff gutter", 1, true), "help omitted W: " .. help)
-    vim.fn.maparg("q", "n", false, true).callback()
+    keymap.invoke("q")
     local config = require("forge.infra.config")
     config.setup({ keymaps = { harness = { visual_line_with_gutter = "gW" } } })
     vim.keymap.del("n", "W", { buffer = state.transcript_buf })
     controller.attach_transcript(state.transcript_buf)
-    assert(vim.fn.maparg("gW", "n", false, true).buffer == 1)
+    assert(keymap.get("gW").buffer == 1)
     config.setup({ keymaps = { harness = { visual_line_with_gutter = false } } })
     vim.keymap.del("n", "gW", { buffer = state.transcript_buf })
     controller.attach_transcript(state.transcript_buf)
@@ -1486,7 +1381,7 @@ local success, failure = xpcall(function()
     start(4)
     presentation.close({ preserve_buffer = true })
     assert(presentation.selection.closed and presentation.transcript.gutter_selection == nil)
-    vim.fn.maparg("<Space>l", "x", false, true).callback()
+    keymap.invoke("<Space>l", { mode = "x" })
     assert(prior_copy_count == 2, "close did not restore prior clipboard mapping")
     escape()
     local rejected = false
@@ -1496,13 +1391,13 @@ local success, failure = xpcall(function()
       is_alive = function() return true end, notice = function(message) error(message) end,
     }, function(owner, message) rejected = owner == nil and message == "fixture rejection" end)
     state.presentation = pending
-    vim.fn.maparg("W", "n", false, true).callback()
+    keymap.invoke("W")
     assert(vim.api.nvim_get_mode().mode == "n", "pending presentation admitted selection")
     open_response.callback(nil, "fixture rejection", { code = "invalid_state" })
     assert(rejected and pending.selection.closed, "rejected startup retained selection owner")
     assert(vim.fn.exists("#ForgeGutterSelection" .. state.transcript_buf) == 0,
       "rejected startup retained selection callbacks")
-    assert(vim.wait(1000, function() return pending.closed end, 1), "rejected presentation did not close")
+    wait_until(function() return pending.closed end, "rejected presentation did not close")
     local replica = require("forge.buffer")
     local input = require("forge.input")
     for _, indent in ipairs({ 2, 4, 6 }) do
@@ -1565,7 +1460,7 @@ local success, failure = xpcall(function()
         assert(vim.api.nvim__inspect_cell(1, position.row - 1, right)[2].background == 0x123456,
           "whole-line selection stopped before the right edge")
       end
-      vim.fn.maparg("<Space>l", "x", false, true).callback()
+      keymap.invoke("<Space>l", { mode = "x" })
       local marker_indent = string.rep(" ", math.max(0, indent - 2))
       assert(clipboard.lines[1] == marker_indent .. "● first prompt line",
         "copied prompt lost its displayed marker: " .. vim.inspect(clipboard.lines))
@@ -1579,15 +1474,9 @@ local success, failure = xpcall(function()
       replica.close(prompt)
     end
   ]])
-end, debug.traceback)
-vim.fn.jobstop(host)
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("harness_gutter_selection OK")
-vim.cmd("qa!")
-  end },
-  { name = "input_timeout", run = function()
-vim.opt.runtimepath:prepend("nvim")
-vim.loader.enable(false)
+end
+end
+T["input_timeout"] = function()
 vim.o.columns = 130
 require("forge").setup({ harness = { provider = "mock" } })
 local picker = require("forge.views.picker")
@@ -1633,7 +1522,7 @@ assert(countdown_tick, "picker did not start its countdown timer")
 elapsed_ns = 1000 * 1000000
 countdown_tick()
 -- The tick is schedule-wrapped, so the wait only drains the scheduled redraw.
-assert(vim.wait(1000, function() return title():find("01:01", 1, true) ~= nil end, 5), title())
+wait_until(function() return title():find("01:01", 1, true) ~= nil end, "countdown did not redraw to 01:01", { context = title })
 vim.uv.hrtime = original_hrtime
 assert(vim.api.nvim_buf_get_changedtick(instance.buf) == before, "countdown rewrote the body")
 assert(vim.deep_equal(vim.api.nvim_win_get_cursor(instance.win), cursor), "countdown moved cursor")
@@ -1643,16 +1532,14 @@ assert(timer:is_closing(), "picker timer leaked")
 
 local configured = { id = "timeout-settings", provider = "mock", approval_timeout = { amount = 10, unit = "m" } }
 local state = { session = configured }
-local original_request, original_configure = client.request, controller.configure
+local original_configure = controller.configure
 local saved = 0
 local deferred, pending_save
-client.request = function(request_specification, callback)
-  local method = request_specification.method
-  if method == "host.trace.status" then callback({ enabled = false })
-  elseif method == "session.provider.model.list" then callback({})
-  elseif method == "background.settings" then callback({ revision = 0, settings = request_specification.params.defaults })
-  else error(method) end
-end
+mock_client.respond({
+  ["host.trace.status"] = { enabled = false },
+  ["session.provider.model.list"] = {},
+  ["background.settings"] = function(spec, callback) callback({ revision = 0, settings = spec.params.defaults }) end,
+})
 controller.configure = function(value, completed)
   saved = saved + 1
   local function complete(applied)
@@ -1661,10 +1548,8 @@ controller.configure = function(value, completed)
   end
   if deferred then pending_save = complete else complete(true) end
 end
-local function press(buffer, key)
-  local mapping = vim.api.nvim_buf_call(buffer, function() return vim.fn.maparg(key, "n", false, true) end)
-  assert(mapping.callback, "missing key " .. key)
-  mapping.callback()
+local function press(target, key)
+  keymap.invoke(key, { buffer = target })
 end
 local function edit(id)
   local current = picker._state_for_test()
@@ -1683,7 +1568,7 @@ local function edit(id)
   error("missing timeout " .. id)
 end
 local function shown(editor)
-  return vim.api.nvim_buf_get_lines(editor.buffer, 0, 1, false)[1]
+  return buffer.line(editor.buffer, 1)
 end
 settings.open(state, host)
 local editor = edit("approval_timeout")
@@ -1755,12 +1640,12 @@ assert(duration.render({ amount = 1, unit = "m" }) == "60s")
 assert(duration.render(duration.change({ amount = 0, unit = "s" }, -1)) == "15s")
 assert(duration.render(duration.change({ amount = 10, unit = "h" }, 1)) == "60m")
 picker.close(false)
-client.request, controller.configure = original_request, original_configure
+controller.configure = original_configure
 local timeout_configuration = require("forge.views.harness.timeout_configuration")
 local timeout_state = { session = { id = "ordered-timeouts", approval_timeout = { amount = 10, unit = "m" },
   status_thoughts = true } }
-local requests, completions, failures = {}, {}, {}
-client.request = function(request, callback) requests[#requests + 1] = { request = request, callback = callback } end
+local completions, failures = {}, {}
+local requests = mock_client.record()
 local function configure_timeout(values)
   timeout_configuration.configure(timeout_state, values, function(applied) completions[#completions + 1] = applied end,
     function(message) failures[#failures + 1] = message end)
@@ -1771,7 +1656,7 @@ configure_timeout({ approval_timeout = { amount = 14, unit = "m" } })
 configure_timeout({ approval_timeout = { amount = 13, unit = "m" } })
 assert(#requests == 1, "rapid edits sent concurrent timeout writes")
 requests[1].callback({ approval_timeout = { amount = 11, unit = "m" } })
-assert(#requests == 2 and requests[2].request.params.approval_timeout.amount == 13
+assert(#requests == 2 and requests[2].spec.params.approval_timeout.amount == 13
   , "pending edits lost the newest value")
 assert(timeout_state.session.approval_timeout.amount == 10, "older response replaced a pending edit")
 requests[2].callback({ approval_timeout = { amount = 13, unit = "m" } })
@@ -1791,31 +1676,15 @@ requests[5].callback({ approval_timeout = { amount = 16, unit = "m" } })
 assert(#requests == 5 and timeout_state.session.approval_timeout.amount == 10,
   "a stale timeout callback wrote to the replacement session")
 assert(completions[7] == false and completions[8] == false)
-client.request = original_request
-print("HARNESS_INPUT_TIMEOUT_PASS")
-vim.cmd("qa!")
-  end },
-  { name = "model_pins", run = function()
-vim.opt.runtimepath:prepend("nvim")
-vim.loader.enable(false)
-local client = require("forge.client")
+end
+T["model_pins"] = function()
 local pins = require("forge.views.harness.model_pins")
 local model_picker = require("forge.views.harness.model_picker")
 local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
-local errors, request_list, confirmed = {}, {}, nil
-require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-client.request = function(request_specification, callback)
-  local method = request_specification.method
-  local parameter = request_specification.params or {}
-
-  request_list[#request_list + 1] = { method = method, parameter = parameter, callback = callback }
-end
-local function invoke(key)
-  local mapping = vim.fn.maparg(key, "n", false, true)
-  assert(mapping.callback, "missing mapping " .. key)
-  mapping.callback()
-end
+local confirmed
+local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+local request_list = mock_client.record()
 local function selected()
   local instance = picker._state_for_test()
   return picker_state.selected_option(instance.state, instance.spec)
@@ -1833,36 +1702,35 @@ end
 local function first()
   return picker._state_for_test().spec.page_list[1].option_list[1]
 end
-
-local success, failure = xpcall(function()
+do
   require("forge").setup({ harness = { provider = "mock" } })
   pins.refresh("fixture_alpha", function(_, pin_error) assert(not pin_error) end)
   request_list[#request_list].callback({})
   open("newer")
   assert(selected().id == "newer" and first().id == "older")
-  invoke("<Right>")
+  keymap.invoke("<Right>")
   assert(selected().value.picker_reasoning == "high")
-  invoke("p")
+  keymap.invoke("p")
   local write = request_list[#request_list]
-  assert(write.method == "provider.model.pin.set" and write.parameter.model == "newer" and write.parameter.pinned)
+  assert(write.spec.method == "provider.model.pin.set" and write.spec.params.model == "newer" and write.spec.params.pinned)
   local count = #request_list
-  invoke("p")
+  keymap.invoke("p")
   assert(#request_list == count, "pin writes overlapped")
   assert(first().id == "older", "unacknowledged pin changed ordering")
   write.callback({ "newer" })
   assert(first().id == "newer" and first().label == "* newer")
   assert(selected().id == "newer" and selected().value.picker_reasoning == "high")
   assert(confirmed == nil, "pinning configured the model")
-  invoke("p")
+  keymap.invoke("p")
   write = request_list[#request_list]
   write.callback(nil, "database failure")
-  assert(#errors == 1 and errors[1]:find("database failure", 1, true))
+  assert(#errors == 1 and errors[1].message:find("database failure", 1, true))
   assert(first().id == "newer" and pins.get("fixture_alpha").newer)
-  invoke("p")
+  keymap.invoke("p")
   write = request_list[#request_list]
   write.callback({})
   assert(first().id == "older" and selected().id == "newer", "unpin lost the original order or selection")
-  invoke("p")
+  keymap.invoke("p")
   write = request_list[#request_list]
   picker.close()
   open("third")
@@ -1871,7 +1739,7 @@ local success, failure = xpcall(function()
   picker.close()
   local current = true
   open("third", function() return current end)
-  invoke("p")
+  keymap.invoke("p")
   write = request_list[#request_list]
   current = false
   write.callback({ "newer", "third" })
@@ -1897,36 +1765,20 @@ local success, failure = xpcall(function()
   request_list[#request_list].callback({ "third" })
   completion:request_model_list(function(model_list) result = model_list end)
   assert(result[1].id == "third" and state.model_list[1].id == "older", "completion changed the raw catalog")
-  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "/model " })
+  buffer.set(0, { "/model " })
   vim.o.virtualedit = "onemore"
   vim.api.nvim_win_set_cursor(0, { 1, 7 })
   completion:get_completions({}, function(value) result = value.items end)
   assert(result[1].label == "third" and result[1].sortText == "000001", "model completion lost pin ordering")
-end, debug.traceback)
-picker.close()
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("harness_model_pins: passed")
-vim.cmd("qa!")
-  end },
-  { name = "new", run = function()
-vim.loader.enable(false)
-
+end
+end
+T["new"] = function()
 local builder = require("forge.builder")
 local client = require("forge.client")
 local forge = require("forge")
 local session = require("forge.session")
 
-local function assert_equals(actual, expected, message)
-  if actual ~= expected then
-    error((message or "values differ") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual), 2)
-  end
-end
-
-local function assert_true(condition, message)
-  if not condition then error(message, 2) end
-end
-
-local test_root = vim.fn.tempname()
+local test_root = temp.directory("new")
 local crate_root = vim.fs.joinpath(test_root, "crate")
 vim.fn.mkdir(vim.fs.joinpath(crate_root, "src"), "p")
 vim.fn.writefile({ "[package]", 'name = "diff-review-harness"', 'version = "0.1.0"' },
@@ -1969,7 +1821,7 @@ local function emit(options, message)
   options.stdout(nil, vim.json.encode(message) .. "\n")
 end
 
-local function fake_launcher(_, options, _)
+local function mock_launcher(_, options, _)
   local process = {}
   function process:write(payload)
     local request = vim.json.decode(vim.trim(payload))
@@ -2006,93 +1858,81 @@ local function fake_launcher(_, options, _)
   return process
 end
 
-local test_success, failure = pcall(function()
+MiniTest.finally(function()
+  pcall(client._host_reset_for_test)
+  pcall(builder._host_reset_for_test)
+end)
+do
   forge.setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
   builder._set_crate_dir_for_test(crate_root)
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")
-  vim.fn.writefile({ "fake" }, builder.binary_path())
-  client._host_set_launcher_for_test(fake_launcher)
+  vim.fn.writefile({ "mock" }, builder.binary_path())
+  client._host_set_launcher_for_test(mock_launcher)
 
   local baseline_tab_count = vim.fn.tabpagenr("$")
   require("forge.views.harness").new_session()
-  assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
-    "cold ForgeHarnessNew should create exactly one timeline tab")
-  assert_true(vim.wait(1000, function()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
+    { fail_reason = "cold ForgeHarnessNew should create exactly one timeline tab" })
+  wait_until(function()
     return session.harness.session and session.harness.session.id == "session-2"
-  end, 10), "cold ForgeHarnessNew should open the session that session.new created")
-  assert_equals(initialize_count, 1, "cold ForgeHarnessNew should initialize one broker")
-  assert_equals(session_new_count, 1, "cold ForgeHarnessNew should create its fresh session through session.new")
-  assert_equals(initialize_request.params.new_session_name, nil,
-    "cold startup should restore the broker without naming a session; session.new owns creation")
+  end, "cold ForgeHarnessNew should open the session that session.new created")
+  eq(initialize_count, 1, { fail_reason = "cold ForgeHarnessNew should initialize one broker" })
+  eq(session_new_count, 1, { fail_reason = "cold ForgeHarnessNew should create its fresh session through session.new" })
+  eq(initialize_request.params.new_session_name, nil,
+    { fail_reason = "cold startup should restore the broker without naming a session; session.new owns creation" })
 
   local cold_tab = session.harness.timeline_tab
   require("forge.views.harness").new_session("warm start")
-  assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
-    "warm ForgeHarnessNew should create one additional timeline tab")
-  assert_true(vim.wait(1000, function()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
+    { fail_reason = "warm ForgeHarnessNew should create one additional timeline tab" })
+  wait_until(function()
     return session.harness.session and session.harness.session.name == "warm start"
-  end, 10), "warm ForgeHarnessNew should complete through session.new")
-  assert_equals(initialize_count, 1, "warm ForgeHarnessNew should reuse the running broker")
-  assert_equals(session_new_count, 2, "warm ForgeHarnessNew should create one broker session")
-  assert_true(vim.api.nvim_tabpage_is_valid(cold_tab), "warm ForgeHarnessNew should preserve the prior timeline tab")
+  end, "warm ForgeHarnessNew should complete through session.new")
+  eq(initialize_count, 1, { fail_reason = "warm ForgeHarnessNew should reuse the running broker" })
+  eq(session_new_count, 2, { fail_reason = "warm ForgeHarnessNew should create one broker session" })
+  assert(vim.api.nvim_tabpage_is_valid(cold_tab), "warm ForgeHarnessNew should preserve the prior timeline tab")
 
   vim.cmd("tabclose!")
   vim.cmd("tabclose!")
-  assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count, "closing Harness timelines should restore the baseline")
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count, { fail_reason = "closing Harness timelines should restore the baseline" })
   require("forge.views.harness").new_session("after close")
-  assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
-    "ForgeHarnessNew after closing every timeline should create exactly one tab")
-  assert_true(vim.wait(1000, function()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
+    { fail_reason = "ForgeHarnessNew after closing every timeline should create exactly one tab" })
+  wait_until(function()
     return session.harness.session and session.harness.session.name == "after close"
-  end, 10), "ForgeHarnessNew should remain usable after every timeline closes")
-  assert_equals(session_new_count, 3, "ForgeHarnessNew after tab closure should reuse the running broker")
+  end, "ForgeHarnessNew should remain usable after every timeline closes")
+  eq(session_new_count, 3, { fail_reason = "ForgeHarnessNew after tab closure should reuse the running broker" })
 
   local successful_tab = session.harness.timeline_tab
   require("forge.views.harness").new_session("fail")
-  assert_equals(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
-    "a failed ForgeHarnessNew should retain exactly one provisional tab")
-  assert_true(vim.wait(1000, function()
-    local line_list = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
+    { fail_reason = "a failed ForgeHarnessNew should retain exactly one provisional tab" })
+  wait_until(function()
+    local line_list = buffer.lines(session.harness.transcript_buf)
     return vim.tbl_contains(line_list, "  New session failed: mock new-session failure")
-  end, 10), "a failed ForgeHarnessNew should explain the failure in its provisional timeline")
-  assert_true(vim.api.nvim_tabpage_is_valid(successful_tab),
+  end, "a failed ForgeHarnessNew should explain the failure in its provisional timeline")
+  assert(vim.api.nvim_tabpage_is_valid(successful_tab),
     "a failed ForgeHarnessNew should preserve the previously active timeline")
-end)
-
-client._host_reset_for_test()
-builder._host_reset_for_test()
-pcall(vim.fn.delete, test_root, "rf")
-
-if not test_success then
-  for _, buffer in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buffer) then vim.bo[buffer].modified = false end
-  end
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  print("ForgeHarnessNew workflows passed: cold, warm, after closing every timeline, and failure")
-  vim.cmd("qa!")
 end
-  end },
-  { name = "prompt_lifecycle", run = function()
-vim.loader.enable(false)
+end
+T["prompt_lifecycle"] = function()
 local state = require("forge.session").harness
 local client = require("forge.client")
 local controller = require("forge.views.harness.controller")
 local input = require("forge.views.harness.input_state")
 local submission = require("forge.views.harness.prompt_submission")
 local host = dofile("nvim/lua/forge/tests/support/input.lua").new(state)
-local controls, errors = {}, {}
+local controls = {}
+local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
 require("forge.views.harness.prompt_history").record = function() end
 require("forge.views.harness.agent_picker").refresh = function() end
-require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 controller.render = function() end
 controller.refresh_winbar = function() end
 controller.attach_transcript = function() end
 state.session = { id = "prompt-lifecycle", provider = "mock" }
 state.capability = { native_steer = true }
-state.composer_buf = vim.api.nvim_create_buf(false, true)
+state.composer_buf = buffer.scratch()
 state.queue, state.pending_steer = {}, {}
 local current = true
 state.presentation = { capture_prompt = function()
@@ -2112,9 +1952,9 @@ client.request = function(request_specification, callback)
 end
 input.attach(state, function() end)
 local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
+  buffer.set(state.composer_buf, vim.split(text, "\n", { plain = true }))
 end
-local function composer_text() return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n") end
+local function composer_text() return buffer.text(state.composer_buf) end
 ---@param text string
 ---@return {id: string, text: string, delivery?: string}?
 local function retained_message(text)
@@ -2230,50 +2070,20 @@ compose("preserve this")
 host.revision = host.revision + 1
 input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
 assert(composer_text() == "preserve this" and assert(retained_message("retract while typing")).id == retracted.id)
-assert(#errors == 0, table.concat(errors, "\n"))
-if state.working_timer then state.working_timer:stop() state.working_timer:close() end
-print("harness_prompt_lifecycle: passed")
-vim.cmd("qa!")
-  end },
-  { name = "provider_checklist", run = function()
+errors:assert_none()
+end
+T["provider_checklist"] = function()
 -- Exercise provider checklists and deferred native creation through a real host and mock provider.
-vim.loader.enable(false)
 local original_directory = vim.fn.getcwd()
-vim.opt.runtimepath:prepend(original_directory .. "/nvim")
 local fixture_evidence = dofile("nvim/lua/forge/tests/support/evidence_directory.lua")("harness-provider-checklist")
 local evidence = fixture_evidence.path
 local workspace, data = evidence .. "/workspace", evidence .. "/data"
-vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
-local function git(...)
-  local command = { "git", "-C", workspace }
-  vim.list_extend(command, { ... })
-  local result = vim.system(command, { text = true }):wait()
-  assert(result.code == 0, result.stderr)
-end
-git("init", "--quiet")
-vim.fn.writefile({ "Checklist fixture" }, workspace .. "/README.md")
-git("add", "README.md")
-git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Fixture baseline")
-local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
--- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
-binary = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
-local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
-package.loaded["forge.builder"] = { ensure = function(callback)
-  vim.schedule(function() callback({ ok = true, path = binary }) end)
-  return function() end
-end }
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
+git_repository.create({ path = workspace, files = { ["README.md"] = { "Checklist fixture" } }, message = "Fixture baseline" })
+local client = host.start({ data = data, config = data }).client
 local state = require("forge.session").harness
-local diagnostics, last_snapshot = {}, nil
-local notifications = require("forge.infra.notifications")
-local original_error = notifications.error
-notifications.error = function(message, title)
-  diagnostics[#diagnostics + 1] = { title = title, message = tostring(message) }
-  return original_error(message, title)
-end
+local last_snapshot
+local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
 
 ---@param method string
 ---@param params? table
@@ -2288,7 +2098,7 @@ local function request(method, params)
       and assert(state.session).id or nil }, function(value, failure)
     completion.value, completion.failure, completion.done = value, failure, true
   end)
-  assert(vim.wait(10000, function() return completion.done end, 10), method .. " did not finish")
+  wait_until(function() return completion.done end, method .. " did not finish", { timeout_ms = 4000 })
   assert(not completion.failure, tostring(completion.failure))
   if method == "session.state.get" then last_snapshot = completion.value end
   return completion.value
@@ -2308,7 +2118,7 @@ end
 
 ---@return string[]
 local function transcript()
-  return vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)
+  return buffer.lines(state.transcript_buf)
 end
 
 ---@param pattern string
@@ -2329,15 +2139,9 @@ local function prompt(steps, text)
   request("session.provider.mock_response", { operation = "script",
     script = { steps = steps, terminal = "completed" } })
   request("session.prompt.submit", { text = text })
-  assert(vim.wait(10000, function()
+  wait_until(function()
     return count(reply) > 0 and request("session.state.get").status.kind == "idle"
-  end, 25), "scripted prompt did not settle: " .. text)
-end
-
----@param pattern string
----@param message string
-local function await_line(pattern, message)
-  assert(vim.wait(10000, function() return count(pattern) > 0 end, 20), message)
+  end, "scripted prompt did not settle: " .. text, { timeout_ms = 4000 })
 end
 
 -- Finished exchanges show sections as headings; open one through the transcript's real mapping.
@@ -2352,16 +2156,14 @@ local function open_section(heading)
   assert(row, "section heading is missing: " .. heading)
   vim.api.nvim_set_current_win(window)
   vim.api.nvim_win_set_cursor(window, { row, 0 })
-  local mapping = vim.fn.maparg("<Tab>", "n", false, true)
-  assert(type(mapping.callback) == "function", "transcript <Tab> mapping is missing")
-  mapping.callback()
+  keymap.invoke("<Tab>")
 end
 
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = true, harness = { provider = "mock" } })
   require("forge.views.harness").open()
-  assert(vim.wait(10000, function() return state.ready and state.session ~= nil end, 10), "startup timeout")
+  wait_until(function() return state.ready and state.session ~= nil end, "startup timeout", { timeout_ms = 4000 })
 
   -- Startup keeps the new chat local: no native conversation exists before the first input.
   local opened = request("session.state.get")
@@ -2376,9 +2178,9 @@ local success, failure = xpcall(function()
   local first = request("session.state.get")
   assert(type(first.session.provider_session_id) == "string" and first.session.provider_session_id ~= "",
     "the first input did not open a native conversation")
-  await_line("Provider-reported checklist · 1/3 completed · Fixture plan", "checklist heading did not render")
+  wait_until(function() return count("Provider-reported checklist · 1/3 completed · Fixture plan") > 0 end, "checklist heading did not render", { timeout_ms = 4000 })
   open_section("Provider-reported checklist · 1/3 completed · Fixture plan")
-  await_line("[x] Read the owner", "checklist rows did not open")
+  wait_until(function() return count("[x] Read the owner") > 0 end, "checklist rows did not open", { timeout_ms = 4000 })
   for _, row in ipairs({ "[x] Read the owner", "[>] Move the types · in progress", "[ ] Document it" }) do
     assert(count(row) == 1, "missing checklist row " .. row .. "\n" .. table.concat(transcript(), "\n"))
   end
@@ -2396,12 +2198,12 @@ local success, failure = xpcall(function()
     checklist_step({ { content = "Ship it", status = "in_progress" }, { content = "Verify it", status = "in_progress" } }),
     checklist_step({ { content = "Ship it", status = "completed" }, { content = "Verify it", status = "in_progress" } }),
   }, "Update the checklist.")
-  await_line("Provider-reported checklist · 1/2 completed · Fixture plan", "replaced checklist did not render")
+  wait_until(function() return count("Provider-reported checklist · 1/2 completed · Fixture plan") > 0 end, "replaced checklist did not render", { timeout_ms = 4000 })
   open_section("Provider-reported checklist · 1/2 completed · Fixture plan")
-  await_line("[x] Ship it", "replaced checklist rows did not open")
+  wait_until(function() return count("[x] Ship it") > 0 end, "replaced checklist rows did not open", { timeout_ms = 4000 })
   assert(count("[x] Ship it") == 1 and count("[>] Ship it") == 0, "replacement duplicated an entry")
   assert(count("[>] Verify it · in progress") == 1, "in-progress entry was not shown")
-  assert(#diagnostics == 0, vim.inspect(diagnostics))
+  diagnostics:assert_none()
 end, debug.traceback)
 if not success then
   local diagnostic = { workspace = workspace, data = data, snapshot = last_snapshot, errors = diagnostics,
@@ -2410,21 +2212,16 @@ if not success then
   vim.fn.writefile(vim.split(vim.inspect(diagnostic), "\n", { plain = true }), evidence .. "/failure.txt")
   failure = tostring(failure) .. "\nRetained diagnostics: " .. evidence .. "/failure.txt"
 end
-notifications.error = original_error
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.host_stop()
-local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
+local collected = host.stop()
 vim.api.nvim_set_current_dir(original_directory)
-vim.fn.stdpath = original_stdpath
 -- Remove passing evidence only after the host exits and releases its files.
 local release_failure = fixture_evidence.release(success and collected)
 assert(success and collected, failure or "host was not collected")
 assert(not release_failure, release_failure)
-print("harness_provider_checklist_host: passed")
-  end },
-  { name = "provider_destination", run = function()
-vim.opt.runtimepath:prepend('nvim')
+end
+T["provider_destination"] = function()
 local session = require('forge.session')
 local client = require('forge.client')
 dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
@@ -2528,7 +2325,7 @@ empty_list = true
 choose_destination('resume')
 assert(#spec.page_list[1].option_list == 0)
 spec.on_close()
-vim.wait(100, function() return spec.page_list[1].title == 'Select Chat' end)
+wait_until(function() return spec.page_list[1].title == 'Select Chat' end, 'closing an empty session list did not return to destinations')
 assert(selected == nil and spec.page_list[1].title == 'Select Chat')
 choose_destination('new')
 assert(selected.destination.kind == 'new')
@@ -2536,7 +2333,7 @@ selected = nil
 choose_provider()
 list_failure = true
 choose_destination('resume')
-vim.wait(100, function() return spec.page_list[1].title == 'Select Chat' end)
+wait_until(function() return spec.page_list[1].title == 'Select Chat' end, 'a failed session list did not return to destinations')
 assert(notifications == 'list failed' and selected == nil)
 assert(session_picker._state_for_test() == nil)
 list_failure, empty_list = false, false
@@ -2553,40 +2350,22 @@ session_picker.close()
 state.session = source_session
 state.pending_steer = { { prompt = 'pending' } }
 assert(not harness.provider_switch_available())
-print('harness_provider_destination: passed')
-vim.cmd('qa!')
-  end },
-  { name = "queue_viewport", run = function()
-vim.loader.enable(false)
-vim.o.lines, vim.o.columns = 30, 80
-local root = vim.fn.getcwd()
-local workspace, data = vim.fn.tempname(), vim.fn.tempname()
-vim.fn.mkdir(workspace, "p")
-vim.fn.mkdir(data, "p")
-local binary = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
-local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind)
-  return (kind == "data" or kind == "config") and data or original_stdpath(kind)
 end
-package.loaded["forge.builder"] = { ensure = function(callback)
-  vim.schedule(function() callback({ ok = true, path = binary }) end)
-  return function() end
-end }
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
+T["queue_viewport"] = function()
+vim.o.lines, vim.o.columns = 30, 80
+local workspace, data = temp.directory("workspace"), temp.directory("data")
+local client = host.start({ data = data, config = data }).client
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
-local failures = {}
-require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
-local function await(predicate, message)
-  assert(vim.wait(5000, function() return #failures > 0 or predicate() end, 10), message .. ": " .. vim.inspect({
+local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+local wait_options = { timeout_ms = 4000, errors = failures, context = function()
+  return vim.inspect({
     ready = state.ready, session = state.session, initial_snapshot_pending = state.initial_snapshot_pending,
     presentation = state.presentation and { ready = state.presentation.ready, failure = state.presentation.failure,
       syncing = state.presentation.syncing, pending = state.presentation.pending },
     input = state.input, host = { ready = client._client.ready, runtime_ready = client._client.runtime_ready },
-  }))
-  assert(#failures == 0, table.concat(failures, "\n"))
-end
+  })
+end }
 local function drafts_pending()
   for _, draft in ipairs(state.input.drafts) do
     if draft.draft_state == "pending" then return true end
@@ -2594,27 +2373,27 @@ local function drafts_pending()
   return false
 end
 local function settled()
-  await(function()
+  wait_until(function()
     return state.input and not drafts_pending() and not state.input.refreshing
       and state.presentation and not state.presentation.syncing and not state.presentation.pending
       and not state.presentation.staging_inflight and not state.presentation.applying
       and vim.deep_equal(state.presentation.staging, state.presentation.applied_staging)
-  end, "queue presentation did not settle")
+  end, "queue presentation did not settle", wait_options)
 end
 local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
+  buffer.set(state.composer_buf, vim.split(text, "\n", { plain = true }))
 end
 local function text()
-  return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
+  return buffer.text(state.composer_buf)
 end
-local success, failure = xpcall(function()
+do
   vim.fn.chdir(workspace)
   require("forge").setup({ harness_logging = false, harness = { provider = "mock",
     providers = { mock = { command = { "mock" }, selectable = true } } } })
   require("forge.views.harness").open()
-  await(function() return state.ready and state.presentation and state.presentation.ready and state.input end, "startup")
+  wait_until(function() return state.ready and state.presentation and state.presentation.ready and state.input end, "startup", wait_options)
   controller.cancel_turn()
-  await(function() return not state.task_operation and not state.request_busy end, "pause")
+  wait_until(function() return not state.task_operation and not state.request_busy end, "pause", wait_options)
   local original = "first queued line\nfirst hidden line"
   local selected = "second queued line\n" .. string.rep("complete draft line 界\n", 12) .. "last draft line"
   compose(original)
@@ -2622,8 +2401,8 @@ local success, failure = xpcall(function()
   compose(selected)
   controller.queue_submit()
   settled()
-  local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-  local status = table.concat(vim.api.nvim_buf_get_lines(state.presentation.status_view.buffer, 0, -1, false), "\n")
+  local transcript = buffer.text(state.transcript_buf)
+  local status = buffer.text(state.presentation.status_view.buffer)
   assert(status:find("first queued line", 1, true) and status:find("second queued line", 1, true))
   assert(not status:find("first hidden line", 1, true) and not status:find("last draft line", 1, true))
   assert(not transcript:find("first queued line", 1, true) and not transcript:find("second queued line", 1, true))
@@ -2648,32 +2427,25 @@ local success, failure = xpcall(function()
     "passive queue refresh moved a history reader")
   controller.submit()
   -- Committing the edit is a host input mutation; the published queue releases its reservation.
-  await(function()
+  wait_until(function()
     for _, entry in ipairs(state.queue) do if entry.reservation then return false end end
     return true
-  end, "edit commit never released its reservation")
+  end, "edit commit never released its reservation", wait_options)
   settled()
   assert(not state.queue_edit and #state.queue == 2)
   controller.edit_queued(-1)
   controller.queue_submit()
   -- Unqueueing is a host input mutation rather than a draft, so wait for the published queue.
-  await(function() return #state.queue == 1 end, "unqueue never reached the host queue")
+  wait_until(function() return #state.queue == 1 end, "unqueue never reached the host queue", wait_options)
   settled()
   assert(not state.queue_edit and #state.queue == 1 and text() == selected,
     "unqueue lost the complete message or removed another entry")
-end, debug.traceback)
+end
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
-client.host_stop()
-local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
-vim.fn.chdir(root)
-vim.fn.stdpath = original_stdpath
-assert(success and collected, failure or "fixture host did not stop")
-print("harness_queue_viewport: passed")
-  end },
-  { name = "session_picker_tabs", run = function()
-vim.opt.runtimepath:prepend("nvim")
-vim.loader.enable(false)
+assert(host.stop(), "fixture host did not stop")
+end
+T["session_picker_tabs"] = function()
 -- The session picker acts on Harness views in other tabs: deleting a session closes every view
 -- that shows it, and opening a retained session in the current tab keeps that tab in place.
 require("forge.infra.config").setup({})
@@ -2688,11 +2460,10 @@ local session = require("forge.session")
 local workspace_path = vim.fn.getcwd()
 local deleted_by_id = {}
 local document_request_by_session = {}
-local failures = {}
+local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
 client.host_get_generation = function() return 1 end
 client.host_is_accepting = function() return true end
 client.session_events_subscribe = function() return function() end end
-require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
 
 ---@param session_id string
 ---@return table
@@ -2749,8 +2520,8 @@ end
 
 ---@param state ForgeHarnessPresentationState
 local function settled(state)
-  assert(vim.wait(2000, function() return state.presentation and state.presentation.ready end, 1),
-    "presentation did not become ready")
+  wait_until(function() return state.presentation and state.presentation.ready end,
+    "presentation did not become ready", { timeout_ms = 2000 })
 end
 
 ---Construct a session in its own tab with a real presentation.
@@ -2773,15 +2544,15 @@ end
 local function picker_action(state, session_id, key)
   vim.api.nvim_set_current_win(state.composer_win)
   controller.open_session_picker()
-  assert(vim.wait(1000, function() return picker.is_open("sessions") end, 1), "session picker did not open")
-  vim.fn.maparg("/", "n", false, true).callback()
+  wait_until(function() return picker.is_open("sessions") end, "session picker did not open")
+  keymap.invoke("/")
   local active_picker = picker._state_for_test()
-  vim.api.nvim_buf_set_lines(active_picker.search_buf, 0, -1, false, { session_id })
+  buffer.set(active_picker.search_buf, { session_id })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
-  vim.fn.maparg(key, "i", false, true).callback()
+  keymap.invoke(key, { mode = "i" })
 end
 
-local ok, failure = xpcall(function()
+do
   local registry = navigation._registry_for_test()
 
   -- Deleting a session shown in another tab closes that view instead of leaving it retrying.
@@ -2790,9 +2561,9 @@ local ok, failure = xpcall(function()
   local bravo_tab, bravo_presentation = bravo.timeline_tab, bravo.presentation
   local bravo_buffer_list = { bravo.transcript_buf, bravo.composer_buf }
   picker_action(alpha, "bravo", "<C-j>")
-  assert(vim.wait(1000, function() return deleted_by_id.bravo end, 1), "picker did not delete bravo")
+  wait_until(function() return deleted_by_id.bravo end, "picker did not delete bravo")
   local requests_at_deletion = document_request_by_session.bravo
-  assert(vim.wait(1000, function() return not vim.api.nvim_tabpage_is_valid(bravo_tab) end, 1),
+  wait_until(function() return not vim.api.nvim_tabpage_is_valid(bravo_tab) end,
     "the tab showing the deleted session stayed open")
   assert(bravo_presentation.closed, "the deleted session's presentation kept syncing")
   assert(registry.bravo == nil and session.harness_by_id.bravo == nil, "the deleted session stayed registered")
@@ -2808,14 +2579,14 @@ local ok, failure = xpcall(function()
   -- Opening a session retained without a tab replaces the current tab in place.
   local charlie = create_session("charlie")
   local delta = create_session("delta")
-  vim.api.nvim_buf_set_lines(delta.composer_buf, 0, -1, false, { "delta draft" })
+  buffer.set(delta.composer_buf, { "delta draft" })
   assert(require("forge.shared.view_command_set").dispatch(controller.command_set(), "close", delta))
   assert(registry.delta == delta and vim.api.nvim_buf_is_valid(delta.composer_buf), "closing delta did not retain it")
   local charlie_tab = charlie.timeline_tab
   local charlie_tab_number = vim.api.nvim_tabpage_get_number(charlie_tab)
   local tab_count = #vim.api.nvim_list_tabpages()
   picker_action(charlie, "delta", "<CR>")
-  assert(vim.wait(1000, function() return delta.presentation and delta.presentation.ready end, 1),
+  wait_until(function() return delta.presentation and delta.presentation.ready end,
     "delta did not open")
   assert(#vim.api.nvim_list_tabpages() == tab_count, "opening in the current tab changed the tab count")
   assert(delta.timeline_tab == charlie_tab and vim.api.nvim_tabpage_is_valid(charlie_tab),
@@ -2823,7 +2594,7 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_get_current_tabpage() == charlie_tab
     and vim.api.nvim_tabpage_get_number(charlie_tab) == charlie_tab_number, "the current tab changed position")
   assert(vim.api.nvim_win_get_buf(delta.composer_win) == delta.composer_buf
-    and vim.api.nvim_buf_get_lines(delta.composer_buf, 0, -1, false)[1] == "delta draft",
+    and buffer.line(delta.composer_buf, 1) == "delta draft",
     "the retained session lost its draft")
   assert(session.harness == delta, "the current tab did not select the chosen session")
 
@@ -2834,32 +2605,24 @@ local ok, failure = xpcall(function()
   local foxtrot_tab = foxtrot.timeline_tab
   tab_count = #vim.api.nvim_list_tabpages()
   picker_action(foxtrot, "echo", "<CR>")
-  assert(vim.wait(1000, function() return session.harness.session and session.harness.session.id == "echo" end, 1),
+  wait_until(function() return session.harness.session and session.harness.session.id == "echo" end,
     "echo did not open")
   assert(#vim.api.nvim_list_tabpages() == tab_count,
     ("opening a tab-closed session in the current tab changed the tab count from %d to %d")
       :format(tab_count, #vim.api.nvim_list_tabpages()))
   assert(vim.api.nvim_get_current_tabpage() == foxtrot_tab, "the tab-closed session opened outside the current tab")
-  assert(#failures == 0, table.concat(failures, "\n"))
-end, debug.traceback)
-if not ok then
-  io.stderr:write(tostring(failure), "\n")
-  vim.cmd("cquit 1")
+  failures:assert_none()
 end
-print("harness_session_picker_tabs: passed")
-vim.cmd("qa!")
-  end },
-  { name = "subagent_profiles", run = function()
-vim.loader.enable(false)
-
+end
+T["subagent_profiles"] = function()
 local client = require("forge.client")
 local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
 local form = require("forge.shared.form")
-local original_request, original_open, original_notify = client.request, form.open, vim.notify
+local original_open = form.open
 local current_form, pending_save, pending_models
 local delayed_save, delayed_models = false, false
-local errors, saves = {}, 0
+local saves = 0
 local model_failure
 local default_provider, alternate_provider, empty_provider = "primary", "secondary", "unavailable"
 local catalog_by_provider = {
@@ -2883,7 +2646,7 @@ local snapshot = { path = "global/forge/subagents.json", revision = "1", documen
 } }
 snapshot.document.profiles.disabled = vim.tbl_extend("force", snapshot.document.profiles.reviewer, { enabled = false })
 local state = { session = { id = "profiles", provider = default_provider, model = "fixture-model", effort = "high", service_tier = "fast" } }
-vim.notify = function(message) errors[#errors + 1] = message end
+local errors = notify.capture()
 form.open = function(options) current_form = original_open(options) return current_form end
 client.request = function(request_specification, callback)
   local session_id = request_specification.session_id
@@ -2960,7 +2723,7 @@ local function edit(id, value)
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = current_form.buffer })
 end
 
-local succeeded, failure = xpcall(function()
+do
   require("forge").setup({ harness = { provider = default_provider } })
   config.options.harness.providers = {
     [default_provider] = { selectable = true },
@@ -3004,7 +2767,7 @@ local succeeded, failure = xpcall(function()
   assert(not picker.is_open("subagent-profiles"))
   assert(vim.api.nvim_get_current_tabpage() ~= origin_tab, "form did not open a full page")
   assert(#vim.api.nvim_tabpage_list_wins(0) == 1 and vim.bo.filetype == "ForgeForm")
-  local form_lines = vim.api.nvim_buf_get_lines(current_form.buffer, 0, -1, false)
+  local form_lines = buffer.lines(current_form.buffer)
   assert(form_lines[1] == "reviewer", "form must start with the Name field")
   assert(#form_lines == #current_form.fields + 1, "form retained header or spacer rows")
   local label_style = vim.api.nvim_get_hl(0, { name = "ForgeFormLabel", link = false })
@@ -3015,7 +2778,6 @@ local succeeded, failure = xpcall(function()
     assert(mark[3].virt_text[1][1] == field.label .. ": " and mark[3].virt_text[1][2] == "ForgeFormLabel")
     if field.choices then assert(mark[3].virt_text[2][2] == "Normal", "choice value inherited label styling") end
   end
-  if vim.g.forge_profile_form_interactive then return end
   focus("model")
   assert(not vim.bo.modifiable, "choice value allowed native text edits")
   current_form:cycle(1)
@@ -3047,9 +2809,9 @@ local succeeded, failure = xpcall(function()
   assert(snapshot.document.profiles.reviewer.instructions == "Submitted instructions")
   current_form:save()
   pending_save("stale revision")
-  assert(vim.bo.modified and errors[#errors]:find("stale revision"))
+  assert(vim.bo.modified and errors[#errors].message:find("stale revision"))
   current_form:close()
-  assert(current_form.active and errors[#errors]:find("Unsaved changes"))
+  assert(current_form.active and errors[#errors].message:find("Unsaved changes"))
   current_form:reload()
   assert(not vim.bo.modified and current_form:values().instructions == "Submitted instructions")
   current_form:close()
@@ -3081,10 +2843,7 @@ local succeeded, failure = xpcall(function()
     for index, option in ipairs(instance.spec.page_list[1].option_list) do
       if option.id == name then instance.state.selected_index_by_page["subagent-profiles"] = index end
     end
-    for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(instance.buf, "n")) do
-      if mapping.lhs == key then mapping.callback() return end
-    end
-    error("missing arrow mapping " .. key)
+    keymap.invoke(key, { buffer = instance.buf })
   end
   local before_toggle = saves
   press_arrow("r", "disabled")
@@ -3096,7 +2855,7 @@ local succeeded, failure = xpcall(function()
   assert(instance.spec.page_list[1].option_list[1].columns[2] == "←No→")
   press_arrow("<Right>", "reviewer")
   assert(snapshot.document.profiles.reviewer.enabled and saves == before_toggle + 2)
-  assert(errors[#errors]:find("Default profile must be enabled"))
+  assert(errors[#errors].message:find("Default profile must be enabled"))
 
   delayed_save = true
   press_arrow("<Left>", "worker")
@@ -3108,7 +2867,7 @@ local succeeded, failure = xpcall(function()
   assert(picker.is_open("subagent-profiles") and pending_save == first_pending,
     "pending toggle allowed another operation")
   pending_save("stale revision")
-  assert(snapshot.document.profiles.worker.enabled and errors[#errors]:find("stale revision"))
+  assert(snapshot.document.profiles.worker.enabled and errors[#errors].message:find("stale revision"))
   press_arrow("<Right>", "worker")
   pending_save()
   assert(not snapshot.document.profiles.worker.enabled)
@@ -3160,11 +2919,11 @@ local succeeded, failure = xpcall(function()
   focus("provider")
   local before_empty = current_form:values()
   current_form:cycle(1)
-  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors]:find("No models available"),
+  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors].message:find("No models available"),
     "empty catalog changed the profile")
   model_failure = "catalog offline"
   current_form:cycle(1)
-  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors]:find("catalog offline"))
+  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors].message:find("catalog offline"))
   model_failure = nil
   current_form:cycle(-1)
   assert(current_form:values().provider == default_provider and current_form:values().model == "fixture-model")
@@ -3210,37 +2969,21 @@ local succeeded, failure = xpcall(function()
   assert(saves == before_late and not picker.is_open("subagent-profiles"), "closed picker saved a late provider switch")
   delayed_models = false
 
-  local config_path = vim.fn.tempname() .. " subagents.json"
   local config_text = vim.json.encode(snapshot.document)
-  vim.fn.writefile({ config_text }, config_path)
+  local config_path = temp.file("profile subagents.json", { config_text })
   snapshot.path = config_path
   require("forge.views.harness.subagent_profiles").open(state, host)
   local before_open = saves
-  assert(vim.fn.maparg("oc", "n", false, true).buffer == 1, "config hotkey must be local to the picker")
-  vim.api.nvim_feedkeys("oc", "xt", false)
+  assert(keymap.get("oc").buffer == 1, "config hotkey must be local to the picker")
+  keymap.feed("oc")
   assert(not picker.is_open("subagent-profiles"), "config hotkey left the picker open")
   assert(saves == before_open, "config hotkey mutated a profile")
   assert(vim.api.nvim_buf_get_name(0) == vim.fn.fnamemodify(config_path, ":p"), "config hotkey opened the wrong file")
   assert(vim.api.nvim_get_current_tabpage() ~= origin_tab, "config did not open in its own tab")
   assert(vim.bo.buftype == "" and vim.bo.modifiable and not vim.bo.readonly)
-  assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == config_text, "config contents changed on open")
+  assert(buffer.line(0, 1) == config_text, "config contents changed on open")
   vim.cmd("tabclose")
-  vim.fn.delete(config_path)
-end, debug.traceback)
-if succeeded and vim.g.forge_profile_form_interactive then return end
-client.request, form.open, vim.notify = original_request, original_open, original_notify
-if not succeeded then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  print("subagent_profiles: passed")
-  vim.cmd("qa!")
 end
-  end },
-}
+end
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

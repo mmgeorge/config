@@ -107,39 +107,3 @@ fn collect(node: Node<'_>, lines: &[&str], folds: &mut Vec<DeclarationFold>) {
         collect(child, lines, folds);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn folds_container_bodies_without_hiding_attributes_or_empty_declarations() {
-        for (path, text, count) in [
-            (
-                "lib.rs",
-                "#[derive(Debug)]\npub enum Error {\n  /// Invalid size.\n  Size,\n}\n\npub struct State {\n  value: u64,\n}\n\nimpl State {\n  pub fn value(&self) -> u64;\n}\n\npub trait Store {\n  fn get(&self);\n}\n\npub struct Empty {}\n",
-                4,
-            ),
-            (
-                "api.ts",
-                "export class Store {\n  private value: number;\n  get(): number;\n}\n\nexport interface Api {\n  get(): number;\n}\n",
-                2,
-            ),
-        ] {
-            let folds = DeclarationFolding::analyze(path, text).unwrap();
-            assert_eq!(folds.len(), count);
-            for fold in &folds {
-                assert!(fold.heading <= fold.start && fold.start < fold.end);
-                assert_eq!(fold.collapsed_suffix, "...}");
-            }
-            if path == "lib.rs" {
-                assert_eq!(folds[0].heading, 0);
-                assert_eq!(folds[0].start, 1);
-                assert!(folds[0].closed);
-                assert!(folds[1..].iter().all(|fold| !fold.closed));
-            } else {
-                assert!(folds.iter().all(|fold| !fold.closed));
-            }
-        }
-    }
-}

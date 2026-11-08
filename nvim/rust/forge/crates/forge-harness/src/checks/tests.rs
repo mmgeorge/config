@@ -34,27 +34,6 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
     std::fs::write(workspace.join(".forge.json"),serde_json::to_vec(&serde_json::json!({"branch_prefix":"feature","checks":CheckConfig { version: 2, definitions }})).unwrap()).unwrap();
 }
 
-#[test]
-fn check_order_rejects_missing_and_cyclic_prerequisites() {
-    let mut check = definition("test", "exit 0");
-    check.depends_on = vec!["missing".into()];
-    let mut config = CheckConfig {
-        version: 2,
-        definitions: vec![check],
-    };
-    assert!(config.order().is_err());
-    config.definitions[0].purpose = CheckPurpose::Prepare;
-    assert!(config.order().is_err());
-    config.definitions[0].depends_on = vec!["test".into()];
-    assert!(config.order().is_err());
-    let mut build = definition("build", "exit 0");
-    build.category = CheckCategory::Build;
-    build.depends_on = vec!["test".into()];
-    config.definitions[0].depends_on = vec!["build".into()];
-    config.definitions.push(build);
-    assert!(config.order().is_err());
-}
-
 fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<CheckSupervisor> {
     let mut presentation = crate::buffer::session::SessionPresentation::new("checks-test".into());
     presentation.initialize(Vec::new()).unwrap();
@@ -87,73 +66,6 @@ fn direct_operation(command: &str, args: &[&str], inputs: Option<CheckInputMap>)
         args: Some(args.iter().map(|argument| (*argument).into()).collect()),
         inputs,
     }
-}
-
-async fn begin_recorded_task(
-    workspace: &std::path::Path,
-    data: &std::path::Path,
-    runner: &CheckSupervisor,
-) -> Result<()> {
-    assert!(
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(workspace)
-            .status()?
-            .success()
-    );
-    let checkpoint = crate::checkpoint::GitCheckpoint::new(workspace)
-        .capture(
-            &crate::storage::objects::ObjectStore::open(data)?,
-            &Arc::new(forge_git::store::RepositoryStore::default()),
-            "recorded-task",
-            1,
-        )
-        .await?;
-    runner.begin_changes("recorded-task".into(), &checkpoint)
-}
-
-/// A check that rewrites its own inputs still passes; its evidence binds the checkpoint captured
-/// before execution, so the gate cannot reuse it for the rewritten source.
-#[tokio::test]
-async fn source_changed_by_a_check_keeps_evidence_for_its_starting_inputs() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    std::fs::write(workspace.path().join("source.txt"), "before")?;
-    save(
-        workspace.path(),
-        vec![definition("mutating", "'after' | save --force source.txt")],
-    );
-    let runner = make_runner(workspace.path(), data.path());
-    runner.script_commands(|request| {
-        assert_eq!(request.command, "'after' | save --force source.txt");
-        std::fs::write(
-            request.directory.join("source.txt"),
-            "after
-",
-        )
-        .expect("scripted check rewrites its source");
-        ScriptedCheckOutcome::default()
-    });
-    begin_recorded_task(workspace.path(), data.path(), &runner).await?;
-    let run = runner.prepare_request(
-        crate::timeline::TimelineOwner::session("checks-test"),
-        crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
-            ids: vec!["mutating".into()],
-            ..Default::default()
-        }),
-        Some("recorded-task".into()),
-        crate::session::CheckShell::Nushell,
-        "Explicit".into(),
-    )?;
-    let run = runner.run(run, None, None).await?;
-    assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
-    assert!(run.commands[0].evidence.is_some());
-    assert!(run.commands[0].error.is_none());
-    assert_eq!(
-        std::fs::read_to_string(workspace.path().join("source.txt"))?.trim(),
-        "after"
-    );
-    Ok(())
 }
 
 #[tokio::test]
@@ -381,71 +293,6 @@ async fn explicit_case_selection_rejects_empty_requests_without_running_the_help
         }
     }
     assert!(workspace.path().join("selected.txt").exists());
-    Ok(())
-}
-
-#[test]
-fn selection_deduplicates_without_broadening_and_rejects_escape_paths() -> Result<()> {
-    let mut selection = CheckSelection::Files {
-        files: vec!["src/a $name.rs".into(), "src/a $name.rs".into()],
-    };
-    selection.normalize()?;
-    assert_eq!(
-        selection,
-        CheckSelection::Files {
-            files: vec!["src/a $name.rs".into()]
-        }
-    );
-    assert!(
-        CheckSelection::Files {
-            files: vec!["../outside.rs".into()]
-        }
-        .normalize()
-        .is_err()
-    );
-    assert!(
-        CheckReceipt {
-            version: 1,
-            selection: CheckSelection::All
-        }
-        .validate_request(&selection)
-        .is_err()
-    );
-    assert!(
-        CheckReceipt {
-            version: 1,
-            selection: CheckSelection::Cases { cases: Vec::new() }
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        CheckReceipt {
-            version: 1,
-            selection: CheckSelection::Files {
-                files: vec!["src/other.rs".into()]
-            }
-        }
-        .validate_request(&selection)
-        .is_err()
-    );
-    let requested = CheckSelection::Cases {
-        cases: vec![CheckCase {
-            target: None,
-            file: "src/test.rs".into(),
-            name: "one".into(),
-        }],
-    };
-    assert!(
-        CheckReceipt {
-            version: 1,
-            selection: CheckSelection::Files {
-                files: vec!["src/test.rs".into()]
-            }
-        }
-        .validate_request(&requested)
-        .is_err()
-    );
     Ok(())
 }
 

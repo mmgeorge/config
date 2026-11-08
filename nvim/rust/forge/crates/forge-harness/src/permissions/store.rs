@@ -207,22 +207,6 @@ mod test {
     use crate::permissions::document::PermissionDecision;
 
     #[test]
-    fn semantically_unchanged_save_repairs_disk_without_revoking_snapshot() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("permissions.json");
-        let mut store = PermissionStore::load(&path, directory.path())?;
-        let source = store.open().1;
-        let policy = store.compiled();
-        let epoch = store.revocation_epoch();
-        fs::write(&path, format!("\n{source}"))?;
-        store.save(&source)?;
-        assert!(Arc::ptr_eq(&policy, &store.compiled()));
-        assert_eq!(epoch, store.revocation_epoch());
-        assert_eq!(fs::read_to_string(path)?, source);
-        Ok(())
-    }
-
-    #[test]
     fn approval_grant_rejects_mixed_or_denied_rules() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store =

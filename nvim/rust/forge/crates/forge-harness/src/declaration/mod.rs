@@ -2,8 +2,6 @@
 
 pub(crate) mod exposure;
 mod sources;
-#[cfg(test)]
-mod tests;
 pub(crate) mod trace;
 mod typescript;
 

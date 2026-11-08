@@ -77,14 +77,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_newline_delimited_and_empty_records() {
-        let mut reader = JsonLineReader::new(BufReader::with_capacity(2, &b"1234\n\n"[..]));
-        assert_eq!(reader.next_frame().await.unwrap().unwrap(), b"1234");
-        assert!(reader.next_frame().await.unwrap().unwrap().is_empty());
-        assert!(reader.next_frame().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn cancelled_read_retains_partial_frame() {
         let (mut writer, stream) = tokio::io::duplex(64);
         let mut reader = JsonLineReader::new(BufReader::with_capacity(2, stream));

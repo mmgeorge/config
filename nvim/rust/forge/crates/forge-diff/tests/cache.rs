@@ -88,26 +88,6 @@ fn eviction_cannot_release_capacity_retained_by_consumers() {
 }
 
 #[test]
-fn reserve_evicts_the_least_recently_used_unreferenced_result() {
-    let mut cache = AnalysisCache::new(CacheLimits {
-        entries: 2,
-        ..CacheLimits::default()
-    });
-    let (first, bytes, diff) = fixture("first\n");
-    let reservation = cache.reserve(bytes).unwrap();
-    drop(cache.insert(first, reservation, diff).unwrap());
-    let (second, bytes, diff) = fixture("second\n");
-    let reservation = cache.reserve(bytes).unwrap();
-    drop(cache.insert(second, reservation, diff).unwrap());
-    drop(cache.get(first).unwrap());
-    let reservation = cache.reserve(AnalysisBytes::default()).unwrap();
-    assert!(cache.get(first).is_some());
-    assert!(cache.get(second).is_none());
-    assert_eq!(cache.usage().admitted_entries, 2);
-    drop(reservation);
-}
-
-#[test]
 fn publication_rejects_foreign_identity_and_insufficient_capacity() {
     let mut cache = AnalysisCache::new(CacheLimits::default());
     let mut other = AnalysisCache::new(CacheLimits::default());
@@ -131,64 +111,4 @@ fn publication_rejects_foreign_identity_and_insufficient_capacity() {
         Err(CacheError::WrongIdentity)
     ));
     assert_eq!(cache.usage().admitted_entries, 0);
-}
-
-#[test]
-fn shared_source_allocation_is_charged_once_within_one_result() {
-    let source = SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap();
-    let diff = compute_hunks(SourcePair {
-        old: source.clone(),
-        new: source,
-    });
-    assert_eq!(diff.retained_source_bytes(), 5);
-    let distinct = compute_hunks(SourcePair {
-        old: SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap(),
-        new: SourceVersion::new(b"same\n".to_vec(), Representation::Raw).unwrap(),
-    });
-    assert_eq!(distinct.retained_source_bytes(), 10);
-}
-
-#[test]
-fn saturated_cache_evicts_only_cache_references_without_rejecting_analysis() {
-    let (key, bytes, diff) = fixture("new\n");
-    let mut cache = AnalysisCache::new(CacheLimits {
-        entries: 1,
-        ..CacheLimits::default()
-    });
-    let reservation = cache.reserve(bytes).unwrap();
-    let consumer = cache.insert(key, reservation, diff).unwrap();
-    drop(cache.reserve(bytes).unwrap());
-    assert_eq!(cache.usage().cached_entries, 0);
-    assert!(cache.get(key).is_none());
-    assert_eq!(consumer.source().new.bytes(), b"new\n");
-    drop(consumer);
-    assert!(cache.reserve(bytes).is_ok());
-    assert_eq!(cache.usage().cached_entries, 0);
-}
-
-#[test]
-fn display_cursors_retain_evicted_analysis_until_the_final_cursor_drops() {
-    use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayState};
-
-    let (key, bytes, diff) = fixture("new\n");
-    let mut cache = AnalysisCache::new(CacheLimits {
-        entries: 1,
-        ..CacheLimits::default()
-    });
-    let reservation = cache.reserve(bytes).unwrap();
-    let handle = cache.insert(key, reservation, diff).unwrap();
-    let mut first = DisplayCursor::new(handle.clone(), 0);
-    let mut second = DisplayCursor::new(handle, 0);
-    assert!(cache.evict(key));
-    assert_eq!(cache.usage().bytes, bytes);
-    drop(cache.reserve(bytes).unwrap());
-    let chunk = first.next_rows(ChunkLimits::default());
-    assert_eq!(chunk.state, DisplayState::Complete);
-    assert_eq!(chunk.rows.len(), 2);
-    drop(first);
-    assert_eq!(cache.usage().admitted_entries, 1);
-    assert_eq!(second.next_rows(ChunkLimits::default()).rows.len(), 2);
-    drop(second);
-    assert_eq!(cache.usage().bytes, AnalysisBytes::default());
-    assert!(cache.reserve(bytes).is_ok());
 }

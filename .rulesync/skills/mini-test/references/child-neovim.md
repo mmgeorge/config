@@ -37,7 +37,7 @@ local T = MiniTest.new_set({
 })
 ```
 
-- `child.start(args, opts)` launches `opts.nvim_executable` (default `v:progpath`) with `--clean -n --listen <address> --headless --cmd "set lines=24 columns=80"` followed by `args`, through `jobstart`. On Windows the address is a `\\.\pipe\mininvim<name>` named pipe. It retries `sockconnect` every 10 ms until `opts.connection_timeout` (default 5000 ms), then raises `Failed to make connection to child Neovim`.
+- `child.start(args, opts)` launches `opts.nvim_executable` (default `v:progpath`) with `--clean -n --listen <address> --headless --cmd "set lines=24 columns=80"` followed by `args`, through `jobstart`. On Windows the address is a `\\.\pipe\mininvim<name>` named pipe, where `<name>` is the tail of `vim.fn.tempname()`, a counter that restarts in every Neovim process. Concurrent test processes therefore choose the same pipe, and a case can connect to another process's child. When running test processes in parallel on Windows, wrap `child.start` so that `vim.fn.tempname` returns a process-unique name, for example by appending `vim.fn.getpid()`, while the child starts. It retries `sockconnect` every 10 ms until `opts.connection_timeout` (default 5000 ms), then raises `Failed to make connection to child Neovim`.
 - `child.restart(args, opts)` stops a running child and starts another, reusing the previous `args` and `opts` when omitted.
 - `child.stop()` sends `0cquit`, waits up to one second for exit, and closes the channels. mini.test registers every child and stops them all on `MiniTest.stop()`.
 - The child inherits the test process's working directory, so a minimal init that adds `getcwd()` to `'runtimepath'` makes the plugin loadable. `--clean` alone loads no plugin code.

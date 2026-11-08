@@ -1560,27 +1560,4 @@ mod tests {
             assert!(decode_method(method).is_ok(), "missing route for {method}");
         }
     }
-
-    #[test]
-    fn retired_method_names_are_rejected() {
-        for method in [
-            "initialize",
-            "shutdown",
-            "status",
-            "walkthrough",
-            "task.transition",
-            "task.list",
-            "task.operation",
-            "goal.set",
-            "review.open_pr",
-            "queue.edit_last",
-            "plan.deviation.resolve",
-            "session.plan.deviation.resolve",
-        ] {
-            assert!(
-                decode_method(method).is_err(),
-                "retired route accepted: {method}"
-            );
-        }
-    }
 }

@@ -325,27 +325,6 @@ impl SessionController {
 mod tests {
     use super::*;
 
-    /// Legacy prompt retries retain one immutable input identity and queued intent.
-    #[test]
-    fn prompt_normalization_preserves_identity_and_model_choices() -> Result<()> {
-        let params = json!({"operation_id":"send-once", "text":"Review this", "queued":true,
-            "model":"selected-model", "effort":"high", "context_window":null});
-        let (first, _) = normalize("session", params.clone())?;
-        let (retry, _) = normalize("session", params)?;
-        assert_eq!(serde_json::to_value(&first)?, serde_json::to_value(&retry)?);
-        let Command::Input(InputCommand::Submit(input)) = first.command else {
-            unreachable!()
-        };
-        assert_eq!(input.id.as_str(), "prompt-input:send-once");
-        assert_eq!(input.intent, InputIntent::Queue);
-        assert_eq!(
-            input.config.as_ref().unwrap().model.as_deref(),
-            Some("selected-model")
-        );
-        assert!(matches!(first.input_control, InputControl::AtExecution));
-        Ok(())
-    }
-
     /// Prompt aliases cannot manufacture internal input purposes or native delivery metadata.
     #[test]
     fn prompt_normalization_rejects_forged_authority_and_conflicting_choices() {

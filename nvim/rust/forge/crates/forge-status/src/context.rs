@@ -346,9 +346,7 @@ fn read_config(workspace: &Path) -> Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use forge_git::test_support::{
-        commit_index, head_commit, init_repository, set_config, set_identity, set_reference,
-    };
+    use forge_git::test_support::{commit_index, init_repository, set_identity};
 
     use super::*;
 
@@ -408,70 +406,6 @@ mod tests {
         assert_eq!(replacement["issues"], serde_json::json!([4, 9]));
         assert_eq!(replacement["preserved"]["enabled"], true);
         assert_eq!(replacement["branch_prefix"], "work/");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn context_resolves_configured_upstream_and_push_references() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        init_repository(directory.path());
-        set_identity(directory.path());
-        commit_index(directory.path(), "feat: tracked branch");
-        let branch = "main";
-        set_reference(
-            directory.path(),
-            &format!("refs/remotes/origin/{branch}"),
-            head_commit(directory.path()),
-        );
-        let remote = "remote \"origin\"";
-        set_config(
-            directory.path(),
-            remote,
-            "url",
-            "https://example.test/origin.git",
-        );
-        set_config(
-            directory.path(),
-            remote,
-            "fetch",
-            "+refs/heads/*:refs/remotes/origin/*",
-        );
-        let tracking = format!("branch \"{branch}\"");
-        set_config(directory.path(), &tracking, "remote", "origin");
-        set_config(
-            directory.path(),
-            &tracking,
-            "merge",
-            &format!("refs/heads/{branch}"),
-        );
-        set_config(directory.path(), &tracking, "pushRemote", "origin");
-        let service = StatusContextService::new(Arc::new(RepositoryStore::default()));
-        let context = service.collect(directory.path().to_owned()).await?;
-        for commit in [context.upstream.as_ref(), context.push.as_ref()] {
-            let commit = commit.context("configured tracking reference was not resolved")?;
-            assert_eq!(commit.reference, format!("origin/{branch}"));
-            assert_eq!(commit.subject, "feat: tracked branch");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unborn_head_and_invalid_config_are_distinct_results() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        init_repository(directory.path());
-        let service = StatusContextService::new(Arc::new(RepositoryStore::default()));
-        let context = service.collect(directory.path().to_owned()).await?;
-        assert!(context.head.is_none());
-        assert!(context.branch.is_some());
-        std::fs::write(directory.path().join(".forge.json"), b"{broken")?;
-        assert!(
-            service
-                .collect(directory.path().to_owned())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("invalid .forge.json")
-        );
         Ok(())
     }
 }

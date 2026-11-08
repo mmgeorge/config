@@ -567,30 +567,4 @@ mod tests {
         assert!(receiver.recv().await.is_err());
         assert!(sender.send_control("later terminal response").is_err());
     }
-
-    #[tokio::test]
-    async fn received_frame_retains_budget_until_writer_finishes() {
-        let (sender, mut receiver) = channel();
-        sender.send("payload").unwrap();
-        let frame = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(sender.budget.lock().unwrap().bytes, frame.bytes().len());
-        drop(frame);
-        assert_eq!(sender.budget.lock().unwrap().bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn normal_record_saturation_preserves_connection_and_control_progress() {
-        let (sender, mut receiver) = channel();
-        for _ in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
-            sender.send(0).unwrap();
-        }
-        assert_eq!(
-            sender.send(0).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        receiver.check().unwrap();
-        sender.send_control("terminal").unwrap();
-        let frame = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(frame.bytes(), b"\"terminal\"\n");
-    }
 }

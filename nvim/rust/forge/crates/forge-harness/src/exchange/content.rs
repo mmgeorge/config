@@ -572,6 +572,3 @@ impl Exchange {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

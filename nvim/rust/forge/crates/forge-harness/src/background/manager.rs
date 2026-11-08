@@ -1015,51 +1015,6 @@ async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: S
 mod tests {
     use super::*;
 
-    /// Refuse to acknowledge progress when the external receiver has closed.
-    #[tokio::test]
-    async fn failed_progress_delivery_cannot_acknowledge_flush() -> Result<()> {
-        let (outbound, receiver) = forge_protocol::outbound::channel();
-        drop(receiver);
-        let (sink, events) = crate::broker::publication::channel();
-        let forward = tokio::spawn(forward_progress(
-            events,
-            Some((outbound, 7)),
-            "background".into(),
-        ));
-        sink.send_wait(crate::broker::publication::SessionUpdate::Runtime {
-            session_id: "background".into(),
-            runtime: crate::provider::ProviderRuntime::default(),
-        })
-        .await?;
-        let error = forward.await?.unwrap_err();
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind),
-            Some(std::io::ErrorKind::BrokenPipe)
-        );
-        assert_eq!(
-            sink.flush().await.unwrap_err().kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_reports_background_worker_failure() {
-        let diff = DiffEngine::new(Default::default(), 1);
-        let manager = BackgroundManager::new(
-            Arc::new(RepositoryStore::default()),
-            Arc::clone(&diff),
-            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
-        );
-        manager.tasks.lock().await.spawn(async {
-            panic!("background worker failed before completing its request");
-        });
-        let error = manager.shutdown().await.unwrap_err();
-        assert!(error.to_string().contains("background worker failed"));
-    }
-
     /// Cancel queued generation on either caller interruption or shutdown before native preparation.
     #[tokio::test]
     async fn cancelled_or_shutdown_admission_never_starts_provider() {

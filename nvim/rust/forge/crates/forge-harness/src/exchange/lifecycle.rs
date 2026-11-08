@@ -314,6 +314,3 @@ impl From<ExchangePhase> for PhaseRecord {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

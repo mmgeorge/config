@@ -191,6 +191,3 @@ impl From<CheckConfig> for BTreeMap<String, Check> {
             .collect()
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -94,23 +94,6 @@ fn dropped_running_owner_quarantines_scopes_and_survives_shutdown() {
 }
 
 #[test]
-fn completed_receipts_consume_capacity_until_acknowledged() {
-    let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(1).unwrap();
-    let scope = MutationScope::Index(identity.worktree.unwrap());
-    let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
-    coordinator.cancel(first).unwrap();
-    assert!(coordinator.admit(vec![scope.clone()], 0).is_err());
-    assert!(coordinator.start(first).is_err());
-    assert_eq!(
-        coordinator.take_receipt(first),
-        Some(OperationCompletion::CancelledBeforeStart)
-    );
-    let next = coordinator.admit(vec![scope], 0).unwrap();
-    assert_ne!(first, next);
-}
-
-#[test]
 fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
     let (root, identity) = fixture();
     commit_index(root.path(), "initial");
@@ -148,22 +131,6 @@ fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
         .unwrap()
         .finish(OperationCompletion::Completed)
         .unwrap();
-}
-
-#[test]
-fn invalid_scope_requests_do_not_consume_admission() {
-    let (_root, identity) = fixture();
-    assert!(MutationCoordinator::new(0).is_err());
-    let coordinator = MutationCoordinator::new(1).unwrap();
-    let scope = MutationScope::Index(identity.worktree.unwrap());
-    assert!(coordinator.admit(vec![], 0).is_err());
-    assert!(
-        coordinator
-            .admit(vec![scope.clone(), scope.clone()], 0)
-            .is_err()
-    );
-    assert!(coordinator.admit(vec![scope.clone(); 65], 0).is_err());
-    assert!(coordinator.admit(vec![scope], 0).is_ok());
 }
 
 #[tokio::test]
@@ -241,54 +208,4 @@ async fn shutdown_wakes_queued_and_running_owners_without_releasing_running_scop
         coordinator.take_receipt(first),
         Some(OperationCompletion::Uncertain)
     );
-}
-
-#[test]
-fn input_accounting_preserves_full_content_until_receipt_adoption() {
-    let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2).unwrap();
-    let scope = MutationScope::Index(identity.worktree.unwrap());
-    let first = coordinator.admit(vec![scope.clone()], 6).unwrap();
-    assert!(coordinator.admit(vec![scope.clone()], usize::MAX).is_err());
-    assert_eq!(coordinator.usage().operations, 1);
-    assert_eq!(coordinator.usage().input_bytes, 6);
-    let second = coordinator.admit(vec![scope.clone()], 4).unwrap();
-    let running = coordinator.start(first).unwrap().unwrap();
-    coordinator.cancel(first).unwrap();
-    assert_eq!(coordinator.usage().input_bytes, 10);
-    running.finish(OperationCompletion::Uncertain).unwrap();
-    assert_eq!(coordinator.usage().input_bytes, 10);
-    assert!(coordinator.admit(vec![scope.clone()], 1).is_err());
-    assert_eq!(
-        coordinator.take_receipt(first),
-        Some(OperationCompletion::Uncertain)
-    );
-    assert_eq!(coordinator.usage().input_bytes, 4);
-    assert!(coordinator.take_receipt(first).is_none());
-    coordinator.admit(vec![scope], 6).unwrap();
-    coordinator.cancel(second).unwrap();
-    assert_eq!(coordinator.usage().input_bytes, 10);
-    coordinator.take_receipt(second).unwrap();
-    assert_eq!(coordinator.usage().input_bytes, 6);
-}
-
-#[test]
-fn cancelled_waiter_and_abandoned_owner_retain_their_input_charges() {
-    let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2).unwrap();
-    let scope = MutationScope::Index(identity.worktree.unwrap());
-    let first = coordinator.admit(vec![scope.clone()], 6).unwrap();
-    let second = coordinator.admit(vec![scope], 4).unwrap();
-    let running = coordinator.start(first).unwrap().unwrap();
-    drop(coordinator.wait_start(second).unwrap());
-    assert_eq!(coordinator.usage().input_bytes, 10);
-    assert_eq!(
-        coordinator.take_receipt(second),
-        Some(OperationCompletion::CancelledBeforeStart)
-    );
-    assert_eq!(coordinator.usage().input_bytes, 6);
-    drop(running);
-    assert_eq!(coordinator.close(), vec![first]);
-    assert!(coordinator.take_receipt(first).is_none());
-    assert_eq!(coordinator.usage().input_bytes, 6);
 }

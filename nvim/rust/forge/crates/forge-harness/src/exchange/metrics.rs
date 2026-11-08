@@ -621,6 +621,3 @@ fn merge_call_report(
     *retained = next;
     Ok(())
 }
-
-#[cfg(test)]
-mod test {}

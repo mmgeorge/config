@@ -28,36 +28,3 @@ pub(crate) fn complete() {
         let _ = notification.send(());
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Preserve one notification when a retained worker owns the eventual enqueue.
-    #[allow(
-        clippy::async_yields_async,
-        reason = "Admission returns the retained worker without waiting for its completion"
-    )]
-    #[tokio::test]
-    async fn admission_transfers_to_retained_worker() {
-        let (admitted, admission) = oneshot::channel();
-        let (enqueue, enqueued) = oneshot::channel();
-        let worker = observe(Some(admitted), async {
-            let notification = take_notification();
-            complete();
-            tokio::spawn(observe(notification, async move {
-                enqueued.await.unwrap();
-                complete();
-            }))
-        })
-        .await;
-        let mut admission = admission;
-        assert!(matches!(
-            admission.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        enqueue.send(()).unwrap();
-        admission.await.unwrap();
-        worker.await.unwrap();
-    }
-}

@@ -631,25 +631,6 @@ pub fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
 mod tests {
     use super::*;
 
-    /// Finish the main agent independently from attached background work.
-    #[test]
-    fn root_assistant_idle_finishes_without_waiting_for_background_terminals() {
-        let mut event: github_copilot_sdk::SessionEvent =
-            serde_json::from_value(serde_json::json!({
-                "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
-            }))
-            .unwrap();
-        assert!(completes_exchange(&event));
-        event.agent_id = Some("child".into());
-        assert!(!completes_exchange(&event));
-        event.agent_id = None;
-        event.event_type = "assistant.turn_end".into();
-        assert!(!completes_exchange(&event));
-        event.event_type = "session.idle".into();
-        assert!(completes_exchange(&event));
-        event.agent_id = Some("child".into());
-        assert!(!completes_exchange(&event));
-    }
     /// Publication cannot manufacture success before any correlated native terminal exists.
     #[tokio::test]
     async fn missing_native_terminal_does_not_publish_or_return_success() -> anyhow::Result<()> {

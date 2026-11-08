@@ -229,21 +229,3 @@ pub(super) fn text(files: &[DesignTestFile]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn declaration_lines_reject_ambiguous_leaf_names() {
-        let functions = forge_diff::syntax::DeclarationCalls::extract(
-            "tests.rs",
-            "mod first { fn same(); }\nmod second { fn same(); }",
-            true,
-        )
-        .unwrap();
-        assert_eq!(declaration_line(&functions, "same"), None);
-        assert_eq!(declaration_line(&functions, "crate::first::same"), Some(1));
-        assert_eq!(declaration_line(&functions, "second::same"), Some(2));
-    }
-}

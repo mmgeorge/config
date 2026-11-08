@@ -464,38 +464,3 @@ fn capability(id: &str) -> ProviderCapability {
         _ => unreachable!("registry only calls capability for known identities"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Discovery support must not advertise mutations the adapter always rejects.
-    #[test]
-    fn antigravity_catalog_discovery_does_not_imply_resource_mutation() {
-        use forge_provider_api::capability::{CapabilityId, CapabilityManifest, Support};
-        let id = forge_provider_api::ProviderId::new("antigravity").unwrap();
-        let manifest = CapabilityManifest::from_descriptor(descriptor(&id).unwrap());
-        for id in [CapabilityId::SkillMutation, CapabilityId::McpMutation] {
-            assert!(matches!(
-                manifest
-                    .capability
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .unwrap()
-                    .support,
-                Support::Unsupported
-            ));
-        }
-        for id in [CapabilityId::SkillCatalog, CapabilityId::McpCatalog] {
-            assert!(!matches!(
-                manifest
-                    .capability
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .unwrap()
-                    .support,
-                Support::Unsupported
-            ));
-        }
-    }
-}

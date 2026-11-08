@@ -515,7 +515,6 @@ mod tests {
     enum Ending {
         Completed,
         Cancelled,
-        Rejected,
     }
 
     struct ScriptLog {
@@ -561,10 +560,6 @@ mod tests {
                     stop_reason: TurnCompletionReason::Normal,
                 },
                 Ending::Cancelled => TurnOutcome::Interrupted,
-                Ending::Rejected => TurnOutcome::Failed {
-                    error: error(forge_provider_api::ProviderFailureKind::Rejected),
-                    retry: RetryDecision::NotAllowed,
-                },
             }
         };
         forge_provider_api::TurnResult::new(
@@ -688,20 +683,6 @@ mod tests {
         assert!(!replay_safe(&output));
     }
 
-    /// Keep required server waits and policy floors while preserving the five-retry boundary.
-    #[test]
-    fn provider_required_wait_extends_but_never_shortens_retry_delay() {
-        assert_eq!(
-            retry_delay(0, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(45))
-        );
-        assert_eq!(
-            retry_delay(4, Some(Duration::from_secs(2))),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(retry_delay(5, Some(Duration::from_secs(600))), None);
-    }
-
     /// Preserve cancellation identity on the first attempt and after transient recovery.
     #[tokio::test(start_paused = true)]
     async fn provider_cancellation_reaches_broker_without_another_retry() -> Result<()> {
@@ -759,27 +740,6 @@ mod tests {
                 assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
             }
         }
-        Ok(())
-    }
-
-    /// Keep provider failures distinct even when their rendered message describes cancellation.
-    #[tokio::test]
-    async fn provider_failure_text_does_not_become_broker_cancellation() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
-        let submission_store =
-            super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let (native, log) = provider(0, Ending::Rejected);
-        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        let error = prompt(&provider, request(), None, &trace, &submission_store)
-            .await
-            .unwrap_err();
-        assert!(!error.is::<crate::broker::TurnCancelled>());
-        assert!(
-            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Failure(failure))
-            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
-        );
-        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

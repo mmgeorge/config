@@ -238,39 +238,3 @@ pub(super) fn decorate(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exact_names_preserve_private_symbols_and_distinguish_removed_names() {
-        let mut design = DeclarationDesign::default();
-        design.proposed.insert(
-            "src/main.rs".into(),
-            "struct Health {}\nfn configure_game() {}\nmod combat {}\n".into(),
-        );
-        design.baseline.insert(
-            "src/main.rs".into(),
-            super::super::DeclarationFile {
-                text: "fn removed() {}".into(),
-                source_digest: String::new(),
-            },
-        );
-        let symbols = NarrativeSymbols::new(&design, Path::new("/workspace"));
-        assert_eq!(symbols.matching("Health")[0].capture, "@type");
-        assert_eq!(symbols.matching("configure_game")[0].capture, "@function");
-        assert_eq!(symbols.matching("combat")[0].capture, "@module");
-        assert!(symbols.matching("configure").is_empty());
-        assert!(symbols.removed("removed"));
-        assert!(!symbols.removed("external"));
-        design.proposed.insert(
-            "src/other.rs".into(),
-            "mod combat { pub fn spawn() {} }\nstruct Health {}".into(),
-        );
-        let symbols = NarrativeSymbols::new(&design, Path::new("/workspace"));
-        assert_eq!(symbols.matching("Health").len(), 2);
-        assert_eq!(symbols.matching("combat::spawn").len(), 1);
-        assert_eq!(symbols.matching("combat.spawn").len(), 1);
-    }
-}

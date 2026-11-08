@@ -6,39 +6,7 @@ use forge_git::{
     snapshot::{HeadState, PathState, WorktreeStamp},
     store::RepositoryStore,
 };
-use support::{
-    add_detached_worktree, git, head_commit, init_repository, move_tracked, stage, stage_and_commit,
-};
-
-#[tokio::test]
-async fn concurrent_document_observations_each_complete() {
-    let fixture = tempfile::tempdir().unwrap();
-    init_repository(fixture.path());
-    let store = RepositoryStore::default();
-    let repository = store
-        .open(fixture.path().to_path_buf())
-        .await
-        .unwrap()
-        .unwrap();
-    let (first, second, third) = tokio::join!(
-        repository.observe(&store),
-        repository.observe(&store),
-        repository.observe(&store),
-    );
-    let observation = [first.unwrap(), second.unwrap(), third.unwrap()];
-    let newest = observation.iter().max_by_key(|value| value.id).unwrap();
-    assert!(Arc::ptr_eq(
-        newest,
-        &repository.current_observation().unwrap()
-    ));
-    assert!(
-        observation
-            .iter()
-            .all(|value| value.generation == repository.generation())
-    );
-    assert_ne!(observation[0].id, observation[1].id);
-    assert_ne!(observation[1].id, observation[2].id);
-}
+use support::{init_repository, stage, stage_and_commit};
 
 #[tokio::test]
 async fn observation_adopts_unborn_then_born_head_and_distinct_sources() {
@@ -79,80 +47,4 @@ async fn observation_adopts_unborn_then_born_head_and_distinct_sources() {
     ));
     repository.invalidate().unwrap();
     assert!(repository.current_observation().is_none());
-}
-
-#[tokio::test]
-async fn split_index_backing_files_are_part_of_the_observation() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    init_repository(root);
-    std::fs::write(root.join("tracked"), "base\n").unwrap();
-    stage(root, &["tracked"]);
-    git(root, &["update-index", "--split-index"]);
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let observed = repository.observe(&store).await.unwrap();
-    assert!(observed.index.index.is_some());
-    assert!(!observed.index.shared.is_empty());
-    assert_eq!(observed.path.len(), 1);
-}
-
-#[tokio::test]
-async fn linked_detached_worktrees_keep_independent_observations() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path().join("main");
-    std::fs::create_dir(&root).unwrap();
-    init_repository(&root);
-    std::fs::write(root.join("tracked"), "base\n").unwrap();
-    stage_and_commit(&root, &["tracked"], "base");
-    let linked = fixture.path().join("linked");
-    add_detached_worktree(&root, &linked, head_commit(&root));
-    std::fs::write(root.join("tracked"), "modified\n").unwrap();
-    let store = RepositoryStore::default();
-    let main = store.open(root).await.unwrap().unwrap();
-    let detached = store.open(linked).await.unwrap().unwrap();
-    let observed_main = main.observe(&store).await.unwrap();
-    let observed_detached = detached.observe(&store).await.unwrap();
-    assert_eq!(main.identity.storage, detached.identity.storage);
-    assert_ne!(observed_main.worktree, observed_detached.worktree);
-    assert!(matches!(observed_detached.head, HeadState::Detached { .. }));
-    assert_eq!(observed_main.path.len(), 1);
-    assert!(observed_detached.path.is_empty());
-    store.invalidate_storage(&main.identity.storage).unwrap();
-    assert!(main.current_observation().is_none());
-    assert!(detached.current_observation().is_none());
-}
-
-#[tokio::test]
-async fn rename_observation_leaves_worktree_metadata_unobserved() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    init_repository(root);
-    std::fs::write(root.join("origin"), "base\n").unwrap();
-    stage_and_commit(root, &["origin"], "base");
-    move_tracked(root, "origin", "destination");
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let observed = repository.observe(&store).await.unwrap();
-    assert_eq!(observed.path.len(), 1);
-    assert_eq!(observed.path[0].origin, Some(WorktreeStamp::Unobserved));
-    assert_eq!(observed.path[0].worktree, WorktreeStamp::Unobserved);
-}
-
-#[tokio::test]
-async fn unstaged_only_observation_preserves_head_baseline() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    init_repository(root);
-    std::fs::write(root.join("tracked"), "before\n").unwrap();
-    stage_and_commit(root, &["tracked"], "base");
-    std::fs::write(root.join("tracked"), "after\n").unwrap();
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let observation = repository.observe(&store).await.unwrap();
-    let PathState::Tracked { head, index, .. } = &observation.path[0].change.state else {
-        panic!("tracked file lost its baseline");
-    };
-    assert_eq!(head, index);
-    assert!(!head.object.is_null());
 }

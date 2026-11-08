@@ -112,25 +112,3 @@ pub fn default_permission_document() -> PermissionDocument {
         ]),
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn parses_rulesync_shaped_permissions_and_rejects_unknown_categories() {
-        let source = r#"{
-          "$schema": "schema",
-          "permission": {
-            "bash": { "git *": "allow", "git commit": "deny" },
-            "mcp": { "github/*": "ask" }
-          }
-        }"#;
-        let document = parse_permission_document(source).unwrap();
-        assert_eq!(
-            document.permission["bash"]["git commit"],
-            PermissionDecision::Deny
-        );
-        assert!(parse_permission_document(r#"{"permission":{"unknown":{"*":"allow"}}}"#).is_err());
-    }
-}

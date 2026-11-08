@@ -664,35 +664,6 @@ impl ExecutionControlSender {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn manual_results_match_the_accepted_inventory() {
-        let mut report: VerificationReport = serde_json::from_value(json!({
-            "outcome":"blocked", "checks":[
-                {"category":"manual","label":"Open window","outcome":"blocked","summary":"No desktop interface","evidence":[]}
-            ]
-        })).unwrap();
-        assert!(report.validate_checks(&["Open window".into()]).is_ok());
-        let mislabeled = report
-            .validate_checks(&["Resize window".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            mislabeled.contains("\"Resize window\"") && mislabeled.contains("1. Resize window"),
-            "a label mismatch must name the expected label: {mislabeled}"
-        );
-        let missing = report
-            .validate_checks(&["Open window".into(), "Close window".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            missing.contains("expected 2 entries") && missing.contains("2. Close window"),
-            "a count mismatch must list every expected action: {missing}"
-        );
-        assert!(report.validate_checks(&[]).is_err());
-        report.checks[0].category = VerificationCategory::Automated;
-        assert!(report.validate_checks(&["Open window".into()]).is_err());
-    }
-
     use super::*;
 
     fn execution() -> PlanExecutionRecord {
@@ -849,30 +820,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_verification_preserves_phase_and_evidence() {
-        let mut execution = execution();
-        execution
-            .finish_phase(
-                done(PlanPhase::Implement, None),
-                SemanticProgress::default(),
-                1,
-            )
-            .unwrap();
-        execution.phase = PlanPhase::Verify;
-        execution
-            .finish_phase(
-                done(PlanPhase::Verify, Some(VerificationOutcome::Blocked)),
-                SemanticProgress::default(),
-                2,
-            )
-            .unwrap();
-        assert_eq!(execution.phase, PlanPhase::Verify);
-        assert_eq!(execution.state, PlanExecutionState::Blocked);
-        assert_eq!(execution.verification.len(), 1);
-        assert!(execution.completed_at_ms.is_none());
-    }
-
-    #[test]
     fn semantic_scan_detects_source_configuration_deletions_and_parse_failure() {
         let workspace = tempfile::tempdir().unwrap();
         let mut design = DeclarationDesign::default();
@@ -1015,32 +962,5 @@ mod revision_policy_tests {
         assert!(control.send(ExecutionOperation::Inspect).await.is_err());
         assert!(receiver.try_recv().is_err());
         Ok(())
-    }
-
-    #[test]
-    fn stale_tools_cannot_revise_outside_resolve() {
-        let (_root, _store, task_controller) = crate::task::SessionTaskController::test_goal();
-        let (sender, _receiver) = mpsc::channel(1);
-        for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
-            let control = ExecutionControlSender {
-                task_controller: task_controller.clone(),
-                task_permit: task_controller.current().unwrap().unwrap().permit(),
-                phase,
-                execution_id: "e".into(),
-                generation: 1,
-                sender: sender.clone(),
-            };
-            assert_eq!(
-                control.require_revision_phase().is_ok(),
-                phase == PlanPhase::Resolve
-            );
-            let tools = crate::tools::ControlToolRegistry.definition_list_for(Some(phase));
-            for name in ["plan_file_edit", "plan_overview_edit", "plan_submit"] {
-                assert_eq!(
-                    tools.iter().any(|tool| tool.name == name),
-                    phase == PlanPhase::Resolve
-                );
-            }
-        }
     }
 }

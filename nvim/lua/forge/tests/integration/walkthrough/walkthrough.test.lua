@@ -1,50 +1,45 @@
--- Integration tests for the `walkthrough` area. Each scenario row runs in its own headless Neovim:
--- `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`. Tests that launch the Forge host
--- assume `rust-build` has produced a current executable.
-local scenarios = {
-  { name = "walkthrough", run = function()
-vim.loader.enable(false)
-vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
-local root, fixture, data = vim.fn.getcwd(), vim.fn.tempname(), vim.fn.tempname()
-vim.fn.mkdir(fixture, "p") vim.fn.mkdir(data, "p")
-local name = "forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-local executable = data .. "/" .. name
--- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
-executable = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
-local stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return kind == "data" and data or stdpath(kind) end
-package.loaded["forge.builder"] = { ensure = function(callback) vim.schedule(function() callback({ok=true,path=executable}) end) return function() end end }
-local client = require("forge.client") client._host_set_launcher_for_test(vim.system)
-local walkthrough = require("forge.walkthrough")
-require("forge.infra.config").options.walkthrough_inventory = false
-local state, notices = nil, {}
-local path = "source.lua"
-local before = { "local captured = 1", "return captured" }
-local after = { "local captured = 2", "return captured" }
-local function git(arguments)
-  local command = { "git", "-C", fixture } vim.list_extend(command, arguments)
-  local result = vim.system(command, {text=true,timeout=10000}):wait()
-  assert(result.code == 0, result.stderr) return vim.trim(result.stdout)
-end
-local ok, failure = xpcall(function()
-  git({"init","--quiet"}) git({"config","user.name","Forge Fixture"}) git({"config","user.email","forge@example.test"})
-  vim.fn.writefile(before, fixture .. "/" .. path)
-  git({"add",path}) git({"commit","--quiet","-m","base"})
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+local host = dofile("nvim/lua/forge/tests/support/host.lua")
+local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["walkthrough"] = function()
+  local state
+  -- Close the walkthrough and stop the host before the temporary directories registered below are deleted.
+  MiniTest.finally(function()
+    if state then pcall(require("forge.walkthrough").close, state) end
+    pcall(host.stop)
+  end)
+  host.start()
+  local walkthrough = require("forge.walkthrough")
+  require("forge.infra.config").options.walkthrough_inventory = false
+  local notices = {}
+  local path = "source.lua"
+  local before = { "local captured = 1", "return captured" }
+  local after = { "local captured = 2", "return captured" }
+  local repository = git_repository.create({ files = { [path] = before }, message = "base" })
+  local fixture = repository.path
   vim.fn.writefile(after, fixture .. "/" .. path)
-  local artifact = { version=12, root="Native Walkthrough", overview="Overview", flow={{text="Source lifecycle"}}, commit=git({"rev-parse","HEAD"}), tasks={{title="Task complete heading",subtasks={{title="Subtask complete heading",changes={{action="Modify",kind="Function",target="captured",note="Native source resolution",file=path,line=2,annotation={title="Immutable annotation",comment="Read-only native Markdown"}}}}}}} }
+  local artifact = { version=12, root="Native Walkthrough", overview="Overview", flow={{text="Source lifecycle"}}, commit=vim.trim(repository.run({"rev-parse","HEAD"})), tasks={{title="Task complete heading",subtasks={{title="Subtask complete heading",changes={{action="Modify",kind="Function",target="captured",note="Native source resolution",file=path,line=2,annotation={title="Immutable annotation",comment="Read-only native Markdown"}}}}}}} }
   vim.fn.writefile({vim.json.encode(artifact)}, fixture .. "/.walkthrough.json")
   state = walkthrough.open({workspace=fixture,on_error=function(message) notices[#notices+1]=message end})
-  assert(vim.wait(45000,function() return #notices>0 or state.replica.status=="Applied" and not state.pending and #state.queue==0 end,10), "Walkthrough did not settle")
+  wait_until(function() return state.replica.status=="Applied" and not state.pending and #state.queue==0 end,
+    "Walkthrough did not settle", { timeout_ms = 4000, errors = notices })
   assert(#notices==0,table.concat(notices,"\n"))
   assert(vim.bo[state.replica.buffer].readonly and vim.wo.foldmethod=="manual")
   assert(require("forge.buffer").set_expansion(state.replica,"walkthrough:task:0:subtask:0",true))
-  local row
-  for index,line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer,0,-1,true)) do if line:find("Modify Function: captured",1,true) then row=index break end end
+  local row = buffer.find_row(state.replica.buffer, "Modify Function: captured")
   assert(row,"native change target missing: " .. vim.inspect(vim.api.nvim_buf_get_lines(state.replica.buffer,0,-1,true)))
   vim.api.nvim_win_set_cursor(0,{row,0})
   walkthrough.open_change(state)
-  assert(vim.wait(10000,function() return #notices>0 or not state.opening and not state.pending and #state.queue==0
-    and state.source[1] and state.source[1].annotation and state.source[1].source.replica.status=="Applied" end,10),"Walkthrough source did not settle")
+  wait_until(function() return not state.opening and not state.pending and #state.queue==0
+    and state.source[1] and state.source[1].annotation and state.source[1].source.replica.status=="Applied" end,
+    "Walkthrough source did not settle", { timeout_ms = 4000, errors = notices })
   assert(#notices==0,table.concat(notices,"\n"))
   local owner = state.source[1]
   assert(owner.review and #vim.api.nvim_list_wins()==2)
@@ -58,27 +53,16 @@ local ok, failure = xpcall(function()
   assert(source_row, "source row missing: " .. vim.inspect(review))
   vim.api.nvim_set_current_win(owner.window)
   vim.api.nvim_win_set_cursor(0,{source_row,0})
-  vim.fn.maparg("o","n",false,true).callback()
-  assert(vim.wait(5000,function() return #notices>0 or vim.api.nvim_get_current_buf()==owner.source.replica.buffer end,10),"native source action did not settle")
+  keymap.invoke("o")
+  wait_until(function() return vim.api.nvim_get_current_buf()==owner.source.replica.buffer end,
+    "native source action did not settle", { timeout_ms = 4000, errors = notices })
   assert(#notices==0,table.concat(notices,"\n"))
   assert(vim.api.nvim_win_get_cursor(0)[1]==1)
-  vim.fn.maparg("q","n",false,true).callback()
+  keymap.invoke("q")
   assert(vim.api.nvim_get_current_buf()==owner.annotation.buffer)
-  assert(git({"diff","--cached","--name-only"})=="")
+  assert(vim.trim(repository.run({"diff","--cached","--name-only"}))=="")
   walkthrough.close(state) state=nil
-end,debug.traceback)
-if state then walkthrough.close(state) end
-client.host_stop()
-local collected=vim.wait(5000,function() return client._client.process==nil end,10)
-vim.fn.stdpath=stdpath
-vim.fn.delete(fixture,"rf") vim.fn.delete(data,"rf")
-if not ok or not collected then vim.api.nvim_err_writeln(failure or "host did not collect") vim.cmd("cquit 1") end
-print("walkthrough_host OK") vim.cmd("qa!")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
+  assert(host.stop(), "host did not collect")
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

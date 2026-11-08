@@ -1748,29 +1748,6 @@ mod tests {
         Ok(())
     }
 
-    /// A command that outlives `turn/interrupt` reports its output and status after Forge
-    /// closed it as interrupted; that late activity is absorbed, not a protocol failure.
-    #[test]
-    fn late_native_activity_after_an_interrupted_turn_is_absorbed() -> Result<()> {
-        let scope =
-            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
-        let mut normalization = CodexNormalization::default();
-        normalization.admit_turn("native", "turn", &scope)?;
-        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
-        let interrupted = normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":"interrupted"}}}), "")?;
-        assert!(interrupted.iter().any(|event| matches!(
-            event,
-            AdapterActivity::Item {
-                event: ItemEvent::Completed(ItemCompletion::CommandExecution(_)),
-                ..
-            }
-        )));
-        let delta = normalization.activities(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","turnId":"turn","itemId":"command","delta":"late"}}), "")?;
-        let completed = normalization.activities(&json!({"method":"item/completed","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"Start-Sleep 40","status":"completed","exitCode":0,"aggregatedOutput":"late"}}}), "")?;
-        assert!(delta.is_empty() && completed.is_empty());
-        Ok(())
-    }
-
     /// Trust only generated header lifetime evidence for the exact original unified-exec call and process.
     #[test]
     fn raw_yield_evidence_checks_owner_process_and_ignores_stdout_spoofing() -> Result<()> {

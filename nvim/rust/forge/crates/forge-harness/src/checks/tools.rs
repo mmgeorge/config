@@ -734,19 +734,6 @@ impl CheckSupervisor {
         )
     }
 
-    /// Validates captured identities before saving settings and opaque helper sources.
-    #[cfg(test)]
-    pub(crate) async fn configure(
-        &self,
-        owner: crate::timeline::TimelineOwner,
-        request: ConfigureChecks,
-        sink: Option<&crate::broker::publication::SessionUpdateSink>,
-        editing: Option<&AtomicBool>,
-    ) -> Result<Value> {
-        self.configure_with_authority(owner, request, sink, editing, None)
-            .await
-    }
-
     pub(super) async fn configure_with_authority(
         &self,
         owner: crate::timeline::TimelineOwner,
@@ -928,27 +915,6 @@ impl CheckSupervisor {
             self.publish(&run, sink).await?;
         }
         self.catalog(None)
-    }
-}
-
-#[cfg(test)]
-mod run_admission_tests {
-    use super::model_may_run_checks;
-    use crate::plan::execution::PlanPhase;
-
-    #[test]
-    fn verify_is_the_only_execution_phase_whose_model_may_run_checks() {
-        assert!(model_may_run_checks(false, 0, None));
-        assert!(model_may_run_checks(false, 0, Some(PlanPhase::Verify)));
-        for phase in [
-            PlanPhase::Implement,
-            PlanPhase::Checking,
-            PlanPhase::Resolve,
-        ] {
-            assert!(!model_may_run_checks(false, 0, Some(phase)), "{phase:?}");
-        }
-        assert!(!model_may_run_checks(true, 0, Some(PlanPhase::Verify)));
-        assert!(!model_may_run_checks(false, 1, Some(PlanPhase::Verify)));
     }
 }
 

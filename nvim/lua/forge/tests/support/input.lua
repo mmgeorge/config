@@ -1,5 +1,4 @@
 local M = {}
-local input = require("forge.views.harness.input_state")
 
 ---@param state table
 ---@return table
@@ -76,12 +75,12 @@ function M.new(state)
       message.attachments = message.attachments or {}
     end
     host.revision = host.revision + 1
-    input.refresh(state)
+    require("forge.views.harness.input_state").refresh(state)
   end
   function host.deliver(id)
     table.remove(host.messages, assert(position(id)))
     host.revision = host.revision + 1
-    input.receive(state, { revision = host.revision, suspended = false, upsert = {}, removed = { id } })
+    require("forge.views.harness.input_state").receive(state, { revision = host.revision, suspended = false, upsert = {}, removed = { id } })
   end
   return host
 end

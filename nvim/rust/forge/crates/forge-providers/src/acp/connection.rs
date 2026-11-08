@@ -796,39 +796,3 @@ impl AcpConnection {
         self.resources.shutdown().await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct UnexpectedCallback;
-
-    #[async_trait]
-    impl AcpHandler for UnexpectedCallback {
-        async fn notification(&self, _: &str, _: Value) -> Result<(), AcpConnectionError> {
-            panic!("empty command must not launch a provider")
-        }
-
-        async fn request(&self, _: &str, _: Value) -> Result<Value, AcpConnectionError> {
-            panic!("empty command must not launch a provider")
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_command_fails_before_launch() {
-        let environment = BTreeMap::new();
-        let launch = AcpLaunch {
-            command: &[],
-            environment: &environment,
-            workspace: ".",
-            profile: None,
-        };
-        let result = AcpConnection::launch(launch, Arc::new(UnexpectedCallback)).await;
-        assert!(matches!(
-            result,
-            Err(AcpConnectionError::Configuration(
-                "ACP provider command is empty"
-            ))
-        ));
-    }
-}

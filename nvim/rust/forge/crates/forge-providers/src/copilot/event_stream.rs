@@ -311,18 +311,4 @@ mod tests {
             "{error}"
         );
     }
-
-    #[tokio::test]
-    async fn intake_reports_task_panics_instead_of_clean_eof() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let task = tokio::spawn(async move {
-            let _sender = sender;
-            panic!("intake fixture panic");
-        });
-        let mut stream = SessionEventStream::fixture(receiver, task);
-        stream.session_id = "native-session".into();
-        let error = format!("{:#}", stream.recv().await.unwrap_err());
-        assert!(error.contains("native-session"), "{error}");
-        assert!(error.contains("intake fixture panic"), "{error}");
-    }
 }

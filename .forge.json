@@ -53,7 +53,7 @@
           },
           "fixture": {
             "type": "string",
-            "description": "Lua test file, test name, or name::scenario",
+            "description": "Lua test file, test name, or name::case",
             "required": false,
             "default": ""
           },

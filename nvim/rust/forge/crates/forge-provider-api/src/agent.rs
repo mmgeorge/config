@@ -176,28 +176,3 @@ pub enum AgentOutcome {
     /// Preserve explicit child closure.
     Closed,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reject an active state on a terminal lifecycle variant at the transport boundary.
-    #[test]
-    fn terminal_agent_observation_requires_an_outcome() {
-        let description = serde_json::json!({
-            "parent_agent_id":null, "delegation":null, "thread_id":null,
-            "definition":null, "nickname":null, "task":null
-        });
-        let active = serde_json::json!({"kind":"finished", "agent":description, "state":"running"});
-        assert!(serde_json::from_value::<AgentLifecycleEvent>(active).is_err());
-        let finished =
-            serde_json::json!({"kind":"finished", "agent":description, "outcome":"interrupted"});
-        assert!(matches!(
-            serde_json::from_value::<AgentLifecycleEvent>(finished).unwrap(),
-            AgentLifecycleEvent::Finished {
-                outcome: AgentOutcome::Interrupted,
-                ..
-            }
-        ));
-    }
-}

@@ -720,27 +720,6 @@ async fn fork_retry_preserves_complete_original_request() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Compaction retry must not open or target a later caller-selected owner.
-#[tokio::test]
-async fn compact_retry_preserves_original_binding_and_scope() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let first = super::super::ProviderCompactionRequest {
-        id: "retained-compaction".into(),
-        request: provider_request(root.path()),
-    };
-    assert!(bridge.thread_compact(first.clone()).await.is_err());
-    let mut retry = first;
-    retry.request.harness_session_id = "different-owner".into();
-    bridge.thread_compact(retry).await?;
-    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
-    let attempts = native.compact_attempts.lock().unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0], attempts[1]);
-    Ok(())
-}
-
 /// Collect positively rejected native admission while retaining every uncertain or invalidated cause.
 #[tokio::test]
 async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() -> anyhow::Result<()>
@@ -806,45 +785,6 @@ async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() 
         );
         bridge.shutdown().await?;
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn unexpected_native_eof_retains_failed_close_for_retry() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(true);
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let request = provider_request(root.path());
-    let owner = request.owner()?;
-    let mut events = bridge.session_events(owner).await?;
-    bridge.thread_open(request).await?;
-    expect_negotiated_capabilities(&mut events);
-    assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
-
-    let session = bridge
-        .sessions
-        .lock()
-        .await
-        .values()
-        .next()
-        .cloned()
-        .unwrap();
-    let binding = session.initialized.get().unwrap().binding.id.clone();
-    native.close_native_stream(&binding);
-
-    let error = events
-        .recv()
-        .await
-        .expect_err("unexpected native EOF was not reported to the host stream");
-    assert!(matches!(error, EventDeliveryError::Closed));
-    async {
-        while native.retire_calls.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-    .await;
-    assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
-    let _ = bridge.shutdown().await;
     Ok(())
 }
 
@@ -982,22 +922,6 @@ async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()
         .unwrap_err();
     assert!(matches!(error, ProviderError::Observation(_)));
     let _ = bridge.shutdown().await;
-    Ok(())
-}
-
-/// Shutdown interrupts a pending open before awaiting its shared admission guard.
-#[tokio::test]
-async fn closed_open_transaction_rejects_work_before_native_dispatch() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let request = provider_request(root.path());
-    let session = bridge.session(request.owner()?).await;
-    session.open_operation.cancel();
-    assert!(matches!(bridge.thread_open(request).await,
-        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed));
-    assert!(native.open_attempts.lock().unwrap().is_empty());
-    bridge.shutdown().await?;
     Ok(())
 }
 

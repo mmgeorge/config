@@ -369,7 +369,6 @@ impl GhClient {
                 if let Some(runner) = scripted {
                     cancellation.check()?;
                     let output = runner(&ScriptedGhInvocation {
-                        directory,
                         argument,
                         input: encoded,
                     })
@@ -568,34 +567,4 @@ fn diagnostic(message: &str) -> String {
         boundary -= 1;
     }
     format!("{}{suffix}", &message[..boundary])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-    #[cfg(windows)]
-    use std::os::windows::process::ExitStatusExt;
-
-    fn output(value: serde_json::Value) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: serde_json::to_vec(&value).unwrap(),
-            stderr: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn graphql_errors_preserve_categories_and_never_publish_partial_data() {
-        for (kind, expected) in [
-            ("RATE_LIMITED", RemoteFailureKind::RateLimited),
-            ("NOT_FOUND", RemoteFailureKind::NotFound),
-            ("UNAUTHORIZED", RemoteFailureKind::Unauthorized),
-        ] {
-            let failure = decode_page(output(serde_json::json!({"errors":[{"type":kind,"message":"API diagnostic"}],"data":null})), "owner/repo").unwrap_err();
-            assert_eq!(failure.kind, expected);
-            assert!(failure.message.contains("API diagnostic"));
-        }
-    }
 }

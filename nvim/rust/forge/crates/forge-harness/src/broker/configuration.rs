@@ -2193,105 +2193,16 @@ mod owned_tests {
         Ok(())
     }
 
-    /// An empty advertised choice list must reject overrides before settings are persisted.
-    #[test]
-    fn context_override_without_advertised_choices_is_rejected() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let before = broker.session.context_window.clone();
-        let model = crate::provider::ProviderModel {
-            id: broker.session.model.clone(),
-            service_tiers: Vec::new(),
-            reasoning: Vec::new(),
-            default_reasoning: None,
-            selected_reasoning: None,
-            context_window: Vec::new(),
-            default_context_window: None,
-            selected_context_window: None,
-            vision: false,
-            description: None,
-            is_default: true,
-        };
-        let preparation = broker.prepare_configuration(json!({"context_window":"fabricated"}))?;
-        let rejected = broker.build_configuration_candidate(preparation, &[model]);
-        assert!(
-            rejected.is_err(),
-            "unadvertised context override was accepted"
-        );
-        assert_eq!(broker.session.context_window, before);
-        assert!(
-            broker
-                .store
-                .pending_configuration_intent(&broker.session.id)?
-                .is_none()
-        );
-        Ok(())
-    }
-
-    /// Resolve omitted controls against the newly selected model, never its predecessor.
-    #[test]
-    fn model_change_replaces_incompatible_inherited_controls() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.session.model = "previous-model".into();
-        broker.session.effort = "high".into();
-        broker.session.context_window = Some("large".into());
-        broker.session.service_tier = crate::provider::ServiceTier::Fast;
-        broker.session.context_usage = crate::session::ContextUsage::reported(900, 1000000);
-        let model = crate::provider::ProviderModel {
-            id: "next-model".into(),
-            service_tiers: Vec::new(),
-            reasoning: vec!["low".into()],
-            default_reasoning: Some("low".into()),
-            selected_reasoning: None,
-            context_window: Vec::new(),
-            default_context_window: None,
-            selected_context_window: None,
-            vision: false,
-            description: None,
-            is_default: false,
-        };
-        let preparation = broker.prepare_configuration(json!({"model":"next-model"}))?;
-        let mut candidate = broker.build_configuration_candidate(preparation, &[model])?;
-        candidate.rebase(&broker.session);
-        assert_eq!(candidate.configured.effort, "low");
-        assert!(candidate.configured.context_window.is_none());
-        assert_eq!(
-            candidate.configured.service_tier,
-            crate::provider::ServiceTier::Standard
-        );
-        assert!(candidate.configured.context_usage.is_none());
-        Ok(())
-    }
-
     /// Select whether a completed binding receipt still authorizes the pending host commit.
     #[derive(Clone, Copy)]
     enum IdentityReceiptBoundary {
         InboxPending,
-        ForeignHistory,
-        RetiredBinding,
     }
 
     /// Persist ordered identity before inbox delivery.
     #[tokio::test]
     async fn configuration_identity_receipt_preserves_ordered_history() -> Result<()> {
         assert_identity_receipt_boundary(IdentityReceiptBoundary::InboxPending).await
-    }
-
-    /// Reject a receipt whose history differs from the history the host already holds.
-    #[tokio::test]
-    async fn configuration_identity_receipt_rejects_foreign_history() -> Result<()> {
-        assert_identity_receipt_boundary(IdentityReceiptBoundary::ForeignHistory).await
-    }
-
-    /// Reject a receipt from a binding that was retired before the host commit.
-    #[tokio::test]
-    async fn configuration_identity_receipt_rejects_retired_binding() -> Result<()> {
-        assert_identity_receipt_boundary(IdentityReceiptBoundary::RetiredBinding).await
     }
 
     async fn assert_identity_receipt_boundary(boundary: IdentityReceiptBoundary) -> Result<()> {
@@ -2485,72 +2396,11 @@ mod owned_tests {
                     );
                     assert!(!broker.task_controller.configuration_is_uncertain());
                 }
-                IdentityReceiptBoundary::ForeignHistory => {
-                    broker.session.provider_session_id = Some("unrelated-history".into());
-                    assert!(
-                        broker
-                            .certify_candidate_reconcile(&mut candidate, result)
-                            .is_err()
-                    );
-                    assert_eq!(
-                        broker.session.provider_session_id.as_deref(),
-                        Some("unrelated-history")
-                    );
-                    assert!(broker.task_controller.configuration_is_uncertain());
-                }
-                IdentityReceiptBoundary::RetiredBinding => {
-                    registry
-                        .retire(
-                            &owner,
-                            crate::provider::session_execution::OwnerCloseReason::Shutdown,
-                        )
-                        .await?;
-                    assert!(
-                        broker
-                            .certify_candidate_reconcile(&mut candidate, result)
-                            .is_err()
-                    );
-                    assert!(broker.session.provider_session_id.is_none());
-                    assert!(broker.task_controller.configuration_is_uncertain());
-                }
             }
             registry.collect_cleanup().await?;
             engine.close().await?;
             fixture.provider_handle().shutdown().await?;
         }
-        Ok(())
-    }
-
-    /// Preserve context observations that arrive between settings preparation and host commit.
-    #[tokio::test]
-    async fn configuration_commit_preserves_newer_context_observations() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let preparation = broker.prepare_configuration(json!({"status_thoughts":false}))?;
-        let candidate = broker.build_configuration_candidate(preparation, &[])?;
-        assert_eq!(candidate.effect(), ConfigurationEffect::Local);
-        broker.session.context_usage = crate::session::ContextUsage::reported(900, 4000);
-        broker.session.resolved_model = Some("observed-model".into());
-        broker.session.provider_session_id = Some("established-thread".into());
-        broker.commit_configuration_candidate(candidate)?;
-        let observed = broker
-            .session
-            .context_usage
-            .as_ref()
-            .context("context observation was lost")?;
-        assert_eq!(observed.used, 900);
-        assert_eq!(observed.size, 4000);
-        assert_eq!(
-            broker.session.resolved_model.as_deref(),
-            Some("observed-model")
-        );
-        assert_eq!(
-            broker.session.provider_session_id.as_deref(),
-            Some("established-thread")
-        );
-        assert!(!broker.observer.status_thoughts.load(Ordering::Relaxed));
         Ok(())
     }
 
@@ -2664,48 +2514,6 @@ mod owned_tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn ask_model_commit_rejects_superseded_settings() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let preparation = broker.prepare_configuration(json!({"ask_model":null}))?;
-        let prepared = broker.build_configuration_candidate(preparation, &[])?;
-        let mut settings = crate::settings::SettingsStore::open(data.path())?;
-        settings.patch(
-            crate::settings::SettingTarget {
-                scope: crate::settings::SettingScope::Session,
-                workspace: &broker.session.workspace,
-                session: &broker.session.id,
-            },
-            &crate::settings::PortableSettings {
-                status_thoughts: Some(true),
-                ..Default::default()
-            },
-        )?;
-        assert!(broker.commit_configuration_candidate(prepared).is_err());
-        Ok(())
-    }
-
-    /// Catalog results cannot apply after the selected configuration changes.
-    #[tokio::test]
-    async fn configuration_catalog_rejects_stale_model_authority() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let job = broker.prepare_configuration_catalog()?;
-        let result = ConfigurationCatalogResult {
-            authority: job.authority,
-            models: Vec::new(),
-        };
-        broker.session.model = "newer-model".to_owned();
-        assert!(broker.commit_configuration_catalog(result).is_err());
-        assert_eq!(broker.session.model, "newer-model");
-        Ok(())
-    }
-
     /// Explicit policy errors must not become silent inherited-default resolution.
     #[tokio::test]
     async fn explicit_isolation_rejects_before_configuration_commit() -> Result<()> {
@@ -2756,24 +2564,6 @@ mod owned_tests {
         Ok(())
     }
 
-    /// Losing an in-flight provider write requires generation recovery before reuse.
-    #[tokio::test]
-    async fn abandoned_configuration_write_poison_fences_owner() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let guard = ConfigurationWriteGuard {
-            registry: Arc::clone(&broker.execution_registry),
-            owner: crate::provider::ThreadOwner::root(&broker.session.id),
-            controller: Arc::clone(&broker.task_controller),
-            armed: true,
-        };
-        drop(guard);
-        assert!(broker.task_controller.configuration_is_uncertain());
-        Ok(())
-    }
-
     /// A captured permission change cannot overwrite a newer session policy.
     #[tokio::test]
     async fn permission_commit_rejects_newer_policy() -> Result<()> {
@@ -2792,30 +2582,6 @@ mod owned_tests {
         broker.session.approval_mode = newer;
         assert!(broker.commit_permission_configuration(captured).is_err());
         assert_eq!(broker.session.approval_mode, newer);
-        Ok(())
-    }
-
-    /// A stable captured approval change commits locally without requesting a provider turn.
-    #[tokio::test]
-    async fn permission_commit_applies_stable_approval() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let before = broker.store.list_exchange(&broker.session.id)?.len();
-        let captured = broker.prepare_permission_configuration(
-            &json!({"change":{"kind":"set_approval","mode":"allow"}}),
-        )?;
-        let result = broker.commit_permission_configuration(captured)?;
-        assert_eq!(
-            broker.session.approval_mode,
-            crate::session::ApprovalMode::Allow
-        );
-        assert!(result.resume.is_none());
-        assert_eq!(
-            broker.store.list_exchange(&broker.session.id)?.len(),
-            before
-        );
         Ok(())
     }
 

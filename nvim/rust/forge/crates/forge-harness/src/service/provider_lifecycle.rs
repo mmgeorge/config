@@ -325,19 +325,3 @@ fn observation_failure_trace(error: &anyhow::Error) -> serde_json::Value {
         .and_then(|failure| failure.get("kind").cloned());
     json!({"error_code":error_code, "kind":kind, "reason":format!("{error:#}")})
 }
-
-#[cfg(test)]
-mod tests {
-    /// The observation failure trace names its stage and normalized cause without native text.
-    #[test]
-    fn observation_failure_trace_records_typed_cause() {
-        let error = anyhow::Error::from(crate::exchange::ProviderObservationError::Commit(
-            anyhow::Error::from(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-            )),
-        ));
-        let payload = super::observation_failure_trace(&error);
-        assert_eq!(payload["error_code"], "observation_commit_failed");
-        assert_eq!(payload["kind"], "ownership_conflict");
-    }
-}

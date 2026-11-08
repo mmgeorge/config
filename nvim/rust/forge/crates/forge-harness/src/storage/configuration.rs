@@ -165,6 +165,3 @@ impl SqliteStore {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {}

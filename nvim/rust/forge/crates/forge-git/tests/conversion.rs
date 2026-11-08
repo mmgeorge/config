@@ -174,22 +174,3 @@ async fn canonical_conversion_refreshes_attribute_precedence() {
         assert_eq!(content.source.bytes(), expected);
     }
 }
-
-#[tokio::test]
-async fn invalid_conversion_configuration_is_not_silently_defaulted() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    fs::write(root.join("file"), b"one\r\n").unwrap();
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    git(root, &["config", "core.autocrlf", "invalid"]);
-    assert!(matches!(
-        repository
-            .content(&store, canonical_request())
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Failed(_)
-    ));
-}

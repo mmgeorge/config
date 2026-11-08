@@ -472,6 +472,3 @@ pub(crate) fn persist_test_session(root: &std::path::Path, id: &str) -> anyhow::
     }))?;
     store.save_session(&session)
 }
-
-#[cfg(test)]
-mod tests {}

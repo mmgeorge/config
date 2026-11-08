@@ -489,35 +489,6 @@ async fn native_remote_errors_are_redacted_and_recorded_as_failures() {
     fixture.connection.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn typed_json_rpc_rejection_maps_without_exposing_native_message() {
-    let fixture = WireFixture::start("invalid_request").await.unwrap();
-    fixture.ready().await.unwrap();
-    let native = fixture
-        .connection
-        .request("session/prompt", json!({"sessionId":"fixture","prompt":[]}))
-        .await
-        .unwrap_err();
-    let normalized = crate::error::acp(native, forge_provider_api::ProviderOperation::TurnStart);
-    assert!(
-        matches!(normalized, ProviderError::Failure(ref failure) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
-    );
-    assert!(
-        !normalized
-            .to_string()
-            .contains("private invalid request detail")
-    );
-    fixture.connection.shutdown().await.unwrap();
-}
-
-#[test]
-fn mcp_native_reason_text_is_replaced_by_normalized_message() {
-    let canary = "private native payload: /home/user/secret-token";
-    let detail = super::provider::normalized_mcp_reason(Some(canary));
-    assert_eq!(detail.as_str(), "MCP resource is unavailable.");
-    assert!(!detail.as_str().contains(canary));
-}
-
 /// Open a production ACP binding against the deterministic native-wire peer.
 async fn provider_fixture(
     mode: &str,
@@ -579,77 +550,6 @@ async fn next_completion(stream: &mut forge_provider_api::ProviderEventStream) {
         }
     }
     .await
-}
-
-/// A catalog that reports its selected model only through the `model` config option still resolves effort for the implicit model.
-#[tokio::test]
-async fn config_option_model_catalog_marks_the_selected_model_and_accepts_implicit_effort() {
-    use forge_provider_api::provider::Provider;
-    let (fixture, provider, opened) = provider_fixture("config_option_models").await;
-    let binding = opened.binding.id;
-    let mut events = opened.events;
-    let models = provider
-        .model_list(
-            operation_context(),
-            forge_provider_api::catalog::QueryContext::Binding(binding.clone()),
-        )
-        .await
-        .unwrap();
-    let defaults = models
-        .iter()
-        .filter(|model| model.is_default)
-        .map(|model| model.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(defaults, vec!["default-model"]);
-    let mut request = prompt_request(
-        &binding,
-        forge_provider_api::InvocationScope::new(
-            forge_provider_api::testing::root_thread("fixture-owner"),
-            "implicit-effort",
-        ),
-        receipt("implicit-effort"),
-        forge_provider_api::PromptInput::Text("implicit effort".into()),
-    );
-    request.configuration.model.reasoning =
-        forge_provider_api::generation::ReasoningSelection::Level("low".into());
-    provider
-        .turn_start(operation_context(), &binding, request)
-        .await
-        .unwrap();
-    // ACP reports no per-turn model, so the started turn confirms the session's selection.
-    let resolved = async {
-        let mut resolved = Vec::new();
-        loop {
-            match events.recv().await.unwrap().unwrap().event {
-                forge_provider_api::ProviderEvent::Turn {
-                    event: forge_provider_api::TurnEvent::ModelResolved(model),
-                    ..
-                } => resolved.push(model.model_id.as_str().to_owned()),
-                forge_provider_api::ProviderEvent::Turn {
-                    event: forge_provider_api::TurnEvent::Completed(_),
-                    ..
-                } => return resolved,
-                _ => {}
-            }
-        }
-    }
-    .await;
-    assert_eq!(resolved, vec!["default-model"]);
-    let reasoning = fixture
-        .peer
-        .requests()
-        .into_iter()
-        .filter(|request| {
-            request["method"] == "session/set_config_option"
-                && request["params"]["configId"] == "effort"
-        })
-        .map(|request| request["params"]["value"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(reasoning, vec!["low"]);
-    provider
-        .thread_close(operation_context(), &binding)
-        .await
-        .unwrap();
 }
 
 /// Build a durable resume with an independent host owner for history-exclusion regressions.

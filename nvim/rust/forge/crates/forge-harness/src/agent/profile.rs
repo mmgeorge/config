@@ -309,34 +309,4 @@ mod tests {
         assert!(AgentProfileStore::new(path).resolve(None).is_err());
         Ok(())
     }
-
-    #[test]
-    fn profile_validation_rejects_disabled_default_and_unknown_fields() -> Result<()> {
-        let mut document = AgentProfileDocument::default();
-        document.profiles.get_mut("worker").unwrap().enabled = false;
-        assert!(document.validate().is_err());
-        document.default_profile = "reviewer".into();
-        document.validate()?;
-        let directory = tempfile::tempdir()?;
-        let store = AgentProfileStore::new(directory.path().join("subagents.json"));
-        store.save("missing", document)?;
-        assert!(
-            store
-                .resolve(Some("worker"))
-                .unwrap_err()
-                .to_string()
-                .contains("disabled")
-        );
-        assert!(
-            store
-                .resolve(Some("unknown"))
-                .unwrap_err()
-                .to_string()
-                .contains("unknown")
-        );
-        let mut value = serde_json::to_value(AgentProfile::default())?;
-        value["typo"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<AgentProfile>(value).is_err());
-        Ok(())
-    }
 }

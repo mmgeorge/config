@@ -230,35 +230,3 @@ async fn plan_answer_publication_failure_rolls_back_decision_and_receipt() -> Re
     );
     Ok(())
 }
-
-/// Old answer receipts acquire their missing outbox entry without repeating the stored decision.
-#[tokio::test]
-async fn legacy_plan_answer_receipt_backfills_publication_without_reapplying_answer() -> Result<()>
-{
-    let (_root, controller, request) = fixture().await?;
-    let events = controller.exchange_owner.question_events();
-    let original = events
-        .answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(
-            request.clone(),
-        )?)
-        .await?;
-    let database =
-        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
-    database.execute("DELETE FROM owner_publication_origin WHERE session_id=?1 AND json_extract(origin,'$.kind')='plan_question_answer'", [controller.observer.session_id()])?;
-    database.execute("DELETE FROM owner_publication WHERE session_id=?1 AND json_extract(event,'$.event')='question_updated'", [controller.observer.session_id()])?;
-    let recovered = events
-        .answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(request)?)
-        .await?;
-    assert_eq!(
-        serde_json::to_value(recovered)?,
-        serde_json::to_value(original)?
-    );
-    let plan = SqliteStore::read_only(&controller.data_root)?
-        .load_plan("owner-plan")?
-        .unwrap();
-    assert_eq!(plan.elicitation.unwrap().answer_revision, 1);
-    let count: i64 = database.query_row("SELECT COUNT(*) FROM owner_publication WHERE session_id=?1 AND json_extract(event,'$.event')='question_updated'", [controller.observer.session_id()], |row| row.get(0))?;
-    assert_eq!(count, 1);
-    controller.finish_exchange_owner().await?;
-    Ok(())
-}

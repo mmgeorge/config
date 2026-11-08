@@ -230,6 +230,3 @@ pub(super) fn recover_observed_agents(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {}

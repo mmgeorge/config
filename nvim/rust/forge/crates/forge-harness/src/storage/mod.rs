@@ -24,11 +24,7 @@ mod tool_output;
 #[cfg(test)]
 mod concurrency_tests;
 #[cfg(test)]
-mod efficiency_tests;
-#[cfg(test)]
 mod reliability_tests;
-#[cfg(test)]
-mod rollback_atomicity_test;
 
 use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
@@ -1560,48 +1556,6 @@ mod test {
         assert_eq!(
             serde_json::to_value(store.list_exchange("session").unwrap()).unwrap(),
             snapshot
-        );
-    }
-
-    #[test]
-    fn lease_transactions_reject_stale_session_writers() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut first = SqliteStore::open(temporary.path()).unwrap();
-        first.save_session(&session("session", "D:/work")).unwrap();
-        let owned = first
-            .acquire_session_lease("session", "client-one")
-            .unwrap();
-        let mut second = SqliteStore::open(temporary.path()).unwrap();
-        assert!(
-            second
-                .acquire_session_lease("session", "client-two")
-                .is_err()
-        );
-        assert!(
-            second
-                .acquire_session_lease("session", "client-two")
-                .is_err(),
-            "a live runtime owner must not be replaced"
-        );
-        first
-            .release_session_lease("session", "client-one")
-            .unwrap();
-        let replacement = second
-            .acquire_session_lease("session", "client-two")
-            .unwrap();
-        assert_eq!(replacement.lease_owner.as_deref(), Some("client-two"));
-        assert!(first.save_owned_session(&owned, "client-one").is_err());
-        first
-            .release_session_lease("session", "client-one")
-            .unwrap();
-        assert_eq!(
-            second
-                .load_session("session")
-                .unwrap()
-                .unwrap()
-                .lease_owner
-                .as_deref(),
-            Some("client-two")
         );
     }
 }

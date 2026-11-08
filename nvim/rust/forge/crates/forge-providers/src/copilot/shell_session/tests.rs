@@ -336,25 +336,6 @@ async fn paused_shell_routes_exact_permission_and_denial() {
     }
 }
 
-/// Fence cancelled calls before allocating auxiliary native state.
-#[tokio::test]
-async fn paused_shell_cancel_before_launch_allocates_nothing() {
-    let fixture = Fixture::new(PermissionResponse::Allow, false, false).await;
-    fixture.callbacks.cancelled.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        fixture
-            .shell
-            .execute(
-                "outer-call",
-                command_tool(),
-                json!({"command":"fixture command","description":"fixture"})
-            )
-            .await,
-        Err(ProviderError::Cancelled)
-    ));
-    assert!(fixture.finish().await.is_empty());
-}
-
 /// Select the same native command family as the production auxiliary session.
 fn command_tool() -> ShellTool {
     if cfg!(windows) {

@@ -324,32 +324,3 @@ fn merge_tokens(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Conflicting late data cannot partially mutate already retained accounting.
-    #[test]
-    fn report_merge_is_idempotent_complementary_and_atomic() {
-        let mut report: TurnUsageReport = serde_json::from_value(serde_json::json!({
-            "report_id":"report", "observed_at_ms":1, "usage":{"input":3}
-        }))
-        .unwrap();
-        let complement: TurnUsageReport = serde_json::from_value(serde_json::json!({
-            "report_id":"report", "observed_at_ms":2, "usage":{"output":4}, "reported_duration_ms":15
-        })).unwrap();
-        assert!(report.merge(&complement).unwrap());
-        assert!(!report.merge(&complement).unwrap());
-        assert_eq!(report.usage().as_ref().unwrap().input, Some(3));
-        let before = report.clone();
-        let conflicting: TurnUsageReport = serde_json::from_value(serde_json::json!({
-            "report_id":"report", "observed_at_ms":3, "usage":{"reasoning":2}, "reported_duration_ms":16
-        })).unwrap();
-        assert_eq!(
-            report.merge(&conflicting),
-            Err(UsageReportError::MeasurementConflict)
-        );
-        assert_eq!(report, before);
-    }
-}

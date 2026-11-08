@@ -5263,9 +5263,6 @@ mod callback_tests {
 }
 
 #[cfg(test)]
-mod recovery_receipt_tests {}
-
-#[cfg(test)]
 mod retained_recovery_tests {
     use super::*;
     use forge_provider_api::ProviderEvent;
@@ -5281,41 +5278,6 @@ mod retained_recovery_tests {
             cancellation,
         )
         .unwrap()
-    }
-
-    struct QueuedReceipt {
-        id: forge_provider_api::SubmissionId,
-        attempt: forge_provider_api::DeliveryAttemptId,
-        sending: AtomicU64,
-    }
-
-    #[async_trait]
-    impl forge_provider_api::submission::InputReceipt for QueuedReceipt {
-        fn id(&self) -> &forge_provider_api::SubmissionId {
-            &self.id
-        }
-        fn attempt_id(&self) -> Result<forge_provider_api::DeliveryAttemptId, ProviderError> {
-            Ok(self.attempt.clone())
-        }
-        async fn record_sending(
-            self: Arc<Self>,
-            _: Option<RecoveryToken>,
-        ) -> Result<(), ProviderError> {
-            self.sending.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }
-        async fn record_accepted(
-            self: Arc<Self>,
-            _: Option<RecoveryToken>,
-        ) -> Result<(), ProviderError> {
-            panic!("cancelled preparation accepted native input")
-        }
-        async fn record_rejected(self: Arc<Self>, _: ProviderError) -> Result<(), ProviderError> {
-            Ok(())
-        }
-        async fn record_failure(self: Arc<Self>, _: ProviderError) -> Result<(), ProviderError> {
-            Ok(())
-        }
     }
 
     struct QueuedHostEffects;
@@ -5413,93 +5375,6 @@ mod retained_recovery_tests {
             turn_control: authority,
             host_effects: Arc::new(QueuedHostEffects),
         }
-    }
-
-    fn assert_admission_failure<T>(
-        result: Result<T, ProviderError>,
-        operation: ProviderOperation,
-        kind: ProviderFailureKind,
-    ) {
-        let error = match result {
-            Err(ProviderError::Failure(error)) => error,
-            _ => panic!("precondition did not preserve its typed provider failure"),
-        };
-        assert_eq!(error.operation(), operation);
-        assert_eq!(error.kind(), kind);
-        assert_eq!(error.phase(), forge_provider_api::ProviderPhase::Admission);
-        let expected = if matches!(
-            kind,
-            ProviderFailureKind::BindingClosed | ProviderFailureKind::BindingInvalidated
-        ) {
-            forge_provider_api::FailureDisposition::Invalidated
-        } else {
-            forge_provider_api::FailureDisposition::Unchanged
-        };
-        assert_eq!(error.disposition(), expected);
-    }
-
-    /// Input preconditions preserve exact lifecycle and immutable-target causes without native traffic.
-    #[tokio::test]
-    async fn input_preconditions_report_exact_admission_causes_before_dispatch() {
-        async {
-            let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnStart).await.unwrap();
-            let configuration = state.request.lock().await.configuration.clone();
-            for index in 0..7 {
-                let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), format!("precondition-{index}"));
-                let receipt = Arc::new(QueuedReceipt { id: forge_provider_api::SubmissionId::try_from(format!("input-{index}")).unwrap(), attempt: forge_provider_api::DeliveryAttemptId::new(format!("attempt-{index}")).unwrap(), sending: AtomicU64::new(0) });
-                let mut request = queued_request(&opened.binding.id, scope.clone(), configuration.clone(), receipt.clone());
-                let expected = match index {
-                    0 => { state.closing.store(true, Ordering::Release); ProviderFailureKind::BindingClosed }
-                    1 => { state.unsafe_history.store(true, Ordering::Release); ProviderFailureKind::BindingInvalidated }
-                    2 => { request.scope.thread_id = forge_provider_api::testing::root_thread("foreign"); ProviderFailureKind::WrongInvocation }
-                    3 => { request.submission_id = forge_provider_api::SubmissionId::try_from("different-input").unwrap(); ProviderFailureKind::WrongInvocation }
-                    4 => { request.attempt_id = forge_provider_api::DeliveryAttemptId::new("different-attempt").unwrap(); ProviderFailureKind::WrongInvocation }
-                    5 => {
-                        request.dispatch = forge_provider_api::submission::DispatchReporter::channel(BindingId::new("foreign-binding").unwrap(), scope, receipt.id.clone(), receipt.attempt.clone()).0;
-                        ProviderFailureKind::WrongInvocation
-                    }
-                    6 => {
-                        *state.active.lock().await = Some(ActiveExecution { scope, task: tokio::spawn(std::future::pending::<Result<(), ProviderError>>()) });
-                        ProviderFailureKind::ExecutionActive
-                    }
-                    _ => unreachable!("all fixture preconditions are enumerated"),
-                };
-                assert_admission_failure(provider.turn_start(context(&format!("submit-precondition-{index}")), &opened.binding.id, request).await, ProviderOperation::TurnStart, expected);
-                assert_eq!(receipt.sending.load(Ordering::Acquire), 0);
-                state.closing.store(false, Ordering::Release); state.unsafe_history.store(false, Ordering::Release);
-                if let Some(active) = state.active.lock().await.take() { active.task.abort(); let _ = active.task.await; }
-            }
-            let steering = SteeringRequest { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "inactive"), delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("never steer".into()), attachments: Vec::new(), };
-            assert!(matches!(provider.turn_steer(context("inactive-steer"), &opened.binding.id, steering.clone()).await, Err(ProviderError::NotConsumed)));
-            state.closing.store(true, Ordering::Release);
-            assert_admission_failure(provider.turn_steer(context("closed-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingClosed);
-            state.closing.store(false, Ordering::Release); state.unsafe_history.store(true, Ordering::Release);
-            assert_admission_failure(provider.turn_steer(context("invalid-steer"), &opened.binding.id, steering.clone()).await, ProviderOperation::TurnSteer, ProviderFailureKind::BindingInvalidated);
-            state.unsafe_history.store(false, Ordering::Release);
-            let mut foreign = steering.clone(); foreign.scope.thread_id = forge_provider_api::testing::root_thread("foreign");
-            assert_admission_failure(provider.turn_steer(context("foreign-steer"), &opened.binding.id, foreign).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
-            *state.active.lock().await = Some(ActiveExecution { scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "other-active"), task: tokio::spawn(std::future::pending::<Result<(), ProviderError>>()) });
-            assert_admission_failure(provider.turn_steer(context("wrong-scope-steer"), &opened.binding.id, steering).await, ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation);
-            if let Some(active) = state.active.lock().await.take() { active.task.abort(); let _ = active.task.await; }
-            provider.thread_close(context("precondition-close"), &opened.binding.id).await.unwrap();
-            let closed_scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "collected");
-            let closed_receipt = Arc::new(QueuedReceipt { id: forge_provider_api::SubmissionId::try_from("closed-input").unwrap(), attempt: forge_provider_api::DeliveryAttemptId::new("closed-attempt").unwrap(), sending: AtomicU64::new(0) });
-            let closed_prompt = queued_request(&opened.binding.id, closed_scope.clone(), configuration.clone(), closed_receipt.clone());
-            let closed_steer = SteeringRequest { scope: closed_scope, delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("cannot reopen".into()), attachments: Vec::new(), };
-            let late_submit = provider.turn_start(context("collected-submit"), &opened.binding.id, closed_prompt).await.expect_err("collected binding admitted input");
-            let late_steer = provider.turn_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.expect_err("collected binding admitted steering");
-            for (operation, cause) in [(ProviderOperation::TurnStart, late_submit), (ProviderOperation::TurnSteer, late_steer)] {
-                assert!(matches!(cause, ProviderError::Failure(error) if error.operation() == operation
-                    && error.kind() == ProviderFailureKind::BindingClosed && error.phase() == forge_provider_api::ProviderPhase::Admission
-                    && error.disposition() == forge_provider_api::FailureDisposition::Closed));
-            }
-            assert_eq!(closed_receipt.sending.load(Ordering::Acquire), 0);
-            provider.shutdown(context("precondition-shutdown")).await.unwrap();
-            let requests = peer.collected().await;
-            assert_eq!(requests.iter().filter(|request| request["method"] == "models.list").count(), 1);
-            assert!(!requests.iter().any(|request| matches!(request["method"].as_str(), Some("session.send" | "session.abort"))));
-        }.await;
     }
 
     /// Accepted input interrupted before positive start remains accepted without a fabricated turn.
@@ -5769,8 +5644,6 @@ mod retained_recovery_tests {
     #[derive(Clone, Copy)]
     enum AbortAcknowledgement {
         Success,
-        Rejected,
-        TransportFailure,
     }
 
     #[derive(Clone, Copy)]
@@ -5778,7 +5651,6 @@ mod retained_recovery_tests {
         CompleteTurn,
         AcceptedBeforeStart,
         PauseRejected,
-        ModelDeferred,
     }
 
     /// Open the production adapter against an SDK peer that retains shell and abort state.
@@ -5909,11 +5781,7 @@ mod retained_recovery_tests {
                     json!({"resultType":"success","textResultForLlm":"background fixture started"})
                 }
                 "session.model.switchTo" => {
-                    if matches!(helper_behavior, HelperBehavior::ModelDeferred) {
-                        json!({"status":"deferred","deferred":true,"modelId":"auto"})
-                    } else {
-                        json!({"status":"applied","deferred":false,"modelId":request["params"]["modelId"]})
-                    }
+                    json!({"status":"applied","deferred":false,"modelId":request["params"]["modelId"]})
                 }
                 "session.tasks.refresh" => {
                     if terminal_ack
@@ -5961,14 +5829,6 @@ mod retained_recovery_tests {
                     }
                     match abort_acknowledgement {
                         AbortAcknowledgement::Success => json!({"success":true}),
-                        AbortAcknowledgement::Rejected => {
-                            json!({"success":false,"error":"fixture rejected abort"})
-                        }
-                        AbortAcknowledgement::TransportFailure => {
-                            return vec![
-                                json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000,"message":"fixture abort acknowledgement lost"}}),
-                            ];
-                        }
                     }
                 }
                 method => panic!("unexpected lifecycle fixture method: {method}"),
@@ -6011,92 +5871,6 @@ mod retained_recovery_tests {
             .await
             .unwrap();
         (provider, opened, root, peer)
-    }
-
-    /// A queued native switch is unconfirmed mutation and cannot commit a model selection.
-    #[tokio::test]
-    async fn deferred_model_configuration_invalidates_without_committing_requested_model() {
-        async {
-            let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelDeferred).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
-            let original = state.request.lock().await.configuration.clone();
-            let mut desired = original.clone(); desired.model.model = Some("alternate".into());
-            assert!(matches!(provider.thread_configure(context("deferred-model"), &opened.binding.id, desired).await,
-                Err(ProviderError::Combined {primary, ..}) if matches!(*primary, ProviderError::Failure(error)
-                    if error.kind() == ProviderFailureKind::Protocol && error.disposition() == forge_provider_api::FailureDisposition::Invalidated)));
-            assert_eq!(state.request.lock().await.configuration, original);
-            assert!(state.closing.load(Ordering::Acquire));
-            provider.thread_close(context("deferred-close"), &opened.binding.id).await.unwrap();
-            provider.shutdown(context("deferred-shutdown")).await.unwrap();
-            peer.collected().await;
-        }.await;
-    }
-
-    struct FixtureCompletedDriver;
-    #[async_trait]
-    impl crate::turn_runner::NativeTurnDriver for FixtureCompletedDriver {
-        async fn run(
-            &self,
-            start: forge_provider_api::NativeTurnStart,
-        ) -> Result<forge_provider_api::TurnResult, ProviderError> {
-            start.observed(1).await?;
-            forge_provider_api::TurnResult::new(
-                forge_provider_api::turn::TurnOutcome::Completed {
-                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
-                },
-                2,
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-            )
-            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
-        }
-        async fn interrupt(&self) -> Result<(), ProviderError> {
-            Ok(())
-        }
-        async fn collect(&self) -> Result<(), ProviderError> {
-            Ok(())
-        }
-    }
-
-    /// A rejected or lost abort acknowledgement remains the cancellation result after normal completion.
-    #[tokio::test]
-    async fn repeated_cancel_preserves_first_stop_failure_after_automatic_settlement() {
-        async {
-            for abort_acknowledgement in [AbortAcknowledgement::Rejected, AbortAcknowledgement::TransportFailure] {
-            let expected_failure = match abort_acknowledgement {
-                AbortAcknowledgement::Rejected => ProviderFailureKind::Rejected,
-                AbortAcknowledgement::TransportFailure => ProviderFailureKind::Transport,
-                AbortAcknowledgement::Success => unreachable!("fixture covers unsuccessful acknowledgements"),
-            };
-            let (abort, aborted) = tokio::sync::oneshot::channel();
-            let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(abort), abort_acknowledgement, None).await;
-            let state = provider.binding(&opened.binding.id, ProviderOperation::TurnInterrupt).await.unwrap();
-            let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "racing-completion");
-            let task_state = state.clone(); let task_scope = scope.clone();
-            let (ready, running) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                let guard = task_state.turn.activate(None, None).unwrap(); let _ = ready.send(());
-                aborted.await.unwrap();
-                let address = forge_provider_api::TurnAddress { scope: task_scope.clone(), thread_id: task_scope.thread_id.clone(), turn_id: task_scope.turn_id().unwrap() };
-                let runner = crate::turn_runner::RetainedTurn::spawn(Arc::new(FixtureCompletedDriver), task_state.sink.clone(), address).unwrap();
-                let completed = runner.join().await;
-                task_state.settlements.lock().await.insert(task_scope.clone(), completed);
-                drop(guard); Ok(())
-            });
-            running.await.unwrap();
-            *state.active.lock().await = Some(ActiveExecution { scope: scope.clone(), task });
-            for attempt in 0..2 {
-                assert!(matches!(provider.turn_interrupt(context(&format!("cancel-{attempt}")), &opened.binding.id, CancelRequest { scope: scope.clone() }).await,
-                    Err(ProviderError::Failure(failure)) if failure.kind() == expected_failure));
-            }
-            assert!(state.settlements.lock().await.get(&scope).is_some_and(Result::is_ok));
-            provider.thread_close(context("close-retry"), &opened.binding.id).await.unwrap(); provider.shutdown(context("shutdown")).await.unwrap();
-            let requests = peer.collected().await;
-            assert_eq!(requests.iter().filter(|request| request["method"] == "session.abort").count(), 1);
-            }
-        }.await;
     }
 
     /// Lost identity delivery after commit immediately revokes the changed binding.

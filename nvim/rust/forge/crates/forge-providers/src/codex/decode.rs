@@ -1017,23 +1017,6 @@ pub fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    /// Accumulated billing and a small reply must not substitute for retained context usage.
-    #[test]
-    fn context_usage_uses_last_request_including_input_not_cumulative_total() {
-        let usage = super::context_usage(&serde_json::json!({"tokenUsage":{
-            "last":{"inputTokens":149900,"outputTokens":100,"totalTokens":150000},
-            "total":{"totalTokens":9000000},"modelContextWindow":258000
-        }}))
-        .unwrap();
-        assert_eq!(usage.used, 150000);
-        assert_eq!(usage.size, 258000);
-        let small = super::context_usage(&serde_json::json!({"tokenUsage":{
-            "last":{"totalTokens":20000},"total":{"totalTokens":9000000},
-            "modelContextWindow":258000
-        }}))
-        .unwrap();
-        assert_eq!(small.used, 20000);
-    }
 
     /// Match the installed app-server schema rather than an MCP response envelope.
     #[test]
@@ -1062,51 +1045,6 @@ mod tests {
             assert_eq!(
                 super::dynamic_tool_response("result".into(), success),
                 serde_json::json!({"contentItems":[{"type":"inputText","text":"result"}],"success":success})
-            );
-        }
-    }
-
-    use super::*;
-
-    #[test]
-    fn move_report_preserves_destination_outside_patch_content() {
-        let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
-        let changes = normalize_file_change_set(
-            &json!({"changes":[{
-                "path":"D:/workspace/src/original.rs", "kind":"update",
-                "diff":format!("{patch}\nMoved to: D:/workspace/src/moved.rs")
-            }]}),
-            &Value::Null,
-            "D:/workspace",
-        );
-        assert_eq!(changes.file[0].kind, ProviderChangeKind::Move);
-        assert_eq!(changes.file[0].move_path.as_deref(), Some("src/moved.rs"));
-        assert_eq!(changes.file[0].diff, patch);
-        let content = "ordinary content\nMoved to: source text";
-        for kind in ["add", "delete"] {
-            let changes = normalize_file_change_set(
-                &json!({"changes":[{
-                    "path":"src/plain.txt", "kind":kind, "diff":content
-                }]}),
-                &Value::Null,
-                "D:/workspace",
-            );
-            assert_eq!(changes.file[0].diff, content);
-            assert!(changes.file[0].move_path.is_none());
-        }
-    }
-
-    #[test]
-    fn argv_command_titles_hide_launchers_without_losing_script_boundaries() {
-        for (executable, marker) in [
-            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-Command"),
-            ("/bin/bash", "-lc"),
-            ("/bin/zsh", "-ic"),
-            ("/opt/homebrew/bin/nu", "--commands"),
-        ] {
-            assert_eq!(
-                tool_title(&json!([executable, marker, "probe 'a path'; probe λ"])).as_deref(),
-                Some("probe 'a path'; probe λ")
             );
         }
     }

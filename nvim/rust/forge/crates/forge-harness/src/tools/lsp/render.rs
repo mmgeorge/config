@@ -425,6 +425,3 @@ fn location(line: u32, column: Option<u32>, hit: bool, text: &str) -> String {
         if hit { "> " } else { "  " }
     )
 }
-
-#[cfg(test)]
-mod tests {}

@@ -6,7 +6,6 @@ use forge_harness as harness;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use harness::provider::session_execution::OwnerObservation;
 use harness::provider::{
     HarnessEvent, HarnessEventSink, InvocationScope, ProviderCompletion, ProviderError,
@@ -210,26 +209,6 @@ impl ProviderTestSession {
         Ok(())
     }
 
-    /// Close all engines and join their independently retained observers.
-    pub async fn close(&self) -> anyhow::Result<()> {
-        self.registry.close().await?;
-        let owners: Vec<_> = self.owners.lock().await.values().cloned().collect();
-        let mut observer_failure = None;
-        for owner in owners {
-            let mut observer = owner.observer.lock().await;
-            if let Some(handle) = observer.as_mut() {
-                if let Err(error) = handle.await {
-                    observer_failure.get_or_insert(error);
-                }
-                observer.take();
-            }
-        }
-        match observer_failure {
-            None => Ok(()),
-            Some(error) => Err(anyhow::Error::new(error).context("test observer task failed")),
-        }
-    }
-
     /// Keep the engine and its idle observer alive independently of result waiters.
     async fn owner(&self, owner: ThreadOwner) -> Result<Arc<TestOwner>, ProviderError> {
         let mut owners = self.owners.lock().await;
@@ -277,81 +256,6 @@ impl ProviderTestSession {
         owners.insert(owner, execution.clone());
         Ok(execution)
     }
-
-    /// Collect active events while the production engine owns admission and settlement.
-    async fn execute(
-        &self,
-        request: ProviderRequest,
-        sink: Option<HarnessEventSink>,
-    ) -> Result<ProviderOutput, ProviderError> {
-        let owner = request.owner()?;
-        let scope = match &sink {
-            Some(sink) => sink.invocation_scope()?.clone(),
-            None => InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string()),
-        };
-        if scope.owner() != owner {
-            return Err(ProviderError::Failure(
-                forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::TurnStart,
-                    forge_provider_api::ProviderFailureKind::Rejected,
-                ),
-            ));
-        }
-        let execution = self.owner(owner).await?;
-        let (output, mut stream) = harness::provider::events::channel(scope.clone());
-        let mut completion: std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            harness::provider::session_execution::NativeReady,
-                            ProviderError,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > = Box::pin(
-            execution
-                .engine
-                .run_until_ready(request, output, &self.store),
-        );
-        let mut observed = Vec::new();
-        let mut stream_open = true;
-        loop {
-            tokio::select! {
-                result = &mut completion => {
-                    while let Ok(event) = stream.try_recv() {
-                        if let Some(sink) = &sink {
-                            sink.send_observation(event.clone()).await?;
-                        }
-                        if let OwnerObservation::Event(event) = event { observed.push(event); }
-                    }
-                    let ready = result?;
-                    match ready.ticket.commit().await {
-                        Ok(()) => return Ok(ProviderOutput { event: observed, completion: ready.outcome? }),
-                        Err(harness::provider::session_execution::SettlementError::Stale) => {
-                            completion = Box::pin(execution.engine.wait_ready(scope.clone()));
-                        }
-                        Err(harness::provider::session_execution::SettlementError::Unavailable) => {
-                            return Err(ProviderError::Observation(
-                                forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
-                            ));
-                        }
-                        Err(harness::provider::session_execution::SettlementError::Provider(error)) => return Err(error),
-                    }
-                }
-                event = stream.recv(), if stream_open => {
-                    let Some(event) = event? else {
-                        stream_open = false;
-                        continue;
-                    };
-                    if let Some(sink) = &sink {
-                        sink.send_observation(event.clone()).await?;
-                    }
-                    if let OwnerObservation::Event(event) = event { observed.push(event); }
-                }
-            }
-        }
-    }
 }
 
 impl Clone for ProviderTestSession {
@@ -363,26 +267,5 @@ impl Clone for ProviderTestSession {
             store: self.store.clone(),
             _directory: self._directory.clone(),
         }
-    }
-}
-
-/// Collect complete output above the session API without taking over its native reader.
-#[async_trait]
-pub trait ProviderTestExt {
-    async fn session_prompt_and_wait(
-        &self,
-        request: ProviderRequest,
-        sink: HarnessEventSink,
-    ) -> Result<ProviderCompletion, ProviderError>;
-}
-
-#[async_trait]
-impl ProviderTestExt for ProviderTestSession {
-    async fn session_prompt_and_wait(
-        &self,
-        request: ProviderRequest,
-        sink: HarnessEventSink,
-    ) -> Result<ProviderCompletion, ProviderError> {
-        Ok(self.execute(request, Some(sink)).await?.completion)
     }
 }

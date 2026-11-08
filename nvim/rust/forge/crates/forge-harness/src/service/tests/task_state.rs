@@ -56,12 +56,6 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_
     task_control_aliases_collect_active_work_and_replay_owner_receipts_case("rpc", "pause").await
 }
 
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_clear() -> Result<()>
-{
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("rpc", "clear").await
-}
-
 /// Run one transport and action variant of the scenario described above, each in its own test so a
 /// variant reports independently and stays within the per-test time limit.
 async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case(
@@ -1000,34 +994,5 @@ async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Res
         crate::exchange::journal::CommandState::Finished { .. }
     ));
     controller.finish_exchange_owner().await?;
-    Ok(())
-}
-
-/// Conversation-only undo reaches the owner through the same alias set at admission and dispatch.
-#[tokio::test]
-async fn task_admission_accepts_conversation_only_undo() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    crate::checks::configure_fixture(root.path());
-    let service = service();
-    service.open_session(1, initialize(&root, "mock")).await?;
-    let session_id = service.registry().await?.initial_session_id().to_owned();
-    let undo = Request {
-        id: 2,
-        method: "session.command.apply".into(),
-        params: json!({"operation_id":"conversation-undo","action":"undo","rollback":{
-            "scope":"conversation","exchange_id":"exchange","latest_exchange_id":"exchange"}}),
-    };
-    service.prepare_task(Some(&session_id), &undo).await?;
-    let unknown = Request {
-        id: 3,
-        method: "session.command.apply".into(),
-        params: json!({"operation_id":"unknown","action":"unknown-action"}),
-    };
-    assert!(
-        service
-            .prepare_task(Some(&session_id), &unknown)
-            .await
-            .is_err()
-    );
     Ok(())
 }

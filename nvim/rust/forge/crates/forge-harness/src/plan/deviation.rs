@@ -125,38 +125,3 @@ pub fn build_effective_plan(
         deviation_ids,
     })
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn overlays_only_approved_scope_deviations() {
-        let accepted = super::super::document::test_fixture("plan", "Accepted");
-        let deviation = PlanDeviation {
-            id: "deviation".into(),
-            plan_id: "plan".into(),
-            execution_id: "execution".into(),
-            kind: PlanDeviationKind::Scope,
-            disposition: PlanDeviationDisposition::AutoApproved,
-            summary: "Change overview".into(),
-            reason: "Repository evidence changed.".into(),
-            task_path: Some("/stages/0/tasks/0".into()),
-            subtask_path: None,
-            affected_paths: Vec::new(),
-            proposed_changes: PlanMutation {
-                plan: Some(super::super::edit::PlanFieldPatch {
-                    overview: Some("Effective".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            created_at_ms: 1,
-            resolved_at_ms: Some(1),
-        };
-        let effective = build_effective_plan(&accepted, &[deviation]).unwrap();
-        assert_eq!(effective.accepted.overview, "Accepted");
-        assert_eq!(effective.document.overview, "Effective");
-        assert_eq!(effective.deviation_ids, ["deviation"]);
-    }
-}

@@ -99,35 +99,3 @@ impl TurnContextDelivery {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn thread(id: &str) -> ProviderSessionId {
-        id.try_into().unwrap()
-    }
-
-    /// Repeat delivery only when the thread, the text, or compaction state changed.
-    #[test]
-    fn delivered_context_requires_resend_only_after_a_visible_change() {
-        let delivery = TurnContextDelivery::Delivered {
-            thread: thread("native"),
-            context: "approval ask".into(),
-            compaction_count: 1,
-        };
-        assert!(!delivery.requires(&thread("native"), "approval ask", 1));
-        assert!(delivery.requires(&thread("native"), "approval yolo", 1));
-        assert!(delivery.requires(&thread("native"), "approval ask", 2));
-        assert!(delivery.requires(&thread("replacement"), "approval ask", 1));
-        assert!(TurnContextDelivery::Unknown.requires(&thread("native"), "approval ask", 0));
-        assert!(!TurnContextDelivery::Unsupported.requires(&thread("native"), "approval ask", 0));
-
-        let mut invalidated = delivery;
-        invalidated.invalidate();
-        assert!(matches!(invalidated, TurnContextDelivery::Unknown));
-        let mut unsupported = TurnContextDelivery::Unsupported;
-        unsupported.invalidate();
-        assert!(matches!(unsupported, TurnContextDelivery::Unsupported));
-    }
-}

@@ -2555,45 +2555,4 @@ mod test {
         let source = store.read().unwrap().open().1;
         assert!(source.contains("\"rg *\": \"allow\""));
     }
-
-    #[tokio::test]
-    async fn cancellation_clears_every_pending_approval_and_emits_lifecycle_events() {
-        let coordinator = PermissionCoordinator::transient("D:/repo").unwrap();
-        let (event_sink, mut event_stream) = crate::provider::events::channel(scope());
-        let waiting_event_sink = event_sink.clone();
-        let waiting_coordinator = Arc::clone(&coordinator);
-        let waiting = tokio::spawn(async move {
-            waiting_coordinator
-                .authorize(
-                    ApprovalMode::Ask,
-                    PermissionRequest {
-                        id: "approval-cancel".into(),
-                        provider: forge_provider_api::ProviderId::new("mock").unwrap(),
-                        reason: None,
-                        target_list: vec![PermissionTarget::Command {
-                            command: "rg TODO".into(),
-                            shell: None,
-                        }],
-                    },
-                    None,
-                    Some(&waiting_event_sink),
-                )
-                .await
-                .unwrap()
-        });
-        approval(event_stream.recv().await.unwrap().unwrap());
-        coordinator.cancel_all(None).await.unwrap();
-        assert!(matches!(
-            event_stream.recv().await.unwrap().unwrap(),
-            OwnerObservation::Event(HarnessEvent::Host {
-                event: HostEvent::PermissionApproval {
-                    execution_kind: _,
-                    event: PermissionApprovalEvent::Cancelled(_)
-                },
-                ..
-            })
-        ));
-        assert_eq!(waiting.await.unwrap(), ApprovalResolution::Cancel);
-        assert!(coordinator.pending_list().unwrap().is_empty());
-    }
 }

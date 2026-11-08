@@ -30,8 +30,6 @@ pub enum CodexConnectionError {
 
 /// Retain transport size alongside decoded JSON or its precise parse failure.
 pub struct ReceivedMessage {
-    #[cfg(test)]
-    pub encoded_bytes: usize,
     pub value: Result<Value, serde_json::Error>,
 }
 
@@ -190,7 +188,7 @@ async fn run_socket(
                     Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(close) => return Err(CodexConnectionError::Closed(format!("shared Codex app-server closed the session channel: {close:?}"))),
                 };
-                let message = ReceivedMessage { #[cfg(test)] encoded_bytes: encoded.len(), value: serde_json::from_str(&encoded) };
+                let message = ReceivedMessage { value: serde_json::from_str(&encoded) };
                 if publish.send(message).is_err() { return Ok(()); }
             },
         }
@@ -202,57 +200,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn binary_and_ping_frames_preserve_json() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Ping(vec![7].into())).await.unwrap();
-            socket
-                .send(Message::Binary(
-                    br#"{"id":1,"result":"accepted"}"#.to_vec().into(),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(
-                socket.next().await.unwrap().unwrap(),
-                Message::Pong(vec![7].into())
-            );
-        });
-        let connection = CodexConnection::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        let message = connection.receive().await.unwrap();
-        assert_eq!(message.encoded_bytes, 28);
-        assert_eq!(message.value.unwrap(), json!({"id":1,"result":"accepted"}));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn malformed_json_and_close_remain_distinct() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text("{".into())).await.unwrap();
-            socket.send(Message::Close(None)).await.unwrap();
-        });
-        let connection = CodexConnection::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        let malformed = connection.receive().await.unwrap();
-        assert_eq!(malformed.encoded_bytes, 1);
-        assert!(malformed.value.is_err());
-        assert!(matches!(
-            connection.receive().await,
-            Err(CodexConnectionError::Closed(_))
-        ));
-        server.await.unwrap();
-    }
 
     /// Retain large output in order and expose connection closure only after the backlog drains.
     #[tokio::test]

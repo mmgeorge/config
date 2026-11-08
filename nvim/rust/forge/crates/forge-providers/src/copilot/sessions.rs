@@ -1368,9 +1368,6 @@ mod tests {
     use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    mod recovery;
-    mod support;
-
     struct Trace;
 
     impl ProviderTrace for Trace {

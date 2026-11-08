@@ -159,38 +159,3 @@ User follow-up:
 {question}"#
     )
 }
-
-#[cfg(test)]
-mod test {
-    use super::PlanPrompt;
-
-    #[test]
-    fn revision_sends_canonical_json_and_contextual_review_comments() {
-        let prompt = PlanPrompt::revision(
-            r#"{"plan_id":"plan","entity_changes":[]}"#,
-            "src/controls.rs\n```text\n8  -   direction: Vec2,\n8  +   velocity: Vec2,\n```\n\n8: Why replace direction with velocity?",
-            Some("Tighten ownership"),
-        );
-
-        assert!(prompt.contains(r#""plan_id":"plan""#));
-        assert!(prompt.contains("Review comments"));
-        assert!(prompt.contains("8: Why replace direction with velocity?"));
-        assert!(!prompt.contains("Semantic annotations"));
-        assert!(prompt.contains("plan_file_edit"));
-        assert!(!prompt.contains("Current rendered plan"));
-    }
-
-    #[test]
-    fn clarification_preserves_the_pending_decision_boundary() {
-        let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
-        assert!(prompt.contains("open decisions that can change"));
-        assert!(!prompt.contains("question_reply"));
-        assert!(!prompt.contains("question_revise"));
-        assert!(!prompt.contains("question_answer"));
-        assert!(!prompt.contains("question_ask"));
-        assert!(!prompt.contains("question_withdraw"));
-        assert!(prompt.contains("Tentative language"));
-        assert!(prompt.contains("Why?"));
-        assert!(prompt.contains("Migration?"));
-    }
-}

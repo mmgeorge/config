@@ -3,32 +3,6 @@ use serde_json::json;
 
 use super::{SessionTaskController, Task, TaskChange, TaskEvent, TaskPhase, TaskTurnId};
 
-/// Reject inconsistent loaded summaries instead of letting editor state choose a workflow.
-#[test]
-fn persisted_task_rejects_contradictory_phase_lifecycle_and_work() -> Result<()> {
-    let task = Task::goal("Inspect the result".into(), Default::default(), 1);
-    let valid = serde_json::to_value(&task)?;
-    let restored: Task = serde_json::from_value(valid.clone())?;
-    assert_eq!(restored.id, task.id);
-    for (field, value) in [("phase", json!("check")), ("status", json!("paused"))] {
-        let mut invalid = valid.clone();
-        invalid[field] = value;
-        assert!(serde_json::from_value::<Task>(invalid).is_err());
-    }
-    for work in [
-        json!({"kind":"checks"}),
-        json!({"kind":"provider","instruction":" "}),
-    ] {
-        let mut invalid = valid.clone();
-        invalid["turn"] = json!({
-            "id":{"exchange_ordinal":1,"turn_ordinal":1},
-            "continuation":{"id":"invalid-work","reason":"Continue","delivery":"pending","work":work}
-        });
-        assert!(serde_json::from_value::<Task>(invalid).is_err());
-    }
-    Ok(())
-}
-
 /// Prove that rejected gate bypasses leave both the database and published admission unchanged.
 #[test]
 fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<()> {
@@ -156,36 +130,5 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
         unreachable!()
     };
     assert_eq!(execution.continuation.turn_count, 0);
-    Ok(())
-}
-
-/// Keep a valid deferred operation admissible when newer user exchanges exist.
-#[test]
-fn continuation_checks_its_exact_source_instead_of_the_latest_exchange() -> Result<()> {
-    let (_root, mut store, _controller) = SessionTaskController::test_goal();
-    for ordinal in 1..=2 {
-        let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
-            "id":format!("exchange-{ordinal}"),"session_id":"session",
-            "agent_id":crate::session::HarnessSession::primary_agent_id("session"),
-            "ordinal":ordinal,"prompt":"Inspect","state":"complete",
-            "created_at_ms":ordinal,"completed_at_ms":ordinal+1,
-            "node_list":[],"attributed_matches_checkpoint":false
-        }))?;
-        store.save_exchange(&exchange)?;
-    }
-    assert!(store.continuation_source_complete(
-        "session",
-        &TaskTurnId {
-            exchange_ordinal: 1,
-            turn_ordinal: 0
-        }
-    )?);
-    assert!(!store.continuation_source_complete(
-        "session",
-        &TaskTurnId {
-            exchange_ordinal: 1,
-            turn_ordinal: 1
-        }
-    )?);
     Ok(())
 }

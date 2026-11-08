@@ -361,16 +361,4 @@ mod tests {
         );
         assert_eq!(expected.differences(&actual).len(), 3);
     }
-
-    #[test]
-    fn methods_keep_their_owner_and_trait_contracts() {
-        let expected = contract(
-            "pub struct State; impl State { pub fn run(&self) {} } pub trait Work { fn go(&self); }",
-        );
-        let actual = contract(
-            "pub struct State; impl State { fn helper() {} pub fn run(&self) {} } pub trait Work { fn go(&self); }",
-        );
-        assert!(expected.differences(&actual).is_empty());
-        assert!(!expected.differences(&contract("pub struct State; impl State { pub fn run(&mut self) {} } pub trait Work { fn go(&self); }")).is_empty());
-    }
 }

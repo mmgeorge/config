@@ -859,6 +859,3 @@ enum TaskIntent {
     RequestPlanChanges(PlanChangeRequest),
     CancelPlan(PlanCancellation),
 }
-
-#[cfg(test)]
-mod tests {}

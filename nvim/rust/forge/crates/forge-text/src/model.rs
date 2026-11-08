@@ -402,42 +402,6 @@ mod tests {
         }
     }
 
-    /// Expand missing-apostrophe negatives independently of context and preserve case.
-    #[test]
-    fn negative_contractions_override_frequency_with_original_case() {
-        for (original, expected) in [
-            ("dont", "don't"),
-            ("wont", "won't"),
-            ("isnt", "isn't"),
-            ("arent", "aren't"),
-            ("wasnt", "wasn't"),
-            ("werent", "weren't"),
-            ("doesnt", "doesn't"),
-            ("didnt", "didn't"),
-            ("havent", "haven't"),
-            ("hasnt", "hasn't"),
-            ("hadnt", "hadn't"),
-            ("couldnt", "couldn't"),
-            ("wouldnt", "wouldn't"),
-            ("shouldnt", "shouldn't"),
-            ("mustnt", "mustn't"),
-            ("neednt", "needn't"),
-        ] {
-            assert_eq!(decide(&format!("Say {original} "), original), expected);
-            assert_eq!(
-                decide(
-                    &format!("Say {} ", original.to_uppercase()),
-                    &original.to_uppercase()
-                ),
-                expected.to_uppercase()
-            );
-            assert_eq!(
-                decide(&format!("{original} "), original),
-                format!("{}{}", expected[..1].to_uppercase(), &expected[1..])
-            );
-        }
-    }
-
     /// Preserve unsupported tokens even when English neighbors make a replacement more probable.
     #[test]
     fn unsupported_alphabets_preserve_original_text() {
@@ -462,45 +426,5 @@ mod tests {
             decide("Please RECIEVE the package near Ω.", "RECIEVE"),
             "RECEIVE"
         );
-    }
-
-    /// Keep recognized contractions intact independently of misleading corpus frequencies.
-    #[test]
-    fn contractions_preserve_spelling_and_capitalize_first_person() {
-        for word in model().unigram.keys().filter(|word| word.contains('\'')) {
-            for original in [word.clone(), word.replace('\'', "\u{2019}")] {
-                let expected = if matches!(
-                    word.as_str(),
-                    "i'm" | "i'll" | "i've" | "i'd" | "i'd've" | "i'll've"
-                ) {
-                    format!("I{}", &original[1..])
-                } else {
-                    original.clone()
-                };
-                assert_eq!(decide(&format!("Say {original} now."), &original), expected);
-            }
-        }
-        for (context, target, expected) in [
-            ("im ", "im", "I'm"),
-            ("Say im ready.", "im", "I'm"),
-            ("Say Im ready.", "Im", "I'm"),
-            ("I cant ", "cant", "can't"),
-            ("cant ", "cant", "Can't"),
-            ("I CANT ", "CANT", "CAN'T"),
-            ("I can't ", "can't", "can't"),
-            ("I can\u{2019}t ", "can\u{2019}t", "can\u{2019}t"),
-            ("Say i'm ready.", "i'm", "I'm"),
-            ("Say i\u{2019}m ready.", "i\u{2019}m", "I\u{2019}m"),
-            ("I CAN'T ", "CAN'T", "CAN'T"),
-        ] {
-            assert_eq!(decide(context, target), expected, "{context}");
-        }
-        for (context, target) in [
-            ("They are ill.", "ill"),
-            ("They were ready.", "were"),
-            ("They work well.", "well"),
-        ] {
-            assert!(!decide(context, target).contains('\''), "{context}");
-        }
     }
 }

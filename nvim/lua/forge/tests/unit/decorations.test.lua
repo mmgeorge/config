@@ -1,45 +1,48 @@
--- Unit tests for `forge.decorations` (decorations.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "source_overlay", run = function()
-vim.loader.enable(false)
-local original_provider = vim.api.nvim_set_decoration_provider
-local provider
-vim.api.nvim_set_decoration_provider = function(_, callbacks) provider = callbacks end
-local buffer = require("forge.buffer")
-vim.api.nvim_set_decoration_provider = original_provider
-local session = buffer.open("source-overlay")
-local source = { "- First", "+ 日本語", "1. Ordered" }
-local metadata = { target = {}, decoration = {}, editable_region = {}, source_overlay = {} }
-for row = 0, 1 do
-  metadata.source_overlay[#metadata.source_overlay + 1] = {
-    range = { start = { row = row, column = 0 }, ["end"] = { row = row, column = 1 } },
-    text = "●", capture = "String", priority = 120,
+-- Unit tests for `forge.decorations` (decorations.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local eq = MiniTest.expect.equality
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["source_overlay"] = function()
+  local original_provider = vim.api.nvim_set_decoration_provider
+  local provider
+  vim.api.nvim_set_decoration_provider = function(_, callbacks) provider = callbacks end
+  local buffer = require("forge.buffer")
+  vim.api.nvim_set_decoration_provider = original_provider
+  local session = buffer.open("source-overlay")
+  local source = { "- First", "+ 日本語", "1. Ordered" }
+  local metadata = { target = {}, decoration = {}, editable_region = {}, source_overlay = {} }
+  for row = 0, 1 do
+    metadata.source_overlay[#metadata.source_overlay + 1] = {
+      range = { start = { row = row, column = 0 }, ["end"] = { row = row, column = 1 } },
+      text = "●", capture = "String", priority = 120,
+    }
+  end
+  metadata.source_highlight = { {
+    range = { start = { row = 1, column = 2 }, ["end"] = { row = 1, column = #source[2] } },
+    capture = "RenderMarkdownCodeInline", priority = 4096,
+  }, {
+    range = { start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 } },
+    capture = "RenderMarkdownCode", priority = 4096,
+  } }
+  metadata.source_overlay[3] = {
+    range = { start = { row = 2, column = #source[3] }, ["end"] = { row = 2, column = #source[3] } },
+    text = " ", capture = "Title", priority = 4096,
   }
-end
-metadata.source_highlight = { {
-  range = { start = { row = 1, column = 2 }, ["end"] = { row = 1, column = #source[2] } },
-  capture = "RenderMarkdownCodeInline", priority = 4096,
-}, {
-  range = { start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 } },
-  capture = "RenderMarkdownCode", priority = 4096,
-} }
-metadata.source_overlay[3] = {
-  range = { start = { row = 2, column = #source[3] }, ["end"] = { row = 2, column = #source[3] } },
-  text = " ", capture = "Title", priority = 4096,
-}
-metadata.source_overlay[4] = {
-  range = { start = { row = 2, column = 0 }, ["end"] = { row = 2, column = 1 } },
-  text = "json", capture = "RenderMarkdownCodeInfo:json", priority = 4097,
-}
-local snapshot = { document = session.document, revision = 0,
-  block = { { id = "source", text = source, metadata = metadata } } }
-assert(buffer.apply_snapshot(session, snapshot).kind == "Applied")
-vim.api.nvim_set_current_buf(session.buffer)
-vim.wo.conceallevel, vim.wo.concealcursor = 3, ""
-local original_extmark = vim.api.nvim_buf_set_extmark
-local emitted = {}
-local succeeded, failure = xpcall(function()
+  metadata.source_overlay[4] = {
+    range = { start = { row = 2, column = 0 }, ["end"] = { row = 2, column = 1 } },
+    text = "json", capture = "RenderMarkdownCodeInfo:json", priority = 4097,
+  }
+  local snapshot = { document = session.document, revision = 0,
+    block = { { id = "source", text = source, metadata = metadata } } }
+  assert(buffer.apply_snapshot(session, snapshot).kind == "Applied")
+  vim.api.nvim_set_current_buf(session.buffer)
+  vim.wo.conceallevel, vim.wo.concealcursor = 3, ""
+  local original_extmark = vim.api.nvim_buf_set_extmark
+  local emitted = {}
   vim.api.nvim_buf_set_extmark = function(_, _, row, column, options)
     emitted[#emitted + 1] = { row = row, column = column, options = options }
   end
@@ -67,24 +70,15 @@ local succeeded, failure = xpcall(function()
   assert(emitted[5].column == #source[3], "end-of-line source padding was lost")
   assert(emitted[6].options.virt_text[1][1] == " " and emitted[6].options.virt_text[2][1] == "json",
     "code information did not resolve into icon and language chunks")
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, false), source))
-end, debug.traceback)
-vim.api.nvim_buf_set_extmark = original_extmark
-assert(succeeded, failure)
-local invalid = vim.deepcopy(snapshot)
-invalid.revision = 1
-invalid.block[1].metadata.source_overlay[2].range.start.column = 3
-invalid.block[1].metadata.source_overlay[2].range["end"].column = 4
-assert(buffer.apply_snapshot(session, invalid).kind == "Desynchronized", "overlay accepted split UTF-8")
-assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, false), source))
-buffer.close(session)
-print("source_overlay: passed")
-vim.cmd("qa!")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
+  eq(buffer_support.lines(session.buffer), source)
+  vim.api.nvim_buf_set_extmark = original_extmark
+  local invalid = vim.deepcopy(snapshot)
+  invalid.revision = 1
+  invalid.block[1].metadata.source_overlay[2].range.start.column = 3
+  invalid.block[1].metadata.source_overlay[2].range["end"].column = 4
+  assert(buffer.apply_snapshot(session, invalid).kind == "Desynchronized", "overlay accepted split UTF-8")
+  eq(buffer_support.lines(session.buffer), source)
+  buffer.close(session)
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

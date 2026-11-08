@@ -1,13 +1,15 @@
 # The single runner for the Neovim Lua tests. Each plugin keeps them in `nvim/lua/<plugin>/tests/`:
 # unit tests under `tests/unit/` and integration tests under `tests/integration/`, both mirroring the
-# plugin's source tree, and every test entry point ends in `.test.lua`. Each scenario row, or each
-# standalone test file, runs in a fresh headless Neovim, in parallel with bounded concurrency, and
-# any still running after five seconds has its whole process tree killed and fails as a timeout.
-# Tests that launch the Forge host assume `rust-build` has produced a current executable.
+# plugin's source tree, and every test file ends in `.test.lua` and returns a `MiniTest.new_set()`.
+# A unit test file runs as one shard, its cases in sequence in one headless Neovim; an integration
+# test file runs each top-level case in its own Neovim. Shards and cases run in parallel with bounded
+# concurrency. A case still running after five seconds fails as a timeout, and the runner kills the
+# whole process tree of a shard that outlives its one-minute limit. Tests that launch the Forge
+# host assume `rust-build` has produced a current executable.
 #
 #   nu .forge/checks/lua-tests.nu                         every test
 #   nu .forge/checks/lua-tests.nu client                  a test name: every file named client.test.lua
-#   nu .forge/checks/lua-tests.nu client::admission_queue one scenario
+#   nu .forge/checks/lua-tests.nu client::admission_queue one top-level case
 #   nu .forge/checks/lua-tests.nu nvim/lua/forge/client.lua  a source file's unit test
 #   nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp      a source directory's unit and integration mirrors
 #   nu .forge/checks/lua-tests.nu --suite status          a source area's unit and integration tests
@@ -16,41 +18,41 @@
 #   nu --stdin .forge/checks/lua-tests.nu check <suite>   Harness check callback
 const repository_root = path self | path dirname | path dirname | path dirname
 const runner_path = path self
-const per_test_timeout = 5sec
-# A mini.test shard reports its own per-case timeout; the outer kill waits this much longer so the
-# shard can name the case that hung before the runner kills it.
+const per_case_timeout = 5sec
+# The shard bootstrap reports its own per-case timeout; the outer kill of a single-case process
+# waits this much longer so the process can name the case that hung before the runner kills it.
 const minitest_report_grace = 1sec
+# The limit for a whole unit test file run as one shard, whatever its case count.
+const minitest_shard_timeout = 1min
 const startup_argument_list = [
   "--headless" "-i" "NONE" "-u" "NONE" "--cmd" "set rtp^=./nvim" "--cmd" "lua vim.loader.enable(false)"
 ]
-# mini.test test files return a `MiniTest.new_set()` and run as one shard per file through this
-# bootstrap. The runner clones the pinned mini.test commit once into a commit-named cache directory
-# and puts it on each shard's 'runtimepath'.
+# Every test process runs its file through this bootstrap. The runner clones the pinned mini.test
+# commit once into a commit-named cache directory and puts it on each process's 'runtimepath'.
 const minitest_shard_path = "nvim/lua/forge/tests/support/minitest_shard.lua"
 const minitest_repository = "https://github.com/nvim-mini/mini.test"
 const minitest_commit = "0d0c3257cf799a6a1869fdb4bdda8f330bb63e03"
 
-# A fixture entry is a repository path, optionally followed by `::scenario` for fixtures that
-# take a scenario name through `arg[1]`.
+# A fixture entry is a repository path, optionally followed by `::case` naming one top-level case.
 def split_fixture_entry [entry: string] {
   let separator_index = $entry | str index-of "::"
   if $separator_index < 0 {
-    {path: $entry, scenario: null}
+    {path: $entry, case: null}
   } else {
-    {path: ($entry | str substring 0..<$separator_index), scenario: ($entry | str substring ($separator_index + 2)..)}
+    {path: ($entry | str substring 0..<$separator_index), case: ($entry | str substring ($separator_index + 2)..)}
   }
 }
 
 def repository_relative [entry: string] {
   let parts = split_fixture_entry $entry
   let relative = $parts.path | path expand | path relative-to $repository_root | str replace --all '\' '/'
-  if $parts.scenario == null { $relative } else { $"($relative)::($parts.scenario)" }
+  if $parts.case == null { $relative } else { $"($relative)::($parts.case)" }
 }
 
 # Every plugin keeps its tests in `nvim/lua/<plugin>/tests/`, split by scope, and both halves mirror
 # the plugin's source tree. A unit test covers one source file: `forge/views/status/status_context.lua`
 # is tested by `forge/tests/unit/views/status/status_context.test.lua`. An integration test drives
-# several modules, the Forge host, or Git, and is a row in the file named after the source area it
+# several modules, the Forge host, or Git, and is a case in the file named after the source area it
 # exercises, such as `forge/tests/integration/views/status/status.test.lua`. Every test entry point
 # ends in `.test.lua`; `support/`, `fixtures/`, and `plans/` beside `unit/` and `integration/` hold
 # helpers, data, and notes that never run as tests. Tests that launch the Forge host assume that
@@ -88,40 +90,25 @@ def unit_test_for_source [relative: string] {
   $"nvim/lua/($parts.0.plugin)/tests/unit/($parts.0.source).test.lua"
 }
 
-# The scenario rows a test file declares as `{ name = "...", run = ... }` at two-space indentation.
-# A file with rows runs each row in its own Neovim, so no scenario shares the five-second budget
-# with another; a file without rows is one standalone script.
-def scenario_row_name_list [relative: string] {
-  open --raw ($repository_root | path join $relative) | lines
-  | parse --regex '^  \{ name = "(?<name>[^"]+)", run = ' | get name
-}
-
-# The top-level cases a mini.test file declares as `T["name"] = ...` at column zero.
-def minitest_case_name_list [relative: string] {
+# The top-level cases a test file declares as `T["name"] = ...` at column zero, which `path::name`
+# selects.
+def case_name_list [relative: string] {
   open --raw ($repository_root | path join $relative) | lines
   | parse --regex '^T\["(?<name>[^"]+)"\] = ' | get name
 }
 
-def is_minitest_file [relative: string] {
-  not (minitest_case_name_list $relative | is-empty)
+# A test file's entries. A unit test file is one shard, its cases sharing a process; an integration
+# test file runs each top-level case in its own process, because its cases drive the Forge host,
+# Git, and windows that hooks cannot reliably reset. A file without top-level cases is an error.
+def expand_cases [relative: string] {
+  let names = case_name_list $relative
+  if ($names | is-empty) { error make {msg: $"Not a mini.test file, because it declares no top-level T[\"name\"] case: ($relative)"} }
+  if (is_unit_test_path $relative) { [$relative] } else { $names | each {|name| $"($relative)::($name)" } }
 }
 
-# The names `path::name` may select in a test file: its scenario rows or its mini.test cases.
-def scenario_name_list [relative: string] {
-  scenario_row_name_list $relative | append (minitest_case_name_list $relative)
-}
-
-# A test file's entries: the file itself as one shard when it is a mini.test file, its scenario
-# rows, or the file itself when it has neither.
-def expand_scenarios [relative: string] {
-  if (is_minitest_file $relative) { return [$relative] }
-  let names = scenario_row_name_list $relative
-  if ($names | is-empty) { [$relative] } else { $names | each {|name| $"($relative)::($name)" } }
-}
-
-# Every test entry, with scenario files expanded.
+# Every test entry, with integration files expanded into their cases.
 def all_fixture_list [] {
-  fixture_file_list | each {|file| expand_scenarios $file } | flatten
+  fixture_file_list | each {|file| expand_cases $file } | flatten
 }
 
 # The test directories a directory selects. A directory inside a `tests/` tree selects itself. A
@@ -177,13 +164,13 @@ def suite_fixture_list [suite: string] {
 }
 
 # Resolve one command-line argument: a test file, a source file (its unit test), a directory, or a
-# test name, each optionally followed by `::scenario`. A test name selects every test file with that
+# test name, each optionally followed by `::case`. A test name selects every test file with that
 # name, so `client` runs both `unit/client.test.lua` and `integration/client/client.test.lua`.
 def resolve_argument [argument: string] {
   let parts = split_fixture_entry $argument
   let directory = test_directory $parts.path
   if $directory != null {
-    if $parts.scenario != null { error make {msg: $"A directory takes no scenario: ($argument)"} }
+    if $parts.case != null { error make {msg: $"A directory takes no case: ($argument)"} }
     return (directory_fixture_list (mirrored_test_directory_list $directory))
   }
   let paths = if ($parts.path | path exists) {
@@ -195,10 +182,10 @@ def resolve_argument [argument: string] {
     if ($candidates | is-empty) { error make {msg: $"No Lua test, directory, or test name matches ($parts.path)"} }
     $candidates
   }
-  if $parts.scenario == null { return $paths }
-  let matching = $paths | where {|path| $parts.scenario in (scenario_name_list $path) }
-  if ($matching | is-empty) { error make {msg: $"Unknown scenario: ($argument)"} }
-  $matching | each {|path| $"($path)::($parts.scenario)" }
+  if $parts.case == null { return $paths }
+  let matching = $paths | where {|path| $parts.case in (case_name_list $path) }
+  if ($matching | is-empty) { error make {msg: $"Unknown case: ($argument)"} }
+  $matching | each {|path| $"($path)::($parts.case)" }
 }
 
 # The integration area that covers a source file: the nearest mirrored integration directory of
@@ -222,12 +209,12 @@ def integration_area_for_source [relative: string] {
 def affected_fixture_list [path_list: list<string>] {
   $path_list | each {|file|
     if (is_fixture_path $file) {
-      if ($file | path exists) { expand_scenarios $file } else { [] }
+      if ($file | path exists) { expand_cases $file } else { [] }
     } else if (is_test_tree_path $file) or not ($file =~ '^nvim/lua/[^/]+/.+\.lua$') {
       all_fixture_list
     } else {
       let unit_test = unit_test_for_source $file
-      let mirrored = if $unit_test != null and ($unit_test | path exists) { expand_scenarios $unit_test } else { [] }
+      let mirrored = if $unit_test != null and ($unit_test | path exists) { expand_cases $unit_test } else { [] }
       let area = integration_area_for_source $file
       let plugin_tests = $file | str replace --regex '^(nvim/lua/[^/]+)/.*$' '$1/tests'
       let covering = if $area != null { directory_fixture_list [$area] } else if ($plugin_tests | path type) == "dir" { directory_fixture_list [$plugin_tests] } else { all_fixture_list }
@@ -246,9 +233,9 @@ def validate_fixture [entry: string] {
     error make {msg: $"Not a repository Lua test: ($entry)"}
   }
   if ($relative | path type) != "file" { error make {msg: $"Fixture does not exist: ($relative)"} }
-  let scenario = (split_fixture_entry $entry_relative).scenario
-  if $scenario != null and $scenario not-in (scenario_name_list $relative) {
-    error make {msg: $"Unknown scenario: ($entry_relative)"}
+  let case = (split_fixture_entry $entry_relative).case
+  if $case != null and $case not-in (case_name_list $relative) {
+    error make {msg: $"Unknown case: ($entry_relative)"}
   }
   $entry_relative
 }
@@ -265,7 +252,7 @@ def select_fixture_list [suite: string, path_list: list<string>, affected: bool]
     $path_list | each {|argument| resolve_argument $argument } | flatten
   }
   if ($selected | is-empty) { error make {msg: "No retained Lua fixtures cover this selection"} }
-  $selected | each {|entry| if ($entry | str contains "::") { [$entry] } else { expand_scenarios $entry } } | flatten | uniq
+  $selected | each {|entry| if ($entry | str contains "::") { [$entry] } else { expand_cases $entry } } | flatten | uniq
   | each {|entry| validate_fixture $entry } | sort
 }
 
@@ -349,9 +336,9 @@ def terminate_owned_tree [pid: int] {
 # output redirected to files, and publishes the exit status, so a timeout can kill the tree and
 # still report the output written so far.
 #
-# A mini.test shard runs its cases one after another and enforces the per-case deadline itself, so
-# its outer deadline is the per-test deadline times its case count, plus the report grace.
-def run_fixture [test: string, setup_list: list<string>, minitest_directory: any] {
+# The shard bootstrap enforces the per-case deadline itself. A whole-file shard is killed at
+# `minitest_shard_timeout`; a single-case process at the per-case deadline plus the report grace.
+def run_fixture [test: string, setup_list: list<string>, minitest_directory: string] {
   let scratch_directory = mktemp -d
   let spec_path = $scratch_directory | path join "spec.json"
   let result_path = $scratch_directory | path join "result.json"
@@ -359,18 +346,12 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: any
   let output_path = $scratch_directory | path join "output.txt"
   let setup_argument_list = $setup_list | each {|statement| ["--cmd" $"lua ($statement)"] } | flatten
   let fixture = split_fixture_entry $test
-  let scenario_argument_list = if $fixture.scenario == null { [] } else { [$fixture.scenario] }
-  let minitest = is_minitest_file $fixture.path
-  let script_argument_list = if $minitest {
-    ["--cmd" $"set rtp^=($minitest_directory | str replace --all '\' '/')" "-l" $minitest_shard_path $fixture.path]
-  } else {
-    ["-l" $fixture.path]
-  }
-  let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append $script_argument_list | append $scenario_argument_list
-  # Nested sets and parametrization make a shard's case count knowable only after collection, so
-  # a shard starts with a one-case deadline and extends it when mini.test reports its total.
-  mut deadline = if $minitest { $per_test_timeout + $minitest_report_grace } else { $per_test_timeout }
-  mut case_count_known = not $minitest
+  let case_argument_list = if $fixture.case == null { [] } else { [$fixture.case] }
+  let script_argument_list = [
+    "--cmd" $"set rtp^=($minitest_directory | str replace --all '\' '/')" "-l" $minitest_shard_path $fixture.path
+  ]
+  let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append $script_argument_list | append $case_argument_list
+  let deadline = if $fixture.case == null { $minitest_shard_timeout } else { $per_case_timeout + $minitest_report_grace }
   {command: $command, output_path: $output_path} | to json --raw | save --force $spec_path
   let started = date now
   let worker_job = job spawn {
@@ -380,13 +361,6 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: any
   }
   mut worker_result: any = null
   while $worker_result == null and (date now) - $started < $deadline {
-    if not $case_count_known {
-      let reported = try { open --raw $output_path | ansi strip | parse --regex 'Total number of cases: (?<count>\d+)' } catch { [] }
-      if not ($reported | is-empty) {
-        $deadline = $per_test_timeout * ([($reported.0.count | into int) 1] | math max) + $minitest_report_grace
-        $case_count_known = true
-      }
-    }
     if ($result_path | path exists) {
       $worker_result = try { open $result_path } catch {|failure|
         {exit_code: 127, failure: $"Worker result is unreadable: ($failure.msg)"}
@@ -438,8 +412,7 @@ def format_outcome [outcome: record] {
 def run_fixture_list [test_list: list<string>, jobs: int, setup_list: list<string> = []] {
   cd $repository_root
   # Fetch mini.test before the shards start, so parallel shards never race to clone it.
-  let uses_minitest = $test_list | any {|test| is_minitest_file (split_fixture_entry $test).path }
-  let minitest_directory = if $uses_minitest { minitest_checkout } else { null }
+  let minitest_directory = minitest_checkout
   let outcome_list = $test_list | par-each --threads $jobs {|test|
     let outcome = run_fixture $test $setup_list $minitest_directory
     print (format_outcome $outcome)
@@ -465,9 +438,9 @@ def default_jobs [] {
   [((sys cpu | length) / 6 | math floor) 1] | math max
 }
 
-# Run Forge Lua fixtures in parallel, each under a hard five-second deadline.
+# Run Forge Lua tests in parallel, each case under a five-second deadline.
 def main [
-  ...test_path: string  # Test files, source files, directories, test names, or name::scenario; changed paths with --affected
+  ...test_path: string  # Test files, source files, directories, test names, or name::case; changed paths with --affected
   --suite: string = "all"  # all, a source area such as status, or a directory under nvim/lua
   --affected  # Treat the paths as changed repository paths and run the tests that cover them
   --jobs: int  # Maximum concurrent fixtures; defaults to a sixth of the logical CPUs

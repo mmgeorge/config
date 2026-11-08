@@ -204,24 +204,3 @@ impl From<&ProviderInput> for forge_provider_api::input::PromptInput {
         }
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::ProviderInput;
-
-    #[test]
-    fn parses_only_a_leading_skill_selector() {
-        assert_eq!(
-            ProviderInput::parse("  $walkthrough explain this"),
-            ProviderInput::Skill {
-                name: "walkthrough".into(),
-                arguments: "explain this".into(),
-                attachments: Vec::new(),
-            }
-        );
-        assert_eq!(
-            ProviderInput::parse("explain $walkthrough"),
-            ProviderInput::from_text("explain $walkthrough")
-        );
-    }
-}

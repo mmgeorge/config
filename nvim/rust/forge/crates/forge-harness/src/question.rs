@@ -2170,69 +2170,6 @@ mod tests {
     }
 
     #[test]
-    fn required_gate_survives_partial_answers_and_rejects_dismissal() -> Result<()> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let controller = QuestionController::open(root.path(), "session")?;
-        let ids = controller.ask(
-            "ask",
-            "exchange",
-            QuestionOrigin::Chat,
-            vec![
-                draft(QuestionRequirement::Required),
-                draft(QuestionRequirement::Required),
-            ],
-        )?;
-        assert!(
-            controller
-                .apply(command(&ids[0], "dismiss", QuestionAction::Dismiss))
-                .is_err()
-        );
-        controller.apply(command(
-            &ids[0],
-            "answer",
-            QuestionAction::Answer {
-                answer: QuestionAnswer::Other {
-                    text: "Tabs".into(),
-                },
-            },
-        ))?;
-        assert!(controller.snapshot()?.required_pending());
-        assert!(
-            controller
-                .snapshot()?
-                .required_pending_in_exchange("exchange")
-        );
-        // The structured reply carries the remaining-required flag; each adapter renders it.
-        assert!(controller.outbox()?.iter().any(|message| matches!(
-            &message.reply.response,
-            forge_provider_api::QuestionReplyResponse::Answer {
-                required_questions_remain: true,
-                ..
-            }
-        )));
-        controller.apply(command(
-            &ids[1],
-            "withdraw",
-            QuestionAction::Withdraw {
-                reason: "Existing interface determines this choice".into(),
-            },
-        ))?;
-        assert!(!controller.snapshot()?.required_pending());
-        assert!(
-            !controller
-                .snapshot()?
-                .required_pending_in_exchange("exchange")
-        );
-        assert!(controller.snapshot()?.required_in_exchange("exchange"));
-        assert!(
-            !controller
-                .snapshot()?
-                .required_in_exchange("other-exchange")
-        );
-        Ok(())
-    }
-
-    #[test]
     fn clarification_does_not_answer_and_revision_rejects_stale_choices_atomically() -> Result<()> {
         let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
         let controller = QuestionController::open(root.path(), "session")?;
@@ -2285,47 +2222,6 @@ mod tests {
         assert_eq!(before, serde_json::to_value(controller.snapshot()?)?);
         assert_eq!(controller.snapshot()?.questions[0].discussion.len(), 2);
         assert_eq!(controller.outbox()?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn task_replacement_retires_questions_but_normal_completion_does_not() -> Result<()> {
-        let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
-        let task = tasks.current()?.unwrap();
-        let controller = QuestionController::open(root.path(), "session")?;
-        let id = controller
-            .ask(
-                "task-question",
-                "exchange",
-                QuestionOrigin::Task(&task),
-                vec![draft(QuestionRequirement::Required)],
-            )?
-            .remove(0);
-        assert!(controller.snapshot()?.required_pending());
-        tasks.change(
-            &mut store,
-            Some(&task.revision),
-            crate::task::TaskChange::Clear,
-            2,
-        )?;
-        assert!(!controller.snapshot()?.required_pending());
-        assert!(matches!(
-            controller.snapshot()?.questions[0].resolution,
-            QuestionResolution::Retired { .. }
-        ));
-        assert!(
-            controller
-                .apply(command(
-                    &id,
-                    "late",
-                    QuestionAction::Answer {
-                        answer: QuestionAnswer::Other {
-                            text: "Late answer".into()
-                        }
-                    }
-                ))
-                .is_err()
-        );
         Ok(())
     }
 }

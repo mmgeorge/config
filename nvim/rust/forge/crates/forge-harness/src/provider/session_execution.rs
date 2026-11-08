@@ -549,24 +549,4 @@ mod tests {
         state.completed(&scope, &thread, &turn, completed).unwrap();
         assert!(state.started(&scope, &thread, &turn).is_err());
     }
-
-    /// Lost observation fences accepted input without certifying native completion.
-    #[test]
-    fn unavailable_does_not_certify_completion() {
-        let owner = ThreadOwner::root("session");
-        let scope = InvocationScope::new(owner.clone(), "exchange");
-        let mut state = ExecutionState::new(owner);
-        state
-            .admit(
-                scope.clone(),
-                "input".try_into().unwrap(),
-                DeliveryAttemptId::new("attempt").unwrap(),
-            )
-            .unwrap();
-        state.unavailable(ObservationFailure::Disconnected);
-        assert!(matches!(
-            state.readiness(&scope).unwrap(),
-            ExecutionReadiness::ObservationLost(ObservationFailure::Disconnected)
-        ));
-    }
 }

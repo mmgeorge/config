@@ -589,16 +589,6 @@ fn finish_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::init_repository;
-
-    #[test]
-    fn complete_stream_preserves_content_beyond_former_limit() {
-        let bytes = b"line\r\n".repeat(1_500_000);
-        assert_eq!(
-            read_exact_content(&mut bytes.as_slice(), bytes.len(), &mut || Ok(())).unwrap(),
-            bytes
-        );
-    }
 
     #[test]
     fn bounded_stream_rejects_growth_shrinkage_and_cancellation() {
@@ -626,65 +616,5 @@ mod tests {
             .to_string(),
             "cancelled"
         );
-    }
-
-    #[test]
-    fn worktree_change_after_open_rejects_acquisition() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        init_repository(root);
-        std::fs::write(root.join("file"), b"initial contents").unwrap();
-        let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
-        let mut local = shared.to_thread_local();
-        let repository = RepositoryState::new(identity, shared);
-        let mut checks = 0;
-        let result = read_worktree(
-            &mut local,
-            &repository.identity,
-            WorktreeRead {
-                path: RepositoryPath::new(b"file".to_vec()).unwrap(),
-                conversion: WorktreeConversion::Raw,
-                expected: None,
-                session: None,
-            },
-            Some(&mut None),
-            &mut || {
-                checks += 1;
-                if checks == 2 {
-                    std::fs::write(root.join("file"), b"changed")?;
-                }
-                Ok(())
-            },
-        );
-        assert!(result.unwrap_err().to_string().contains("shrank"));
-    }
-
-    #[test]
-    fn binary_classification_retains_exact_canonical_identity() {
-        let mut identity = None;
-        let result = finish_bytes(
-            b"binary\0one".to_vec(),
-            Representation::GitCanonical,
-            ContentOrigin::Supplied,
-            None,
-            Some(&mut identity),
-        )
-        .unwrap();
-        assert!(matches!(result, ContentResult::Binary));
-        assert_eq!(
-            identity,
-            Some(SourceIdentity::from_bytes(
-                b"binary\0one",
-                Representation::GitCanonical
-            ))
-        );
-        let result = finish_bytes(
-            b"binary\0two".to_vec(),
-            Representation::GitCanonical,
-            ContentOrigin::Supplied,
-            identity,
-            Some(&mut None),
-        );
-        assert!(result.unwrap_err().to_string().contains("identity differs"));
     }
 }

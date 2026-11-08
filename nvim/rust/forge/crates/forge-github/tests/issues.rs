@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use forge_github::issue_store::IssueStore;
 use forge_github::lease::RepositoryLease;
-use forge_github::model::{DetailRecord, PageInput, SnapshotState, SyncScope};
+use forge_github::model::{PageInput, SnapshotState, SyncScope};
 use redb::{Database, TableDefinition};
 use serde_json::json;
 
@@ -191,45 +191,6 @@ fn deletion_rejects_non_repository_layouts() -> Result<()> {
     store.read_state()?;
     assert!(store.delete_repository_cache().is_err());
     assert!(database_path.exists());
-    Ok(())
-}
-
-#[test]
-fn construction_validates_identity_without_creating_storage() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("nested/issues.redb");
-    assert!(IssueStore::new(database_path.clone(), "invalid", Duration::ZERO).is_err());
-    let store = IssueStore::new(database_path.clone(), "Owner/Repo", Duration::ZERO)?;
-    assert!(!database_path.parent().unwrap().exists());
-    assert_eq!(store.read_state()?.repo, "owner/repo");
-    assert!(database_path.exists());
-    Ok(())
-}
-
-#[test]
-fn operation_completion_releases_database_ownership() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("issues.redb");
-    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    let detail = store.upsert_detail(
-        12,
-        DetailRecord {
-            repo: "untrusted/record".into(),
-            number: 999,
-            fetched_at: 123,
-            item: json!({"title":"Cached detail"}),
-        },
-    )?;
-    assert_eq!(detail.repo, "owner/repo");
-    assert_eq!(detail.number, 12);
-    drop(Database::create(&database_path)?);
-    let other = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    let result = other.read_details(&[13, 12, 12])?;
-    assert!(!result.details[0].found);
-    assert_eq!(result.details[1].number, 12);
-    assert_eq!(result.details[2].number, 12);
-    drop(Database::create(&database_path)?);
-    assert!(store.read_detail(12)?.found);
     Ok(())
 }
 

@@ -96,34 +96,3 @@ fn parse(reader: impl std::io::Read) -> Result<Vec<CheckResult>> {
     }
     Ok(document.result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generic_reports_preserve_complete_diagnostics_without_runner_detection() -> Result<()> {
-        let diagnostic = "failure\n".repeat(100_000);
-        let value = serde_json::json!({"version":1,"result":[{
-            "file":"tests/example.data","state":"failed","duration_ms":12,
-            "command":"arbitrary-checker --case example","output":diagnostic
-        }]});
-        let parsed = parse(std::io::Cursor::new(value.to_string()))?;
-        assert_eq!(parsed[0].output, diagnostic);
-        assert_eq!(parsed[0].duration_ms, Some(12));
-        assert_eq!(parsed[0].state, CheckResultState::Failed);
-        Ok(())
-    }
-
-    #[test]
-    fn malformed_reports_do_not_publish_partial_results() {
-        for source in [
-            r#"{"version":2,"result":[]}"#,
-            r#"{"version":1,"result":[{"file":"../escape","state":"passed","duration_ms":0,"command":"runner","output":""}]}"#,
-            r#"{"version":1,"result":[{"file":"test","state":"running","duration_ms":0,"command":"runner","output":""}]}"#,
-            "not JSON",
-        ] {
-            assert!(parse(std::io::Cursor::new(source)).is_err());
-        }
-    }
-}

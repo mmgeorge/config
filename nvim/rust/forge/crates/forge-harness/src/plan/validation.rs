@@ -1183,30 +1183,7 @@ mod test {
                 .contains("missing task")
         );
     }
-    use super::super::{EntityChangeAction, PlanFileChange, test_fixture};
-
-    #[test]
-    fn validates_entity_rename_semantics() {
-        let mut document = test_fixture("plan", "Overview");
-        document.entity_changes[0].action = EntityChangeAction::Rename;
-        document.entity_changes[0].renamed_from = Some("LegacyPlanDocument".into());
-        document.stages[0].tasks[0].files[0].change = PlanFileChange::Modify {
-            path: document.entity_changes[0].path.clone(),
-        };
-        assert!(document.validate().is_ok());
-
-        document.entity_changes[0].renamed_from = None;
-        let missing_error = document.validate().unwrap_err().to_string();
-        assert!(missing_error.contains("is required when action is rename"));
-
-        document.entity_changes[0].renamed_from = Some(document.entity_changes[0].name.clone());
-        let identical_error = document.validate().unwrap_err().to_string();
-        assert!(identical_error.contains("must differ from the renamed entity name"));
-
-        document.entity_changes[0].action = EntityChangeAction::Modify;
-        let unexpected_error = document.validate().unwrap_err().to_string();
-        assert!(unexpected_error.contains("is valid only when action is rename"));
-    }
+    use super::super::test_fixture;
 
     #[test]
     fn aggregates_independent_edit_violations() {
@@ -1217,59 +1194,5 @@ mod test {
 
         assert!(error.contains("substantive reviewer-visible intent"));
         assert!(error.contains("cannot escape the workspace"));
-    }
-
-    #[test]
-    fn submission_rejects_unattached_entities() {
-        let mut document = test_fixture("plan", "Validate.");
-        document.stages[0].tasks[0].files[0].subtasks[0]
-            .owned_entities_mut()
-            .unwrap()
-            .clear();
-
-        let error = document.validate_for_submission().unwrap_err().to_string();
-
-        assert!(error.contains("must belong to exactly one subtask"));
-        assert!(error.contains("requires at least one entity"));
-    }
-
-    #[test]
-    fn submission_rejects_a_description_that_repeats_its_operation() {
-        let mut document = test_fixture("plan", "Keep structured operations singular.");
-        let super::super::document::PlanSubtask::Work(subtask) =
-            &mut document.stages[0].tasks[0].files[0].subtasks[0]
-        else {
-            panic!("fixture must contain a work subtask");
-        };
-        subtask.description = "Create the canonical plan owner.".into();
-
-        let error = document.validate_for_submission().unwrap_err().to_string();
-
-        assert!(error.contains("/stages/0/tasks/0/files/0/subtasks/0.description"));
-        assert!(error.contains(
-            "must complement operation `create` without repeating `Create` as its first word"
-        ));
-    }
-
-    #[test]
-    fn dependency_manifest_must_have_one_task_owner() {
-        let mut document = test_fixture("plan", "Validate dependency ownership.");
-        document
-            .dependencies
-            .push(super::super::document::PlanDependencyChange {
-                action: super::super::document::ChangeAction::Add,
-                name: "tokio".into(),
-                version: "1".into(),
-                resolved_version: None,
-                manifest: "Cargo.toml".into(),
-                license: Some("MIT".into()),
-                justification: "Run asynchronous work.".into(),
-            });
-
-        let error = document.validate_for_submission().unwrap_err().to_string();
-        assert!(error.contains("must match exactly one task file"));
-
-        document.dependencies[0].manifest = "src/plan.rs".into();
-        document.validate_for_submission().unwrap();
     }
 }

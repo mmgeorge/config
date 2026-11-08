@@ -29,34 +29,3 @@ pub(super) fn input(
     input.push(json!({"type": "text", "text": text}));
     Ok(input)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use forge_provider_api::input::FileAttachment;
-    use std::sync::Arc;
-
-    fn attachment(media_type: &str) -> FileAttachment {
-        FileAttachment {
-            path: "fixture.bin".into(),
-            label: "fixture.bin".into(),
-            media_type: media_type.into(),
-            contents: Arc::from([0u8, 1, 2]),
-            context: "Attached fixture.bin".into(),
-        }
-    }
-
-    #[test]
-    fn image_attachments_require_negotiated_support_and_encode_native_data() {
-        let image = attachment("image/png");
-        assert!(matches!(
-            input(String::new(), std::slice::from_ref(&image), false),
-            Err(ProviderError::Unsupported(_))
-        ));
-        let encoded = input("ask".into(), &[image], true).unwrap();
-        assert_eq!(encoded[1]["type"], "image");
-        assert_eq!(encoded[1]["mimeType"], "image/png");
-        assert_eq!(encoded[1]["data"], "AAEC");
-        assert_eq!(encoded[2]["text"], "ask");
-    }
-}

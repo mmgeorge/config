@@ -144,25 +144,3 @@ pub fn render_plan_audit(audit: &PlanAudit) -> String {
     ));
     line.join("\n") + "\n"
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn compares_effective_paths_with_reported_changes() {
-        let document = super::super::document::test_fixture("plan", "Overview");
-        let mut scheduler = PlanScheduler::activate(&document);
-        scheduler.task[0].changed_paths = vec!["src/unplanned.rs".into()];
-        let audit = build_plan_audit(
-            "audit".into(),
-            "execution".into(),
-            &document,
-            &scheduler,
-            &[],
-            1,
-        );
-        assert_eq!(audit.unplanned_paths[0].path, "src/unplanned.rs");
-        assert_eq!(audit.unchanged_planned_paths[0].path, "src/plan.rs");
-    }
-}

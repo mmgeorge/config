@@ -1,32 +1,34 @@
--- Unit tests for `forge.snapshot` (snapshot.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "transfer", run = function()
-vim.loader.enable(false)
-local replica = require("forge.buffer")
-local transfer = require("forge.snapshot")
-local session = replica.open("document")
+-- Unit tests for `forge.snapshot` (snapshot.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
-local function snapshot(revision, text)
-  return { document = "document", revision = revision, block = {
-    { id = "body", text = { text }, metadata = { target = {}, decoration = {}, editable_region = {} } },
-  } }
-end
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-local function parts(value, identity)
-  local encoded = vim.json.encode(value)
-  local midpoint = math.floor(#encoded / 2)
-  local result = {}
-  for sequence, payload in ipairs({ encoded:sub(1, midpoint), encoded:sub(midpoint + 1) }) do
-    result[sequence] = {
-      document = "document", revision = value.revision, transfer = identity, sequence = sequence - 1,
-      part_count = 2, total_bytes = #encoded, payload = payload,
-    }
+T["transfer"] = function()
+  local replica = require("forge.buffer")
+  local transfer = require("forge.snapshot")
+  local session = replica.open("document")
+  MiniTest.finally(function() pcall(replica.close, session) end)
+
+  local function snapshot(revision, text)
+    return { document = "document", revision = revision, block = {
+      { id = "body", text = { text }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+    } }
   end
-  return result
-end
 
-local ok, failure = xpcall(function()
+  local function parts(value, identity)
+    local encoded = vim.json.encode(value)
+    local midpoint = math.floor(#encoded / 2)
+    local result = {}
+    for sequence, payload in ipairs({ encoded:sub(1, midpoint), encoded:sub(midpoint + 1) }) do
+      result[sequence] = {
+        document = "document", revision = value.revision, transfer = identity, sequence = sequence - 1,
+        part_count = 2, total_bytes = #encoded, payload = payload,
+      }
+    end
+    return result
+  end
+
   assert(replica.apply_snapshot(session, snapshot(0, "original")).kind == "Applied")
   local first = parts(snapshot(1, "complete"), 1)
   local changedtick = session.changedtick
@@ -69,20 +71,6 @@ local ok, failure = xpcall(function()
     local complete, error = transfer.accept(state, candidate[2])
     assert(not complete and error and state.active == nil)
   end
-end, debug.traceback)
-
-replica.close(session)
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  vim.cmd("qa!")
 end
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

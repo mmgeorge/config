@@ -556,6 +556,3 @@ fn keyword_shape(error: &ValidationError<'_>, schema: &Value, keyword: &str) -> 
     let expected_value = schema.pointer(&keyword_path)?.clone();
     Some(json!({ keyword: expected_value }))
 }
-
-#[cfg(test)]
-mod test {}

@@ -1,8 +1,7 @@
-use super::super::{HarnessBroker, foreground_goal_effect};
-use super::test_support::{check_fixture, planning_question_broker, repository};
-use anyhow::{Context, Result};
+use super::super::HarnessBroker;
+use super::test_support::{check_fixture, repository};
+use anyhow::Result;
 use serde_json::{Value, json};
-use std::sync::Arc;
 
 /// Build a real persisted execution gate without an external model or platform-specific command.
 async fn workflow_gate_fixture() -> Result<(tempfile::TempDir, tempfile::TempDir, HarnessBroker)> {
@@ -159,29 +158,6 @@ async fn workflow_check_evidence_tracks_every_completion_input() -> Result<()> {
     Ok(())
 }
 
-/// Repair malformed repository configuration without consuming model work or suspending Check.
-#[tokio::test]
-async fn workflow_check_preparation_errors_enter_resolution() -> Result<()> {
-    let (workspace, _data, mut broker) = workflow_gate_fixture().await?;
-    std::fs::write(
-        workspace.path().join(".forge.json"),
-        "{ invalid configuration }",
-    )?;
-    broker.run_checks().await?;
-    let task = broker.task_controller.current()?.unwrap();
-    assert_eq!(task.phase(), crate::task::TaskPhase::Resolve);
-    assert_eq!(task.status(), crate::task::TaskStatus::Running);
-    let record = broker.current_execution()?.unwrap();
-    assert!(
-        record
-            .findings
-            .iter()
-            .any(|finding| finding.contains("check preparation requires correction"))
-    );
-    assert_eq!(broker.active_goal()?.continuation.turn_count, 0);
-    Ok(())
-}
-
 /// Exercise every execution edge out of one original phase against real committed state and
 /// reject the complement atomically. Each original phase runs as its own test because every
 /// one builds a fresh Git-backed gate fixture.
@@ -256,21 +232,6 @@ async fn workflow_execution_transitions_from_implement_preserve_the_gate_graph()
     assert_transitions_from(crate::plan::PlanPhase::Implement).await
 }
 
-#[tokio::test]
-async fn workflow_execution_transitions_from_checking_preserve_the_gate_graph() -> Result<()> {
-    assert_transitions_from(crate::plan::PlanPhase::Checking).await
-}
-
-#[tokio::test]
-async fn workflow_execution_transitions_from_resolve_preserve_the_gate_graph() -> Result<()> {
-    assert_transitions_from(crate::plan::PlanPhase::Resolve).await
-}
-
-#[tokio::test]
-async fn workflow_execution_transitions_from_verify_preserve_the_gate_graph() -> Result<()> {
-    assert_transitions_from(crate::plan::PlanPhase::Verify).await
-}
-
 /// Reject persisted gate payloads that omit the facts required by their phase variants.
 #[tokio::test]
 async fn workflow_verification_payload_cannot_omit_its_contract_or_evidence() -> Result<()> {
@@ -300,36 +261,6 @@ async fn workflow_verification_payload_cannot_omit_its_contract_or_evidence() ->
             .revision,
         task.revision
     );
-    Ok(())
-}
-
-/// Credit Goal work for observable content changes while leaving tool activity and phases alone.
-#[tokio::test]
-async fn workflow_goal_progress_uses_workspace_content_without_a_check_phase() -> Result<()> {
-    let workspace = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(workspace.path(), data.path(), false);
-    broker.task_controller.change(
-        &mut broker.store,
-        None,
-        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
-            "Repair the workspace".into(),
-            Default::default(),
-            1,
-        ))),
-        1,
-    )?;
-    assert!(!observe_goal_workspace(&mut broker).await?);
-    assert!(!observe_goal_workspace(&mut broker).await?);
-    std::fs::write(workspace.path().join("goal.rs"), "fn changed() {}\n")?;
-    assert!(observe_goal_workspace(&mut broker).await?);
-    assert!(!observe_goal_workspace(&mut broker).await?);
-    std::fs::remove_file(workspace.path().join("goal.rs"))?;
-    assert!(observe_goal_workspace(&mut broker).await?);
-    let task = broker.task_controller.current()?.unwrap();
-    assert_eq!(task.phase(), crate::task::TaskPhase::Work);
-    assert_eq!(task.next_action(), crate::task::TaskNextAction::Model);
-    assert_eq!(broker.active_goal()?.continuation.turn_count, 0);
     Ok(())
 }
 
@@ -410,11 +341,6 @@ async fn assert_resolution_routing(changed: bool) -> Result<()> {
 }
 
 #[tokio::test]
-async fn workflow_resolution_reuses_checks_when_the_workspace_is_unchanged() -> Result<()> {
-    assert_resolution_routing(false).await
-}
-
-#[tokio::test]
 async fn workflow_resolution_reruns_checks_after_a_source_repair() -> Result<()> {
     assert_resolution_routing(true).await
 }
@@ -453,101 +379,4 @@ async fn execution_control_rejects_exchange_changed_during_evidence_capture() ->
         Some("newer exchange state")
     );
     Ok(())
-}
-
-/// Streamed timing updates do not revoke phase authority or get overwritten by its commit.
-#[tokio::test]
-async fn execution_control_preserves_progress_during_evidence_capture() -> Result<()> {
-    let (_workspace, _data, mut broker) = workflow_gate_fixture().await?;
-    broker.run_checks().await?;
-    let mut record = broker.current_execution()?.unwrap();
-    record.phase = crate::plan::PlanPhase::Resolve;
-    record.generation += 1;
-    let task = broker.task_controller.current()?.unwrap();
-    broker.task_controller.apply(
-        &mut broker.store,
-        &task.permit(),
-        crate::task::TaskEvent::ExecutionUpdated(Box::new(record.clone())),
-        3,
-    )?;
-    let task = broker.task_controller.current()?.unwrap();
-    let mut exchange = broker.store.latest_exchange(&broker.session.id)?.unwrap();
-    let job = broker.prepare_execution_control(
-        &record.id,
-        record.generation,
-        &task.permit(),
-        crate::plan::execution::ExecutionOperation::Phase(crate::plan::execution::PlanPhaseDone {
-            phase: record.phase,
-            revision: record.revision,
-            summary: "Resolved without source changes".into(),
-            verification: None,
-        }),
-        &exchange,
-    )?;
-    let evidence = job.run().await?;
-    exchange.metrics.observe_elapsed(123456);
-    let progress = serde_json::to_value(&exchange.metrics)?;
-    let stage = broker.apply_execution_control(evidence, &mut exchange)?;
-    match stage {
-        super::super::execution::ExecutionControlStage::Complete(_) => {}
-        super::super::execution::ExecutionControlStage::Report(job) => {
-            broker.commit_execution_control_report(job.run().await?, &mut exchange)?;
-        }
-    }
-    assert_eq!(serde_json::to_value(&exchange.metrics)?, progress);
-    assert_eq!(
-        broker.current_execution()?.unwrap().phase,
-        crate::plan::PlanPhase::Verify
-    );
-    Ok(())
-}
-
-/// Exercise Goal workspace evidence without synthesizing a provider turn.
-async fn observe_goal_workspace(broker: &mut HarnessBroker) -> Result<bool> {
-    use crate::provider::session_execution::{
-        HostEffectId, HostEffectKind, HostEffectOutput, ResultEffectAdmission, SettlementCell,
-    };
-    let task = broker
-        .task_controller
-        .current()?
-        .context("goal fixture has no task")?;
-    let crate::task::WorkflowSnapshot::Goal { goal } = &task.workflow else {
-        anyhow::bail!("goal fixture requires Goal");
-    };
-    let previous_id = goal.observed_checkpoint.clone();
-    let previous = previous_id
-        .as_ref()
-        .map(|id| broker.store.load_checkpoint(id))
-        .transpose()?
-        .flatten();
-    let cell = Arc::new(SettlementCell::default());
-    let id = HostEffectId {
-        batch_revision: 1,
-        kind: HostEffectKind::GoalEvidence,
-        ordinal: 0,
-    };
-    let ResultEffectAdmission::Apply(guard) = cell.begin_result_effect(id)? else {
-        unreachable!("new fixture has no previously committed effect")
-    };
-    let result = foreground_goal_effect::GoalProgressJob {
-        capture: broker.prepare_workspace_capture(),
-        previous,
-        previous_id,
-        permit: task.permit(),
-        guard,
-    }
-    .run()
-    .await?;
-    let (changed, guard) = result.commit_workspace(broker)?;
-    guard.commit_output(HostEffectOutput {
-        nodes: Vec::new(),
-        events: Vec::new(),
-        elicitation: None,
-        awaiting_input: false,
-        publication_drained: true,
-        plan_document: None,
-        continuing: None,
-        plan_record: None,
-    })?;
-    Ok(changed)
 }

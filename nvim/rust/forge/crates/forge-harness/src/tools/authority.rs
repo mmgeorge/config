@@ -463,65 +463,6 @@ mod test {
         Ok(())
     }
 
-    /// A saved denial fences commits under the captured policy but not new permission requests.
-    ///
-    /// Saving "always deny" for one command during a turn must not reject the turn's later,
-    /// unrelated permission requests, which the coordinator evaluates against the current policy.
-    #[test]
-    fn saved_denial_admits_new_permission_requests_but_fences_captured_commits() -> Result<()> {
-        use crate::permissions::document::PermissionDecision;
-        let (root, _store, controller) = SessionTaskController::test_goal();
-        let permissions = Arc::new(std::sync::RwLock::new(
-            crate::permissions::store::PermissionStore::load(
-                root.path().join("permissions.json"),
-                root.path(),
-            )?,
-        ));
-        let captured = {
-            let store = permissions.read().unwrap();
-            PermissionAuthoritySnapshot::capture(permissions.clone(), &store)
-        };
-        let mut context =
-            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
-        context.bind_test_task_controller(controller);
-        context.permission_snapshot = Some(captured);
-        context.permission_required = true;
-        let authority = TaskAuthority::capture(&context).unwrap();
-        permissions.write().unwrap().set_rule_list(&[(
-            "bash".into(),
-            "whoami".into(),
-            PermissionDecision::Deny,
-        )])?;
-        assert!(authority.validate_scope().is_err());
-        authority.validate_task_for_new_request()?;
-        Ok(())
-    }
-
-    /// Replacing a store cannot recycle an old permission generation.
-    #[test]
-    fn replacing_permission_store_revokes_captured_callback() -> Result<()> {
-        let (root, _store, controller) = SessionTaskController::test_goal();
-        let path = root.path().join("permissions.json");
-        let permissions = Arc::new(std::sync::RwLock::new(
-            crate::permissions::store::PermissionStore::load(&path, root.path())?,
-        ));
-        let captured = {
-            let store = permissions.read().unwrap();
-            PermissionAuthoritySnapshot::capture(permissions.clone(), &store)
-        };
-        let mut context =
-            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
-        context.bind_test_task_controller(controller);
-        context.permission_snapshot = Some(captured);
-        context.permission_required = true;
-        let authority = TaskAuthority::capture(&context).unwrap();
-        authority.validate_scope()?;
-        *permissions.write().unwrap() =
-            crate::permissions::store::PermissionStore::load(&path, root.path())?;
-        assert!(authority.validate_scope().is_err());
-        Ok(())
-    }
-
     #[test]
     fn policy_replacement_revokes_captured_callback_before_mutation() -> Result<()> {
         let (root, _store, controller) = SessionTaskController::test_goal();

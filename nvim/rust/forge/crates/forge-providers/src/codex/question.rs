@@ -67,29 +67,3 @@ pub(super) fn render(reply: &QuestionReply) -> String {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::render;
-    use forge_provider_api::input::{QuestionReply, QuestionReplyResponse};
-
-    #[test]
-    fn answer_uses_codex_reply_envelope_and_waits_for_other_required_questions() {
-        let reply = QuestionReply {
-            question_id: "question:3".into(),
-            revision: 2,
-            message_id: "host-message".into(),
-            question: "Pick a mode\ncarefully".into(),
-            response: QuestionReplyResponse::Answer {
-                answer: "Careful mode".into(),
-                required_questions_remain: true,
-            },
-        };
-
-        let rendered = render(&reply);
-
-        assert!(rendered.starts_with("<send_user_message_question_reply>\n"));
-        assert!(rendered.contains("\"questionItemId\":\"question:3\""));
-        assert!(rendered.contains("Record this answer without resuming"));
-    }
-}

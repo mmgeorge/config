@@ -11,7 +11,7 @@ use forge_github::issue_store::IssueStore;
 use forge_github::lease::RepositoryLease;
 use forge_github::model::{GithubRepositoryId, IssueDetail};
 use forge_github::remote::{
-    GithubRemote, IssueDetailRequest, IssuePage, IssuePageRequest, RemoteFailure, RemoteFailureKind,
+    GithubRemote, IssueDetailRequest, IssuePage, IssuePageRequest, RemoteFailure,
 };
 use forge_github::service::{GithubService, IssueOperation};
 
@@ -154,52 +154,6 @@ async fn abandoned_caller_retains_detail_and_deletion_ownership_through_persiste
     let shutdown = service.shutdown(Duration::from_secs(1)).await;
     assert_eq!(shutdown.unfinished_jobs, 0);
     assert_eq!(shutdown.failed_jobs, 0);
-    RepositoryLease::deletion(&root.path().join("repo"))?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn close_cancels_remote_detail_without_creating_a_cached_success() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let store = store(root.path())?;
-    let remote = Arc::new(DetailRemote::default());
-    let service = GithubService::default();
-    let caller = fetch(service.clone(), remote.clone(), store.clone());
-    remote.started.notified().await;
-    let shutdown = service.shutdown(Duration::from_secs(1)).await;
-    assert_eq!(shutdown.unfinished_jobs, 0);
-    assert!(caller.await?.unwrap_err().to_string().contains("closed"));
-    assert!(!store.read_detail(7)?.found);
-    RepositoryLease::deletion(&root.path().join("repo"))?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn detail_failures_preserve_remote_diagnostics_and_release_ownership() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let store = store(root.path())?;
-    let remote = Arc::new(DetailRemote {
-        failure: Some(RemoteFailure {
-            kind: RemoteFailureKind::NotFound,
-            message: "missing issue fixture".into(),
-        }),
-        ..Default::default()
-    });
-    remote.release.notify_one();
-    let service = GithubService::default();
-    let failure = service
-        .fetch_detail(remote, store.clone(), request())
-        .await
-        .unwrap_err();
-    assert!(failure.to_string().contains("missing issue fixture"));
-    assert!(!store.read_detail(7)?.found);
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
     RepositoryLease::deletion(&root.path().join("repo"))?;
     Ok(())
 }

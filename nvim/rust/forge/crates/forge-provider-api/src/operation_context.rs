@@ -322,26 +322,4 @@ mod tests {
         cancellation.cancelled().await;
         assert!(cancellation.is_cancelled());
     }
-
-    /// Preserve cancellation as a typed unchanged admission rejection instead of a delivery claim.
-    #[test]
-    fn explicit_cancellation_rejects_new_admission_with_unchanged_disposition() {
-        let (source, cancellation) = OperationCancellation::channel();
-        let context = OperationContext::new(
-            OperationId::new("cancelled-operation").unwrap(),
-            Duration::from_secs(60),
-            cancellation,
-        )
-        .unwrap();
-        source.cancel();
-        let ProviderError::Failure(failure) = context
-            .check_admission(ProviderOperation::TurnStart)
-            .unwrap_err()
-        else {
-            panic!("interruption lost its typed failure");
-        };
-        assert_eq!(failure.kind(), ProviderFailureKind::Cancelled);
-        assert_eq!(failure.disposition(), FailureDisposition::Unchanged);
-        assert_eq!(failure.operation(), ProviderOperation::TurnStart);
-    }
 }

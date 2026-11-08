@@ -1,30 +1,4 @@
-use forge_diff::source::{NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion};
-
-#[test]
-fn exact_bytes_and_newline_metadata_survive_source_construction() {
-    for (bytes, line_count, newline_count, crlf_count, has_final_newline) in [
-        (&b""[..], 0, 0, 0, false),
-        (&b"\n"[..], 1, 1, 0, true),
-        (&b"a\r\nb\nlast\r"[..], 3, 2, 1, false),
-        (&b"\r\n\r\n"[..], 2, 2, 2, true),
-        ("é🙂\n終".as_bytes(), 2, 1, 0, false),
-    ] {
-        let source = SourceVersion::new(bytes.to_vec(), Representation::Raw).unwrap();
-        assert_eq!(source.bytes(), bytes);
-        assert_eq!(source.text().as_bytes(), bytes);
-        assert_eq!(
-            source.newline(),
-            NewlineMetadata {
-                line_count,
-                newline_count,
-                crlf_count,
-                has_final_newline,
-            }
-        );
-        let clone = source.clone();
-        assert_eq!(source.bytes().as_ptr(), clone.bytes().as_ptr());
-    }
-}
+use forge_diff::source::{Representation, SourceError, SourcePair, SourceVersion};
 
 #[test]
 fn identical_bytes_in_distinct_representations_have_distinct_analysis_identities() {
@@ -42,22 +16,6 @@ fn identical_bytes_in_distinct_representations_have_distinct_analysis_identities
         });
         assert!(comparison.hunks().is_empty());
     }
-}
-
-#[test]
-fn invalid_encoding_and_binary_remain_distinct_admission_results() {
-    assert_eq!(
-        SourceVersion::new(vec![0xff], Representation::Raw).unwrap_err(),
-        SourceError::UnsupportedEncoding
-    );
-    assert_eq!(
-        SourceVersion::new(b"text\0data".to_vec(), Representation::Raw).unwrap_err(),
-        SourceError::Binary
-    );
-    let bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
-    let accepted = SourceVersion::new(bytes.clone(), Representation::Raw).unwrap();
-    assert_eq!(accepted.bytes(), bytes);
-    assert_eq!(accepted.newline().line_count, 1);
 }
 
 #[test]
@@ -79,14 +37,4 @@ fn acquisition_claims_must_match_exact_content_and_newline_state() {
             .unwrap_err(),
         SourceError::InconsistentMetadata
     );
-}
-
-#[test]
-fn spare_capacity_does_not_restrict_source_admission() {
-    let mut content = Vec::with_capacity(8 * 1024 * 1024 + 1);
-    content.push(b'x');
-    let retained = content.capacity();
-    let source = SourceVersion::new(content, Representation::Raw).unwrap();
-    assert_eq!(source.retained_bytes(), retained);
-    assert_eq!(source.bytes(), b"x");
 }

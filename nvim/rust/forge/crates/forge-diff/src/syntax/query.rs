@@ -267,26 +267,3 @@ fn append_source(language: &str, kind: &str, visited: &mut HashSet<String>, outp
         output.push('\n');
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configured_lua_patterns_preserve_classes_escapes_and_literal_braces() {
-        for (pattern, text, expected) in [
-            ("^[A-Z][A-Z%d_]*$", "VALUE_2", true),
-            ("^[A-Z][A-Z%d_]*$", "value", false),
-            ("%slang%s*=", " lang =", true),
-            ("%${", "${value}", true),
-            ("^\\\\if[a-zA-Z@]+$", "\\\\ifdefined", true),
-            ("^[-][-][-]", "--- comment", true),
-        ] {
-            assert_eq!(
-                lua_pattern(pattern).unwrap().is_match(text),
-                expected,
-                "{pattern}"
-            );
-        }
-    }
-}

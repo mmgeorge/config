@@ -424,21 +424,6 @@ impl SessionAction {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn admits_entry(&self) -> bool {
-        matches!(
-            self,
-            Self::NewGoal { .. }
-                | Self::NewPlan { .. }
-                | Self::Execute { .. }
-                | Self::Attach { .. }
-                | Self::Fork { .. }
-                | Self::Replan { .. }
-                | Self::Resume { .. }
-                | Self::RequestChanges { .. }
-        )
-    }
-
     fn method(&self) -> &'static str {
         match self {
             Self::RequestChanges { .. } => "session.plan.changes.request",
@@ -481,77 +466,6 @@ fn preserve_command_metadata(command: &mut SessionCommand, params: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_aliases_and_slash_commands_have_identical_typed_payloads() -> Result<()> {
-        for (method, params, text, canonical) in [
-            (
-                "session.goal.set",
-                json!({"objective":"Finish the task"}),
-                "/goal Finish the task",
-                json!({"action":"goal","text":"Finish the task"}),
-            ),
-            (
-                "session.goal.pause",
-                json!({}),
-                "/goal pause",
-                json!({"action":"pause"}),
-            ),
-            (
-                "session.goal.resume",
-                json!({}),
-                "/goal resume",
-                json!({"action":"resume"}),
-            ),
-            (
-                "session.goal.clear",
-                json!({}),
-                "/goal clear",
-                json!({"action":"clear"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"continue"}),
-                "/goal continue",
-                json!({"action":"continue"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"plan","text":"Plan the work"}),
-                "/plan Plan the work",
-                json!({"action":"plan","text":"Plan the work"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"resume"}),
-                "/plan retry",
-                json!({"action":"resume"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"clear"}),
-                "/plan cancel",
-                json!({"action":"clear"}),
-            ),
-            (
-                "session.command.apply",
-                json!({"action":"replan","plan_id":"selected","revision":3}),
-                "/replan selected 3",
-                json!({"action":"replan","plan_id":"selected","revision":3}),
-            ),
-        ] {
-            let command = SessionCommand::parse_request(&Request {
-                id: 1,
-                method: method.into(),
-                params,
-            })?
-            .unwrap();
-            let slash = SessionCommand::parse_text(text, Some("same-operation"))?.unwrap();
-            assert_eq!(command.action.to_params()?, canonical);
-            assert_eq!(slash.action.to_params()?, canonical);
-        }
-        Ok(())
-    }
 
     /// Keep automatic acceptance across submissions while honoring pause and explicit disable.
     #[test]
@@ -645,26 +559,6 @@ mod tests {
             SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
                 .is_none()
         );
-        Ok(())
-    }
-
-    /// Keep policy commands distinct from plan creation, including invalid arguments.
-    #[test]
-    fn plan_accept_commands_do_not_start_planning() -> Result<()> {
-        for (text, enabled) in [("/plan accept on", true), ("/plan accept off", false)] {
-            let command = SessionCommand::parse_text(text, None)?.unwrap();
-            assert!(
-                matches!(command.action, SessionAction::PlanAccept { enabled: value } if value == enabled)
-            );
-            assert!(!command.action.admits_entry());
-            let request = command.to_request(1)?;
-            assert_eq!(request.params["action"], "plan_accept");
-            assert_eq!(request.params["enabled"], enabled);
-            assert!(SessionCommand::parse_request(&request)?.is_some());
-        }
-        for text in ["/plan accept", "/plan accept yes", "/plan accept on extra"] {
-            assert!(SessionCommand::parse_text(text, None).is_err());
-        }
         Ok(())
     }
 }

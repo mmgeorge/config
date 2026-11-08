@@ -31,8 +31,6 @@ mod change_results_test;
 mod checkpoint_settlement;
 mod checks;
 pub(crate) use checkpoint_settlement::FinalCheckpointCommit;
-#[cfg(test)]
-mod background_settings_test;
 mod compaction;
 mod configuration;
 pub(crate) use compaction::{CompactionEvidenceError, CompactionProvenance, CompactionResult};
@@ -6567,20 +6565,6 @@ impl HarnessBroker {
         Ok(())
     }
 
-    #[cfg(test)]
-    async fn test_apply_provider_event(
-        &mut self,
-        runtime: &mut ExchangeRuntime,
-        interaction: &mut Exchange,
-        provider_event: HarnessEvent,
-        events: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        let applied = self.apply_provider_event(runtime, interaction, provider_event, events)?;
-        let delivery = self.prepare_provider_delivery(applied)?;
-        events.extend(delivery.deliver().await?);
-        Ok(())
-    }
-
     /// Transfer one active exchange runtime to a service-owned foreground transaction.
     pub(crate) fn begin_owned_foreground(
         &mut self,
@@ -8157,35 +8141,6 @@ impl HarnessBroker {
                 progress: serde_json::from_value(progress)?,
             }),
         ]))
-    }
-
-    /// Revalidate and return foreground state to the broker after the owned worker ends.
-    #[cfg(test)]
-    pub(crate) fn finish_owned_foreground(
-        &mut self,
-        transaction: &mut OwnedForegroundTransaction,
-    ) -> Result<Exchange> {
-        anyhow::ensure!(
-            transaction.scope.owner() == crate::provider::ThreadOwner::root(&self.session.id),
-            "foreground transaction crosses execution ownership"
-        );
-        anyhow::ensure!(
-            self.exchange_runtime.is_none(),
-            "another foreground runtime is already installed"
-        );
-        let runtime = transaction
-            .runtime
-            .as_ref()
-            .context("foreground transaction already committed")?;
-        anyhow::ensure!(
-            runtime.exchange_id == transaction.interaction.id,
-            "foreground runtime belongs to another exchange"
-        );
-        if let Some(permit) = &runtime.task_permit {
-            permit.validate(self.task_controller.current()?.as_ref())?;
-        }
-        self.exchange_runtime = transaction.runtime.take();
-        Ok(transaction.interaction.clone())
     }
 
     /// Prepare ordered effects while holding broker state; delivery may run after releasing it.

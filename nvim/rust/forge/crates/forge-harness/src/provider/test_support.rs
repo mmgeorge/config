@@ -1,7 +1,7 @@
 use crate::provider::ScopeOwner;
 mod collect;
 mod fixture;
-pub(crate) use collect::{ProviderTestExt, ProviderTestSession};
+pub(crate) use collect::ProviderTestSession;
 pub(crate) use fixture::{EventFixtureProvider, call_tool};
 
 use std::sync::Arc;
@@ -388,24 +388,3 @@ pub(crate) fn native_event(
 
 /// Create observed-child ownership evidence through the production registry in fixtures.
 pub(crate) use super::ownership::observed_agent_fixture;
-
-/// Consume the host-owned manifest that a successful binding open publishes before native events.
-pub(crate) async fn expect_negotiated_capabilities(
-    stream: &mut super::bridge::HostEventStream,
-) -> anyhow::Result<forge_provider_api::CapabilityManifest> {
-    let observed = stream
-        .recv()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("binding stream ended before negotiated capabilities"))?;
-    anyhow::ensure!(
-        observed.native.is_none(),
-        "negotiated capabilities are a host publication without a native sequence"
-    );
-    match observed.event {
-        super::session_execution::OwnerObservation::Event(super::HarnessEvent::Host {
-            scope: forge_provider_api::EventScope::Binding { .. },
-            event: super::HostEvent::CapabilitiesNegotiated { manifest, .. },
-        }) => Ok(manifest),
-        other => anyhow::bail!("expected negotiated capabilities, observed {other:?}"),
-    }
-}

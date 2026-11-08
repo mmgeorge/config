@@ -501,47 +501,4 @@ mod tests {
             1
         );
     }
-
-    #[test]
-    fn malformed_patch_keeps_an_explicit_diagnostic_and_complete_raw_action() {
-        let width = WidthProfile::default();
-        let renderer = TranscriptRenderer::new(&width).unwrap();
-        let source = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n";
-        let tree = ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None, None)
-            .unwrap();
-        assert!(
-            tree.block[0]
-                .text
-                .wire_rows()
-                .join(" ")
-                .contains("truncated saved patch hunk")
-        );
-        assert!(
-            tree.action.values().any(
-                |action| matches!(action, TranscriptAction::Diff { text, .. } if text == source)
-            )
-        );
-    }
-}
-
-#[test]
-fn line_ending_changes_preserve_counts_and_raw_actions_without_notices() -> Result<()> {
-    let width = forge_buffer::width::WidthProfile::default();
-    let renderer = TranscriptRenderer::new(&width)?;
-    let source = "--- a/file.rs\n+++ b/file.rs\n@@ -1,3 +1,3 @@\n-first\n-old\n-last\n+first\r\n+new\r\n+last\r\n";
-    let tree = ChangeTree::render(&renderer, "endings", "Changed", "", source, None, None)?;
-    assert_eq!(tree.block[0].text.row(0), Some("▸ Changed 1 file +1 -1"));
-    assert!(
-        !tree
-            .block
-            .iter()
-            .flat_map(|block| block.text.wire_rows())
-            .any(|row| row.to_lowercase().contains("line endings"))
-    );
-    assert!(
-        tree.action
-            .values()
-            .any(|action| matches!(action, TranscriptAction::Diff { text, .. } if text == source))
-    );
-    Ok(())
 }

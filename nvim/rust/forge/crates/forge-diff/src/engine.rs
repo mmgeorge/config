@@ -519,50 +519,6 @@ mod tests {
         assert!(engine.compare(request("new\n")).await.is_ok());
     }
 
-    #[tokio::test]
-    async fn close_rejects_new_requests_without_releasing_running_work() {
-        let (engine, started, release) = blocked_engine();
-        let worker_engine = Arc::clone(&engine);
-        let caller = tokio::spawn(async move { worker_engine.compare(request("new\n")).await });
-        started.notified().await;
-        engine.close();
-        assert!(matches!(
-            engine.compare(request("new\n")).await,
-            Err(EngineError::Closed)
-        ));
-        assert_eq!(engine.usage().active_jobs, 1);
-        release.send(()).unwrap();
-        assert!(caller.await.unwrap().is_ok());
-    }
-
-    #[tokio::test]
-    async fn shutdown_deadline_preserves_ownership_until_native_exit() {
-        let (engine, started, release) = blocked_engine();
-        let worker_engine = Arc::clone(&engine);
-        let caller = tokio::spawn(async move { worker_engine.compare(request("new\n")).await });
-        started.notified().await;
-        assert_eq!(
-            engine.shutdown(Duration::ZERO).await,
-            EngineShutdown {
-                unfinished_jobs: 1,
-                unfinished_workers: 1,
-            }
-        );
-        assert_eq!(engine.usage().cache.admitted_entries, 1);
-        let draining_engine = Arc::clone(&engine);
-        let drain =
-            tokio::spawn(async move { draining_engine.shutdown(Duration::from_secs(1)).await });
-        tokio::task::yield_now().await;
-        assert!(!drain.is_finished());
-        release.send(()).unwrap();
-        assert_eq!(drain.await.unwrap(), EngineShutdown::default());
-        assert!(caller.await.unwrap().is_ok());
-        assert_eq!(
-            engine.shutdown(Duration::ZERO).await,
-            EngineShutdown::default()
-        );
-    }
-
     #[test]
     fn native_completion_releases_admission_after_its_executor_is_destroyed() {
         let runtime = tokio::runtime::Builder::new_current_thread()

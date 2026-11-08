@@ -1,44 +1,46 @@
--- Unit tests for `forge.buffer_view` (buffer_view.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "buffer_view", run = function()
-vim.loader.enable(false)
-local buffer = require("forge.buffer")
-local session
-local original_window = vim.api.nvim_get_current_win()
-local original_buffer = vim.api.nvim_get_current_buf()
-local second_window
+-- Unit tests for `forge.buffer_view` (buffer_view.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local eq = MiniTest.expect.equality
 
-local function metadata() return { target = {}, decoration = {}, editable_region = {}, fold = {} } end
-local function block(id, text) return { id = id, text = { text }, metadata = metadata() } end
-local function cursor_at(id, column, window)
-  local _, row = session.sequence:position(id)
-  vim.api.nvim_win_set_cursor(window or original_window, { row + 1, column or 0 })
-end
-local function assert_cursor(id, column, window)
-  local cursor = vim.api.nvim_win_get_cursor(window or original_window)
-  assert(session.sequence:locate(cursor[1] - 1).id == id, "cursor changed declaration identity")
-  assert(cursor[2] == column, "cursor changed byte column")
-end
-local function patch(blocks, text_edit)
-  local inserted, text, changed, retained, retired = {}, {}, {}, {}, {}
-  for _, value in ipairs(blocks) do
-    inserted[#inserted + 1], retained[value.id] = value.id, true
-    vim.list_extend(text, value.text)
-    changed[#changed + 1] = { block = value.id, row_count = #value.text, metadata = value.metadata }
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["buffer_view"] = function()
+  local buffer = require("forge.buffer")
+  local session
+  MiniTest.finally(function() if session then pcall(buffer.close, session) end end)
+  local original_window = vim.api.nvim_get_current_win()
+  local second_window
+
+  local function metadata() return { target = {}, decoration = {}, editable_region = {}, fold = {} } end
+  local function block(id, text) return { id = id, text = { text }, metadata = metadata() } end
+  local function cursor_at(id, column, window)
+    local _, row = session.sequence:position(id)
+    vim.api.nvim_win_set_cursor(window or original_window, { row + 1, column or 0 })
   end
-  for id in pairs(session.block) do if not retained[id] then retired[#retired + 1] = id end end
-  local result = buffer.apply_patch(session, {
-    document = session.document, base = session.revision, next = session.revision + 1,
-    base_rows = session.row_count, next_rows = #text, base_blocks = session.sequence:count(), next_blocks = #blocks,
-    text_edit = text_edit or { { start_row = 0, removed_rows = session.row_count, text = text } },
-    block_edit = { { start_block = 0, removed_blocks = session.sequence:count(), inserted = inserted } },
-    metadata_edit = changed, removed_block = retired,
-  })
-  assert(result.kind == "Applied", result.diagnostic)
-end
+  local function assert_cursor(id, column, window)
+    local cursor = vim.api.nvim_win_get_cursor(window or original_window)
+    assert(session.sequence:locate(cursor[1] - 1).id == id, "cursor changed declaration identity")
+    assert(cursor[2] == column, "cursor changed byte column")
+  end
+  local function patch(blocks, text_edit)
+    local inserted, text, changed, retained, retired = {}, {}, {}, {}, {}
+    for _, value in ipairs(blocks) do
+      inserted[#inserted + 1], retained[value.id] = value.id, true
+      vim.list_extend(text, value.text)
+      changed[#changed + 1] = { block = value.id, row_count = #value.text, metadata = value.metadata }
+    end
+    for id in pairs(session.block) do if not retained[id] then retired[#retired + 1] = id end end
+    local result = buffer.apply_patch(session, {
+      document = session.document, base = session.revision, next = session.revision + 1,
+      base_rows = session.row_count, next_rows = #text, base_blocks = session.sequence:count(), next_blocks = #blocks,
+      text_edit = text_edit or { { start_row = 0, removed_rows = session.row_count, text = text } },
+      block_edit = { { start_block = 0, removed_blocks = session.sequence:count(), inserted = inserted } },
+      metadata_edit = changed, removed_block = retired,
+    })
+    assert(result.kind == "Applied", result.diagnostic)
+  end
 
-local success, failure = xpcall(function()
   session = buffer.open("cursor", { preserve_view = true })
   local full, public = {}, {}
   for index = 1, 90 do
@@ -131,7 +133,7 @@ local success, failure = xpcall(function()
     local anchor = vim.fn.getpos("v")
     assert(vim.deep_equal({ anchor[2], anchor[3] - 1 }, first),
       "selection anchor moved: " .. vim.inspect(anchor))
-    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), last), "selection cursor moved")
+    eq(vim.api.nvim_win_get_cursor(0), last, { fail_reason = "selection cursor moved" })
   end
   for _, mode in ipairs({ "v", "V", block_mode, "s", "S", block_select }) do
     for _, reverse in ipairs({ false, true }) do
@@ -186,8 +188,8 @@ local success, failure = xpcall(function()
   vim.fn.setpos(".", { 0, 2, 1, 5 })
   local anchor_before, cursor_before = vim.fn.getpos("v"), vim.fn.getpos(".")
   patch({ tabs })
-  assert(vim.deep_equal(vim.fn.getpos("v"), anchor_before), "block anchor virtual column changed")
-  assert(vim.deep_equal(vim.fn.getpos("."), cursor_before), "block cursor virtual column changed")
+  eq(vim.fn.getpos("v"), anchor_before, { fail_reason = "block anchor virtual column changed" })
+  eq(vim.fn.getpos("."), cursor_before, { fail_reason = "block cursor virtual column changed" })
   vim.cmd.normal({ args = { escape }, bang = true })
   vim.wo.virtualedit = virtualedit
   patch({ status_rows() })
@@ -202,22 +204,7 @@ local success, failure = xpcall(function()
   patch({ status_rows() })
   assert_selection("v", { 1, 0 }, { 1, 0 })
   vim.cmd.normal({ args = { escape }, bang = true })
-  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(original_window), { 1, 0 }))
-end, debug.traceback)
-
-if second_window and vim.api.nvim_win_is_valid(second_window) then vim.api.nvim_win_close(second_window, true) end
-if vim.api.nvim_win_is_valid(original_window) then
-  vim.api.nvim_win_set_buf(original_window, original_buffer)
+  eq(vim.api.nvim_win_get_cursor(original_window), { 1, 0 })
 end
-if session then buffer.close(session) end
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("buffer_view: passed")
-vim.cmd("qa!")
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

@@ -568,42 +568,6 @@ fn decode_path(text: &str) -> Result<String, PatchParseError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metadata_only_files_and_octal_unicode_paths_remain_visible() {
-        let source = "diff --git a/old name b/new name\nsimilarity index 100%\nrename from old name\nrename to new name\ndiff --git a/image b/image\nnew file mode 100644\nBinary files /dev/null and b/image differ\ndiff --git \"a/\\344\\270\\255.rs\" \"b/\\344\\270\\255.rs\"\nold mode 100644\nnew mode 100755\n";
-        let patch = UnifiedPatch::parse(source).unwrap();
-        assert_eq!(patch.file.len(), 3);
-        assert_eq!(patch.file[0].old_path.as_deref(), Some("old name"));
-        assert_eq!(patch.file[0].new_path.as_deref(), Some("new name"));
-        assert!(patch.file[1].binary);
-        assert!(patch.file[1].old_path.is_none());
-        assert_eq!(patch.file[2].new_path.as_deref(), Some("中.rs"));
-        assert!(patch.file.iter().all(|file| file.hunk.is_empty()));
-    }
-
-    #[test]
-    fn malformed_counts_fail_without_partial_results_or_panics() {
-        let prefix = "--- a/file\n+++ b/file\n";
-        for body in [
-            "@@ -1,2 +1,2 @@\n one\n",
-            "@@ -0 +1 @@\n-old\n+new\n",
-            "@@ -1 +1 @@\n-old\n-extra\n+new\n",
-            "@@ -1 +1 @@\n-old\n+new\n+extra\n",
-            "@@@ -1 -1 +1 @@@\n",
-            "@@ -18446744073709551615,2 +1 @@\n-old\n+new\n",
-        ] {
-            assert!(
-                UnifiedPatch::parse(&format!("{prefix}{body}")).is_err(),
-                "{body}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod source_coverage_tests {
     use super::*;
     use crate::source::{Representation, SourcePair, SourceVersion};

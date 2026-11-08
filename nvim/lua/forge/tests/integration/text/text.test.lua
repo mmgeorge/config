@@ -1,16 +1,20 @@
--- Integration tests for the `text` area. Each scenario row runs in its own headless Neovim:
--- `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`. Tests that launch the Forge host
--- assume `rust-build` has produced a current executable.
-local scenarios = {
-  { name = "harper_dictionary", run = function()
-local executable=vim.fn.exepath('harper-ls')
-if executable=='' then
-  executable=vim.fs.joinpath(vim.fn.stdpath('data'),'mason','packages','harper-ls',
-    'harper-ls'..(vim.fn.has('win32')==1 and '.exe' or ''))
-end
-assert(vim.fn.executable(executable)==1,'Harper must be installed for dictionary integration')
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').native()
-local ok,failure=xpcall(function()
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local text_fixture = dofile("nvim/lua/forge/tests/support/text_fixture.lua")
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["harper_dictionary"] = function()
+  local executable=vim.fn.exepath('harper-ls')
+  if executable=='' then
+    executable=vim.fs.joinpath(vim.fn.stdpath('data'),'mason','packages','harper-ls',
+      'harper-ls'..(vim.fn.has('win32')==1 and '.exe' or ''))
+  end
+  assert(vim.fn.executable(executable)==1,'Harper must be installed for dictionary integration')
+  local fixture=text_fixture.native()
+  MiniTest.finally(fixture.close)
   fixture.exec([[
     local executable=...
     local previous=vim.fn.stdpath
@@ -34,13 +38,13 @@ local ok,failure=xpcall(function()
       return false
     end
   ]],{executable})
-  assert(vim.wait(10000,function()
+  wait_until(function()
     return fixture.exec('return spelling_flagged()')
-  end,10),'Harper did not flag the unknown spelling: '..vim.inspect(fixture.exec([[
+  end,'Harper did not flag the unknown spelling',{timeout_ms=4000,context=function() return vim.inspect(fixture.exec([[
     return {diagnostics=vim.diagnostic.get(0),errors=text_errors,
       clients=vim.tbl_map(function(client) return {name=client.name,initialized=client.initialized} end,
         vim.lsp.get_clients({bufnr=0}))}
-  ]])))
+  ]])) end})
   fixture.exec([[
     for _,diagnostic in ipairs(vim.diagnostic.get(0)) do
       assert(diagnostic.code~='OkToOkay','OkToOkay is still enabled')
@@ -53,7 +57,8 @@ local ok,failure=xpcall(function()
       context={diagnostics={}},
     },function(error,actions) shared_actions=actions;shared_action_error=error end,0)
   ]])
-  assert(vim.wait(3000,function() return fixture.exec('return shared_actions~=nil') end,10))
+  wait_until(function() return fixture.exec('return shared_actions~=nil') end,
+    'Harper did not answer the dictionary code action request',{timeout_ms=3000})
   fixture.exec([[
     assert(not shared_action_error,vim.inspect(shared_action_error))
     local global
@@ -71,17 +76,17 @@ local ok,failure=xpcall(function()
     previous_dictionary=client.settings['harper-ls'].userDictPath
     client.commands[global.command.command](global.command,{client_id=client.id,bufnr=vim.api.nvim_get_current_buf()})
   ]])
-  assert(vim.wait(5000,function()
+  wait_until(function()
     return fixture.exec([[
       local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
       return client and client.settings['harper-ls'].userDictPath~=previous_dictionary
         and not spelling_flagged()
     ]])
-  end,10),'Shared dictionary did not refresh Harper against unsaved text: '..vim.inspect(fixture.exec([[
+  end,'Shared dictionary did not refresh Harper against unsaved text',{timeout_ms=4000,context=function() return vim.inspect(fixture.exec([[
     local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
     return {previous=previous_dictionary,current=client and client.settings['harper-ls'].userDictPath,
       diagnostics=vim.diagnostic.get(0),errors=text_errors}
-  ]])))
+  ]])) end})
   fixture.exec([[
     local saved=vim.fn.readfile(shared_dictionary)
     assert(saved[1]=='# Version-controlled vocabulary')
@@ -98,8 +103,8 @@ local ok,failure=xpcall(function()
     vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use recieve spelling.'})
     vim.api.nvim_win_set_cursor(0,{1,0})
   ]])
-  assert(vim.wait(5000,function() return fixture.exec('return spelling_flagged()') end,10),
-    'Removing an accepted word did not refresh Harper')
+  wait_until(function() return fixture.exec('return spelling_flagged()') end,
+    'Removing an accepted word did not refresh Harper',{timeout_ms=4000})
   fixture.exec([[
     vim.api.nvim_buf_set_lines(0,0,-1,false,{''})
     vim.api.nvim_win_set_cursor(0,{1,0})
@@ -109,26 +114,25 @@ local ok,failure=xpcall(function()
   fixture.exec([[for _,client in ipairs(vim.lsp.get_clients({name='harper_ls'})) do client:stop() end]])
   local errors=fixture.exec('return text_errors')
   assert(#errors==0,vim.inspect(errors))
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('Harper shared dictionary: one global action, preserved comments, live grammar and autocorrect reload passed')
-vim.cmd('qa!')
-  end },
-  { name = "harper_rules", run = function()
-local executable = vim.fn.exepath("harper-ls")
-if executable == "" then
-  executable = vim.fs.joinpath(vim.fn.stdpath("data"), "mason", "packages", "harper-ls",
-    "harper-ls" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
 end
-assert(vim.fn.executable(executable) == 1, "Harper must be installed for rule integration")
-local root = vim.fn.tempname()
-vim.fn.mkdir(root .. "/first", "p")
-vim.fn.mkdir(root .. "/second", "p")
-local path = root .. "/rules.json"
-vim.fn.writefile({ "{}" }, path)
-local fixture = dofile("nvim/lua/forge/tests/support/text_fixture.lua").open()
-local success, failure = xpcall(function()
+
+T["harper_rules"] = function()
+  local executable = vim.fn.exepath("harper-ls")
+  if executable == "" then
+    executable = vim.fs.joinpath(vim.fn.stdpath("data"), "mason", "packages", "harper-ls",
+      "harper-ls" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
+  end
+  assert(vim.fn.executable(executable) == 1, "Harper must be installed for rule integration")
+  local root = temp.directory("harper-rules")
+  vim.fn.mkdir(root .. "/first", "p")
+  vim.fn.mkdir(root .. "/second", "p")
+  local path = root .. "/rules.json"
+  vim.fn.writefile({ "{}" }, path)
+  local fixture = text_fixture.open()
+  MiniTest.finally(function()
+    pcall(fixture.exec, [[for _, client in ipairs(vim.lsp.get_clients({name="harper_ls"})) do client:stop(true) end]])
+    pcall(fixture.close)
+  end)
   fixture.exec([[
     local executable, root, path = ...
     local previous = vim.fn.stdpath
@@ -147,7 +151,7 @@ local success, failure = xpcall(function()
       rule_buffers[#rule_buffers + 1] = buffer
     end
   ]], { executable, root, path })
-  assert(vim.wait(10000, function()
+  wait_until(function()
     return fixture.exec([[
       for _, buffer in ipairs(rule_buffers) do
         local found = false
@@ -158,7 +162,7 @@ local success, failure = xpcall(function()
       end
       return true
     ]])
-  end, 10), "Harper did not publish rule identifiers in both projects")
+  end, "Harper did not publish rule identifiers in both projects", { timeout_ms = 4000 })
   fixture.exec([[
     local buffer = rule_buffers[1]
     local client = assert(vim.lsp.get_clients({ bufnr = buffer, name = "harper_ls" })[1])
@@ -170,7 +174,8 @@ local success, failure = xpcall(function()
       context = { diagnostics = {} },
     }, function(error, actions) rule_error = error rule_actions = actions end, buffer)
   ]])
-  assert(vim.wait(3000, function() return fixture.exec("return rule_actions ~= nil") end, 10))
+  wait_until(function() return fixture.exec("return rule_actions ~= nil") end,
+    "Harper did not answer the rule code action request", { timeout_ms = 3000 })
   fixture.exec([[
     assert(not rule_error, vim.inspect(rule_error))
     local selected
@@ -181,7 +186,7 @@ local success, failure = xpcall(function()
     local client = assert(vim.lsp.get_clients({ bufnr = rule_buffers[1], name = "harper_ls" })[1])
     client.commands[selected.command.command](selected.command)
   ]])
-  assert(vim.wait(5000, function()
+  wait_until(function()
     return fixture.exec([[
       for _, buffer in ipairs(rule_buffers) do
         local client = vim.lsp.get_clients({ bufnr = buffer, name = "harper_ls" })[1]
@@ -195,16 +200,17 @@ local success, failure = xpcall(function()
       end
       return true
     ]])
-  end, 10), "Disabling a rule did not refresh both clients while preserving other rules: " .. vim.inspect(fixture.exec([[
-    local result = { errors = text_errors, buffers = {} }
-    for _, buffer in ipairs(rule_buffers) do
-      local client = vim.lsp.get_clients({ bufnr = buffer, name = "harper_ls" })[1]
-      result.buffers[#result.buffers + 1] = {
-        diagnostics = vim.diagnostic.get(buffer), linters = client and client.settings["harper-ls"].linters,
-      }
-    end
-    return result
-  ]])))
+  end, "Disabling a rule did not refresh both clients while preserving other rules", { timeout_ms = 4000,
+    context = function() return vim.inspect(fixture.exec([[
+      local result = { errors = text_errors, buffers = {} }
+      for _, buffer in ipairs(rule_buffers) do
+        local client = vim.lsp.get_clients({ bufnr = buffer, name = "harper_ls" })[1]
+        result.buffers[#result.buffers + 1] = {
+          diagnostics = vim.diagnostic.get(buffer), linters = client and client.settings["harper-ls"].linters,
+        }
+      end
+      return result
+    ]])) end })
   assert(vim.json.decode(table.concat(vim.fn.readfile(path), "\n")).RepeatedWords == false)
   fixture.exec([[
     local buffer = rule_buffers[1]
@@ -214,18 +220,18 @@ local success, failure = xpcall(function()
     client:stop()
     harper.attach(buffer, { kind = "markdown", root = ... })
   ]], { root .. "/first" })
-  assert(vim.wait(5000, function()
+  wait_until(function()
     return fixture.exec([[
       local client = vim.lsp.get_clients({ bufnr = rule_buffers[1], name = "harper_ls" })[1]
       return client and client.initialized and client.settings["harper-ls"].linters.RepeatedWords == false
     ]])
-  end, 10), "A new Harper client did not load persisted rules")
+  end, "A new Harper client did not load persisted rules", { timeout_ms = 4000 })
   fixture.exec([[
     local path = ...
     vim.fn.writefile({ "{}" }, path)
     vim.api.nvim_exec_autocmds("BufWritePost", { pattern = path })
   ]], { path })
-  assert(vim.wait(5000, function()
+  wait_until(function()
     return fixture.exec([[
       for _, buffer in ipairs(rule_buffers) do
         local found = false
@@ -236,47 +242,41 @@ local success, failure = xpcall(function()
       end
       return true
     ]])
-  end, 10), "Removing a disabled rule did not restore diagnostics")
+  end, "Removing a disabled rule did not restore diagnostics", { timeout_ms = 4000 })
   assert(#fixture.exec("return text_errors") == 0, vim.inspect(fixture.exec("return text_errors")))
-end, debug.traceback)
-fixture.exec([[for _, client in ipairs(vim.lsp.get_clients({name="harper_ls"})) do client:stop(true) end]])
-fixture.close()
-vim.fn.delete(root, "rf")
-assert(success, failure)
-print("Harper rule integration: metadata action, two projects, persistence, reconnect, and re-enable passed")
-vim.cmd("qa!")
-  end },
-  { name = "harper_scopes", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').open()
-local function prepare(lines,filetype,native)
-  fixture.exec([[
-    local lines,filetype,native=...
-    local buffer=vim.api.nvim_create_buf(true,false)
-    vim.api.nvim_set_current_buf(buffer)
-    vim.api.nvim_buf_set_name(buffer,(filetype=='ForgeHarnessInput' or native)
-      and 'ForgeFixture://'..buffer or vim.fn.tempname()..'.'..filetype)
-    vim.api.nvim_buf_set_lines(buffer,0,-1,false,lines)
-    if filetype=='ForgeHarnessInput' then vim.bo.buftype='nofile' end
-    vim.bo.filetype=filetype
-    if filetype=='ForgeHarnessInput' then vim.api.nvim_buf_set_name(buffer,'HarnessInput://renamed-'..buffer) end
-    if filetype=='lua' or filetype=='unknown-code' then vim.treesitter.start(buffer,'lua') end
-    if native then
-      local draft=require('forge.editable').new('harper-draft')
-      require('forge.editable').register(draft,'body',0)
-      require('forge.editable').attach(draft,buffer,{body={start={row=1,column=0},finish={row=1,column=#lines[2]}}},{notice=error})
-    end
-  ]],{lines,filetype,native or false})
 end
-local function expect_row(row)
-  assert(vim.wait(5000,function()
-    return fixture.exec([[for _,diagnostic in ipairs(vim.diagnostic.get(0))do
-      if diagnostic.code=='RepeatedWords' and diagnostic.lnum==... then return true end
-    end return false]],{row})
-  end,10),'Harper did not report the eligible row '..row)
-  local diagnostics=fixture.exec('return vim.diagnostic.get(0)')
-  for _,diagnostic in ipairs(diagnostics) do assert(diagnostic.lnum==row,vim.inspect(diagnostics)) end
-end
-local ok,failure=xpcall(function()
+
+T["harper_scopes"] = function()
+  local fixture=text_fixture.open()
+  MiniTest.finally(fixture.close)
+  local function prepare(lines,filetype,native)
+    fixture.exec([[
+      local lines,filetype,native=...
+      local buffer=vim.api.nvim_create_buf(true,false)
+      vim.api.nvim_set_current_buf(buffer)
+      vim.api.nvim_buf_set_name(buffer,(filetype=='ForgeHarnessInput' or native)
+        and 'ForgeFixture://'..buffer or vim.fn.tempname()..'.'..filetype)
+      vim.api.nvim_buf_set_lines(buffer,0,-1,false,lines)
+      if filetype=='ForgeHarnessInput' then vim.bo.buftype='nofile' end
+      vim.bo.filetype=filetype
+      if filetype=='ForgeHarnessInput' then vim.api.nvim_buf_set_name(buffer,'HarnessInput://renamed-'..buffer) end
+      if filetype=='lua' or filetype=='unknown-code' then vim.treesitter.start(buffer,'lua') end
+      if native then
+        local draft=require('forge.editable').new('harper-draft')
+        require('forge.editable').register(draft,'body',0)
+        require('forge.editable').attach(draft,buffer,{body={start={row=1,column=0},finish={row=1,column=#lines[2]}}},{notice=error})
+      end
+    ]],{lines,filetype,native or false})
+  end
+  local function expect_row(row)
+    wait_until(function()
+      return fixture.exec([[for _,diagnostic in ipairs(vim.diagnostic.get(0))do
+        if diagnostic.code=='RepeatedWords' and diagnostic.lnum==... then return true end
+      end return false]],{row})
+    end,'Harper did not report the eligible row '..row,{timeout_ms=4000})
+    local diagnostics=fixture.exec('return vim.diagnostic.get(0)')
+    for _,diagnostic in ipairs(diagnostics) do assert(diagnostic.lnum==row,vim.inspect(diagnostics)) end
+  end
   fixture.exec([[
     vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath('data'),'site'))
     require('forge').setup({text_correction={enabled=false},harper={enabled=true}})
@@ -297,7 +297,8 @@ local ok,failure=xpcall(function()
       range={start={line=0,character=0},['end']={line=0,character=23}},context={diagnostics={}}},
       function(error,result)harper_readonly_actions=result end,0)
   ]])
-  assert(vim.wait(1000,function()return fixture.exec('return harper_readonly_actions~=nil')end,5))
+  wait_until(function()return fixture.exec('return harper_readonly_actions~=nil')end,
+    'Harper did not answer the read-only code action request')
   assert(#fixture.exec('return harper_readonly_actions')==0,'read-only content exposed a code action')
   fixture.exec([[
     local client=assert(vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1])
@@ -305,7 +306,8 @@ local ok,failure=xpcall(function()
       range={start={line=1,character=8},['end']={line=1,character=15}},context={diagnostics={}}},
       function(error,result)harper_stale_actions=result end,0)
   ]])
-  assert(vim.wait(3000,function()return fixture.exec('return harper_stale_actions~=nil')end,5))
+  wait_until(function()return fixture.exec('return harper_stale_actions~=nil')end,
+    'Harper did not answer the stale code action request',{timeout_ms=3000})
   fixture.exec([[
     assert(#harper_stale_actions>0)
     local client=assert(vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1])
@@ -320,20 +322,16 @@ local ok,failure=xpcall(function()
   prepare(long,'markdown')
   expect_row(9000)
   fixture.exec([[for _,client in ipairs(vim.lsp.get_clients({name='harper_ls'}))do client:stop()end]])
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('Harper scopes: comments, UTF-16, prompts, commits, native guards, stale fixes, and long documents passed')
-vim.cmd('qa!')
-  end },
-  { name = "async_lifecycle", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').open()
-local ok,failure=xpcall(function()
+end
+
+T["async_lifecycle"] = function()
+  local fixture=text_fixture.open()
+  MiniTest.finally(fixture.close)
   fixture.exec('text_hold=true')
   fixture.type('iPlease recieve ')
-  assert(vim.wait(1000,function()return fixture.exec('return #text_requests')==1 end,10))
+  wait_until(function()return fixture.exec('return #text_requests')==1 end,'correction request 1 was not sent')
   fixture.type('teh ')
-  assert(vim.wait(1000,function()return fixture.exec('return #text_requests')==2 end,10))
+  wait_until(function()return fixture.exec('return #text_requests')==2 end,'correction request 2 was not sent')
   fixture.exec([[
     local request=text_requests[2]
     request.callback({decision='replace',occurrence=request.occurrence.id,original='teh',replacement='the',profile='fixture',profile_revision='revision'})
@@ -342,7 +340,7 @@ local ok,failure=xpcall(function()
   ]])
   fixture.wait('Please recieve the ')
   fixture.type('recieve ')
-  assert(vim.wait(1000,function()return fixture.exec('return #text_requests')==3 end,10))
+  wait_until(function()return fixture.exec('return #text_requests')==3 end,'correction request 3 was not sent')
   fixture.exec([[
     local client=require('forge.client')
     local generation=client.host_get_generation()+1
@@ -352,7 +350,7 @@ local ok,failure=xpcall(function()
   ]])
   fixture.wait('Please recieve the recieve ')
   fixture.type('teh ')
-  assert(vim.wait(1000,function()return fixture.exec('return #text_requests')==4 end,10))
+  wait_until(function()return fixture.exec('return #text_requests')==4 end,'correction request 4 was not sent')
   fixture.exec([[
     local request=text_requests[4]
     request.callback({decision='replace',occurrence=request.occurrence.id,original='teh',replacement='the',profile='fixture',profile_revision='obsolete'})
@@ -361,22 +359,18 @@ local ok,failure=xpcall(function()
   fixture.type('<BS>')
   fixture.wait('Please recieve the recieve teh')
   fixture.type(' ')
-  assert(vim.wait(1000,function()return fixture.exec('return #text_requests')==5 end,10))
+  wait_until(function()return fixture.exec('return #text_requests')==5 end,'correction request 5 was not sent')
   fixture.exec([[
     local request=text_requests[5]
     request.callback({decision='replace',occurrence=request.occurrence.id,original='teh',replacement='the',profile='other-project',profile_revision='revision'})
   ]])
   fixture.wait('Please recieve the recieve teh ')
   assert(fixture.exec('return #text_errors')==0)
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('text asynchronous lifecycle: reverse completion order, host replacement, and profile mismatch passed')
-vim.cmd('qa!')
-  end },
-  { name = "contractions", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').native()
-local ok,failure=xpcall(function()
+end
+
+T["contractions"] = function()
+  local fixture=text_fixture.native()
+  MiniTest.finally(fixture.close)
   assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'Neovim')]]),
     'Neovim was not loaded from the shared vocabulary')
   fixture.exec([[
@@ -393,7 +387,6 @@ local ok,failure=xpcall(function()
       end)
     end
   ]])
-  local observations={}
   for _,case in ipairs({
     {prefix='I can',suffix="'t ",expected="I can't "},
     {prefix='I can',suffix='’t ',expected='I can’t '},
@@ -429,14 +422,9 @@ local ok,failure=xpcall(function()
     for character in case.suffix:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
       local before=fixture.text()
       fixture.type(character)
-      assert(vim.wait(2500,function() return fixture.text()~=before end,5),'typed character did not reach the buffer')
+      wait_until(function() return fixture.text()~=before end,'typed character did not reach the buffer',{timeout_ms=2500})
       stages[#stages+1]={typed=character,text=fixture.text()}
     end
-    observations[#observations+1]={
-      input=case.prefix..case.suffix,
-      stages=stages,
-      requests=fixture.exec('return contraction_requests'),
-    }
     fixture.wait(case.expected)
     local requests=fixture.exec('return contraction_requests')
     assert(#requests==1,vim.inspect({case=case,requests=requests}))
@@ -453,17 +441,13 @@ local ok,failure=xpcall(function()
   fixture.wait('I dont')
   fixture.type(' ')
   fixture.wait('I dont ')
-  print(vim.inspect(observations))
   local errors=fixture.exec('return text_errors')
   assert(#errors==0,vim.inspect(errors))
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-vim.cmd('qa!')
-  end },
-  { name = "eligibility", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').open()
-local ok,failure=xpcall(function()
+end
+
+T["eligibility"] = function()
+  local fixture=text_fixture.open()
+  MiniTest.finally(fixture.close)
   fixture.exec([[
     vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath('data'),'site'))
     vim.api.nvim_buf_set_lines(0,0,-1,false,{'local name = "recieve"','-- Please recieve'})
@@ -505,15 +489,11 @@ local ok,failure=xpcall(function()
   fixture.type('A ')
   fixture.wait('Read-only recieve \nPlease receive ')
   assert(fixture.exec('return #text_requests')==requests,'read-only native text was admitted')
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('text eligibility: real Lua comments, code exclusion, and explicit native regions passed')
-vim.cmd('qa!')
-  end },
-  { name = "text", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').native({cold_text='Cold text '})
-local ok,failure=xpcall(function()
+end
+
+T["text"] = function()
+  local fixture=text_fixture.native({cold_text='Cold text '})
+  MiniTest.finally(fixture.close)
   fixture.type('<Esc>')
   fixture.exec([[vim.api.nvim_buf_set_lines(0,0,-1,false,{''});vim.api.nvim_win_set_cursor(0,{1,0})]])
   assert(fixture.exec('return require("forge.client")._client.harness_ready')~=true,'text initialized Harness')
@@ -529,7 +509,7 @@ local ok,failure=xpcall(function()
       occurrence='wire-example',context='Please recieve',target={start=7,['end']=14},protected={}}}
     client.request(request,function(result,error) text_wire={request=request,result=result,error=error} end)
   ]])
-  assert(vim.wait(2000,function()return fixture.exec('return text_wire~=nil')end,10))
+  wait_until(function()return fixture.exec('return text_wire~=nil')end,'text.correct did not answer the replacement request',{timeout_ms=2000})
   local wire=fixture.exec('return text_wire')
   assert(wire.result and wire.result.replacement=='receive',vim.inspect(wire))
   fixture.exec([[
@@ -537,7 +517,7 @@ local ok,failure=xpcall(function()
       occurrence='unchanged-example',context='Please receive',target={start=7,['end']=14},protected={}}}
     require('forge.client').request(request,function(result,error)text_unchanged_wire={request=request,result=result,error=error} end)
   ]])
-  assert(vim.wait(2000,function()return fixture.exec('return text_unchanged_wire~=nil')end,10))
+  wait_until(function()return fixture.exec('return text_unchanged_wire~=nil')end,'text.correct did not answer the unchanged request',{timeout_ms=2000})
   local unchanged=fixture.exec('return text_unchanged_wire')
   assert(unchanged.result.decision=='unchanged',vim.inspect(unchanged))
   vim.fn.writefile({vim.json.encode({initialize=fixture.exec('return text_initialize_wire'),replace=wire,unchanged=unchanged})},
@@ -548,25 +528,21 @@ local ok,failure=xpcall(function()
   ]])
   assert(type(fixture.exec('return text_policy_error'))=='string','text method accepted session context')
   fixture.exec([[require('forge.client').host_stop(nil,function()text_stopped=true end)]])
-  assert(vim.wait(5000,function()return fixture.exec('return text_stopped==true')end,10),'text host did not stop')
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('text host: local model, typed correction, rejection, session independence, wire contract, and shutdown passed')
-vim.cmd('qa!')
-  end },
-  { name = "question_slash", run = function()
-local fixture = dofile("nvim/lua/forge/tests/support/text_fixture.lua").open()
-
----@param text string
-local function begin(text)
-  fixture.type("<Esc>")
-  fixture.exec([[vim.api.nvim_buf_set_lines(0,0,-1,false,{''});vim.api.nvim_win_set_cursor(0,{1,0})]])
-  fixture.type("i" .. text)
-  fixture.wait(text)
+  wait_until(function()return fixture.exec('return text_stopped==true')end,'text host did not stop',{timeout_ms=4000})
 end
 
-local ok, failure = xpcall(function()
+T["question_slash"] = function()
+  local fixture = text_fixture.open()
+  MiniTest.finally(fixture.close)
+
+  ---@param text string
+  local function begin(text)
+    fixture.type("<Esc>")
+    fixture.exec([[vim.api.nvim_buf_set_lines(0,0,-1,false,{''});vim.api.nvim_win_set_cursor(0,{1,0})]])
+    fixture.type("i" .. text)
+    fixture.wait(text)
+  end
+
   for _, ending in ipairs({ { " ", " " }, { "<CR>", "\n" } }) do
     begin("foo/")
     fixture.type(ending[1])
@@ -625,50 +601,42 @@ local ok, failure = xpcall(function()
       original='recieve',replacement='receive',profile='fixture',profile_revision='revision'})]])
   fixture.wait("Please recieve/")
   assert(fixture.exec("return #text_errors") == 0)
-end, debug.traceback)
-fixture.close()
-assert(ok, failure)
-print("text_question_slash: delayed punctuation, rejection, spelling, and protected tokens passed")
-vim.cmd("qa!")
-  end },
-  { name = "stale_reply", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').open()
-local ok,failure=xpcall(function()
+end
+
+T["stale_reply"] = function()
+  local fixture=text_fixture.open()
+  MiniTest.finally(fixture.close)
   fixture.exec('text_hold=true')
   fixture.type('iPlease recieve ')
-  assert(vim.wait(1500,function() return fixture.exec('return #text_requests')==1 end,10))
+  wait_until(function() return fixture.exec('return #text_requests')==1 end,'correction request 1 was not sent',{timeout_ms=1500})
   fixture.type('more')
   fixture.wait('Please recieve more')
   fixture.exec([[local request=text_requests[1]; request.callback({decision='replace',occurrence=request.occurrence.id,
     original='recieve',replacement='receive',profile='fixture',profile_revision='revision'})]])
   fixture.wait('Please recieve more')
   fixture.type(' recieve ')
-  assert(vim.wait(1500,function() return fixture.exec('return #text_requests')==2 end,10))
+  wait_until(function() return fixture.exec('return #text_requests')==2 end,'correction request 2 was not sent',{timeout_ms=1500})
   fixture.type('<BS>')
   fixture.wait('Please recieve more recieve')
   fixture.exec([[local request=text_requests[2]; request.callback({decision='replace',occurrence=request.occurrence.id,
     original='recieve',replacement='receive',profile='fixture',profile_revision='revision'})]])
   fixture.wait('Please recieve more recieve')
   fixture.type(' teh ')
-  assert(vim.wait(1500,function() return fixture.exec('return #text_requests')==3 end,10))
+  wait_until(function() return fixture.exec('return #text_requests')==3 end,'correction request 3 was not sent',{timeout_ms=1500})
   fixture.exec('require("forge.text").invalidate(vim.api.nvim_get_current_buf())')
   fixture.exec([[local request=text_requests[3]; request.callback({decision='replace',occurrence=request.occurrence.id,
     original='teh',replacement='the',profile='fixture',profile_revision='revision'})]])
   fixture.wait('Please recieve more recieve teh ')
   assert(fixture.exec('return #text_errors')==0)
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('text stale reply: later typing, Backspace-before-response, and submission invalidation passed')
-vim.cmd('qa!')
-  end },
-  { name = "sustained_input", run = function()
--- Sustained typing and long contexts against the real text host. Each word is typed only after
--- the previous correction applies, so the fixture advances on host replies rather than on a
--- typing cadence measured by the real clock.
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').native()
-local word_count=120
-local ok,failure=xpcall(function()
+end
+
+T["sustained_input"] = function()
+  -- Sustained typing and long contexts against the real text host. Each word is typed only after
+  -- the previous correction applies, so the fixture advances on host replies rather than on a
+  -- typing cadence measured by the real clock.
+  local fixture=text_fixture.native()
+  MiniTest.finally(fixture.close)
+  local word_count=120
   fixture.type('i')
   fixture.exec('text_measurements={}')
   local function applied_count()
@@ -682,8 +650,8 @@ local ok,failure=xpcall(function()
   end
   for word=1,word_count do
     fixture.type('recieve ')
-    assert(vim.wait(2000,function()return applied_count()>=word end,1),
-      ('correction %d did not apply: %s'):format(word,vim.inspect(fixture.exec('return text_measurements'))))
+    wait_until(function()return applied_count()>=word end,('correction %d did not apply'):format(word),
+      {timeout_ms=2000,context=function() return vim.inspect(fixture.exec('return text_measurements')) end})
   end
   local redraw_count=fixture.exec([[
     local count=0
@@ -706,8 +674,8 @@ local ok,failure=xpcall(function()
       text_measurements={}
     ]],{words})
     fixture.type('i ')
-    assert(vim.wait(2000,function()return fixture.exec('return #text_measurements>=2')end,1),
-      ('a %d-word context did not settle'):format(words))
+    wait_until(function()return fixture.exec('return #text_measurements>=2')end,
+      ('a %d-word context did not settle'):format(words),{timeout_ms=2000})
     local status=fixture.exec([[
       for _,entry in ipairs(text_measurements) do
         if entry.event=='text.correction' then return entry.fields.status end
@@ -717,14 +685,11 @@ local ok,failure=xpcall(function()
     fixture.type('<Esc>')
   end
   assert(#fixture.exec('return text_errors')==0,vim.inspect(fixture.exec('return text_errors')))
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-vim.cmd('qa!')
-  end },
-  { name = "wordlist", run = function()
-local fixture=dofile('nvim/lua/forge/tests/support/text_fixture.lua').native()
-local ok,failure=xpcall(function()
+end
+
+T["wordlist"] = function()
+  local fixture=text_fixture.native()
+  MiniTest.finally(fixture.close)
   assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'repo')]]),
     'default wordlist was not included in the profile')
   for _,term in ipairs({'coroutine','middleware','stdin','rpc','refactor','todo','opt','perf','off'}) do
@@ -777,7 +742,8 @@ local ok,failure=xpcall(function()
       end)
     end
   ]])
-  assert(vim.wait(5000,function()return fixture.exec('return text_dictionary_gate.remaining')==0 end,5))
+  wait_until(function()return fixture.exec('return text_dictionary_gate.remaining')==0 end,
+    'dictionary gate corrections did not all answer',{timeout_ms=4000})
   local gate_errors=fixture.exec('return text_dictionary_gate.errors')
   assert(#gate_errors==0,vim.inspect(gate_errors))
   fixture.exec([[
@@ -788,7 +754,8 @@ local ok,failure=xpcall(function()
       text_wordlist_ready=result;text_wordlist_failure=failure
     end)
   ]])
-  assert(vim.wait(2000,function()return fixture.exec('return text_wordlist_ready~=nil or text_wordlist_failure~=nil')end,5))
+  wait_until(function()return fixture.exec('return text_wordlist_ready~=nil or text_wordlist_failure~=nil')end,
+    'text service did not reinitialize with the explicit wordlist',{timeout_ms=2000})
   assert(fixture.exec('return text_wordlist_failure')==vim.NIL)
   fixture.type('iUse teh ')
   fixture.wait('Use teh ')
@@ -802,16 +769,6 @@ local ok,failure=xpcall(function()
   fixture.type('iUse teh ')
   fixture.wait('Use the ')
   assert(fixture.exec('return #text_errors')==0,vim.inspect(fixture.exec('return text_errors')))
-end,debug.traceback)
-fixture.close()
-assert(ok,failure)
-print('text wordlist host: default repo entry, explicit allow, and save-triggered profile reload passed')
-vim.cmd('qa!')
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

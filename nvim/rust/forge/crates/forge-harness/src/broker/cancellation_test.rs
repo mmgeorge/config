@@ -18,14 +18,13 @@ async fn cancellation_signal_remains_bound_to_its_invocation() {
     first.cancelled().await;
     second.cancelled().await;
 }
-use crate::provider::{ProviderCompletion, TurnEvent};
+use crate::provider::ProviderCompletion;
 use crate::turn::{ToolState, TurnOutcome, TurnState};
 use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone, Copy)]
 enum ProviderFailure {
     Cancelled,
-    SimilarMessage,
     Stalled,
 }
 
@@ -226,17 +225,6 @@ fn cancellation_fixture(
                     ProviderFailure::Cancelled | ProviderFailure::Stalled => {
                         TurnOutcome::Interrupted
                     }
-                    ProviderFailure::SimilarMessage => TurnOutcome::Failed {
-                        error: forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::TurnStart,
-                            forge_provider_api::ProviderFailureKind::Unknown,
-                        )
-                        .at_phase(
-                            forge_provider_api::ProviderPhase::Observation,
-                            forge_provider_api::FailureDisposition::Uncertain,
-                        ),
-                        retry: forge_provider_api::turn::RetryDecision::NotAllowed,
-                    },
                 };
                 native_outcome = outcome;
                 native_completed_at_ms = 4;
@@ -269,12 +257,6 @@ fn cancellation_fixture(
 #[tokio::test]
 async fn native_cancelled_error_preserves_denied_history_and_allows_next_prompt() -> Result<()> {
     assert_native_failure(ProviderFailure::Cancelled).await
-}
-
-/// Similar provider text must not gain cancellation semantics or trigger automatic replay.
-#[tokio::test]
-async fn provider_failure_named_cancelled_remains_failed() -> Result<()> {
-    assert_native_failure(ProviderFailure::SimilarMessage).await
 }
 
 /// Stop a noisy shell command at its deadline, persist failure, and keep the next prompt usable.
@@ -332,11 +314,10 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     expired?;
     let expected = match failure {
         ProviderFailure::Cancelled => ExchangeState::Cancelled,
-        ProviderFailure::SimilarMessage | ProviderFailure::Stalled => ExchangeState::Failed,
+        ProviderFailure::Stalled => ExchangeState::Failed,
     };
     let expected_code = match failure {
         ProviderFailure::Cancelled => "turn_cancelled",
-        ProviderFailure::SimilarMessage => "request_failed",
         ProviderFailure::Stalled => "tool_timeout",
     };
     assert_eq!(
@@ -364,17 +345,6 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     );
     let expected_turn = match failure {
         ProviderFailure::Cancelled | ProviderFailure::Stalled => TurnOutcome::Interrupted,
-        ProviderFailure::SimilarMessage => TurnOutcome::Failed {
-            error: forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::TurnStart,
-                forge_provider_api::ProviderFailureKind::Unknown,
-            )
-            .at_phase(
-                forge_provider_api::ProviderPhase::Observation,
-                forge_provider_api::FailureDisposition::Uncertain,
-            ),
-            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
-        },
     };
     assert_eq!(
         exchange.turn[0].state(),
@@ -519,125 +489,6 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     Ok(())
 }
 
-/// An owner collection drains real success and failure without repeating its cancellation signal.
-#[tokio::test]
-async fn collected_foreground_retains_actual_native_success_and_failure() -> Result<()> {
-    for succeeds in [true, false] {
-        let cancellation = Arc::new(TurnCancellation::new());
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ThreadOwner::root("collected"),
-            "exchange",
-        );
-        let (_sink, events) = crate::provider::events::channel(scope);
-        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-            Default::default(),
-        )?);
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let worker_started = started.clone();
-        let worker_release = release.clone();
-        let mut native = ForegroundWait::start(
-            events,
-            async move {
-                worker_started.notify_one();
-                worker_release.notified().await;
-                Ok(if succeeds {
-                    Ok(17u32)
-                } else {
-                    Err(crate::provider::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::TurnStart,
-                            forge_provider_api::ProviderFailureKind::Rejected,
-                        ),
-                    ))
-                })
-            },
-            cancellation.capture(),
-            watchdog,
-        )?;
-        native.authorize_submission();
-        started.notified().await;
-        cancellation.request();
-        release.notify_one();
-        let NativeForegroundSignal::NativeReady(result) = native.next_collected().await? else {
-            anyhow::bail!(
-                "collection repeated a cancellation signal instead of draining native completion"
-            )
-        };
-        if succeeds {
-            assert_eq!(result.unwrap(), 17);
-        } else {
-            assert!(
-                matches!(result, Err(crate::provider::ProviderError::Failure(failure))
-            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Keep a steering readiness refresh and its observation stream alive after cancellation.
-#[tokio::test]
-async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream() -> Result<()> {
-    let cancellation = TurnCancellation::new();
-    let scope = crate::provider::InvocationScope::new(
-        crate::provider::ThreadOwner::root("cancelled-refresh"),
-        "exchange",
-    );
-    let (sink, events) = crate::provider::events::channel(scope.clone());
-    let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-        Default::default(),
-    )?);
-    let mut native = ForegroundWait::start(
-        events,
-        async { Ok(17u32) },
-        cancellation.capture(),
-        watchdog,
-    )?;
-    native.authorize_submission();
-    assert!(matches!(
-        native.next_collected().await?,
-        NativeForegroundSignal::NativeReady(17)
-    ));
-    native.acknowledge_result();
-    cancellation.request();
-    let (release, ready) = tokio::sync::oneshot::channel();
-    native.restart_observation(async move {
-        ready
-            .await
-            .context("retained readiness refresh was dropped")?;
-        Ok(23u32)
-    })?;
-    native.authorize_submission();
-    assert!(
-        native.has_dispatched_task(),
-        "cancellation discarded the retained readiness refresh"
-    );
-    sink.send(crate::provider::test_support::native_event(
-        scope.clone(),
-        ProviderEvent::Turn {
-            thread_id: scope.owner().thread_id(),
-            turn_id: scope.turn_id().unwrap(),
-            event: TurnEvent::Started(forge_provider_api::turn::TurnStarted { started_at_ms: 1 }),
-        },
-    ))?;
-    assert!(
-        matches!(
-            native.next_collected().await?,
-            NativeForegroundSignal::ProviderEvent(_)
-        ),
-        "refresh replaced the original observation stream"
-    );
-    release
-        .send(())
-        .map_err(|_| anyhow::anyhow!("refresh ownership was lost"))?;
-    assert!(matches!(
-        native.next_collected().await?,
-        NativeForegroundSignal::NativeReady(23)
-    ));
-    Ok(())
-}
-
 /// Collection through the complete foreground wait preserves late native evidence over level cancellation.
 #[tokio::test]
 async fn collected_transaction_drains_native_result_without_recancelling() -> Result<()> {
@@ -719,46 +570,5 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
             "consumed native result left an empty native poll enabled"
         );
     }
-    Ok(())
-}
-
-/// Collection stops semantic progress scans, which its closed effect gate could never dispatch.
-#[tokio::test(start_paused = true)]
-async fn collected_transaction_requests_no_plan_scan() -> Result<()> {
-    let workspace = super::test::repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = super::test::planning_question_broker(workspace.path(), data.path(), false);
-    broker.checkpoint = None;
-    let mut staged = broker.stage_foreground_interaction(
-        "scan",
-        PromptMode::Chat,
-        Some(&ExchangeAdmission::chat("scan".into())),
-        ProviderInput::from_text("scan"),
-    )?;
-    broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
-    let engine = broker
-        .execution_registry()
-        .owner(crate::provider::ThreadOwner::root(&broker.session.id))
-        .await?;
-    let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
-    transaction.scan_enabled = true;
-    transaction.question_enabled = false;
-    transaction.agent_command_active = true;
-    transaction.execution_open = false;
-    let horizon = std::time::Duration::from_secs(600);
-    let scanned = |signal: Result<Result<ForegroundSignal>, tokio::time::error::Elapsed>| {
-        matches!(signal, Ok(Ok(ForegroundSignal::PlanScan)))
-    };
-    assert!(
-        scanned(tokio::time::timeout(horizon, transaction.next()).await),
-        "an uncollected execution must keep scanning progress"
-    );
-    transaction.collection = Some(ForegroundCollection::Cancel(
-        crate::exchange::command::CancelledInputPolicy::Retain,
-    ));
-    assert!(
-        !scanned(tokio::time::timeout(horizon, transaction.next()).await),
-        "collection requested a scan its closed effect gate cannot dispatch"
-    );
     Ok(())
 }

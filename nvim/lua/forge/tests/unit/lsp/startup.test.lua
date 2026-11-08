@@ -1,52 +1,31 @@
--- Unit tests for `forge.lsp.startup` (startup.lua), as a mini.test set. `.forge/checks/lua-tests.nu`
--- runs the file as one shard through `tests/support/minitest_shard.lua`, one case after another in a
--- single Neovim, so every case restores the editor functions it replaces in `post_case`.
 local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
 local eq = MiniTest.expect.equality
 
--- The editor functions the cases replace with fakes, captured before each case and restored after
--- it, even when the case fails.
+-- The real editor functions, captured before each case so mocks can delegate to them.
 local original_editor = {}
 
 local T = MiniTest.new_set({
-  hooks = {
-    pre_case = function()
-      original_editor = {
-        get_configs = vim.lsp.get_configs, start = vim.lsp.start, get_clients = vim.lsp.get_clients,
-        get_client_by_id = vim.lsp.get_client_by_id, buf_is_attached = vim.lsp.buf_is_attached,
-        now = vim.uv.now, fs_scandir = vim.uv.fs_scandir, notify = vim.notify,
-      }
-    end,
-    post_case = function()
-      require("forge.lsp.startup").close()
-      vim.lsp.get_configs, vim.lsp.start = original_editor.get_configs, original_editor.start
-      vim.lsp.get_clients, vim.lsp.get_client_by_id = original_editor.get_clients, original_editor.get_client_by_id
-      vim.lsp.buf_is_attached = original_editor.buf_is_attached
-      vim.uv.now, vim.uv.fs_scandir = original_editor.now, original_editor.fs_scandir
-      vim.notify = original_editor.notify
-    end,
-  },
+  hooks = isolation.hooks({
+    pre_case = function() original_editor = { now = vim.uv.now, fs_scandir = vim.uv.fs_scandir } end,
+    post_case = function() require("forge.lsp.startup").close() end,
+  }),
 })
-
--- A fresh directory that the case's `finally` step deletes.
-local function temporary_directory()
-  local directory = vim.fn.tempname()
-  vim.fn.mkdir(directory, "p")
-  MiniTest.finally(function() vim.fn.delete(directory, "rf") end)
-  return directory
-end
 
 T["lsp_root_deadline"] = function()
   local startup = require("forge.lsp.startup")
-  local directory = temporary_directory()
+  local directory = temp.directory("workspace")
   for _, name in ipairs({ "one", "two", "three" }) do
     vim.fn.mkdir(directory .. "/" .. name, "p")
     vim.fn.writefile({ "return {}" }, directory .. "/" .. name .. "/main.lua")
   end
-  local callbacks, clients, notices = {}, {}, {}
+  local callbacks, clients = {}, {}
   local elapsed, launches, respond = 0, 0, false
   vim.uv.now = function() return original_editor.now() + elapsed end
-  vim.notify = function(message) notices[#notices + 1] = message end
+  local notices = notify.capture()
   vim.lsp.get_configs = function()
     return { { name = "root-deadline", filetypes = { "lua" }, root_dir = function(_, receive)
       callbacks[#callbacks + 1] = receive
@@ -65,11 +44,11 @@ T["lsp_root_deadline"] = function()
   end
 
   local state = startup.start(directory)
-  assert(vim.wait(500, function() return #callbacks == 3 end, 5), "root discovery serialized unanswered callbacks")
+  wait_until(function() return #callbacks == 3 end, "root discovery serialized unanswered callbacks")
   elapsed = 2001
-  assert(vim.wait(500, function() return not state.discovering end, 5), "root discovery did not stop after two seconds")
+  wait_until(function() return not state.discovering end, "root discovery did not stop after two seconds")
   for _, job in pairs(state.jobs) do assert(job.done and job.rejected and not job.failure) end
-  eq(notices, {})
+  notices:assert_none()
   for _, receive in ipairs(callbacks) do receive(directory) end
   vim.wait(50, function() return launches > 0 end, 5)
   assert(launches == 0, "late root callback launched a server")
@@ -77,27 +56,27 @@ T["lsp_root_deadline"] = function()
 
   elapsed, respond, callbacks = 0, true, {}
   state = startup.start(directory)
-  assert(vim.wait(500, function() return not state.discovering end, 5), "valid roots did not finish discovery")
+  wait_until(function() return not state.discovering end, "valid roots did not finish discovery")
   eq(launches, 1)
   elapsed = 2500
   vim.wait(100, function() return #notices > 0 end, 5)
   assert(#notices == 0, "root timeout was applied to server initialization")
   elapsed = 60001
-  assert(vim.wait(500, function() return #notices > 0 end, 5), "server initialization lost its longer deadline")
+  wait_until(function() return #notices > 0 end, "server initialization lost its longer deadline")
   eq(#notices, 1)
-  assert(notices[1]:find("initialization exceeded 60 seconds", 1, true), notices[1])
+  assert(notices[1].message:find("initialization exceeded 60 seconds", 1, true), notices[1].message)
 end
 
 T["lsp_startup_manifests"] = function()
   local startup = require("forge.lsp.startup")
   local source = require("forge.lsp.source")
-  local directory = temporary_directory()
+  local directory = temp.directory("workspace")
   vim.fn.writefile({ "console.log('loose')" }, directory .. "/loose.js")
   vim.fn.writefile({ "fn main() {}" }, directory .. "/loose.rs")
-  local clients, launched, notices = {}, {}, {}
+  local clients, launched = {}, {}
   local elapsed, initialize = 0, true
   vim.uv.now = function() return original_editor.now() + elapsed end
-  vim.notify = function(message) notices[#notices + 1] = message end
+  local notices = notify.capture()
   vim.lsp.get_configs = function()
     local function root(buffer, receive)
       local path = vim.api.nvim_buf_get_name(buffer)
@@ -131,7 +110,7 @@ T["lsp_startup_manifests"] = function()
   vim.lsp.buf_is_attached = function() return false end
 
   local state = startup.start(directory)
-  assert(vim.wait(1000, function() return not state.discovering end, 5))
+  wait_until(function() return not state.discovering end, "discovery of loose source files did not finish")
   assert(next(state.jobs) == nil and #launched == 0, "loose JavaScript or Rust files triggered startup")
   startup.close()
 
@@ -140,17 +119,34 @@ T["lsp_startup_manifests"] = function()
   vim.fn.mkdir(project, "p")
   vim.fn.writefile({ '{"name":"manifest-only"}' }, project .. "/package.json")
   vim.fn.writefile({ '[workspace]', 'members = []' }, project .. "/Cargo.toml")
-  for index = 1, 130 do vim.fn.mkdir(directory .. "/directory-" .. index, "p") end
-  local noise = directory .. "/noise"
-  vim.fn.mkdir(noise, "p")
-  -- Discovery yields after every 256 directory entries, so a few batches of noise prove it keeps scanning.
-  for index = 1, 600 do vim.fn.writefile({}, noise .. "/entry-" .. index) end
+  vim.fn.mkdir(directory .. "/noise", "p")
+  -- Discovery yields after every 256 directory entries, so a few batches of noise prove it keeps
+  -- scanning. The scanner lists the noise directory's entries without creating them on disk.
+  local noise_entries = {}
+  for index = 1, 130 do noise_entries[#noise_entries + 1] = { "directory-" .. index, "directory" } end
+  for index = 1, 600 do noise_entries[#noise_entries + 1] = { "entry-" .. index, "file" } end
+  local noise_listings = {}
+  local original_scandir_next = vim.uv.fs_scandir_next
+  vim.uv.fs_scandir = function(path, callback)
+    local noise_root = path:find("/noise$") ~= nil
+    if not noise_root and not path:find("/noise/", 1, true) then return original_editor.fs_scandir(path, callback) end
+    local listing = { entries = noise_root and noise_entries or {}, cursor = 0 }
+    noise_listings[listing] = true
+    vim.schedule(function() callback(nil, listing) end)
+    return listing
+  end
+  vim.uv.fs_scandir_next = function(scan)
+    if not noise_listings[scan] then return original_scandir_next(scan) end
+    scan.cursor = scan.cursor + 1
+    local entry = scan.entries[scan.cursor]
+    if entry then return entry[1], entry[2] end
+  end
 
   state = startup.start(directory)
-  assert(vim.wait(10000, function() return #launched == 2 end, 5), "nested manifests were not discovered")
+  wait_until(function() return #launched == 2 end, "nested manifests were not discovered", { timeout_ms = 4000 })
   elapsed = 60001
-  assert(vim.wait(1000, function() return not state.discovering end, 5), "declined root blocked discovery")
-  eq(notices, {})
+  wait_until(function() return not state.discovering end, "declined root blocked discovery")
+  notices:assert_none()
   local selected = {}
   for _, launch in ipairs(launched) do selected[launch.name] = vim.fs.basename(launch.path) end
   eq(selected, { typescript = "package.json", rust = "Cargo.toml" })
@@ -166,17 +162,18 @@ T["lsp_startup_manifests"] = function()
   vim.fn.writefile({ '{}' }, stalled .. "/package.json")
   initialize, elapsed = false, 0
   state = startup.start(stalled)
-  assert(vim.wait(1000, function() return #launched == 3 end, 5), vim.inspect({ launched = launched, jobs = state.jobs }))
+  wait_until(function() return #launched == 3 end, "stalled manifest did not launch its server",
+    { context = function() return vim.inspect({ launched = launched, jobs = state.jobs }) end })
   elapsed = 60001
-  assert(vim.wait(1000, function() return #notices > 0 end, 5), "client initialization timeout did not settle")
+  wait_until(function() return #notices > 0 end, "client initialization timeout did not settle")
   eq(#notices, 1)
-  assert(notices[1]:find("typescript initialization exceeded", 1, true), "an actual client initialization timeout was suppressed")
+  assert(notices[1].message:find("typescript initialization exceeded", 1, true), "an actual client initialization timeout was suppressed")
 end
 
 T["lazy_startup"] = function()
   local startup = require("forge.lsp.startup")
   local source = require("forge.lsp.source")
-  local directory = temporary_directory()
+  local directory = temp.directory("workspace")
   local frontend, provider, sibling = directory .. "/frontend", directory .. "/provider", directory .. "/sibling"
   for _, path in ipairs({ frontend, provider, sibling }) do vim.fn.mkdir(path, "p") end
   vim.fn.writefile({ "{}" }, frontend .. "/package.json")
@@ -210,7 +207,7 @@ T["lazy_startup"] = function()
   local function await(path)
     local done, failure
     startup.wait(directory, path, function(error) done, failure = true, error end)
-    assert(vim.wait(2000, function() return done end, 5), "lazy startup did not finish")
+    wait_until(function() return done end, "lazy startup did not finish", { timeout_ms = 2000 })
     assert(not failure, failure)
   end
 
@@ -219,13 +216,13 @@ T["lazy_startup"] = function()
   assert(scans == 0 and #launched == 0, "file query scanned workspace or duplicated editor client")
   local done, failure, issues
   startup.wait(directory, nil, function(error, gaps) done, failure, issues = true, error, gaps end)
-  assert(vim.wait(2000, function() return #launched == 2 end, 5), "one initializing server blocked another project root")
+  wait_until(function() return #launched == 2 end, "one initializing server blocked another project root", { timeout_ms = 2000 })
   assert(scans > 0 and #launched == 2, "workspace request omitted a distinct project root")
   await(frontend .. "/main.ts")
   assert(not done, "workspace ignored an initializing project server")
   local now = original_editor.now()
   vim.uv.now = function() return now + 60001 end
-  assert(vim.wait(2000, function() return done end, 5), "workspace startup timeout did not settle")
+  wait_until(function() return done end, "workspace startup timeout did not settle", { timeout_ms = 2000 })
   vim.uv.now = original_editor.now
   assert(not failure and #issues == 1 and issues[1].name == "typescript", "startup timeout discarded ready project servers")
   hold_initialization = false
@@ -252,7 +249,7 @@ T["startup"] = function()
   local startup = require("forge.lsp.startup")
   local query = require("forge.lsp.semantic")
   local source = require("forge.lsp.source")
-  local directory = temporary_directory()
+  local directory = temp.directory("workspace")
   local path = directory .. "/main.lua"
   vim.fn.writefile({ "function ready() end" }, path)
   local calls, queried, client = 0, false, nil
@@ -293,7 +290,7 @@ T["startup"] = function()
   vim.lsp.buf_is_attached = function() return true end
 
   startup.start(directory)
-  assert(vim.wait(1000, function() return client ~= nil end, 5), "background startup did not run")
+  wait_until(function() return client ~= nil end, "background startup did not run")
   assert(root_in_fast_event, "fixture did not exercise a libuv root callback")
   local done, result, error
   query.request(directory, { operation = "hover", path = path, line = 1, column = 1 }, function(_, receive) receive({}) end,
@@ -305,17 +302,17 @@ T["startup"] = function()
   vim.wait(150, function() return done end, 5)
   assert(not done and not queried, "query ran while the server reported indexing")
   client.progress.pending = {}
-  assert(vim.wait(1000, function() return done end, 5), "query did not resume after initialization")
+  wait_until(function() return done end, "query did not resume after initialization")
   assert(not error, tostring(error))
   eq(result.hover, "ready")
   assert(calls == 1, "query created a duplicate server")
   local missing, missing_done
   startup.wait(directory, directory .. "/missing.lua", function(failure) missing, missing_done = failure, true end)
-  assert(vim.wait(1000, function() return missing_done end, 5))
+  wait_until(function() return missing_done end, "startup wait for a missing source did not finish")
   assert(missing:find("path_not_found:", 1, true) and calls == 1)
   local recovered, recovery_error
   startup.wait(directory, path, function(failure) recovered, recovery_error = true, failure end)
-  assert(vim.wait(1000, function() return recovered end, 5))
+  wait_until(function() return recovered end, "startup wait for a valid source did not finish after a missing one")
   assert(not recovery_error, "missing source poisoned the valid startup waiter")
   local cancelled = false
   client.initialized = false
@@ -328,7 +325,7 @@ T["startup"] = function()
   assert(not source.loaded(path), "startup leaked a hidden buffer")
   hold_root = true
   startup.start(directory)
-  assert(vim.wait(1000, function() return deferred_root ~= nil end, 5), "deferred root was not requested")
+  wait_until(function() return deferred_root ~= nil end, "deferred root was not requested")
   startup.close()
   deferred_root(directory)
   vim.wait(80, function() return calls > 1 end, 5)

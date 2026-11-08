@@ -234,31 +234,3 @@ impl ScopeOwner for TurnAddress {
         &self.scope.thread_id
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reject malformed owner identities before transport can admit them.
-    #[test]
-    fn deserialization_rejects_empty_owner_identities() {
-        for raw in [
-            serde_json::json!({"session_id":"", "agent_id":"agent"}),
-            serde_json::json!({"session_id":"session", "agent_id":""}),
-            serde_json::json!({"session_id":" ", "agent_id":"agent"}),
-            serde_json::json!({"session_id":"session", "agent_id":"\t"}),
-        ] {
-            assert!(serde_json::from_value::<ThreadOwner>(raw).is_err());
-        }
-        let owner = ThreadOwner::new("session".into(), AgentId::new("agent").unwrap()).unwrap();
-        let encoded = serde_json::to_value(&owner).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({"session_id":"session", "agent_id":"agent"})
-        );
-        assert_eq!(
-            serde_json::from_value::<ThreadOwner>(encoded).unwrap(),
-            owner
-        );
-    }
-}

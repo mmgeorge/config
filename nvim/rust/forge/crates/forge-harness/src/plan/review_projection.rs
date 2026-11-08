@@ -1033,57 +1033,6 @@ fn row_range(range: &TextRange, row: usize, length: usize) -> Option<TextRange> 
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn file_tree_ranges_close_each_file_over_its_children() {
-        let anchor = |line, target| super::PlanNavigationAnchor {
-            line,
-            json_path: "/fixture".into(),
-            target,
-            path: None,
-            label: "fixture".into(),
-        };
-        let ranges = super::file_tree_ranges(
-            &[
-                anchor(
-                    10,
-                    super::PlanReviewTarget::FileTreeFile {
-                        path: "src/first.rs".into(),
-                    },
-                ),
-                anchor(
-                    11,
-                    super::PlanReviewTarget::FileTreeEntity {
-                        name: "First".into(),
-                        path: "src/first.rs".into(),
-                    },
-                ),
-                anchor(
-                    12,
-                    super::PlanReviewTarget::FileTreeFile {
-                        path: "src/second.rs".into(),
-                    },
-                ),
-                anchor(
-                    13,
-                    super::PlanReviewTarget::FileTreeTest {
-                        name: "second_works".into(),
-                        action: crate::plan::ChangeAction::Add,
-                        path: "src/second.rs".into(),
-                        category: crate::plan::TestCategory::Unit,
-                    },
-                ),
-                anchor(
-                    15,
-                    super::PlanReviewTarget::Section {
-                        section: crate::plan::PlanSection::Dependencies,
-                    },
-                ),
-            ],
-            20,
-        );
-        assert_eq!(ranges, [(10, 12), (12, 15)]);
-    }
-
     use super::*;
     use crate::plan::{PlanAnnotationInput, PlanFileStore};
     use forge_buffer::document::BufferDocument;

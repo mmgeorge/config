@@ -1,52 +1,54 @@
--- Unit tests for `forge.block_sequence` (block_sequence.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "block_sequence", run = function()
-vim.loader.enable(false)
-local Sequence = require("forge.block_sequence")
+-- Unit tests for `forge.block_sequence` (block_sequence.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local eq = MiniTest.expect.equality
 
-local function entry(id, count)
-  return { id = id, entry = { row_count = count, metadata = {} } }
-end
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-local sequence = Sequence.new()
-local reference = {}
-local function verify()
-  assert(sequence:count() == #reference)
-  local start = 0
-  for index, item in ipairs(reference) do
-    assert(sequence:at(index - 1).id == item.id)
-    local actual_index, actual_start = sequence:position(item.id)
-    assert(actual_index == index - 1 and actual_start == start)
-    for row = start, start + item.entry.row_count - 1 do
-      assert(sequence:locate(row).id == item.id)
+T["block_sequence"] = function()
+  local Sequence = require("forge.block_sequence")
+
+  local function entry(id, count)
+    return { id = id, entry = { row_count = count, metadata = {} } }
+  end
+
+  local sequence = Sequence.new()
+  local reference = {}
+  local function verify()
+    assert(sequence:count() == #reference)
+    local start = 0
+    for index, item in ipairs(reference) do
+      assert(sequence:at(index - 1).id == item.id)
+      local actual_index, actual_start = sequence:position(item.id)
+      assert(actual_index == index - 1 and actual_start == start)
+      for row = start, start + item.entry.row_count - 1 do
+        assert(sequence:locate(row).id == item.id)
+      end
+      start = start + item.entry.row_count
     end
-    start = start + item.entry.row_count
-  end
-  assert(sequence:rows() == start)
-  assert(sequence:locate(start) == nil)
-  local function check(node, parent)
-    if not node then return 0 end
-    assert(node.parent == parent)
-    local left, right = check(node.left, node), check(node.right, node)
-    assert(math.abs(left - right) <= 1, "unbalanced sequence")
-    assert(node.height == math.max(left, right) + 1)
-    return node.height
-  end
-  check(sequence.root, nil)
-  local first, last = math.floor(start / 3), math.floor(start * 2 / 3)
-  local expected, actual, position = {}, {}, 0
-  for _, item in ipairs(reference) do
-    if position <= last and position + item.entry.row_count >= first then
-      expected[#expected + 1] = { item.id, position }
+    assert(sequence:rows() == start)
+    assert(sequence:locate(start) == nil)
+    local function check(node, parent)
+      if not node then return 0 end
+      assert(node.parent == parent)
+      local left, right = check(node.left, node), check(node.right, node)
+      assert(math.abs(left - right) <= 1, "unbalanced sequence")
+      assert(node.height == math.max(left, right) + 1)
+      return node.height
     end
-    position = position + item.entry.row_count
+    check(sequence.root, nil)
+    local first, last = math.floor(start / 3), math.floor(start * 2 / 3)
+    local expected, actual, position = {}, {}, 0
+    for _, item in ipairs(reference) do
+      if position <= last and position + item.entry.row_count >= first then
+        expected[#expected + 1] = { item.id, position }
+      end
+      position = position + item.entry.row_count
+    end
+    sequence:visit_range(first, last, function(node, row) actual[#actual + 1] = { node.id, row } end)
+    eq(actual, expected, { fail_reason = "inclusive range traversal lost a block boundary" })
   end
-  sequence:visit_range(first, last, function(node, row) actual[#actual + 1] = { node.id, row } end)
-  assert(vim.deep_equal(actual, expected), "inclusive range traversal lost a block boundary")
-end
 
-local ok, failure = xpcall(function()
   math.randomseed(4701)
   for iteration = 1, 500 do
     local position = math.random(0, #reference)
@@ -79,21 +81,8 @@ local ok, failure = xpcall(function()
   sequence.visits = 0
   local found = {}
   sequence:visit_range(5000, 5000, function(node) found[#found + 1] = node.id end)
-  assert(vim.deep_equal(found, { "5000", "5001" }))
+  eq(found, { "5000", "5001" })
   assert(sequence.visits < 64, "local range lookup traversed unrelated blocks")
-end, debug.traceback)
-
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  vim.cmd("qa!")
 end
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

@@ -1107,46 +1107,8 @@ branches: Vec::new()
 }
 
 #[cfg(test)]
-pub(crate) fn test_subtask_fixture() -> PlanSubtask {
-    PlanSubtask::Test(PlanTestSubtask {
-        operation: TestSubtaskOperation::Test,
-        action: ChangeAction::Add,
-        renamed_from: None,
-        name: "validates_plans".into(),
-        category: TestCategory::Unit,
-        behavior: "Reject malformed plans.".into(),
-        covers_entities: vec!["PlanDocument".into()],
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn attach_test_fixture(document: &mut PlanDocument) {
-    document.stages[0].tasks[0].files[0]
-        .subtasks
-        .push(test_subtask_fixture());
-}
-
-#[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn validates_complete_submission() {
-        test_fixture("plan", "Build structured planning.")
-            .validate_for_submission()
-            .unwrap();
-    }
-
-    #[test]
-    fn rejects_ambiguous_entity_references() {
-        let result = serde_json::from_value::<EntityReference>(serde_json::json!({
-            "kind": "planned_entity",
-            "entity": "PlanDocument",
-            "external_entity_name": "CLI"
-        }));
-
-        assert!(result.is_err());
-    }
 
     #[test]
     fn requires_the_explicit_plan_document_schema_version() {

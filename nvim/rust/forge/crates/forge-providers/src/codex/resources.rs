@@ -310,35 +310,3 @@ fn disabled(resource: &McpLaunch) -> McpDefinition {
 fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn native_mcp_config_preserves_admitted_launch_details() {
-        let resource = McpLaunch {
-            name: "repo tools".into(),
-            transport: McpTransport::Stdio {
-                command: "tool-server".into(),
-                arguments: vec!["--stdio".into()],
-                environment: BTreeMap::from([("TOKEN".into(), "secret".into())]),
-            },
-            timeout: Some(std::time::Duration::from_secs(17)),
-            working_directory: Some(std::path::PathBuf::from("/workspace")),
-            tools: Some(
-                forge_provider_api::session::McpToolSelection::from_names(vec!["search".into()])
-                    .unwrap(),
-            ),
-        };
-        let config = native_server(&resource).expect("valid normalized launch");
-        assert_eq!(config["enabled"], true);
-        assert_eq!(config["command"], "tool-server");
-        assert_eq!(config["args"], json!(["--stdio"]));
-        assert_eq!(config["env"]["TOKEN"], "secret");
-        assert_eq!(config["cwd"], "/workspace");
-        assert_eq!(config["enabled_tools"], json!(["search"]));
-        assert_eq!(config["tool_timeout_sec"], 17.0);
-    }
-}

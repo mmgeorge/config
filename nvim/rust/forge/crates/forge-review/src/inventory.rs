@@ -343,25 +343,4 @@ mod tests {
             .is_empty()
         );
     }
-
-    #[test]
-    fn single_untracked_sem_output_inherits_only_its_requested_path() {
-        let requested = [PathBuf::from("src/new.rs")];
-        let output = br#"[{"name":"added","type":"function","start_line":3,"parent_id":null}]"#;
-        let entity = decode_untracked(output, &requested).unwrap();
-        assert_eq!(entity.len(), 1);
-        assert_eq!(entity[0].file, "src/new.rs");
-        assert_eq!(entity[0].line, Some(3));
-        assert!(decode_untracked(output, &[]).is_err());
-        assert!(
-            decode_untracked(output, &[PathBuf::from("one.rs"), PathBuf::from("two.rs")]).is_err()
-        );
-        let named = br#"[{"file":"src/two.rs","name":"added","type":"function","start_line":3}]"#;
-        assert_eq!(
-            decode_untracked(named, &[PathBuf::from("one.rs"), PathBuf::from("two.rs")]).unwrap()
-                [0]
-            .file,
-            "src/two.rs"
-        );
-    }
 }

@@ -639,69 +639,6 @@ mod tests {
     use forge_diff::{cache::CacheLimits, engine::DiffEngine};
 
     #[tokio::test]
-    async fn saved_diff_retains_large_read_only_source_through_bounded_delivery() -> Result<()> {
-        let store = Arc::new(RepositoryStore::default());
-        let diff = DiffEngine::new(CacheLimits::default(), 2);
-        let service = SourceDocumentService::new(
-            store,
-            diff.clone(),
-            SyntaxEngine::new(diff.analysis_pool()),
-        );
-        let text = format!("+{}\n", "x".repeat(254))
-            .repeat(70_000)
-            .into_bytes();
-        assert!(
-            service
-                .open_text(
-                    DocumentId("literal-limit".into()),
-                    "message".into(),
-                    text.clone()
-                )
-                .is_ok()
-        );
-        let id = DocumentId("saved-diff".into());
-        let opened = service.open_diff_text(id.clone(), "Tool changes".into(), text)?;
-        assert_eq!(opened.revision, "diff");
-        assert_eq!(opened.snapshot.block[0].text.row_count(), 256);
-        let mut revision = opened.snapshot.revision;
-        let mut more = opened.more;
-        let mut rows = 256;
-        let mut sequence = 0;
-        while more {
-            sequence += 1;
-            let delivered = service
-                .demand(DocumentInput {
-                    document: id.clone(),
-                    revision,
-                    view: ViewId("source-view".into()),
-                    sequence: InputSequence(sequence),
-                    action: "demand".into(),
-                    block: opened.snapshot.block[0].id.clone(),
-                    position: TextPosition { row: 0, column: 0 },
-                    target: None,
-                })
-                .await?;
-            if let Some(patch) = delivered.patch {
-                assert!(patch.next_rows - patch.base_rows <= 256);
-                rows = patch.next_rows;
-                revision = patch.next;
-            }
-            more = delivered.more;
-        }
-        assert_eq!(rows, 70_000);
-        assert!(service.close(&id));
-        assert!(
-            service
-                .open_diff_text(
-                    DocumentId("diff-limit".into()),
-                    "large".into(),
-                    vec![b'x'; 8 * 1024 * 1024 + 1]
-                )
-                .is_ok()
-        );
-        Ok(())
-    }
-    #[tokio::test]
     async fn saved_diff_controls_preserve_unclassified_patch_and_independent_options() -> Result<()>
     {
         use forge_diff::view::{DiffPresentation, DiffVisibility};

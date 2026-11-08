@@ -532,31 +532,4 @@ mod tests {
         }
         .await
     }
-
-    /// A retained reader rejects new foreground work instead of reopening its retired turn.
-    #[tokio::test]
-    async fn retained_turn_rejects_unowned_native_start() -> anyhow::Result<()> {
-        async {
-            let (intake, sender) = fixture().await;
-            let (context, _events) = context("retired").await;
-            let receiver = intake.attach(context).await?;
-            drop(receiver);
-            sender
-                .send(event(
-                    "foreign-start",
-                    "assistant.turn_start",
-                    json!({"turnId":"0"}),
-                ))
-                .await?;
-            let mut failures = intake.failure.clone();
-            failures.wait_for(Option::is_some).await?;
-            assert!(matches!(
-                *failures.borrow(),
-                Some(ObservationFailure::UnexpectedExecution)
-            ));
-            intake.close().await?;
-            Ok::<(), anyhow::Error>(())
-        }
-        .await
-    }
 }

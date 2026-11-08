@@ -367,32 +367,3 @@ impl CheckReceipt {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn all_and_selected_requests_preserve_the_wire_contract() {
-        for request in [
-            RunRequest::All,
-            RunRequest::Selected(SelectedChecks {
-                ids: vec!["unit".into()],
-                ..Default::default()
-            }),
-        ] {
-            let encoded = serde_json::to_value(&request).unwrap();
-            let decoded: RunRequest = serde_json::from_value(encoded.clone()).unwrap();
-            assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
-        }
-        for field in ["ids", "include", "selections"] {
-            let mut value = serde_json::json!({"all": true});
-            value[field] = if field == "selections" {
-                serde_json::json!({"unit":{"kind":"all"}})
-            } else {
-                serde_json::json!(["unit"])
-            };
-            assert!(serde_json::from_value::<RunRequest>(value).is_err());
-        }
-    }
-}

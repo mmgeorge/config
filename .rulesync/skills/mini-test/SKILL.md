@@ -84,7 +84,7 @@ return T
 - `data`: a table merged down to cases as `case.data`, for filtering.
 - `n_retry`: rerun a failing case, with its `*_case` hooks, up to this many times. A retry hides a flake instead of fixing it; prefer making the case deterministic.
 
-Hooks are the reliable cleanup point because they run whether or not the case failed. Within one callable, `MiniTest.finally(fn)` registers cleanup that runs after that callable ends, on success or error; use it next to the code that created a temporary directory, buffer, timer, or autocommand.
+Hooks are the reliable cleanup point because they run whether or not the case failed. Within one callable, `MiniTest.finally(fn)` registers cleanup that runs after that callable ends, on success or error; use it next to the code that created a temporary directory, buffer, timer, or autocommand. Callbacks run in registration order and without protection: an error raised in one escapes the case runner and can leave the run hanging, so wrap fallible cleanup in `pcall` and never assert inside a callback. A hook is itself a callable, so a `finally` registered from `pre_case` runs as soon as `pre_case` returns, before the case body; call helpers that register cleanup from the case body.
 
 ## Expectations and case helpers
 

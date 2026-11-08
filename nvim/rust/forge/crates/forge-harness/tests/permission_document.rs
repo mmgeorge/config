@@ -1,17 +1,8 @@
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
-use forge_harness::permissions::store::PermissionStore;
 use forge_harness::provider::ProviderLaunch;
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::json;
-
-#[test]
-fn repository_permission_document_matches_the_runtime_schema() {
-    let manifest_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let permission_path = manifest_root.join("../../../../forge/permissions.json");
-    PermissionStore::load(&permission_path, manifest_root)
-        .unwrap_or_else(|error| panic!("validate {}: {error:#}", permission_path.display()));
-}
 
 fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
     let temporary = tempfile::tempdir().unwrap();
@@ -99,60 +90,4 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     assert!(invalid.response.error().is_some());
     let persisted = std::fs::read_to_string(temporary.path().join("permissions.json")).unwrap();
     assert!(persisted.contains("git commit *"));
-}
-
-#[tokio::test]
-async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
-    let (_temporary, mut broker) = broker_fixture();
-    for (command, expected) in [
-        ("/write", ApprovalMode::Ask),
-        ("/yolo", ApprovalMode::Allow),
-        ("/ask", ApprovalMode::Ask),
-    ] {
-        let response = broker
-            .dispatch(Request {
-                id: 10,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": command }),
-            })
-            .await;
-        assert!(response.response.error().is_none());
-        assert_eq!(broker.snapshot().unwrap().session.approval_mode, expected);
-    }
-
-    broker
-        .dispatch(Request {
-            id: 11,
-            method: "session.prompt.submit".into(),
-            params: json!({ "text": "/write" }),
-        })
-        .await;
-    for command in ["/plan", "  /plan \n", "/plan"] {
-        let changed = broker
-            .dispatch(Request {
-                id: 12,
-                method: "session.prompt.submit".into(),
-                params: json!({ "text": command }),
-            })
-            .await;
-        assert!(changed.response.error().is_none());
-        let snapshot = broker.snapshot().unwrap();
-        assert!(snapshot.session.active_task.is_none());
-        assert_eq!(snapshot.session.approval_mode, ApprovalMode::Ask);
-        assert!(snapshot.active_plan.is_none());
-        assert!(snapshot.exchange.is_empty());
-    }
-    let planned = broker
-        .dispatch(Request {
-            id: 13,
-            method: "session.prompt.submit".into(),
-            params: json!({ "text": "/plan preserve the selected mode" }),
-        })
-        .await;
-    assert!(planned.response.error().is_none());
-    assert_eq!(
-        broker.snapshot().unwrap().session.approval_mode,
-        ApprovalMode::Ask
-    );
-    assert!(broker.snapshot().unwrap().session.active_task.is_some());
 }

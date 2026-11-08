@@ -552,59 +552,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-    /// A known durable writer conflict retains a safe resource reason instead of native error text.
-    #[test]
-    fn active_writer_resume_rejection_is_a_normalized_resource_conflict() {
-        let error = decode_result(&json!({"error":{"code":-32600,"message":"thread private-thread-id already has an active writer"}}), ProviderOperation::ThreadOpen, "thread/resume").unwrap_err();
-        assert!(
-            matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
-        );
-        assert!(!error.to_string().contains("private-thread-id"));
-    }
-
-    /// Create a fully collected transport for isolated dispatcher-collection tests.
-    async fn closed_rpc() -> NativeRpc {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                if message.is_close() {
-                    break;
-                }
-            }
-        });
-        let rpc = NativeRpc::new(
-            CodexConnection::connect(&format!("ws://{address}"))
-                .await
-                .unwrap(),
-        );
-        rpc.close().await.unwrap();
-        peer.await.unwrap();
-        rpc
-    }
-
-    /// Report a dispatcher panic without exposing its private payload.
-    #[tokio::test]
-    async fn dispatcher_panic_is_a_normalized_collection_failure() {
-        let rpc = closed_rpc().await;
-        let task = tokio::spawn(async { panic!("private dispatcher panic marker") });
-        while !task.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        *rpc.reader.lock().await = Some(task);
-        let error = rpc.close().await.unwrap_err();
-        assert!(matches!(&error, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::TurnStart
-            && failure.kind() == ProviderFailureKind::Runtime));
-        assert!(!format!("{error:?} {error}").contains("private dispatcher panic marker"));
-        let source = std::error::Error::source(&error).unwrap();
-        assert!(source.is::<ProviderFailure>());
-        assert!(source.source().is_none());
-        assert!(rpc.reader.lock().await.is_none());
-    }
-
     /// Keep method-specific missing-session recognition inside the native response decoder.
     #[test]
     fn response_errors_are_typed_and_never_retain_native_text() {

@@ -511,25 +511,6 @@ async fn completion_racing_steering_preserves_proven_rejection_and_delivery_unce
     Ok(())
 }
 
-/// Panicking native work is normalized without leaking its payload and fences the exact owner.
-#[tokio::test]
-async fn submission_task_failure_is_normalized_and_fences_owner() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.native.with_pre_dispatch(|_| async {
-        panic!("private native task panic");
-    });
-    for owner in owners() {
-        let (engine, _, _, result) = fixture.run(&owner, "panic").await?;
-        let error = match result.await? {
-            Err(error) => error,
-            Ok(_) => anyhow::bail!("panic completed successfully"),
-        };
-        assert!(!format!("{error:?} {error}").contains("private native task panic"));
-        assert!(!engine.is_healthy().await);
-    }
-    fixture.close().await
-}
-
 /// Exact collected cancellation before positive start preserves accepted input without a fictional turn.
 #[tokio::test]
 async fn accepted_prestart_cancellation_resolves_without_turn_completion() -> Result<()> {

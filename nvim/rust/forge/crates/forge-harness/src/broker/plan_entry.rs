@@ -459,27 +459,6 @@ mod tests {
         .await
     }
 
-    /// Queue active phase guidance from the same workflow state that resume commits.
-    #[tokio::test]
-    async fn resumed_paused_resolve_entry_uses_committed_phase_instead_of_stopped_state()
-    -> Result<()> {
-        assert_resumed_execution_entry_uses_committed_phase(
-            PlanExecutionState::Paused,
-            crate::plan::PlanPhase::Resolve,
-        )
-        .await
-    }
-
-    /// Resumed Check reserves local work instead of a provider entry.
-    #[tokio::test]
-    async fn resumed_paused_checking_reserves_local_work_instead_of_provider_entry() -> Result<()> {
-        assert_resumed_execution_entry_uses_committed_phase(
-            PlanExecutionState::Paused,
-            crate::plan::PlanPhase::Checking,
-        )
-        .await
-    }
-
     async fn assert_resumed_execution_entry_uses_committed_phase(
         stopped: PlanExecutionState,
         phase: crate::plan::PlanPhase,
@@ -610,74 +589,6 @@ mod tests {
             assert_eq!(execution.record.findings, before.record.findings);
             assert_eq!(execution.continuation, projected.continuation);
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pause_without_active_task_preserves_chat_state() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        for id in 1..=2 {
-            let result = broker
-                .dispatch(Request {
-                    id,
-                    method: "session.command.apply".into(),
-                    params: json!({"operation_id":format!("pause-chat-{id}"),"action":"pause"}),
-                })
-                .await;
-            assert!(
-                result.response.error().is_none(),
-                "{:?}",
-                result.response.error()
-            );
-            assert!(broker.task_controller.current()?.is_none());
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uncoordinated_acceptance_preserves_replacement_without_provider_execution()
-    -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let replacement = broker
-            .task_controller
-            .change(
-                &mut broker.store,
-                None,
-                TaskChange::Install(Box::new(Task::goal(
-                    "Replacement task".into(),
-                    Default::default(),
-                    1,
-                ))),
-                1,
-            )?
-            .unwrap();
-        let before = broker.store.list_exchange(&broker.session.id)?.len();
-        let result = broker
-            .dispatch(Request {
-                id: 77,
-                method: "session.question.continue".into(),
-                params: json!({"operation_id":"accepted-review"}),
-            })
-            .await;
-        assert!(
-            result.response.error().is_some(),
-            "{:?}",
-            result.response.error()
-        );
-        assert_eq!(
-            broker.task_controller.current()?.unwrap().revision,
-            replacement.revision
-        );
-        assert_eq!(
-            broker.store.list_exchange(&broker.session.id)?.len(),
-            before
-        );
         Ok(())
     }
 

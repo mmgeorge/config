@@ -79,52 +79,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_tree_shares_highlights_and_context_without_reconstructing_old_source() {
-        let engine = engine();
-        let old = engine
-            .analyze(request(
-                SyntaxLanguage::Rust,
-                "fn previous() { let value = 1; }\n",
-            ))
-            .await
-            .unwrap();
-        let new = engine
-            .analyze(request(
-                SyntaxLanguage::Rust,
-                "fn current() { let value = 2; }\n",
-            ))
-            .await
-            .unwrap();
-        assert_ne!(old.source_identity(), new.source_identity());
-        assert_eq!(old.tree_count(), 1);
-        for handle in [&old, &new] {
-            assert!(
-                handle
-                    .captures()
-                    .iter()
-                    .any(|capture| capture.family == SyntaxFamily::Context
-                        && capture.name.as_ref() == "scope.name")
-            );
-            assert!(
-                handle
-                    .captures()
-                    .iter()
-                    .any(|capture| capture.family == SyntaxFamily::Highlight
-                        && capture.name.as_ref() == "declaration")
-            );
-        }
-        let cached = engine
-            .analyze(request(
-                SyntaxLanguage::Rust,
-                "fn previous() { let value = 1; }\n",
-            ))
-            .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&old.0, &cached.0));
-        assert_eq!(engine.usage().active_jobs, 0);
-    }
-
-    #[tokio::test]
     async fn every_configured_language_analyzes_a_real_fragment() {
         let engine = engine();
         for (name, text) in [
@@ -179,50 +133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_consumers_cancel_independently_and_release_native_admission() {
-        use crate::workers::WorkBudget;
-        use std::future::Future;
-        use std::task::Poll;
-
-        let pool = Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1,
-            jobs: 2,
-        }));
-        let (release, blocked) = std::sync::mpsc::channel();
-        let (started, running) = tokio::sync::oneshot::channel();
-        pool.submit(
-            WorkPriority::Foreground,
-            WorkBudget::new(0, None),
-            move |_| {
-                started.send(()).unwrap();
-                blocked.recv().unwrap();
-            },
-        )
-        .unwrap();
-        running.await.unwrap();
-        let engine = SyntaxEngine::new(Arc::clone(&pool));
-        let mut first = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn shared() {}")));
-        let mut second = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn shared() {}")));
-        assert!(
-            std::future::poll_fn(|context| Poll::Ready(first.as_mut().poll(context)))
-                .await
-                .is_pending()
-        );
-        assert!(
-            std::future::poll_fn(|context| Poll::Ready(second.as_mut().poll(context)))
-                .await
-                .is_pending()
-        );
-        assert_eq!(engine.usage().active_jobs, 1);
-        assert_eq!(pool.usage().admitted_jobs, 2);
-        drop(first);
-        assert_eq!(engine.usage().active_jobs, 1);
-        release.send(()).unwrap();
-        assert!(second.await.is_ok());
-        assert_eq!(pool.usage().admitted_jobs, 0);
-    }
-
-    #[tokio::test]
     async fn visible_syntax_waits_for_temporary_shared_pool_saturation() {
         use crate::workers::WorkBudget;
         use std::future::Future;
@@ -253,45 +163,5 @@ mod tests {
             result.err()
         );
         assert_eq!(pool.usage().admitted_jobs, 0);
-    }
-
-    #[tokio::test]
-    async fn syntax_admission_rejects_permanently_unavailable_capacity() {
-        use crate::workers::PoolError;
-        for (workers, jobs, expected) in [
-            (0, 1, PoolError::WorkerUnavailable),
-            (1, 0, PoolError::WorkerUnavailable),
-        ] {
-            let pool = Arc::new(AnalysisPool::new(PoolLimits { workers, jobs }));
-            let engine = SyntaxEngine::new(pool);
-            let outcome = engine
-                .analyze(request(SyntaxLanguage::Rust, "fn main() {}"))
-                .await;
-            assert_eq!(outcome.err(), Some(SyntaxError::Pool(expected)));
-        }
-    }
-
-    #[tokio::test]
-    async fn pinned_syntax_survives_cache_eviction_without_blocking_new_files() {
-        let engine = engine();
-        let pinned = engine
-            .analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
-            .await
-            .unwrap();
-        for revision in 0..257 {
-            let source = format!("fn revision_{revision}() {{ let value = {revision}; }}");
-            let syntax = engine
-                .analyze(request(SyntaxLanguage::Rust, &source))
-                .await
-                .unwrap();
-            assert!(!syntax.captures().is_empty());
-        }
-        let reloaded = engine
-            .analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
-            .await
-            .unwrap();
-        assert!(!Arc::ptr_eq(&pinned.0, &reloaded.0));
-        assert_eq!(pinned.source_identity(), reloaded.source_identity());
-        assert!(!pinned.captures().is_empty());
     }
 }

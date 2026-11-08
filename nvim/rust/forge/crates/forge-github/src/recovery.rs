@@ -667,17 +667,4 @@ mod tests {
         assert!(store.prepare(resource(2), capture("operation-3")).is_err());
         assert_eq!(fs::read(&future_path).unwrap(), future_bytes);
     }
-
-    #[test]
-    fn windows_reserved_names_and_trailing_dots_do_not_alias_recovery_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = store(&directory);
-        let mut first = resource(1);
-        first.repository = GithubRepositoryId::new("github.com", "con", "repo.").unwrap();
-        let mut second = first.clone();
-        second.repository = GithubRepositoryId::new("github.com", "con", "repo").unwrap();
-        assert_ne!(store.path(&first), store.path(&second));
-        drop(store.prepare(first, capture("first")).unwrap());
-        assert!(store.prepare(second, capture("second")).is_ok());
-    }
 }

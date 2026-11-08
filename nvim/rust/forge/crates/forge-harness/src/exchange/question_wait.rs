@@ -431,6 +431,3 @@ impl Drop for QuestionWaits {
         self.owner_closed.send_replace(true);
     }
 }
-
-#[cfg(test)]
-mod tests {}

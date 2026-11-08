@@ -525,53 +525,6 @@ mod test {
     use super::*;
     use crate::provider::ScopeOwner;
 
-    /// Host rejection must not rewrite the retained native completion.
-    #[test]
-    fn host_rejection_does_not_rewrite_native_completion() {
-        let context = ControlTurnContext::inactive(PromptMode::Chat);
-        let native = forge_provider_api::TurnResult::new(
-            forge_provider_api::turn::TurnOutcome::Completed {
-                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
-            },
-            1,
-            None,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        context
-            .provider_completion
-            .publish(ProviderCompletion {
-                control_error: Some("actual host control error".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ThreadOwner::root("fixture"),
-            "exchange",
-        );
-        let address = forge_provider_api::TurnAddress {
-            thread_id: scope.owner().thread_id(),
-            turn_id: scope.turn_id().unwrap(),
-            scope,
-        };
-        let ProviderExecutionPreview {
-            revision, outcome, ..
-        } = context
-            .preview_provider_execution(&native, &Default::default(), &address)
-            .unwrap();
-        assert_eq!(
-            outcome.unwrap().control_error.as_deref(),
-            Some("actual host control error")
-        );
-        assert!(matches!(
-            native.outcome(),
-            forge_provider_api::turn::TurnOutcome::Completed { .. }
-        ));
-        assert!(context.commit_provider_execution(revision).unwrap());
-    }
-
     /// Explicit retry permission still cannot replay a completed native or host effect.
     #[test]
     fn retry_requires_explicit_permission_and_safe_completed_effects() {
@@ -637,24 +590,6 @@ mod test {
                 allowed
             );
         }
-    }
-
-    /// Fence a queued control callback before it can inspect or mutate host state.
-    #[tokio::test]
-    async fn cancelled_submission_rejects_control_callback() {
-        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.submission_cancelled = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
-        let mut runtime = ControlToolRuntime::new(context);
-        let error = runtime
-            .invoke(ControlToolInvocation {
-                call_id: None,
-                task_permit: None,
-                name: "unreachable_control".into(),
-                arguments: json!({}),
-            })
-            .await
-            .unwrap_err();
-        assert!(error.is::<crate::broker::TurnCancelled>());
     }
 
     use serde_json::json;

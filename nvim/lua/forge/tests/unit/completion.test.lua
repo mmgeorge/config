@@ -1,37 +1,37 @@
--- Unit tests for `forge.completion` (completion.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "forge_completion", run = function()
-vim.loader.enable(false)
-local completion = require("forge.completion")
-local original_schedule, original_notify, original_now = vim.schedule, vim.notify, vim.uv.now
----@type (fun())[]
-local scheduled = {}
----@type string[]
-local notices = {}
-local now = 1000
-vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
-vim.notify = function(message) notices[#notices + 1] = message end
-vim.uv.now = function() return now end
+-- Unit tests for `forge.completion` (completion.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local eq = MiniTest.expect.equality
 
-local function drain()
-  local count = 0
-  while #scheduled > 0 do
-    count = count + 1
-    assert(count < 100, "completion scheduled an unbounded callback chain")
-    table.remove(scheduled, 1)()
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["forge_completion"] = function()
+  local completion = require("forge.completion")
+  ---@type (fun())[]
+  local scheduled = {}
+  local now = 1000
+  vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+  local notices = notify.capture()
+  vim.uv.now = function() return now end
+
+  local function drain()
+    local count = 0
+    while #scheduled > 0 do
+      count = count + 1
+      assert(count < 100, "completion scheduled an unbounded callback chain")
+      table.remove(scheduled, 1)()
+    end
   end
-end
 
----@param revision integer
----@param values string[]
----@param generation? string
----@return ForgeCompletionSnapshot
-local function snapshot(revision, values, generation)
-  return { identity = "repository", generation = generation or "host-one", revision = revision, values = values, truncated = false }
-end
+  ---@param revision integer
+  ---@param values string[]
+  ---@param generation? string
+  ---@return ForgeCompletionSnapshot
+  local function snapshot(revision, values, generation)
+    return { identity = "repository", generation = generation or "host-one", revision = revision, values = values, truncated = false }
+  end
 
-local ok, failure = xpcall(function()
   local requests = 0
   ---@type ForgeCompletionDone?
   local respond
@@ -46,18 +46,18 @@ local ok, failure = xpcall(function()
   assert(requests == 1 and respond)
   respond(snapshot(1, { "alpha", "beta", "origin/main" }), nil)
   drain()
-  assert(vim.deep_equal(completion.values(cache, "o"), { "origin/main" }))
+  eq(completion.values(cache, "o"), { "origin/main" })
   for _ = 1, 100 do completion.values(cache, "b") end
   assert(requests == 1 and #scheduled == 0, "warm completion scheduled repository work")
 
   completion.invalidate(cache)
-  assert(vim.deep_equal(completion.values(cache, "a"), { "alpha" }))
+  eq(completion.values(cache, "a"), { "alpha" })
   drain()
   local previous = cache.snapshot
   respond(nil, "Git fixture failed")
   drain()
   assert(cache.snapshot == previous and cache.pending == nil)
-  assert(notices[#notices]:find("Git fixture failed", 1, true))
+  assert(notices[#notices].message:find("Git fixture failed", 1, true))
   completion.values(cache, "")
   assert(#scheduled == 0, "failed refresh retried before its backoff")
   now = now + 1000
@@ -90,7 +90,7 @@ local ok, failure = xpcall(function()
   respond(snapshot(4, { "outdated" }), nil)
   drain()
   assert(cache.snapshot == accepted and cache.stale)
-  assert(notices[#notices]:find("repository invalidation", 1, true))
+  assert(notices[#notices].message:find("repository invalidation", 1, true))
 
   completion.values(cache, "")
   drain()
@@ -100,7 +100,7 @@ local ok, failure = xpcall(function()
   old_response(snapshot(4, { "outdated" }), nil)
   drain()
   assert(cache.snapshot == nil)
-  assert(notices[#notices]:find("superseded host generation", 1, true))
+  assert(notices[#notices].message:find("superseded host generation", 1, true))
   assert(completion.replace(cache, snapshot(1, { "raw-" .. string.char(255) }, "host-two")))
   assert(completion.values(cache, "raw-")[1] == "raw-" .. string.char(255))
 
@@ -115,21 +115,7 @@ local ok, failure = xpcall(function()
   completion.values(thrown, "")
   drain()
   assert(thrown.pending == nil and thrown.snapshot == nil)
-  assert(notices[#notices]:find("request launch failure", 1, true))
-end, debug.traceback)
-
-vim.schedule, vim.notify, vim.uv.now = original_schedule, original_notify, original_now
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  vim.cmd("qa!")
+  assert(notices[#notices].message:find("request launch failure", 1, true))
 end
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

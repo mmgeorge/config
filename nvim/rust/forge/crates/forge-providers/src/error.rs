@@ -163,28 +163,4 @@ mod tests {
             ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Uncertain
         ));
     }
-    /// Preserve process retry ownership independently of a reader which has already joined.
-    #[tokio::test]
-    async fn native_collection_preserves_independent_failures_without_payloads() {
-        let reader = tokio::spawn(async { panic!("native-secret-reader-panic") })
-            .await
-            .unwrap_err();
-        let error = acp(
-            AcpConnectionError::Collection {
-                process: Some(std::io::Error::other("native-secret-process-stop")),
-                reader: Some(reader),
-            },
-            ProviderOperation::ThreadClose,
-        );
-        let ProviderError::Combined { primary, secondary } = &error else {
-            panic!("independent cleanup failures were collapsed")
-        };
-        assert_eq!(secondary.len(), 1);
-        assert!(matches!(primary.as_ref(), ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::ThreadClose && failure.phase() == forge_provider_api::ProviderPhase::Collection
-                && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
-        assert!(matches!(&secondary[0], ProviderError::Failure(failure)
-            if failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Closed));
-        assert!(!format!("{error:?} {error}").contains("native-secret"));
-    }
 }

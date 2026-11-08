@@ -1,198 +1,209 @@
--- Integration tests for the `buffer` area. Each scenario row runs in its own headless Neovim:
--- `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`. Tests that launch the Forge host
--- assume `rust-build` has produced a current executable.
-local scenarios = {
-  { name = "document_host_generation", run = function()
-local fixture = dofile(vim.fn.getcwd() .. "/nvim/lua/forge/tests/support/status_fixture.lua")
-vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
-local generation, accepting = 1, true
-local requests, notices = {}, {}
-local subscription = {}
-local delayed
-vim.notify = function(message) notices[#notices + 1] = tostring(message) end
-package.loaded["forge.client"] = {
-  host_get_generation = function() return generation end,
-  host_is_accepting = function() return accepting end,
-  document_events_subscribe = function(document, callback)
-    subscription[document] = callback
-    return function() subscription[document] = nil end
-  end,
-  request = function(request_specification, callback)
-  local method = request_specification.method
-  local params = request_specification.params or {}
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local host = dofile("nvim/lua/forge/tests/support/host.lua")
+local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
+local status_fixture = dofile("nvim/lua/forge/tests/support/status_fixture.lua")
+local presentation_status = dofile("nvim/lua/forge/tests/support/presentation_status.lua")
 
-    assert(accepting, "document request resurrected a stopped host")
-    requests[#requests + 1] = { method, params.operation }
-    if params.operation == "open" then
-      local snapshot = { document = params.document, revision = 1, block = {
-        { id = "source", text = { "captured source" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
-      } }
-      if method == "repository.status.document" then callback(fixture.snapshot(params.document, { revision = 1 }))
-      else callback({ title = "HEAD", object = "HEAD", revision = "HEAD", snapshot = snapshot, more = false }) end
-    elseif params.operation == "refresh" then delayed = callback
-    elseif params.operation == "close_view" then callback(nil)
-    else callback({}) end
-  end,
-}
-local status = require("forge.status")
-local source = require("forge.source_document")
-local parent = status.open({ workspace = vim.fn.getcwd() })
-assert(vim.wait(1000, function() return parent.replica.status == "Applied" and not parent.request_active end))
-local child = source.open({ workspace = vim.fn.getcwd(), path = "history.txt", revision = "HEAD" })
-assert(vim.wait(1000, function() return vim.api.nvim_get_current_buf() == child.replica.buffer end))
-accepting = false
-local before = #requests
-source.close(child)
-assert(vim.wait(1000, function() return vim.api.nvim_get_current_buf() == parent.replica.buffer end))
-vim.wait(30, function() return false end)
-assert(#requests == before, "source close or status redisplay contacted a dead host")
-assert(#notices == 0, table.concat(notices, "\n"))
-generation, accepting = 2, true
-status.demand(parent)
-status.refresh(parent)
-assert(vim.wait(1000, function() return #notices > 0 end))
-assert(notices[#notices]:find("refresh or reopen", 1, true))
-assert(#requests == before, "stale status request reached the replacement host")
-local notice_count = #notices
-status.action(parent, "open")
-assert(#notices == notice_count + 1 and notices[#notices]:find("refresh or reopen", 1, true))
-status.close(parent)
-assert(vim.wait(1000, function() return not parent.request_active end))
-local replacement = status.open({ workspace = vim.fn.getcwd() })
-assert(vim.wait(1000, function() return replacement.replica.status == "Applied" and not replacement.request_active end))
-assert(replacement.host_generation == 2)
-status.refresh(replacement)
-assert(delayed)
-generation = 3
-delayed({ document = replacement.document, base = 1, next = 2 })
-assert(vim.wait(1000, function() return not replacement.request_active end))
-assert(replacement.replica.revision == 1, "old-generation response modified the replica")
-status.close(replacement)
-assert(vim.wait(1000, function() return not replacement.request_active end))
-local late_source = source.open({ workspace = vim.fn.getcwd(), path = "late.txt", revision = "HEAD" })
-generation = 4
-assert(vim.wait(1000, function() return not late_source.active end))
-assert(late_source.replica.status == "Closed", "late source open remained usable after host collection")
-assert(next(subscription) == nil, "closed status retained its document subscription")
-print("native document host generation lifecycle passed")
-  end },
-  { name = "markdown_viewport", run = function()
-vim.loader.enable(false)
-local data = vim.fn.stdpath("data")
-vim.opt.runtimepath:append(data .. "/site")
-vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
-vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
-require("render-markdown").setup(require("plugins.markdown")[1].opts())
-local client = require("forge.client")
-local requests = {}
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  requests[#requests + 1] = { params = params, callback = callback }
-end
-package.loaded["forge.views.harness.terminals"] = { watch = function() return { close = function() end } end }
-local markdown = require("forge.render.harness.markdown")
-local render, rendered = markdown.render, 0
-markdown.render = function(...)
-  rendered = rendered + 1
-  return render(...)
-end
--- Count sequence visits only inside Markdown viewport selection; other refresh observers, such as
--- the response reveal, walk the sequence for their own purposes.
-local viewport, markdown_visits = markdown.viewport, 0
-markdown.viewport = function(document, ...)
-  local before = document.sequence.visits
-  local range_list = viewport(document, ...)
-  markdown_visits = markdown_visits + document.sequence.visits - before
-  return range_list
-end
-local transcript = vim.api.nvim_create_buf(false, true)
-local composer = vim.api.nvim_create_buf(false, true)
-local window = vim.api.nvim_get_current_win()
-vim.api.nvim_win_set_buf(window, transcript)
-local owner = require("forge.views.harness.presentation").open({ session_id = "markdown-viewport",
-  transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
-  is_alive = function() return true end, notice = function(message) error(message) end,
-}, function(value, failure) assert(value, failure) end)
-local block = {}
-for index = 1, 3000 do
-  local text = {}
-  for row = 1, 10 do text[row] = "settled row " .. index .. ":" .. row end
-  block[index] = { id = "history:" .. index, text = text,
-    metadata = { target = {}, decoration = {}, editable_region = {}, fold = {}, markdown = index == 1 or index == 3000 } }
-end
-block[1].text[1], block[3000].text[1] = "# First message", "# Last message"
-requests[1].callback({ transcript = { document = owner.document, revision = 0, block = block } })
-assert(vim.wait(10000, function() return owner.ready end, 1), "snapshot did not settle")
-vim.cmd("redraw")
-assert(owner.markdown_ranges[1].id == "history:1" and #owner.markdown_ranges == 1)
-for revision = 1, 100 do
-  markdown_visits = 0
-  local count = #requests
-  owner.sync()
-  assert(vim.wait(1000, function() return #requests > count end, 1), "refresh did not leave the frame queue")
-  requests[#requests].callback({ patch = { {
-    document = owner.document, base = revision - 1, next = revision,
-    base_rows = 30000, next_rows = 30000, base_blocks = 3000, next_blocks = 3000,
-    block_edit = {}, removed_block = {}, metadata_edit = {},
-    text_edit = { { start_row = 29999, removed_rows = 1, text = { "output " .. revision } } },
-  } } })
-  assert(owner.transcript.revision == revision)
-  assert(markdown_visits < 300, "Markdown traversed off-screen history")
-end
--- Every buffer change re-renders the visible Markdown, because an edit outside a message can
--- extend Tree-sitter's included region at its boundary; only the newly visible range is checked.
-local rendered_before_scroll = rendered
-vim.api.nvim_win_set_cursor(window, { 29991, 0 })
-vim.cmd("normal! zt")
-vim.api.nvim_exec_autocmds("CursorMoved", { buffer = transcript })
-assert(vim.wait(1000, function() return owner.markdown_ranges[1].id == "history:3000" end, 1))
-assert(rendered > rendered_before_scroll, "scrolling did not render the newly visible message")
-vim.cmd("split")
-local second = vim.api.nvim_get_current_win()
-owner.views[second] = require("forge.input").open(owner.transcript, second)
-vim.api.nvim_win_set_cursor(second, { 1, 0 })
-vim.cmd("normal! zt")
-owner.resize()
-assert(#owner.markdown_ranges == 2, "split windows lost one visible Markdown region")
-assert(owner.markdown_ranges[1].id == "history:1" and owner.markdown_ranges[2].id == "history:3000")
-owner.close()
-print("markdown_viewport OK: 30,000 rows, 100 retained-message updates, scrolling and splits")
-vim.cmd("qa!")
-  end },
-  { name = "row_prefix", run = function()
-vim.loader.enable(false)
-local replica = require("forge.buffer")
-local gutter = require("forge.gutter")
-local commands = require("forge.document_commands")
-local owner = replica.open("row-prefix")
-local selection, clipboard
-local original_clipboard = vim.g.clipboard
-vim.g.clipboard = { name = "Prefix fixture", copy = {
-  ["+"] = function(lines) clipboard = lines end, ["*"] = function() end,
-}, paste = { ["+"] = function() return { {}, "V" } end, ["*"] = function() return { {}, "V" } end } }
+T["document_host_generation"] = function()
+  local generation, accepting = 1, true
+  local requests = {}
+  local notices = notify.capture()
+  local subscription = {}
+  local delayed
+  package.loaded["forge.client"] = {
+    host_get_generation = function() return generation end,
+    host_is_accepting = function() return accepting end,
+    document_events_subscribe = function(document, callback)
+      subscription[document] = callback
+      return function() subscription[document] = nil end
+    end,
+    request = function(request_specification, callback)
+    local method = request_specification.method
+    local params = request_specification.params or {}
 
-local function metadata(text, indent, source_indent)
-  local result = { target = {}, decoration = {}, editable_region = {},
-    layout = { indent = indent, source_indent = source_indent }, gutter = {} }
-  for row = 0, #text - 1 do
-    result.gutter[#result.gutter + 1] = { position = { row = row, column = 0 }, priority = 100,
-      chunk = { { text = "  8 ", capture = "LineNr" }, { text = "+ ", capture = "DiffAdd" } } }
+      assert(accepting, "document request resurrected a stopped host")
+      requests[#requests + 1] = { method, params.operation }
+      if params.operation == "open" then
+        local snapshot = { document = params.document, revision = 1, block = {
+          { id = "source", text = { "captured source" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+        } }
+        if method == "repository.status.document" then callback(status_fixture.snapshot(params.document, { revision = 1 }))
+        else callback({ title = "HEAD", object = "HEAD", revision = "HEAD", snapshot = snapshot, more = false }) end
+      elseif params.operation == "refresh" then delayed = callback
+      elseif params.operation == "close_view" then callback(nil)
+      else callback({}) end
+    end,
+  }
+  local status = require("forge.status")
+  local source = require("forge.source_document")
+  local parent = status.open({ workspace = vim.fn.getcwd() })
+  wait_until(function() return parent.replica.status == "Applied" and not parent.request_active end,
+    "status document did not apply its first snapshot")
+  local child = source.open({ workspace = vim.fn.getcwd(), path = "history.txt", revision = "HEAD" })
+  wait_until(function() return vim.api.nvim_get_current_buf() == child.replica.buffer end,
+    "source document did not become the current buffer")
+  accepting = false
+  local before = #requests
+  source.close(child)
+  wait_until(function() return vim.api.nvim_get_current_buf() == parent.replica.buffer end,
+    "closing the source did not redisplay the status document")
+  vim.wait(30, function() return false end, 5)
+  assert(#requests == before, "source close or status redisplay contacted a dead host")
+  notices:assert_none()
+  generation, accepting = 2, true
+  status.demand(parent)
+  status.refresh(parent)
+  wait_until(function() return #notices > 0 end, "stale status refresh did not report the replaced host")
+  assert(notices[#notices].message:find("refresh or reopen", 1, true))
+  assert(#requests == before, "stale status request reached the replacement host")
+  local notice_count = #notices
+  status.action(parent, "open")
+  assert(#notices == notice_count + 1 and notices[#notices].message:find("refresh or reopen", 1, true))
+  status.close(parent)
+  wait_until(function() return not parent.request_active end, "closing the stale status did not settle")
+  local replacement = status.open({ workspace = vim.fn.getcwd() })
+  wait_until(function() return replacement.replica.status == "Applied" and not replacement.request_active end,
+    "replacement status document did not apply its snapshot")
+  assert(replacement.host_generation == 2)
+  status.refresh(replacement)
+  assert(delayed)
+  generation = 3
+  delayed({ document = replacement.document, base = 1, next = 2 })
+  wait_until(function() return not replacement.request_active end, "old-generation refresh response did not settle")
+  assert(replacement.replica.revision == 1, "old-generation response modified the replica")
+  status.close(replacement)
+  wait_until(function() return not replacement.request_active end, "closing the replacement status did not settle")
+  local late_source = source.open({ workspace = vim.fn.getcwd(), path = "late.txt", revision = "HEAD" })
+  generation = 4
+  wait_until(function() return not late_source.active end, "late source open did not settle after host collection")
+  assert(late_source.replica.status == "Closed", "late source open remained usable after host collection")
+  assert(next(subscription) == nil, "closed status retained its document subscription")
+end
+
+T["markdown_viewport"] = function()
+  local data = vim.fn.stdpath("data")
+  vim.opt.runtimepath:append(data .. "/site")
+  vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+  vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
+  require("render-markdown").setup(require("plugins.markdown")[1].opts())
+  local client = require("forge.client")
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+
+    callback = presentation_status(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
   end
-  return result
-end
-
-local function inline_marks()
-  local result = {}
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(owner.buffer, owner.namespace, 0, -1, { details = true })) do
-    if mark[4].virt_text_pos == "inline" then result[mark[2]] = (result[mark[2]] or 0) + 1 end
+  package.loaded["forge.views.harness.terminals"] = { watch = function() return { close = function() end } end }
+  local markdown = require("forge.render.harness.markdown")
+  local render, rendered = markdown.render, 0
+  markdown.render = function(...)
+    rendered = rendered + 1
+    return render(...)
   end
-  return result
+  -- Count sequence visits only inside Markdown viewport selection; other refresh observers, such as
+  -- the response reveal, walk the sequence for their own purposes.
+  local viewport, markdown_visits = markdown.viewport, 0
+  markdown.viewport = function(document, ...)
+    local before = document.sequence.visits
+    local range_list = viewport(document, ...)
+    markdown_visits = markdown_visits + document.sequence.visits - before
+    return range_list
+  end
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({ session_id = "markdown-viewport",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) error(message) end,
+  }, function(value, failure) assert(value, failure) end)
+  local block = {}
+  for index = 1, 3000 do
+    local text = {}
+    for row = 1, 10 do text[row] = "settled row " .. index .. ":" .. row end
+    block[index] = { id = "history:" .. index, text = text,
+      metadata = { target = {}, decoration = {}, editable_region = {}, fold = {}, markdown = index == 1 or index == 3000 } }
+  end
+  block[1].text[1], block[3000].text[1] = "# First message", "# Last message"
+  requests[1].callback({ transcript = { document = owner.document, revision = 0, block = block } })
+  wait_until(function() return owner.ready end, "snapshot did not settle", { timeout_ms = 4000 })
+  vim.cmd("redraw")
+  assert(owner.markdown_ranges[1].id == "history:1" and #owner.markdown_ranges == 1)
+  for revision = 1, 100 do
+    markdown_visits = 0
+    local count = #requests
+    owner.sync()
+    wait_until(function() return #requests > count end, "refresh did not leave the frame queue")
+    requests[#requests].callback({ patch = { {
+      document = owner.document, base = revision - 1, next = revision,
+      base_rows = 30000, next_rows = 30000, base_blocks = 3000, next_blocks = 3000,
+      block_edit = {}, removed_block = {}, metadata_edit = {},
+      text_edit = { { start_row = 29999, removed_rows = 1, text = { "output " .. revision } } },
+    } } })
+    assert(owner.transcript.revision == revision)
+    assert(markdown_visits < 300, "Markdown traversed off-screen history")
+  end
+  -- Every buffer change re-renders the visible Markdown, because an edit outside a message can
+  -- extend Tree-sitter's included region at its boundary; only the newly visible range is checked.
+  local rendered_before_scroll = rendered
+  vim.api.nvim_win_set_cursor(window, { 29991, 0 })
+  vim.cmd("normal! zt")
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = transcript })
+  wait_until(function() return owner.markdown_ranges[1].id == "history:3000" end,
+    "scrolling did not select the last message's Markdown range")
+  assert(rendered > rendered_before_scroll, "scrolling did not render the newly visible message")
+  vim.cmd("split")
+  local second = vim.api.nvim_get_current_win()
+  owner.views[second] = require("forge.input").open(owner.transcript, second)
+  vim.api.nvim_win_set_cursor(second, { 1, 0 })
+  vim.cmd("normal! zt")
+  owner.resize()
+  assert(#owner.markdown_ranges == 2, "split windows lost one visible Markdown region")
+  assert(owner.markdown_ranges[1].id == "history:1" and owner.markdown_ranges[2].id == "history:3000")
+  owner.close()
 end
 
-local ok, failure = xpcall(function()
+T["row_prefix"] = function()
+  local replica = require("forge.buffer")
+  local gutter = require("forge.gutter")
+  local commands = require("forge.document_commands")
+  local owner = replica.open("row-prefix")
+  local selection, clipboard
+  vim.g.clipboard = { name = "Prefix fixture", copy = {
+    ["+"] = function(lines) clipboard = lines end, ["*"] = function() end,
+  }, paste = { ["+"] = function() return { {}, "V" } end, ["*"] = function() return { {}, "V" } end } }
+
+  local function metadata(text, indent, source_indent)
+    local result = { target = {}, decoration = {}, editable_region = {},
+      layout = { indent = indent, source_indent = source_indent }, gutter = {} }
+    for row = 0, #text - 1 do
+      result.gutter[#result.gutter + 1] = { position = { row = row, column = 0 }, priority = 100,
+        chunk = { { text = "  8 ", capture = "LineNr" }, { text = "+ ", capture = "DiffAdd" } } }
+    end
+    return result
+  end
+
+  local function inline_marks()
+    local result = {}
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(owner.buffer, owner.namespace, 0, -1, { details = true })) do
+      if mark[4].virt_text_pos == "inline" then result[mark[2]] = (result[mark[2]] or 0) + 1 end
+    end
+    return result
+  end
+
+  MiniTest.finally(function()
+    if selection then pcall(selection.close) end
+    pcall(replica.close, owner)
+  end)
   vim.api.nvim_set_current_buf(owner.buffer)
   vim.wo.virtualedit = "all"
   selection = commands.attach_selection(owner, { normalize = true })
@@ -217,7 +228,7 @@ local ok, failure = xpcall(function()
       vim.cmd("normal! yy")
       assert(vim.fn.getreg('"') == source .. "\n", "ordinary yank included UI decoration")
       selection.start()
-      vim.fn.maparg("<Space>l", "x", false, true).callback()
+      keymap.invoke("<Space>l", { mode = "x" })
       assert(vim.deep_equal(clipboard, { expected .. source, "" }), "copy omitted or duplicated prefix")
     end
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(owner.buffer, 0, -1, true), text), "layout changed source bytes")
@@ -237,7 +248,7 @@ local ok, failure = xpcall(function()
   assert(bounds.insertion[2].position.column == 2 and bounds.insertion[2].width == 2)
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
   selection.start()
-  vim.fn.maparg("<Space>l", "x", false, true).callback()
+  keymap.invoke("<Space>l", { mode = "x" })
   assert(clipboard[1] == "  8 +   → already indented", "nonzero source insertion moved")
 
   local updated = metadata({ "tail", "more" }, 6)
@@ -267,19 +278,13 @@ local ok, failure = xpcall(function()
   assert(replica.set_expansion(owner, "body", true))
   assert(owner.row_count == 3 and gutter.bounds(owner, 2).width == 10 and inline_marks()[1] == 1,
     "fold rematerialization lost the shared prefix")
-end, debug.traceback)
-if selection then selection.close() end
-replica.close(owner)
-vim.g.clipboard = original_clipboard
-assert(ok, failure)
 
-local runtime = vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p"))
-local job = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
-assert(job > 0)
-local function run(source, arguments) return vim.rpcrequest(job, "nvim_exec_lua", source, arguments or {}) end
-ok, failure = xpcall(function()
-  vim.rpcrequest(job, "nvim_ui_attach", 44, 16, { rgb = true })
-  run([[
+  local runtime = vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p"))
+  local child = MiniTest.new_child_neovim()
+  child.start()
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.api.nvim_ui_attach(44, 16, { rgb = true })
+  child.lua([[
     local runtime = ...
     vim.opt.rtp:prepend(runtime)
     vim.o.laststatus, vim.o.showtabline, vim.o.showmode, vim.o.ruler = 0, 0, false, false
@@ -291,10 +296,10 @@ ok, failure = xpcall(function()
     vim.api.nvim_set_hl(0, "DiffAdd", { fg = 0x00ff00, bg = 0x002800 })
   ]], { runtime })
   for _, width in ipairs({ 32, 60 }) do
-    vim.rpcrequest(job, "nvim_ui_try_resize", width, 16)
+    child.api.nvim_ui_try_resize(width, 16)
     for _, wrapped in ipairs({ false, true }) do
       for _, indent in ipairs({ 2, 4, 6 }) do
-        local screen = run([[
+        child.lua([[
           local indent, wrapped = ...
           vim.wo.wrap = wrapped
           local text = { "pub struct Player;", "    nested source line with several words and a long wrapped ending" }
@@ -310,14 +315,10 @@ ok, failure = xpcall(function()
             revision = (fixture.revision or 0) + 1, block = { { id = "source", text = text, metadata = metadata } } }).kind == "Applied")
           vim.cmd("normal! gg0")
           vim.cmd("redraw!")
-          local rows = {}
-          for row = 1, 4 do
-            local cells = {}
-            for column = 1, vim.o.columns do cells[#cells + 1] = vim.fn.screenstring(row, column) end
-            rows[row] = table.concat(cells)
-          end
-          return rows
         ]], { indent, wrapped })
+        local screenshot = child.get_screenshot()
+        local screen = {}
+        for row = 1, 4 do screen[row] = table.concat(screenshot.text[row]) end
         assert(vim.trim(screen[1]) == "8 + pub struct Player;", "gutter split source from indentation: " .. vim.inspect(screen))
         assert(screen[1]:sub(1, indent + 4) == string.rep(" ", indent - 2) .. "  8 + ",
           "outer indentation followed the gutter: " .. screen[1])
@@ -325,65 +326,30 @@ ok, failure = xpcall(function()
           assert(not screen[3]:find("8 +", 1, true), "wrapped continuation repeated line number")
         end
       end
+    end
   end
-  end
-end, debug.traceback)
-vim.fn.jobstop(job)
-assert(ok, failure)
-print("row_prefix: shared rendering, cursor, copy, replacement, folds, and wrapping passed")
-vim.cmd("qa!")
-  end },
-  { name = "source", run = function()
-vim.loader.enable(false)
+end
 
-local root = vim.fs.normalize(vim.fn.getcwd())
-local fixture = vim.fn.tempname()
-local data_directory = vim.fn.tempname()
-assert(vim.fn.mkdir(fixture, "p") == 1)
-local executable_name = "forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
-local build = require("forge.builder").binary_path()
-assert(vim.fn.executable(build) == 1, "build the selected Forge host before this integration test")
-assert(vim.fn.mkdir(data_directory, "p") == 1)
-local executable = data_directory .. "/" .. executable_name
--- Launch the shared pinned executable lease rather than a freshly scanned per-run copy.
-executable = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
-local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind)
-  if kind == "data" then return data_directory end
-  return original_stdpath(kind)
-end
-package.loaded["forge.builder"] = {
-  ensure = function(callback)
-    vim.schedule(function() callback({ ok = true, path = executable }) end)
-    return function() end
-  end,
-}
-local client = require("forge.client")
-client._host_set_launcher_for_test(vim.system)
-local source = require("forge.source_document")
-local notices, state = {}, nil
-local function git(arguments)
-  local command = { "git", "-C", fixture }
-  vim.list_extend(command, arguments)
-  local result = vim.system(command, { text = true, timeout = 10000 }):wait()
-  assert(result.code == 0, result.stderr)
-end
-local ok, failure = xpcall(function()
-  git({ "init", "--quiet" })
-  git({ "config", "user.name", "Forge Fixture" })
-  git({ "config", "user.email", "forge@example.test" })
+T["source"] = function()
+  local source, state
+  -- Close the source and stop the host before the temporary directories registered below are deleted.
+  MiniTest.finally(function()
+    if state then pcall(source.close, state) end
+    pcall(host.stop)
+  end)
+  local client = host.start().client
+  source = require("forge.source_document")
+  local notices = {}
   local lines = {}
   for index = 1, 700 do lines[index] = ("local value_%d = %d"):format(index, index) end
-  assert(vim.fn.writefile(lines, fixture .. "/source file.lua") == 0)
-  git({ "add", "source file.lua" })
-  git({ "commit", "--quiet", "-m", "Source fixture" })
+  local fixture = git_repository.create({ files = { ["source file.lua"] = lines }, message = "Source fixture" }).path
   local origin = vim.api.nvim_get_current_buf()
   state = source.open({ workspace = fixture, path = "source file.lua", revision = "HEAD", line = 700,
     is_current = function() return vim.api.nvim_get_current_buf() == origin end,
     on_error = function(message) notices[#notices + 1] = tostring(message) end })
-  assert(vim.wait(10000, function()
-    return #notices > 0 or (state.replica.status == "Applied" and state.replica.row_count == 700 and not state.more)
-  end, 10), "source delivery did not finish")
+  wait_until(function()
+    return state.replica.status == "Applied" and state.replica.row_count == 700 and not state.more
+  end, "source delivery did not finish", { timeout_ms = 4000, errors = notices })
   assert(#notices == 0, table.concat(notices, "\n"))
   assert(vim.api.nvim_get_current_buf() == state.replica.buffer, "source did not bind its initiating window")
   assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, true), lines), "native source rows changed")
@@ -396,7 +362,8 @@ local ok, failure = xpcall(function()
     function(result, request_failure)
       if request_failure then notices[#notices + 1] = tostring(request_failure) else snapshot = result end
     end)
-  assert(vim.wait(3000, function() return snapshot ~= nil or #notices > 0 end, 10), "native source snapshot did not arrive")
+  wait_until(function() return snapshot ~= nil end, "native source snapshot did not arrive",
+    { timeout_ms = 3000, errors = notices })
   assert(#notices == 0, table.concat(notices, "\n"))
   assert(snapshot.document == state.document and snapshot.revision == state.replica.revision)
   assert(snapshot.more == false and snapshot.diff_view == nil, "plain source snapshot acquired diff controls")
@@ -405,26 +372,9 @@ local ok, failure = xpcall(function()
   assert(vim.deep_equal(captured, lines), "source recovery snapshot differs from captured rows")
   local closed = false
   source.close(state, function() closed = true end)
-  assert(vim.wait(3000, function() return closed end, 10), "native source close did not settle")
+  wait_until(function() return closed end, "native source close did not settle", { timeout_ms = 3000 })
   state = nil
-end, debug.traceback)
-if state then source.close(state) end
-client.host_stop()
-local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
-vim.fn.stdpath = original_stdpath
-vim.fn.delete(fixture, "rf")
-vim.fn.delete(data_directory, "rf")
-if not ok or not collected then
-  vim.api.nvim_err_writeln(failure or "source host process was not collected")
-  vim.cmd("cquit 1")
+  assert(host.stop(), "source host process was not collected")
 end
-print("source_host OK: 700 exact rows, multiple native batches, no Harness session")
-vim.cmd("qa!")
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

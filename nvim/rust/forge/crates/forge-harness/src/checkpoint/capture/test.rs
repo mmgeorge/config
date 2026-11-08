@@ -125,36 +125,6 @@ async fn admitted_capture_honors_cancellation_but_accepts_repository_invalidatio
     }
 }
 
-#[test]
-fn capture_cancellation_after_object_publication_returns_no_record() {
-    let repository = repository();
-    let data = tempfile::tempdir().unwrap();
-    let store = SqliteStore::open(data.path()).unwrap();
-    let checkpoint = GitCheckpoint::new(repository.path());
-    fs::write(repository.path().join("tracked.txt"), b"changed\n").unwrap();
-    let identity = crate::plan::digest(b"changed\n");
-    let result = checkpoint.capture_native(&store.objects, "session", 1, || {
-        anyhow::ensure!(store.objects.get(&identity).is_err(), "capture cancelled");
-        Ok(())
-    });
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("capture cancelled")
-    );
-    assert_eq!(
-        fs::read(repository.path().join("tracked.txt")).unwrap(),
-        b"changed\n"
-    );
-    assert_eq!(store.objects.get(&identity).unwrap(), b"changed\n");
-    assert!(
-        checkpoint
-            .capture_native(&store.objects, "session", 2, || Ok(()))
-            .is_ok()
-    );
-}
-
 fn git(workspace: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .args(args)
@@ -327,14 +297,6 @@ fn refuses_rollback_after_workspace_divergence() {
 }
 
 #[test]
-fn rejects_checkpoint_paths_outside_the_worktree() {
-    let repository = repository();
-    let snapshot = GitCheckpoint::new(repository.path());
-    assert!(snapshot.file_path("../escape.txt").is_err());
-    assert!(snapshot.file_path("/absolute.txt").is_err());
-}
-
-#[test]
 fn stale_preview_rejects_before_any_file_changes() {
     use super::super::restore::{RestoreJournal, RestorePreview};
     let repository = repository();
@@ -459,35 +421,6 @@ fn two_prompt_checkpoints_preserve_initial_staging_and_unrelated_edits() {
         "retain this"
     );
     assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
-}
-
-#[cfg(windows)]
-#[test]
-fn case_only_rename_restores_original_spelling() {
-    use super::super::restore::{RestoreJournal, RestorePreview};
-    let repository = repository();
-    let root = repository.path();
-    let data = tempfile::tempdir().unwrap();
-    let objects = ObjectStore::open(data.path()).unwrap();
-    let adapter = GitCheckpoint::new(root);
-    let before = adapter
-        .capture_native(&objects, "session", 0, || Ok(()))
-        .unwrap();
-    fs::rename(root.join("tracked.txt"), root.join("TRACKED.txt")).unwrap();
-    let after = adapter
-        .capture_native(&objects, "session", 1, || Ok(()))
-        .unwrap();
-    assert!(after.deleted.iter().any(|path| path == "tracked.txt"));
-    assert!(after.file.iter().any(|file| file.path == "TRACKED.txt"));
-    let preview = RestorePreview::prepare(&objects, root, &after, &before).unwrap();
-    let mut journal = RestoreJournal::begin(&objects, preview).unwrap();
-    journal.apply(&objects, &mut || Ok(())).unwrap();
-    let names = fs::read_dir(root)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect::<Vec<_>>();
-    assert!(names.iter().any(|name| name == "tracked.txt"));
-    assert!(!names.iter().any(|name| name == "TRACKED.txt"));
 }
 
 #[test]

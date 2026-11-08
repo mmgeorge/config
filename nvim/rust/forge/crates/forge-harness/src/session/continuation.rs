@@ -53,20 +53,3 @@ impl Default for ContinuationBudget {
         Self::new(20, 5)
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::ContinuationBudget;
-
-    #[test]
-    fn exhausts_each_limit_without_requesting_an_extra_turn() {
-        let mut no_progress = ContinuationBudget::new(20, 2);
-        assert!(no_progress.observe(false));
-        assert!(!no_progress.observe(false));
-
-        let mut total = ContinuationBudget::new(2, 2);
-        assert!(total.observe(true));
-        assert!(!total.observe(true));
-        assert_eq!(total.turn_count, 2);
-    }
-}

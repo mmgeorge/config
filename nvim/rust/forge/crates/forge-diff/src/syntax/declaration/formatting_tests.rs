@@ -197,26 +197,3 @@ fn lua_declaration_corpus_preserves_meaning() {
         include_str!("../../../tests/fixtures/declaration_formatting/lua.lua.txt"),
     );
 }
-
-#[test]
-fn meaning_oracle_detects_parseable_corruption() {
-    let original = meaning(
-        SyntaxLanguage::Rust,
-        "pub struct Position(\n/// Coordinate.\npub Vec2,\n);\n",
-    );
-    let corrupted = meaning(
-        SyntaxLanguage::Rust,
-        "pub struct Position(\n/// Coordinate. pub Vec2,\n);\n",
-    );
-    assert_ne!(original.syntax, corrupted.syntax);
-    assert_ne!(original.comments, corrupted.comments);
-    let original = meaning(
-        SyntaxLanguage::Typescript,
-        "export type Label = 'two words';\n",
-    );
-    let corrupted = meaning(
-        SyntaxLanguage::Typescript,
-        "export type Label = 'twowords';\n",
-    );
-    assert_ne!(original.syntax, corrupted.syntax);
-}

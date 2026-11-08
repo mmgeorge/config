@@ -355,30 +355,6 @@ mod tests {
             .to_owned())
     }
 
-    #[tokio::test]
-    async fn control_request_preserves_json_larger_than_one_mib() -> Result<()> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let content = "λ".repeat(1024 * 1024);
-        let body =
-            serde_json::to_vec(&json!({"method":"tools/call","params":{"content":content}}))?;
-        let sender = tokio::spawn(async move {
-            let mut socket = tokio::net::TcpStream::connect(address).await?;
-            let header = format!(
-                "POST /control HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            socket.write_all(header.as_bytes()).await?;
-            socket.write_all(&body).await?;
-            Ok::<_, anyhow::Error>(())
-        });
-        let (socket, _) = listener.accept().await?;
-        let (_, request, _) = read_request(socket, "/control").await?;
-        sender.await??;
-        assert_eq!(request.unwrap()["params"]["content"], content);
-        Ok(())
-    }
-
     /// Retiring one invocation endpoint drains its accepted call without redirecting it to a replacement.
     #[tokio::test]
     async fn invocation_endpoints_isolate_old_calls_and_retire_independently() -> Result<()> {

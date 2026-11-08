@@ -1,20 +1,21 @@
--- Unit tests for `forge.protocol` (protocol.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "contract", run = function()
-vim.loader.enable(false)
-local protocol = require("forge.protocol")
-local function decode(value)
-  local result, failure = protocol.decode_message(vim.json.encode(value))
-  assert(result, failure)
-  return result
-end
-local function reject(value)
-  local result, failure = protocol.decode_message(vim.json.encode(value))
-  assert(not result and failure:find("Invalid Forge host message", 1, true))
-end
+-- Unit tests for `forge.protocol` (protocol.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
-local ok, failure = xpcall(function()
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["contract"] = function()
+  local protocol = require("forge.protocol")
+  local function decode(value)
+    local result, failure = protocol.decode_message(vim.json.encode(value))
+    assert(result, failure)
+    return result
+  end
+  local function reject(value)
+    local result, failure = protocol.decode_message(vim.json.encode(value))
+    assert(not result and failure:find("Invalid Forge host message", 1, true))
+  end
+
   decode({ session_id = "session", event = "provider_event", payload = { kind = "approval_requested", data = {request_id = "approval", execution_kind = "managed"} } })
   reject({ session_id = "session", event = "provider_event", payload = { kind = "approval_requested", data = {id = "obsolete"} } })
 
@@ -57,13 +58,6 @@ local ok, failure = xpcall(function()
   reject({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = vim.NIL, token = "2", state = "accepted" },
   } })
-end, debug.traceback)
-if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

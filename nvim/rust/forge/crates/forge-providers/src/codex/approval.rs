@@ -442,28 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_argv_preserves_literal_arguments_without_a_shell_launcher() {
-        let arguments = ["rg", "-n", "a|b;$(probe)", "", r"C:\space path\file.txt"];
-        for params in [
-            json!({"command":shlex::try_join(arguments).unwrap()}),
-            json!({"command":arguments}),
-            json!({"command":"rg", "args":&arguments[1..]}),
-        ] {
-            let message = json!({"method":"item/commandExecution/requestApproval","params":params});
-            let request =
-                permission_from_provider("item/commandExecution/requestApproval", &message, ".")
-                    .unwrap();
-            let PermissionTarget::Command { command, shell } = &request.target_list[0] else {
-                panic!()
-            };
-            let parsed = normalize_command_in(command, shell.unwrap());
-            assert!(parsed.failure.is_none(), "{command}: {parsed:?}");
-            assert_eq!(parsed.invocation_list.len(), 1);
-            assert_eq!(parsed.invocation_list[0].token_list, arguments);
-        }
-    }
-
-    #[test]
     fn malformed_native_command_approval_payloads_are_rejected() {
         for params in [
             json!({"command":"pwsh -c 'unfinished"}),

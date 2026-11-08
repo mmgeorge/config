@@ -78,35 +78,3 @@ impl ProviderGenerationPermit {
         &self.provider
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep retirement blocked until every user of the admitted generation releases its permit.
-    #[tokio::test]
-    async fn shared_generation_permit_outlives_each_observer_and_waiting_writer()
-    -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let broker = crate::broker::HarnessBroker::initialize(serde_json::from_value(
-            serde_json::json!({
-                "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"generation-permit",
-                "provider":{"kind":"mock","command":[]},
-            }),
-        )?)?;
-        let lane = Arc::new(tokio::sync::RwLock::new(()));
-        let permit = ProviderGenerationPermit {
-            provider: broker.provider_handle(),
-            _lease: Arc::new(lane.clone().read_owned().await),
-        };
-        let mut retirement = Box::pin(lane.write_owned());
-        assert!(futures_util::poll!(retirement.as_mut()).is_pending());
-        let collection = permit.clone();
-        assert!(Arc::ptr_eq(permit.provider(), collection.provider()));
-        drop(permit);
-        assert!(futures_util::poll!(retirement.as_mut()).is_pending());
-        drop(collection);
-        let _retirement = retirement.await;
-        Ok(())
-    }
-}

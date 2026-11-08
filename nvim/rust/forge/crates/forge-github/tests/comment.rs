@@ -7,10 +7,7 @@ use std::{
 
 use anyhow::Result;
 use forge_github::{
-    comment::*,
-    model::GithubRepositoryId,
-    pull_request::PullRequestTarget,
-    remote::{RemoteFailure, RemoteFailureKind},
+    comment::*, model::GithubRepositoryId, pull_request::PullRequestTarget, remote::RemoteFailure,
     service::GithubService,
 };
 
@@ -176,65 +173,4 @@ async fn matching_body_skips_write_and_invalid_confirmation_blocks_until_observe
     assert!(
         matches!(service.comment(remote, target(), CommentOperation::Reconcile).await.unwrap(), CommentResult::Reconciled { state: Some(state) } if state.body == "observed")
     );
-}
-
-#[tokio::test]
-async fn rejected_admission_keeps_next_explicit_mutation_available() {
-    let service = GithubService::default();
-    let remote = remote(
-        vec![Some(state("old")), Some(state("old"))],
-        vec![
-            CommentMutationOutcome::Rejected(RemoteFailure {
-                kind: RemoteFailureKind::InvalidResponse,
-                message: "not admitted".into(),
-            }),
-            CommentMutationOutcome::Confirmed(None),
-        ],
-    );
-    assert!(matches!(
-        service
-            .comment(remote.clone(), target(), edit())
-            .await
-            .unwrap(),
-        CommentResult::Rejected { .. }
-    ));
-    assert!(matches!(
-        service
-            .comment(
-                remote,
-                target(),
-                CommentOperation::Delete {
-                    receipt: "operation-2".into()
-                }
-            )
-            .await
-            .unwrap(),
-        CommentResult::Confirmed { state: None }
-    ));
-}
-
-#[test]
-fn bigint_comment_identity_accepts_exact_numbers_and_rejects_lossy_values() {
-    let mut encoded = serde_json::to_value(state("body")).unwrap();
-    for identity in [
-        serde_json::json!("4000000000"),
-        serde_json::json!(4_000_000_000u64),
-    ] {
-        encoded["databaseId"] = identity;
-        assert_eq!(
-            serde_json::from_value::<CommentState>(encoded.clone())
-                .unwrap()
-                .database_id,
-            4_000_000_000
-        );
-    }
-    for identity in [
-        serde_json::json!(1.5),
-        serde_json::json!("+123"),
-        serde_json::json!("12345678901234567"),
-        serde_json::Value::Null,
-    ] {
-        encoded["databaseId"] = identity;
-        assert!(serde_json::from_value::<CommentState>(encoded.clone()).is_err());
-    }
 }

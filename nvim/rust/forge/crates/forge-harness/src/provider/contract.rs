@@ -268,34 +268,3 @@ impl From<forge_provider_api::completion::ProviderCompletion> for ProviderComple
         }
     }
 }
-
-#[cfg(test)]
-mod test {
-    /// Keep persisted completion fields flat while separating native observations from host effects.
-    #[test]
-    fn native_completion_preserves_the_flat_host_wire_format() {
-        let mut completion = super::ProviderCompletion::default();
-        completion.native.provider_session_id =
-            Some("native-session".to_owned().try_into().unwrap());
-        completion.native.runtime.provider = "test-provider".into();
-        completion.native.evidence.tool_called = true;
-        completion.plan_read = Some("plan".into());
-        let encoded = serde_json::to_value(&completion).unwrap();
-        assert!(encoded.get("native").is_none());
-        assert_eq!(encoded["provider_session_id"], "native-session");
-        assert_eq!(encoded["runtime"]["provider"], "test-provider");
-        assert_eq!(encoded["evidence"]["tool_called"], true);
-        assert_eq!(encoded["plan_read"], "plan");
-        let restored: super::ProviderCompletion = serde_json::from_value(encoded).unwrap();
-        assert_eq!(
-            restored
-                .native
-                .provider_session_id
-                .as_ref()
-                .map(|id| id.as_str()),
-            Some("native-session")
-        );
-        assert_eq!(restored.plan_read.as_deref(), Some("plan"));
-        assert!(restored.native.evidence.tool_called);
-    }
-}

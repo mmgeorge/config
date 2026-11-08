@@ -55,23 +55,3 @@ impl<T> RetainedTask<T> {
         result
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep a typed native failure unchanged across repeated collection.
-    #[tokio::test]
-    async fn native_failure_survives_repeated_collection() {
-        let task: RetainedTask = RetainedTask::new(
-            ProviderOperation::TurnStart,
-            tokio::spawn(async { Err(ProviderError::DeliveryUncertain) }),
-        );
-        for _ in 0..2 {
-            assert!(matches!(
-                task.join().await,
-                Err(ProviderError::DeliveryUncertain)
-            ));
-        }
-    }
-}

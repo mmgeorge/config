@@ -1,112 +1,112 @@
--- Unit tests for `forge.views.harness.settings` (settings.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "settings", run = function()
-vim.loader.enable(false)
-vim.o.columns = 130
-vim.o.lines = 50
-require("forge").setup({ harness = { provider = "mock" } })
-local client = require("forge.client")
-dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
-local settings = require("forge.views.harness.settings")
-local picker = require("forge.views.picker")
-local path = vim.fn.tempname() .. ".jsonl"
-vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"operation/start","items":["a,b","c"]}}' }, path)
-local enabled = false
-local rejected_record_count = 0
-local controller = require("forge.views.harness.controller")
-local original_configure = controller.configure
-local original_transition = controller.task_transition
-local original_clue = package.loaded["mini.clue"]
-local source_buffer = vim.api.nvim_get_current_buf()
-local source_clue_disabled = vim.b[source_buffer].miniclue_disable
-local clue_requests = 0
-package.loaded["mini.clue"] = {
-  ensure_buf_triggers = function(buffer)
-    clue_requests = clue_requests + 1
-    if vim.b[buffer].miniclue_disable then return end
-    vim.keymap.set("n", "<Space>", function()
-      error("mini.clue replaced the settings toggle")
-    end, { buffer = buffer, nowait = true })
-  end,
-}
-local state
-local configured_session = {
-  id = "settings-session", provider = "fixture_alpha", model = "mock-model", effort = "medium",
-  plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
-}
-local original_request = client.request
-local commit_settings = require("forge.integrations.background_settings")
-local original_commit_request = commit_settings.request
-commit_settings.request = function(_, _, callback)
-  callback({ revision = 0,
-    settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { fixture_alpha = { model = "mock-model", thinking = "low" },
-      fixture_beta = { model = "mock-model", thinking = "low" },
-      fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } } })
-end
-client.request = function(request_specification, callback)
-  local session_id = request_specification.session_id
-  local method = request_specification.method
-  local params = request_specification.params or {}
+-- Unit tests for `forge.views.harness.settings` (settings.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local eq = MiniTest.expect.equality
 
-  local context = require("forge.event_contract").method_policy(method).session_context
-  assert(context == "required" and session_id == "settings-session"
-    or context ~= "required" and (session_id == nil or session_id == "settings-session"))
-  assert(method == "host.trace.status" or method == "host.trace.configure" or method == "session.trace.clear"
-    or method == "session.configure" or method == "session.provider.model.list" or method == "session.check.editing.set")
-  if method == "session.provider.model.list" then
-    callback({
-      { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium", service_tiers = { "fast", "ultrafast" } },
-      { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
-    })
-    return
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["settings"] = function()
+  vim.o.columns = 130
+  vim.o.lines = 50
+  require("forge").setup({ harness = { provider = "mock" } })
+  local client = require("forge.client")
+  dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
+  local settings = require("forge.views.harness.settings")
+  local picker = require("forge.views.picker")
+  local path = temp.directory("settings-log") .. "/trace.jsonl"
+  vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"operation/start","items":["a,b","c"]}}' }, path)
+  local enabled = false
+  local rejected_record_count = 0
+  local controller = require("forge.views.harness.controller")
+  local source_buffer = vim.api.nvim_get_current_buf()
+  local source_clue_disabled = vim.b[source_buffer].miniclue_disable
+  local clue_requests = 0
+  package.loaded["mini.clue"] = {
+    ensure_buf_triggers = function(buffer)
+      clue_requests = clue_requests + 1
+      if vim.b[buffer].miniclue_disable then return end
+      vim.keymap.set("n", "<Space>", function()
+        error("mini.clue replaced the settings toggle")
+      end, { buffer = buffer, nowait = true })
+    end,
+  }
+  local state
+  local configured_session = {
+    id = "settings-session", provider = "fixture_alpha", model = "mock-model", effort = "medium",
+    plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
+  }
+  local commit_settings = require("forge.integrations.background_settings")
+  commit_settings.request = function(_, _, callback)
+    callback({ revision = 0,
+      settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { fixture_alpha = { model = "mock-model", thinking = "low" },
+        fixture_beta = { model = "mock-model", thinking = "low" },
+        fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } } })
   end
-  if method == "session.check.editing.set" then
-    callback({ check_editing = params.enabled })
-    return
-  end
-  if method == "session.configure" then
-    if params.ask_model then
-      state.ask_model = vim.deepcopy(params.ask_model)
-      callback({ ask_model = state.ask_model })
+  client.request = function(request_specification, callback)
+    local session_id = request_specification.session_id
+    local method = request_specification.method
+    local params = request_specification.params or {}
+
+    local context = require("forge.event_contract").method_policy(method).session_context
+    assert(context == "required" and session_id == "settings-session"
+      or context ~= "required" and (session_id == nil or session_id == "settings-session"))
+    assert(method == "host.trace.status" or method == "host.trace.configure" or method == "session.trace.clear"
+      or method == "session.configure" or method == "session.provider.model.list" or method == "session.check.editing.set")
+    if method == "session.provider.model.list" then
+      callback({
+        { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium", service_tiers = { "fast", "ultrafast" } },
+        { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
+      })
       return
     end
-    for _, key in ipairs({ "model", "effort", "service_tier", "auto_compaction", "approval_timeout", "answer_timeout" }) do
-      if params[key] ~= nil then configured_session[key] = params[key] end
+    if method == "session.check.editing.set" then
+      callback({ check_editing = params.enabled })
+      return
     end
-    if params.shell then configured_session.shell = params.shell end
-    if params.access then
-      configured_session.access = vim.deepcopy(params.access)
-      if not state.capability.os_sandbox then configured_session.access.sandbox = false end
+    if method == "session.configure" then
+      if params.ask_model then
+        state.ask_model = vim.deepcopy(params.ask_model)
+        callback({ ask_model = state.ask_model })
+        return
+      end
+      for _, key in ipairs({ "model", "effort", "service_tier", "auto_compaction", "approval_timeout", "answer_timeout" }) do
+        if params[key] ~= nil then configured_session[key] = params[key] end
+      end
+      if params.shell then configured_session.shell = params.shell end
+      if params.access then
+        configured_session.access = vim.deepcopy(params.access)
+        if not state.capability.os_sandbox then configured_session.access.sandbox = false end
+      end
+      if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
+      if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
+      if params.plan_executor_model then configured_session.plan_executor.model = params.plan_executor_model end
+      if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
+      callback(vim.deepcopy(configured_session))
+      if params.session_tools ~= nil then state.session_tools = params.session_tools end
+      return
     end
-    if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
-    if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
-    if params.plan_executor_model then configured_session.plan_executor.model = params.plan_executor_model end
-    if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
-    callback(vim.deepcopy(configured_session))
-    if params.session_tools ~= nil then state.session_tools = params.session_tools end
-    return
+    if method == "host.trace.configure" then enabled = params.enabled end
+    if method == "session.trace.clear" then vim.fn.writefile({}, path) end
+    callback({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
   end
-  if method == "host.trace.configure" then enabled = params.enabled end
-  if method == "session.trace.clear" then vim.fn.writefile({}, path) end
-  callback({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
-end
-controller.configure = function(params, completed)
-  client.request({ session_id = "settings-session", method = "session.configure", params = params }, function(result)
-    state.session = result
-    if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
-    if params.check_timing then state.check_timing = params.check_timing end
-    if params.automatic_checks ~= nil then state.automatic_checks = params.automatic_checks end
+  controller.configure = function(params, completed)
+    client.request({ session_id = "settings-session", method = "session.configure", params = params }, function(result)
+      state.session = result
+      if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
+      if params.check_timing then state.check_timing = params.check_timing end
+      if params.automatic_checks ~= nil then state.automatic_checks = params.automatic_checks end
+      completed(true)
+    end)
+  end
+  controller.task_transition = function(action, _, completed)
+    assert(action.action == "permission" and action.change.kind == "set_approval")
+    configured_session.approval_mode = action.change.mode
+    state.session.approval_mode = action.change.mode
     completed(true)
-  end)
-end
-controller.task_transition = function(action, _, completed)
-  assert(action.action == "permission" and action.change.kind == "set_approval")
-  configured_session.approval_mode = action.change.mode
-  state.session.approval_mode = action.change.mode
-  completed(true)
-end
-local success, failure = xpcall(function()
+  end
   state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true, integration = { isolation_modes = {
     { id = "elevated", description = "Setup needs admin approval" },
     { id = "unelevated", description = "Restricted token; denied-read paths are unsupported" },
@@ -119,7 +119,7 @@ local success, failure = xpcall(function()
   assert(vim.b[instance.buf].miniclue_disable == true, "picker permits leader triggers to replace its bindings")
   assert(vim.b[source_buffer].miniclue_disable == source_clue_disabled, "picker disabled source-buffer clues")
   package.loaded["mini.clue"].ensure_buf_triggers(instance.buf)
-  local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
+  local text = buffer.text(instance.buf)
   assert(not text:find("CLI:", 1, true), text)
   assert(instance.spec.page_list[1].subtitle == nil, "settled configuration should have no subtitle")
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
@@ -145,15 +145,9 @@ local success, failure = xpcall(function()
     picker.update(current.spec)
     return field
   end
-  local function press(binding)
-    local current = picker._state_for_test()
-    local mapping = vim.api.nvim_buf_call(current.buf, function() return vim.fn.maparg(binding, "n", false, true) end)
-    assert(mapping.callback, "missing key " .. binding)
-    mapping.callback()
-  end
   local function key(id, binding)
     select(id)
-    press(binding)
+    keymap.invoke(binding, { buffer = picker._state_for_test().buf })
   end
   local function assert_configuration_geometry()
     local current = picker._state_for_test()
@@ -169,17 +163,15 @@ local success, failure = xpcall(function()
   end
   assert_configuration_geometry()
   assert(instance.spec.page_navigation == "tabs" and #instance.spec.page_list == 5)
-  local space_mapping = vim.api.nvim_buf_call(instance.buf, function()
-    return vim.fn.maparg("<Space>", "n", false, true)
-  end)
+  local space_mapping = keymap.get("<Space>", { buffer = instance.buf })
   assert(space_mapping.buffer == 1 and space_mapping.callback, "configuration lost the generic Space toggle binding")
-  assert(instance.spec.hint_mode == "help")
+  eq(instance.spec.hint_mode, "help")
   local footer = vim.api.nvim_win_get_config(instance.win).footer
   assert(type(footer) == "table" and vim.trim(footer[1][1]) == "? help",
     "configuration must show only the help shortcut")
   local row_count, row_id_set = 0, {}
   for page_index, page in ipairs(instance.spec.page_list) do
-    assert(page.id == ({ "models", "workflow", "permissions", "tools", "system" })[page_index])
+    eq(page.id, ({ "models", "workflow", "permissions", "tools", "system" })[page_index])
     for _, row in ipairs(page.option_list) do
       assert(not row_id_set[row.id], "setting row occurs in multiple categories")
       row_id_set[row.id] = true
@@ -218,7 +210,7 @@ local success, failure = xpcall(function()
         "separate compaction section remains")
     end
   end
-  assert(find("ask-model").section == "Ask model")
+  eq(find("ask-model").section, "Ask model")
   local _, ask_field = find("ask-model")
   assert(ask_field.value == configured_session.model and ask_field.disabled_reason)
   local override_row, override_field = find("ask-override")
@@ -231,7 +223,7 @@ local success, failure = xpcall(function()
   assert(thinking_field.disabled_reason and speed_field.disabled_reason)
   key("ask-override", "<CR>")
   assert(state.ask_model.model == configured_session.model and state.ask_model.effort == configured_session.effort)
-  assert(state.ask_model.service_tier == "default")
+  eq(state.ask_model.service_tier, "default")
   local _, enabled_model = find("ask-model")
   assert(not enabled_model.disabled_reason)
   select("session-tools")
@@ -241,13 +233,11 @@ local success, failure = xpcall(function()
   assert(vim.bo.filetype == "ForgeHelp", "? did not open picker help")
   assert(vim.api.nvim_win_get_config(help_window).zindex > vim.api.nvim_win_get_config(picker._state_for_test().win).zindex,
     "help opened behind the picker")
-  local help_text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  local help_text = buffer.text(0)
   assert(help_text:find("<Space>", 1, true) and help_text:find("<CR>", 1, true), "help omitted activation bindings: " .. help_text)
   assert(help_text:find("Toggle, edit, or open", 1, true))
   assert(help_text:find("Show the next picker page", 1, true))
-  local close_help = vim.fn.maparg("q", "n", false, true)
-  assert(close_help.callback, "help has no close mapping")
-  close_help.callback()
+  keymap.invoke("q")
   assert(not vim.api.nvim_win_is_valid(help_window))
   assert(vim.deep_equal(picker.capture_state(), before_help), "closing help changed the selected setting")
   key("ask-model", "<Right>")
@@ -263,14 +253,14 @@ local success, failure = xpcall(function()
   assert(inherited_model.value == configured_session.model and inherited_model.disabled_reason)
   key("ask-model", "<Right>")
   assert(state.ask_model.model == nil, "disabled Ask model changed without Override")
-  assert(find("session-tools").section == "Tools")
+  eq(find("session-tools").section, "Tools")
   key("session-tools", "<CR>")
-  assert(state.session_tools == false)
+  eq(state.session_tools, false)
   assert(find("session-tools").fields[1].value == false, "confirmed history setting kept the stale picker value")
   key("session-tools", "<Space>")
-  assert(state.session_tools == true)
-  assert(find("session-tools").fields[1].value == true)
-  assert(find("check-timing").section == "Checks")
+  eq(state.session_tools, true)
+  eq(find("session-tools").fields[1].value, true)
+  eq(find("check-timing").section, "Checks")
   local workflow_rows = picker._state_for_test().spec.page_list[2].option_list
   assert(workflow_rows[1].id == "automatic-checks", "Automatic must be the first check setting")
   for _, row in ipairs(workflow_rows) do
@@ -282,25 +272,25 @@ local success, failure = xpcall(function()
     assert(row.id ~= "permission-defaults" and row.label ~= "Defaults", "obsolete Defaults row remains")
   end
   key("check-timing", "<Right>")
-  assert(state.check_timing == "between_work")
+  eq(state.check_timing, "between_work")
   key("check-timing", "<Left>")
-  assert(state.check_timing == "after_queue")
-  assert(find("automatic-checks").section == "Checks")
+  eq(state.check_timing, "after_queue")
+  eq(find("automatic-checks").section, "Checks")
   key("automatic-checks", "<Right>")
   assert(state.automatic_checks ~= true, "arrows toggled automatic checks")
   key("automatic-checks", "<CR>")
   assert(state.automatic_checks == true and state.check_timing == "after_queue")
-  assert(find("automatic-checks").fields[1].value == true)
+  eq(find("automatic-checks").fields[1].value, true)
   key("automatic-checks", "<CR>")
   assert(state.automatic_checks == false and state.check_timing == "after_queue")
   key("status-thoughts", "<Right>")
   assert(state.status_thoughts ~= true, "arrows must not toggle booleans")
   key("status-thoughts", "<CR>")
-  assert(state.status_thoughts == true)
+  eq(state.status_thoughts, true)
   key("status-thoughts", "<Tab>")
   assert(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id == "models",
     "Tab did not wrap from the last category to the first")
-  press("<S-Tab>")
+  keymap.invoke("<S-Tab>", { buffer = picker._state_for_test().buf })
   assert(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id == "system",
     "Shift-Tab did not wrap from the first category to the last")
   local focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)
@@ -309,7 +299,7 @@ local success, failure = xpcall(function()
   local lsp_row = find("lsp-tools")
   assert(subagent_row ~= lsp_row and #subagent_row.fields == 1 and #lsp_row.fields == 1)
   assert(subagent_row.section == "Tools" and lsp_row.section == "Tools")
-  assert(find("status-thoughts").section == "Display")
+  eq(find("status-thoughts").section, "Display")
   local all_pages = picker._state_for_test().spec.page_list
   local rows = all_pages[#all_pages].option_list
   local last = rows[#rows]
@@ -317,7 +307,7 @@ local success, failure = xpcall(function()
   key("subagent-tools", "<Tab>")
   assert(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id == "system",
     "Tab did not switch to the next category")
-  press("<S-Tab>")
+  keymap.invoke("<S-Tab>", { buffer = picker._state_for_test().buf })
   assert(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id == "tools",
     "Shift-Tab did not switch to the previous category")
   focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)
@@ -340,7 +330,7 @@ local success, failure = xpcall(function()
   key("check-editing", "<CR>")
   assert(state.check_editing == true and find("check-editing").fields[1].value == true)
   key("check-editing", "<Space>")
-  assert(state.check_editing == false)
+  eq(state.check_editing, false)
   local mode_row, mode_field, _, _, mode_page = find("approval-mode")
   assert(mode_page == "permissions" and mode_row.section == "Tools" and mode_field.value == "Ask")
   for _, choice in ipairs({ { "deny", "Deny" }, { "allow", "Approve" }, { "ask", "Ask" } }) do
@@ -353,7 +343,7 @@ local success, failure = xpcall(function()
   local enabled_description = find("sandbox").fields[1].description
   assert(enabled_description:find("implementation guarantees", 1, true))
   key("sandbox", "<CR>")
-  assert(configured_session.access.sandbox == false)
+  eq(configured_session.access.sandbox, false)
   local disabled_description = find("sandbox").fields[1].description
   assert(disabled_description ~= enabled_description and disabled_description:find("without OS sandbox", 1, true))
   assert(table.concat(picker._state_for_test().frame.lines, " "):find("without OS sandbox", 1, true),
@@ -387,49 +377,47 @@ local success, failure = xpcall(function()
   key("write-access", "<Right>")
   assert(configured_session.access.write_access == "full" and configured_session.access.sandbox == false)
   key("compact-threshold", "<Right>")
-  assert(configured_session.auto_compaction.threshold_tokens == 256000)
+  eq(configured_session.auto_compaction.threshold_tokens, 256000)
   key("compact-threshold", "<CR>")
   local threshold_picker = picker._state_for_test()
   local threshold_rows = threshold_picker.spec.page_list[1].option_list
-  assert(vim.deep_equal(vim.tbl_map(function(row) return row.label end, threshold_rows), { "64k", "128k", "256k", "512k" }))
-  press("<Down>")
-  press("<CR>")
-  assert(configured_session.auto_compaction.threshold_tokens == 512000)
-  assert(require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec).id == "compact-threshold")
+  eq(vim.tbl_map(function(row) return row.label end, threshold_rows), { "64k", "128k", "256k", "512k" })
+  keymap.invoke("<Down>", { buffer = picker._state_for_test().buf })
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(configured_session.auto_compaction.threshold_tokens, 512000)
+  eq(require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec).id, "compact-threshold")
   key("approval_timeout", "<CR>")
   local editor = assert(picker._state_for_test().field_editor)
-  local increase = vim.api.nvim_buf_call(editor.buffer, function() return vim.fn.maparg("<Up>", "n", false, true) end)
-  increase.callback()
-  local save = vim.api.nvim_buf_call(editor.buffer, function() return vim.fn.maparg("<CR>", "n", false, true) end)
-  save.callback()
+  keymap.invoke("<Up>", { buffer = editor.buffer })
+  keymap.invoke("<CR>", { buffer = editor.buffer })
   assert(configured_session.approval_timeout.amount == 11 and configured_session.approval_timeout.unit == "m"
     and not picker._state_for_test().field_editor)
   key("main-model", "<Right>")
   assert(configured_session.model == "other-model" and configured_session.effort == "low")
   key("main-thinking", "<Right>")
-  assert(configured_session.effort == "high")
+  eq(configured_session.effort, "high")
   key("main-speed", "<Right>")
-  assert(configured_session.service_tier == "fast")
+  eq(configured_session.service_tier, "fast")
   local executable = vim.fn.executable
   vim.fn.executable = function(name) return name == "nu" and 0 or executable(name) end
   key("shell", "<Right>")
-  assert(configured_session.shell == "system")
+  eq(configured_session.shell, "system")
   vim.fn.executable = function(name) return name == "nu" and 1 or executable(name) end
   key("shell", "<Right>")
-  assert(configured_session.shell == "nushell")
+  eq(configured_session.shell, "nushell")
   key("shell", "<Right>")
-  assert(configured_session.shell == "system")
+  eq(configured_session.shell, "system")
   vim.fn.executable = executable
   for _, page in ipairs(picker._state_for_test().spec.page_list) do
     for _, option in ipairs(page.option_list) do
       assert(option.id ~= "native-import", "session import must not appear in configuration")
     end
   end
-  assert(find("read-access").section == "Access")
-  assert(find("write-access").section == "Access")
-  assert(find("readable-directories").section == "Access")
-  assert(find("writable-directories").section == "Access")
-  assert(find("sandbox").section == "Sandbox")
+  eq(find("read-access").section, "Access")
+  eq(find("write-access").section, "Access")
+  eq(find("readable-directories").section, "Access")
+  eq(find("writable-directories").section, "Access")
+  eq(find("sandbox").section, "Sandbox")
   if vim.fn.has("win32") == 1 then assert(find("isolation-mode").section == "Sandbox") end
   key("provider", "<Left>")
   assert(picker.is_open("harness-config"), "Left opened an action")
@@ -457,11 +445,11 @@ local success, failure = xpcall(function()
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   assert(find("sandbox").fields[1].value == true, "reopening displayed effective access instead of the preference")
   key("read-access", "<Right>")
-  assert(configured_session.access.read_access == "workspace")
+  eq(configured_session.access.read_access, "workspace")
   key("write-access", "<Right>")
-  assert(configured_session.access.write_access == "off")
+  eq(configured_session.access.write_access, "off")
   key("write-access", "<Right>")
-  assert(configured_session.access.write_access == "workspace")
+  eq(configured_session.access.write_access, "workspace")
   picker.close()
   for _, provider in ipairs({ "fixture_beta", "fixture_gamma", "fixture_delta", "mock" }) do
     configured_session.provider = provider
@@ -483,27 +471,27 @@ local success, failure = xpcall(function()
   assert(enabled)
   local before = #vim.api.nvim_list_tabpages()
   settings.log("settings-session", "open")
-  assert(#vim.api.nvim_list_tabpages() == before + 1)
+  eq(#vim.api.nvim_list_tabpages(), before + 1)
   assert(vim.bo.readonly and not vim.bo.modifiable)
   local log_buffer = vim.api.nvim_get_current_buf()
-  local log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  local log_text = buffer.text(log_buffer)
   assert(log_text:find("request  #1", 1, true), log_text)
   assert(log_text:find('"method": "operation/start"', 1, true), log_text)
   assert(log_text:find('"a,b"', 1, true), log_text)
   vim.fn.delete(path)
-  vim.fn.maparg("R", "n", false, true).callback()
-  assert(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false)[1] == "No log events yet")
+  keymap.invoke("R")
+  eq(buffer.line(log_buffer, 1), "No log events yet")
   vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","payload":{"method":"operation/start"}}' }, path)
   vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"response","payload":{"ok":true}}' }, path, "a")
-  vim.fn.maparg("R", "n", false, true).callback()
-  log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  keymap.invoke("R")
+  log_text = buffer.text(log_buffer)
   assert(log_text:find("response  #2", 1, true), log_text)
   settings.log("settings-session")
   assert(#vim.api.nvim_list_tabpages() == before + 1, "log open duplicated the tab")
-  assert(vim.api.nvim_get_current_buf() == log_buffer)
+  eq(vim.api.nvim_get_current_buf(), log_buffer)
   assert(not vim.wo.winbar:find("rejected", 1, true), "zero rejections appeared as diagnostic loss")
   rejected_record_count = 7
-  local refresh = vim.fn.maparg("R", "n", false, true)
+  local refresh = keymap.get("R")
   refresh.callback()
   assert(vim.wo.winbar:find("7 records rejected", 1, true), "log refresh hid host-reported saturation")
   rejected_record_count = 0
@@ -522,7 +510,7 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ chunk(2, logical:sub(split + 2)),
     '{"timestamp_ms":1700000000123,"event":"ordinary","payload":{"after_chunk":true}}' }, path)
   refresh.callback()
-  log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  log_text = buffer.text(log_buffer)
   assert(log_text:find("chunked  #1", 1, true) and log_text:find("λ retained across rotations", 1, true),
     "log viewer did not reassemble UTF-8 fragments across all retained archives: " .. log_text)
   assert(log_text:find("ordinary  #2", 1, true), "chunk reassembly lost ordinary records or logical ordering")
@@ -530,31 +518,15 @@ local success, failure = xpcall(function()
     "chunk transport envelopes appeared as log events")
   vim.fn.delete(path .. ".10")
   refresh.callback()
-  log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  log_text = buffer.text(log_buffer)
   assert(log_text:find("Incomplete retained log record", 1, true), "missing archived fragments disappeared silently")
   assert(log_text:find("ordinary  #2", 1, true), "incomplete chunks hid the following ordinary event")
   vim.fn.delete(path .. ".1")
   settings.log("settings-session", "clear")
   assert(enabled)
-  assert(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false)[1] == "No log events yet")
+  eq(buffer.line(log_buffer, 1), "No log events yet")
   settings.log("settings-session", "off")
   assert(not enabled)
-end, debug.traceback)
-controller.configure = original_configure
-controller.task_transition = original_transition
-package.loaded["mini.clue"] = original_clue
-client.request = original_request
-commit_settings.request = original_commit_request
-vim.fn.delete(path)
-for index = 1, 10 do vim.fn.delete(path .. "." .. index) end
-if not success then error(failure) end
-print("harness_settings: passed")
-vim.cmd("qa!")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

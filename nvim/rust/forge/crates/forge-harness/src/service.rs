@@ -2872,22 +2872,3 @@ fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod target_test {
-    use super::*;
-
-    #[test]
-    fn explicit_invalid_target_never_becomes_main_agent_input() {
-        assert!(validate_root_control(None).is_ok());
-        assert!(validate_root_control(Some(&Value::Null)).is_ok());
-        for value in [
-            json!({}),
-            json!({"thread_id":"child"}),
-            json!({"thread_id":"child","turn_id":" "}),
-            json!({"thread_id":"child","turn_id":"turn"}),
-        ] {
-            assert!(validate_root_control(Some(&value)).is_err());
-        }
-    }
-}

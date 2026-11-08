@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::ScopeOwner;
 use crate::{
-    exchange::{Exchange, ExchangeNode},
+    exchange::Exchange,
     provider::{InvocationScope, ProviderEvent, ThreadOwner, TurnAddress},
 };
 use anyhow::Result;
@@ -222,29 +222,6 @@ impl TestTurn {
         Self { exchange }
     }
 
-    fn synchronize(&mut self) -> Result<()> {
-        let turn = &self.exchange.turn[0];
-        for item in turn.items() {
-            let id = match item {
-                TurnItem::Message { id } | TurnItem::Tool { id } => id,
-            };
-            let node_id = format!("{}:content:{id}", turn.id());
-            if !self
-                .exchange
-                .node_list
-                .iter()
-                .any(|node| node.id() == node_id)
-            {
-                self.exchange.node_list.push(ExchangeNode::TurnContent {
-                    id: node_id,
-                    turn_id: turn.id().to_owned(),
-                    item: item.clone(),
-                });
-            }
-        }
-        self.exchange.reconcile_entries()
-    }
-
     pub(crate) fn tools(&self) -> impl Iterator<Item = &ToolCall> {
         self.exchange.tools().map(|(_, tool)| tool)
     }
@@ -267,10 +244,6 @@ impl TestTurn {
             now_ms,
         )?;
         Ok(())
-    }
-    pub(crate) fn record_text(&mut self, kind: MessageKind, text: &str) -> Result<()> {
-        self.exchange.turn[0].record_text(kind, text)?;
-        self.synchronize()
     }
 
     pub(crate) fn finish(&mut self, outcome: TurnOutcome, now_ms: i64) -> Result<()> {

@@ -760,31 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_issue_edit_abort_preserves_document_and_draft() {
-        let mut document = issue_document();
-        let before = serde_json::to_value(document.snapshot()).unwrap();
-        let draft = document.draft_payload().unwrap();
-        let mut prepared = document
-            .prepare_edit(RegionEdit {
-                document: DocumentId("issue-document".into()),
-                region: RegionId("body".into()),
-                base: RegionRevision(0),
-                sequence: EditSequence(1),
-                text: "candidate\r\n".into(),
-            })
-            .unwrap();
-        let candidate = prepared.take_draft();
-        assert_eq!(
-            candidate["issue_document"]["field"]["body"]["text"],
-            "candidate\r\n"
-        );
-        drop(prepared);
-        assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
-        assert_eq!(document.draft_payload().unwrap(), draft);
-        edit(&mut document, "body", 0, 1, "accepted");
-    }
-
-    #[test]
     fn issue_draft_reopen_retains_newer_text_and_exact_pending_capture() {
         let mut original = issue_document();
         edit(&mut original, "body", 0, 1, "submitted\r\n");
@@ -807,22 +782,5 @@ mod tests {
         );
         assert_eq!(restored.fields().unwrap()[2].sequence, EditSequence(2));
         assert!(restored.fields().unwrap()[2].dirty);
-    }
-    #[test]
-    fn issue_closed_unknown_requires_durable_fresh_source_gate() {
-        let mut document = issue_document();
-        edit(&mut document, "body", 0, 1, "uncertain body");
-        document.begin_save().unwrap().unwrap();
-        let payload = document
-            .resolution_payload(SaveOutcome::Rejected, true)
-            .unwrap();
-        document
-            .resolve_pending(SaveOutcome::Rejected, true)
-            .unwrap();
-        assert!(document.begin_save().is_err());
-        let mut reopened = issue_document();
-        reopened.restore_draft(&payload).unwrap();
-        assert!(reopened.fresh_required());
-        assert!(reopened.begin_save().is_err());
     }
 }

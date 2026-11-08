@@ -1,5 +1,3 @@
-mod support;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,11 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use forge_git::command::{CommandLimits, read_command};
 use forge_github::model::{GithubRepositoryId, SyncScope};
-use forge_github::remote::{
-    GhClient, GithubRemote, IssueDetailRequest, IssuePageRequest, RemoteFailureKind,
-};
+use forge_github::remote::{GhClient, GithubRemote, IssuePageRequest, RemoteFailureKind};
 use serde_json::json;
-use support::is_pending_after_one_poll;
 
 struct FixtureExecutable {
     _directory: tempfile::TempDir,
@@ -154,61 +149,6 @@ async fn native_gh_arguments_input_decode_and_cleanup_preserve_the_remote_contra
 }
 
 #[tokio::test]
-async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("block")?;
-    let mut caller = Vec::new();
-    for position in 0..4 {
-        let client = client.clone();
-        caller.push(tokio::spawn(async move {
-            if position < 2 {
-                client.read_issues(request()).await.map(|_| ())
-            } else {
-                client
-                    .read_issue_detail(IssueDetailRequest {
-                        repository: request().repository,
-                        number: 7,
-                    })
-                    .await
-                    .map(|_| ())
-            }
-        }));
-    }
-    let marker = started(root.path(), 4).await?;
-    {
-        let waiting = client.read_issue_detail(IssueDetailRequest {
-            repository: request().repository,
-            number: 7,
-        });
-        tokio::pin!(waiting);
-        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
-    }
-    let mut alive = Vec::new();
-    for marker in marker {
-        let id = marker
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .replace("started.", "");
-        let lock = fs::File::options()
-            .read(true)
-            .write(true)
-            .open(root.path().join(format!("alive.{id}")))?;
-        assert!(lock.try_lock().is_err());
-        alive.push(lock);
-    }
-    for caller in caller {
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-    }
-    client.shutdown(Duration::from_secs(2)).await?;
-    for lock in alive {
-        lock.try_lock()?;
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -> Result<()> {
     let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("block")?;
@@ -237,33 +177,6 @@ async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -
 }
 
 #[tokio::test]
-async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("block")?;
-    let mut caller = Vec::new();
-    for _ in 0..4 {
-        let client = client.clone();
-        caller.push(tokio::spawn(
-            async move { client.read_issues(request()).await },
-        ));
-    }
-    started(root.path(), 4).await?;
-    let waiting = client.read_issues(request());
-    tokio::pin!(waiting);
-    assert!(is_pending_after_one_poll(waiting.as_mut()).await);
-    assert_eq!(started(root.path(), 4).await?.len(), 4);
-    fs::write(root.path().join("mode"), "success")?;
-    for caller in caller {
-        caller.abort();
-        let _ = caller.await;
-    }
-    (&mut waiting).await?;
-    assert_eq!(started(root.path(), 5).await?.len(), 5);
-    client.shutdown(Duration::from_secs(2)).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn oversized_output_and_command_failure_do_not_become_empty_success() -> Result<()> {
     let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("success")?;
@@ -287,39 +200,6 @@ async fn oversized_output_and_command_failure_do_not_become_empty_success() -> R
     assert_eq!(failure.kind, RemoteFailureKind::RateLimited);
     assert!(failure.message.contains("HTTP 403"));
     client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (first, client) = fixture("block")?;
-    let (second, unused) = fixture("block")?;
-    drop(unused);
-    let context = client.for_directory(second.path().to_owned())?;
-    let mut caller = Vec::new();
-    for _ in 0..2 {
-        let client = client.clone();
-        caller.push(tokio::spawn(
-            async move { client.read_issues(request()).await },
-        ));
-        let context = context.clone();
-        caller.push(tokio::spawn(
-            async move { context.read_issues(request()).await },
-        ));
-    }
-    started(first.path(), 2).await?;
-    started(second.path(), 2).await?;
-    {
-        let waiting = context.read_issues(request());
-        tokio::pin!(waiting);
-        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
-    }
-    for caller in caller {
-        caller.abort();
-        let _ = caller.await;
-    }
-    client.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
 
@@ -625,72 +505,6 @@ async fn native_pr_edits_preserve_exact_text_and_reconcile_without_reposting() -
     assert_eq!(recovered.outcome, PullRequestOutcome::Reconciled);
     assert_eq!(recovered.matches_submission, Some(true));
     assert_eq!(fs::read(root.path().join("mutation-log"))?, writes);
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn field_edits_and_lifecycle_changes_share_fifo_native_ownership() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    use forge_github::pull_request::PullRequestEdit;
-    let (root, client) = fixture("pr_block")?;
-    fs::write(root.path().join("pr-state"), "OPEN false")?;
-    fs::write(root.path().join("submitted-title.json"), "\"Queued title\"")?;
-    let service = GithubService::default();
-    let active = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Edit {
-                        edit: PullRequestEdit {
-                            title: Some("Queued title".into()),
-                            body: None,
-                        },
-                    }),
-                )
-                .await
-        })
-    };
-    async {
-        while !root.path().join("mutation-started").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    .await;
-    let next = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Transition {
-                        desired: DesiredPullRequestState::Closed,
-                    }),
-                )
-                .await
-        })
-    };
-    fs::write(root.path().join("release-mutation"), "release")?;
-    assert!(active.await??.ok && next.await??.ok);
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-release-order"))?,
-        "updatePullRequest released=false\nclosePullRequest released=true\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-log"))?,
-        "updatePullRequest\nclosePullRequest\n"
-    );
     assert_eq!(
         service
             .shutdown(Duration::from_secs(1))

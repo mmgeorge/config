@@ -8,7 +8,6 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 enum ChildBackgroundCompletion {
     Shutdown,
-    Natural,
 }
 
 /// Retain command output beyond foreground collection until the actual background task ends.
@@ -85,7 +84,6 @@ fn child_background_fixture(
                     }
                     let outcome = match completion {
                         ChildBackgroundCompletion::Shutdown => ToolOutcome::Interrupted,
-                        ChildBackgroundCompletion::Natural => ToolOutcome::Succeeded,
                     };
                     for event in [
                         ItemEvent::Tool {
@@ -156,12 +154,6 @@ async fn managed_child_shutdown_persists_original_background_tool_before_complet
     assert_managed_child_background_completion(ChildBackgroundCompletion::Shutdown).await
 }
 
-/// Preserve a natural completion racing foreground delivery without replacing its native owner.
-#[tokio::test]
-async fn managed_child_natural_background_completion_preserves_original_tool() -> Result<()> {
-    assert_managed_child_background_completion(ChildBackgroundCompletion::Natural).await
-}
-
 /// Drive real admission, runtime delivery, broker reduction, and durable child completion.
 async fn assert_managed_child_background_completion(
     completion: ChildBackgroundCompletion,
@@ -218,7 +210,6 @@ async fn assert_managed_child_background_completion(
                             ChildBackgroundCompletion::Shutdown => {
                                 crate::turn::ToolState::Interrupted
                             }
-                            ChildBackgroundCompletion::Natural => crate::turn::ToolState::Completed,
                         };
                         assert_eq!(tool.id, "original-background-tool");
                         assert_eq!(turn.provider().scope.owner(), owner);

@@ -226,6 +226,3 @@ impl Exchange {
         Ok(content)
     }
 }
-
-#[cfg(test)]
-mod tests {}

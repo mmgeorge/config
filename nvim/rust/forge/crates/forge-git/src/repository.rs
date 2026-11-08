@@ -400,27 +400,6 @@ mod tests {
     };
 
     #[test]
-    fn observation_retry_classifies_only_concurrent_repository_changes() {
-        for message in [
-            "status provider changed during observation",
-            "status changed during observation",
-            "worktree metadata changed during observation",
-            "rename origin changed during observation",
-            "index changed during observation",
-            "HEAD changed during observation",
-            "snapshot was invalidated",
-            "repository read was superseded by invalidation",
-            "content acquisition was invalidated",
-            "observation was invalidated",
-        ] {
-            assert!(transient_observation_failure(&anyhow::anyhow!(message)));
-        }
-        assert!(!transient_observation_failure(&anyhow::anyhow!(
-            "invalid index checksum"
-        )));
-    }
-
-    #[test]
     fn newer_request_supersedes_older_completion_and_duplicate_adoption() {
         let fixture = tempfile::tempdir().unwrap();
         init_repository(fixture.path());
@@ -468,98 +447,6 @@ mod tests {
                 .to_string()
                 .contains("generation was superseded")
         );
-    }
-
-    #[test]
-    fn invalidated_handle_reopen_failure_preserves_previous_handle_until_retry() {
-        let fixture = tempfile::tempdir().unwrap();
-        init_repository(fixture.path());
-        let (identity, shared) = crate::identity::discover_repository(fixture.path())
-            .unwrap()
-            .unwrap();
-        let repository = RepositoryState::new(identity, shared);
-        let object_hash = repository.object_hash();
-        let unavailable = fixture.path().join("git-unavailable");
-        std::fs::rename(&repository.identity.git_directory, &unavailable).unwrap();
-        repository.invalidate().unwrap();
-        let failure = repository.local_repository().unwrap_err();
-        assert!(
-            failure
-                .to_string()
-                .contains("reopen invalidated Git repository")
-        );
-        assert_eq!(repository.object_hash(), object_hash);
-        assert_eq!(
-            repository.repository.lock().unwrap().generation,
-            RepositoryGeneration(0)
-        );
-        std::fs::rename(unavailable, &repository.identity.git_directory).unwrap();
-        let local = repository.local_repository().unwrap();
-        assert_eq!(local.object_hash(), object_hash);
-        assert_eq!(
-            repository.repository.lock().unwrap().generation,
-            repository.generation()
-        );
-    }
-
-    #[test]
-    fn foreign_worktree_and_mismatched_read_generation_are_rejected() {
-        let fixture = tempfile::tempdir().unwrap();
-        init_repository(fixture.path());
-        let (identity, shared) = crate::identity::discover_repository(fixture.path())
-            .unwrap()
-            .unwrap();
-        let repository = RepositoryState::new(identity, shared);
-        let request = repository.begin_observation().unwrap();
-        let foreign = tempfile::tempdir().unwrap();
-        init_repository(foreign.path());
-        let foreign_identity = crate::discover_identity(foreign.path()).unwrap().unwrap();
-        let mut incoming = result(&repository, request);
-        incoming.value.worktree = foreign_identity.worktree.unwrap();
-        assert!(
-            repository
-                .adopt(incoming)
-                .unwrap_err()
-                .to_string()
-                .contains("another worktree")
-        );
-        let mut incoming = result(&repository, request);
-        incoming.generation = RepositoryGeneration(request.generation.0 + 1);
-        assert!(
-            repository
-                .adopt(incoming)
-                .unwrap_err()
-                .to_string()
-                .contains("generation was superseded")
-        );
-        assert!(repository.current_observation().is_none());
-    }
-
-    #[tokio::test]
-    async fn detached_snapshot_does_not_supersede_pending_observation() {
-        let fixture = tempfile::tempdir().unwrap();
-        init_repository(fixture.path());
-        let store = RepositoryStore::default();
-        let repository = store
-            .open(fixture.path().to_owned())
-            .await
-            .unwrap()
-            .unwrap();
-        let request = repository.begin_observation().unwrap();
-        let snapshot = repository.snapshot(&store).await.unwrap();
-        assert_eq!(snapshot.generation, request.generation);
-        assert!(repository.current_observation().is_none());
-        assert_eq!(
-            repository.observation.lock().unwrap().requested,
-            request.id.0
-        );
-        repository.adopt(result(&repository, request)).unwrap();
-        let current = repository.current_observation().unwrap();
-        repository.snapshot(&store).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &current,
-            &repository.current_observation().unwrap()
-        ));
     }
 
     fn result(

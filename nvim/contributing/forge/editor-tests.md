@@ -6,41 +6,25 @@ Tests that launch the Forge host assume a current executable. Run `rust-build` a
 
 ## Test layout
 
-Each plugin keeps its tests in `nvim/lua/<plugin>/tests/`, split by how much of the system a test exercises. Both halves mirror the plugin's source tree, so a source path names where its tests live. Every test file ends in `.test.lua`, and the runner finds tests by that suffix alone.
+Each plugin keeps its tests in `nvim/lua/<plugin>/tests/`, split by how much of the system a test exercises. Both halves mirror the plugin's source tree, so a source path names where its tests live. Every test file ends in `.test.lua` and is a [mini.test](https://github.com/nvim-mini/mini.test) set, and the runner finds test files by that suffix alone.
 
-| Kind | Location | Form |
+| Kind | Location | Process |
 | --- | --- | --- |
-| Unit | `tests/unit/` at the source file's mirrored path: `nvim/lua/forge/views/status/status_context.lua` → `nvim/lua/forge/tests/unit/views/status/status_context.test.lua`, and `init.lua` → `init.test.lua` | One row per test in the file's `scenarios` table |
-| Integration | `tests/integration/` in the mirrored directory of the source area it drives, in the file named after that area: `views/status/` → `nvim/lua/forge/tests/integration/views/status/status.test.lua`, and a top-level module's area is a directory named after it, such as `integration/client/client.test.lua` for `client.lua` | One row per test in the area file's `scenarios` table |
+| Unit | `tests/unit/` at the source file's mirrored path: `nvim/lua/forge/views/status/status_context.lua` → `nvim/lua/forge/tests/unit/views/status/status_context.test.lua`, and `init.lua` → `init.test.lua` | One shard per file, whose cases run in sequence in one Neovim |
+| Integration | `tests/integration/` in the mirrored directory of the source area it drives, in the file named after that area: `views/status/` → `nvim/lua/forge/tests/integration/views/status/status.test.lua`, and a top-level module's area is a directory named after it, such as `integration/client/client.test.lua` for `client.lua` | One Neovim per top-level case |
 | Support | `tests/support/` for shared helpers, `tests/fixtures/` for data and shared setup scripts, `tests/plans/` for notes | Plain `.lua` or Markdown; never run as tests |
 
-Forge's integration areas are `buffer`, `client`, `git`, `lsp`, `review_document`, `text`, `walkthrough`, and, under `views/`, `harness`, `picker`, `plan_review`, and `status`. Each area name is also a suite. An integration test stays a standalone file in its area directory only when a row cannot hold it: when it reloads its own file in a child Neovim, such as `harness_markdown_layout.test.lua`, or dispatches its own scenarios, such as `plan_review_question_response.test.lua`. Load helpers by repository path, such as `dofile("nvim/lua/forge/tests/support/state.lua")`, at file scope.
+Forge's integration areas are `buffer`, `client`, `git`, `lsp`, `review_document`, `text`, `walkthrough`, and, under `views/`, `harness`, `picker`, `plan_review`, and `status`. Each area name is also a suite. An integration test stays a standalone file in its area directory only when it reloads its own file in a child Neovim, such as `harness_markdown_layout.test.lua`, or shares a heavy `pre_once` setup across its cases, such as `plan_review_question_response.test.lua`. Load helpers by repository path, such as `dofile("nvim/lua/forge/tests/support/state.lua")`, at file scope.
 
-A test file declares its tests as rows at two-space indentation, which is how the runner finds them, and dispatches on `arg[1]`:
-
-```lua
-local scenarios = {
-  { name = "admission_queue", run = function()
-    -- arrange, act, and assert against forge.client
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
-```
-
-Add a new test as a row in the existing unit or area file rather than as a new file, and move a unit test file whenever its source file moves.
-
-### mini.test files
-
-A test file may instead be a [mini.test](https://github.com/nvim-mini/mini.test) set, which replaces the row table and dispatcher with hooks, `MiniTest.expect`, child Neovim processes, and screenshots. `nvim/lua/forge/tests/unit/lsp/startup.test.lua` is the pilot. The file returns a `MiniTest.new_set()`, and the runner discovers its cases from top-level `T["name"] = ...` lines:
+A test file returns a `MiniTest.new_set()` whose hooks come from `support/isolation.lua`. It declares each test as a top-level `T["name"] = function() ... end` at column zero, which is how the runner finds cases:
 
 ```lua
 local MiniTest = require("mini.test")
-local T = MiniTest.new_set({ hooks = { post_case = function() require("forge.lsp.startup").close() end } })
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+
+local T = MiniTest.new_set({ hooks = isolation.hooks({
+  post_case = function() require("forge.lsp.startup").close() end,
+}) })
 
 T["close_without_start"] = function()
   MiniTest.expect.no_error(require("forge.lsp.startup").close)
@@ -49,9 +33,33 @@ end
 return T
 ```
 
-mini.test has no parallel execution, so the runner supplies it. It clones the pinned commit once into a commit-named directory beside the Nushell cache. It then runs each mini.test file as one shard, its cases sequentially in a single Neovim, through `nvim/lua/forge/tests/support/minitest_shard.lua`, and runs shards in parallel with every other test. The shard arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case. The runner's outer kill waits the shard's case count times five seconds, plus one second for that report. A timeout ends the shard, so later cases in the file do not run. `file::case` runs one case in its own shard.
+Add a new test as a case in the existing unit or area file rather than as a new file, and move a unit test file whenever its source file moves. Compare values with `MiniTest.expect.equality` and check failures with `MiniTest.expect.error` rather than hand-written assertion helpers.
 
-Cases in a shard share one process, so a case must leave no state behind. Capture and restore every replaced editor function in `pre_case` and `post_case` hooks, which run even when the case fails, and delete temporary directories through `MiniTest.finally`. A case that needs a pristine editor drives a child from `MiniTest.new_child_neovim()` and restarts it in `pre_case`.
+### Isolation
+
+Cases in a unit shard share one Neovim, so a case must leave nothing behind. `isolation.hooks()` captures the editor before each case and restores it afterward, whether or not the case failed. It first runs the caller's `post_case`, which stops work the case started, and then drains the `vim.schedule` queue so that no callback fires in the next case. It then deletes the case's autocommands and timers. It restores replaced `vim.*` functions, global options, `vim.g`, Lua globals, the working directory, global keymaps, user commands, and the starting window's options. It closes the case's tabpages and windows, wipes its buffers, and unloads every `forge`, `github`, `git`, and `rust_sidecar` module. Require plugin modules inside cases or hooks, never at file scope, because the next case receives fresh module singletons.
+
+Cleanup that a case owns goes through `MiniTest.finally`. mini.test runs those callbacks without protection, so an error raised in one escapes the case; wrap fallible cleanup in `pcall`. A callback runs when the function that registered it returns, and a hook is such a function, so call a helper that registers a `finally` from the case body, never from a hook.
+
+### Child Neovim
+
+A file that must reload itself in a fresh editor starts a child with `MiniTest.new_child_neovim()`, attaches the grid size it needs through `child.api.nvim_ui_attach`, and reads the screen with `child.get_screenshot()`. A self-relaunching file checks a `vim.g` child flag at the very top, before `require("mini.test")`, runs its child body, and returns; otherwise it builds and returns `T`. The child's dispatch never reads `arg`, which the shard bootstrap owns. On Windows the bootstrap gives each child pipe a process-unique name, because mini.test derives the name from a `tempname()` counter that restarts in every process, and concurrent tests would otherwise connect to each other's children.
+
+### Shared helpers
+
+`tests/support/` holds the code that cases would otherwise repeat. Each helper below takes effect for the rest of the current case and undoes itself through `MiniTest.finally`, except `wait.lua`, `buffer.lua`, and `keymap.lua`, which change nothing that outlives the call.
+
+| Helper | Use |
+| --- | --- |
+| `wait.lua` | `wait_until(condition, message, { timeout_ms, errors, context })` polls every 5 ms for at most 1000 ms by default and fails with `message`. It fails fast when the `errors` list is non-empty and appends `context()` to the failure. Keep `timeout_ms` at or below 4000, because each case is killed at five seconds. |
+| `buffer.lua` | It reads and writes whole buffers through `lines`, `text`, and `set`, reads one-based rows through `line`, creates `scratch` buffers, and finds the row containing some text through `find_row`. Files with a local `buffer` variable load it as `buffer_support`. |
+| `keymap.lua` | `invoke` runs a mapping's Lua callback in the current window, resolving a buffer-local mapping in `buffer`. `get` asserts that a mapping exists, `find` returns nil when it does not, and `feed` types keys through `vim.keycode`. |
+| `temp.lua` | `directory(label)` and `file(label, lines)` create temporary paths that are deleted when the case ends. |
+| `stub.lua` | `stub(target, key, value)` replaces one field and returns the original. |
+| `notify.lua` | `capture({ min_level, notifications })` records `vim.notify` messages and, optionally, `forge.infra.notifications` reports, and offers `messages()`, `clear()`, and `assert_none()`. |
+| `mock_client.lua` | `record()` keeps every `forge.client.request`, and `respond(responses)` answers by method. Both accept `wrap_callback` and `copy_params`. |
+| `host.lua` | `start({ data, config, schedule_ensure })` launches the real host with temporary data and the pinned executable, and `stop()` returns whether its process was collected. |
+| `git_repository.lua` | `create({ path, branch, bare, files, message })` builds a fixture repository with a fixed identity, and `run(arguments, { text })` fails the case on a nonzero exit. |
 
 ## Suites
 
@@ -59,7 +67,7 @@ The `lua-test` check runs every Lua test through the runner. Its default `affect
 
 ## Run a fixture
 
-`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` check calls it, and outside. Each scenario row, or each standalone file, runs in its own fresh Neovim, `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" -l <file> [scenario]`, from the repository root. The runner runs tests in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`, and kills the whole process tree of any test still running after five seconds, including the Forge host it launched. A killed test fails as a timeout, and a test that prints success but stays alive therefore fails too.
+`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` check calls it, and outside. The runner clones the pinned mini.test commit once into a commit-named directory beside the Nushell cache. It runs every unit shard and every integration case in its own fresh Neovim from the repository root: `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" --cmd "set rtp^=<mini.test>" -l nvim/lua/forge/tests/support/minitest_shard.lua <file> [case]`. The shard bootstrap arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case, so a timeout ends the shard and later cases in a unit file do not run. The runner kills the whole process tree, including any Forge host, of a single-case process still running one second past that deadline, and of a unit shard still running after one minute. It runs processes in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`.
 
 Inside Harness, select tests through the check:
 
@@ -70,11 +78,11 @@ check_run({"check":"lua-test","inputs":{"suite":"harness"}})
 
 Use a `suite` only when a whole area needs coverage.
 
-Outside Harness, call the runner directly. Without arguments it runs every test. Each argument is a test file, a source file (which selects its unit test), a directory, a test name (the file name without `.test.lua`, which selects every file with that name), or any of these followed by `::scenario`. A source directory selects both of its mirrors:
+Outside Harness, call the runner directly. Without arguments it runs every test. Each argument is a test file, a source file (which selects its unit test), a directory, a test name (the file name without `.test.lua`, which selects every file with that name), or any of these followed by `::case`, which names one top-level case. A source directory selects both of its mirrors:
 
 ```nu
 nu .forge/checks/lua-tests.nu client                                 # unit/client.test.lua and integration/client/client.test.lua
-nu .forge/checks/lua-tests.nu client::admission_queue                # one scenario
+nu .forge/checks/lua-tests.nu client::admission_queue                # one case
 nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua
 nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp                     # unit and integration tests for lsp/
 nu .forge/checks/lua-tests.nu --suite status --jobs 4                # a source area as the suite
@@ -82,7 +90,7 @@ nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/walkthrough.lua
 nu .forge/checks/lua-tests.nu
 ```
 
-The runner prints each test's result and duration as it finishes, then the slowest tests and a pass and fail count, and exits nonzero when any test fails. `--list` prints the selection without running it. Every test must finish within the five-second limit, and there are no per-test exceptions. A test that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed.
+The runner prints each test's result and duration as it finishes, then the slowest tests and a pass and fail count, and exits nonzero when any test fails. `--list` prints the selection without running it. Every case must finish within the five-second limit, and there are no per-test exceptions. A test that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed.
 
 `--lua` runs the given Lua before each selected test loads, for ad hoc setup such as `vim.g` values.
 

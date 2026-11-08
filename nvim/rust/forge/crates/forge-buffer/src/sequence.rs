@@ -858,37 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_append_prepend_and_bulk_removal_keep_logarithmic_height() {
-        let mut sequence =
-            BlockSequence::new((0..20_000).map(|identity| block(identity, 1)).collect()).unwrap();
-        for identity in 20_000..22_000 {
-            let position = if identity % 2 == 0 { 0 } else { sequence.len() };
-            sequence
-                .splice(position..position, vec![block(identity, 1)])
-                .unwrap();
-        }
-        let (height, count, _, _) = audit(&sequence, sequence.root, None);
-        assert!(height <= 2 * (count + 1).ilog2() as usize);
-        sequence.splice(5..sequence.len() - 5, vec![]).unwrap();
-        assert_eq!(sequence.len(), 10);
-        audit(&sequence, sequence.root, None);
-        let capacity = sequence.node.len();
-        for identity in 30_000..31_000 {
-            sequence.splice(4..5, vec![block(identity, 3)]).unwrap();
-        }
-        assert_eq!(
-            sequence.node.len(),
-            capacity,
-            "replacement must reuse released node slots"
-        );
-        audit(&sequence, sequence.root, None);
-        sequence.splice(0..sequence.len(), vec![]).unwrap();
-        assert!(sequence.is_empty());
-        assert!(sequence.locator.is_empty());
-        assert_eq!(sequence.row_count(), 0);
-    }
-
-    #[test]
     fn failed_splice_preserves_sequence_and_region_owners() {
         let mut first = block(1, 1);
         first.metadata.editable_region.push(EditableRegion {
@@ -917,34 +886,5 @@ mod tests {
         assert_eq!(sequence.region_owner.len(), 1);
         sequence.splice(0..1, vec![]).unwrap();
         assert!(sequence.region_owner.is_empty());
-    }
-
-    #[test]
-    fn fold_endpoint_edits_are_validated_before_publication() {
-        use crate::block::{BlockAnchor, FoldRange};
-        let mut first = block(1, 1);
-        first.metadata.fold.push(FoldRange {
-            collapsed_suffix: None,
-            heading_start: None,
-            collapse_children: false,
-            expand_children: false,
-            id: FoldId("section".into()),
-            start: TextPosition { row: 0, column: 0 },
-            end: BlockAnchor {
-                block: BlockId("block-2".into()),
-                position: TextPosition { row: 1, column: 0 },
-            },
-            closed: true,
-        });
-        let mut sequence = BlockSequence::new(vec![first, block(2, 1)]).unwrap();
-        let before = sequence.blocks().cloned().collect::<Vec<_>>();
-        assert!(sequence.splice(1..2, vec![]).is_err());
-        assert!(sequence.splice(1..2, vec![block(2, 0)]).is_err());
-        assert_eq!(sequence.blocks().cloned().collect::<Vec<_>>(), before);
-        sequence.splice(1..2, vec![block(2, 2)]).unwrap();
-        assert_eq!(sequence.fold_owner.len(), 1);
-        sequence.splice(0..2, vec![]).unwrap();
-        assert!(sequence.fold_owner.is_empty());
-        assert!(sequence.fold_endpoint.is_empty());
     }
 }

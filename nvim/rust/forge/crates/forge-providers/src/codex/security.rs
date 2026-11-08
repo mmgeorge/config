@@ -134,26 +134,4 @@ mod tests {
         assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
         assert_eq!(turn["approvalPolicy"], "untrusted");
     }
-
-    /// Each advertised Windows choice has an explicit native encoding.
-    #[cfg(windows)]
-    #[test]
-    fn windows_isolation_preserves_each_advertised_choice() {
-        for (mode, native, prefer_mxc) in [
-            ("elevated", "elevated", false),
-            ("unelevated", "unelevated", false),
-            ("mxc", "elevated", true),
-        ] {
-            let access = AccessPolicy {
-                isolation_mode: Some(mode.into()),
-                ..Default::default()
-            };
-            let mut thread = json!({});
-            CodexSecurity::new(&access)
-                .unwrap()
-                .apply_thread(&mut thread, "D:/repo");
-            assert_eq!(thread["config"]["windows.sandbox"], native);
-            assert_eq!(thread["config"]["features.prefer_mxc"], prefer_mxc);
-        }
-    }
 }

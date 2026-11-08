@@ -1,44 +1,50 @@
--- Unit tests for `rust_sidecar.executable_cache` (executable_cache.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "sidecar_cache", run = function()
-vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
-local root = vim.fn.tempname()
-vim.fn.mkdir(root, "p")
-local source = root .. "/source.exe"
-vim.fn.writefile({ "first executable version" }, source)
-local cache = require("rust_sidecar.executable_cache")
-local image = require("rust_sidecar.windows_image")
-local original_copy, original_pin, original_defer = vim.uv.fs_copyfile, image.pin, vim.defer_fn
-local leases = {}
--- The cache prunes superseded images from a deferred callback; capture it so cleanup runs on demand.
-local deferred_prunes = {}
-vim.defer_fn = function(callback) deferred_prunes[#deferred_prunes + 1] = callback end
-local function run_deferred_prunes()
-  local ready = deferred_prunes
-  deferred_prunes = {}
-  for _, callback in ipairs(ready) do callback() end
-end
--- Pruning visits one cache entry per scheduled step, so drain enough steps to cover every entry.
-local function drain_scheduled_steps()
-  for _ = 1, 8 do
-    local reached = false
-    vim.schedule(function() reached = true end)
-    assert(vim.wait(1000, function() return reached end, 1), "scheduler did not advance")
-  end
-end
-if vim.fn.has("win32") ~= 1 then image.pin = function() return function() end end end
-local function acquire()
-  local result, failure, done
-  cache.acquire(source, root, "fixture.exe", function(value, error)
-    result, failure, done = value, error, true
-    if value then leases[#leases + 1] = value end
+-- Unit tests for `rust_sidecar.executable_cache` (executable_cache.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local eq = MiniTest.expect.equality
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["sidecar_cache"] = function()
+  local leases = {}
+  MiniTest.finally(function()
+    for _, lease in ipairs(leases) do pcall(lease.release) end
   end)
-  assert(vim.wait(3000, function() return done end, 5), "cache acquisition did not complete")
-  assert(result, failure)
-  return result
-end
-local ok, failure = xpcall(function()
+  local root = temp.directory("cache")
+  local source = root .. "/source.exe"
+  vim.fn.writefile({ "first executable version" }, source)
+  local cache = require("rust_sidecar.executable_cache")
+  local image = require("rust_sidecar.windows_image")
+  local original_copy = vim.uv.fs_copyfile
+  -- The cache prunes superseded images from a deferred callback; capture it so cleanup runs on demand.
+  local deferred_prunes = {}
+  vim.defer_fn = function(callback) deferred_prunes[#deferred_prunes + 1] = callback end
+  local function run_deferred_prunes()
+    local ready = deferred_prunes
+    deferred_prunes = {}
+    for _, callback in ipairs(ready) do callback() end
+  end
+  -- Pruning visits one cache entry per scheduled step, so drain enough steps to cover every entry.
+  local function drain_scheduled_steps()
+    for _ = 1, 8 do
+      local reached = false
+      vim.schedule(function() reached = true end)
+      wait_until(function() return reached end, "scheduler did not advance")
+    end
+  end
+  if vim.fn.has("win32") ~= 1 then image.pin = function() return function() end end end
+  local function acquire()
+    local result, failure, done
+    cache.acquire(source, root, "fixture.exe", function(value, error)
+      result, failure, done = value, error, true
+      if value then leases[#leases + 1] = value end
+    end)
+    wait_until(function() return done end, "cache acquisition did not complete", { timeout_ms = 3000 })
+    assert(result, failure)
+    return result
+  end
   local copied = 0
   vim.uv.fs_copyfile = function(...)
     copied = copied + 1
@@ -56,7 +62,7 @@ local ok, failure = xpcall(function()
   assert(vim.uv.fs_utime(source, stat.atime.sec, stat.mtime.sec + 1))
   local third = acquire()
   assert(third.path ~= first.path and copied == 2, "rebuild reused an old image")
-  assert(vim.fn.readfile(second.path)[1] == "first executable version", "rebuild changed the active image")
+  eq(vim.fn.readfile(second.path)[1], "first executable version", { fail_reason = "rebuild changed the active image" })
   if vim.fn.has("win32") == 1 then
     run_deferred_prunes()
     drain_scheduled_steps()
@@ -65,7 +71,7 @@ local ok, failure = xpcall(function()
     local fourth = acquire()
     assert(fourth.cache_hit)
     run_deferred_prunes()
-    assert(vim.wait(3000, function() return not vim.uv.fs_stat(second.path) end, 10), "released old image was not collected")
+    wait_until(function() return not vim.uv.fs_stat(second.path) end, "released old image was not collected", { timeout_ms = 3000 })
   end
   third.release()
   assert(vim.uv.fs_stat(third.path), "current cached image was removed")
@@ -79,7 +85,7 @@ local ok, failure = xpcall(function()
       leases[#leases + 1] = value
     end)
   end
-  assert(vim.wait(3000, function() return #results == 2 end, 5))
+  wait_until(function() return #results == 2 end, "concurrent acquisitions did not both complete", { timeout_ms = 3000 })
   assert(copied == previous_copies + 1 and results[1].path == results[2].path, "concurrent acquisition duplicated publication")
   local mutate = true
   vim.fn.writefile({ "intermediate executable" }, source)
@@ -92,18 +98,7 @@ local ok, failure = xpcall(function()
     end)
   end
   local current = acquire()
-  assert(vim.fn.readfile(current.path)[1] == "final executable version", "source change published a stale executable")
-end, debug.traceback)
-for _, lease in ipairs(leases) do pcall(lease.release) end
-vim.uv.fs_copyfile, image.pin, vim.defer_fn = original_copy, original_pin, original_defer
-vim.fn.delete(root, "rf")
-assert(ok, failure)
-print("sidecar_cache: reuse, image pinning, rebuild isolation, and cleanup passed")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
+  eq(vim.fn.readfile(current.path)[1], "final executable version", { fail_reason = "source change published a stale executable" })
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

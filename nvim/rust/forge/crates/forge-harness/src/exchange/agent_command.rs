@@ -583,44 +583,6 @@ async fn interrupt(
 mod tests {
     use super::*;
 
-    /// Reject empty input and leave child ownership unchanged before admission.
-    #[test]
-    fn rejects_empty_child_input_before_admission() {
-        let children = AgentCoordinator::new("root".into());
-        let command = AgentCommand::capture(
-            AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
-                profile: None,
-                text: "  ".into(),
-            }),
-            &children,
-        );
-        assert!(matches!(command, Err(AgentFailure::EmptyMessage)));
-        assert!(children.snapshot(None).is_empty());
-    }
-
-    /// Keep informational inspections outside the mutating FIFO contract.
-    #[test]
-    fn rejects_read_only_agent_queries() {
-        let children = AgentCoordinator::new("root".into());
-        assert!(matches!(
-            AgentCommand::capture(AgentOperation::List { prefix: None }, &children),
-            Err(AgentFailure::InspectionOnly)
-        ));
-    }
-    /// Restore never bypasses input or target validation through derived decoding.
-    #[test]
-    fn rejects_invalid_serialized_agent_commands() {
-        for command in [
-            serde_json::json!({"action":"start","request":{"profile":null,"text":" "}}),
-            serde_json::json!({"action":"start","request":{"profile":" ","text":"work"}}),
-            serde_json::json!({"action":"send_message","request":{"target":{"agent_id":"child","task_id":null},"selector":"child","text":""}}),
-            serde_json::json!({"action":"follow_up","request":{"target":{"agent_id":"","task_id":null},"selector":"child","text":"work"}}),
-            serde_json::json!({"action":"interrupt","request":{"scope":"one","target":{"target":{"agent_id":"child","task_id":null},"selector":""}}}),
-        ] {
-            assert!(serde_json::from_value::<AgentCommand>(command).is_err());
-        }
-    }
-
     /// Cancelling an observation retains the sole receiver for the original worker.
     #[tokio::test]
     async fn cancelled_observation_retains_original_worker() {

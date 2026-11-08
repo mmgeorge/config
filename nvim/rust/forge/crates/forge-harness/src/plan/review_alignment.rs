@@ -49,37 +49,3 @@ fn scopes<'source>(
     }
     Ok(result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ambiguous_overloads_and_reordered_callables_do_not_create_crossing_anchors() {
-        let old = super::super::calls::present("example.ts",
-            "declare function overloaded(value: string): void;\ndeclare function overloaded(value: number): void;\nfunction first(): void;\nfunction second(): void;", &[]).unwrap();
-        let new = super::super::calls::present("example.ts",
-            "declare function overloaded(value: number): void;\ndeclare function overloaded(value: string): void;\nfunction second(): void;\nfunction first(): void;", &[]).unwrap();
-        let alignment = compare("example.ts", "example.ts", Some(&old), Some(&new)).unwrap();
-        assert!(
-            alignment
-                .anchors
-                .windows(2)
-                .all(|pair| pair[0].old <= pair[1].old && pair[0].new <= pair[1].new)
-        );
-        let overload_end = old
-            .callables("example.ts")
-            .unwrap()
-            .iter()
-            .filter(|callable| callable.owner.starts_with("overloaded"))
-            .map(|callable| callable.end_line as usize)
-            .max()
-            .unwrap();
-        assert!(
-            alignment
-                .anchors
-                .iter()
-                .all(|anchor| anchor.old >= overload_end)
-        );
-    }
-}

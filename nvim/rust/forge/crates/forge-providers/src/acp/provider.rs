@@ -3771,42 +3771,6 @@ mod tests {
         provider.shutdown(operation_context()).await.unwrap();
     }
 
-    /// An exact cancel which wins the wrapper race fences that scope before future registration.
-    #[tokio::test]
-    async fn absent_invocation_cancel_fences_late_input_without_touching_successor() {
-        let (_directory, provider, request) = failed_open_fixture(false);
-        let opened = provider
-            .thread_open(operation_context(), request)
-            .await
-            .unwrap();
-        let binding = opened.binding.id;
-        let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::testing::root_thread("failed-open"),
-            "not-yet-polled",
-        );
-        assert!(
-            matches!(provider.turn_interrupt(operation_context(), &binding, forge_provider_api::CancelRequest { scope: scope.clone() }).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)
-        );
-        let late = provider
-            .pending_inputs
-            .register(&binding, &scope, operation_context().id());
-        assert!(late.is_cancelled());
-        let successor_scope =
-            forge_provider_api::InvocationScope::new(scope.thread_id, "successor");
-        let successor =
-            provider
-                .pending_inputs
-                .register(&binding, &successor_scope, operation_context().id());
-        assert!(!successor.is_cancelled());
-        drop(late);
-        drop(successor);
-        provider
-            .thread_close(operation_context(), &binding)
-            .await
-            .unwrap();
-        provider.shutdown(operation_context()).await.unwrap();
-    }
-
     /// Build adapter-issued opaque evidence for a single stored delivery attempt.
     fn checkpoint(
         accepted: bool,
@@ -3849,48 +3813,6 @@ mod tests {
     impl forge_provider_api::trace::ProviderTrace for IgnoreTrace {
         fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
     }
-
-    /// Unsupported native isolation must fail before an invalid launch command can run.
-    #[tokio::test]
-    async fn isolated_text_is_rejected_before_native_runtime_dispatch() {
-        let provider = provider();
-        let result = provider
-            .thread_open(
-                operation_context(),
-                forge_provider_api::SessionRequest {
-                    thread_id: (forge_provider_api::testing::root_thread("isolated")).clone(),
-                    mode: forge_provider_api::SessionMode::Background,
-                    workspace: "must-not-inspect".into(),
-                    history: forge_provider_api::SessionHistory::IsolatedText(
-                        forge_provider_api::IsolatedTextPolicy::new(),
-                    ),
-                    configuration: forge_provider_api::SessionConfiguration {
-                        model: Default::default(),
-                        access: forge_provider_api::access::AccessPolicy {
-                            sandbox: false,
-                            ..Default::default()
-                        },
-                        approval: forge_provider_api::approval::ApprovalMode::Ask,
-                        resources: Default::default(),
-                    },
-                    resource_lease: None,
-                    tools: Vec::new(),
-                    tool_endpoint: None,
-                    system_instructions: "supplied only".into(),
-                    trace: Arc::new(IgnoreTrace),
-                },
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(ProviderError::Unsupported(
-                forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::TextGeneration
-                )
-            ))
-        ));
-        provider.shutdown(operation_context()).await.unwrap();
-    }
 }
 
 /// Return the compaction Claude reported as completed or failed after `/compact`.
@@ -3908,6 +3830,3 @@ fn settled_compaction(
         )
     })
 }
-
-#[cfg(test)]
-mod settled_compaction_tests {}

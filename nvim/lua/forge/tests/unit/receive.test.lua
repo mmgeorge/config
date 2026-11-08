@@ -1,19 +1,19 @@
--- Unit tests for `forge.receive` (receive.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "queue", run = function()
-vim.loader.enable(false)
-local receive = require("forge.receive")
-local native_schedule = vim.schedule
-local scheduled = {}
-vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+-- Unit tests for `forge.receive` (receive.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
-local function run_one()
-  assert(#scheduled == 1, "receive path queued multiple drain callbacks")
-  table.remove(scheduled, 1)()
-end
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-local ok, failure = xpcall(function()
+T["queue"] = function()
+  local receive = require("forge.receive")
+  local scheduled = {}
+  vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+
+  local function run_one()
+    assert(#scheduled == 1, "receive path queued multiple drain callbacks")
+    table.remove(scheduled, 1)()
+  end
+
   local messages, decoded, credits, finished = {}, 0, 0, false
   local state = receive.new({
     decode = function(line) decoded = decoded + 1 return vim.json.decode(line) end,
@@ -82,20 +82,6 @@ local ok, failure = xpcall(function()
   receive.push(state, "1\n")
   run_one()
   assert(state.closed)
-end, debug.traceback)
-
-vim.schedule = native_schedule
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  vim.cmd("qa!")
 end
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

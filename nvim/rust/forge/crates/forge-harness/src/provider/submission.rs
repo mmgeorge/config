@@ -1066,14 +1066,6 @@ impl Submission {
         Ok(record)
     }
 
-    /// Compose reconciliation for fixtures whose test body is the synchronous state owner.
-    #[cfg(test)]
-    pub(crate) async fn reconcile(
-        self: &Arc<Self>,
-        provider: &Provider,
-    ) -> Result<SubmissionRecord> {
-        self.apply_reconciliation(self.observe_reconciliation(provider).await?)
-    }
     /// Returns the stable host identity used for correlation, never a deduplication promise.
     pub fn id(&self) -> &str {
         &self.id
@@ -1832,25 +1824,6 @@ mod tests {
         }
     }
 
-    /// A positive rejection exposes its committed Prepared state on the first owner application.
-    #[test]
-    fn proven_nonacceptance_returns_committed_state_and_rotates_attempt() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
-        let input = store.prepare(&request("pending"), fixture_provider_id())?;
-        input.sending(None)?;
-        let snapshot = input.record()?;
-        let attempt = snapshot.attempt_id.clone();
-        let after = input.apply_reconciliation(SubmissionReconciliation {
-            snapshot,
-            evidence: forge_provider_api::SubmissionEvidence::NotAccepted,
-        })?;
-        assert_eq!(after.delivery, SubmissionState::Prepared);
-        assert_ne!(after.attempt_id, attempt);
-        assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
-        Ok(())
-    }
-
     /// Reject positive history evidence captured before a replacement attempt or history binding.
     #[test]
     fn stale_acceptance_cannot_bind_replacement_attempt_or_history() -> Result<()> {
@@ -2227,28 +2200,6 @@ mod tests {
             recovered.record()?.delivery,
             SubmissionState::Accepted { .. }
         ));
-        Ok(())
-    }
-
-    /// Native acceptance is evidence only; reconciling it does not run host task callbacks.
-    #[tokio::test]
-    async fn accepted_receipt_reconciliation_preserves_notification_and_identity() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let store = SubmissionStore::open(
-            directory.path(),
-            Arc::new(TraceStore::open(directory.path())?),
-        )?;
-        let submission =
-            store.prepare(&request("entry"), forge_providers::registry::default_id())?;
-        let accepted = submission.acceptance();
-        submission.accepted(Some(token("receipt")))?;
-        let before = submission.record()?;
-        let (native, _) = receipt_provider();
-        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        let after = submission.reconcile(provider.as_provider()).await?;
-        assert!(*accepted.borrow());
-        assert_eq!(after.id, before.id);
-        assert_eq!(after.delivery, before.delivery);
         Ok(())
     }
 

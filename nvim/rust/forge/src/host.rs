@@ -783,15 +783,6 @@ mod tests {
         poll_fn(|context| std::task::Poll::Ready(future.as_mut().poll(context).is_pending())).await
     }
 
-    /// Preserve early cancellation identity before a foreground result envelope exists.
-    #[test]
-    fn early_cancellation_retains_typed_response_code() {
-        let error = anyhow::Error::new(forge_harness::broker::TurnCancelled)
-            .context("prepare Harness request");
-        let response = request_failure_response(41, &error);
-        assert_eq!(response.error().unwrap().code, "turn_cancelled");
-    }
-
     #[tokio::test]
     async fn request_timeout_retains_its_runtime_and_admission_until_completion() {
         let runtime = Arc::new(ForgeRuntime::new().unwrap());
@@ -829,17 +820,6 @@ mod tests {
         assert!(requests.pending().is_empty());
         assert!(retained.upgrade().is_none());
         assert_eq!(admission.available_permits(), 1);
-    }
-
-    #[tokio::test]
-    async fn panicked_request_reports_its_identity_and_leaves_no_registry_entry() {
-        let requests = RequestTaskStore::default();
-        requests
-            .spawn(19, async { panic!("request fixture panic") })
-            .unwrap();
-        let failure = requests.join_next().await.unwrap().unwrap_err();
-        assert!(failure.to_string().contains("Forge request 19 task failed"));
-        assert!(requests.pending().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -291,6 +291,3 @@ impl ControlEndpoint for ControlSession {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {}

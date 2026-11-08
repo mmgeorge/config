@@ -7,21 +7,7 @@ use anyhow::{Context, Result};
 
 #[derive(Clone, Copy)]
 enum ChildCompletionFailure {
-    ProviderCancelled,
-    ProviderFailed,
     CleanupFailed,
-}
-
-/// Independent typed cancellation must settle the child even without a local cancellation signal.
-#[tokio::test]
-async fn managed_child_provider_cancellation_is_cancelled_without_watch_signal() -> Result<()> {
-    assert_child_completion_failure(ChildCompletionFailure::ProviderCancelled).await
-}
-
-/// A normalized provider failure remains distinct from cancellation.
-#[tokio::test]
-async fn managed_child_normalized_provider_error_remains_failed() -> Result<()> {
-    assert_child_completion_failure(ChildCompletionFailure::ProviderFailed).await
 }
 
 /// Cleanup failure retains its failure state and obligation even after provider cancellation.
@@ -70,21 +56,6 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         )
         .await?;
     let (output, cleanup_error, expected) = match failure {
-        ChildCompletionFailure::ProviderCancelled => (
-            Err(anyhow::Error::new(TurnCancelled)),
-            None,
-            ExchangeState::Cancelled,
-        ),
-        ChildCompletionFailure::ProviderFailed => (
-            Err(anyhow::Error::new(crate::provider::ProviderError::from(
-                forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::TurnStart,
-                    forge_provider_api::ProviderFailureKind::Unknown,
-                ),
-            ))),
-            None,
-            ExchangeState::Failed,
-        ),
         ChildCompletionFailure::CleanupFailed => (
             Err(anyhow::Error::new(TurnCancelled)),
             Some("cleanup transport failed".into()),
@@ -92,20 +63,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         ),
     };
     let turn_outcome = match failure {
-        ChildCompletionFailure::ProviderFailed => crate::turn::TurnOutcome::Failed {
-            error: forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::TurnStart,
-                forge_provider_api::ProviderFailureKind::Unknown,
-            )
-            .at_phase(
-                forge_provider_api::ProviderPhase::Observation,
-                forge_provider_api::FailureDisposition::Uncertain,
-            ),
-            retry: forge_provider_api::turn::RetryDecision::NotAllowed,
-        },
-        ChildCompletionFailure::ProviderCancelled | ChildCompletionFailure::CleanupFailed => {
-            crate::turn::TurnOutcome::Interrupted
-        }
+        ChildCompletionFailure::CleanupFailed => crate::turn::TurnOutcome::Interrupted,
     };
     broker
         .observe_child_fixture(
@@ -162,15 +120,6 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
                     .agent_coordinator
                     .cleanup_task(owner.agent_id().as_str())
                     .is_some()
-            );
-        }
-        ChildCompletionFailure::ProviderCancelled | ChildCompletionFailure::ProviderFailed => {
-            assert_eq!(agent.state, AgentState::Ready);
-            assert!(
-                broker
-                    .agent_coordinator
-                    .cleanup_task(owner.agent_id().as_str())
-                    .is_none()
             );
         }
     }

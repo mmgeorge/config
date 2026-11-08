@@ -29,22 +29,10 @@ See [Extending project checks](extending-project-checks.md) when changing input 
 
 Compile the affected package first, with a 300-second compile deadline. Select the exact regression for the changed boundary; source files and broad module filters are not substitutes for a named regression. These selectors name current test functions and describe their coverage, not recorded passing results.
 
-- `forge-providers`: `turn_runner::tests::dropped_waiter_retains_native_outcome_and_publishes_once_after_collection` checks retained work, one native outcome, collection ordering, and one terminal publication.
 - `forge-providers`: `turn_runner::tests::cleanup_failure_retains_native_result_and_fences_without_completion` checks unavailable publication after failed collection without ordinary completion.
-- `forge-providers`: `turn_runner::tests::prestart_cancellation_collects_without_manufacturing_a_turn` checks cancellation before native start.
-- `forge-providers`: `mock::tests::automatic_settlement_and_exact_cancel_preserve_successor` checks canonical completion and interruption of the exact original turn.
-- `forge-providers`: `mock::tests::grouped_prompt_completion_covers_recovered_and_current_attempts` checks original input-attempt coverage across grouped acceptance.
 - `forge-provider-api`: `turn::tests::only_normal_completion_permits_automatic_continuation` checks normal completion versus token limit, request limit, refusal, failure, and interruption.
-- `forge-provider-api`: `turn_usage::tests::report_merge_is_idempotent_complementary_and_atomic` checks identified partial accounting and conflicting replay.
-- `forge-provider-api`: `compaction::tests::exact_terminal_metadata_refines_unknown_counts_without_retargeting_or_overwriting` checks exact operation/thread metadata refinement while preserving known counts.
-- `forge-harness`: `turn::tool::tests::tool_final_snapshots_and_refinements_are_atomic_and_replay_safe` checks descriptor refinements, final output replacement, reload, and conflicting final replay.
-- `forge-harness`: `buffer::projection::tests::native_user_item_retains_its_sender_and_original_identity` checks native user-item history and sender rendering.
 
-- `forge-harness`: `agent::observed::tests::child_items_and_completed_turn_retain_original_ownership_after_summary_finish` checks independent native child ownership, partial content, and its own collected terminal result.
-- `forge-harness`: `agent::observed::tests::summary_only_nested_agents_keep_explicit_hierarchy_and_reject_cycles` checks native ancestry without invented managed tasks or child turns.
-- `forge-harness`: `storage::observed_agent::tests::unavailable_binding_preserves_native_uncertainty_and_does_not_touch_replacement` checks persisted observation loss without replacing native lifecycle evidence or touching another generation.
 - `forge-harness`: `storage::agent_policy::tests::only_matching_user_authorization_clears_latest_durable_policy` checks that stale reservations and automatic work cannot clear a stopped managed child's durable authorization policy.
-- `forge-harness`: `storage::agent_policy::tests::stopped_task_pointer_rejects_unknown_and_foreign_ownership` checks retained stopped-task pointers against persisted ownership.
 - `forge-harness`: `storage::agent_policy::tests::accepted_parent_report_acknowledgement_is_atomic_and_preserves_child_failure` checks actual user-report acknowledgement without clearing a stale policy or replacing the child failure.
 
 For example, from `nvim/rust/forge`:

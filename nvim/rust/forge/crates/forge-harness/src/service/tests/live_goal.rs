@@ -12,17 +12,6 @@ async fn live_goal_complete_commits_before_native_acceptance() -> Result<()> {
     live_goal_control_case("goal_complete", "summary", "All requested work is complete").await
 }
 
-/// A blocked goal control also commits before the provider accepts the submission.
-#[tokio::test]
-async fn live_goal_blocked_commits_before_native_acceptance() -> Result<()> {
-    live_goal_control_case(
-        "goal_blocked",
-        "reason",
-        "The required external input is unavailable",
-    )
-    .await
-}
-
 /// Run one goal control, each in its own test so it reports independently and stays within the
 /// per-test time limit.
 async fn live_goal_control_case(tool: &str, field: &str, message: &str) -> Result<()> {

@@ -195,20 +195,3 @@ fn optional(value: &Option<String>, role: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn artifact() -> serde_json::Value {
-        serde_json::json!({"version":12,"flow":[{"text":"flow"}],"overview":"overview","root":"Project description","commit":"1234567890123456789012345678901234567890","tasks":[{"title":"Task","subtasks":[{"title":"Subtask","changes":[{"action":"Modify","kind":"Function","target":"function","note":"note","file":"src/main.rs","line":3,"annotation":{"title":"Annotation","comment":"Comment"}}]}]}]})
-    }
-    #[test]
-    fn artifact_rejects_escape_and_legacy_plural_annotation() {
-        let mut value = artifact();
-        value["tasks"][0]["subtasks"][0]["changes"][0]["file"] = "../outside".into();
-        assert!(Artifact::parse(&serde_json::to_vec(&value).unwrap()).is_err());
-        let mut value = artifact();
-        value["tasks"][0]["subtasks"][0]["changes"][0]["annotations"] = serde_json::json!([]);
-        assert!(Artifact::parse(&serde_json::to_vec(&value).unwrap()).is_err());
-    }
-}

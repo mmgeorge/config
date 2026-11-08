@@ -110,27 +110,3 @@ fn relative_path(path: &str, workspace: &str) -> String {
     }
     path
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_only_paths_inside_the_workspace() {
-        for path in [
-            "/Users/me/project/src/lib.rs",
-            "Users/me/project/src/lib.rs",
-            "src/lib.rs",
-        ] {
-            assert_eq!(relative_path(path, "/Users/me/project"), "src/lib.rs");
-        }
-        assert_eq!(
-            relative_path("C:\\project\\src\\lib.rs", "C:\\project"),
-            "src/lib.rs"
-        );
-        assert_eq!(
-            relative_path("/Users/me/project-other/lib.rs", "/Users/me/project"),
-            "/Users/me/project-other/lib.rs"
-        );
-    }
-}

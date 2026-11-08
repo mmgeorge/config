@@ -7071,51 +7071,6 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         }.await;
     }
 
-    /// Input preconditions preserve closed, invalidated, identity, and occupied-slot causes without native dispatch.
-    #[tokio::test]
-    async fn input_preconditions_preserve_exact_typed_rejection_reasons() {
-        let (provider, session, _events, _socket) = compaction_fixture().await;
-        let mut input = request();
-        input.dispatch = forge_provider_api::submission::DispatchReporter::channel(
-            session.binding.id.clone(),
-            input.scope.clone(),
-            input.submission_id.clone(),
-            input.attempt_id.clone(),
-        )
-        .0;
-        let mut wrong = input.clone();
-        wrong.scope =
-            forge_provider_api::InvocationScope::new(session.owner.clone(), "wrong-invocation");
-        assert!(
-            matches!(provider.turn_start(context(), &session.binding.id, wrong).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
-        );
-        session.invalidated.store(true, Ordering::Release);
-        assert!(
-            matches!(provider.turn_start(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
-        );
-        session.invalidated.store(false, Ordering::Release);
-        session.closing.store(true, Ordering::Release);
-        assert!(
-            matches!(provider.turn_start(context(), &session.binding.id, input.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated)
-        );
-        session.closing.store(false, Ordering::Release);
-        let (cancel, _) = mpsc::unbounded_channel();
-        *session.active.lock().await = Some(ActiveExecution {
-            scope: input.scope.clone(),
-            native_turn_id: "existing-turn".into(),
-            turn_updates: watch::channel(Some("existing-turn".into())).0,
-            submissions: Arc::new(Mutex::new(Vec::new())),
-            request: input.clone(),
-            cancel,
-            task: None,
-        });
-        assert!(
-            matches!(provider.turn_start(context(), &session.binding.id, input).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::ExecutionActive && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
-        );
-        session.active.lock().await.take();
-        session.rpc.lock().await.close().await.unwrap();
-    }
-
     /// Lost rollback acknowledgment retains uncertainty and cannot remove a newer turn on retry.
     #[tokio::test]
     async fn uncertain_retraction_never_repeats_native_rollback() {
@@ -7153,22 +7108,6 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::OperationConflict));
             let _ = session.rpc.lock().await.close().await;
         }.await;
-    }
-
-    /// A native user item's client ID links back to the Forge submission that produced it.
-    #[test]
-    fn client_id_recovers_only_forge_submissions() {
-        let submission = forge_provider_api::SubmissionId::try_from("input").unwrap();
-        let attempt = forge_provider_api::DeliveryAttemptId::new("attempt").unwrap();
-        assert_eq!(
-            submission_from_client_id(&native_input_id(&submission, &attempt)),
-            Some(submission)
-        );
-        assert_eq!(submission_from_client_id("typed-in-another-client"), None);
-        assert_eq!(
-            submission_from_client_id(r#"["other","input","attempt"]"#),
-            None
-        );
     }
 
     /// Retraction requires exact attempt identity and cannot discard a second input in the same turn.

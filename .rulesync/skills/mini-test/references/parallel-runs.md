@@ -26,6 +26,8 @@ A shard is the set of cases one process runs:
 
 Bound concurrency below the CPU count when cases start children or external processes, since each case may hold several processes.
 
+On Windows, concurrent shards that start child Neovims collide on the child's `--listen` pipe, because `child.start` names it after a `tempname()` counter that restarts in every process; the [child reference](child-neovim.md) shows the workaround. Install it in the shard bootstrap so that every test file inherits it.
+
 ## Shard bootstrap
 
 Run each shard with `nvim --headless --noplugin -u scripts/minimal_init.lua -l tests/shard.lua <file> [top-level name]`. The bootstrap collects and filters cases itself, keeps the event loop alive until the reporter finishes, arms a deadline per case, and exits with the shard's status:

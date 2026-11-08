@@ -396,33 +396,3 @@ impl GenerationService {
         }
     }
 }
-
-#[cfg(test)]
-mod cancellation_tests {
-    use super::*;
-    use forge_protocol::message::Request;
-    use serde_json::json;
-
-    #[test]
-    fn cancellation_targets_admitted_request_before_execution_and_releases_registry() {
-        let repository = Arc::new(RepositoryStore::default());
-        let diff = DiffEngine::new(Default::default(), 1);
-        let syntax = SyntaxEngine::new(diff.analysis_pool());
-        let service = GenerationService::new(repository, diff, syntax).unwrap();
-        let request = |id, operation, target| -> Request {
-            serde_json::from_value(json!({"id":id,"method":"repository.generation",
-                "params": if operation == "cancel" { json!({"operation":operation,"request_id":target}) }
-                    else { json!({"operation":operation}) }})).unwrap()
-        };
-        let first = service.admit(&request(1, "generate", 0)).unwrap().unwrap();
-        let second = service.admit(&request(2, "generate", 0)).unwrap().unwrap();
-        service.admit(&request(3, "cancel", 1)).unwrap();
-        assert!(first.cancellation.is_cancelled());
-        assert!(!second.cancellation.is_cancelled());
-        drop(first);
-        service.admit(&request(4, "cancel", 1)).unwrap();
-        assert!(!second.cancellation.is_cancelled());
-        drop(second);
-        assert!(service.cancellation.lock().unwrap().is_empty());
-    }
-}

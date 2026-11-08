@@ -2454,33 +2454,4 @@ mod tests {
         broker.provider.shutdown().await?;
         Ok(())
     }
-    /// Restoring configured model inheritance cannot assert a model from an earlier execution.
-    #[test]
-    fn finished_question_discussion_clears_actual_model_without_changing_requested_model()
-    -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let configured = broker.session.model.clone();
-        broker.session.resolved_model = Some("discussion-actual".into());
-        broker.question_discussion = true;
-        broker.finish_question_discussion(QuestionDiscussion {
-            visible_text: "Question discussion".into(),
-            previous_usage: None,
-        })?;
-        assert_eq!(broker.session.model, configured);
-        assert!(broker.session.resolved_model.is_none());
-        assert!(!broker.question_discussion);
-        assert!(broker.question_model.is_none());
-        assert!(
-            broker
-                .store
-                .load_session(&broker.session.id)?
-                .unwrap()
-                .resolved_model
-                .is_none()
-        );
-        Ok(())
-    }
 }

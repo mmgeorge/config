@@ -48,17 +48,7 @@ impl std::ops::Deref for ReviewSourceData {
     }
 }
 
-impl ReviewSourceData {
-    #[cfg(test)]
-    pub(super) fn replace_revision(
-        &mut self,
-        document: PlanDocument,
-        rendered: RenderedPlan,
-    ) -> Result<()> {
-        self.revision = PlanReviewRevision::new(&self.document.plan_id, document, rendered)?;
-        Ok(())
-    }
-}
+impl ReviewSourceData {}
 
 /// Owns a working review source whose access mode cannot change during analysis.
 pub(crate) struct EditableReviewSource(ReviewSourceData);

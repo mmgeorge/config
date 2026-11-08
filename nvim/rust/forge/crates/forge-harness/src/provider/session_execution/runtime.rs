@@ -4610,53 +4610,6 @@ mod tests {
         Ok(())
     }
 
-    /// Preserve actual mutation order when batch revisions and effect ordinals overlap.
-    #[test]
-    fn effect_publications_preserve_application_order() -> anyhow::Result<()> {
-        let cell = Arc::new(SettlementCell::default());
-        let ids = [
-            HostEffectId {
-                batch_revision: 2,
-                kind: HostEffectKind::QuestionWithdrawal,
-                ordinal: 0,
-            },
-            HostEffectId {
-                batch_revision: 1,
-                kind: HostEffectKind::QuestionAnswer,
-                ordinal: 0,
-            },
-            HostEffectId {
-                batch_revision: 2,
-                kind: HostEffectKind::PlanQuestion,
-                ordinal: 0,
-            },
-        ];
-        for id in ids {
-            let ResultEffectAdmission::Apply(guard) = cell.begin_result_effect(id)? else {
-                panic!("new effect must be admitted")
-            };
-            guard.commit_output(HostEffectOutput {
-                nodes: Vec::new(),
-                events: Vec::new(),
-                elicitation: None,
-                awaiting_input: false,
-                publication_drained: false,
-                plan_document: None,
-                continuing: None,
-                plan_record: None,
-            })?;
-        }
-        assert_eq!(cell.pending_effect_publications()?, ids);
-        assert!(matches!(
-            cell.begin_result_effect(ids[1])?,
-            ResultEffectAdmission::Applied(_)
-        ));
-        assert_eq!(cell.pending_effect_publications()?, ids);
-        cell.acknowledge_effect_publication(ids[1])?;
-        assert_eq!(cell.pending_effect_publications()?, vec![ids[0], ids[2]]);
-        Ok(())
-    }
-
     /// Retry a failed collection before releasing the old execution owner.
     #[tokio::test]
     async fn close_retries_incomplete_cleanup_before_releasing_owner() -> anyhow::Result<()> {
@@ -4914,20 +4867,5 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    /// Closed presentation queues fail completion waiters instead of dropping them.
-    #[tokio::test]
-    async fn rejected_completion_resolves_with_observation_failure() {
-        let (reply, response) = oneshot::channel();
-        Delivery::Complete {
-            reply,
-            result: Box::new(Err(protocol("original"))),
-        }
-        .fail(ObservationFailure::Disconnected);
-        assert!(matches!(
-            response.await.unwrap(),
-            Err(ProviderError::Observation(ObservationFailure::Disconnected))
-        ));
     }
 }

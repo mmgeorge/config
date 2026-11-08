@@ -1,7 +1,6 @@
 //! In-process stand-in for the `gh` executable, used by tests of decoding and routing.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 
@@ -9,7 +8,6 @@ use super::GhClient;
 
 /// One request that `GhClient` would otherwise pass to the `gh` process.
 pub(crate) struct ScriptedGhInvocation {
-    pub(crate) directory: PathBuf,
     /// Arguments without the `--input <file>` pair; the file's bytes are in `input`.
     pub(crate) argument: Vec<OsString>,
     pub(crate) input: Option<Vec<u8>>,

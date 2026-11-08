@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, Write};
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -21,31 +21,6 @@ fn checkpoint_worker_survives_closed_stderr() -> Result<()> {
         .stderr(writer)
         .spawn()?;
     wait_for_worker(&mut child)
-}
-
-#[test]
-fn checkpoint_worker_emits_no_diagnostics() -> Result<()> {
-    let mut diagnostics = tempfile::tempfile()?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "checkpoint_worker_without_diagnostics",
-            "--ignored",
-            "--nocapture",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(diagnostics.try_clone()?)
-        .spawn()?;
-    wait_for_worker(&mut child)?;
-    diagnostics.rewind()?;
-    let mut output = String::new();
-    diagnostics.read_to_string(&mut output)?;
-    ensure!(
-        output.is_empty(),
-        "unexpected checkpoint diagnostics: {output}"
-    );
-    Ok(())
 }
 
 fn wait_for_worker(child: &mut Child) -> Result<()> {

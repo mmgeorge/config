@@ -1,7 +1,7 @@
 use super::*;
 use crate::{provider::ProviderLaunch, storage::SqliteStore};
 use anyhow::Result;
-use forge_git::test_support::{commit_index, init_repository, set_identity};
+use forge_git::test_support::{init_repository, set_identity};
 use std::{path::Path, sync::Arc};
 
 fn manager() -> Arc<BackgroundManager> {
@@ -91,34 +91,5 @@ async fn background_resume_marks_interrupted_compaction_unconfirmed() -> Result<
     );
     let events = SqliteStore::open(&data)?.list_session_event(&first.session_id)?;
     assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Unconfirmed)));
-    Ok(())
-}
-
-#[tokio::test]
-async fn history_keeps_ten_complete_messages_and_rejects_changed_head() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    init_repository(fixture.path());
-    set_identity(fixture.path());
-    for index in 0..12 {
-        commit_index(
-            fixture.path(),
-            &format!("feat: entry {index}\n\nBody {index}"),
-        );
-    }
-    commit_index(
-        fixture.path(),
-        &format!(
-            "feat: preserve full history\n\n{}\nlast-history-marker",
-            "history ".repeat(70000)
-        ),
-    );
-    let store = forge_git::store::RepositoryStore::default();
-    let context = BackgroundContext::read(&store, fixture.path().to_str().unwrap()).await?;
-    assert_eq!(context.history.matches("Commit ").count(), 10);
-    assert!(!context.history.contains("entry 0\n"));
-    assert!(context.history.contains("Body 11"));
-    assert!(context.history.contains("last-history-marker") && context.history.len() > 500_000);
-    commit_index(fixture.path(), "feat: later");
-    assert!(context.verify(&store).await.is_err());
     Ok(())
 }

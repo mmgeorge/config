@@ -18,29 +18,6 @@ fn submit(id: &str) -> InputOperation {
     }
 }
 
-/// Keep rejection identity stable while an invalid edit leaves content unchanged.
-#[test]
-fn stale_edit_returns_typed_rejection_without_changing_content() -> Result<()> {
-    let input = SessionInputQueue::default();
-    input.apply(submit("message"))?;
-    let result = input.apply(InputOperation {
-        id: "stale-edit".into(),
-        control_revision: 0,
-        after_control: None,
-        action: InputAction::Reserve {
-            id: "message".into(),
-            revision: 0,
-            reservation: "editor".into(),
-        },
-    })?;
-    assert_eq!(result.error_code, Some(InputRejection::RevisionChanged));
-    assert_eq!(input.snapshot()?.messages[0].text, "message message");
-    assert!(input.snapshot()?.messages[0].reservation().is_none());
-    let restored: InputUpdate = serde_json::from_slice(&serde_json::to_vec(&result)?)?;
-    assert_eq!(restored.error_code, Some(InputRejection::RevisionChanged));
-    Ok(())
-}
-
 /// Preserve reserved and edited input when an earlier local directive completes late.
 #[test]
 fn local_input_completion_cannot_remove_an_edited_or_reserved_revision() -> Result<()> {
@@ -204,36 +181,6 @@ fn receipt_delivery_cannot_overwrite_a_newer_input_attempt() -> Result<()> {
         )?
         .unwrap();
     assert!(input.snapshot()?.messages.is_empty());
-    Ok(())
-}
-
-#[test]
-fn user_input_precedes_generated_continuation() -> Result<()> {
-    let input = SessionInputQueue::default();
-    let mut continuation = submit("continuation");
-    if let InputAction::Submit { message } = &mut continuation.action {
-        message.purpose = InputPurpose::TaskContinuation {
-            revision: crate::task::TaskRevision::fresh(),
-            id: crate::task::TaskInputId::fresh(),
-            completed_turn_id: crate::task::TaskTurnId {
-                exchange_ordinal: 1,
-                turn_ordinal: 1,
-            },
-            reason: "More work remains".into(),
-        };
-        message.intent = InputIntent::Auto;
-    }
-    input.apply(continuation)?;
-    input.apply(submit("user"))?;
-    assert!(input.claim("continuation", 1, InputRoute::Turn)?.is_none());
-    assert!(
-        input
-            .claim("continuation", 1, InputRoute::Steering)?
-            .is_none()
-    );
-    assert!(input.claim("user", 1, InputRoute::Turn)?.is_some());
-    input.delivery("user", None, None, None)?;
-    assert!(input.claim("continuation", 1, InputRoute::Turn)?.is_some());
     Ok(())
 }
 

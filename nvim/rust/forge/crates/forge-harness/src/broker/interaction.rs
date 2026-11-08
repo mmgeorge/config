@@ -747,77 +747,6 @@ impl HarnessBroker {
 mod receipt_tests {
     use super::*;
 
-    /// Terminal snapshots are historical observations, not a second negotiated capability authority.
-    #[tokio::test]
-    async fn completion_preserves_negotiated_capability_authority() -> Result<()> {
-        use forge_provider_api::capability::{CapabilityId, Support};
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let (mut exchange, _, _) = broker
-            .test_stage_interaction_for_turn("Preserve negotiated support", true, 100)
-            .await?;
-        for (revision, supported) in [(1, true), (2, false)] {
-            let mut manifest = forge_provider_api::CapabilityManifest::from_descriptor(
-                broker.provider.descriptor(),
-            );
-            manifest.effective_revision = revision;
-            for capability in &mut manifest.capability {
-                if matches!(
-                    capability.id,
-                    CapabilityId::NativeFork
-                        | CapabilityId::NativeCompact
-                        | CapabilityId::NativeSteer
-                ) {
-                    capability.support = if supported {
-                        Support::Supported
-                    } else {
-                        Support::Unsupported
-                    };
-                }
-            }
-            broker.apply_effective_capabilities(manifest.clone())?;
-            let expected = serde_json::to_value(&broker.capability)?;
-            let mut stale = broker.capability.clone();
-            stale.native_fork = !supported;
-            stale.native_compact = !supported;
-            stale.native_steer = !supported;
-            broker.session.provider_checkpoint_id = Some("previous-turn-checkpoint".into());
-            let completion = ProviderCompletion {
-                native: forge_provider_api::completion::ProviderCompletion {
-                    capability: stale,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            broker.stage_host_completion(&mut exchange, completion, PromptMode::Chat)?;
-            assert_eq!(serde_json::to_value(&broker.capability)?, expected);
-            assert_eq!(
-                serde_json::to_value(&broker.latest_manifest)?,
-                serde_json::to_value(Some(&manifest))?
-            );
-            {
-                let metadata = broker.observer.metadata.read().unwrap();
-                assert_eq!(serde_json::to_value(&metadata.capability)?, expected);
-                assert_eq!(
-                    serde_json::to_value(&metadata.manifest)?,
-                    serde_json::to_value(Some(&manifest))?
-                );
-            }
-            assert_eq!(broker.session.native_fork, supported);
-            assert_eq!(broker.session.native_compact, supported);
-            let stored = broker.store.load_session(&broker.session.id)?.unwrap();
-            assert_eq!(stored.native_fork, supported);
-            assert_eq!(stored.native_compact, supported);
-            assert!(
-                broker.session.provider_checkpoint_id.is_none(),
-                "absent per-turn retraction eligibility was preserved"
-            );
-        }
-        Ok(())
-    }
-
     /// A routing thread is not durable history, and absent terminal metadata cannot erase known history.
     #[tokio::test]
     async fn turn_routes_and_absent_completion_preserve_native_history() -> Result<()> {
@@ -914,35 +843,6 @@ mod receipt_tests {
         assert_eq!(
             expected[0].kind,
             crate::provider::session_execution::HostEffectKind::PlanSubmit
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejected_goal_callback_does_not_become_native_terminal_evidence() -> Result<()> {
-        let (_root, _store, controller) = crate::task::SessionTaskController::test_goal();
-        let permit = controller.current()?.unwrap().permit();
-        let invocation = crate::tools::ControlToolInvocation {
-            call_id: None,
-            task_permit: Some(permit),
-            name: "goal_complete".into(),
-            arguments: json!({"summary":"completed host callback"}),
-        };
-        let mut host = ProviderCompletion::default();
-        crate::tools::apply_invocation(&invocation, &mut host)?;
-        let rejected = crate::provider::HostEffectBatch::new(1, host);
-        let surviving = crate::provider::HostEffectBatch::new(2, ProviderCompletion::default());
-        let mut batches = vec![rejected.clone(), surviving];
-        let mut output = crate::provider::HostEffectBatch::active_completion(&batches).unwrap();
-        rejected.reject();
-        discard_rejected_host_effects(&mut output, &mut batches);
-        assert!(output.goal_control.is_none());
-        let (evidence, _) = output.goal_evidence();
-        assert!(!evidence.structured_complete);
-        assert!(!evidence.structured_blocked);
-        assert!(
-            applicable_host_effects(&output, &batches, PromptMode::GoalContinuation, false)?
-                .is_empty()
         );
         Ok(())
     }

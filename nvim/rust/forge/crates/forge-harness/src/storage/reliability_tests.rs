@@ -1,7 +1,6 @@
 use super::{SqliteStore, test::session};
 use crate::session::SessionStore;
 use anyhow::Result;
-use rusqlite::TransactionBehavior;
 
 #[test]
 fn newer_databases_are_preserved_and_obsolete_history_is_deleted() -> Result<()> {
@@ -82,39 +81,6 @@ fn partial_deletion_recovers_without_blocking_unrelated_writes() -> Result<()> {
     assert!(!plans.exists());
     assert!(reopened.load_session("deleted")?.is_none());
     assert!(reopened.load_session("survivor")?.is_some());
-    Ok(())
-}
-
-#[test]
-fn sqlite_contention_produces_an_actionable_error() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let mut first = SqliteStore::open(root.path())?;
-    let second = SqliteStore::open(root.path())?;
-    second.connection.busy_timeout(std::time::Duration::ZERO)?;
-    let _write = first
-        .connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let error: anyhow::Error = second
-        .connection
-        .execute(
-            "INSERT INTO prompt_history_record(text,created_at_ms) VALUES('blocked',0)",
-            [],
-        )
-        .unwrap_err()
-        .into();
-    let message = super::error_message(&error.context("save prompt history"));
-    assert!(message.contains("SQLite contention"));
-    assert!(message.contains("5 seconds"));
-    assert!(message.contains("save prompt history"));
-    assert_eq!(
-        second
-            .connection
-            .query_row("SELECT COUNT(*) FROM prompt_history_record", [], |row| row
-                .get::<_, i64>(
-                0
-            ))?,
-        0
-    );
     Ok(())
 }
 

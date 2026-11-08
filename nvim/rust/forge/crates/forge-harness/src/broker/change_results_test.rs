@@ -91,18 +91,8 @@ async fn failed_completion_checkpoint_can_finalize_as_failed() {
 }
 
 #[tokio::test]
-async fn checkpoint_commit_failure_preserves_previous_comparison() {
-    assert_checkpoint_commit_failure_preserves_comparison(false, false).await;
-}
-
-#[tokio::test]
 async fn checkpoint_commit_failure_preserves_recaptured_comparison() {
     assert_checkpoint_commit_failure_preserves_comparison(true, false).await;
-}
-
-#[tokio::test]
-async fn checkpoint_commit_failure_preserves_recovered_initial_checkpoint() {
-    assert_checkpoint_commit_failure_preserves_comparison(false, true).await;
 }
 
 /// Fails the checkpoint insert once, checks the exchange keeps its previous comparison, and

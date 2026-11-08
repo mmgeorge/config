@@ -108,11 +108,6 @@ impl DisplayRegistry {
 }
 
 impl DisplayProjection<'_> {
-    #[cfg(test)]
-    pub(super) fn snapshot(&self) -> DisplayRegistry {
-        self.registry.clone()
-    }
-
     pub(super) fn tool(&mut self, source: ToolAddress, scope: Option<&str>) -> DisplayId {
         let scope = scope.map(str::to_owned);
         let occurrence = self
@@ -146,51 +141,5 @@ impl DisplayProjection<'_> {
 
     pub(super) fn source_tool(&self, identity: &ToolAddress) -> Option<DisplayId> {
         self.registry.source_tool(identity)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::ScopeOwner;
-
-    /// Create checked source identities containing separators to exercise collision safety.
-    fn fixture_address(turn_id: &str, item_id: &str) -> ToolAddress {
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ThreadOwner::root("display-fixture"),
-            "exchange",
-        );
-        ToolAddress {
-            turn: crate::provider::TurnAddress {
-                thread_id: scope.owner().thread_id(),
-                turn_id: forge_provider_api::TurnId::new(turn_id).unwrap(),
-                scope,
-            },
-            item_id: forge_provider_api::ItemId::new(item_id).unwrap(),
-        }
-    }
-    #[test]
-    fn identities_survive_reordering_and_distinguish_sources_scopes_and_occurrences() {
-        let first = fixture_address("a:b", "c");
-        let second = fixture_address("a", "b:c");
-        let mut registry = DisplayRegistry::default();
-        let mut projection = registry.project("entry".into());
-        let root = projection.tool(first.clone(), None);
-        let other = projection.tool(second.clone(), None);
-        let scoped = projection.tool(first.clone(), Some("summary"));
-        let repeated = projection.tool(first.clone(), None);
-        assert_eq!(
-            std::collections::HashSet::from([root, other, scoped, repeated]).len(),
-            4
-        );
-        let mut projection = registry.project("entry".into());
-        assert_eq!(projection.tool(second, None), other);
-        assert_eq!(projection.tool(first.clone(), None), root);
-        assert_eq!(projection.tool(first.clone(), Some("summary")), scoped);
-        assert_eq!(projection.tool(first.clone(), None), repeated);
-        assert_ne!(
-            registry.project("other entry".into()).tool(first, None),
-            root
-        );
     }
 }

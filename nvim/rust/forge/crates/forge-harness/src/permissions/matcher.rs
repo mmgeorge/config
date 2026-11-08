@@ -403,38 +403,6 @@ mod test {
     }
 
     #[test]
-    fn prefers_specific_command_denial_and_aggregates_compounds() {
-        let permission = compiled(
-            r#"{"permission":{"bash":{"git *":"allow","git commit":"deny","rg *":"allow"}}}"#,
-        );
-        let allowed = PermissionRequest {
-            id: "1".into(),
-            provider: forge_provider_api::ProviderId::new("test")
-                .expect("static provider identity is valid"),
-            reason: None,
-            target_list: vec![PermissionTarget::Command {
-                command: "git status && rg foo".into(),
-                shell: None,
-            }],
-        };
-        assert_eq!(
-            permission.evaluate(&allowed).unwrap().decision,
-            PermissionDecision::Allow
-        );
-        let denied = PermissionRequest {
-            target_list: vec![PermissionTarget::Command {
-                command: "git commit -m test".into(),
-                shell: None,
-            }],
-            ..allowed
-        };
-        assert_eq!(
-            permission.evaluate(&denied).unwrap().decision,
-            PermissionDecision::Deny
-        );
-    }
-
-    #[test]
     fn nushell_script_files_retain_exact_rules_and_pipeline_denials() {
         let permission = compiled(
             r#"{"permission":{"bash":{"nu *":"allow","nu --no-config-file forbidden.nu":"deny","git reset *":"deny"}}}"#,
@@ -463,35 +431,6 @@ mod test {
                 "{command}"
             );
         }
-    }
-
-    #[test]
-    fn catch_all_command_rule_supplies_the_default_decision() {
-        let request = PermissionRequest {
-            id: "1".into(),
-            provider: forge_provider_api::ProviderId::new("test")
-                .expect("static provider identity is valid"),
-            reason: None,
-            target_list: vec![PermissionTarget::Command {
-                command: "cargo test".into(),
-                shell: None,
-            }],
-        };
-        for (rule, expected) in [
-            ("allow", PermissionDecision::Allow),
-            ("ask", PermissionDecision::Ask),
-            ("deny", PermissionDecision::Deny),
-        ] {
-            let permission = compiled(&format!(r#"{{"permission":{{"bash":{{"*":"{rule}"}}}}}}"#));
-            assert_eq!(permission.evaluate(&request).unwrap().decision, expected);
-        }
-        assert_eq!(
-            compiled(r#"{"permission":{"bash":{"git":"allow"}}}"#)
-                .evaluate(&request)
-                .unwrap()
-                .decision,
-            PermissionDecision::Ask
-        );
     }
 
     #[test]

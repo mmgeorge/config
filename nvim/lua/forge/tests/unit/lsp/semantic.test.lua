@@ -1,50 +1,53 @@
--- Unit tests for `forge.lsp.semantic` (semantic.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "lsp_query", run = function()
-local startup = require("forge.lsp.startup")
-local original_wait = startup.wait
-startup.wait = function(_, _, receive) receive() return function() end end
-local query = require("forge.lsp.semantic")
-local directory = vim.fn.tempname()
-vim.fn.mkdir(directory, "p")
-local path = directory .. "/source.lua"
-vim.fn.writefile({ "😀 value", "function sample() end" }, path)
-local buffer = vim.api.nvim_create_buf(false, false)
-vim.api.nvim_buf_set_name(buffer, path)
-vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "😀 value", "function sample() end" })
-vim.bo[buffer].filetype = "lua"
-local original_clients, original_attached = vim.lsp.get_clients, vim.lsp.buf_is_attached
-local handler, calls, pending_callback = nil, {}, nil
-local client = { id = 981, name = "fixture", config = { root_dir = directory, filetypes = { "lua" } }, offset_encoding = "utf-16" }
-function client:is_stopped() return false end
-function client:supports_method() return true end
-function client:cancel_request() end
-function client:request(method, params, callback)
-  calls[#calls + 1] = { method = method, params = params }
-  pending_callback = callback
-  vim.schedule(function() if handler then handler(method, params, callback) end end)
-  return true, #calls
-end
-vim.lsp.get_clients = function() return { client } end
-vim.lsp.buf_is_attached = function() return true end
-local range = { start = { line = 0, character = 3 }, ["end"] = { line = 0, character = 8 } }
-local function execute(arguments, authorize, budget, workspace)
-  local done, result, failure = false
-  local cancel = query.request(workspace or directory, arguments, authorize or function(paths, receive)
-    local allowed = {}
-    for _, target in ipairs(paths) do allowed[target] = true end
-    receive(allowed)
-  end, function(value, error) result, failure, done = value, error, true end, budget)
-  return function()
-    assert(vim.wait(1500, function() return done end, 5), "LSP query did not finish")
-    return result, failure
-  end, cancel
-end
-local success, failure = xpcall(function()
+-- Unit tests for `forge.lsp.semantic` (semantic.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local eq = MiniTest.expect.equality
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["lsp_query"] = function()
+  local startup = require("forge.lsp.startup")
+  startup.wait = function(_, _, receive) receive() return function() end end
+  local query = require("forge.lsp.semantic")
+  local directory = temp.directory("workspace")
+  local path = directory .. "/source.lua"
+  vim.fn.writefile({ "😀 value", "function sample() end" }, path)
+  local buffer = vim.api.nvim_create_buf(false, false)
+  vim.api.nvim_buf_set_name(buffer, path)
+  buffer_support.set(buffer, { "😀 value", "function sample() end" })
+  vim.bo[buffer].filetype = "lua"
+  local handler, calls, pending_callback = nil, {}, nil
+  local client = { id = 981, name = "fixture", config = { root_dir = directory, filetypes = { "lua" } }, offset_encoding = "utf-16" }
+  function client:is_stopped() return false end
+  function client:supports_method() return true end
+  function client:cancel_request() end
+  function client:request(method, params, callback)
+    calls[#calls + 1] = { method = method, params = params }
+    pending_callback = callback
+    vim.schedule(function() if handler then handler(method, params, callback) end end)
+    return true, #calls
+  end
+  vim.lsp.get_clients = function() return { client } end
+  vim.lsp.buf_is_attached = function() return true end
+  local range = { start = { line = 0, character = 3 }, ["end"] = { line = 0, character = 8 } }
+  local function execute(arguments, authorize, budget, workspace)
+    local done, result, failure = false
+    local cancel = query.request(workspace or directory, arguments, authorize or function(paths, receive)
+      local allowed = {}
+      for _, target in ipairs(paths) do allowed[target] = true end
+      receive(allowed)
+    end, function(value, error) result, failure, done = value, error, true end, budget)
+    return function()
+      wait_until(function() return done end, "LSP query did not finish", { timeout_ms = 1500 })
+      return result, failure
+    end, cancel
+  end
   for _, operation in ipairs({ "definition", "type_definition", "implementation", "references" }) do
     handler = function(_, params, callback)
-      assert(params.position.character == 3, "input did not use server UTF-16 coordinates")
+      eq(params.position.character, 3, { fail_reason = "input did not use server UTF-16 coordinates" })
       assert(params.textDocument.uri == vim.uri_from_bufnr(buffer), "request changed the attached document URI")
       callback(nil, { { targetUri = vim.uri_from_fname(path), targetSelectionRange = range },
         { uri = vim.uri_from_fname(path), range = range } })
@@ -65,7 +68,7 @@ local success, failure = xpcall(function()
   assert(#assert(retry()).rows == 1 and retries == 2, "content-modified response was not retried")
   handler = function(_, _, callback) callback(nil, {}) end
   local await = execute({ operation = "references", path = path, line = 1, column = 3 })
-  assert(#assert(await()).rows == 0)
+  eq(#assert(await()).rows, 0)
   handler = function(_, _, callback) callback(nil, { { name = "sample", kind = 12, selectionRange = range,
     children = { { name = "value", kind = 13, selectionRange = range } } } }) end
   await = execute({ operation = "document_symbols", path = path, query = "sample.value" })
@@ -73,7 +76,7 @@ local success, failure = xpcall(function()
   assert(#result.rows == 1 and result.rows[1].text:find("sample.value", 1, true))
   handler = function(_, _, callback) callback(nil, { contents = { kind = "markdown", value = "function sample()" } }) end
   await = execute({ operation = "hover", path = path, line = 1, column = 3 })
-  assert(assert(await()).hover == "function sample()")
+  eq(assert(await()).hover, "function sample()")
   handler = function(method, _, callback)
     if method == "textDocument/prepareCallHierarchy" then callback(nil, { { name = "sample", uri = vim.uri_from_fname(path), range = range, selectionRange = range } })
     else callback(nil, { { from = { name = "caller", uri = vim.uri_from_fname(path), range = range } } }) end
@@ -155,90 +158,83 @@ local success, failure = xpcall(function()
   stale, error = await()
   assert(not stale and error:find("source_changed", 1, true))
   assert(vim.api.nvim_buf_is_valid(buffer), "user buffer was deleted")
-end, debug.traceback)
-vim.lsp.get_clients, vim.lsp.buf_is_attached = original_clients, original_attached
-startup.wait = original_wait
-vim.api.nvim_buf_delete(buffer, { force = true })
-vim.fn.delete(directory, "rf")
-if not success then error(failure) end
-print("lsp_query: passed")
-  end },
-  { name = "workspace", run = function()
-local startup = require("forge.lsp.startup")
-local semantic = require("forge.lsp.semantic")
-local directory = vim.fn.tempname()
-vim.fn.mkdir(directory .. "/rust", "p")
-vim.fn.mkdir(directory .. "/typescript", "p")
-local rust_path, typescript_path = directory .. "/rust/main.rs", directory .. "/typescript/main.ts"
-vim.fn.writefile({ "fn sample() {}" }, rust_path)
-vim.fn.writefile({ "function sample() {}" }, typescript_path)
-local original = { wait = startup.wait, clients = vim.lsp.get_clients, timer = vim.uv.new_timer }
-local clients, calls, answered, cancelled, pending = {}, {}, {}, {}, {}
-local hold, empty, malformed = false, false, false
-local held_name, captured_deadline, startup_calls
----Holds the semantic layer's ten-second workspace deadline callback while capture is enabled,
----so the fixture fires the expiry directly instead of letting a timer elapse.
----@type fun()?
-local deadline_expiry
-startup.wait = function(_, _, receive) startup_calls = (startup_calls or 0) + 1 receive() return function() end end
-vim.uv.new_timer = function()
-  local timer = assert(original.timer())
-  return {
-    start = function(_, delay, interval, callback)
-      if captured_deadline and delay == 10000 then deadline_expiry = callback return 0 end
-      return timer:start(delay, interval, callback)
-    end,
-    stop = function() return timer:stop() end,
-    close = function() return timer:close() end,
-  }
 end
-local function make_client(identity, name, root, path, supported, failed)
-  local client = { id = identity, name = name, root_dir = root, config = { root_dir = root },
-    initialized = true, offset_encoding = "utf-16",
-    server_capabilities = { diagnosticProvider = { workspaceDiagnostics = supported } } }
-  function client:is_stopped() return false end
-  function client:supports_method() return supported end
-  function client:cancel_request(request) cancelled[name .. ":" .. request] = true end
-  function client:request(method, _, receive)
-    calls[name] = (calls[name] or 0) + 1
-    local function respond()
-      answered[name] = (answered[name] or 0) + 1
-      if failed then receive({ message = "fixture failure" }) return end
-      local range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }
-      if method == "workspace/diagnostic" then
-        if malformed and name == "typescript" then receive(nil, {}) return end
-        receive(nil, { items = { { uri = vim.uri_from_fname(path), kind = "full", resultId = name,
-          items = empty and {} or { { range = range, severity = 1, message = name .. " failure" } } } } })
-      else
-        assert(method == "workspace/symbol")
-        receive(nil, { { name = "sample", kind = 12, location = { uri = vim.uri_from_fname(path), range = range } } })
-      end
-    end
-    if hold or held_name == name then pending[#pending + 1] = respond else vim.schedule(respond) end
-    return true, calls[name]
+
+T["workspace"] = function()
+  local startup = require("forge.lsp.startup")
+  local semantic = require("forge.lsp.semantic")
+  local directory = temp.directory("workspace")
+  vim.fn.mkdir(directory .. "/rust", "p")
+  vim.fn.mkdir(directory .. "/typescript", "p")
+  local rust_path, typescript_path = directory .. "/rust/main.rs", directory .. "/typescript/main.ts"
+  vim.fn.writefile({ "fn sample() {}" }, rust_path)
+  vim.fn.writefile({ "function sample() {}" }, typescript_path)
+  local original_new_timer = vim.uv.new_timer
+  local clients, calls, answered, cancelled, pending = {}, {}, {}, {}, {}
+  local hold, empty, malformed = false, false, false
+  local held_name, captured_deadline, startup_calls
+  ---Holds the semantic layer's ten-second workspace deadline callback while capture is enabled,
+  ---so the fixture fires the expiry directly instead of letting a timer elapse.
+  ---@type fun()?
+  local deadline_expiry
+  startup.wait = function(_, _, receive) startup_calls = (startup_calls or 0) + 1 receive() return function() end end
+  vim.uv.new_timer = function()
+    local timer = assert(original_new_timer())
+    return {
+      start = function(_, delay, interval, callback)
+        if captured_deadline and delay == 10000 then deadline_expiry = callback return 0 end
+        return timer:start(delay, interval, callback)
+      end,
+      stop = function() return timer:stop() end,
+      close = function() return timer:close() end,
+    }
   end
-  return client
-end
-clients = {
-  make_client(71, "rust", directory .. "/rust", rust_path, true),
-  make_client(72, "typescript", directory .. "/typescript", typescript_path, true),
-  make_client(73, "unsupported", directory, rust_path, false),
-  make_client(74, "failed", directory, rust_path, true, true),
-}
-vim.lsp.get_clients = function() return clients end
-local function query(operation)
-  local done, result, failure
-  local cancel = semantic.request(directory, { operation = operation, query = "sample", scope = "workspace" }, function(paths, receive)
-    local allowed = {}
-    for _, path in ipairs(paths) do allowed[path] = true end
-    receive(allowed)
-  end, function(value, error) done, result, failure = true, value, error end)
-  return function()
-    assert(vim.wait(2000, function() return done end, 5), "workspace query did not finish")
-    return result, failure
-  end, cancel
-end
-local success, failure = xpcall(function()
+  local function make_client(identity, name, root, path, supported, failed)
+    local client = { id = identity, name = name, root_dir = root, config = { root_dir = root },
+      initialized = true, offset_encoding = "utf-16",
+      server_capabilities = { diagnosticProvider = { workspaceDiagnostics = supported } } }
+    function client:is_stopped() return false end
+    function client:supports_method() return supported end
+    function client:cancel_request(request) cancelled[name .. ":" .. request] = true end
+    function client:request(method, _, receive)
+      calls[name] = (calls[name] or 0) + 1
+      local function respond()
+        answered[name] = (answered[name] or 0) + 1
+        if failed then receive({ message = "fixture failure" }) return end
+        local range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } }
+        if method == "workspace/diagnostic" then
+          if malformed and name == "typescript" then receive(nil, {}) return end
+          receive(nil, { items = { { uri = vim.uri_from_fname(path), kind = "full", resultId = name,
+            items = empty and {} or { { range = range, severity = 1, message = name .. " failure" } } } } })
+        else
+          eq(method, "workspace/symbol")
+          receive(nil, { { name = "sample", kind = 12, location = { uri = vim.uri_from_fname(path), range = range } } })
+        end
+      end
+      if hold or held_name == name then pending[#pending + 1] = respond else vim.schedule(respond) end
+      return true, calls[name]
+    end
+    return client
+  end
+  clients = {
+    make_client(71, "rust", directory .. "/rust", rust_path, true),
+    make_client(72, "typescript", directory .. "/typescript", typescript_path, true),
+    make_client(73, "unsupported", directory, rust_path, false),
+    make_client(74, "failed", directory, rust_path, true, true),
+  }
+  vim.lsp.get_clients = function() return clients end
+  local function query(operation)
+    local done, result, failure
+    local cancel = semantic.request(directory, { operation = operation, query = "sample", scope = "workspace" }, function(paths, receive)
+      local allowed = {}
+      for _, path in ipairs(paths) do allowed[path] = true end
+      receive(allowed)
+    end, function(value, error) done, result, failure = true, value, error end)
+    return function()
+      wait_until(function() return done end, "workspace query did not finish", { timeout_ms = 2000 })
+      return result, failure
+    end, cancel
+  end
   local await = query("diagnostics")
   local result, error = await()
   assert(result and not error, error)
@@ -278,28 +274,17 @@ local success, failure = xpcall(function()
     function() error("empty diagnostics should not require structural analysis") end,
     function(value, error) done, reply, failure = true, value, error end)
   -- Expire only after the responsive server answers, so the deadline marks just the held one failed.
-  assert(vim.wait(2000, function() return deadline_expiry ~= nil and (answered.rust or 0) > rust_answers end, 5),
-    "workspace deadline was not armed or the responsive server did not answer")
+  wait_until(function() return deadline_expiry ~= nil and (answered.rust or 0) > rust_answers end,
+    "workspace deadline was not armed or the responsive server did not answer", { timeout_ms = 2000 })
   assert(not done, "workspace facade replied before its deadline")
   deadline_expiry()
-  assert(vim.wait(2000, function() return done end, 5), "workspace facade lost its timeout reply")
+  wait_until(function() return done end, "workspace facade lost its timeout reply", { timeout_ms = 2000 })
   assert(reply and not failure and #reply.coverage == 2 and reply.freshness == "unknown", failure or vim.inspect(reply))
-  assert(startup_calls == 1, "workspace operation repeated its startup wait")
+  eq(startup_calls, 1, { fail_reason = "workspace operation repeated its startup wait" })
   for _, entry in ipairs(reply.coverage) do
     assert(entry.state == (entry.name == "typescript" and "failed" or "complete"))
   end
   for _, respond in ipairs(pending) do respond() end
-end, debug.traceback)
-startup.wait, vim.lsp.get_clients = original.wait, original.clients
-vim.uv.new_timer = original.timer
-vim.fn.delete(directory, "rf")
-assert(success, failure)
-print("lsp_workspace: passed")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

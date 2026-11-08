@@ -244,9 +244,3 @@ fn render_projection(output: &mut String, projection: FileProjection) {
         output.push('\n');
     }
 }
-
-#[cfg(test)]
-mod test {}
-
-#[cfg(test)]
-mod host_effect_tests {}

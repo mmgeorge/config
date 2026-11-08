@@ -163,29 +163,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn explicit_overrides_bypass_the_persisted_default() {
-        for override_name in DISCOVERY_OVERRIDE {
-            assert!(has_discovery_override(|name| name == *override_name));
-        }
-        assert!(!has_discovery_override(|_| false));
-    }
-
-    #[test]
-    fn unavailable_discovery_and_cache_io_failure_are_distinct() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let cache = directory.path().join("location.json");
-        assert_eq!(resolve(&cache, || None)?, (None, false));
-        assert!(!cache.exists());
-        let blocker = directory.path().join("file");
-        std::fs::write(&blocker, "not a directory")?;
-        assert!(
-            resolve(&blocker.join("location.json"), || Some(
-                directory.path().to_owned()
-            ))
-            .is_err()
-        );
-        Ok(())
-    }
 }

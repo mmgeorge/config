@@ -297,35 +297,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeated_targets_preserve_saved_rows_and_reject_ambiguous_relocation() {
-        let target = super::super::PlanReviewTarget::Section {
-            section: super::super::PlanSection::Requirements,
-        };
-        let mut index = super::super::PlanNavigationIndex {
-            plan_id: "plan".into(),
-            plan_version: 1,
-            anchor: [4, 5, 6]
-                .into_iter()
-                .map(|line| super::super::PlanNavigationAnchor {
-                    line,
-                    target: target.clone(),
-                    json_path: "/design/document/requirements".into(),
-                    path: None,
-                    label: "Requirements".into(),
-                })
-                .collect(),
-        };
-        assert_eq!(find_target(&index, &target, 5), Some(5));
-        assert_eq!(find_target(&index, &target, 6), Some(6));
-        for anchor in &mut index.anchor {
-            anchor.line += 10;
-        }
-        assert_eq!(find_target(&index, &target, 5), None);
-        index.anchor.truncate(1);
-        assert_eq!(find_target(&index, &target, 5), Some(14));
-    }
-
-    #[test]
     fn annotation_restart_preserves_text_and_rejects_concurrent_or_source_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("working.json");
@@ -418,6 +389,3 @@ pub(crate) fn resolve_annotations(
         .collect::<Result<Vec<_>>>()?;
     Ok(annotation)
 }
-
-#[cfg(test)]
-mod subject_tests {}

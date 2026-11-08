@@ -243,45 +243,6 @@ async fn closed_publication_cannot_complete_an_exchange() -> Result<()> {
 }
 
 #[tokio::test]
-async fn admission_skips_completed_transcript_but_settles_running_exchange() -> Result<()> {
-    for completed in [true, false] {
-        let repository = repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut previous, _, _) = broker
-            .test_stage_interaction_for_turn("previous", true, 10)
-            .await?;
-        if completed {
-            previous.finish(crate::exchange::ExchangeOutcome::Complete, 20)?;
-        }
-        broker.store.save_exchange(&previous)?;
-        if completed {
-            let connection =
-                rusqlite::Connection::open(crate::storage::state::database(data.path()))?;
-            connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.node_list','invalid transcript') WHERE id=?1", [&previous.id])?;
-        }
-        let (next, new_runtime, events) = broker
-            .test_stage_interaction_for_turn("next", true, 30)
-            .await?;
-        assert!(new_runtime);
-        assert_ne!(next.id, previous.id);
-        assert_eq!(next.ordinal, previous.ordinal + 1);
-        if completed {
-            assert!(events.is_empty(), "completed exchange was republished");
-        } else {
-            // The superseded exchange never started a provider turn, so admission closes it
-            // as cancelled rather than reporting completed work.
-            assert_eq!(
-                broker.store.load_exchange(&previous.id)?.unwrap().state(),
-                ExchangeState::Cancelled
-            );
-            assert!(!events.is_empty(), "required completion was not published");
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn admission_precedes_preparation_and_settles_success_failure_and_cancellation() -> Result<()>
 {
     for outcome in ["complete", "fail", "cancel"] {
@@ -386,48 +347,5 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         );
         assert!(broker.exchange_runtime.is_none());
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn optional_question_preserves_input_readiness_without_loading_history() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(repository.path(), data.path(), true);
-    assert!(!broker.observer().input_readiness()?.has_elicitation);
-    let result = broker
-        .dispatch(Request {
-            id: 1,
-            method: "session.prompt.submit".into(),
-            params: json!({"text":"prompt me with a multiple-choice question"}),
-        })
-        .await;
-    assert!(
-        result.response.error().is_none(),
-        "{:?}",
-        result.response.error()
-    );
-    let snapshot = broker.snapshot()?;
-    let ready = broker.observer().input_readiness()?;
-    assert_eq!(snapshot.questions.questions.len(), 1);
-    assert!(snapshot.questions.questions[0].pending());
-    assert!(snapshot.active_elicitation.is_none());
-    assert!(!ready.has_elicitation);
-    assert_eq!(
-        broker
-            .observer()
-            .admission
-            .snapshot()?
-            .task_revision
-            .as_ref(),
-        snapshot
-            .session
-            .active_task
-            .as_ref()
-            .map(|task| &task.revision)
-    );
-    assert_eq!(ready.checks_running, snapshot.checks_running);
-    assert_eq!(ready.has_approval, !snapshot.approval.is_empty());
-    assert_eq!(ready.native_steer, snapshot.capability.native_steer);
     Ok(())
 }

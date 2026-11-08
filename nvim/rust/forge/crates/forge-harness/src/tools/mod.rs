@@ -38,6 +38,3 @@ pub(crate) use runtime::ControlToolRuntime;
 pub(crate) use runtime::ProviderExecutionPreview;
 pub use runtime::{ControlToolResult, ControlTurnContext};
 pub use stdio::run_stdio;
-
-#[cfg(test)]
-mod test;

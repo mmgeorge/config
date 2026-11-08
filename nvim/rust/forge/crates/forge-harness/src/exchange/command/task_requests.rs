@@ -299,6 +299,3 @@ struct ReviewFeedback {
     comment: Option<String>,
     annotations: Vec<crate::plan::PlanAnnotationInput>,
 }
-
-#[cfg(test)]
-mod tests {}

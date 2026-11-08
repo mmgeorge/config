@@ -1,20 +1,14 @@
--- Unit tests for `forge.views.permissions` (permissions.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "permissions", run = function()
-local function assert_equals(actual, expected, message)
-  if actual ~= expected then
-    error((message or "values differ") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
-  end
-end
+-- Unit tests for `forge.views.permissions` (permissions.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local eq = MiniTest.expect.equality
 
-local function assert_true(value, message)
-  if not value then error(message or "expected truthy value") end
-end
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-local ok, failure = pcall(function()
+T["permissions"] = function()
   local request_list = {}
-  local notification_list = {}
   local save_error = "line 3: invalid permission decision"
   local permission_path = vim.fn.tempname() .. ".json"
   local permission_source = '{\n  "read": { "*": "allow" }\n}\n'
@@ -39,53 +33,45 @@ local ok, failure = pcall(function()
       end
     end,
   }
-  package.loaded["forge.infra.notifications"] = {
-    error = function(message, title)
-      notification_list[#notification_list + 1] = { level = "error", message = message, title = title }
-    end,
-    info = function(message, title)
-      notification_list[#notification_list + 1] = { level = "info", message = message, title = title }
-    end,
-  }
-  package.loaded["forge.views.permissions"] = nil
+  local notification_list = notify.capture({ notifications = true })
 
   require("forge.views.permissions").open()
   local buffer = vim.api.nvim_get_current_buf()
-  assert_equals(vim.api.nvim_buf_get_name(buffer), permission_path, "permissions should expose the broker-owned path")
-  assert_equals(vim.bo[buffer].buftype, "acwrite", "permissions should save through broker validation")
-  assert_equals(vim.bo[buffer].filetype, "json", "permissions should use JSON editing")
-  assert_true(not vim.bo[buffer].modified, "opening permissions should begin clean")
+  eq(vim.api.nvim_buf_get_name(buffer), permission_path, { fail_reason = "permissions should expose the broker-owned path" })
+  eq(vim.bo[buffer].buftype, "acwrite", { fail_reason = "permissions should save through broker validation" })
+  eq(vim.bo[buffer].filetype, "json", { fail_reason = "permissions should use JSON editing" })
+  assert(not vim.bo[buffer].modified, "opening permissions should begin clean")
 
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "{", '  "read": { "*": "invalid" }', "}" })
+  buffer_support.set(buffer, { "{", '  "read": { "*": "invalid" }', "}" })
   vim.bo[buffer].modified = true
   vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = buffer })
-  assert_true(vim.bo[buffer].modified, "a rejected document should remain modified")
-  assert_equals(notification_list[#notification_list].level, "error", "a rejected document should report an error")
-  assert_equals(notification_list[#notification_list].message, save_error, "the broker validation should reach the user")
+  assert(vim.bo[buffer].modified, "a rejected document should remain modified")
+  eq(notification_list[#notification_list].level, vim.log.levels.ERROR, { fail_reason = "a rejected document should report an error" })
+  eq(notification_list[#notification_list].message, save_error, { fail_reason = "the broker validation should reach the user" })
 
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "{", '  "read": { "*": "allow" }', "}" })
+  buffer_support.set(buffer, { "{", '  "read": { "*": "allow" }', "}" })
   vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = buffer })
-  assert_true(not vim.bo[buffer].modified, "an accepted document should become clean")
-  assert_equals(notification_list[#notification_list].level, "info", "an accepted document should report success")
-  assert_equals(request_list[1].method, "permissions.document.open", "the view should load through the broker")
-  assert_equals(request_list[2].method, "permissions.document.save", "the view should save through the broker")
-  assert_equals(request_list[3].method, "permissions.document.save", "the corrected document should be resubmitted")
+  assert(not vim.bo[buffer].modified, "an accepted document should become clean")
+  eq(notification_list[#notification_list].level, vim.log.levels.INFO, { fail_reason = "an accepted document should report success" })
+  eq(request_list[1].method, "permissions.document.open", { fail_reason = "the view should load through the broker" })
+  eq(request_list[2].method, "permissions.document.save", { fail_reason = "the view should save through the broker" })
+  eq(request_list[3].method, "permissions.document.save", { fail_reason = "the corrected document should be resubmitted" })
 
   local buffer_count = #vim.api.nvim_list_bufs()
   require("forge.views.permissions").open()
-  assert_equals(vim.api.nvim_get_current_buf(), buffer, "reopening permissions should reuse its editor")
-  assert_equals(#vim.api.nvim_list_bufs(), buffer_count, "reopening permissions leaked a buffer")
-  assert_equals(#vim.api.nvim_get_autocmds({ event = "BufWriteCmd", buffer = buffer }), 1, "reopening duplicated save handlers")
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { '{"draft":true}' })
+  eq(vim.api.nvim_get_current_buf(), buffer, { fail_reason = "reopening permissions should reuse its editor" })
+  eq(#vim.api.nvim_list_bufs(), buffer_count, { fail_reason = "reopening permissions leaked a buffer" })
+  eq(#vim.api.nvim_get_autocmds({ event = "BufWriteCmd", buffer = buffer }), 1, { fail_reason = "reopening duplicated save handlers" })
+  buffer_support.set(buffer, { '{"draft":true}' })
   require("forge.views.permissions").open()
-  assert_equals(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], '{"draft":true}', "reopening erased an unsaved draft")
-  assert_true(vim.bo[buffer].modified, "reopening cleared the draft's modified state")
+  eq(buffer_support.line(buffer, 1), '{"draft":true}', { fail_reason = "reopening erased an unsaved draft" })
+  assert(vim.bo[buffer].modified, "reopening cleared the draft's modified state")
 
   defer_save = true
   vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = buffer })
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { '{"newer":true}' })
+  buffer_support.set(buffer, { '{"newer":true}' })
   pending_save({}, nil)
-  assert_true(vim.bo[buffer].modified, "save completion marked newer edits saved")
+  assert(vim.bo[buffer].modified, "save completion marked newer edits saved")
   vim.api.nvim_exec_autocmds("BufWriteCmd", { buffer = buffer })
   vim.api.nvim_buf_delete(buffer, { force = true })
   pending_save({}, nil)
@@ -96,21 +82,8 @@ local ok, failure = pcall(function()
   vim.api.nvim_set_current_buf(unrelated)
   buffer_count = #vim.api.nvim_list_bufs()
   pending_open({ path = permission_path, source = permission_source }, nil)
-  assert_equals(vim.api.nvim_get_current_buf(), unrelated, "delayed permissions replaced the newly selected buffer")
-  assert_equals(#vim.api.nvim_list_bufs(), buffer_count, "abandoned permissions request allocated an editor")
-end)
-
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-else
-  vim.cmd("qa!")
+  eq(vim.api.nvim_get_current_buf(), unrelated, { fail_reason = "delayed permissions replaced the newly selected buffer" })
+  eq(#vim.api.nvim_list_bufs(), buffer_count, { fail_reason = "abandoned permissions request allocated an editor" })
 end
-  end },
-}
 
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
-end
-error(("unknown scenario %q"):format(tostring(selected)))
+return T

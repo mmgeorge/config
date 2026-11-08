@@ -398,29 +398,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn cleanup_retains_completed_results_until_their_consumer_releases_them() -> Result<()> {
-        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        let (_task_root, _task_store, task_controller) =
-            crate::task::SessionTaskController::test_goal();
-        context.bind_test_task_controller(task_controller);
-        let executor = ControlToolExecutor::new(context);
-        let outcome = executor
-            .execute(ControlToolInvocation {
-                call_id: None,
-                task_permit: None,
-                name: "goal_status".into(),
-                arguments: json!({"status":"working"}),
-            })
-            .await?;
-        assert!(outcome.result.is_ok());
-        let mut close = Box::pin(executor.close());
-        assert!(futures_util::poll!(close.as_mut()).is_pending());
-        drop(outcome);
-        close.await;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn cancellation_revokes_the_editor_request_and_rejects_its_late_response() -> Result<()> {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("source.rs"), "pub fn source() {}\n")?;

@@ -1,15 +1,18 @@
--- Unit tests for `forge.effects` (effects.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "native", run = function()
-vim.loader.enable(false)
-local replica = require("forge.buffer")
-local input = require("forge.input")
-local effects = require("forge.effects")
-local session = replica.open("effects")
-local filename = vim.fn.tempname() .. " space [literal].txt"
-vim.fn.writefile({ "source", "界value" }, filename)
-local ok, failure = xpcall(function()
+-- Unit tests for `forge.effects` (effects.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+local eq = MiniTest.expect.equality
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["native"] = function()
+  local replica = require("forge.buffer")
+  local input = require("forge.input")
+  local effects = require("forge.effects")
+  local session = replica.open("effects")
+  MiniTest.finally(function() pcall(replica.close, session) end)
+  local filename = temp.file("space [literal].txt", { "source", "界value" })
   assert(replica.apply_snapshot(session, { document = "effects", revision = 0, block = {
     { id = "body", text = { "item" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
   } }).kind == "Applied")
@@ -30,8 +33,8 @@ local ok, failure = xpcall(function()
   assert(#vim.api.nvim_list_wins() == windows + 1)
   local found = false
   for _, window in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(window)) == filename then
-      assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), { 2, 3 }))
+    if vim.fs.normalize(vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(window))) == filename then
+      eq(vim.api.nvim_win_get_cursor(window), { 2, 3 })
       assert(vim.wo[window].foldtext ~= "v:lua.require'forge.folds'.text()", "source inherited document fold ownership")
       found = true
     end
@@ -39,7 +42,6 @@ local ok, failure = xpcall(function()
   assert(found, "source path did not open literally")
   assert(effects.apply(session, view, effect) == "Duplicate")
   local opened_url
-  local original_open = vim.ui.open
   vim.ui.open = function(url)
     opened_url = url
     return true
@@ -54,7 +56,6 @@ local ok, failure = xpcall(function()
     url = "https://github.example.test/owner/repository/issues/7",
   }
   local browser_result, browser_diagnostic = effects.apply(session, view, browser)
-  vim.ui.open = original_open
   assert(browser_result == "Applied", browser_diagnostic)
   assert(opened_url == browser.url, "browser effect did not preserve its URL")
   assert(effects.apply(session, view, browser) == "Duplicate")
@@ -92,19 +93,10 @@ local ok, failure = xpcall(function()
   local foreground = vim.api.nvim_get_current_win()
   assert(effects.apply(session, view, navigation) == "Applied")
   assert(vim.api.nvim_get_current_win() == foreground, "cursor effect changed the foreground window")
-  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), { 3, 0 }))
+  eq(vim.api.nvim_win_get_cursor(view.window), { 3, 0 })
   assert(not vim.wo[view.window].foldenable,
     "cursor effect left its destination hidden in a closed fold")
   input.close(view)
-end, debug.traceback)
-replica.close(session)
-vim.fn.delete(filename)
-if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

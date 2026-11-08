@@ -1,20 +1,28 @@
--- Unit tests for `forge.document_commands` (document_commands.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "document_commands", run = function()
-vim.loader.enable(false)
-local replica = require("forge.buffer")
-local input = require("forge.input")
-local config = require("forge.infra.config")
-local commands = require("forge.document_commands")
-local session = replica.open("command-fixture")
-local owner, view
-local clipboard
-vim.g.clipboard = { name = "Forge fixture", copy = {
-  ["+"] = function(lines, kind) clipboard = { lines = lines, kind = kind } end,
-  ["*"] = function() end,
-}, paste = { ["+"] = function() return { {}, "V" } end, ["*"] = function() return { {}, "V" } end } }
-local ok, failure = xpcall(function()
+-- Unit tests for `forge.document_commands` (document_commands.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+local eq = MiniTest.expect.equality
+
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["document_commands"] = function()
+  local replica = require("forge.buffer")
+  local input = require("forge.input")
+  local config = require("forge.infra.config")
+  local commands = require("forge.document_commands")
+  local session = replica.open("command-fixture")
+  local owner, view
+  MiniTest.finally(function()
+    if owner then pcall(owner.close) end
+    if view then pcall(input.close, view) end
+    pcall(replica.close, session)
+  end)
+  local clipboard
+  vim.g.clipboard = { name = "Forge fixture", copy = {
+    ["+"] = function(lines, kind) clipboard = { lines = lines, kind = kind } end,
+    ["*"] = function() end,
+  }, paste = { ["+"] = function() return { {}, "V" } end, ["*"] = function() return { {}, "V" } end } }
   config.setup({ keymaps = { status = { open = { "go", "gO" }, refresh = false, discard = "X" } } })
   vim.api.nvim_set_current_buf(session.buffer)
   local pending_closed = false
@@ -22,11 +30,11 @@ local ok, failure = xpcall(function()
     close = function() pending_closed = true end,
     open = function() error("pending document admitted a content action") end,
   } })
-  vim.fn.maparg("go", "n", false, true).callback()
-  vim.fn.maparg("?", "n", false, true).callback()
+  keymap.invoke("go")
+  keymap.invoke("?")
   assert(vim.bo.filetype == "ForgeHelp", "pending document did not expose help")
-  vim.fn.maparg("q", "n", false, true).callback()
-  vim.fn.maparg("q", "n", false, true).callback()
+  keymap.invoke("q")
+  keymap.invoke("q")
   assert(pending_closed, "pending document trapped its close command")
   pending_owner.close()
   assert(replica.apply_snapshot(session, { document = session.document, revision = 0, block = {
@@ -67,13 +75,13 @@ local ok, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
   local_map("<Space>l", "x").callback()
   assert(clipboard and vim.deep_equal(clipboard.lines, { " 1 │ first", " 2 │ second", "" }), "clipboard omitted native gutters: " .. vim.inspect(clipboard))
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, true), { "first", "second" }), "selection changed source rows")
+  eq(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, true), { "first", "second" }, { fail_reason = "selection changed source rows" })
   local_map("<Space>l", "x").callback()
   assert(old_yank == 1, "temporary clipboard mapping was not restored")
   local_map("W").callback()
   local newer_yank = 0
   vim.keymap.set("x", "<Space>l", function() newer_yank = newer_yank + 1 end, { buffer = session.buffer })
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+  keymap.feed("<Esc>", "nx")
   vim.api.nvim_exec_autocmds("ModeChanged", {})
   local_map("<Space>l", "x").callback()
   assert(newer_yank == 1, "selection cleanup replaced a newer clipboard mapping")
@@ -86,25 +94,13 @@ local ok, failure = xpcall(function()
     help_width = math.max(help_width, vim.fn.strdisplaywidth(line) + 2)
   end
   assert(vim.api.nvim_win_get_width(0) == math.min(help_width, vim.o.columns - 4), "help ignores command content width")
-  vim.fn.maparg("q", "n", false, true).callback()
+  keymap.invoke("q")
   vim.keymap.set("n", "gO", function() newer_open = newer_open + 1 end, { buffer = session.buffer })
   owner.close()
   local_map("go").callback()
   local_map("gO").callback()
   assert(old_open == 1 and newer_open == 1, "close replaced prior or newer user mappings")
   assert(not local_map("?"), "close retained owned help binding")
-end, debug.traceback)
-if owner then owner.close() end
-if view then input.close(view) end
-replica.close(session)
-if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("document_commands OK")
-vim.cmd("qa!")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

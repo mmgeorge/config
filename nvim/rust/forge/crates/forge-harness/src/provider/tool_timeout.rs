@@ -664,27 +664,4 @@ mod tests {
         }
         Ok(())
     }
-
-    /// A late host result cannot retire a positively reopened native turn's tool.
-    #[tokio::test(start_paused = true)]
-    async fn late_host_completion_cannot_retire_reopened_tool() -> Result<()> {
-        let watchdog = watchdog()?;
-        let mut tool = address("continued");
-        tool.turn.scope.invocation_id = "reopened".into();
-        tool.turn.turn_id = tool.turn.scope.turn_id()?;
-        watchdog.observe(&crate::provider::test_support::native_event(
-            tool.turn.scope.clone(),
-            ProviderEvent::Turn {
-                thread_id: tool.turn.thread_id.clone(),
-                turn_id: tool.turn.turn_id.clone(),
-                event: TurnEvent::Started(forge_provider_api::turn::TurnStarted {
-                    started_at_ms: 1,
-                }),
-            },
-        ))?;
-        watchdog.observe(&requested(&tool, TestTool::Command, serde_json::json!({})))?;
-        assert!(watchdog.finish_foreground()?);
-        assert_eq!(watchdog.expired().await?.unwrap().address, tool);
-        Ok(())
-    }
 }

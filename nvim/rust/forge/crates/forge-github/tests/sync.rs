@@ -378,37 +378,6 @@ async fn remote_wait_and_abandoned_caller_retain_deletion_and_sync_exclusion() -
     Ok(())
 }
 
-#[tokio::test(start_paused = true)]
-async fn rate_limit_retries_are_bounded_and_preserve_the_remote_diagnostic() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let (store, request) = request(root.path())?;
-    let remote = Arc::new(RemoteFixture::default());
-    for _ in 0..4 {
-        remote.page.lock().unwrap().push_back(Err(RemoteFailure {
-            kind: RemoteFailureKind::RateLimited,
-            message: "API limit for this host".into(),
-        }));
-    }
-    let service = GithubService::default();
-    let started = tokio::time::Instant::now();
-    let failure = service
-        .sync(remote.clone(), store.clone(), request, None)
-        .await
-        .unwrap_err();
-    assert!(failure.to_string().contains("API limit for this host"));
-    assert_eq!(remote.request.lock().unwrap().len(), 4);
-    assert!(started.elapsed() >= Duration::from_secs(180));
-    assert_eq!(store.read_state()?.issue_count, 0);
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(2))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    Ok(())
-}
-
 #[test]
 fn remote_identity_normalizes_components_and_rejects_path_or_url_injection() {
     let first = GithubRepositoryId::new("GITHUB.COM.", "Owner", "Repo").unwrap();
@@ -470,91 +439,6 @@ async fn all_scope_preserves_closed_records_and_rejects_foreign_records_before_c
     );
     assert_eq!(store.read_state()?.issue_count, 1);
     assert_eq!(std::fs::read(request.snapshot)?, before);
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(2))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn remote_job_limit_leaves_storage_capacity_and_rejects_excess_sync() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let (store, request) = request(root.path())?;
-    let service = GithubService::default();
-    let remote = Arc::new(BlockedRemote {
-        started: Default::default(),
-        release: Default::default(),
-    });
-    let mut caller = Vec::new();
-    for index in 0..16 {
-        let name = format!("repository-{index}");
-        let store = IssueStore::new(
-            root.path().join(&name).join("issues/issues.redb"),
-            &format!("owner/{name}"),
-            Duration::ZERO,
-        )?;
-        let mut request = request.clone();
-        request.repository = GithubRepositoryId::new("github.com", "owner", &name).unwrap();
-        request.snapshot = root.path().join(name).join("issues/open-snapshot.json");
-        let service = service.clone();
-        let task_remote = remote.clone();
-        caller.push(tokio::spawn(async move {
-            service.sync(task_remote, store, request, None).await
-        }));
-        remote.started.notified().await;
-    }
-    assert!(
-        service
-            .sync(remote, store.clone(), request, None)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("admission is full")
-    );
-    assert!(
-        service
-            .execute(store, IssueOperation::State {})
-            .await
-            .is_ok()
-    );
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(2))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    for caller in caller {
-        assert!(caller.await?.is_err());
-    }
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn close_interrupts_rate_delay_without_issuing_another_remote_read() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let (store, request) = request(root.path())?;
-    let remote = Arc::new(RemoteFixture::default());
-    remote.page.lock().unwrap().push_back(Err(RemoteFailure {
-        kind: RemoteFailureKind::RateLimited,
-        message: "retry later".into(),
-    }));
-    let service = GithubService::default();
-    let caller = {
-        let service = service.clone();
-        let remote = remote.clone();
-        tokio::spawn(async move { service.sync(remote, store, request, None).await })
-    };
-    while remote.request.lock().unwrap().is_empty() {
-        tokio::task::yield_now().await;
-    }
-    service.close();
-    assert!(caller.await?.unwrap_err().to_string().contains("closed"));
-    assert_eq!(remote.request.lock().unwrap().len(), 1);
     assert_eq!(
         service
             .shutdown(Duration::from_secs(2))

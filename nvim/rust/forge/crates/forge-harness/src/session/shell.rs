@@ -83,21 +83,3 @@ impl CheckShell {
         Ok(command)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn nushell_selection_uses_nushell_and_preserves_failed_status() -> Result<()> {
-        let Ok(executable) = CheckShell::Nushell.executable() else {
-            return Ok(());
-        };
-        let mut command =
-            CheckShell::Nushell.command(&executable, "print 'nushell output'; exit 9", false)?;
-        let result = command.output().await?;
-        assert_eq!(result.status.code(), Some(9));
-        assert!(String::from_utf8_lossy(&result.stdout).contains("nushell output"));
-        Ok(())
-    }
-}

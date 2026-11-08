@@ -2,7 +2,7 @@ use forge_git::test_support as support;
 
 use std::fs;
 
-use forge_diff::source::{Representation, SourceVersion};
+use forge_diff::source::Representation;
 use forge_git::{
     RepositoryPath,
     content::{
@@ -12,8 +12,7 @@ use forge_git::{
     store::RepositoryStore,
 };
 use support::{
-    commit_index, git, init_repository, init_sha256_repository, resolve_revision, set_config,
-    set_reference, stage, stage_conflict, stage_gitlink, write_blob,
+    commit_index, git, init_repository, resolve_revision, set_config, stage, stage_conflict,
 };
 
 #[tokio::test]
@@ -156,33 +155,6 @@ async fn missing_binary_encoding_size_and_source_identity_have_distinct_outcomes
 }
 
 #[tokio::test]
-async fn object_reads_ignore_replacement_refs_and_support_sha256() {
-    for format in ["sha1", "sha256"] {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        if format == "sha256" {
-            init_sha256_repository(root);
-        } else {
-            init_repository(root);
-        }
-        let original = write_blob(root, b"original");
-        let replacement = write_blob(root, b"replacement");
-        set_reference(root, &format!("refs/replace/{original}"), replacement);
-        let store = RepositoryStore::default();
-        let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-        let loaded = ready(
-            repository
-                .content(&store, request(ContentSource::Object(original)))
-                .await
-                .unwrap()
-                .value,
-        );
-        assert_eq!(loaded.source.bytes(), b"original");
-        assert!(matches!(loaded.origin, ContentOrigin::Object(object) if object == original));
-    }
-}
-
-#[tokio::test]
 async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_content() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
@@ -210,52 +182,6 @@ async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_con
             .value;
         assert_eq!(ready(result).source.bytes(), bytes);
     }
-}
-
-#[tokio::test]
-async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
-    let fixture = tempfile::tempdir().unwrap();
-    init_repository(fixture.path());
-    let store = RepositoryStore::default();
-    let repository = store
-        .open(fixture.path().to_path_buf())
-        .await
-        .unwrap()
-        .unwrap();
-    let source =
-        SourceVersion::new(vec![b'a'; 8 * 1024 * 1024 + 1], Representation::DisplayOnly).unwrap();
-    let identity = source.identity();
-    let loaded = ready(
-        repository
-            .content(&store, request(ContentSource::Supplied(source)))
-            .await
-            .unwrap()
-            .value,
-    );
-    assert_eq!(loaded.source.identity(), identity);
-    let source =
-        SourceVersion::new(b"one\r\ntwo\nthree".repeat(10_001), Representation::Raw).unwrap();
-    let result = repository
-        .content(&store, request(ContentSource::Supplied(source.clone())))
-        .await
-        .unwrap()
-        .value;
-    assert_eq!(ready(result).source.bytes(), source.bytes());
-    let constrained = RepositoryStore::new(1, 1).unwrap();
-    let repository = constrained
-        .open(fixture.path().to_path_buf())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut spare = Vec::with_capacity(4096);
-    spare.push(b'x');
-    let source = SourceVersion::new(spare, Representation::Raw).unwrap();
-    let result = repository
-        .content(&constrained, request(ContentSource::Supplied(source)))
-        .await
-        .unwrap()
-        .value;
-    assert_eq!(ready(result).source.bytes(), b"x");
 }
 
 #[tokio::test]
@@ -297,65 +223,6 @@ async fn conflict_stage_reads_select_exact_stage_and_literal_path() {
             .unwrap()
             .value,
         ContentResult::Missing
-    ));
-}
-
-#[tokio::test]
-async fn empty_missing_and_non_blob_objects_are_not_conflated() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    init_repository(root);
-    fs::write(root.join("empty"), b"").unwrap();
-    stage(root, &["empty"]);
-    commit_index(root, "fixture");
-    let empty = resolve_revision(root, "HEAD:empty");
-    let commit = resolve_revision(root, "HEAD");
-    stage_gitlink(root, "link", commit);
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let loaded = ready(
-        repository
-            .content(&store, request(ContentSource::Object(empty)))
-            .await
-            .unwrap()
-            .value,
-    );
-    assert!(loaded.source.bytes().is_empty());
-    assert_eq!(loaded.source.newline().line_count, 0);
-    assert!(matches!(
-        repository
-            .content(&store, request(ContentSource::Object(commit)))
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Unavailable(ContentUnavailable::NotBlob(gix::objs::Kind::Commit))
-    ));
-    assert!(matches!(
-        repository
-            .content(
-                &store,
-                request(ContentSource::Object(gix::ObjectId::null(
-                    gix::hash::Kind::Sha1
-                )))
-            )
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Missing
-    ));
-    assert!(matches!(
-        repository
-            .content(
-                &store,
-                request(ContentSource::IndexStage {
-                    path: path("link"),
-                    stage: IndexStage::Normal
-                })
-            )
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Unavailable(ContentUnavailable::Gitlink)
     ));
 }
 

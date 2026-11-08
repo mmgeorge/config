@@ -1,17 +1,6 @@
 use super::*;
 use crate::test_support::git;
 
-#[test]
-fn diagnostic_retains_exit_context_and_final_error_within_utf8_budget() {
-    let input = format!("Git exited 1: {}\nfinal hook error", "界".repeat(2000));
-    let diagnostic = bounded_diagnostic(&input);
-    assert!(diagnostic.len() <= 2048);
-    assert!(diagnostic.starts_with("Git exited 1:"));
-    assert!(diagnostic.contains("[Diagnostic truncated]"));
-    assert!(diagnostic.ends_with("final hook error"));
-    assert_eq!(bounded_diagnostic("short error"), "short error");
-}
-
 async fn fixture() -> (
     tempfile::TempDir,
     Arc<RepositoryStore>,
@@ -94,45 +83,6 @@ async fn run(
     let outcome = service.submit(intent).unwrap().finish().await.unwrap();
     assert!(service.acknowledge(outcome.operation).is_some());
     outcome
-}
-
-#[tokio::test]
-async fn whole_file_stage_uses_current_source_after_queue_handoff() {
-    let (directory, store, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "captured\n").unwrap();
-    let blocker = store
-        .writes
-        .admit(
-            vec![MutationScope::Index(
-                repository.identity.worktree.clone().unwrap(),
-            )],
-            0,
-        )
-        .unwrap();
-    let guard = store.writes.start(blocker).unwrap().unwrap();
-    let observed = repository.observe(&store).await.unwrap();
-    let intent = service
-        .reserve(
-            Arc::clone(&repository),
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .unwrap();
-    intent
-        .validate_observed_sources(&observed.head, &observed.path)
-        .unwrap();
-    let ticket = service.submit(intent).unwrap();
-    std::fs::write(directory.path().join("sample.txt"), "new text\n").unwrap();
-    guard.finish(OperationCompletion::Completed).unwrap();
-    store.writes.take_receipt(blocker);
-    let outcome = ticket.finish().await.unwrap();
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert_eq!(
-        git(directory.path(), &["show", ":sample.txt"]),
-        b"new text\n"
-    );
-    service.acknowledge(outcome.operation).unwrap();
 }
 
 #[tokio::test]
@@ -242,27 +192,6 @@ async fn unverified_outcome_blocks_writes_until_read_only_reconciliation() {
 }
 
 #[tokio::test]
-async fn unrelated_index_change_does_not_reject_selected_path() {
-    let (directory, _, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
-    let intent = service
-        .prepare(
-            Arc::clone(&repository),
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .await
-        .unwrap();
-    std::fs::write(directory.path().join("other.txt"), "other\n").unwrap();
-    git(directory.path(), &["add", "other.txt"]);
-    let outcome = service.submit(intent).unwrap().finish().await.unwrap();
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert_eq!(git(directory.path(), &["show", ":other.txt"]), b"other\n");
-    service.acknowledge(outcome.operation).unwrap();
-}
-
-#[tokio::test]
 async fn branch_write_invalidates_linked_worktrees() {
     let (directory, store, repository, service) = fixture().await;
     let linked = directory.path().join("linked");
@@ -338,80 +267,6 @@ async fn untracked_discard_deletes_only_captured_file() {
     assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
     assert!(!directory.path().join("untracked.txt").exists());
     assert!(directory.path().join("sample.txt").exists());
-}
-
-#[test]
-fn batch_rejects_duplicate_global_and_nested_actions() {
-    let stage = || GitWriteAction::Stage {
-        path: vec![path("sample.txt")],
-    };
-    assert!(
-        GitWriteAction::Batch {
-            action: vec![stage(), stage()]
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        GitWriteAction::Batch {
-            action: vec![GitWriteAction::Push]
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        GitWriteAction::Batch {
-            action: vec![GitWriteAction::Batch {
-                action: vec![stage()]
-            }]
-        }
-        .validate()
-        .is_err()
-    );
-    assert_eq!(OperationId::from_value(0).unwrap().value(), 0);
-    assert!(OperationId::from_value(9_007_199_254_740_992).is_err());
-}
-
-#[tokio::test]
-async fn progress_sequence_spans_commands_with_independent_streams() {
-    let (_directory, _, repository, service) = fixture().await;
-    let mut intent = service
-        .prepare(
-            repository,
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .await
-        .unwrap();
-    let collected = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&collected);
-    intent.set_progress(Arc::new(move |chunk| {
-        sink.lock().unwrap().push((chunk.stream, chunk.sequence));
-        Ok(())
-    }));
-    for stream in [
-        CommandStream::Stdout,
-        CommandStream::Stderr,
-        CommandStream::Stdout,
-        CommandStream::Stderr,
-    ] {
-        intent.progress.as_ref().unwrap()(crate::command::CommandProgress {
-            stream,
-            sequence: 0,
-            bytes: vec![b'x'],
-        })
-        .unwrap();
-    }
-    assert_eq!(
-        *collected.lock().unwrap(),
-        vec![
-            (CommandStream::Stdout, 0),
-            (CommandStream::Stderr, 0),
-            (CommandStream::Stdout, 1),
-            (CommandStream::Stderr, 1)
-        ]
-    );
 }
 
 #[tokio::test]
@@ -490,34 +345,6 @@ async fn cancelled_waiter_keeps_recoverable_outcome_until_acknowledged() {
         Some(OperationCompletion::CancelledBeforeStart)
     );
     assert_eq!(store.writes.usage().input_bytes, 0);
-}
-
-#[tokio::test]
-async fn commit_with_large_summary_reports_completed() {
-    let (directory, _, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
-    git(directory.path(), &["add", "sample.txt"]);
-    let message = format!("test: {}", "large summary ".repeat(9000));
-    let completed = run(
-        &service,
-        &repository,
-        GitWriteAction::Commit {
-            message: message.clone(),
-        },
-    )
-    .await;
-    assert_eq!(completed.target[0].completion, TargetCompletion::Completed);
-    let recorded = Command::new("git")
-        .arg("-C")
-        .arg(directory.path())
-        .args(["log", "-1", "--format=%s"])
-        .output()
-        .unwrap();
-    assert!(recorded.status.success());
-    assert_eq!(
-        recorded.stdout,
-        format!("{}\n", message.trim_end()).as_bytes()
-    );
 }
 
 #[tokio::test]

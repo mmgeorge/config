@@ -463,6 +463,3 @@ where
 fn keep_selection<T>(selection: &SelectionChange<T>) -> bool {
     matches!(selection, SelectionChange::Keep)
 }
-
-#[cfg(test)]
-mod tests {}

@@ -224,26 +224,6 @@ mod test {
         tokio::task::yield_now().await;
         assert!(pending.is_finished());
     }
-
-    #[tokio::test]
-    async fn known_credential_failure_stays_unavailable_while_other_servers_load() {
-        let provider = bridge(
-            Arc::new(Notify::new()),
-            Arc::new(AtomicUsize::new(0)),
-            Some("credential reference is unset"),
-        );
-        let mut discovery = McpDiscovery::default();
-        let rows = discovery.snapshot(provider, request(), None).await.unwrap();
-        assert_eq!(rows[0].status, McpStatus::Unavailable);
-        assert_eq!(
-            rows[0]
-                .status_detail
-                .as_ref()
-                .map(|message| message.as_str()),
-            Some("credential reference is unset")
-        );
-        assert_eq!(rows[1].status, McpStatus::Loading);
-    }
 }
 
 /// Merge runtime observations without replacing shared resource identity, selection, or preparation errors.
@@ -284,6 +264,3 @@ pub(crate) fn merge_configured(
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {}

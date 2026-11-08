@@ -145,6 +145,3 @@ impl CheckNotification {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

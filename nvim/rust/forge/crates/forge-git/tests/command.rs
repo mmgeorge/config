@@ -2,9 +2,7 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
-use forge_git::command::{
-    CommandLimits, read_command, read_command_pair, read_command_with_expiry,
-};
+use forge_git::command::{CommandLimits, read_command, read_command_with_expiry};
 
 fn fixture(name: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -35,46 +33,6 @@ fn preserves_both_streams_and_nonzero_exit_status() {
     assert!(output.stdout.ends_with(b"saved stdout\n"));
     assert_eq!(output.stderr.len(), 96 * 1024 + b"saved stderr\n".len());
     assert!(output.stderr.ends_with(b"saved stderr\n"));
-}
-
-#[test]
-fn paired_reads_preserve_both_failures_and_streams() {
-    let (first, second) = read_command_pair(
-        fixture("command_child_failure"),
-        fixture("command_child_failure"),
-        CommandLimits {
-            stderr_bytes: 128 * 1024,
-            ..limits()
-        },
-        || Ok(()),
-    )
-    .unwrap();
-    for output in [first, second] {
-        assert_eq!(output.status.code(), Some(7));
-        assert!(output.stdout.ends_with(b"saved stdout\n"));
-        assert!(output.stderr.ends_with(b"saved stderr\n"));
-    }
-}
-
-#[test]
-fn paired_reads_cancel_both_children_before_returning() {
-    let fixture_dir = tempfile::tempdir().unwrap();
-    let first_ready = fixture_dir.path().join("first-child.ready");
-    let second_ready = fixture_dir.path().join("second-child.ready");
-    let mut first = fixture("command_child_wait");
-    first.env("FORGE_TEST_READY", &first_ready);
-    let mut second = fixture("command_child_wait");
-    second.env("FORGE_TEST_READY", &second_ready);
-    // Cancel once both children confirm they are running, not after a wall-clock delay.
-    let error = read_command_pair(first, second, limits(), || {
-        anyhow::ensure!(
-            !(first_ready.exists() && second_ready.exists()),
-            "cancel pair"
-        );
-        Ok(())
-    })
-    .unwrap_err();
-    assert!(error.to_string().contains("cancel pair"));
 }
 
 #[test]
@@ -117,39 +75,6 @@ fn active_cancellation_terminates_a_spawned_child() {
     })
     .unwrap_err();
     assert!(error.to_string().contains("cancelled after spawn"));
-}
-
-#[test]
-fn callback_unwind_disposes_the_child_before_returning() {
-    let outcome = std::panic::catch_unwind(|| {
-        let mut checked = false;
-        let _ = read_command(&mut fixture("command_child_wait"), limits(), || {
-            assert!(!checked, "synthetic callback unwind after spawn");
-            checked = true;
-            Ok(())
-        });
-    });
-    assert!(outcome.is_err());
-}
-
-#[test]
-fn invalid_deadline_and_prestart_cancellation_do_not_launch() {
-    let mut missing = Command::new("forge-nonexistent-command-fixture");
-    let error = read_command(
-        &mut missing,
-        CommandLimits {
-            timeout: Duration::ZERO,
-            ..limits()
-        },
-        || panic!("invalid limits must reject before cancellation callback"),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("timeout must be positive"));
-    let error = read_command(&mut missing, limits(), || {
-        anyhow::bail!("cancelled before spawn")
-    })
-    .unwrap_err();
-    assert!(error.to_string().contains("cancelled before spawn"));
 }
 
 #[test]

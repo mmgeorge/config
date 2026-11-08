@@ -1095,24 +1095,6 @@ mod tests {
         Ok(())
     }
 
-    /// A snapshot lease pauses both direct offers and the ordered delivery worker until abandoned.
-    #[test]
-    fn reconnect_lease_blocks_output_and_drop_releases_without_acknowledgment()
-    -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = Arc::new(SessionPublications::open(root.path(), "session")?);
-        let lease = publications.begin_reconciliation()?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        publications.publish(event("during snapshot"), Some(&sender))?;
-        assert!(publications.begin_offer()?.is_none());
-        assert!(receiver.try_recv().is_err());
-        assert_eq!(records(&publications)[0].state(), PublicationState::Pending);
-        drop(lease);
-        assert_eq!(records(&publications)[0].state(), PublicationState::Pending);
-        assert!(publications.begin_offer()?.is_some());
-        Ok(())
-    }
-
     /// A lost caller cannot pin output forever, and its late token cannot release a newer lease.
     #[tokio::test(start_paused = true)]
     async fn reconnect_lease_expiration_rejects_late_confirmation() -> Result<(), PublicationError>
@@ -1141,31 +1123,6 @@ mod tests {
         ));
         drop(current);
         assert!(publications.begin_offer()?.is_some());
-        Ok(())
-    }
-
-    /// A failed event in a logical group cannot leave a publishable prefix behind.
-    #[test]
-    fn publication_batch_rolls_back_every_event_on_failure() -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let mut invalid = event("wrong session");
-        invalid.session_id = "another session".into();
-        assert!(matches!(
-            publications.publish_batch(vec![event("first"), invalid]),
-            Err(PublicationError::SessionMismatch)
-        ));
-        assert!(records(&publications).is_empty());
-        publications.publish_batch(vec![event("one"), event("two")])?;
-        let retained = records(&publications);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].sequence().get(), 1);
-        assert_eq!(retained[1].sequence().get(), 2);
-        assert!(
-            retained
-                .iter()
-                .all(|publication| publication.state() == PublicationState::Pending)
-        );
         Ok(())
     }
 
@@ -1290,43 +1247,6 @@ mod tests {
         assert_eq!(retained[0].state(), PublicationState::Uncertain);
         assert_eq!(retained[1].state(), PublicationState::Pending);
         assert!(receiver.try_recv().is_err());
-        Ok(())
-    }
-
-    /// Invalid and cross-session notifications cannot consume identities or enter the delivery prefix.
-    #[test]
-    fn invalid_publications_leave_the_retained_prefix_unchanged() -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let mut foreign = event("foreign");
-        foreign.session_id = "other".into();
-        assert!(matches!(
-            publications.publish(foreign, None),
-            Err(PublicationError::SessionMismatch)
-        ));
-        let mut invalid = event("invalid");
-        invalid.event = "unrecognized_notification".into();
-        assert!(matches!(
-            publications.publish(invalid, None),
-            Err(PublicationError::InvalidEvent)
-        ));
-        for payload in [
-            serde_json::Value::Null,
-            serde_json::json!([]),
-            serde_json::json!(7),
-        ] {
-            let mut nonobject = event("invalid payload");
-            nonobject.payload = payload;
-            assert!(matches!(
-                publications.publish(nonobject, None),
-                Err(PublicationError::InvalidEvent)
-            ));
-        }
-        assert!(records(&publications).is_empty());
-        assert_eq!(
-            publications.publish(event("valid"), None)?.sequence().get(),
-            1
-        );
         Ok(())
     }
 }

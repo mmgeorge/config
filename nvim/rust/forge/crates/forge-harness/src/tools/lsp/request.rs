@@ -334,6 +334,3 @@ impl Arguments {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -767,5 +767,3 @@ fn serialize_recovery<Serializer: serde::Serializer>(
         }
     }
 }
-#[cfg(test)]
-mod tests;

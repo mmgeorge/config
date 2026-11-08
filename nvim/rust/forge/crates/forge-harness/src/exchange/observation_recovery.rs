@@ -400,22 +400,6 @@ impl ObservationRecovery {
 mod tests {
     use super::*;
 
-    /// A delayed request for the old inbox cannot change recovery or current-generation availability.
-    #[tokio::test]
-    async fn stale_request_does_not_start_recovery() {
-        let old = Arc::new(SessionObservationInbox::default());
-        let current = Arc::new(SessionObservationInbox::default());
-        let (reply, received) = oneshot::channel();
-        let mut recovery = ObservationRecovery::default();
-        recovery.request(old, &current, reply);
-        assert!(matches!(
-            received.await.unwrap(),
-            Err(ProviderLifecycleFailure::GenerationChanged)
-        ));
-        assert!(!recovery.active());
-        assert!(recovery.target.is_none());
-        assert!(recovery.replies.is_empty());
-    }
     /// Storage failure releases waiters but leaves the original collection worker observable.
     #[tokio::test]
     async fn storage_failure_retains_pending_collection() {

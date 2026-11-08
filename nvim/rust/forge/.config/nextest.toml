@@ -50,6 +50,13 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 filter = "package(forge-git) & test(/^writer::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# Unified diff suite: these tests check that emitted patches apply and reverse byte-for-byte by
+# running real `git apply`, which is the oracle for the unified-diff format. They take about
+# 1.2 s alone.
+[[profile.default.overrides]]
+filter = "package(forge-diff) & binary(unified)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 # Status writer suite: status actions stage, unstage and discard through Git, and these tests
 # check the result against real `git diff --cached` and `git show`.
 [[profile.default.overrides]]

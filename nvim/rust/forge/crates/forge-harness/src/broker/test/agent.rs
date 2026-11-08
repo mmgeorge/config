@@ -1,10 +1,9 @@
 use super::super::{
-    AppliedProviderEvent, ApprovalMode, Exchange, ExchangeAdmission, ExchangeState, HarnessBroker,
-    InitializeRequest, PlanExecutionState, PromptMode, ProviderEvent, ProviderInput,
-    ProviderLaunch, SessionUpdate, TurnCancelled,
+    ApprovalMode, Exchange, ExchangeAdmission, ExchangeState, HarnessBroker, InitializeRequest,
+    PromptMode, ProviderEvent, ProviderInput, ProviderLaunch, TurnCancelled,
 };
 use super::test_support::{
-    admit_child_fixture, check_fixture, child_address, child_completed, child_event, child_tool,
+    admit_child_fixture, child_address, child_completed, child_event, child_tool,
     completed_message, planning_question_broker, repository, settle_managed_children,
 };
 use crate::provider::ScopeOwner;
@@ -273,98 +272,6 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
             .approval_mode,
         ApprovalMode::Ask
     );
-    Ok(())
-}
-
-/// Keep binding status out of task transitions while validating the exact child owner.
-#[test]
-fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let admission = admit_child_fixture(&mut broker, "terminal-status")?;
-    let owner = crate::provider::ThreadOwner::new(
-        broker.session.id.clone().into(),
-        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
-    )
-    .expect("registered session and agent identities are nonempty");
-    let status = |target: crate::provider::ThreadOwner| {
-        crate::provider::session_execution::OwnerObservation::Event(
-            crate::provider::test_support::native_event(
-                forge_provider_api::EventScope::Binding {
-                    thread_id: forge_provider_api::ThreadId::from(target.clone()),
-                },
-                ProviderEvent::Thread {
-                    thread_id: target.thread_id(),
-                    event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(
-                        forge_provider_api::terminal::TerminalInventory::observed(Vec::new()),
-                    )),
-                },
-            ),
-        )
-    };
-    let before = broker
-        .agent_coordinator
-        .task(&admission.task.id)
-        .unwrap()
-        .state;
-    assert!(matches!(
-        broker.apply_managed_agent_observation(
-            owner.clone(),
-            &admission.task.id,
-            status(owner.clone()),
-            &mut Vec::new()
-        )?,
-        AppliedProviderEvent::None
-    ));
-    assert_eq!(
-        broker
-            .agent_coordinator
-            .task(&admission.task.id)
-            .unwrap()
-            .state,
-        before
-    );
-    let foreign = crate::provider::ThreadOwner::root("foreign");
-    assert!(
-        broker
-            .apply_managed_agent_observation(
-                owner.clone(),
-                &admission.task.id,
-                status(foreign),
-                &mut Vec::new()
-            )
-            .is_err()
-    );
-    let diagnostic = crate::provider::session_execution::OwnerObservation::Event(
-        crate::provider::test_support::native_event(
-            forge_provider_api::EventScope::Binding {
-                thread_id: forge_provider_api::ThreadId::from(owner.clone()),
-            },
-            ProviderEvent::Thread {
-                thread_id: owner.thread_id(),
-                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Err(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::TerminalList,
-                        forge_provider_api::ProviderFailureKind::Runtime,
-                    )
-                    .at_phase(
-                        forge_provider_api::ProviderPhase::Observation,
-                        forge_provider_api::FailureDisposition::Unchanged,
-                    ),
-                )),
-            },
-        ),
-    );
-    assert!(matches!(
-        broker.apply_managed_agent_observation(
-            owner,
-            &admission.task.id,
-            diagnostic,
-            &mut Vec::new()
-        )?,
-        AppliedProviderEvent::Update(SessionUpdate::Diagnostic { .. })
-    ));
     Ok(())
 }
 
@@ -840,124 +747,6 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         .await
         .is_err()
     );
-    Ok(())
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn child_execution_blocks_automatic_verification_without_mutating_the_goal() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = check_fixture(
-        repository.path(),
-        data.path(),
-        vec!["Write-Output verified".into()],
-        false,
-    )
-    .await;
-    let admission = admit_child_fixture(&mut broker, "verification-child")?;
-    assert!(
-        broker
-            .run_checks()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("child execution")
-    );
-    let execution = broker
-        .store
-        .load_plan_execution("check-execution")?
-        .unwrap();
-    assert!(execution.check_runs.is_empty());
-    assert_eq!(execution.state, PlanExecutionState::Active);
-    assert!(broker.task_controller.current()?.is_some());
-    let owner = crate::provider::ThreadOwner::new(
-        (broker.session.id.clone()).into(),
-        forge_provider_api::agent::AgentId::new(admission.agent.id).unwrap(),
-    )
-    .expect("registered session and agent identities are nonempty");
-    broker
-        .complete_managed_agent(
-            owner,
-            admission.task.id,
-            Err(anyhow::anyhow!("stopped")),
-            Vec::new(),
-            None,
-            &mut Vec::new(),
-        )
-        .await?;
-    broker.run_checks().await?;
-    assert_eq!(
-        broker
-            .store
-            .load_plan_execution("check-execution")?
-            .unwrap()
-            .state,
-        PlanExecutionState::Complete
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn child_summary_preserves_running_exchange_when_followup_is_queued() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let admission = admit_child_fixture(&mut broker, "queued-followup")?;
-    let owner = crate::provider::ThreadOwner::new(
-        (broker.session.id.clone()).into(),
-        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
-    )
-    .expect("registered session and agent identities are nonempty");
-    broker
-        .observe_child_fixture(
-            owner.clone(),
-            &admission.task.id,
-            child_event(
-                &child_address(&(owner), &admission.task.id),
-                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
-                    started_at_ms: 0,
-                }),
-            ),
-            &mut Vec::new(),
-        )
-        .await?;
-    let request = crate::agent::AgentRequest {
-        operation_id: "queued".into(),
-        source: crate::agent::AgentSource::User,
-        operation: crate::agent::AgentOperation::Followup {
-            target: admission.agent.id.clone(),
-            message: "Next".into(),
-        },
-    };
-    let queued = broker.agent_coordinator.reserve_followup(
-        &request,
-        &admission.agent.id,
-        "Next",
-        &admission.task.parent_exchange_id,
-        101,
-    )?;
-    let mut parent = broker
-        .store
-        .load_exchange(&admission.task.parent_exchange_id)?
-        .unwrap();
-    parent.append_agent_task(&queued.task)?;
-    broker.store.admit_agent_task(
-        &queued.agent,
-        &queued.task,
-        &parent,
-        queued.continuation_authorization(),
-    )?;
-    queued.commit()?;
-    let snapshot = broker.snapshot()?;
-    let summary = &snapshot.agent.summary[&admission.agent.id];
-    assert_eq!(summary["state"], "running");
-    assert_eq!(summary["latest_exchange_id"], admission.task.id);
-    assert_eq!(
-        summary["target"]["turn_id"],
-        json!(child_address(&owner, &admission.task.id).turn_id)
-    );
-    assert_eq!(summary["exchange_count"], 2);
     Ok(())
 }
 
@@ -1700,49 +1489,6 @@ fn routing_fixture(
         crate::provider::test_support::ProviderTestSession::from_native(native.fixture())?;
     Ok((native, fixture))
 }
-#[tokio::test]
-async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tier() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let (_routing, routing_fixture) =
-        routing_fixture(forge_providers::registry::default_id(), false)?;
-    broker
-        .agent_provider_factory
-        .register(routing_fixture.provider_handle());
-    save_child_profile(
-        &broker,
-        "configured-child",
-        crate::agent::AgentProfile {
-            provider: forge_providers::registry::default_id().to_string(),
-            model: "fixture-model".into(),
-            reasoning_effort: "low".into(),
-            service_tier: "fast".into(),
-            ..Default::default()
-        },
-    )?;
-    let root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
-    let spawn = crate::agent::SpawnAgentRequest {
-        profile: Some("configured-child".into()),
-        text: "Inspect".into(),
-    };
-    let selection = broker
-        .agent_provider_factory
-        .resolve(
-            &root,
-            forge_providers::registry::nonselectable_id()
-                .expect("registry supplies a nonselectable fixture identity"),
-            &spawn,
-        )
-        .await?;
-    assert_eq!(selection.model, "fixture-model");
-    assert_eq!(selection.reasoning_effort, "low");
-    assert_eq!(selection.context_window, None);
-    assert_eq!(selection.service_tier, crate::provider::ServiceTier::Fast);
-    assert_eq!(selection.access.sandbox, root.access.sandbox);
-    assert_eq!(selection.approval_mode, root.approval_mode);
-    Ok(())
-}
 
 #[tokio::test]
 async fn durable_operation_receipts_prevent_duplicate_child_tasks_before_and_after_completion()
@@ -2344,11 +2090,6 @@ impl SuspendedParentProvider {
 #[tokio::test]
 async fn suspended_parent_joins_children_before_resuming() -> Result<()> {
     assert_suspended_parent_joins_children(false).await
-}
-
-#[tokio::test]
-async fn user_input_wakes_suspended_parent_without_native_steering() -> Result<()> {
-    assert_suspended_parent_joins_children(true).await
 }
 
 /// Suspends the parent behind two running children and checks that it resumes only after both

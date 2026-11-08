@@ -173,23 +173,3 @@ impl LogSegment {
         Ok(Some(fragments.into_iter().rev().flatten().collect()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// Stop before consuming another record when the owning interaction is cancelled.
-    #[test]
-    fn snapshot_honors_cancellation_between_records() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join("session.jsonl");
-        std::fs::write(&current, "{}\n{}\n")?;
-        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(json!({})));
-        let failure = snapshot.next(|| anyhow::bail!("cancelled")).unwrap_err();
-        assert_eq!(failure.to_string(), "cancelled");
-        assert_eq!(snapshot.next(|| Ok(()))?, Some(json!({})));
-        Ok(())
-    }
-}

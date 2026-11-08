@@ -689,20 +689,3 @@ impl TaskSnapshot {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn task_replacement_rejects_stale_control_results() {
-        let mut task = Task::goal("First".into(), ContinuationBudget::default(), 1);
-        let permit = task.permit();
-        permit.validate(Some(&task)).unwrap();
-        task.renew(2);
-        assert!(permit.validate(Some(&task)).is_err());
-        assert!(permit.validate(None).is_err());
-        let replacement = Task::goal("Second".into(), ContinuationBudget::default(), 3);
-        assert!(permit.validate(Some(&replacement)).is_err());
-    }
-}

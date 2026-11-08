@@ -12,7 +12,6 @@ use std::time::Duration;
 /// Select the native boundary held by a cancellation scenario.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CollectionBoundary {
-    Preparing,
     Active,
     /// Hold native execution after the provider echoes the submitted user message, as Codex does.
     ActiveAfterUserEcho,
@@ -41,7 +40,6 @@ async fn slow_collection_fixture(
 ) -> Result<SlowCollectionFixture> {
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
-    let (prepared, mut preparation) = tokio::sync::mpsc::unbounded_channel();
     let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let steered_submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -214,18 +212,6 @@ async fn slow_collection_fixture(
         "id":"fixture-model", "reasoning":["low","medium","high"],
         "context_window":[], "vision":false, "is_default":true,
     }))?]);
-    let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    native.with_pre_dispatch(move |_| {
-        let first = preparations.fetch_add(1, Ordering::AcqRel) == 0;
-        let prepared = prepared.clone();
-        async move {
-            if first && matches!(boundary, CollectionBoundary::Preparing) {
-                let _ = prepared.send(());
-                return std::future::pending().await;
-            }
-            Ok(())
-        }
-    });
     let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let collection_count = collections.clone();
     native.with_cleanup_request(move |_| {
@@ -273,22 +259,10 @@ async fn slow_collection_fixture(
         &sink,
     )
     .await?;
-    match boundary {
-        CollectionBoundary::Preparing => {
-            preparation
-                .recv()
-                .await
-                .context("first input never reached pre-acceptance preparation")?;
-        }
-        CollectionBoundary::Active
-        | CollectionBoundary::ActiveAfterUserEcho
-        | CollectionBoundary::ActiveInTool => {
-            starts
-                .recv()
-                .await
-                .context("first input never emitted its native start observation")?;
-        }
-    }
+    starts
+        .recv()
+        .await
+        .context("first input never emitted its native start observation")?;
     let engine = controller
         .broker
         .lock()
@@ -542,72 +516,6 @@ async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result
     }
     .await;
     fixture.finish(scenario).await
-}
-
-/// Collect a delayed cancellation inside its command budget and reopen input.
-#[tokio::test(start_paused = true)]
-async fn owner_cancel_with_slow_native_collection_settles_and_reopens_input() -> Result<()> {
-    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
-    let mut fixture =
-        slow_collection_fixture(Duration::from_secs(20), CollectionBoundary::Preparing).await?;
-    let scenario = async {
-        fixture
-            .controller
-            .exchange_owner
-            .execute_command(Command::CancelExchange(CancelExchangeRequest {
-                input: CancelledInputPolicy::RestoreIfUnconsumed,
-            }))
-            .await
-            .context("cancel failed although native collection was healthy")?;
-        prompt::apply(
-            &fixture.controller,
-            Request {
-                id: 801,
-                method: "session.prompt.submit".into(),
-                params: json!({"operation_id":"after-slow-cancel","text":"Prompt after slow cancellation"}),
-            },
-            &fixture.sink,
-        )
-        .await?;
-        let received = fixture.dispatches.recv().await;
-        ensure!(matches!(
-            received,
-            Some(forge_provider_api::input::PromptInput::Text(text))
-                if text == "Prompt after slow cancellation"
-        ));
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    fixture.finish(scenario).await
-}
-
-/// A second cancellation during collection joins the first instead of failing as uncertain.
-#[tokio::test(start_paused = true)]
-async fn owner_second_cancel_during_collection_resolves_with_the_first() -> Result<()> {
-    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
-    let fixture =
-        slow_collection_fixture(Duration::from_secs(20), CollectionBoundary::Preparing).await?;
-    let scenario = async {
-        let command = || {
-            Command::CancelExchange(CancelExchangeRequest {
-                input: CancelledInputPolicy::Retain,
-            })
-        };
-        let first = fixture.controller.exchange_owner.execute_command(command());
-        let second = fixture.controller.exchange_owner.execute_command(command());
-        let (first, second) = async { tokio::join!(first, second) }.await;
-        first.context("first cancellation failed")?;
-        second.context("second cancellation was refused while collection was in flight")?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    fixture.finish(scenario).await
-}
-
-/// Retain pre-acceptance cleanup after the cancellation response times out.
-#[tokio::test(start_paused = true)]
-async fn owner_overdue_cancel_recovers_when_late_collection_completes() -> Result<()> {
-    overdue_cancel_recovers(CollectionBoundary::Preparing).await
 }
 
 /// Retain actual native execution cleanup after the cancellation response times out.

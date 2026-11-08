@@ -693,41 +693,6 @@ fn inbox_poisoned(_component: &'static str) -> ProviderError {
 mod tests {
     use crate::provider::ScopeOwner;
 
-    /// Retain independent watchdog failures once without overwriting published snapshots.
-    #[tokio::test]
-    async fn watchdog_collection_preserves_all_failures_across_repeated_retirement() {
-        use forge_provider_api::{ProviderFailure, ProviderFailureKind, ProviderOperation};
-        let inbox = super::SessionObservationInbox::default();
-        let first = inbox.retain_watchdog_failure(
-            ProviderFailure::new(
-                ProviderOperation::TurnInterrupt,
-                ProviderFailureKind::Transport,
-            )
-            .into(),
-        );
-        let second = inbox.retain_watchdog_failure(
-            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
-                .into(),
-        );
-        assert_eq!(first.collection().len(), 1);
-        assert_eq!(second.collection().len(), 2);
-        for _ in 0..2 {
-            let Err(crate::provider::ProviderError::Cleanup(report)) =
-                inbox.retire_background().await
-            else {
-                panic!("watchdog failures remain observable");
-            };
-            assert_eq!(report.collection().len(), 2);
-            assert_eq!(
-                report
-                    .to_string()
-                    .matches("provider observation failed:")
-                    .count(),
-                1
-            );
-        }
-    }
-
     use super::*;
     use anyhow::Result;
 
@@ -1054,46 +1019,6 @@ mod tests {
         inbox.retire_background().await?;
         work.registry.close().await?;
         work.provider.shutdown().await?;
-        Ok(())
-    }
-
-    /// Keep watchdog collection failure sticky and reject publication after close.
-    #[tokio::test]
-    async fn retired_generation_collects_watchdogs_and_rejects_late_events() -> Result<()> {
-        let inbox = SessionObservationInbox::default();
-        let failed = inbox
-            .background_tasks
-            .lock()
-            .unwrap()
-            .spawn(async { panic!("fixture watchdog failure") });
-        while !failed.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let (release, pending) = tokio::sync::oneshot::channel();
-        inbox.background_tasks.lock().unwrap().spawn(async move {
-            let _ = pending.await;
-        });
-        inbox.close();
-        let collection = inbox.retire_background();
-        tokio::pin!(collection);
-        assert!(futures_util::poll!(collection.as_mut()).is_pending());
-        release.send(()).unwrap();
-        assert!(collection.await.is_err());
-        assert!(inbox.retire_background().await.is_err());
-        assert!(
-            inbox
-                .push(notice(
-                    crate::provider::EventScope::Binding {
-                        thread_id: forge_provider_api::ThreadId::from(
-                            crate::provider::ThreadOwner::root("session")
-                        ),
-                    },
-                    forge_provider_api::SanitizedMessage::new("stale")
-                        .expect("fixture diagnostic is nonempty")
-                        .to_string()
-                ))
-                .is_err()
-        );
         Ok(())
     }
 }

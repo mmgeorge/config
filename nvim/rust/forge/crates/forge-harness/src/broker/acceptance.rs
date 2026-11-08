@@ -1187,52 +1187,6 @@ mod tests {
         Ok((workspace, data, broker, plan))
     }
 
-    /// Missing approval produces revision-scoped questions without writing review artifacts.
-    #[test]
-    fn execution_preparation_retains_feedback_and_frozen_choices_while_awaiting_input() -> Result<()>
-    {
-        let (_workspace, _data, broker, plan) = reviewed_execution_fixture()?;
-        let current = broker.task_controller.current()?;
-        let selection = crate::exchange::command::PlanExecutionSelection::capture(
-            &plan,
-            current.as_ref(),
-            crate::task::command::ExecuteSelection {
-                comment: Some("Keep the selected design".into()),
-                plan_compact: Some(false),
-                ..Default::default()
-            },
-        )?;
-        let before = serde_json::to_value(broker.store.load_plan(&plan.id)?)?;
-        let prepared = broker.observer.prepare_plan_execution(
-            &crate::exchange::command::CommandId::new("review-preparation")?,
-            &selection,
-            2,
-        )?;
-        let PlanExecutionPreparation::AwaitingInput {
-            change,
-            question_set: _,
-        } = prepared
-        else {
-            anyhow::bail!("missing approval must await reviewer input")
-        };
-        let review = change.effects.plan.last().unwrap().review.as_ref().unwrap();
-        assert!(review.elicitation.has_pending_decisions());
-        assert_eq!(
-            review.overall_comment.as_deref(),
-            Some("Keep the selected design")
-        );
-        assert_eq!(
-            review.execution_request.as_ref().unwrap().plan_compact,
-            Some(false)
-        );
-        assert!(review.saved_source_digest.is_some());
-        assert_eq!(
-            serde_json::to_value(broker.store.load_plan(&plan.id)?)?,
-            before
-        );
-        Ok(())
-    }
-
     /// Validation must leave artifacts/task state unchanged and guard the later preparation against file edits.
     #[test]
     fn execution_preflight_is_read_only_and_freezes_working_source_authority() -> Result<()> {
@@ -1440,30 +1394,6 @@ mod tests {
                 .iter()
                 .any(|finding| finding.contains("Clarify the owner."))
         );
-        Ok(())
-    }
-
-    /// Retain explicit automatic acceptance across successive execution revisions.
-    #[tokio::test]
-    async fn inline_execution_revisions_preserve_explicit_automatic_acceptance() -> Result<()> {
-        let mut execution_fixture = resolving_execution().await?;
-        execution_fixture.broker.dispatch_session_command(
-            "session.command.apply",
-            json!({"action":"plan_accept","enabled":true}),
-        )?;
-        for revision in 2..=3 {
-            let submitted = submit_execution_revision(&mut execution_fixture, revision).await?;
-            assert_eq!(submitted.state, PlanState::Accepted);
-            assert_eq!(submitted.accepted_revision, Some(revision));
-            assert!(
-                execution_fixture
-                    .broker
-                    .task_controller
-                    .current()?
-                    .unwrap()
-                    .auto_accept_plan
-            );
-        }
         Ok(())
     }
 

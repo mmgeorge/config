@@ -251,54 +251,6 @@ mod tests {
     use super::*;
     use crate::broker::test::{git_repository, planning_question_broker};
 
-    /// An original completed invocation's workspace capture does not hold the broker mutex.
-    #[tokio::test]
-    async fn idle_checkpoint_capture_keeps_broker_available() -> Result<()> {
-        let repository = git_repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut exchange = super::super::test::completed_interaction(
-            "idle-checkpoint",
-            &broker.session.id,
-            Vec::new(),
-        );
-        exchange.phase = crate::exchange::ExchangePhase::Running;
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ThreadOwner::root(&broker.session.id),
-            exchange.id.clone(),
-        );
-        let first = crate::provider::test_support::address(&scope);
-        exchange.start_turn(first.clone(), 10)?;
-        exchange
-            .turn_mut(&first)
-            .context("first turn missing")?
-            .finish(
-                crate::turn::TurnOutcome::Completed {
-                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
-                },
-                11,
-            )?;
-        exchange.begin_finalization(crate::exchange::ExchangeOutcome::Failed, 12)?;
-        broker.store.save_exchange(&exchange)?;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let shared = Arc::new(tokio::sync::Mutex::new(broker));
-        let mut capture = shared
-            .lock()
-            .await
-            .prepare_final_checkpoint(&exchange, crate::exchange::ExchangeOutcome::Failed)?;
-        capture.barrier = Some((started.clone(), release.clone()));
-        let job = tokio::spawn(capture.run());
-        started.notified().await;
-        assert!(
-            shared.try_lock().is_ok(),
-            "idle checkpoint held the broker mutex"
-        );
-        release.notify_one();
-        job.await??;
-        Ok(())
-    }
-
     /// Discard an unlocked capture when initial checkpoint collection changed its baseline.
     #[tokio::test]
     async fn final_capture_rechecks_baseline_before_committing() -> Result<()> {

@@ -15,6 +15,24 @@ local MiniTest = require("mini.test")
 -- An empty script path keeps mini.test from sourcing a project `scripts/minitest.lua` instead.
 MiniTest.setup({ script_path = "", silent = true })
 
+-- On Windows, mini.test names a child's `--listen` pipe after the tail of `tempname()`, a counter
+-- that restarts in every process, so concurrent shards collide on `\\.\pipe\mininvim1` and a case
+-- can connect to another shard's child. The process ID makes the name unique while a child starts.
+local new_child_neovim = MiniTest.new_child_neovim
+MiniTest.new_child_neovim = function()
+  local child = new_child_neovim()
+  local start = child.start
+  child.start = function(...)
+    local tempname = vim.fn.tempname
+    vim.fn.tempname = function() return tempname() .. "-" .. vim.fn.getpid() end
+    local ok, result = pcall(start, ...)
+    vim.fn.tempname = tempname
+    if not ok then error(result, 0) end
+    return result
+  end
+  return child
+end
+
 -- A case's label is its description below the file name, such as `group | case`.
 local function case_label(case) return table.concat(case.desc, " | ", 2) end
 

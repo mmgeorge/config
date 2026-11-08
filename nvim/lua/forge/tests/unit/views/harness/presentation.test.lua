@@ -1,105 +1,111 @@
--- Unit tests for `forge.views.harness.presentation` (presentation.lua). Each scenario row runs in its own
--- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
-local scenarios = {
-  { name = "harness_file_paging", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local expanded, loaded, revision = false, 0, 0
-local requests, notices, pending = {}, {}, {}
-local total, hold = 300, false
-local owner
-local transcript = vim.api.nvim_create_buf(false, true)
-local composer = vim.api.nvim_create_buf(false, true)
-local window = vim.api.nvim_get_current_win()
-vim.o.lines, vim.o.columns = 24, 100
-vim.api.nvim_win_set_buf(window, transcript)
+-- Unit tests for `forge.views.harness.presentation` (presentation.lua).
+local MiniTest = require("mini.test")
+local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
+local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local eq = MiniTest.expect.equality
 
-local function snapshot(document)
-  local body = {}
-  for row = 1, loaded do body[row] = ("source row %03d"):format(row) end
-  local last = expanded and "file:deferred-body" or "empty"
-  local blocks = {
-    { id = "file", text = { "Modified source.rs" }, metadata = {
-      node = { id = "file", kind = "file", lifecycle = "settled", generation = 1,
-        content_revision = revision, loaded_rows = loaded, loaded_bytes = 0, order = 0, more = false,
-        display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
-      section = { { id = "file", revision = revision, open = expanded, more = false } },
-      fold = { { id = "file", start = { row = 0, column = 0 },
-        ["end"] = { block = last, position = { row = 1, column = 0 } },
-        closed = true, expand_children = true } },
-    } },
-  }
-  if expanded then
-    blocks[#blocks + 1] = { id = "hunk", text = { "@@ -1 +1 @@" }, metadata = {
-      section = { { id = "hunk", revision = revision, open = true, more = false } },
-      fold = { { id = "hunk", start = { row = 0, column = 0 },
-        ["end"] = { block = "rows", position = { row = #body, column = 0 } }, closed = false } },
-    } }
-    blocks[#blocks + 1] = { id = "rows", text = body, metadata = {} }
-    blocks[#blocks + 1] = { id = "file:deferred-body", text = { loaded < total and "More content available" or "End" }, metadata = {
-      section = loaded < total and { { id = "file", revision = revision, open = true, more = true } } or {},
-    } }
-  else
-    blocks[#blocks + 1] = { id = "empty", text = { "" }, metadata = {} }
+local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["harness_file_paging"] = function()
+  local client = require("forge.client")
+  local expanded, loaded, revision = false, 0, 0
+  local requests, notices, pending = {}, {}, {}
+  local total, hold = 300, false
+  local owner
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.o.lines, vim.o.columns = 24, 100
+  vim.api.nvim_win_set_buf(window, transcript)
+
+  local function snapshot(document)
+    local body = {}
+    for row = 1, loaded do body[row] = ("source row %03d"):format(row) end
+    local last = expanded and "file:deferred-body" or "empty"
+    local blocks = {
+      { id = "file", text = { "Modified source.rs" }, metadata = {
+        node = { id = "file", kind = "file", lifecycle = "settled", generation = 1,
+          content_revision = revision, loaded_rows = loaded, loaded_bytes = 0, order = 0, more = false,
+          display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
+        section = { { id = "file", revision = revision, open = expanded, more = false } },
+        fold = { { id = "file", start = { row = 0, column = 0 },
+          ["end"] = { block = last, position = { row = 1, column = 0 } },
+          closed = true, expand_children = true } },
+      } },
+    }
+    if expanded then
+      blocks[#blocks + 1] = { id = "hunk", text = { "@@ -1 +1 @@" }, metadata = {
+        section = { { id = "hunk", revision = revision, open = true, more = false } },
+        fold = { { id = "hunk", start = { row = 0, column = 0 },
+          ["end"] = { block = "rows", position = { row = #body, column = 0 } }, closed = false } },
+      } }
+      blocks[#blocks + 1] = { id = "rows", text = body, metadata = {} }
+      blocks[#blocks + 1] = { id = "file:deferred-body", text = { loaded < total and "More content available" or "End" }, metadata = {
+        section = loaded < total and { { id = "file", revision = revision, open = true, more = true } } or {},
+      } }
+    else
+      blocks[#blocks + 1] = { id = "empty", text = { "" }, metadata = {} }
+    end
+    for _, block in ipairs(blocks) do
+      block.metadata.target = {}
+      block.metadata.decoration = {}
+      block.metadata.editable_region = {}
+    end
+    return { document = document, revision = revision, block = blocks }
   end
-  for _, block in ipairs(blocks) do
-    block.metadata.target = {}
-    block.metadata.decoration = {}
-    block.metadata.editable_region = {}
+
+  local function deliver(params, callback)
+    if params.operation == "node" then
+      assert(params.node == "file", "hunk body caused a separate request")
+      eq(params.rows, 2 * vim.api.nvim_win_get_height(window))
+      assert(params.width.columns > 0)
+      expanded = params.expanded
+      if expanded then loaded = math.min(total, (params.action == "load_more") and loaded + params.rows or math.max(loaded, params.rows)) end
+      revision = revision + 1
+      callback({})
+    elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
+    else callback({}) end
   end
-  return { document = document, revision = revision, block = blocks }
-end
 
-local function deliver(params, callback)
-  if params.operation == "node" then
-    assert(params.node == "file", "hunk body caused a separate request")
-    assert(params.rows == 2 * vim.api.nvim_win_get_height(window))
-    assert(params.width.columns > 0)
-    expanded = params.expanded
-    if expanded then loaded = math.min(total, (params.action == "load_more") and loaded + params.rows or math.max(loaded, params.rows)) end
-    revision = revision + 1
-    callback({})
-  elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
-  else callback({}) end
-end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
 
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
-
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  if params.operation == "background_terminals" then callback({ supported = false })
-  elseif params.operation == "open" then
-    vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
-  else
-    requests[#requests + 1] = params
-    if hold and params.operation == "node" and (params.action == "load_more") then
-      pending[#pending + 1] = { params = params, callback = callback }
-    else deliver(params, callback) end
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false })
+    elseif params.operation == "open" then
+      vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
+    else
+      requests[#requests + 1] = params
+      if hold and params.operation == "node" and (params.action == "load_more") then
+        pending[#pending + 1] = { params = params, callback = callback }
+      else deliver(params, callback) end
+    end
   end
-end
 
-local function settled()
-  return not owner.syncing and not owner.applying and not owner.pending and not owner.transcript.update_pending
-end
-local function page_count()
-  local count = 0
-  for _, request in ipairs(requests) do
-    if request.operation == "node" and (request.action == "load_more") then count = count + 1 end
+  local function settled()
+    return not owner.syncing and not owner.applying and not owner.pending and not owner.transcript.update_pending
   end
-  return count
-end
-local ok, failure = xpcall(function()
+  local function page_count()
+    local count = 0
+    for _, request in ipairs(requests) do
+      if request.operation == "node" and (request.action == "load_more") then count = count + 1 end
+    end
+    return count
+  end
+  MiniTest.finally(function() if owner then pcall(owner.close) end end)
   owner = require("forge.views.harness.presentation").open({
     session_id = "file-paging", transcript_buffer = transcript, composer_buffer = composer,
     transcript_window = window, is_alive = function() return true end,
     notice = function(message) notices[#notices + 1] = message end,
   }, function() end)
-  assert(vim.wait(1000, function() return owner.ready end, 1), table.concat(notices, "\n"))
+  wait_until(function() return owner.ready end, "file presentation did not become ready",
+    { context = function() return table.concat(notices, "\n") end })
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return expanded and settled() and owner.transcript.block.file.metadata.node.display == "full" end, 1))
+  wait_until(function() return expanded and settled() and owner.transcript.block.file.metadata.node.display == "full" end, "opening the file heading did not settle its full display")
   local initial = loaded
-  assert(initial == 2 * vim.api.nvim_win_get_height(window))
+  eq(initial, 2 * vim.api.nvim_win_get_height(window))
   for _ = 1, 5 do owner.observe_sections() end
   assert(page_count() == 0, "visible heading fetched another page")
   assert(owner.transcript.block.hunk ~= nil, "initial hunk was not opened with its file")
@@ -122,8 +128,8 @@ local ok, failure = xpcall(function()
   local top = vim.fn.line("w0")
   local delivery = table.remove(pending, 1)
   deliver(delivery.params, delivery.callback)
-  assert(vim.wait(1000, settled, 1))
-  assert(loaded == initial + 2 * vim.api.nvim_win_get_height(window))
+  wait_until(settled, "page delivery did not settle the presentation")
+  eq(loaded, initial + 2 * vim.api.nvim_win_get_height(window))
   assert(vim.deep_equal(cursor, vim.api.nvim_win_get_cursor(window)), "page delivery moved cursor")
   assert(top == vim.fn.line("w0"), "page delivery moved viewport")
   assert(page_count() == 1, "publication fetched another page away from the boundary")
@@ -131,23 +137,23 @@ local ok, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(window, { loaded - math.floor(initial / 2) + 4, 0 })
   vim.cmd("normal! zt")
   owner.observe_sections()
-  assert(#pending == 1)
+  eq(#pending, 1)
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, settled, 1))
+  wait_until(settled, "closing the file heading did not settle the presentation")
   delivery = table.remove(pending, 1)
   -- A stale page response cannot reopen a fold the user has closed.
   delivery.callback({})
-  assert(vim.wait(1000, settled, 1))
-  assert(owner.transcript.block.file.metadata.node.display == "heading")
+  wait_until(settled, "stale page response did not settle the presentation")
+  eq(owner.transcript.block.file.metadata.node.display, "heading")
   assert(#notices == 0, table.concat(notices, "\n"))
 
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return settled() and owner.transcript.block.file.metadata.node.display == "full" end, 1))
+  wait_until(function() return settled() and owner.transcript.block.file.metadata.node.display == "full" end, "reopening the file heading did not settle its full display")
   vim.api.nvim_win_set_cursor(window, { loaded - math.floor(initial / 2) + 4, 0 })
   vim.cmd("normal! zt")
   owner.observe_sections()
-  assert(#pending == 1)
+  eq(#pending, 1)
   delivery = table.remove(pending, 1)
   -- The host rejects an oversized page with a typed error; a failure without detail is an
   -- unknown outcome that the presentation retries.
@@ -162,62 +168,54 @@ local ok, failure = xpcall(function()
   assert(#failure_marks == 1 and failure_marks[1][4].virt_text[1][1]:find("Section unavailable", 1, true),
     "failed page did not mark its section unavailable")
   owner.set_section("file", true, false)
-  assert(vim.wait(1000, settled, 1), "explicit retry was blocked")
-end, debug.traceback)
-if owner then owner.close() end
-assert(ok, failure)
-print("harness_file_paging: passed")
-vim.cmd("qa!")
-  end },
-  { name = "presentation", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local original_request = client.request
-local original_accepting = client.host_is_accepting
-local markdown = require("forge.render.harness.markdown")
-local original_markdown_render = markdown.render
-local original_defer = vim.defer_fn
-client.host_is_accepting = function() return true end
-local requests = {}
-local input_state = require("forge.views.harness.input_state")
-local session_state = { session = { id = "test-session" } }
-local host = dofile("nvim/lua/forge/tests/support/input.lua").new(session_state)
-client.request = function(request_specification, callback)
-  local session = request_specification.session_id
-  local method = request_specification.method
-  local params = request_specification.params or {}
+  wait_until(settled, "explicit retry was blocked")
+end
 
-  local receive = callback
-  callback = function(result, failure, detail)
-    if type(result) == "table" and (params.operation == "open" or params.operation == "sync") then
-      result.status = result.status or { document = params.document .. ":status", revision = 0, block = {} }
+T["presentation"] = function()
+  local client = require("forge.client")
+  local markdown = require("forge.render.harness.markdown")
+  local original_markdown_render = markdown.render
+  local original_defer = vim.defer_fn
+  client.host_is_accepting = function() return true end
+  local requests = {}
+  local input_state = require("forge.views.harness.input_state")
+  local session_state = { session = { id = "test-session" } }
+  local host = dofile("nvim/lua/forge/tests/support/input.lua").new(session_state)
+  client.request = function(request_specification, callback)
+    local session = request_specification.session_id
+    local method = request_specification.method
+    local params = request_specification.params or {}
+
+    local receive = callback
+    callback = function(result, failure, detail)
+      if type(result) == "table" and (params.operation == "open" or params.operation == "sync") then
+        result.status = result.status or { document = params.document .. ":status", revision = 0, block = {} }
+      end
+      receive(result, failure, detail)
     end
-    receive(result, failure, detail)
+    eq(session, "test-session")
+    if host.request(method, params, callback) then return end
+    eq(method, "session.document")
+    if params.operation == "background_terminals" then callback({ supported = false }) return end
+    requests[#requests + 1] = { method = method, params = params, callback = callback }
   end
-  assert(session == "test-session")
-  if host.request(method, params, callback) then return end
-  assert(method == "session.document")
-  if params.operation == "background_terminals" then callback({ supported = false }) return end
-  requests[#requests + 1] = { method = method, params = params, callback = callback }
-end
-local function snapshot(document, text, editable)
-  return { document = document, revision = 0, block = { { id = "body", text = { text },
-    metadata = { target = {}, decoration = {}, editable_region = editable and {
-      { id = "composer", revision = 0, range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } },
-    } or {} } } } }
-end
-local owner
-local prompt_submission = require("forge.views.harness.prompt_submission")
-local function submit(callback)
-  local context, failure = owner.capture_prompt()
-  assert(context, failure)
-  prompt_submission.start(session_state, { text = "", context = context }, callback)
-end
-local ok, failure = xpcall(function()
+  local function snapshot(document, text, editable)
+    return { document = document, revision = 0, block = { { id = "body", text = { text },
+      metadata = { target = {}, decoration = {}, editable_region = editable and {
+        { id = "composer", revision = 0, range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } },
+      } or {} } } } }
+  end
+  local owner
+  local prompt_submission = require("forge.views.harness.prompt_submission")
+  local function submit(callback)
+    local context, failure = owner.capture_prompt()
+    assert(context, failure)
+    prompt_submission.start(session_state, { text = "", context = context }, callback)
+  end
   input_state.attach(session_state, function() end)
-  local transcript = vim.api.nvim_create_buf(false, true)
-  local composer = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft" })
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  buffer.set(composer, { "draft" })
   local window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(window, transcript)
   local attached
@@ -236,7 +234,7 @@ local ok, failure = xpcall(function()
   }
   requests[1].callback({ transcript = history })
   assert(attached == owner and owner.ready)
-  assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "native transcript")
+  eq(buffer.line(transcript, 1), "native transcript")
   assert(vim.bo[composer].modifiable and not vim.bo[transcript].modifiable)
   owner.activate(function() error("plain transcript text was activated") end)
   assert(#requests == 1, "plain transcript text dispatched an action without a target")
@@ -246,7 +244,7 @@ local ok, failure = xpcall(function()
   owner.sync()
   owner.sync()
   assert(#requests == 1, "refresh bypassed the publication interval")
-  assert(vim.wait(500, function() return #requests == 2 end, 1))
+  wait_until(function() return #requests == 2 end, "refresh after the publication interval did not dispatch")
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   requests[2].callback({ snapshot = vim.NIL, patch = {} })
   assert(owner.transcript.status == "Applied", "null snapshot desynchronized incremental transcript updates")
@@ -260,64 +258,64 @@ local ok, failure = xpcall(function()
   submit(function() end)
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
   local submission = host.requests[#host.requests]
-  assert(submission.parameters.action.message.text == "first typed prompt")
+  eq(submission.parameters.action.message.text, "first typed prompt")
   local function retract(id)
     host.revision = host.revision + 1
     input_state.receive(session_state, { revision = host.revision, suspended = true, upsert = {}, removed = {},
       retracted = id or submission.parameters.action.message.id })
   end
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "")
+  eq(buffer.line(composer, 1), "")
   host.complete(submission)
   retract("stale-message")
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "", "stale retraction restored a draft")
+  assert(buffer.line(composer, 1) == "", "stale retraction restored a draft")
   retract()
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "first typed prompt")
+  eq(buffer.line(composer, 1), "first typed prompt")
   host.flush()
 
   submit(function() end)
   submission = host.requests[#host.requests]
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "newer draft", "λ" })
+  buffer.set(composer, { "newer draft", "λ" })
   host.complete(submission)
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "acceptance overwrote newer typing")
+  assert(buffer.line(composer, 1) == "newer draft", "acceptance overwrote newer typing")
   retract()
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "retraction overwrote newer typing")
+  assert(buffer.line(composer, 1) == "newer draft", "retraction overwrote newer typing")
   host.flush()
 
   submit(function() end)
   submission = host.requests[#host.requests]
   assert(submission.parameters.action.message.text == "newer draft\nλ", "submission lost multiline Unicode text")
   host.complete(submission)
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "typed after acceptance" })
+  buffer.set(composer, { "typed after acceptance" })
   retract()
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
+  eq(buffer.line(composer, 1), "typed after acceptance")
   host.flush()
 
   local cancellation
   submit(function(_, message) cancellation = message end)
   host.complete(nil, "interrupted")
   assert(cancellation == "interrupted", "composer dropped submission failure")
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
+  eq(buffer.line(composer, 1), "typed after acceptance")
   submit(function() end)
   host.complete(nil, "admission failed")
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance", "failure lost the draft")
+  assert(buffer.line(composer, 1) == "typed after acceptance", "failure lost the draft")
   local request_count = #host.requests
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { " " })
+  buffer.set(composer, { " " })
   local rejected
   submit(function(result, submission_error) rejected = not result and submission_error end)
   assert(rejected and #host.requests == request_count, "blank draft reached Rust")
   for _, source in ipairs({ { string.rep("x", 65537) }, vim.fn["repeat"]({ "row" }, 4097) }) do
-    vim.api.nvim_buf_set_lines(composer, 0, -1, false, source)
+    buffer.set(composer, source)
     submit(function() end)
     local large_submission = host.requests[#host.requests]
     assert(large_submission.parameters.action.message.text == table.concat(source, "\n"), "valid draft was truncated")
     host.complete(large_submission)
   end
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft at close" })
+  buffer.set(composer, { "draft at close" })
   local completed_after_close = 0
   submit(function() completed_after_close = completed_after_close + 1 end)
   submission = host.requests[#host.requests]
   assert(owner.close())
-  assert(requests[#requests].params.operation == "close")
+  eq(requests[#requests].params.operation, "close")
   host.complete(submission)
   host.complete(submission)
   retract()
@@ -325,8 +323,8 @@ local ok, failure = xpcall(function()
     "presentation close discarded or duplicated request completion")
   assert(not vim.api.nvim_buf_is_valid(composer), "closing the workspace retained its owned composer buffer")
 
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
   local rejected
   require("forge.views.harness.presentation").open({ session_id = "test-session",
@@ -334,18 +332,18 @@ local ok, failure = xpcall(function()
     is_alive = function() return true end,
   }, function(value, error_message) assert(value and not error_message) rejected = false end)
   local delayed = requests[#requests]
-  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "new startup draft" })
+  buffer.set(composer, { "new startup draft" })
   local changedtick = vim.api.nvim_buf_get_changedtick(composer)
   delayed.callback({ transcript = snapshot(delayed.params.document, "stale transcript") })
   assert(rejected == false, "typing during startup rejected the transcript")
   assert(vim.api.nvim_buf_is_valid(composer) and vim.api.nvim_buf_get_changedtick(composer) == changedtick)
-  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "new startup draft")
+  eq(buffer.line(composer, 1), "new startup draft")
 
   vim.api.nvim_buf_delete(transcript, { force = true })
   vim.api.nvim_buf_delete(composer, { force = true })
 
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
   local notices = {}
   owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
@@ -361,9 +359,9 @@ local ok, failure = xpcall(function()
   local function refresh()
     local count = #requests
     owner.sync()
-    assert(vim.wait(500, function()
+    wait_until(function()
       return #requests > count and requests[#requests].params.operation == "sync"
-    end, 1))
+    end, "sync did not dispatch a transcript read")
     return requests[#requests]
   end
   owner.follow_tail()
@@ -392,7 +390,7 @@ local ok, failure = xpcall(function()
   retry.callback(nil, "temporary admission contention", { code = "not_admitted" })
   assert(not owner.failure and owner.transcript.revision == revision)
   local previous = #requests
-  assert(vim.wait(2000, function() return #requests > previous end, 1), "transcript read did not retry")
+  wait_until(function() return #requests > previous end, "transcript read did not retry", { timeout_ms = 2000 })
   requests[#requests].callback({ patch = {}, status = { document = owner.document .. ":status", revision = 0, block = {} } })
   assert(not owner.failure and not owner.sync_failure, "successful retry retained its diagnostic")
   owner.set_staging({ "queued draft" }, {})
@@ -400,11 +398,11 @@ local ok, failure = xpcall(function()
   assert(staging.params.operation == "staging" and staging.params.sequence)
   previous = #requests
   staging.callback(nil, "response lost after application", { code = "outcome_unknown" })
-  assert(vim.wait(2000, function() return #requests > previous end, 1))
+  wait_until(function() return #requests > previous end, "unknown staging outcome was not retried", { timeout_ms = 2000 })
   assert(requests[#requests].params.sequence == staging.params.sequence, "staging retry changed mutation identity")
   requests[#requests].callback({})
   assert(not owner.failure)
-  local retained_lines = vim.api.nvim_buf_get_lines(transcript, 0, -1, false)
+  local retained_lines = buffer.lines(transcript)
   local retained_cursor = vim.api.nvim_win_get_cursor(window)
   local retained_view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
   local retained_revision = owner.transcript.revision
@@ -417,14 +415,14 @@ local ok, failure = xpcall(function()
   assert(#notices == 1, "refresh failure flooded notifications: " .. vim.inspect(notices))
   assert(owner.transcript.status == "Applied" and owner.transcript.revision == retained_revision,
     "permanent projection failure invalidated the usable transcript revision")
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), retained_lines),
+  assert(vim.deep_equal(buffer.lines(transcript), retained_lines),
     "permanent projection failure replaced usable transcript content")
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), retained_cursor)
     and vim.deep_equal(vim.api.nvim_win_call(window, vim.fn.winsaveview), retained_view),
     "permanent projection failure moved the transcript cursor or viewport")
   assert(owner.close())
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
 
   -- A deleted session is terminal: the retry loop must stop instead of polling every second.
@@ -469,7 +467,7 @@ local ok, failure = xpcall(function()
   requests[#requests].callback(nil, "temporary admission contention", { code = "not_admitted" })
   assert(owner.sync_failure and #pending_deferred(is_retry) == 1, "transient failure did not schedule a retry")
   local before_retry = #requests
-  assert(fire_deferred(is_retry) == 1)
+  eq(fire_deferred(is_retry), 1)
   assert(#requests == before_retry + 1 and requests[#requests].params.operation == "sync",
     "retry did not reissue the transcript read")
   requests[#requests].callback(nil, "session not found", { code = "session_not_found" })
@@ -486,8 +484,8 @@ local ok, failure = xpcall(function()
   assert(#deleted_notices == 1, "deleted session flooded notifications: " .. vim.inspect(deleted_notices))
   assert(owner.close())
   vim.defer_fn = original_defer
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
   owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
     transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
@@ -507,13 +505,13 @@ local ok, failure = xpcall(function()
     "deferred thought did not request its owned activity")
   assert(owner.close())
 
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
   local markdown_publication = {}
-  markdown.render = function(buffer, rendered_window, ranges)
+  markdown.render = function(rendered_buffer, rendered_window, ranges)
     markdown_publication[#markdown_publication + 1] = {
-      buffer = buffer, window = rendered_window, ranges = vim.deepcopy(ranges),
+      buffer = rendered_buffer, window = rendered_window, ranges = vim.deepcopy(ranges),
     }
   end
   owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
@@ -536,8 +534,7 @@ local ok, failure = xpcall(function()
     block_edit = {}, removed_block = {},
     metadata_edit = { { block = "tail", row_count = 3, metadata = markdown_history.block[2].metadata } },
   } } })
-  assert(vim.wait(500, function() return owner.transcript.revision == 1 end, 1),
-    "prompt insertion did not publish")
+  wait_until(function() return owner.transcript.revision == 1 end, "prompt insertion did not publish")
   assert(vim.deep_equal(owner.markdown_ranges, rendered_ranges),
     "appending a prompt changed the retained response's Markdown ownership: "
       .. vim.inspect({ before = rendered_ranges, after = owner.markdown_ranges }))
@@ -551,14 +548,13 @@ local ok, failure = xpcall(function()
     base_blocks = 2, next_blocks = 2, text_edit = {}, block_edit = {}, removed_block = {},
     metadata_edit = { { block = "tail", row_count = 3, metadata = markdown_history.block[2].metadata } },
   } } })
-  assert(vim.wait(500, function() return owner.transcript.revision == 2 end, 1),
-    "metadata-only publication did not settle")
+  wait_until(function() return owner.transcript.revision == 2 end, "metadata-only publication did not settle")
   assert(#markdown_publication == render_count, "non-Markdown metadata-only publication rerendered Markdown")
   assert(owner.close())
   markdown.render = original_markdown_render
 
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   vim.api.nvim_win_set_buf(window, transcript)
   vim.cmd("belowright 3split")
   local composer_window = vim.api.nvim_get_current_win()
@@ -586,15 +582,15 @@ local ok, failure = xpcall(function()
     assert(owner.status_view.window == nil,
       ("resize left idle status using %d rows in a %d-row pane"):format(measured, height))
     assert(owner.transcript.revision == status_revision, "resize required a new transcript revision")
-    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), { "" }),
+    assert(vim.deep_equal(buffer.lines(transcript), { "" }),
       "resize inserted spacing into transcript text")
     assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), status_cursor), "resize moved the transcript cursor")
     assert(vim.api.nvim_get_current_win() == composer_window, "resize stole composer focus")
   end
   assert(owner.close())
 
-  transcript = vim.api.nvim_create_buf(false, true)
-  composer = vim.api.nvim_create_buf(false, true)
+  transcript = buffer.scratch()
+  composer = buffer.scratch()
   window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(window, transcript)
   local staged_request, reveal_timer = {}, {}
@@ -672,219 +668,211 @@ local ok, failure = xpcall(function()
   owner.set_staging({}, { first })
   advance(100)
   assert(#staged_request == 7, "closed presentation published delayed steering")
-end, debug.traceback)
-vim.defer_fn = original_defer
-client.request = original_request
-client.host_is_accepting = original_accepting
-markdown.render = original_markdown_render
-if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else print("harness_presentation OK") vim.cmd("qa!") end
-  end },
-  { name = "publication", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local input = require("forge.views.harness.input_state")
-local state = { session = { id = "publication" } }
-local host = dofile("nvim/lua/forge/tests/support/input.lua").new(state)
-local requests = {}
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
-
-  if host.request(request_specification.method, params, callback) then return end
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  if params.operation == "background_terminals" then callback({ supported = false }) return end
-  requests[#requests + 1] = { params = params, callback = callback, time = vim.uv.hrtime() }
 end
-local transcript = vim.api.nvim_create_buf(false, true)
-local composer = vim.api.nvim_create_buf(false, true)
-vim.api.nvim_set_current_buf(transcript)
-local publications = 0
-local owner = require("forge.views.harness.presentation").open({
-  session_id = "publication", transcript_buffer = transcript, composer_buffer = composer,
-  transcript_window = vim.api.nvim_get_current_win(), is_alive = function() return true end,
-  notice = function(message) error(message) end, on_update = function() publications = publications + 1 end,
-}, function(value, failure) assert(value and not failure, failure) end)
-requests[1].callback({ transcript = { document = owner.document, revision = 0, block = {
-  { id = "body", text = { "frame 0" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
-} } })
-local function burst(expected)
-  local started = vim.uv.hrtime()
-  local defer = vim.defer_fn
-  local scheduled_delay
-  vim.defer_fn = function(callback, delay)
-    scheduled_delay = delay
-    return defer(callback, delay)
+
+T["publication"] = function()
+  local client = require("forge.client")
+  local input = require("forge.views.harness.input_state")
+  local state = { session = { id = "publication" } }
+  local host = dofile("nvim/lua/forge/tests/support/input.lua").new(state)
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+
+    if host.request(request_specification.method, params, callback) then return end
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false }) return end
+    requests[#requests + 1] = { params = params, callback = callback, time = vim.uv.hrtime() }
   end
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  vim.api.nvim_set_current_buf(transcript)
+  local publications = 0
+  local owner = require("forge.views.harness.presentation").open({
+    session_id = "publication", transcript_buffer = transcript, composer_buffer = composer,
+    transcript_window = vim.api.nvim_get_current_win(), is_alive = function() return true end,
+    notice = function(message) error(message) end, on_update = function() publications = publications + 1 end,
+  }, function(value, failure) assert(value and not failure, failure) end)
+  requests[1].callback({ transcript = { document = owner.document, revision = 0, block = {
+    { id = "body", text = { "frame 0" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+  } } })
+  local function burst(expected)
+    local started = vim.uv.hrtime()
+    local defer = vim.defer_fn
+    local scheduled_delay
+    vim.defer_fn = function(callback, delay)
+      scheduled_delay = delay
+      return defer(callback, delay)
+    end
+    for _ = 1, 100 do owner.sync() end
+    vim.defer_fn = defer
+    assert(scheduled_delay == 17, "refresh did not schedule the 60 Hz target")
+    assert(#requests == expected - 1, "burst published immediately")
+    wait_until(function() return #requests == expected end, "burst did not publish")
+    assert((requests[expected].time - started) / 1e6 >= 1000 / 60, "refresh exceeded the 60 Hz target")
+  end
+  burst(2)
   for _ = 1, 100 do owner.sync() end
-  vim.defer_fn = defer
-  assert(scheduled_delay == 17, "refresh did not schedule the 60 Hz target")
-  assert(#requests == expected - 1, "burst published immediately")
-  assert(vim.wait(1000, function() return #requests == expected end, 1), "burst did not publish")
-  assert((requests[expected].time - started) / 1e6 >= 1000 / 60, "refresh exceeded the 60 Hz target")
-end
-burst(2)
-for _ = 1, 100 do owner.sync() end
-local patch = {}
-for revision = 1, 64 do
-  patch[revision] = { document = owner.document, base = revision - 1, next = revision,
-    base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
-    block_edit = {}, removed_block = {}, metadata_edit = {},
-    text_edit = { { start_row = 0, removed_rows = 1, text = { "frame " .. revision } } },
-  }
-end
-local observations = 0
-local timer = vim.uv.new_timer()
-timer:start(0, 1, vim.schedule_wrap(function()
-  observations = observations + 1
-  local text = vim.api.nvim_buf_get_lines(transcript, 0, -1, false)
-  assert(#text == 1 and (text[1] == "frame 0" or text[1] == "frame 64"), "partial batch reached the main loop")
-end))
-local completed = vim.uv.hrtime()
-local initial_publications = publications
-requests[2].callback({ patch = patch })
-assert(owner.transcript.revision == 64)
-assert(publications == initial_publications + 1, "batch notified before its final revision")
-assert(vim.wait(1000, function() return #requests == 3 end, 1), "in-flight burst lost its trailing update")
-assert((requests[3].time - completed) / 1e6 >= 1000 / 60, "trailing publication exceeded the 60 Hz target")
-requests[3].callback({ patch = {} })
-timer:stop()
-timer:close()
-assert(observations > 0)
-input.attach(state, function() end)
----@type string[]
-local prompt_rows = {}
-for index = 1, 5000 do prompt_rows[index] = string.rep("complete prompt ", 5) end
-local prompt = table.concat(prompt_rows, "\n")
-assert(#prompt > 65536)
-vim.api.nvim_buf_set_lines(composer, 0, -1, false, prompt_rows)
-local submitted = false
-require("forge.views.harness.prompt_submission").start(state,
-  { text = prompt, context = assert(owner.capture_prompt()) }, function(result, failure)
-  assert(result and not failure, failure)
-  submitted = true
-end)
-local submission = host.requests[#host.requests]
-assert(submission.parameters.action.kind == "submit"
-  and submission.parameters.action.message.text == prompt, "large composer draft lost content")
-host.complete(submission)
-assert(submitted, "large composer submission did not finish")
-owner.sync()
-assert(owner.close())
-local closed_count = #requests
-vim.wait(100, function() return false end, 1)
-assert(#requests == closed_count, "closed presentation dispatched a pending refresh")
-print("harness_publication: passed, atomic 64-patch batch and 60 Hz target with trailing updates")
-vim.cmd("qa!")
-  end },
-  { name = "sections", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local expanded, revision, generation = false, 0, 1
-local requests, notices = {}, {}
-local held, deferred = {}, false
-local owner
-local transcript = vim.api.nvim_create_buf(false, true)
-local composer = vim.api.nvim_create_buf(false, true)
-local window = vim.api.nvim_get_current_win()
-vim.api.nvim_win_set_buf(window, transcript)
-local function snapshot(document)
-  local value = { document = document, revision = revision, block = {
-    { id = "heading", text = { "Tools" }, metadata = {
-      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = generation, order = 0, more = false,
-        content_revision = revision, loaded_rows = expanded and 1 or 0, loaded_bytes = 0,
-        display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
-      target = {}, decoration = {}, editable_region = {},
-      section = { { id = "tools", revision = revision, open = expanded, more = false } },
-      fold = { { id = "tools", start = { row = 0, column = 0 },
-        ["end"] = { block = expanded and "body" or "heading", position = { row = 1, column = 0 } }, closed = not expanded } },
-    } },
-    { id = "body", text = { expanded and "loaded only on demand" or "" },
-      metadata = { target = {}, decoration = {}, editable_region = {} } },
-  } }
-  if not expanded then table.remove(value.block) end
-  return value
-end
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
-
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  requests[#requests + 1] = params
-  if deferred and (params.operation == "node" or params.operation == "sync") then
-    held[#held + 1] = { params = params, callback = callback }
-    return
+  local patch = {}
+  for revision = 1, 64 do
+    patch[revision] = { document = owner.document, base = revision - 1, next = revision,
+      base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
+      block_edit = {}, removed_block = {}, metadata_edit = {},
+      text_edit = { { start_row = 0, removed_rows = 1, text = { "frame " .. revision } } },
+    }
   end
-  if params.operation == "background_terminals" then callback({ supported = false })
-  elseif params.operation == "open" then
-    vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
-  elseif params.operation == "node" then
-    expanded = params.expanded
-    revision = revision + 1
-    callback({})
-  elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
-  else callback({}) end
+  local observations = 0
+  local timer = vim.uv.new_timer()
+  timer:start(0, 1, vim.schedule_wrap(function()
+    observations = observations + 1
+    local text = buffer.lines(transcript)
+    assert(#text == 1 and (text[1] == "frame 0" or text[1] == "frame 64"), "partial batch reached the main loop")
+  end))
+  local completed = vim.uv.hrtime()
+  local initial_publications = publications
+  requests[2].callback({ patch = patch })
+  eq(owner.transcript.revision, 64)
+  assert(publications == initial_publications + 1, "batch notified before its final revision")
+  wait_until(function() return #requests == 3 end, "in-flight burst lost its trailing update")
+  assert((requests[3].time - completed) / 1e6 >= 1000 / 60, "trailing publication exceeded the 60 Hz target")
+  requests[3].callback({ patch = {} })
+  timer:stop()
+  timer:close()
+  assert(observations > 0)
+  input.attach(state, function() end)
+  ---@type string[]
+  local prompt_rows = {}
+  for index = 1, 5000 do prompt_rows[index] = string.rep("complete prompt ", 5) end
+  local prompt = table.concat(prompt_rows, "\n")
+  assert(#prompt > 65536)
+  buffer.set(composer, prompt_rows)
+  local submitted = false
+  require("forge.views.harness.prompt_submission").start(state,
+    { text = prompt, context = assert(owner.capture_prompt()) }, function(result, failure)
+    assert(result and not failure, failure)
+    submitted = true
+  end)
+  local submission = host.requests[#host.requests]
+  assert(submission.parameters.action.kind == "submit"
+    and submission.parameters.action.message.text == prompt, "large composer draft lost content")
+  host.complete(submission)
+  assert(submitted, "large composer submission did not finish")
+  owner.sync()
+  assert(owner.close())
+  local closed_count = #requests
+  vim.wait(100, function() return false end, 1)
+  assert(#requests == closed_count, "closed presentation dispatched a pending refresh")
 end
-local function respond(failure)
-  local pending = assert(table.remove(held, 1), "no held request")
-  if failure then pending.callback(nil, failure, { code = "request_failed" })
-  elseif pending.params.operation == "node" then
-    if pending.params.generation == generation then expanded = pending.params.expanded end
-    revision = revision + 1
-    pending.callback({})
-  else pending.callback({ snapshot = snapshot(pending.params.document) }) end
-  return pending.params.operation
-end
-local function body_loaded()
-  return table.concat(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), "\n"):find("loaded only", 1, true) ~= nil
-end
-local ok, failure = xpcall(function()
+
+T["sections"] = function()
+  local client = require("forge.client")
+  local expanded, revision, generation = false, 0, 1
+  local requests, notices = {}, {}
+  local held, deferred = {}, false
+  local owner
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local function snapshot(document)
+    local value = { document = document, revision = revision, block = {
+      { id = "heading", text = { "Tools" }, metadata = {
+        node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = generation, order = 0, more = false,
+          content_revision = revision, loaded_rows = expanded and 1 or 0, loaded_bytes = 0,
+          display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
+        target = {}, decoration = {}, editable_region = {},
+        section = { { id = "tools", revision = revision, open = expanded, more = false } },
+        fold = { { id = "tools", start = { row = 0, column = 0 },
+          ["end"] = { block = expanded and "body" or "heading", position = { row = 1, column = 0 } }, closed = not expanded } },
+      } },
+      { id = "body", text = { expanded and "loaded only on demand" or "" },
+        metadata = { target = {}, decoration = {}, editable_region = {} } },
+    } }
+    if not expanded then table.remove(value.block) end
+    return value
+  end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    requests[#requests + 1] = params
+    if deferred and (params.operation == "node" or params.operation == "sync") then
+      held[#held + 1] = { params = params, callback = callback }
+      return
+    end
+    if params.operation == "background_terminals" then callback({ supported = false })
+    elseif params.operation == "open" then
+      vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
+    elseif params.operation == "node" then
+      expanded = params.expanded
+      revision = revision + 1
+      callback({})
+    elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
+    else callback({}) end
+  end
+  local function respond(failure)
+    local pending = assert(table.remove(held, 1), "no held request")
+    if failure then pending.callback(nil, failure, { code = "request_failed" })
+    elseif pending.params.operation == "node" then
+      if pending.params.generation == generation then expanded = pending.params.expanded end
+      revision = revision + 1
+      pending.callback({})
+    else pending.callback({ snapshot = snapshot(pending.params.document) }) end
+    return pending.params.operation
+  end
+  local function body_loaded()
+    return buffer.text(transcript):find("loaded only", 1, true) ~= nil
+  end
+  MiniTest.finally(function() if owner then pcall(owner.close) end end)
   owner = require("forge.views.harness.presentation").open({
     session_id = "sections", transcript_buffer = transcript, composer_buffer = composer,
     transcript_window = window, is_alive = function() return true end,
     notice = function(message) notices[#notices + 1] = message end,
   }, function() end)
-  assert(vim.wait(1000, function() return owner.ready end, 1))
-  assert(owner.transcript.block.heading.metadata.node.display == "heading")
-  assert(not table.concat(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), "\n"):find("loaded only", 1, true))
+  wait_until(function() return owner.ready end, "section presentation did not become ready")
+  eq(owner.transcript.block.heading.metadata.node.display, "heading")
+  assert(not buffer.text(transcript):find("loaded only", 1, true))
   local loading_namespace = vim.api.nvim_get_namespaces()["ForgeHarnessLoading" .. transcript]
-  local collapsed_lines = vim.api.nvim_buf_get_lines(transcript, 0, -1, false)
+  local collapsed_lines = buffer.lines(transcript)
   deferred = true
   assert(owner.toggle_heading(window))
   assert(owner.transcript.block.heading.metadata.node.display == "heading", "unloaded fold opened before delivery")
   assert(owner.transcript.fold_loading[window].tools, "opening did not publish loading state")
   assert(#vim.api.nvim_buf_get_extmarks(transcript, loading_namespace, 0, -1, {}) == 0,
     "pending expansion displayed a loading marker")
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), collapsed_lines),
+  assert(vim.deep_equal(buffer.lines(transcript), collapsed_lines),
     "pending expansion replaced the collapsed heading")
   assert(not body_loaded())
-  assert(respond() == "node")
-  assert(vim.wait(1000, function() return #held > 0 end, 1))
+  eq(respond(), "node")
+  wait_until(function() return #held > 0 end, "node acknowledgement did not request the section body")
   assert(owner.transcript.block.heading.metadata.node.display == "heading", "fold opened on acknowledgement before content")
   assert(#vim.api.nvim_buf_get_extmarks(transcript, loading_namespace, 0, -1, {}) == 0,
     "acknowledged expansion displayed a loading marker before content arrived")
   assert(not body_loaded())
-  assert(respond() == "sync")
-  assert(vim.wait(1000, function()
+  eq(respond(), "sync")
+  wait_until(function()
     return body_loaded() and owner.transcript.block.heading.metadata.node.display == "full"
-  end, 1), "opening the native fold did not demand its body")
+  end, "opening the native fold did not demand its body")
   assert(not owner.transcript.fold_loading[window], "loaded fold retained loading state")
   assert(vim.api.nvim_win_get_cursor(window)[1] == 1,
     "section expansion followed the tail instead of retaining its heading")
   deferred = false
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function()
+  wait_until(function()
     return not body_loaded()
-  end, 1), "closing the native fold retained its body")
+  end, "closing the native fold retained its body")
   deferred = true
   assert(owner.toggle_heading(window))
   assert(owner.toggle_heading(window))
   assert(not owner.transcript.fold_loading[window], "second toggle did not cancel loading")
-  assert(respond() == "node")
-  assert(respond() == "node")
-  assert(vim.wait(1000, function() return #held > 0 end, 1))
-  assert(respond() == "sync")
-  assert(vim.wait(1000, function() return not owner.syncing and not owner.applying end, 1))
+  eq(respond(), "node")
+  eq(respond(), "node")
+  wait_until(function() return #held > 0 end, "cancelled expansion did not request a sync")
+  eq(respond(), "sync")
+  wait_until(function() return not owner.syncing and not owner.applying end, "cancelled delivery did not settle the presentation")
   assert(owner.transcript.block.heading.metadata.node.display == "heading" and not body_loaded(), "cancelled delivery reopened the fold")
   assert(#notices == 0, table.concat(notices, "\n"))
   assert(owner.toggle_heading(window))
@@ -898,20 +886,20 @@ local ok, failure = xpcall(function()
   assert(not require("forge.views.harness.health").notice({ presentation = owner }), "section failure escaped its local scope")
   deferred = false
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return body_loaded() and owner.transcript.block.heading.metadata.node.display == "full" end, 1), "failed opening was not retryable")
+  wait_until(function() return body_loaded() and owner.transcript.block.heading.metadata.node.display == "full" end, "failed opening was not retryable")
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return not body_loaded() end, 1))
+  wait_until(function() return not body_loaded() end, "closing the retried fold retained its body")
   deferred = true
   assert(owner.toggle_heading(window))
   generation = generation + 1
-  assert(respond() == "node")
-  assert(vim.wait(1000, function() return #held > 0 end, 1))
-  assert(respond() == "sync")
-  assert(vim.wait(1000, function() return #held > 0 end, 1), "retired node generation did not reconcile the opening")
+  eq(respond(), "node")
+  wait_until(function() return #held > 0 end, "retired node generation did not request a sync")
+  eq(respond(), "sync")
+  wait_until(function() return #held > 0 end, "retired node generation did not reconcile the opening")
   assert(held[1].params.operation == "node" and held[1].params.generation == generation)
-  assert(respond() == "node")
-  assert(vim.wait(1000, function() return #held > 0 end, 1))
-  assert(respond() == "sync")
+  eq(respond(), "node")
+  wait_until(function() return #held > 0 end, "replacement node generation did not request a sync")
+  eq(respond(), "sync")
   assert(body_loaded() and not owner.section_failure.tools, "generation replacement became a section failure")
   local sequence = 0
   for _, request in ipairs(requests) do
@@ -920,44 +908,37 @@ local ok, failure = xpcall(function()
       sequence = request.sequence
     end
   end
-end, debug.traceback)
-if owner then owner.close() end
-assert(ok, failure)
-print("harness_sections: passed")
-vim.cmd("qa!")
-  end },
-  { name = "timeline_position", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local request_for, host_is_accepting = client.request, client.host_is_accepting
-local pending = {}
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
-
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  if params.operation == "background_terminals" then callback({ supported = false }) return end
-  pending[#pending + 1] = { params = params, callback = callback }
 end
 
-local function take(operation)
-  assert(vim.wait(1000, function() return #pending > 0 end, 1), "missing " .. operation)
-  local request = table.remove(pending, 1)
-  assert(request and request.params.operation == operation, "expected " .. operation .. ", got " .. vim.inspect(request and request.params))
-  return request
-end
+T["timeline_position"] = function()
+  local client = require("forge.client")
+  local pending = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
 
-local function snapshot(document, revision, count)
-  local rows = {}
-  for row = 1, count do rows[row] = "source row " .. row end
-  return { document = document, revision = revision, block = {
-    { id = "body", text = rows, metadata = { target = {}, decoration = {}, editable_region = {} } },
-  } }
-end
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false }) return end
+    pending[#pending + 1] = { params = params, callback = callback }
+  end
 
-local success, failure = xpcall(function()
-  local transcript = vim.api.nvim_create_buf(false, true)
-  local composer = vim.api.nvim_create_buf(false, true)
+  local function take(operation)
+    wait_until(function() return #pending > 0 end, "missing " .. operation)
+    local request = table.remove(pending, 1)
+    assert(request and request.params.operation == operation, "expected " .. operation .. ", got " .. vim.inspect(request and request.params))
+    return request
+  end
+
+  local function snapshot(document, revision, count)
+    local rows = {}
+    for row = 1, count do rows[row] = "source row " .. row end
+    return { document = document, revision = revision, block = {
+      { id = "body", text = rows, metadata = { target = {}, decoration = {}, editable_region = {} } },
+    } }
+  end
+
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
   local window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(window, transcript)
   local owner = require("forge.views.harness.presentation").open({
@@ -998,14 +979,14 @@ local success, failure = xpcall(function()
 
   -- A selection queued during refresh captures the outgoing view only after that refresh settles.
   owner.sync()
-  assert(vim.wait(1000, function() return #pending == 1 end, 1))
+  wait_until(function() return #pending == 1 end, "refresh did not dispatch its sync request")
   owner.select_agent(nil)
   assert(#pending == 1, "timeline selection raced a refresh")
   sync(8)
   take("select_agent").callback({})
   sync(80)
-  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), { 48, 6 }))
-  assert(#pending == 0)
+  eq(vim.api.nvim_win_get_cursor(window), { 48, 6 })
+  eq(#pending, 0)
   owner.highlight()
   local highlighting = take("highlight")
   owner.highlight()
@@ -1017,7 +998,7 @@ local success, failure = xpcall(function()
   sync(8)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), { 3, 2 }),
     "timeline selection lost the saved child position")
-  assert(#pending == 0)
+  eq(#pending, 0)
 
   owner.select_agent(nil)
   take("select_agent").callback({})
@@ -1026,7 +1007,7 @@ local success, failure = xpcall(function()
   prepared.callback({ snapshot = snapshot(opening.params.document, revision, 6000) })
   assert(owner.transcript.update_pending, "large timeline did not yield during preparation")
   vim.api.nvim_win_set_cursor(window, { 5, 1 })
-  assert(vim.wait(10000, function() return not owner.transcript.update_pending end, 1))
+  wait_until(function() return not owner.transcript.update_pending end, "large timeline preparation did not finish", { timeout_ms = 4000 })
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), { 48, 6 }), "return did not restore parent history")
   owner.select_agent("child")
   take("select_agent").callback({})
@@ -1045,45 +1026,38 @@ local success, failure = xpcall(function()
     "unchanged timeline switch did not capture its outgoing view")
   owner.close()
   take("close").callback({})
-end, debug.traceback)
-client.request, client.host_is_accepting = request_for, host_is_accepting
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("harness_timeline_position: passed")
-vim.cmd("qa!")
-  end },
-  { name = "transcript_follow", run = function()
-vim.loader.enable(false)
-local client = require("forge.client")
-local original_request = client.request
-local original_accepting = client.host_is_accepting
-local request_list = {}
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
-
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  if params.operation == "background_terminals" then callback({ supported = false }) return end
-  if params.operation == "resize" then callback({}) return end
-  request_list[#request_list + 1] = { params = params, callback = callback }
 end
 
-local completion_blocks = {}
-local function snapshot(document, revision, line_list)
-  local block_list = {}
-  for row, line in ipairs(line_list) do
-    block_list[#block_list + 1] = { id = "row:" .. row, text = { line },
-      metadata = { target = {}, decoration = {}, editable_region = {} } }
-    if line:find("Working", 1, true) == 1 then
-      block_list[#block_list].metadata.status = { row = 0, animated = true }
-    end
+T["transcript_follow"] = function()
+  local client = require("forge.client")
+  local request_list = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false }) return end
+    if params.operation == "resize" then callback({}) return end
+    request_list[#request_list + 1] = { params = params, callback = callback }
   end
-  vim.list_extend(block_list, vim.deepcopy(completion_blocks))
-  return { document = document, revision = revision, block = block_list }
-end
 
-local owner
-local success, failure = xpcall(function()
-  local transcript = vim.api.nvim_create_buf(false, true)
+  local completion_blocks = {}
+  local function snapshot(document, revision, line_list)
+    local block_list = {}
+    for row, line in ipairs(line_list) do
+      block_list[#block_list + 1] = { id = "row:" .. row, text = { line },
+        metadata = { target = {}, decoration = {}, editable_region = {} } }
+      if line:find("Working", 1, true) == 1 then
+        block_list[#block_list].metadata.status = { row = 0, animated = true }
+      end
+    end
+    vim.list_extend(block_list, vim.deepcopy(completion_blocks))
+    return { document = document, revision = revision, block = block_list }
+  end
+
+  local owner
+  MiniTest.finally(function() if owner and not owner.closed then pcall(owner.close) end end)
+  local transcript = buffer.scratch()
   local window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(window, transcript)
   vim.wo[window].wrap = true
@@ -1101,23 +1075,23 @@ local success, failure = xpcall(function()
   }, function(value, error_message) assert(value and not error_message) end)
   local opening = table.remove(request_list, 1)
   opening.callback({ transcript = snapshot(opening.params.document, 0, line_list) })
-  assert(vim.wait(1000, function() return owner.ready end, 1), "opening did not finish")
+  wait_until(function() return owner.ready end, "opening did not finish")
   assert(vim.api.nvim_get_current_win() == composer_window, "opening stole composer focus")
   assert(vim.api.nvim_win_get_cursor(window)[1] == #line_list, "opening did not position the initial tail")
 
   local revision = 0
   local function await_publication()
-    assert(vim.wait(1000, function()
+    wait_until(function()
       return owner.failure or owner.transcript.revision == revision and not owner.applying
-    end, 1), owner.transcript.diagnostic or "transcript publication did not finish")
+    end, owner.transcript.diagnostic or "transcript publication did not finish")
     assert(not owner.failure, owner.failure)
     assert(owner.transcript.status == "Applied", owner.transcript.diagnostic)
   end
   local function take_refresh()
     owner.sync()
-    assert(vim.wait(1000, function()
+    wait_until(function()
       return #request_list > 0 and request_list[#request_list].params.operation == "sync"
-    end, 1), "missing timeline refresh: " .. vim.inspect({ failure = owner.failure, requests = request_list,
+    end, "missing timeline refresh: " .. vim.inspect({ failure = owner.failure, requests = request_list,
       applying = owner.applying, syncing = owner.syncing }))
     return table.remove(request_list)
   end
@@ -1176,9 +1150,9 @@ local success, failure = xpcall(function()
 
   local second_window = vim.api.nvim_open_win(transcript, false, { split = "right" })
   owner.refresh_views()
-  assert(vim.wait(1000, function() return #request_list > 0 end, 1), "missing second view request")
+  wait_until(function() return #request_list > 0 end, "missing second view request")
   local view_request = table.remove(request_list)
-  assert(view_request.params.operation == "open_view")
+  eq(view_request.params.operation, "open_view")
   view_request.callback({})
   vim.api.nvim_win_set_cursor(second_window, { #line_list, 3 })
   line_list[#line_list] = "updated output shown in both windows"
@@ -1308,7 +1282,7 @@ local success, failure = xpcall(function()
   -- A permission review opened over the composer mid-stream takes focus; the tail must keep following.
   vim.api.nvim_win_set_cursor(window, { 12, 4 })
   vim.api.nvim_set_current_win(composer_window)
-  local popup = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, { relative = "editor",
+  local popup = vim.api.nvim_open_win(buffer.scratch(), true, { relative = "editor",
     row = 1, col = 1, width = 20, height = 2, style = "minimal" })
   completion_blocks[3].text = { "Tool finished", "Permission requested", string.rep("detail ", 20) .. "end" }
   refresh()
@@ -1318,7 +1292,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_close(popup, true)
   vim.api.nvim_set_current_win(window)
   vim.api.nvim_win_set_cursor(window, { 12, 4 })
-  popup = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, { relative = "editor",
+  popup = vim.api.nvim_open_win(buffer.scratch(), true, { relative = "editor",
     row = 1, col = 1, width = 20, height = 2, style = "minimal" })
   completion_blocks[3].text[2] = "Permission granted"
   refresh()
@@ -1438,16 +1412,16 @@ local success, failure = xpcall(function()
 
   begin_response("switched", { "Historical response in another timeline" })
   owner.select_agent("child")
-  assert(vim.wait(1000, function()
+  wait_until(function()
     local request = request_list[#request_list]
     if request and request.params.operation == "select_agent" then return true end
     if request and request.params.operation == "sync" then
       table.remove(request_list).callback({ patch = {} })
     end
     return false
-  end, 1), "missing timeline selection")
+  end, "missing timeline selection")
   local selection_request = table.remove(request_list)
-  assert(selection_request.params.operation == "select_agent")
+  eq(selection_request.params.operation, "select_agent")
   selection_request.callback({})
   finish_response()
   expect_position(window, { 12, 4 }, "switching timelines replayed historical completion")
@@ -1456,74 +1430,67 @@ local success, failure = xpcall(function()
 
   vim.api.nvim_win_close(second_window, true)
   assert(owner.close())
-end, debug.traceback)
-if owner and not owner.closed then owner.close() end
-client.request, client.host_is_accepting = original_request, original_accepting
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1")
-else print("harness_transcript_follow OK") vim.cmd("qa!") end
-  end },
-  { name = "update_scheduling", run = function()
-vim.opt.runtimepath:prepend("nvim")
-vim.loader.enable(false)
-local client = require("forge.client")
-local perf = require("forge.infra.perf")
-local measured_patch
-perf.enabled = function(scope) return scope == "harness" end
-perf.event = function(_, event, fields)
-  if event == "ui.buffer.patch" then measured_patch = perf.payload(fields) end
 end
-local requests, notices = {}, {}
-client.host_is_accepting = function() return true end
-client.request = function(request_specification, callback)
-  local params = request_specification.params or {}
 
-  callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
-  requests[#requests + 1] = { params = params, callback = callback }
-end
-local owner, publications
-local function open()
-  publications = 0
-  local transcript, composer = vim.api.nvim_create_buf(false, true), vim.api.nvim_create_buf(false, true)
-  local window = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(window, transcript)
-  owner = require("forge.views.harness.presentation").open({ session_id = "scheduled",
-    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
-    is_alive = function() return true end, notice = function(message) notices[#notices + 1] = message end,
-    on_update = function() publications = publications + 1 end,
-  }, function(value, failure) assert(value and not failure, failure) end)
-  requests[#requests].callback({ transcript = { document = owner.document, revision = 0,
-    block = { { id = "body", text = { "initial" },
-      metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
-end
-local function refresh()
-  local count = #requests
-  owner.sync()
-  assert(vim.wait(1000, function()
-    return #requests > count and requests[#requests].params.operation == "sync"
-  end, 1), "refresh did not dispatch after its publication interval")
-  return requests[#requests]
-end
-local function snapshot(revision)
-  local block = {}
-  for index = 1, 2048 do
-    block[index] = { id = "body:" .. index, text = { "prepared " .. index },
-      metadata = { target = {}, decoration = {}, editable_region = {} } }
+T["update_scheduling"] = function()
+  local client = require("forge.client")
+  local perf = require("forge.infra.perf")
+  local measured_patch
+  perf.enabled = function(scope) return scope == "harness" end
+  perf.event = function(_, event, fields)
+    if event == "ui.buffer.patch" then measured_patch = perf.payload(fields) end
   end
-  return { document = owner.document, revision = revision, block = block }
-end
-local function patch(base)
-  return { document = owner.document, base = base, next = base + 1,
-    base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
-    text_edit = { { start_row = 0, removed_rows = 1, text = { "update " .. (base + 1) } } },
-    block_edit = {}, removed_block = {}, metadata_edit = {} }
-end
-local success, failure = xpcall(function()
+  local requests, notices = {}, {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
+  end
+  local owner, publications
+  local function open()
+    publications = 0
+    local transcript, composer = buffer.scratch(), buffer.scratch()
+    local window = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(window, transcript)
+    owner = require("forge.views.harness.presentation").open({ session_id = "scheduled",
+      transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+      is_alive = function() return true end, notice = function(message) notices[#notices + 1] = message end,
+      on_update = function() publications = publications + 1 end,
+    }, function(value, failure) assert(value and not failure, failure) end)
+    requests[#requests].callback({ transcript = { document = owner.document, revision = 0,
+      block = { { id = "body", text = { "initial" },
+        metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
+  end
+  local function refresh()
+    local count = #requests
+    owner.sync()
+    wait_until(function()
+      return #requests > count and requests[#requests].params.operation == "sync"
+    end, "refresh did not dispatch after its publication interval")
+    return requests[#requests]
+  end
+  local function snapshot(revision)
+    local block = {}
+    for index = 1, 2048 do
+      block[index] = { id = "body:" .. index, text = { "prepared " .. index },
+        metadata = { target = {}, decoration = {}, editable_region = {} } }
+    end
+    return { document = owner.document, revision = revision, block = block }
+  end
+  local function patch(base)
+    return { document = owner.document, base = base, next = base + 1,
+      base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
+      text_edit = { { start_row = 0, removed_rows = 1, text = { "update " .. (base + 1) } } },
+      block_edit = {}, removed_block = {}, metadata_edit = {} }
+  end
   open()
   local pending = refresh()
   local observed_revision
   vim.schedule(function()
     observed_revision = owner.transcript.revision
-    assert(vim.api.nvim_buf_get_lines(owner.transcript.buffer, 0, -1, false)[1] == "initial",
+    assert(buffer.line(owner.transcript.buffer, 1) == "initial",
       "preparation exposed an unfinished publication")
   end)
   pending.callback({ snapshot = snapshot(50) })
@@ -1532,15 +1499,14 @@ local success, failure = xpcall(function()
   local count = #requests
   owner.sync()
   assert(#requests == count, "a second sync overtook pending buffer updates")
-  assert(vim.wait(3000, function() return owner.transcript.revision == 50 end, 1), "snapshot preparation stalled")
+  wait_until(function() return owner.transcript.revision == 50 end, "snapshot preparation stalled", { timeout_ms = 3000 })
   assert(observed_revision == 0, "queued editor work waited for preparation to finish")
   assert(publications == 1, "preparation notified before its atomic publication")
   local timing = owner.transcript.update_timing
   assert(timing.slices > 1, "snapshot preparation used one unbounded callback")
   assert(timing.maximum_prepare_ms < 50, "snapshot preparation exceeded the per-slice budget")
   assert(timing.maximum_commit_ms < 250, "atomic snapshot publication exceeded the commit budget")
-  assert(vim.wait(1000, function() return requests[#requests].params.revision == 50 end, 1),
-    "trailing refresh did not dispatch")
+  wait_until(function() return requests[#requests].params.revision == 50 end, "trailing refresh did not dispatch")
   assert(requests[#requests].params.revision == 50, "follow-up sync used an intermediate revision")
   requests[#requests].callback({ patch = {} })
   assert(not owner.syncing and not owner.applying)
@@ -1553,7 +1519,7 @@ local success, failure = xpcall(function()
   local closed = owner
   local closed_revision = owner.transcript.revision
   owner.close()
-  assert(vim.wait(1000, function() return not closed.transcript.update_pending end, 1), "closed view retained an update job")
+  wait_until(function() return not closed.transcript.update_pending end, "closed view retained an update job")
   assert(closed.transcript.revision == closed_revision, "preparation published after its view closed")
   assert(requests[#requests].params.operation == "close", "closing remained blocked behind buffer updates")
   requests[#requests].callback({})
@@ -1564,9 +1530,9 @@ local success, failure = xpcall(function()
   local replaced_revision, previous_generation = owner.transcript.revision, client.host_get_generation
   local replaced_generation = client.host_get_generation() + 1
   client.host_get_generation = function() return replaced_generation end
-  assert(vim.wait(1000, function() return not owner.transcript.update_pending end, 1), "replaced host retained an update job")
+  wait_until(function() return not owner.transcript.update_pending end, "replaced host retained an update job")
   assert(owner.transcript.revision == replaced_revision, "old host preparation reached the replacement view")
-  assert(vim.api.nvim_buf_get_lines(owner.transcript.buffer, 0, -1, false)[1] == "initial",
+  assert(buffer.line(owner.transcript.buffer, 1) == "initial",
     "host replacement changed the last committed text")
   owner.close()
   client.host_get_generation = previous_generation
@@ -1580,7 +1546,7 @@ local success, failure = xpcall(function()
   local invalid = patch(1)
   invalid.base = 99
   failed_request.callback({ patch = { invalid, patch(2) } })
-  assert(vim.wait(1000, function() return not owner.applying end, 1), "failed patch retained an update job")
+  wait_until(function() return not owner.applying end, "failed patch retained an update job")
   assert(owner.transcript.status == "Desynchronized" and #notices == previous_notices + 1, "failed patch was not surfaced")
   assert(requests[#requests].params.operation == "snapshot", "failed patch did not request recovery")
   requests[#requests].callback({ document = owner.document, revision = 3,
@@ -1589,15 +1555,6 @@ local success, failure = xpcall(function()
   assert(owner.transcript.status == "Applied" and owner.transcript.revision == 3,
     "snapshot recovery did not restore the committed document")
   owner.close()
-end, debug.traceback)
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-print("harness_update_scheduling: passed")
-vim.cmd("qa!")
-  end },
-}
-
-local selected = arg[1]
-for _, scenario in ipairs(scenarios) do
-  if scenario.name == selected then return scenario.run() end
 end
-error(("unknown scenario %q"):format(tostring(selected)))
+
+return T

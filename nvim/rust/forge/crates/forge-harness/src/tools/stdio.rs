@@ -75,6 +75,3 @@ async fn serve(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {}

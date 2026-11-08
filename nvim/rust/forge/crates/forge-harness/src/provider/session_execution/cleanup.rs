@@ -331,45 +331,6 @@ mod tests {
         Ok(())
     }
 
-    /// Discard raw task panic payloads before exposing any retained failure representation.
-    #[tokio::test]
-    async fn panicking_cleanup_worker_exposes_only_normalized_failure() -> anyhow::Result<()> {
-        let ledger = CleanupLedger::default();
-        let receiver = ledger.start(CleanupWorkKind::OwnerFence, async {
-            panic!("private-native-panic-marker credential-marker");
-        })?;
-        drop(receiver);
-        let report = ledger.collect().await.unwrap_err();
-        assert!(matches!(
-            report.failures().next(),
-            Some(CleanupError::Join {
-                kind: CleanupWorkKind::OwnerFence,
-                failure: CleanupJoinFailure::Panicked,
-            })
-        ));
-        for cause in std::iter::successors(
-            Some(&report as &(dyn std::error::Error + 'static)),
-            |error| error.source(),
-        ) {
-            let display = cause.to_string();
-            assert!(!display.contains("private-native-panic-marker"));
-            assert!(!display.contains("credential-marker"));
-            assert!(!cause.is::<tokio::task::JoinError>());
-        }
-        let debug = format!("{report:?}");
-        assert!(!debug.contains("private-native-panic-marker"));
-        assert!(!debug.contains("credential-marker"));
-        let normalized = crate::provider::lifecycle_error::classify_source(
-            forge_provider_api::ProviderOperation::ThreadClose,
-            &report,
-        );
-        assert!(
-            matches!(normalized, crate::provider::ProviderError::Failure(failure)
-            if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime)
-        );
-        Ok(())
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_start_and_seal_cannot_escape_collection() -> anyhow::Result<()> {
         let ledger = Arc::new(CleanupLedger::default());

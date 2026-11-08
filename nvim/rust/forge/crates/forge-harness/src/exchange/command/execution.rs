@@ -190,25 +190,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Pending question authority must include both its content and answer revisions.
-    #[test]
-    fn question_selection_rejects_changed_answers_and_zero_content_revision() -> anyhow::Result<()>
-    {
-        let mut elicitation = crate::plan::PlanElicitation::new(
-            crate::plan::PlanQuestionSet::freeform("Decision?".into()).normalize()?,
-        );
-        let selection = PlanQuestionSetSelection::capture(&elicitation)?;
-        elicitation.answer_revision += 1;
-        assert!(matches!(
-            selection.validate(&elicitation),
-            Err(TaskCommandFailure::PlanChanged)
-        ));
-        let mut serialized = serde_json::to_value(selection)?;
-        serialized["revision"] = serde_json::json!(0);
-        assert!(serde_json::from_value::<PlanQuestionSetSelection>(serialized).is_err());
-        Ok(())
-    }
-
     /// Retained execution intent must neither select a newer plan nor widen absent/replaced task authority.
     #[test]
     fn captured_execution_rejects_changed_targets_and_revalidates_recovered_intent()

@@ -186,6 +186,3 @@ struct StoredPlanEdit {
     prior: Option<TaskSelection>,
     request: PlanEditRequest,
 }
-
-#[cfg(test)]
-mod tests {}

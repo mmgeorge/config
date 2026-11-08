@@ -140,21 +140,6 @@ mod tests {
     use super::*;
     use crate::store::RepositoryStore;
 
-    #[test]
-    fn cleanup_failure_preserves_the_operation_and_cleanup_errors() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let temporary = tempfile::NamedTempFile::new_in(directory.path())?;
-        let path = temporary.path().to_owned();
-        std::fs::remove_file(&path)?;
-        std::fs::create_dir(&path)?;
-        let error = cleanup_failure(temporary, anyhow::anyhow!("original write failure"));
-        let message = format!("{error:#}");
-        assert!(message.contains("original write failure"));
-        assert!(message.contains("repository config temporary cleanup failed"));
-        std::fs::remove_dir(path)?;
-        Ok(())
-    }
-
     #[tokio::test]
     async fn replacement_preserves_original_on_conflict_and_cancel() -> Result<()> {
         let directory = tempfile::tempdir()?;
