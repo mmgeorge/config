@@ -65,6 +65,10 @@ impl SessionController {
         if self.input_stopping.load(Ordering::Acquire) {
             return Err(ProviderLifecycleFailure::ControllerClosed);
         }
+        #[cfg(test)]
+        if self.initialization_fails.load(Ordering::Acquire) {
+            return Err(ProviderLifecycleFailure::StateUnavailable);
+        }
         let revision = self.mcp_revision.load(Ordering::Acquire);
         let (owner, registry) = {
             let mut broker = self.broker.lock().await;

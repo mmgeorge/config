@@ -299,7 +299,7 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         error: anyhow::Error,
     ) -> Result<ForegroundAction> {
-        self.trace.record(&self.session.id, "exchange.foreground.failure_classified", json!({
+        self.trace.record(&self.session.id, "exchange.turn.failure_classified", json!({
             "exchange_id":transaction.state.scope.exchange_id,
             "error_code": if error.is::<crate::task::StaleTask>() { "task_authority_revoked" }
                 else if error.is::<TurnCancelled>() { "turn_cancelled" }
@@ -370,9 +370,9 @@ impl HarnessBroker {
     /// successful cleanup, and `advance_foreground_failure` makes the restore-or-finalize decision.
     pub(crate) fn settle_collected_cancellation(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Running { transaction, .. } = dispatch else {
+        let TurnTransaction::Running { transaction, .. } = dispatch else {
             anyhow::bail!("collected cancellation has no running foreground owner");
         };
         transaction.fail_live_host_observer(&self.trace, &self.session.id);
@@ -397,13 +397,13 @@ impl HarnessBroker {
     /// clean finalization path commits its own ticket. Skip the commit when no ticket remains.
     fn begin_failure_settlement_commit(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<Option<ForegroundAction>> {
-        let (ForegroundDispatch::Running {
+        let (TurnTransaction::Running {
             transaction,
             admission,
         }
-        | ForegroundDispatch::Finalizing {
+        | TurnTransaction::Finalizing {
             transaction,
             admission,
         }) = dispatch
@@ -453,15 +453,15 @@ impl HarnessBroker {
     /// Record the scoped-collected settlement commit and resume failure settlement.
     pub(crate) fn complete_failure_settlement_commit(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<(), crate::provider::session_execution::SettlementError>,
     ) -> Result<ForegroundAction> {
         let failure = match dispatch {
-            ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission.failure.as_mut(),
-            ForegroundDispatch::Admitting(_)
-            | ForegroundDispatch::Done(_)
-            | ForegroundDispatch::Transitioning => None,
+            TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission.failure.as_mut(),
+            TurnTransaction::Admitting(_)
+            | TurnTransaction::Done(_)
+            | TurnTransaction::Transitioning => None,
         }
         .context("settlement commit completed without its failure owner")?;
         anyhow::ensure!(
@@ -565,12 +565,12 @@ impl HarnessBroker {
     /// Start failure processing even if the request has not acquired a native owner.
     pub(crate) fn fail_foreground_dispatch(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         error: anyhow::Error,
     ) -> Result<ForegroundAction> {
         dispatch.fail_live_host_observer(&self.trace, &self.session.id);
         match dispatch {
-            ForegroundDispatch::Admitting(admission) => {
+            TurnTransaction::Admitting(admission) => {
                 let error = if (admission.owner_collection_pending()
                     || admission.owner_collection_complete())
                     && error
@@ -610,11 +610,11 @@ impl HarnessBroker {
                 });
                 Ok(ForegroundAction::WaitForPublicationDrain)
             }
-            ForegroundDispatch::Running {
+            TurnTransaction::Running {
                 transaction,
                 admission,
             }
-            | ForegroundDispatch::Finalizing {
+            | TurnTransaction::Finalizing {
                 transaction,
                 admission,
             } => {
@@ -627,7 +627,7 @@ impl HarnessBroker {
                     self.fail_foreground(transaction, error)
                 }
             }
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => Err(error),
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => Err(error),
         }
     }
 
@@ -719,10 +719,10 @@ impl HarnessBroker {
     /// Apply the joined staged baseline and retain any typed engine cleanup error.
     pub(crate) fn complete_staged_admission_cleanup(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: AdmissionCleanupResult,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Admitting(admission) = dispatch else {
+        let TurnTransaction::Admitting(admission) = dispatch else {
             anyhow::bail!("admission cleanup has no admission owner");
         };
         let failure = admission
@@ -933,10 +933,10 @@ impl HarnessBroker {
     /// Commit final staged evidence only for the originally captured exchange revision.
     pub(crate) fn complete_staged_admission_checkpoint(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<checkpoint_settlement::FinalCheckpointResult>,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Admitting(admission) = dispatch else {
+        let TurnTransaction::Admitting(admission) = dispatch else {
             anyhow::bail!("staged failure checkpoint has no admission owner");
         };
         let failure = admission
@@ -990,16 +990,16 @@ impl HarnessBroker {
     /// Record typed cleanup separately and retain all observations accepted before closure.
     pub(crate) fn complete_foreground_cleanup(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         original: anyhow::Error,
         cleanup: Result<(), ProviderError>,
     ) -> Result<ForegroundAction> {
         let (transaction, _admission) = match dispatch {
-            ForegroundDispatch::Running {
+            TurnTransaction::Running {
                 transaction,
                 admission,
             }
-            | ForegroundDispatch::Finalizing {
+            | TurnTransaction::Finalizing {
                 transaction,
                 admission,
             } => (transaction, admission),
@@ -1044,14 +1044,14 @@ impl HarnessBroker {
     /// Advance to failure publication after retained observations have been applied.
     pub(crate) fn advance_foreground_failure(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<ForegroundAction> {
         let (transaction, admission) = match dispatch {
-            ForegroundDispatch::Running {
+            TurnTransaction::Running {
                 transaction,
                 admission,
             }
-            | ForegroundDispatch::Finalizing {
+            | TurnTransaction::Finalizing {
                 transaction,
                 admission,
             } => (transaction, admission),
@@ -1328,12 +1328,12 @@ impl HarnessBroker {
     /// Apply collection or cancellation proof only to the failed exchange that owns the baseline.
     pub(crate) fn complete_failure_baseline(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: FailureBaselineResult,
     ) -> Result<ForegroundAction> {
         let transaction = match dispatch {
-            ForegroundDispatch::Running { transaction, .. }
-            | ForegroundDispatch::Finalizing { transaction, .. } => transaction,
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => transaction,
             _ => anyhow::bail!("baseline collection has no foreground owner"),
         };
         let failure = transaction
@@ -1370,12 +1370,12 @@ impl HarnessBroker {
     /// Commit the final failure checkpoint or retry if its revision became stale.
     pub(crate) fn complete_foreground_failure_checkpoint(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<checkpoint_settlement::FinalCheckpointResult>,
     ) -> Result<ForegroundAction> {
         let transaction = match dispatch {
-            ForegroundDispatch::Running { transaction, .. }
-            | ForegroundDispatch::Finalizing { transaction, .. } => transaction,
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => transaction,
             _ => anyhow::bail!("failure checkpoint has no foreground owner"),
         };
         let failure = transaction
@@ -1598,14 +1598,14 @@ impl HarnessBroker {
     /// Continue failure publication after explicit admission events have been forwarded.
     pub(crate) fn foreground_failure_admission_events_forwarded(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<()>,
     ) -> Result<ForegroundAction> {
         let admission = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission,
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => {
                 anyhow::bail!("admission event forwarding has no failure owner")
             }
         };
@@ -1706,14 +1706,14 @@ impl HarnessBroker {
     /// Record flush completion and wait until service-owned effects have joined.
     pub(crate) fn foreground_failure_published(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<Vec<SessionEvent>>,
     ) -> Result<ForegroundAction> {
         let admission = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission,
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => {
                 anyhow::bail!("failure publication has no owner")
             }
         };
@@ -1733,13 +1733,13 @@ impl HarnessBroker {
     /// Release the owner only after cleanup, presentation and service job collection.
     pub(crate) fn finish_foreground_failure(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<ForegroundAction> {
         let admission = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission,
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => {
                 anyhow::bail!("failure drain has no owner")
             }
         };
@@ -1761,19 +1761,19 @@ impl HarnessBroker {
             return Ok(action);
         }
         let restarting = match &*dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => {
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => {
                 admission.owner_collection_restarts()
             }
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => false,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => false,
         };
         let failed_task = match &*dispatch {
-            ForegroundDispatch::Running { transaction, .. }
-            | ForegroundDispatch::Finalizing { transaction, .. } => {
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => {
                 transaction.dispatched_task_permit.clone()
             }
-            ForegroundDispatch::Admitting(admission) => match &admission.purpose {
+            TurnTransaction::Admitting(admission) => match &admission.purpose {
                 crate::input::InputPurpose::TaskEntry { revision, .. }
                 | crate::input::InputPurpose::TaskContinuation { revision, .. } => self
                     .task_controller
@@ -1782,7 +1782,7 @@ impl HarnessBroker {
                     .map(|task| task.permit()),
                 _ => None,
             },
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => None,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => None,
         };
         if !restarting
             && let Some(permit) = failed_task
@@ -1802,13 +1802,13 @@ impl HarnessBroker {
             )?;
         }
         let settlement = match &*dispatch {
-            ForegroundDispatch::Running { transaction, .. }
-            | ForegroundDispatch::Finalizing { transaction, .. } => {
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => {
                 Some(transaction.settlement.clone())
             }
-            ForegroundDispatch::Admitting(_)
-            | ForegroundDispatch::Done(_)
-            | ForegroundDispatch::Transitioning => None,
+            TurnTransaction::Admitting(_)
+            | TurnTransaction::Done(_)
+            | TurnTransaction::Transitioning => None,
         };
         let collected = (|| -> Result<()> {
             if let Some(settlement) = settlement
@@ -1826,9 +1826,9 @@ impl HarnessBroker {
             Ok(())
         })();
         let admission = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission,
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission,
             _ => unreachable!("failure owner checked above"),
         };
         let mut failure = admission.failure.take().context("failure state missing")?;
@@ -1842,7 +1842,7 @@ impl HarnessBroker {
         }
         self.trace.record(
             &self.session.id,
-            "exchange.foreground.failure_settled",
+            "exchange.turn.failure_settled",
             json!({
                 "reason": format!("{:#}", failure.original),
                 "cleanup": failure.cleanup.as_ref().map(ToString::to_string),
@@ -1893,7 +1893,7 @@ impl HarnessBroker {
                     response,
                     event: std::mem::take(&mut admission.events),
                 };
-                *dispatch = ForegroundDispatch::Done(result);
+                *dispatch = TurnTransaction::Done(result);
                 return Ok(ForegroundAction::Finish);
             }
         }
@@ -2081,7 +2081,7 @@ mod tests {
             let original_model = broker.session.resolved_model.clone();
             let prompt = "Keep this exact draft: Î±\nsecond line";
             let (sink, _updates) = publication::channel();
-            let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+            let TurnTransaction::Admitting(admission) = broker.begin_foreground_dispatch(
                 Request {
                     id: 19,
                     method: "session.prompt.submit".into(),
@@ -2125,7 +2125,7 @@ mod tests {
             transaction.collection = Some(ForegroundCollection::Cancel(
                 crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed,
             ));
-            let mut dispatch = ForegroundDispatch::Running {
+            let mut dispatch = TurnTransaction::Running {
                 transaction: Box::new(transaction),
                 admission,
             };
@@ -2155,7 +2155,7 @@ mod tests {
                         ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
                     ));
                     assert_eq!(broker.session.resolved_model, original_model);
-                    let ForegroundDispatch::Running { admission, .. } = &dispatch else {
+                    let TurnTransaction::Running { admission, .. } = &dispatch else {
                         anyhow::bail!("foreground owner disappeared");
                     };
                     let failure = admission

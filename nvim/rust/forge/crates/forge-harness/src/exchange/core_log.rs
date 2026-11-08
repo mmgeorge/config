@@ -284,15 +284,16 @@ impl CoreOutcome {
                 | CommandOutcome::Configured(_)
                 | CommandOutcome::Input { .. },
             ) => Self::Succeeded,
-            Err(CommandFailure::CollectionTimedOut | CommandFailure::ConfigurationTimedOut) => {
+            Err(CommandFailure::StopTimedOut | CommandFailure::ConfigurationTimedOut) => {
                 Self::TimedOut
             }
             Err(CommandFailure::Interrupted | CommandFailure::OwnerStopping) => Self::Interrupted,
             Err(
                 CommandFailure::DeliveryUncertain
-                | CommandFailure::DispatchUnconfirmed
-                | CommandFailure::CollectionUncertain,
+                | CommandFailure::DispatchLost
+                | CommandFailure::StopFailed,
             ) => Self::ObservationLost,
+            Err(CommandFailure::ProviderFailed) => Self::Interrupted,
             Err(CommandFailure::ConfigurationReconcileFailed { kind }) => {
                 Self::ProviderReason { kind: *kind }
             }

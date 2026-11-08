@@ -8,7 +8,7 @@ use super::queue::QueuedCommand;
 use super::rollback_run::{RollbackEvent, RollbackRun};
 use super::services::OwnerServices;
 use super::task_command::{TaskCommandEvent, TaskCommandRun};
-use super::transition::{ExchangeTransition, ForegroundStatus, TransitionEvent, TransitionIntent};
+use super::transition::{ExchangeStop, StopIntent, TransitionEvent, TurnStatus};
 
 /// Own exactly one caller command while its asynchronous stages progress.
 pub(super) enum ActiveCommand {
@@ -27,7 +27,7 @@ pub(super) enum ActiveCommand {
     /// Cancellation retains collection and checkpoint ownership through settlement.
     Cancel {
         command: QueuedCommand,
-        transition: Box<ExchangeTransition>,
+        transition: Box<ExchangeStop>,
     },
 }
 
@@ -84,9 +84,9 @@ impl ActiveCommand {
                 | ConfigurationChange::InputTimeouts(_),
             ) => Self::Configuration(command),
             Command::CancelExchange(request) => {
-                let transition = ExchangeTransition::start_at(
+                let transition = ExchangeStop::start_at(
                     command.record.request.id.clone(),
-                    TransitionIntent::Cancel(request.input),
+                    StopIntent::Cancel(request.input),
                     services,
                     None,
                     None,
@@ -106,8 +106,8 @@ impl ActiveCommand {
     /// busy session's broker, so local policy commits while a turn holds it.
     pub(super) async fn pin_cancellation_target(
         &mut self,
-        foreground: &ForegroundStatus,
-        dispatch: Option<&mut crate::broker::ForegroundDispatch>,
+        foreground: &TurnStatus,
+        dispatch: Option<&mut crate::broker::TurnTransaction>,
         broker: &tokio::sync::Mutex<crate::broker::HarnessBroker>,
         services: &OwnerServices,
     ) -> Result<
@@ -134,15 +134,15 @@ impl ActiveCommand {
                 };
                 let foreground_absent = matches!(
                     dispatch.as_deref(),
-                    None | Some(crate::broker::ForegroundDispatch::Done(_))
+                    None | Some(crate::broker::TurnTransaction::Done(_))
                 );
                 // Mark the canonical foreground before pausing its task revokes callback authority.
                 // Otherwise the same update can misclassify that intentional revocation as failure.
                 if let Some(dispatch) = dispatch {
                     match dispatch {
-                        crate::broker::ForegroundDispatch::Admitting(_)
-                        | crate::broker::ForegroundDispatch::Running { .. }
-                        | crate::broker::ForegroundDispatch::Finalizing { .. } => {
+                        crate::broker::TurnTransaction::Admitting(_)
+                        | crate::broker::TurnTransaction::Running { .. }
+                        | crate::broker::TurnTransaction::Finalizing { .. } => {
                             let action = broker
                                 .step_foreground(
                                     dispatch,
@@ -155,8 +155,8 @@ impl ActiveCommand {
                                 return Err(super::transition::TransitionFailure::Uncertain);
                             }
                         }
-                        crate::broker::ForegroundDispatch::Done(_)
-                        | crate::broker::ForegroundDispatch::Transitioning => {}
+                        crate::broker::TurnTransaction::Done(_)
+                        | crate::broker::TurnTransaction::Transitioning => {}
                     }
                 }
                 broker
@@ -242,7 +242,7 @@ impl ActiveCommand {
     /// Await one fact without blocking the driver's provider event or command intake.
     pub(super) async fn next(
         &mut self,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         delivery: super::task_command::TaskDeliveryGate,
     ) -> CommandEvent {
         match self {

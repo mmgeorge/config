@@ -50,6 +50,13 @@ pub(crate) struct OwnerServices {
 }
 
 impl OwnerServices {
+    /// Replace the provider catalog and advance the resource revision its readers watch.
+    pub(crate) async fn catalog_publish(&self, catalog: crate::provider::ProviderCatalogRequest) {
+        *self.catalog.write().await = catalog;
+        self.resource_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Capture the provider only after excluding retirement for all cloned users of this permit.
     pub(super) async fn observe_provider_generation(&self) -> ProviderGenerationPermit {
         let lease = self.provider_lane.clone().read_owned().await;

@@ -1,7 +1,21 @@
 use super::*;
 
+/// Describe how far a turn's provider send has progressed, for owners that must not stop it mid-send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DispatchStage {
+    /// The journal still records the input as `Prepared`, so stopping the turn prevents the send.
+    Unsent,
+    /// The submission is running and the provider has not confirmed it. Stopping the turn now
+    /// interrupts a send whose delivery is then unknown.
+    InFlight,
+    /// The send ended without confirmation, so the turn fails and its provider generation with it.
+    Lost,
+    /// The provider confirmed the send, or the turn has no send left.
+    Settled,
+}
+
 /// Own a foreground request across admission, native execution and host settlement.
-pub(crate) enum ForegroundDispatch {
+pub(crate) enum TurnTransaction {
     Admitting(Box<ForegroundAdmission>),
     Running {
         transaction: Box<ForegroundTransaction>,
@@ -80,7 +94,7 @@ enum AdmissionPhase {
     Prepared,
 }
 
-impl ForegroundDispatch {
+impl TurnTransaction {
     /// Capture the latest admitted invocation in this foreground's explicit execution chain.
     pub(crate) fn invocation_scope(
         &self,
@@ -153,6 +167,38 @@ impl ForegroundDispatch {
             Self::Done(_) | Self::Transitioning => {
                 anyhow::bail!("foreground publication owner is unavailable")
             }
+        }
+    }
+
+    /// Get how far this turn's provider send has progressed.
+    pub(crate) fn dispatch_stage(&self) -> DispatchStage {
+        match self {
+            Self::Admitting(_) => DispatchStage::Unsent,
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => {
+                match transaction.request.dispatch.observer().current() {
+                    // Only the journal proves the adapter has not crossed the send boundary; a
+                    // turn without a readable `Prepared` record may already be sending.
+                    Ok(None) => match transaction
+                        .request
+                        .submission
+                        .as_ref()
+                        .map(|submission| submission.record())
+                    {
+                        Some(Ok(record))
+                            if matches!(
+                                record.delivery,
+                                crate::provider::submission::SubmissionState::Prepared
+                            ) =>
+                        {
+                            DispatchStage::Unsent
+                        }
+                        Some(Ok(_) | Err(_)) | None => DispatchStage::InFlight,
+                    },
+                    Ok(Some(_)) => DispatchStage::Settled,
+                    Err(_) => DispatchStage::Lost,
+                }
+            }
+            Self::Done(_) | Self::Transitioning => DispatchStage::Settled,
         }
     }
 
@@ -461,7 +507,7 @@ impl HarnessBroker {
         submission: Arc<crate::provider::submission::Submission>,
         attachments: Vec<crate::attachment::InputAttachment>,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         let previous_purpose = std::mem::replace(&mut self.input_purpose, message.purpose);
         let previous_submission = self.input_submission.take();
         let result = self.begin_foreground_dispatch(
@@ -476,7 +522,7 @@ impl HarnessBroker {
         self.input_submission = previous_submission;
         let mut dispatch = result?;
         dispatch.set_attachments(attachments)?;
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+        let TurnTransaction::Admitting(admission) = &mut dispatch else {
             unreachable!("queued input begins at foreground admission")
         };
         admission.input_submission = Some(submission);
@@ -491,7 +537,7 @@ impl HarnessBroker {
         display: Option<ExchangeAdmission>,
         input: ProviderInput,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         let request = Request {
             id: 0,
             method: "session.prompt.submit".into(),
@@ -502,7 +548,7 @@ impl HarnessBroker {
             request.params["_prompt_admission"] = json!({"document":document,"token":token});
         }
         let mut dispatch = self.begin_foreground_dispatch(request, sink)?;
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+        let TurnTransaction::Admitting(admission) = &mut dispatch else {
             unreachable!()
         };
         admission.command = None;
@@ -527,14 +573,14 @@ impl HarnessBroker {
         prompt: String,
         display: String,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         let request = Request {
             id: 0,
             method: "session.prompt.submit".into(),
             params: json!({"text":prompt}),
         };
         let mut dispatch = self.begin_foreground_dispatch(request, sink)?;
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+        let TurnTransaction::Admitting(admission) = &mut dispatch else {
             unreachable!()
         };
         admission.local_interaction = Some((
@@ -552,7 +598,7 @@ impl HarnessBroker {
         selected: &crate::provider::ExchangeId,
         text: String,
         sink: publication::SessionUpdateSink,
-    ) -> Result<Option<ForegroundDispatch>> {
+    ) -> Result<Option<TurnTransaction>> {
         anyhow::ensure!(
             self.prompt_admission.is_none(),
             "another prompt admission is active"
@@ -567,7 +613,7 @@ impl HarnessBroker {
             };
             let mut dispatch = self.begin_foreground_dispatch(request, sink)?;
             let resume = self.prepare_selected_continuation(selected, text)?;
-            let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+            let TurnTransaction::Admitting(admission) = &mut dispatch else {
                 unreachable!()
             };
             match resume {
@@ -1101,7 +1147,7 @@ impl HarnessBroker {
         &mut self,
         request: Request,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         let scoped = sink.clone();
         self.with_publication_sink(&scoped, |broker| {
             broker.begin_foreground_dispatch_inner(request, sink)
@@ -1112,7 +1158,7 @@ impl HarnessBroker {
         &mut self,
         request: Request,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         anyhow::ensure!(
             RuntimeMethod::decode(&request.method)? == RuntimeMethod::SessionPromptSubmit,
             "foreground dispatch requires a prompt submission"
@@ -1131,55 +1177,53 @@ impl HarnessBroker {
         };
         let submission = self.begin_prompt_submission(&request.params)?;
         let purpose = std::mem::take(&mut self.input_purpose);
-        Ok(ForegroundDispatch::Admitting(Box::new(
-            ForegroundAdmission {
-                request,
-                sink: Some(sink),
-                submission: Some(submission),
-                input_submission: self.input_submission.take(),
-                text,
-                attachments: Vec::new(),
-                purpose,
-                command,
-                command_result: None,
-                command_response: None,
-                command_delivery: None,
-                admission_published: false,
-                task_preparation: None,
-                task_model_selection: None,
-                task_configuration: None,
-                task_compaction: None,
-                task_compaction_job: None,
-                task_compacted: false,
-                task_compaction_failure: None,
-                workspace_prepared: false,
-                prior_finalization: None,
-                prior_checked: false,
-                question_catalog: None,
-                question_discussion: None,
-                clarification: None,
-                planning: None,
-                reset_check_setup: false,
-                automatic_check_owner: None,
-                events: Vec::new(),
-                staged_interaction: None,
-                local_interaction: None,
-                provider_prepared: false,
-                engine: None,
-                failure: None,
-                phase: AdmissionPhase::Begin,
-                collection: None,
-            },
-        )))
+        Ok(TurnTransaction::Admitting(Box::new(ForegroundAdmission {
+            request,
+            sink: Some(sink),
+            submission: Some(submission),
+            input_submission: self.input_submission.take(),
+            text,
+            attachments: Vec::new(),
+            purpose,
+            command,
+            command_result: None,
+            command_response: None,
+            command_delivery: None,
+            admission_published: false,
+            task_preparation: None,
+            task_model_selection: None,
+            task_configuration: None,
+            task_compaction: None,
+            task_compaction_job: None,
+            task_compacted: false,
+            task_compaction_failure: None,
+            workspace_prepared: false,
+            prior_finalization: None,
+            prior_checked: false,
+            question_catalog: None,
+            question_discussion: None,
+            clarification: None,
+            planning: None,
+            reset_check_setup: false,
+            automatic_check_owner: None,
+            events: Vec::new(),
+            staged_interaction: None,
+            local_interaction: None,
+            provider_prepared: false,
+            engine: None,
+            failure: None,
+            phase: AdmissionPhase::Begin,
+            collection: None,
+        })))
     }
 
     /// Return only a fully settled foreground response.
     pub(crate) fn finish_foreground(
         &mut self,
-        dispatch: ForegroundDispatch,
+        dispatch: TurnTransaction,
     ) -> Result<DispatchResult> {
         match dispatch {
-            ForegroundDispatch::Done(result) => Ok(result),
+            TurnTransaction::Done(result) => Ok(result),
             _ => anyhow::bail!("foreground dispatch has not settled"),
         }
     }
@@ -1710,9 +1754,9 @@ impl HarnessBroker {
     /// Advance admission only after each owned presentation and preparation has completed.
     pub(crate) fn admit_prepared_foreground(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Admitting(admission) = dispatch else {
+        let TurnTransaction::Admitting(admission) = dispatch else {
             anyhow::bail!("foreground admission has no owner");
         };
         if admission.collection.is_some() {
@@ -1729,7 +1773,7 @@ impl HarnessBroker {
                 .take()
                 .expect("response checked above");
             response.event.append(&mut admission.events);
-            *dispatch = ForegroundDispatch::Done(response);
+            *dispatch = TurnTransaction::Done(response);
             return Ok(ForegroundAction::Finish);
         }
         if admission.staged_interaction.is_none()
@@ -1941,12 +1985,12 @@ impl HarnessBroker {
         let transaction = self.construct_foreground_transaction(staged, engine)?;
         admission.staged_interaction.take();
         admission.engine.take();
-        let ForegroundDispatch::Admitting(admission) =
-            std::mem::replace(dispatch, ForegroundDispatch::Transitioning)
+        let TurnTransaction::Admitting(admission) =
+            std::mem::replace(dispatch, TurnTransaction::Transitioning)
         else {
             unreachable!();
         };
-        *dispatch = ForegroundDispatch::Running {
+        *dispatch = TurnTransaction::Running {
             transaction: Box::new(transaction),
             admission,
         };
@@ -2259,7 +2303,7 @@ impl HarnessBroker {
     pub(crate) fn begin_approval_timeout_dispatch(
         &mut self,
         sink: publication::SessionUpdateSink,
-    ) -> Result<(Option<ForegroundDispatch>, PendingProviderDelivery)> {
+    ) -> Result<(Option<TurnTransaction>, PendingProviderDelivery)> {
         let owner = crate::provider::ThreadOwner::root(&self.session.id);
         let feedback = self.permission_coordinator.take_timeout_feedback(&owner)?;
         let mut dispatch = None;
@@ -2308,7 +2352,7 @@ impl HarnessBroker {
                         Some(&admission),
                         ProviderInput::from_text(feedback.clone()),
                     )?;
-                    let ForegroundDispatch::Admitting(state) = &mut owned else {
+                    let TurnTransaction::Admitting(state) = &mut owned else {
                         unreachable!()
                     };
                     state.staged_interaction = Some(interaction);

@@ -19,13 +19,13 @@ use super::{
     services::{OwnerServices, ProviderGenerationPermit},
     settings::{SettingsEvent, SettingsProgress, SettingsRun},
     transition::{
-        ChildCollectionPolicy, ExchangeTransition, ForegroundStatus, RetainedTransition,
-        TransitionEvent, TransitionOutcome, TransitionProgress,
+        ChildCollectionPolicy, ExchangeStop, RetainedTransition, TransitionEvent,
+        TransitionOutcome, TransitionProgress, TurnStatus,
     },
 };
 use crate::{
     broker::{
-        DispatchResult, ForegroundDispatch, HarnessBroker,
+        DispatchResult, HarnessBroker, TurnTransaction,
         publication::{SessionUpdate, SessionUpdateStream},
     },
     command::ExecutionPermit,
@@ -158,7 +158,7 @@ pub(super) struct InputDeliveryRun {
     work: PreparationWork,
     stage: DeliveryStage,
     observation: InputObservation,
-    transition: Option<ExchangeTransition>,
+    transition: Option<ExchangeStop>,
     selected: Option<crate::provider::ExchangeId>,
     collected: bool,
     execution: Option<ExecutionPermit>,
@@ -302,7 +302,7 @@ impl InputDeliveryRun {
     }
 
     /// Await owned I/O or foreground completion without blocking owner intake and native events.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> InputDeliveryEvent {
+    pub(super) async fn next(&mut self, foreground: TurnStatus) -> InputDeliveryEvent {
         if matches!(self.observation, InputObservation::Pending) {
             return std::future::pending().await;
         }
@@ -314,7 +314,7 @@ impl InputDeliveryRun {
     }
 
     /// Observe the current stage once without changing its owner-applied state.
-    async fn poll_next(&mut self, foreground: ForegroundStatus) -> InputDeliveryEvent {
+    async fn poll_next(&mut self, foreground: TurnStatus) -> InputDeliveryEvent {
         match &mut self.stage {
             DeliveryStage::Observation { task } => InputDeliveryEvent::Observation(task.await),
             DeliveryStage::Work => match &mut self.work {
@@ -379,7 +379,7 @@ impl InputDeliveryRun {
     pub(super) fn update(
         &mut self,
         event: InputDeliveryEvent,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         broker: &mut HarnessBroker,
         services: &OwnerServices,
         receipts: &mut InputReceipts,
@@ -782,7 +782,7 @@ impl InputDeliveryRun {
                     if let Ok(Ok(result)) = result {
                         self.terminal_events.extend(result.event);
                     }
-                    return Err(OperationFailure::DispatchUnconfirmed);
+                    return Err(OperationFailure::DispatchLost);
                 }
                 let DeliveryStage::Foreground { submission, .. } =
                     std::mem::replace(&mut self.stage, DeliveryStage::Consumed)
@@ -1050,7 +1050,7 @@ impl InputDeliveryRun {
         };
         let mut retained = self
             .transition
-            .map(ExchangeTransition::into_retained)
+            .map(ExchangeStop::into_retained)
             .unwrap_or_else(|| RetainedTransition::configuration(self.control));
         retained.retain_generation(self.generation);
         if let Some(engine) = settled_steering {
@@ -1297,9 +1297,9 @@ impl InputDeliveryRun {
         let control = self.control.take().or_else(|| {
             self.transition
                 .as_mut()
-                .and_then(ExchangeTransition::take_control)
+                .and_then(ExchangeStop::take_control)
         });
-        self.transition = Some(ExchangeTransition::for_input(
+        self.transition = Some(ExchangeStop::for_input(
             self.input.clone(),
             children,
             services,
@@ -1426,7 +1426,7 @@ pub(super) struct InputForegroundStart {
     pub(super) id: uuid::Uuid,
     /// Distinguish original input dispatch from a continuation after local compaction.
     pub(super) source: InputForegroundSource,
-    pub(super) transaction: ForegroundDispatch,
+    pub(super) transaction: TurnTransaction,
     pub(super) updates: SessionUpdateStream,
     pub(super) execution: ExecutionPermit,
     pub(super) completion: oneshot::Sender<anyhow::Result<DispatchResult>>,

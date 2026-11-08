@@ -208,8 +208,10 @@ local function status_text()
   local confirmed_model = type(active_session.resolved_model) == "string" and active_session.resolved_model or nil
   local model_catalog = state.model_provider == active_session.provider and state.model_list or nil
   local model_options = require("forge.views.harness.model_options")
-  local model = confirmed_model and model_options.label(model_catalog, confirmed_model)
-    or (model_options.label(model_catalog, configured_model) .. " (unconfirmed)")
+  local displayed_model = confirmed_model or configured_model
+  local saved_label = displayed_model == active_session.model and type(active_session.model_label) == "string"
+    and active_session.model_label or nil
+  local model = model_options.label(model_catalog, displayed_model, saved_label)
   local effort = selected_setting(state, "effort")
   local selected_model = selected_setting(state, "model")
   if selected_model ~= configured_model then
@@ -2061,9 +2063,7 @@ function M.select_model(on_confirm)
         return
       end
       if not is_current() then return end
-      state.model_provider = provider
-      state.model_list = vim.deepcopy(model_list or {})
-      open_model_picker(state.model_list)
+      open_model_picker(model_list or {})
     end)
   end)
 end
@@ -2151,16 +2151,11 @@ function M.select_provider()
 end
 
 function M.resolve_runtime_model()
-  local state = harness_state()
-  local provider = state.session and state.session.provider
-  -- This warms the model cache on attach. Providers such as Claude Code list models only from
-  -- an open binding, so an unavailable catalog here is expected; pickers fetch again on demand
-  -- and report their own failures.
-  require("forge.views.harness.provider_catalog").models(true, function(model_list, request_error)
-    if request_error then return end
-    state.model_provider = provider
-    state.model_list = vim.deepcopy(model_list or {})
-  end)
+  -- This warms the model cache on attach; `provider_catalog.models` stores the catalog and
+  -- redraws the winbar. Providers such as Claude Code list models only from an open binding,
+  -- so an unavailable catalog here is expected; pickers fetch again on demand and report their
+  -- own failures.
+  require("forge.views.harness.provider_catalog").models(true, function() end)
 end
 
 ---@param action table

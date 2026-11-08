@@ -84,7 +84,7 @@ pub(super) fn capture(
     services: &OwnerServices,
     cursor: Option<PublicationSequence>,
     limit: NonZeroU16,
-    update_step: u64,
+    step: u64,
     execution_available: bool,
 ) -> Result<ReconnectSnapshot, ReconnectError> {
     let lease = services.publications.begin_reconciliation()?;
@@ -115,7 +115,7 @@ pub(super) fn capture(
         "receipt_id": uuid::Uuid::new_v4().to_string(),
         "after": cursor, "through": through, "high_water": high_water,
         "more": through.or(cursor) != high_water, "events": events,
-        "update_step": update_step, "execution_available": execution_available,
+        "update_step": step, "execution_available": execution_available,
     });
     Ok(ReconnectSnapshot {
         response,

@@ -68,10 +68,10 @@ impl HarnessBroker {
 
     pub(super) fn begin_live_host_effect(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         request: crate::provider::LiveHostEffect,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Running { transaction, .. } = dispatch else {
+        let TurnTransaction::Running { transaction, .. } = dispatch else {
             request.reject(ProviderError::Cancelled);
             return Ok(ForegroundAction::Wait);
         };
@@ -266,11 +266,11 @@ impl HarnessBroker {
 
     pub(super) fn complete_live_plan_submission(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<foreground_plan_effect::PlanSubmissionResult>,
     ) -> Result<ForegroundAction> {
-        let (ForegroundDispatch::Running { transaction, .. }
-        | ForegroundDispatch::Finalizing { transaction, .. }) = dispatch
+        let (TurnTransaction::Running { transaction, .. }
+        | TurnTransaction::Finalizing { transaction, .. }) = dispatch
         else {
             anyhow::bail!("live host effect lost its foreground");
         };
@@ -315,11 +315,11 @@ impl HarnessBroker {
 
     pub(super) fn complete_live_plan_mutation(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<foreground_plan_effect::PlanMutationResult>,
     ) -> Result<ForegroundAction> {
-        let (ForegroundDispatch::Running { transaction, .. }
-        | ForegroundDispatch::Finalizing { transaction, .. }) = dispatch
+        let (TurnTransaction::Running { transaction, .. }
+        | TurnTransaction::Finalizing { transaction, .. }) = dispatch
         else {
             anyhow::bail!("live mutation lost its foreground");
         };
@@ -364,11 +364,11 @@ impl HarnessBroker {
 
     pub(super) fn complete_live_host_publication(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         result: Result<Vec<SessionEvent>>,
     ) -> Result<ForegroundAction> {
-        let (ForegroundDispatch::Running { transaction, .. }
-        | ForegroundDispatch::Finalizing { transaction, .. }) = dispatch
+        let (TurnTransaction::Running { transaction, .. }
+        | TurnTransaction::Finalizing { transaction, .. }) = dispatch
         else {
             anyhow::bail!("live host publication lost its foreground");
         };
@@ -411,7 +411,7 @@ impl HarnessBroker {
     }
 }
 
-impl ForegroundDispatch {
+impl TurnTransaction {
     /// Release a callback observer on failure while retaining its mutation evidence for recovery.
     pub(crate) fn fail_live_host_observer(
         &mut self,

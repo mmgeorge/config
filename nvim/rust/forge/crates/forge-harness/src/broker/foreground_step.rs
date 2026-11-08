@@ -6,25 +6,23 @@ impl HarnessBroker {
     /// Route one admitted signal to its owner-checked state transition.
     pub(crate) fn step_foreground(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         signal: ForegroundSignal,
     ) -> Result<ForegroundAction> {
         let receipt = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission.input_submission.take(),
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => None,
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission.input_submission.take(),
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => None,
         };
         let previous = std::mem::replace(&mut self.input_submission, receipt);
         let result = self.step_foreground_inner(dispatch, signal);
         let receipt = std::mem::replace(&mut self.input_submission, previous);
         match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => {
-                admission.input_submission = receipt
-            }
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {}
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission.input_submission = receipt,
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => {}
         }
         result
     }
@@ -32,22 +30,22 @@ impl HarnessBroker {
     /// Apply one signal with the current admission's receipt installed for legacy reducers.
     fn step_foreground_inner(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         signal: ForegroundSignal,
     ) -> Result<ForegroundAction> {
         let signal = match signal {
             ForegroundSignal::LiveHost(request) => {
                 return self.begin_live_host_effect(dispatch, *request);
             }
-            ForegroundSignal::PlanMutationCompleted(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            ForegroundSignal::PlanMutationCompleted(result) if matches!(dispatch, TurnTransaction::Running { transaction, .. } | TurnTransaction::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
             {
                 return self.complete_live_plan_mutation(dispatch, result);
             }
-            ForegroundSignal::PlanSubmissionCompleted(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            ForegroundSignal::PlanSubmissionCompleted(result) if matches!(dispatch, TurnTransaction::Running { transaction, .. } | TurnTransaction::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
             {
                 return self.complete_live_plan_submission(dispatch, result);
             }
-            ForegroundSignal::PlanTerminalPublished(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            ForegroundSignal::PlanTerminalPublished(result) if matches!(dispatch, TurnTransaction::Running { transaction, .. } | TurnTransaction::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
             {
                 return self.complete_live_host_publication(dispatch, result);
             }
@@ -72,10 +70,10 @@ impl HarnessBroker {
             signal => signal,
         };
         let failure_waiting = match &*dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission.failure.is_some(),
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => false,
+            TurnTransaction::Admitting(admission)
+            | TurnTransaction::Running { admission, .. }
+            | TurnTransaction::Finalizing { admission, .. } => admission.failure.is_some(),
+            TurnTransaction::Done(_) | TurnTransaction::Transitioning => false,
         };
         if failure_waiting && matches!(&signal, ForegroundSignal::PublicationDrained) {
             return self.finish_foreground_failure(dispatch);
@@ -87,17 +85,15 @@ impl HarnessBroker {
             signal => signal,
         };
         let failure_cleanup = match &*dispatch {
-            ForegroundDispatch::Running { transaction, .. }
-            | ForegroundDispatch::Finalizing { transaction, .. } => {
-                transaction.failure_cleanup_active
-            }
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => transaction.failure_cleanup_active,
             _ => false,
         };
         let signal = match signal {
             ForegroundSignal::Checkpoint(result) if failure_cleanup => {
                 let transaction = match dispatch {
-                    ForegroundDispatch::Running { transaction, .. }
-                    | ForegroundDispatch::Finalizing { transaction, .. } => transaction,
+                    TurnTransaction::Running { transaction, .. }
+                    | TurnTransaction::Finalizing { transaction, .. } => transaction,
                     _ => unreachable!(),
                 };
                 self.apply_foreground_failure_checkpoint(transaction, result)?;
@@ -108,12 +104,12 @@ impl HarnessBroker {
         if matches!(
             &signal,
             ForegroundSignal::Native(NativeForegroundSignal::NativeReady(_))
-        ) && let ForegroundDispatch::Running { transaction, .. }
-        | ForegroundDispatch::Finalizing { transaction, .. } = dispatch
+        ) && let TurnTransaction::Running { transaction, .. }
+        | TurnTransaction::Finalizing { transaction, .. } = dispatch
         {
             transaction.acknowledge_native_result();
         }
-        if let ForegroundDispatch::Admitting(admission) = dispatch {
+        if let TurnTransaction::Admitting(admission) = dispatch {
             match &signal {
                 ForegroundSignal::CollectionStarted(disposition) => {
                     admission.begin_owner_collection(*disposition)?;
@@ -129,7 +125,7 @@ impl HarnessBroker {
         }
         let signal = match signal {
             ForegroundSignal::EffectFailed(error)
-                if matches!(dispatch, ForegroundDispatch::Admitting(_)) =>
+                if matches!(dispatch, TurnTransaction::Admitting(_)) =>
             {
                 return self.fail_foreground_dispatch(dispatch, error);
             }
@@ -138,8 +134,8 @@ impl HarnessBroker {
         if matches!(&signal, ForegroundSignal::AdmissionPrepared) {
             return self.admit_prepared_foreground(dispatch);
         }
-        if matches!(&*dispatch, ForegroundDispatch::Admitting(_)) {
-            let ForegroundDispatch::Admitting(admission) = dispatch else {
+        if matches!(&*dispatch, TurnTransaction::Admitting(_)) {
+            let TurnTransaction::Admitting(admission) = dispatch else {
                 unreachable!()
             };
             return self.step_foreground_admission(admission, signal);
@@ -150,12 +146,12 @@ impl HarnessBroker {
             return self.resume_stale_after_question(dispatch);
         }
         if matches!(&signal, ForegroundSignal::QuestionChanged)
-            && matches!(&*dispatch, ForegroundDispatch::Finalizing { transaction, .. }
+            && matches!(&*dispatch, TurnTransaction::Finalizing { transaction, .. }
                 if transaction.finalization.as_ref().is_some_and(|finalization| finalization.goal_waiting_questions))
         {
             return self.resume_foreground_goal_after_question(dispatch);
         }
-        if matches!(&*dispatch, ForegroundDispatch::Finalizing { .. })
+        if matches!(&*dispatch, TurnTransaction::Finalizing { .. })
             && matches!(
                 &signal,
                 ForegroundSignal::FinalizeEffectsRequested
@@ -201,7 +197,7 @@ impl HarnessBroker {
             ForegroundSignal::Native(NativeForegroundSignal::NativeReady(
                 ProviderAttempt::Ready(ready),
             )) => {
-                let ForegroundDispatch::Running { transaction, .. } = dispatch else {
+                let TurnTransaction::Running { transaction, .. } = dispatch else {
                     anyhow::bail!("native completion has no running foreground owner");
                 };
                 if let Err(error) = self.collect_foreground_observations(transaction) {
@@ -244,7 +240,7 @@ impl HarnessBroker {
                 return self.complete_foreground_native(dispatch, outcome);
             }
             ForegroundSignal::QuestionStopped(result) => {
-                let ForegroundDispatch::Running { transaction, .. } = dispatch else {
+                let TurnTransaction::Running { transaction, .. } = dispatch else {
                     anyhow::bail!("question cleanup has no running foreground owner");
                 };
                 transaction.question_stop_pending = false;
@@ -260,13 +256,13 @@ impl HarnessBroker {
             }
             signal => signal,
         };
-        let already_finalizing = matches!(dispatch, ForegroundDispatch::Finalizing { .. });
+        let already_finalizing = matches!(dispatch, TurnTransaction::Finalizing { .. });
         let (transaction, admission) = match dispatch {
-            ForegroundDispatch::Running {
+            TurnTransaction::Running {
                 transaction,
                 admission,
             }
-            | ForegroundDispatch::Finalizing {
+            | TurnTransaction::Finalizing {
                 transaction,
                 admission,
             } => (transaction, admission),

@@ -28,7 +28,7 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     broker.checkpoint = None;
     broker.turn_cancellation.arm();
     let (publication, _updates) = publication::channel();
-    let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+    let TurnTransaction::Admitting(admission) = broker.begin_foreground_dispatch(
         Request {
             id: 1,
             method: "session.prompt.submit".into(),
@@ -63,7 +63,7 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
         invoked.fetch_add(1, Ordering::SeqCst);
         std::future::pending::<Result<ProviderAttempt>>().await
     }));
-    let mut dispatch = ForegroundDispatch::Running {
+    let mut dispatch = TurnTransaction::Running {
         transaction: Box::new(transaction),
         admission,
     };

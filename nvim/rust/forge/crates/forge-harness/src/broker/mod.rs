@@ -28,6 +28,8 @@ pub(crate) fn automatic_session_name(session_title: &str) -> String {
 mod cancellation_test;
 #[cfg(test)]
 mod change_results_test;
+#[cfg(test)]
+mod model_label_test;
 mod checkpoint_settlement;
 mod checks;
 pub(crate) use checkpoint_settlement::FinalCheckpointCommit;
@@ -59,7 +61,7 @@ mod foreground_start;
 mod foreground_step;
 mod foreground_workspace;
 use foreground_dispatch::ForegroundAdmission;
-pub(crate) use foreground_dispatch::ForegroundDispatch;
+pub(crate) use foreground_dispatch::{DispatchStage, TurnTransaction};
 pub mod publication;
 use publication::{ConfigurationProgressState, SessionUpdate, TimelineUpdate};
 mod check_admission;
@@ -2463,6 +2465,7 @@ impl HarnessBroker {
                             model: preference
                                 .as_ref()
                                 .map_or(request.model, |value| value.model.clone()),
+                            model_label: None,
                             provider_label: provider_descriptor.label.clone(),
                             resolved_model: None,
                             effort: preference
@@ -2500,12 +2503,13 @@ impl HarnessBroker {
                             auto_compaction: Default::default(),
                             last_compaction_turn: None,
                         };
-                        session.context_window = preference.as_ref().and_then(|preference| {
-                            preference
-                                .model_setting
-                                .get(&session.model)
-                                .and_then(|setting| setting.context_window.clone())
-                        });
+                        let model_setting = preference
+                            .as_ref()
+                            .and_then(|preference| preference.model_setting.get(&session.model));
+                        session.context_window =
+                            model_setting.and_then(|setting| setting.context_window.clone());
+                        session.model_label =
+                            model_setting.and_then(|setting| setting.label.clone());
                         session.acquire_lease(&request.client_id)?;
                         session
                     }
@@ -10812,11 +10816,18 @@ fn preference_for_session(
     let mut model_setting = previous
         .map(|preference| preference.model_setting)
         .unwrap_or_default();
+    // A session that never saw the catalog keeps the label an earlier selection learned.
+    let label = session.model_label.clone().or_else(|| {
+        model_setting
+            .get(&session.model)
+            .and_then(|setting| setting.label.clone())
+    });
     model_setting.insert(
         session.model.clone(),
         ModelSetting {
             reasoning: Some(session.effort.clone()),
             context_window: session.context_window.clone(),
+            label,
         },
     );
     HarnessPreference {

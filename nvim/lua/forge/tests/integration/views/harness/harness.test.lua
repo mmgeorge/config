@@ -868,7 +868,14 @@ do
   } }, "native-controller")
   assert(state.session.resolved_model == nil, "nullable native model became a truthy Lua sentinel")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar, { use_winbar = true, maxwidth = 200 }).str
-  assert(title:find("default (unconfirmed)", 1, true) and not title:find("vim.NIL", 1, true), "configured model was presented as confirmed execution evidence")
+  assert(title:find("default", 1, true) and not title:find("unconfirmed", 1, true) and not title:find("vim.NIL", 1, true),
+    "an unresolved session did not display its configured model")
+  state.session.model, state.session.model_label = "saved-alias", "Saved Alias 5"
+  controller.refresh_winbar()
+  title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar, { use_winbar = true, maxwidth = 200 }).str
+  assert(title:find("Saved Alias 5", 1, true) and not title:find("saved-alias", 1, true),
+    "a session without a loaded catalog did not display its saved model label")
+  state.session.model, state.session.model_label = "default", nil
   receive("provider_event", { kind = "runtime_resolved", data = {
     session_id = "native-controller", provider = "Mock CLI", model = "resolved-model",
   } }, "native-controller")

@@ -49,7 +49,7 @@ impl HarnessBroker {
     /// Poll the same owned jobs and settlement phases used by the service driver.
     pub(crate) async fn drive_local_foreground(
         &mut self,
-        dispatch: ForegroundDispatch,
+        dispatch: TurnTransaction,
         updates: publication::SessionUpdateStream,
     ) -> Result<DispatchResult> {
         Box::pin(self.drive_local_foreground_initial(dispatch, updates, None)).await
@@ -57,7 +57,7 @@ impl HarnessBroker {
 
     pub(crate) async fn drive_local_foreground_initial(
         &mut self,
-        mut dispatch: ForegroundDispatch,
+        mut dispatch: TurnTransaction,
         mut updates: publication::SessionUpdateStream,
         initial: Option<ForegroundJob>,
     ) -> Result<DispatchResult> {

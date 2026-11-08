@@ -14,14 +14,13 @@ use super::{
     queue::QueuedCommand,
     services::OwnerServices,
     transition::{
-        ChildCollectionPolicy, ExchangeTransition, ForegroundStatus, RetainedTransition,
-        TransitionEvent, TransitionFailure, TransitionIntent, TransitionOutcome,
-        TransitionProgress,
+        ChildCollectionPolicy, ExchangeStop, RetainedTransition, StopIntent, TransitionEvent,
+        TransitionFailure, TransitionOutcome, TransitionProgress, TurnStatus,
     },
 };
 
 /// Read the single owner's complete boundary for installing task input.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TaskDeliveryGate {
     /// No foreground, steering, or queued preparation occupies the delivery slot.
     Open,
@@ -37,7 +36,7 @@ pub(super) struct TaskCommandRun {
     stage: TaskStage,
     checkpoint: Option<TaskCommandCheckpoint>,
     control: Option<OwnedSemaphorePermit>,
-    transition: Option<ExchangeTransition>,
+    transition: Option<ExchangeStop>,
 }
 
 impl TaskCommandRun {
@@ -73,7 +72,7 @@ impl TaskCommandRun {
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.transition
             .as_mut()
-            .and_then(ExchangeTransition::take_collection_signal)
+            .and_then(ExchangeStop::take_collection_signal)
     }
 
     /// Close tool admission only while old invocation work is being collected or replaced.
@@ -260,7 +259,7 @@ impl TaskCommandRun {
     /// Await one retained fact while provider observations and caller intake continue to advance.
     pub(super) async fn next(
         &mut self,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         delivery: TaskDeliveryGate,
     ) -> TaskCommandEvent {
         match &mut self.stage {
@@ -316,7 +315,7 @@ impl TaskCommandRun {
     pub(super) fn update(
         &mut self,
         event: TaskCommandEvent,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         broker: &mut crate::broker::HarnessBroker,
         services: &OwnerServices,
         can_commit: bool,
@@ -674,9 +673,9 @@ impl TaskCommandRun {
                             events,
                         });
                     }
-                    task.transition = Some(ExchangeTransition::start(
+                    task.transition = Some(ExchangeStop::start(
                         task.command.record.request.id.clone(),
-                        TransitionIntent::Cancel(super::command::CancelledInputPolicy::Retain),
+                        StopIntent::Cancel(super::command::CancelledInputPolicy::Retain),
                         services,
                         None,
                         None,
@@ -748,7 +747,7 @@ impl TaskCommandRun {
                 if matches!(self.stage, TaskStage::Ready(_)) {
                     return Ok(TaskCommandProgress::waiting());
                 }
-                Err(OperationFailure::DispatchUnconfirmed)
+                Err(OperationFailure::DispatchLost)
             }
             TaskCommandEvent::Ready => {
                 let TaskStage::Ready(outcome) =
@@ -768,7 +767,7 @@ impl TaskCommandRun {
     pub(super) fn into_retained(self) -> (QueuedCommand, RetainedTransition) {
         let mut retained = self
             .transition
-            .map(ExchangeTransition::into_retained)
+            .map(ExchangeStop::into_retained)
             .unwrap_or_else(|| RetainedTransition::configuration(self.control));
         match self.stage {
             TaskStage::PreparingCreation { task, .. } => {
@@ -1273,9 +1272,9 @@ impl TaskCommandRun {
         } else {
             None
         };
-        self.transition = Some(ExchangeTransition::start(
+        self.transition = Some(ExchangeStop::start(
             self.command.record.request.id.clone(),
-            TransitionIntent::Reconfigure {
+            StopIntent::Reconfigure {
                 children: ChildCollectionPolicy::Collect,
             },
             services,

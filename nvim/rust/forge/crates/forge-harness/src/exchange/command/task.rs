@@ -786,9 +786,9 @@ pub(crate) enum TaskSynchronizationFailure {
     /// Task/input authority or compatibility resources prevented initial delivery after task commit.
     #[error("initial task input could not be prepared for dispatch")]
     InputPreparationUnavailable,
-    /// Task input work remains owned, but its handoff was not confirmed before the observation deadline.
-    #[error("initial task input dispatch was not confirmed; delivery remains owned")]
-    DispatchUnconfirmed,
+    /// The provider worker ended before it confirmed the task input's dispatch, so the input is never resent.
+    #[error("the provider did not confirm it received the task input")]
+    DispatchLost,
     /// Host restart ended observation after the task checkpoint committed.
     #[error("synchronization was interrupted by a host restart")]
     Interrupted,
@@ -805,7 +805,7 @@ impl TaskSynchronizationFailure {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::InputPreparationUnavailable => "task_input_preparation_unavailable",
-            Self::DispatchUnconfirmed => "provider_dispatch_unconfirmed",
+            Self::DispatchLost => "provider_dispatch_unconfirmed",
             Self::Interrupted => "command_interrupted",
             Self::TargetChanged => "task_changed",
             Self::StateUnavailable => "task_state_unavailable",

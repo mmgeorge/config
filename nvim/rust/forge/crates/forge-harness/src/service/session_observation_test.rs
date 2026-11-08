@@ -245,14 +245,16 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     foreground.fail.notify_one();
     async {
         loop {
-            // Observation loss fences foreground execution until explicit new work recovers
-            // the binding, so settlement shows through the drained input queue instead.
-            if controller
-                .coordinator
-                .submissions
-                .snapshot()?
-                .messages
-                .is_empty()
+            // Observation loss closes the provider's event stream, so the owner fails the turn,
+            // drains the input queue, and restarts the provider on its own initiative.
+            // The restart reopens execution last, so an open permit marks it finished.
+            if controller.coordinator.execution.available_permits() == 1
+                && controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .is_empty()
                 && delivered.lock().unwrap()[before_loss..]
                     .iter()
                     .any(|event| {
@@ -269,8 +271,8 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     .await?;
     assert_eq!(
         controller.coordinator.execution.available_permits(),
-        0,
-        "failed observation left foreground execution open before recovery"
+        1,
+        "the automatic restart did not reopen foreground execution"
     );
     let broker = controller.broker.lock().await;
     assert!(
@@ -316,8 +318,9 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         .map(serde_json::from_str::<Value>)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for event in [
-        "exchange.foreground.failure_settled",
+        "exchange.turn.failure_settled",
         "exchange.input.completed",
+        "exchange.restart.finished",
     ] {
         assert!(
             records.iter().any(|record| record["event"] == event),
@@ -336,6 +339,9 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     if let Some(task) = controller.input_task.lock().await.take() {
         task.await?;
     }
+    // The restart installed a live observation stream, which only owner shutdown retires, so
+    // close the owner before collecting the session's listener, as session close does.
+    controller.finish_exchange_owner().await?;
     let native_shutdown = crate::provider::operation::OperationControl::fresh(
         forge_provider_api::ProviderOperation::Shutdown,
     )?;

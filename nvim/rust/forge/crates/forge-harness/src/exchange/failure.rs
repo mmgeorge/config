@@ -18,8 +18,8 @@ pub(super) enum OperationFailure {
     Transition(#[from] TransitionFailure),
     #[error("owner operation state could not be committed")]
     Domain(#[source] anyhow::Error),
-    #[error("replacement dispatch was not confirmed; collection remains required")]
-    DispatchUnconfirmed,
+    #[error("the provider worker ended before it confirmed the dispatch")]
+    DispatchLost,
     #[error("owner operation cannot start another effect after storage certification failed")]
     StorageUncommitted,
     #[error("owner operation exceeded its observation deadline")]
@@ -34,7 +34,45 @@ pub(super) enum OperationFailure {
     Reconciliation(#[source] crate::provider::ProviderError),
 }
 
+/// Describe how a command whose work had to be stopped finishes.
+pub(super) enum StoppedCommand {
+    /// The command finishes with this typed failure.
+    Failed(super::command::CommandFailure),
+    /// Owner storage could not commit the command's outcome.
+    Uncommitted,
+}
+
 impl OperationFailure {
+    /// Classify the outcome of a command that failed while its work was stopped.
+    ///
+    /// A lost deadline reports a timeout, storage failures leave the outcome uncommitted, an
+    /// explicit rejection keeps its own failure, and every other cause means the stop could not
+    /// prove the provider idle.
+    pub(super) fn into_stopped_command(self) -> StoppedCommand {
+        use super::command::CommandFailure;
+        match self {
+            Self::Domain(_)
+            | Self::StorageUncommitted
+            | Self::Transition(TransitionFailure::Domain(_)) => StoppedCommand::Uncommitted,
+            Self::Transition(TransitionFailure::Rejected(failure)) => {
+                StoppedCommand::Failed(failure)
+            }
+            Self::JobDeadline | Self::Transition(TransitionFailure::Overdue) => {
+                StoppedCommand::Failed(CommandFailure::StopTimedOut)
+            }
+            Self::InputReconciliation(_)
+            | Self::Compaction { .. }
+            | Self::DispatchLost
+            | Self::JobObservationLost(_)
+            | Self::Validation(_)
+            | Self::ExecutionUnavailable
+            | Self::Reconciliation(_)
+            | Self::Transition(TransitionFailure::Uncertain) => {
+                StoppedCommand::Failed(CommandFailure::StopFailed)
+            }
+        }
+    }
+
     /// Get a stable host classification without inspecting provider or diagnostic text.
     pub(super) fn code(&self) -> &'static str {
         match self {
@@ -46,7 +84,7 @@ impl OperationFailure {
             Self::Transition(TransitionFailure::Domain(_)) | Self::Domain(_) => {
                 "operation_state_commit_failed"
             }
-            Self::DispatchUnconfirmed => "provider_dispatch_unconfirmed",
+            Self::DispatchLost => "provider_dispatch_unconfirmed",
             Self::StorageUncommitted => "operation_state_uncommitted",
             Self::JobDeadline => "operation_timeout",
             Self::JobObservationLost(_) => "operation_observation_lost",
@@ -112,7 +150,7 @@ impl OperationFailure {
                 | TransitionFailure::Uncertain,
             )
             | Self::Domain(_)
-            | Self::DispatchUnconfirmed
+            | Self::DispatchLost
             | Self::StorageUncommitted
             | Self::JobDeadline
             | Self::JobObservationLost(_)

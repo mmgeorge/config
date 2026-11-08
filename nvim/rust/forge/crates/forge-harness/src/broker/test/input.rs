@@ -1,7 +1,7 @@
 use super::super::{
-    ExchangeAdmission, ForegroundAction, ForegroundCollection, ForegroundDispatch,
-    ForegroundSignal, NativeForegroundSignal, PromptMode, ProviderAttempt, ProviderCompletion,
-    ProviderError, ProviderEvent, ProviderInput, Request, publication,
+    ExchangeAdmission, ForegroundAction, ForegroundCollection, ForegroundSignal,
+    NativeForegroundSignal, PromptMode, ProviderAttempt, ProviderCompletion, ProviderError,
+    ProviderEvent, ProviderInput, Request, TurnTransaction, publication,
 };
 use super::test_support::{completed_message, planning_question_broker, repository};
 use crate::provider::ScopeOwner;
@@ -65,7 +65,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     transaction.acknowledge_native_result();
     transaction.collection = Some(ForegroundCollection::Restart);
     let (sink, _stream) = publication::channel();
-    let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+    let TurnTransaction::Admitting(admission) = broker.begin_foreground_dispatch(
         Request {
             id: 9,
             method: "session.prompt.submit".into(),
@@ -76,7 +76,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     else {
         unreachable!()
     };
-    let mut dispatch = ForegroundDispatch::Running {
+    let mut dispatch = TurnTransaction::Running {
         transaction: Box::new(transaction),
         admission,
     };
@@ -89,7 +89,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
         )?,
         ForegroundAction::Wait
     ));
-    let ForegroundDispatch::Running { transaction, .. } = &dispatch else {
+    let TurnTransaction::Running { transaction, .. } = &dispatch else {
         unreachable!()
     };
     assert!(!transaction.failure_cleanup_active);
@@ -104,7 +104,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
             Box::new(Ok(ProviderCompletion::default())),
         ))),
     )?;
-    assert!(matches!(dispatch, ForegroundDispatch::Finalizing { .. }));
+    assert!(matches!(dispatch, TurnTransaction::Finalizing { .. }));
     Ok(())
 }
 

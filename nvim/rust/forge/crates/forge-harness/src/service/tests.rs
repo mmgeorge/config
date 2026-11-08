@@ -1,6 +1,6 @@
 mod bootstrap;
-mod live_goal;
 mod owner_cancel;
+mod owner_dispatch;
 mod owner_fixture;
 mod owner_storage_failure;
 mod owner_transition;
@@ -1174,10 +1174,8 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
         params:json!({"id":"retry-uncertain","action":{"kind":"retry","id":"uncertain-message","revision":uncertain.upsert[0].revision}})
     }, RuntimeMethod::SessionInputApply, &retry_sink).await?;
     let failure = response_for(&mut retry_output, 4).await?;
-    assert!(
-        failure["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("unconfirmed")),
+    assert_eq!(
+        failure["error"]["code"], "input_delivery_uncertain",
         "{failure}"
     );
     assert_eq!(

@@ -276,6 +276,14 @@ impl CommandQueue {
         }
     }
 
+    /// Get the command that `start` would take next, without starting it.
+    pub(super) fn next_command(&self) -> Option<&super::command::Command> {
+        let id = self.order.front()?;
+        self.pending
+            .get(id)
+            .map(|command| &command.record.request.command)
+    }
+
     /// Start at most one queued command when the driver's update-step contract permits it.
     pub(super) fn start(
         &mut self,

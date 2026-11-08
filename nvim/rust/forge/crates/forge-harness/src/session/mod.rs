@@ -91,6 +91,10 @@ pub struct HarnessSession {
     pub provider_checkpoint_id: Option<String>,
     pub provider_fork_state: ProviderForkState,
     pub model: String,
+    /// Names `model` by the provider catalog's display label known when it was selected, so the
+    /// editor can show it before the catalog loads. Only `model` selects what the provider runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_label: Option<String>,
     #[serde(default)]
     pub provider_label: String,
     #[serde(default)]
@@ -166,9 +170,40 @@ pub struct PlanExecutor {
 pub struct ModelSetting {
     pub reasoning: Option<String>,
     pub context_window: Option<String>,
+    /// Retains the catalog display label last seen for this model identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Find the catalog display label for an exact model identifier.
+///
+/// `default` matches only a catalog entry whose identifier is `default`, never the entry the
+/// provider marks as its default, because that alias can select a different model later.
+pub fn catalog_model_label(
+    catalog: &[crate::provider::ProviderModel],
+    model: &str,
+) -> Option<String> {
+    catalog
+        .iter()
+        .find(|candidate| candidate.id == model)
+        .and_then(|candidate| candidate.label.clone())
 }
 
 impl HarnessSession {
+    /// Select a model with its display label and discard evidence about the previous model.
+    pub fn select_model(&mut self, model: String, model_label: Option<String>) {
+        self.model = model;
+        self.model_label = model_label;
+        self.resolved_model = None;
+    }
+
+    /// Adopt a newer catalog label for the selected model without changing the selection.
+    pub fn refresh_model_label(&mut self, catalog: &[crate::provider::ProviderModel]) {
+        if let Some(label) = catalog_model_label(catalog, &self.model) {
+            self.model_label = Some(label);
+        }
+    }
+
     /// Derive the persistent primary-agent identity from a session identity.
     pub fn primary_agent_id(session_id: &str) -> String {
         format!("{session_id}:agent:primary")

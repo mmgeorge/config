@@ -1297,7 +1297,7 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
     /// Reject unsupported contracts before changed fields decode while preserving new-session resume.
@@ -1342,7 +1342,7 @@ mod test {
         Ok(())
     }
 
-    pub(super) fn session(id: &str, workspace: &str) -> HarnessSession {
+    pub(crate) fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
             purpose: crate::session::SessionPurpose::Conversation,
             id: id.into(),
@@ -1354,6 +1354,7 @@ mod test {
             provider_checkpoint_id: None,
             provider_fork_state: crate::session::ProviderForkState::Ready,
             model: "default".into(),
+            model_label: None,
             provider_label: "Fixture Beta".into(),
             resolved_model: None,
             effort: "medium".into(),

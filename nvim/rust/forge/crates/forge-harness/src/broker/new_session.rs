@@ -28,11 +28,15 @@ pub fn prepare_new_session(
         .as_ref()
         .map_or_else(|| source.model.clone(), |value| value.model.clone());
     let same_model = model == source.model;
-    let context_window = preference
+    let model_setting = preference
         .as_ref()
-        .and_then(|value| value.model_setting.get(&model))
+        .and_then(|value| value.model_setting.get(&model));
+    let context_window = model_setting
         .map(|setting| setting.context_window.clone())
         .unwrap_or_else(|| same_model.then(|| source.context_window.clone()).flatten());
+    let model_label = model_setting
+        .and_then(|setting| setting.label.clone())
+        .or_else(|| same_model.then(|| source.model_label.clone()).flatten());
     let session_id = Uuid::new_v4().to_string();
     let mut child = HarnessSession {
         purpose: crate::session::SessionPurpose::Conversation,
@@ -51,6 +55,7 @@ pub fn prepare_new_session(
         provider_checkpoint_id: None,
         provider_fork_state: ProviderForkState::Ready,
         model,
+        model_label,
         provider_label: source.provider_label,
         resolved_model: None,
         effort: preference

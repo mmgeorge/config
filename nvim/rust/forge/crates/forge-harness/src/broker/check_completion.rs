@@ -25,7 +25,7 @@ impl HarnessBroker {
         prompt: String,
         change_owner: String,
         sink: publication::SessionUpdateSink,
-    ) -> Result<ForegroundDispatch> {
+    ) -> Result<TurnTransaction> {
         let scoped = sink.clone();
         self.with_publication_sink(&scoped, |broker| {
             let mut dispatch = broker.begin_foreground_dispatch(
@@ -36,7 +36,7 @@ impl HarnessBroker {
                 },
                 sink,
             )?;
-            let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+            let TurnTransaction::Admitting(admission) = &mut dispatch else {
                 unreachable!("new foreground dispatch is admitting");
             };
             let mut exchange_admission = ExchangeAdmission::chat(String::new());

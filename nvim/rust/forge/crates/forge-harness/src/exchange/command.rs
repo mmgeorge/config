@@ -726,7 +726,7 @@ pub(crate) enum CommandFailure {
     #[error("command was interrupted by a host restart; inspect retained state before retrying")]
     Interrupted,
     /// Native delivery remains uncertain and cannot be replayed.
-    #[error("input delivery is still unconfirmed; the input was not resent")]
+    #[error("the provider may have received this message, so it was not sent again")]
     DeliveryUncertain,
     /// Retained attachments could not be validated before committing an edit.
     #[error("a retained input attachment is unavailable")]
@@ -741,22 +741,25 @@ pub(crate) enum CommandFailure {
     #[error("the session closed before the command started")]
     OwnerStopping,
     /// Compatibility admission could not be acquired before any collection work began.
-    #[error("session ownership was unavailable; the command could not proceed")]
+    #[error("the session could not take control of its provider, so the command did not run")]
     OwnershipUnavailable,
-    /// Native handoff was not confirmed; no replay is authorized by this failure.
-    #[error("provider dispatch was not confirmed; execution remains owned for collection")]
-    DispatchUnconfirmed,
-    /// Native or host collection could not establish safe execution availability.
-    #[error("execution collection did not establish quiescence; replacement remains blocked")]
-    CollectionUncertain,
-    /// Native collection still owns work after its observation deadline elapsed.
-    #[error("Exceeded cancellation timeout")]
-    CollectionTimedOut,
+    /// The provider worker ended before it confirmed the dispatch, so the input is never resent.
+    #[error("the provider did not confirm it received the message; it is restarting")]
+    DispatchLost,
+    /// A stop could not prove the provider idle, so the owner restarts the provider.
+    #[error("the turn could not be stopped cleanly, so the provider is restarting")]
+    StopFailed,
+    /// The provider stopped and its restart failed, so the session cannot run commands.
+    #[error("the provider stopped and could not be restarted; reopen the session")]
+    ProviderFailed,
+    /// A stop still owns native work after its deadline elapsed.
+    #[error("stopping the turn took too long")]
+    StopTimedOut,
     /// The selected current exchange changed before its command could commit.
     #[error("the selected exchange changed before the command could apply")]
     ExchangeChanged,
     /// A settings job remains retained after its observation deadline.
-    #[error("configuration exceeded its deadline; pending work remains owned for collection")]
+    #[error("applying the configuration took too long; the work it interrupted is still stopping")]
     ConfigurationTimedOut,
     /// Preflight rejected the selection before collecting or changing native work.
     #[error(transparent)]
@@ -787,9 +790,10 @@ impl CommandFailure {
             Self::PrerequisiteFailed => "command_prerequisite_failed",
             Self::OwnerStopping => "command_owner_stopping",
             Self::OwnershipUnavailable => "session_ownership_unavailable",
-            Self::DispatchUnconfirmed => "provider_dispatch_unconfirmed",
-            Self::CollectionUncertain => "execution_collection_uncertain",
-            Self::CollectionTimedOut => "execution_collection_timeout",
+            Self::DispatchLost => "provider_dispatch_unconfirmed",
+            Self::StopFailed => "execution_collection_uncertain",
+            Self::ProviderFailed => "provider_failed",
+            Self::StopTimedOut => "execution_collection_timeout",
             Self::ExchangeChanged => "command_exchange_changed",
             Self::ConfigurationTimedOut => "configuration_timeout",
             Self::ConfigurationRejected(reason) => reason.code(),

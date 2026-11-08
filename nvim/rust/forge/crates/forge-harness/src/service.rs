@@ -1236,6 +1236,11 @@ struct SessionController {
     submission_store: Arc<crate::provider::submission::SubmissionStore>,
     input_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     input_stopping: AtomicBool,
+    /// Fail every later provider initialization, so tests reach a restart that cannot finish.
+    ///
+    /// No provider boundary fails restart initialization, because it opens no native session.
+    #[cfg(test)]
+    initialization_fails: AtomicBool,
     trace: Arc<crate::trace::TraceStore>,
     data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
@@ -1361,6 +1366,8 @@ impl SessionController {
             submission_store: broker.submission_store.clone(),
             input_task: Mutex::new(None),
             input_stopping: AtomicBool::new(false),
+            #[cfg(test)]
+            initialization_fails: AtomicBool::new(false),
             trace: broker.trace.clone(),
             data_root: broker.data_root.clone(),
             observer,

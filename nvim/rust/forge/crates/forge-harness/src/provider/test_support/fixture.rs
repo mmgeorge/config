@@ -37,6 +37,9 @@ type ReconcileHandler = dyn Fn(&SubmissionId, Option<&RecoveryToken>, &[Recovery
     + Sync;
 type PreDispatchHandler =
     dyn Fn(PromptRequest) -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync;
+type SendingHandler = dyn Fn(PromptRequest, watch::Receiver<bool>) -> BoxFuture<'static, Result<(), ProviderError>>
+    + Send
+    + Sync;
 type OpenHandler =
     dyn Fn(SessionRequest) -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync;
 type ConfigureHandler = dyn Fn(BindingId, SessionConfiguration) -> BoxFuture<'static, Result<(), ProviderError>>
@@ -215,6 +218,7 @@ struct FixtureDriver {
     invocation: Arc<FixtureInvocation>,
     handler: Arc<PromptHandler>,
     pre_dispatch: Option<Arc<PreDispatchHandler>>,
+    sending: Option<Arc<SendingHandler>>,
     admission: Option<Arc<AdmissionHandler>>,
     cleanup: Option<Arc<CleanupHandler>>,
     identity: Option<Arc<IdentityHandler>>,
@@ -247,6 +251,13 @@ impl forge_providers::testing::NativeTurnDriver for FixtureDriver {
             if *cancelled.borrow() || self.session.closed.load(Ordering::Acquire) {
                 request.receipt.clone().record_rejected(ProviderError::NotConsumed).await?;
                 return Err(ProviderError::NotConsumed);
+            }
+            // A send in progress cannot observe cancellation: the provider may already hold the input.
+            if let Some(hook) = &self.sending
+                && hook(request.clone(), cancelled.clone()).await.is_err()
+            {
+                request.receipt.clone().record_failure(ProviderError::DeliveryUncertain).await?;
+                return Err(ProviderError::DeliveryUncertain);
             }
             request.dispatch.confirm();
             let receipt = match self.admission.as_ref().map_or(Ok(None), |hook| hook(&request)) {
@@ -313,6 +324,7 @@ pub struct EventFixtureProvider {
     admission: std::sync::RwLock<Option<Arc<AdmissionHandler>>>,
     reconcile: std::sync::RwLock<Option<Arc<ReconcileHandler>>>,
     pre_dispatch: std::sync::RwLock<Option<Arc<PreDispatchHandler>>>,
+    sending: std::sync::RwLock<Option<Arc<SendingHandler>>>,
     thread_open: std::sync::RwLock<Option<Arc<OpenHandler>>>,
     thread_configure: std::sync::RwLock<Option<Arc<ConfigureHandler>>>,
     configure_guard: std::sync::RwLock<Option<Arc<ConfigureHandler>>>,
@@ -351,6 +363,7 @@ impl EventFixtureProvider {
             admission: Default::default(),
             reconcile: Default::default(),
             pre_dispatch: Default::default(),
+            sending: Default::default(),
             thread_open: Default::default(),
             thread_configure: Default::default(),
             configure_guard: Default::default(),
@@ -470,6 +483,24 @@ impl EventFixtureProvider {
             .write()
             .expect("fixture pre-dispatch lock is not poisoned") =
             Some(Arc::new(move |request| Box::pin(handler(request))));
+        self.clone()
+    }
+
+    /// Pause or fail after sending evidence is persisted and before the adapter confirms dispatch.
+    /// The handler receives the invocation's interruption signal so a test can detect a stop
+    /// requested while the send is in flight; the send itself cannot honor it.
+    pub fn with_sending<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
+    where
+        F: Fn(PromptRequest, watch::Receiver<bool>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
+    {
+        *self
+            .sending
+            .write()
+            .expect("fixture sending lock is not poisoned") =
+            Some(Arc::new(move |request, interrupted| {
+                Box::pin(handler(request, interrupted))
+            }));
         self.clone()
     }
 
@@ -1001,6 +1032,11 @@ impl EventFixtureProvider {
             handler: self.handler.clone(),
             pre_dispatch: self
                 .pre_dispatch
+                .read()
+                .expect("fixture hook lock is not poisoned")
+                .clone(),
+            sending: self
+                .sending
                 .read()
                 .expect("fixture hook lock is not poisoned")
                 .clone(),

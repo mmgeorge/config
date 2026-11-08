@@ -28,6 +28,17 @@ pub(super) struct ObservationRecovery {
     deadline: Option<tokio::time::Instant>,
     storage_failed: bool,
     uncommitted: Option<RecoveryEvidence>,
+    demand: RestartDemand,
+}
+
+/// Select whether a requested restart replaces a provider whose observation stream is healthy.
+#[derive(Default, Clone, Copy)]
+enum RestartDemand {
+    /// Restart only when the observation stream closed or configuration is uncertain.
+    #[default]
+    WhenUnhealthy,
+    /// Restart unconditionally, because a turn failed and its provider state is unknown.
+    Always,
 }
 
 #[derive(Default)]
@@ -112,6 +123,23 @@ impl ObservationRecovery {
         }
     }
 
+    /// Restart the current provider generation after a turn failed, even when it looks healthy.
+    ///
+    /// A failed turn can leave native state the owner never observed, so execution reopens only
+    /// after the provider is replaced and initialized again. Return whether the restart is queued;
+    /// it is not when owner storage already failed, which no restart can repair.
+    pub(super) fn request_after_failure(&mut self, current: Arc<SessionObservationInbox>) -> bool {
+        if self.storage_failed {
+            return false;
+        }
+        self.target.get_or_insert(current);
+        self.demand = RestartDemand::Always;
+        if matches!(self.stage, Stage::Idle | Stage::Failed) {
+            self.stage = Stage::Requested;
+        }
+        true
+    }
+
     /// Prevent new caller/native work from overtaking a requested generation recovery.
     pub(super) fn active(&self) -> bool {
         !matches!(self.stage, Stage::Idle | Stage::Failed)
@@ -137,7 +165,10 @@ impl ObservationRecovery {
                 self.finish(Err(ProviderLifecycleFailure::GenerationChanged));
                 return Ok(true);
             }
-            if !target.is_closed() && !services.tasks.configuration_is_uncertain() {
+            if matches!(self.demand, RestartDemand::WhenUnhealthy)
+                && !target.is_closed()
+                && !services.tasks.configuration_is_uncertain()
+            {
                 self.finish(Ok(()));
                 return Ok(true);
             }
@@ -388,6 +419,7 @@ impl ObservationRecovery {
         }
         self.target = None;
         self.deadline = None;
+        self.demand = RestartDemand::WhenUnhealthy;
         self.stage = if result.is_ok() {
             Stage::Idle
         } else {

@@ -1151,7 +1151,7 @@ function M.generation_request(params, callback, on_model, selection)
     if finished then return end
     if not generation then finished = true callback(nil, failure) return end
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
-    local label = generation.model .. effort .. " (unconfirmed)"
+    local label = generation.model .. effort
     if on_model then on_model(label .. " (" .. generation.provider.kind .. ")") end
     request_id = M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, function(...)
       finished = true
@@ -1161,8 +1161,7 @@ function M.generation_request(params, callback, on_model, selection)
       local event = progress.event
       if not on_model or type(event) ~= "table" then return end
       if event.kind == "runtime_resolved" and event.data then
-        label = type(event.data.model) == "string" and (event.data.model .. effort)
-          or (generation.model .. effort .. " (unconfirmed)")
+        label = (type(event.data.model) == "string" and event.data.model or generation.model) .. effort
         on_model(label)
       elseif event.kind == "reasoning_summary" and type(event.text) == "string" then
         on_model(label .. "\n" .. event.text)

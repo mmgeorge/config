@@ -30,6 +30,7 @@ mod task_command;
 mod task_input;
 mod transition;
 pub(crate) use services::OwnerServices;
+mod driver;
 pub(crate) mod journal;
 mod lifecycle;
 mod live_effect_queue;
@@ -61,7 +62,8 @@ mod rollback_run;
 pub(crate) use reconnect::{ReconnectConfirmation, ReconnectError, ReconnectSnapshot};
 mod settings;
 mod shutdown;
-pub(crate) use owner::{ExchangeOwner, ProviderObservationError};
+pub(crate) use driver::ProviderObservationError;
+pub(crate) use owner::ExchangeOwner;
 mod record;
 mod thought;
 

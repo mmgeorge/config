@@ -105,6 +105,9 @@ function M.models(force, callback)
     if key ~= cache_key() then return end
     if not failure then
       state.model_provider, state.model_list = provider, vim.deepcopy(value or {})
+      -- The winbar names the session's model by its catalog label, so it must redraw once the
+      -- catalog arrives instead of keeping the raw selection id such as `opus`.
+      require("forge.views.harness.controller").refresh_winbar()
     end
     deliver(value, failure)
   end)

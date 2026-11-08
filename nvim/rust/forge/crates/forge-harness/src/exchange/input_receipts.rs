@@ -223,7 +223,7 @@ impl InputReceipts {
                     binding: ReceiptBinding::Bound,
                     acceptance,
                     observation: ReceiptObservation::Watching,
-                    work: ReceiptWork::Unconfirmed,
+                    work: ReceiptWork::DeliveryUncertain,
                     accepted: false,
                 },
             );
@@ -315,7 +315,7 @@ impl InputReceipts {
                 if !tracked.accepted {
                     return Err(InputReceiptError::AcceptanceUnconfirmed);
                 }
-                let unconfirmed = matches!(tracked.work, ReceiptWork::Unconfirmed);
+                let unconfirmed = matches!(tracked.work, ReceiptWork::DeliveryUncertain);
                 let delivery = if unconfirmed {
                     None
                 } else {
@@ -404,7 +404,7 @@ impl InputReceipts {
                     update.retracted = Some(tracked.input.id.as_str().into());
                 }
                 if retirement == SubmissionRetirement::Sending {
-                    tracked.work = ReceiptWork::Unconfirmed;
+                    tracked.work = ReceiptWork::DeliveryUncertain;
                 } else {
                     self.pending.remove(&submission);
                 }
@@ -457,7 +457,7 @@ impl InputReceipts {
                     update.retracted = Some(tracked.input.id.as_str().into());
                 }
                 if retirement == SubmissionRetirement::Sending {
-                    tracked.work = ReceiptWork::Unconfirmed;
+                    tracked.work = ReceiptWork::DeliveryUncertain;
                 } else {
                     self.pending.remove(&submission);
                 }
@@ -551,7 +551,7 @@ impl InputReceipts {
             .map_err(InputReceiptError::Queue)?;
         let mut retired = Vec::new();
         for (id, tracked) in &mut self.pending {
-            if !matches!(tracked.work, ReceiptWork::Unconfirmed) {
+            if !matches!(tracked.work, ReceiptWork::DeliveryUncertain) {
                 continue;
             }
             let record = tracked
@@ -635,7 +635,7 @@ struct TrackedInput {
 /// Keep uncertain delivery observed after its dispatch worker has finished.
 enum ReceiptWork {
     Running,
-    Unconfirmed,
+    DeliveryUncertain,
 }
 
 /// Keep failed observation owned without a permanently-ready retry loop.

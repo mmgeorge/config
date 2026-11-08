@@ -13,8 +13,8 @@ use super::{
     rollback::{RollbackFailure, RollbackOutcome},
     services::OwnerServices,
     transition::{
-        ExchangeTransition, ForegroundStatus, RetainedTransition, TransitionEvent,
-        TransitionIntent, TransitionOutcome, TransitionProgress,
+        ExchangeStop, RetainedTransition, StopIntent, TransitionEvent, TransitionOutcome,
+        TransitionProgress, TurnStatus,
     },
 };
 
@@ -23,7 +23,7 @@ pub(super) struct RollbackRun {
     /// Retain the admitted identity and completion observers until its finite outcome commits.
     pub(super) command: QueuedCommand,
     stage: RollbackStage,
-    transition: Option<ExchangeTransition>,
+    transition: Option<ExchangeStop>,
     control: Option<OwnedSemaphorePermit>,
     retirement: Option<OwnedRwLockWriteGuard<()>>,
     pending_finish: Option<(RollbackOutcome, Vec<SessionEvent>)>,
@@ -34,7 +34,7 @@ impl RollbackRun {
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.transition
             .as_mut()
-            .and_then(ExchangeTransition::take_collection_signal)
+            .and_then(ExchangeStop::take_collection_signal)
     }
     /// Get whether this rollback changes history and therefore closes invocation tool admission.
     pub(super) fn closes_tool_admission(&self) -> bool {
@@ -55,9 +55,9 @@ impl RollbackRun {
         let (stage, transition) = if intent.requires_collection() {
             (
                 RollbackStage::Collecting,
-                Some(ExchangeTransition::start(
+                Some(ExchangeStop::start(
                     command.record.request.id.clone(),
-                    TransitionIntent::Cancel(CancelledInputPolicy::Retain),
+                    StopIntent::Cancel(CancelledInputPolicy::Retain),
                     services,
                     None,
                     None,
@@ -90,7 +90,7 @@ impl RollbackRun {
     }
 
     /// Await one owned fact while the driver remains free to process provider events.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> RollbackEvent {
+    pub(super) async fn next(&mut self, foreground: TurnStatus) -> RollbackEvent {
         match &mut self.stage {
             RollbackStage::Acquiring(task) => RollbackEvent::Control(
                 task.await
@@ -130,7 +130,7 @@ impl RollbackRun {
     pub(super) fn update(
         &mut self,
         event: RollbackEvent,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         broker: &mut crate::broker::HarnessBroker,
         services: &OwnerServices,
         can_commit: bool,
@@ -342,7 +342,7 @@ impl RollbackRun {
 /// Hold rollback work after command completion without granting a replacement execution permit.
 pub(super) struct RollbackRecovery {
     stage: RollbackStage,
-    transition: Option<ExchangeTransition>,
+    transition: Option<ExchangeStop>,
     control: Option<OwnedSemaphorePermit>,
     retirement: Option<OwnedRwLockWriteGuard<()>>,
     pending_finish: Option<(RollbackOutcome, Vec<SessionEvent>)>,
@@ -432,7 +432,7 @@ impl RollbackRecovery {
     pub(super) fn into_transition(self) -> RetainedTransition {
         drop(self.retirement);
         self.transition
-            .map(ExchangeTransition::into_retained)
+            .map(ExchangeStop::into_retained)
             .unwrap_or_else(|| RetainedTransition::configuration(self.control))
     }
 }

@@ -462,7 +462,7 @@ the status split. Press `q` there to return. Configure or disable that binding t
 Explicit steering sends the current composer text to the active response while
 preserving queued follow-ups. If the active turn ends before dispatch, the message
 keeps its priority for the next eligible interaction. Harness never automatically
-resends a message whose delivery is unconfirmed.
+resends a message whose delivery is uncertain.
 Consecutive messages sent to an active steering queue are handed off in order
 without waiting for earlier acknowledgments. Each keeps its own delivery status;
 explicitly queued follow-ups still wait for the active work to finish.
@@ -474,6 +474,11 @@ Interrupting a prompt before the model shows any reply, reasoning, or tool activ
 removes that exchange and returns the prompt to the composer; the provider's echo of
 your own prompt does not count as activity. After visible activity, the exchange stays
 in history as cancelled.
+When a turn fails in a way that leaves the provider's state unknown, such as a send
+that ends without confirmation, Harness restarts the provider before it runs anything
+else. Commands, including `Ctrl-C`, wait until the restart finishes. If the provider
+cannot restart, the session shows an error, later commands fail immediately, and the
+session must be reopened.
 Pending steering appears above queued follow-ups in the status split. Explicitly
 queued messages remain visible while execution is paused or idle. Direct submissions
 enter exchange history. The lower prompt buffer contains only the draft being edited.
@@ -481,7 +486,7 @@ The prompt grows with visual wrapped rows up to its configured maximum height.
 Longer drafts scroll through wrapped rows without inserting newlines into the text.
 Queued prompts remain visible until accepted. If submission fails before acceptance,
 the message and its attachments remain visible in red. `Alt-R` retries the first
-failed message without changing the composer draft. For unconfirmed delivery, the
+failed message without changing the composer draft. For uncertain delivery, the
 same shortcut checks provider acceptance before permitting a resend. Recovery entries
 retained after a host restart require manual delivery confirmation and are not resent
 by this shortcut. Explicitly queued messages do not interrupt the active response or checks.

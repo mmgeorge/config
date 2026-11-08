@@ -290,10 +290,10 @@ impl HarnessBroker {
     /// Continue the retained invocation until its child and user inputs are settled.
     pub(crate) fn complete_foreground_native(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         outcome: ForegroundOutcome,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Running {
+        let TurnTransaction::Running {
             transaction,
             admission,
         } = dispatch
@@ -324,15 +324,15 @@ impl HarnessBroker {
                         None,
                         transaction.collection,
                     ));
-                let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
-                let ForegroundDispatch::Running {
+                let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
+                let TurnTransaction::Running {
                     transaction,
                     admission,
                 } = old
                 else {
                     unreachable!("running owner checked above")
                 };
-                *dispatch = ForegroundDispatch::Finalizing {
+                *dispatch = TurnTransaction::Finalizing {
                     transaction,
                     admission,
                 };
@@ -537,15 +537,15 @@ impl HarnessBroker {
                 transaction.collection,
             ));
         }
-        let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
-        let ForegroundDispatch::Running {
+        let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
+        let TurnTransaction::Running {
             transaction,
             admission,
         } = old
         else {
             unreachable!("running owner checked above")
         };
-        *dispatch = ForegroundDispatch::Finalizing {
+        *dispatch = TurnTransaction::Finalizing {
             transaction,
             admission,
         };

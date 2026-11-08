@@ -10,11 +10,11 @@ use super::queue::QueuedCommand;
 use super::services::{OwnerServices, ProviderGenerationPermit};
 use super::settings::{SettingsEvent, SettingsProgress, SettingsRun};
 use super::transition::{
-    ChildCollectionPolicy, ExchangeTransition, ForegroundStatus, RetainedTransition,
-    TransitionEvent, TransitionFailure, TransitionIntent, TransitionOutcome, TransitionProgress,
+    ChildCollectionPolicy, ExchangeStop, RetainedTransition, StopIntent, TransitionEvent,
+    TransitionFailure, TransitionOutcome, TransitionProgress, TurnStatus,
 };
 use crate::broker::{
-    ForegroundDispatch, HarnessBroker,
+    HarnessBroker, TurnTransaction,
     publication::{SessionUpdate, SessionUpdateStream},
 };
 use crate::command::ExecutionPermit;
@@ -25,7 +25,7 @@ use forge_protocol::message::SessionEvent;
 pub(super) struct NativeCommandRun {
     /// Durable command identity and every attached completion observer.
     pub(super) command: QueuedCommand,
-    transition: Option<ExchangeTransition>,
+    transition: Option<ExchangeStop>,
     work: NativeWork,
     stage: NativeCommandStage,
     selected: Option<ExchangeId>,
@@ -46,7 +46,7 @@ impl NativeCommandRun {
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.transition
             .as_mut()
-            .and_then(ExchangeTransition::take_collection_signal)
+            .and_then(ExchangeStop::take_collection_signal)
     }
     /// Keep new tool effects closed while this command owns native collection or replacement.
     pub(super) fn closes_tool_admission(&self) -> bool {
@@ -139,7 +139,7 @@ impl NativeCommandRun {
     }
 
     /// Await one fact while the session driver continues consuming provider events and commands.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> NativeCommandEvent {
+    pub(super) async fn next(&mut self, foreground: TurnStatus) -> NativeCommandEvent {
         let deadline = self.deadline;
         tokio::select! {
             biased;
@@ -152,7 +152,7 @@ impl NativeCommandRun {
     }
 
     /// Consume available stage evidence before observing configuration expiry.
-    async fn next_stage(&mut self, foreground: ForegroundStatus) -> NativeCommandEvent {
+    async fn next_stage(&mut self, foreground: TurnStatus) -> NativeCommandEvent {
         match &mut self.stage {
             NativeCommandStage::AcquiringControl(task) => NativeCommandEvent::Control(
                 task.await
@@ -199,7 +199,7 @@ impl NativeCommandRun {
     pub(super) fn update(
         &mut self,
         event: NativeCommandEvent,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         broker: &mut HarnessBroker,
         services: &OwnerServices,
         can_commit: bool,
@@ -470,20 +470,20 @@ impl NativeCommandRun {
     fn begin_collection(
         &mut self,
         children: ChildCollectionPolicy,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         services: &OwnerServices,
     ) -> Result<NativeCommandProgress, OperationFailure> {
         if self.generation.is_none() || self.control.is_none() {
             return Err(OperationFailure::ExecutionUnavailable);
         }
-        if matches!(foreground, ForegroundStatus::Unavailable) {
+        if matches!(foreground, TurnStatus::Blocked) {
             return Err(OperationFailure::Transition(TransitionFailure::Rejected(
-                CommandFailure::CollectionUncertain,
+                CommandFailure::StopFailed,
             )));
         }
-        self.transition = Some(ExchangeTransition::start_at(
+        self.transition = Some(ExchangeStop::start_at(
             self.command.record.request.id.clone(),
-            TransitionIntent::Reconfigure { children },
+            StopIntent::Reconfigure { children },
             services,
             self.generation.clone(),
             self.control.take(),
@@ -535,7 +535,7 @@ impl NativeCommandRun {
     pub(super) fn into_retained(self) -> (QueuedCommand, RetainedTransition) {
         let mut transition = self
             .transition
-            .map(ExchangeTransition::into_retained)
+            .map(ExchangeStop::into_retained)
             .unwrap_or_else(|| RetainedTransition::configuration(self.control));
         transition.retain_generation(self.generation);
         match self.stage {
@@ -630,7 +630,7 @@ pub(super) enum NativeCommandProgress {
 /// Transfer replacement resources into foreground ownership before confirming command completion.
 pub(super) struct NativeCommandReplacement {
     pub(super) id: uuid::Uuid,
-    pub(super) transaction: ForegroundDispatch,
+    pub(super) transaction: TurnTransaction,
     pub(super) updates: SessionUpdateStream,
     pub(super) execution: ExecutionPermit,
 }

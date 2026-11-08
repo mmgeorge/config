@@ -454,19 +454,16 @@ impl ForegroundFinalization {
 }
 
 impl HarnessBroker {
-    pub(crate) fn stale_continuation_waits_for_question(
-        &self,
-        dispatch: &ForegroundDispatch,
-    ) -> bool {
-        matches!(dispatch, ForegroundDispatch::Finalizing { transaction, .. }
+    pub(crate) fn stale_continuation_waits_for_question(&self, dispatch: &TurnTransaction) -> bool {
+        matches!(dispatch, TurnTransaction::Finalizing { transaction, .. }
             if transaction.finalization.as_ref().is_some_and(|finalization| finalization.phase == FinalizationPhase::WaitingStaleQuestion))
     }
 
     pub(crate) fn resume_stale_after_question(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Finalizing { transaction, .. } = dispatch else {
+        let TurnTransaction::Finalizing { transaction, .. } = dispatch else {
             anyhow::bail!("stale continuation question has no finalizing owner");
         };
         if self
@@ -492,12 +489,12 @@ impl HarnessBroker {
     /// Refresh host prerequisites before re-admitting a proven unsent continuation.
     pub(crate) fn refresh_stale_continuation(
         &mut self,
-        dispatch: &mut ForegroundDispatch,
+        dispatch: &mut TurnTransaction,
         request: ProviderRequest,
         command: Option<crate::provider::SteerCommand>,
         retry: crate::provider::retry::RetryState,
     ) -> Result<ForegroundAction> {
-        let ForegroundDispatch::Running {
+        let TurnTransaction::Running {
             transaction,
             admission,
         } = dispatch
@@ -543,15 +540,15 @@ impl HarnessBroker {
         ticket.retire_for_refresh();
         let engine = transaction.engine.clone();
         let scope = transaction.state.scope.clone();
-        let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
-        let ForegroundDispatch::Running {
+        let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
+        let TurnTransaction::Running {
             transaction,
             admission,
         } = old
         else {
             unreachable!("running owner checked above")
         };
-        *dispatch = ForegroundDispatch::Finalizing {
+        *dispatch = TurnTransaction::Finalizing {
             transaction,
             admission,
         };
@@ -565,10 +562,10 @@ impl HarnessBroker {
     /// Apply one owned checkpoint or settlement result to the retained finalization.
     pub(crate) fn step_foreground_finalization(
         &mut self,
-        dispatch: &mut super::foreground_dispatch::ForegroundDispatch,
+        dispatch: &mut super::foreground_dispatch::TurnTransaction,
         signal: ForegroundSignal,
     ) -> Result<ForegroundAction> {
-        let super::foreground_dispatch::ForegroundDispatch::Finalizing {
+        let super::foreground_dispatch::TurnTransaction::Finalizing {
             transaction,
             admission,
         } = dispatch
@@ -798,16 +795,16 @@ impl HarnessBroker {
                 transaction.question_enabled = true;
                 let old = std::mem::replace(
                     dispatch,
-                    super::foreground_dispatch::ForegroundDispatch::Transitioning,
+                    super::foreground_dispatch::TurnTransaction::Transitioning,
                 );
-                let super::foreground_dispatch::ForegroundDispatch::Finalizing {
+                let super::foreground_dispatch::TurnTransaction::Finalizing {
                     transaction,
                     admission,
                 } = old
                 else {
                     unreachable!("finalization owner checked above")
                 };
-                *dispatch = super::foreground_dispatch::ForegroundDispatch::Running {
+                *dispatch = super::foreground_dispatch::TurnTransaction::Running {
                     transaction,
                     admission,
                 };
@@ -850,15 +847,15 @@ impl HarnessBroker {
                     transaction.native.restart(submission.run())?;
                     transaction.native_open = true;
                     transaction.question_enabled = true;
-                    let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
-                    let ForegroundDispatch::Finalizing {
+                    let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
+                    let TurnTransaction::Finalizing {
                         transaction,
                         admission,
                     } = old
                     else {
                         unreachable!("finalization owner checked above")
                     };
-                    *dispatch = ForegroundDispatch::Running {
+                    *dispatch = TurnTransaction::Running {
                         transaction,
                         admission,
                     };
@@ -956,16 +953,16 @@ impl HarnessBroker {
                 finalization.repair_active = true;
                 let old = std::mem::replace(
                     dispatch,
-                    super::foreground_dispatch::ForegroundDispatch::Transitioning,
+                    super::foreground_dispatch::TurnTransaction::Transitioning,
                 );
-                let super::foreground_dispatch::ForegroundDispatch::Finalizing {
+                let super::foreground_dispatch::TurnTransaction::Finalizing {
                     transaction,
                     admission,
                 } = old
                 else {
                     unreachable!("finalization owner checked above")
                 };
-                *dispatch = super::foreground_dispatch::ForegroundDispatch::Running {
+                *dispatch = super::foreground_dispatch::TurnTransaction::Running {
                     transaction,
                     admission,
                 };
@@ -1092,7 +1089,7 @@ impl HarnessBroker {
                 let settlement_stage = |phase: &'static str| {
                     trace.record(
                         &session_id,
-                        "exchange.foreground.settlement",
+                        "exchange.turn.settlement",
                         json!({
                             "phase":phase, "outcome":native_outcome,
                         }),
@@ -1137,8 +1134,8 @@ impl HarnessBroker {
                 let events = std::mem::take(&mut admission.events);
                 finalization.submission.take();
                 transaction.steering.active.retire();
-                let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
-                let ForegroundDispatch::Finalizing {
+                let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
+                let TurnTransaction::Finalizing {
                     transaction,
                     mut admission,
                 } = old
@@ -1152,7 +1149,7 @@ impl HarnessBroker {
                 admission.sink = None;
                 drop(transaction);
                 drop(admission);
-                *dispatch = super::foreground_dispatch::ForegroundDispatch::Done(DispatchResult {
+                *dispatch = super::foreground_dispatch::TurnTransaction::Done(DispatchResult {
                     response,
                     event: events,
                 });
@@ -2097,9 +2094,9 @@ impl HarnessBroker {
     /// Resume deferred goal evidence only after required questions have resolved.
     pub(crate) fn resume_foreground_goal_after_question(
         &mut self,
-        dispatch: &mut super::foreground_dispatch::ForegroundDispatch,
+        dispatch: &mut super::foreground_dispatch::TurnTransaction,
     ) -> Result<ForegroundAction> {
-        let super::foreground_dispatch::ForegroundDispatch::Finalizing {
+        let super::foreground_dispatch::TurnTransaction::Finalizing {
             transaction,
             admission,
         } = dispatch

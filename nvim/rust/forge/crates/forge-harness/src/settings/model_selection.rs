@@ -6,6 +6,7 @@ use crate::session::{HarnessSession, PlanExecutor};
 /// Retain a complete catalog-validated selection for a tool-free or executor invocation.
 pub(crate) struct ValidatedModelSelection {
     model: String,
+    model_label: Option<String>,
     effort: String,
     service_tier: ServiceTier,
 }
@@ -85,8 +86,7 @@ impl ValidatedModelSelection {
         {
             session.context_usage = None;
         }
-        session.model = self.model.clone();
-        session.resolved_model = None;
+        session.select_model(self.model.clone(), self.model_label.clone());
         session.effort = self.effort.clone();
         session.context_window = None;
         session.service_tier = self.service_tier;
@@ -138,6 +138,7 @@ impl ValidatedModelSelection {
         };
         Ok(Self {
             model: model.into(),
+            model_label: crate::session::catalog_model_label(catalog, model),
             effort: effort.into(),
             service_tier,
         })

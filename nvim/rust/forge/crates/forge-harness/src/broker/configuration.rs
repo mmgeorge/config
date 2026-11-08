@@ -972,10 +972,14 @@ impl HarnessBroker {
         if let Some(model) = params.get("model").and_then(Value::as_str) {
             anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
             if model != configured.model {
-                configured.model = model.to_owned();
-                configured.resolved_model = None;
+                configured.select_model(
+                    model.to_owned(),
+                    crate::session::catalog_model_label(models, model),
+                );
             }
         }
+        // An alias such as `opus` can name a newer model than the saved label describes.
+        configured.refresh_model_label(models);
         if let Some(effort) = params.get("effort").and_then(Value::as_str) {
             anyhow::ensure!(!effort.trim().is_empty(), "effort cannot be empty");
             configured.effort = effort.to_owned();

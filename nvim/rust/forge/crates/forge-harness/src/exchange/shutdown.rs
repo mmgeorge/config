@@ -5,8 +5,8 @@ use futures_util::FutureExt;
 use super::{
     services::OwnerServices,
     transition::{
-        ExchangeTransition, ForegroundStatus, RetainedTransition, TransitionEvent,
-        TransitionFailure, TransitionProgress,
+        ExchangeStop, RetainedTransition, TransitionEvent, TransitionFailure, TransitionProgress,
+        TurnStatus,
     },
 };
 
@@ -21,7 +21,7 @@ impl OwnerShutdown {
     /// Start internal cancellation after the admitted command has reached its finite result.
     pub(super) fn start(services: &OwnerServices) -> Self {
         Self {
-            state: ShutdownState::Collecting(ExchangeTransition::for_shutdown(services)),
+            state: ShutdownState::Collecting(ExchangeStop::for_shutdown(services)),
             attempt_count: 1,
             signals: Default::default(),
         }
@@ -65,7 +65,7 @@ impl OwnerShutdown {
             self.attempt_count = 1;
             self.state = ShutdownState::Recovering(Self::collect(retained, services.clone()));
         } else if matches!(self.state, ShutdownState::Settled { .. }) {
-            self.state = ShutdownState::Collecting(ExchangeTransition::for_shutdown(services));
+            self.state = ShutdownState::Collecting(ExchangeStop::for_shutdown(services));
             self.attempt_count = 1;
         }
     }
@@ -76,7 +76,7 @@ impl OwnerShutdown {
     }
 
     /// Await one retained shutdown fact without blocking foreground or provider event intake.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> ShutdownEvent {
+    pub(super) async fn next(&mut self, foreground: TurnStatus) -> ShutdownEvent {
         match &mut self.state {
             ShutdownState::Collecting(transition) => {
                 ShutdownEvent::Transition(transition.next(foreground.clone()).await)
@@ -96,7 +96,7 @@ impl OwnerShutdown {
     pub(super) fn update(
         &mut self,
         event: ShutdownEvent,
-        foreground: ForegroundStatus,
+        foreground: TurnStatus,
         broker: &mut crate::broker::HarnessBroker,
         services: &OwnerServices,
     ) -> ShutdownProgress {
@@ -156,7 +156,7 @@ impl OwnerShutdown {
                         drop(retained);
                         self.attempt_count += 1;
                         self.state =
-                            ShutdownState::Collecting(ExchangeTransition::for_shutdown(services));
+                            ShutdownState::Collecting(ExchangeStop::for_shutdown(services));
                     }
                     Ok((retained, Ok(()))) => {
                         self.state = ShutdownState::Settled {
@@ -266,7 +266,7 @@ pub(super) struct ShutdownProgress {
 }
 
 enum ShutdownState {
-    Collecting(ExchangeTransition),
+    Collecting(ExchangeStop),
     Recovering(tokio::task::JoinHandle<ShutdownCollection>),
     Retiring(tokio::task::JoinHandle<(ShutdownRetirement, anyhow::Result<()>)>),
     RetirementFailed { _resources: ShutdownRetirement },

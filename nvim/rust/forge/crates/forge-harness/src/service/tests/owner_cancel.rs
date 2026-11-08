@@ -485,7 +485,7 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
         ensure!(!cancellation.is_finished(), "pending progress completed the command");
         let overdue = cancellation.await?;
         ensure!(matches!(overdue,
-            Err(ExecuteCommandError::Failed(CommandFailure::CollectionTimedOut))
+            Err(ExecuteCommandError::Failed(CommandFailure::StopTimedOut))
         ), "overdue cancellation did not preserve its normalized failure");
         ensure!(started.elapsed() >= Duration::from_secs(30));
         ensure!(started.elapsed() < Duration::from_secs(31), "cancellation restarted its budget");

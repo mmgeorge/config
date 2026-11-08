@@ -210,9 +210,12 @@ impl SettingsSnapshot {
     ) -> Result<()> {
         if let Some(model) = self.provider.get("model").and_then(Value::as_str) {
             ensure!(!model.trim().is_empty(), "saved model cannot be empty");
-            session.model = model.to_owned();
-            // Saved configuration does not confirm the model used by a native turn.
-            session.resolved_model = None;
+            // Saved configuration does not confirm the model used by a native turn, and a
+            // label learned for a different model no longer names this one.
+            let model_label = (session.model == model)
+                .then(|| session.model_label.clone())
+                .flatten();
+            session.select_model(model.to_owned(), model_label);
         }
         if let Some(effort) = self.provider.get("effort").and_then(Value::as_str) {
             ensure!(!effort.trim().is_empty(), "saved effort cannot be empty");
