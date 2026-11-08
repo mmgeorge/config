@@ -95,6 +95,9 @@ pub(crate) struct ConnectionHost {
     runtime: Arc<ForgeRuntime>,
     router: Arc<HostRouter>,
     requests: Arc<RequestTaskStore>,
+    /// Signals each shutdown pass that finished feature shutdown and now waits for requests.
+    #[cfg(test)]
+    awaiting_requests: Arc<tokio::sync::Notify>,
 }
 
 struct ConnectionInput<Input> {
@@ -214,6 +217,8 @@ impl ConnectionHost {
             router: Arc::new(HostRouter::new(Arc::clone(&runtime))),
             requests: Arc::clone(&runtime.requests),
             runtime,
+            #[cfg(test)]
+            awaiting_requests: Arc::default(),
         }
     }
 
@@ -533,6 +538,10 @@ impl ConnectionHost {
             {
                 break;
             }
+            #[cfg(test)]
+            if feature_done && !pending.is_empty() {
+                self.awaiting_requests.notify_one();
+            }
             tokio::select! {
                 result = &mut shutdown, if !feature_done => {
                     feature_done = true;
@@ -769,6 +778,11 @@ async fn write_frame<Output: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
+    /// Polls a future once and reports whether it stayed pending.
+    async fn is_pending<Observed: Future>(mut future: std::pin::Pin<&mut Observed>) -> bool {
+        poll_fn(|context| std::task::Poll::Ready(future.as_mut().poll(context).is_pending())).await
+    }
+
     /// Preserve early cancellation identity before a foreground result envelope exists.
     #[test]
     fn early_cancellation_retains_typed_response_code() {
@@ -786,10 +800,12 @@ mod tests {
         let admission = Arc::new(Semaphore::new(1));
         let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
         let (release, released) = oneshot::channel();
+        let (started, request_started) = oneshot::channel();
         requests
             .spawn(7, async move {
                 let _runtime = runtime;
                 let _permit = permit;
+                started.send(()).unwrap();
                 released.await?;
                 Ok(())
             })
@@ -801,16 +817,15 @@ mod tests {
         );
         requests.close();
         assert!(requests.spawn(8, async { Ok(()) }).is_err());
-        assert!(
-            timeout(Duration::from_millis(10), requests.join_next())
-                .await
-                .is_err()
-        );
+        request_started.await.unwrap();
+        let join = requests.join_next();
+        tokio::pin!(join);
+        assert!(is_pending(join.as_mut()).await);
         assert_eq!(requests.pending(), vec![7]);
         assert!(retained.upgrade().is_some());
         assert_eq!(admission.available_permits(), 0);
         release.send(()).unwrap();
-        requests.join_next().await.unwrap().unwrap();
+        join.await.unwrap().unwrap();
         assert!(requests.pending().is_empty());
         assert!(retained.upgrade().is_none());
         assert_eq!(admission.available_permits(), 1);
@@ -827,7 +842,7 @@ mod tests {
         assert!(requests.pending().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn eof_stops_a_writer_blocked_inside_an_output_write() {
         let runtime = Arc::new(ForgeRuntime::new().unwrap());
         let host = ConnectionHost::new(Arc::clone(&runtime));
@@ -952,6 +967,7 @@ mod tests {
             })
             .unwrap();
         let host = ConnectionHost::new(Arc::clone(&runtime));
+        let awaiting_requests = Arc::clone(&host.awaiting_requests);
         let (client, server) = tokio::io::duplex(4096);
         let (input, output) = tokio::io::split(server);
         let running = tokio::spawn(async move { host.run(input, output).await });
@@ -979,18 +995,13 @@ mod tests {
             }
         }
         .await;
+        awaiting_requests.notified().await;
         response.clear();
-        assert!(
-            timeout(
-                Duration::from_millis(20),
-                client.read_until(b'\n', &mut response)
-            )
-            .await
-            .is_err()
-        );
+        let mut read_response = std::pin::pin!(client.read_until(b'\n', &mut response));
+        assert!(is_pending(read_response.as_mut()).await);
         assert_eq!(runtime.requests.pending(), vec![7]);
         release.send(()).unwrap();
-        client.read_until(b'\n', &mut response).await.unwrap();
+        read_response.await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&response).unwrap()["result"]["shutdown"],
             true

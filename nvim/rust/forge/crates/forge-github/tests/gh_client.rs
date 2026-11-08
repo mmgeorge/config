@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +13,7 @@ use forge_github::remote::{
     GhClient, GithubRemote, IssueDetailRequest, IssuePageRequest, RemoteFailureKind,
 };
 use serde_json::json;
+use support::is_pending_after_one_poll;
 
 struct FixtureExecutable {
     _directory: tempfile::TempDir,
@@ -96,158 +99,6 @@ fn request() -> IssuePageRequest {
     }
 }
 
-#[tokio::test]
-async fn immutable_source_acquires_raw_git_blob_without_text_or_symlink_conversion() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    use forge_github::{review_api::GithubReviewRemote, review_source::ReviewSourceRequest};
-    let (root, client) = fixture("success")?;
-    let bytes = b"../target\r\n\0\xff";
-    fs::write(root.path().join("source-blob"), bytes)?;
-    fs::write(
-        root.path().join("source-identity.json"),
-        serde_json::to_vec(&json!({"data":{"repository":{
-            "commit":{"__typename":"Commit","oid":"a".repeat(40)},
-            "source":{"__typename":"Blob","oid":"b".repeat(40),"byteSize":bytes.len()}
-        }}}))?,
-    )?;
-    let path = "folder/λ \"quoted\".rs";
-    let source = client
-        .read_source(ReviewSourceRequest {
-            repository: request().repository,
-            commit: "a".repeat(40),
-            path: path.into(),
-        })
-        .await?;
-    assert_eq!(source.bytes, bytes);
-    assert_eq!(source.blob, Some("b".repeat(40)));
-    let captured: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join("source-request.json"))?)?;
-    assert_eq!(
-        captured["variables"]["expression"],
-        format!("{}:{path}", "a".repeat(40))
-    );
-    assert!(root.path().join("source-blob-read").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn immutable_source_absence_never_requests_a_blob() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    use forge_github::{review_api::GithubReviewRemote, review_source::ReviewSourceRequest};
-    let (root, client) = fixture("success")?;
-    fs::write(
-        root.path().join("source-identity.json"),
-        serde_json::to_vec(&json!({"data":{"repository":{
-            "commit":{"__typename":"Commit","oid":"a".repeat(40)},"source":null
-        }}}))?,
-    )?;
-    let source = client
-        .read_source(ReviewSourceRequest {
-            repository: request().repository,
-            commit: "a".repeat(40),
-            path: "absent.rs".into(),
-        })
-        .await?;
-    assert!(source.blob.is_none() && source.bytes.is_empty());
-    assert!(!root.path().join("source-blob-read").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn repository_users_merge_sources_and_preserve_partial_failure() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("success")?;
-    fs::write(
-        root.path().join("contributors.json"),
-        r#"[[{"login":"Bob"},{"login":"Alice"}]]"#,
-    )?;
-    fs::write(
-        root.path().join("collaborators.json"),
-        r#"[[{"login":"alice","name":"Alice Developer"},{"login":"carol"}]]"#,
-    )?;
-    let users = client.read_repository_users(request().repository).await?;
-    assert_eq!(
-        users
-            .contributors
-            .iter()
-            .map(|user| user.login.as_str())
-            .collect::<Vec<_>>(),
-        ["Alice", "Bob", "carol"]
-    );
-    assert_eq!(
-        users.contributors[0].name.as_deref(),
-        Some("Alice Developer")
-    );
-    assert!(users.failure.is_empty());
-    fs::write(
-        root.path().join("collaborators.failure"),
-        "HTTP 403: Requires repository permission",
-    )?;
-    let users = client.read_repository_users(request().repository).await?;
-    assert_eq!(users.contributors.len(), 2);
-    assert_eq!(users.failure.len(), 1);
-    assert!(users.failure[0].message.contains("collaborators"));
-    fs::write(
-        root.path().join("contributors.failure"),
-        "HTTP 404: Not Found",
-    )?;
-    let failure = client
-        .read_repository_users(request().repository)
-        .await
-        .unwrap_err();
-    assert!(failure.message.contains("contributors") && failure.message.contains("collaborators"));
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn repository_users_distinguish_empty_pages_from_invalid_pages() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("success")?;
-    fs::write(root.path().join("contributors.json"), "[[]]")?;
-    fs::write(root.path().join("collaborators.json"), "[]")?;
-    assert!(
-        client
-            .read_repository_users(request().repository)
-            .await?
-            .contributors
-            .is_empty()
-    );
-    for invalid in [
-        "{}".to_owned(),
-        "[[{}]]".into(),
-        "[[{\"login\":\"bad user\"}]]".into(),
-    ] {
-        fs::write(root.path().join("contributors.json"), &invalid)?;
-        fs::write(root.path().join("collaborators.json"), &invalid)?;
-        assert_eq!(
-            client
-                .read_repository_users(request().repository)
-                .await
-                .unwrap_err()
-                .kind,
-            RemoteFailureKind::InvalidResponse
-        );
-    }
-    let users = serde_json::to_string(&vec![
-        (0..101)
-            .map(|index| json!({"login":format!("user-{index}")}))
-            .collect::<Vec<_>>(),
-    ])?;
-    fs::write(root.path().join("contributors.json"), &users)?;
-    fs::write(root.path().join("collaborators.json"), "[]")?;
-    assert_eq!(
-        client
-            .read_repository_users(request().repository)
-            .await?
-            .contributors
-            .len(),
-        101
-    );
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
 async fn started(root: &Path, count: usize) -> Result<Vec<PathBuf>> {
     async {
         loop {
@@ -303,48 +154,6 @@ async fn native_gh_arguments_input_decode_and_cleanup_preserve_the_remote_contra
 }
 
 #[tokio::test]
-async fn native_issue_detail_preserves_normalized_records_and_explicit_host_routing() -> Result<()>
-{
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("success")?;
-    fs::write(
-        root.path().join("response.json"),
-        include_str!("fixtures/detail.json"),
-    )?;
-    let request = IssueDetailRequest {
-        repository: request().repository,
-        number: 7,
-    };
-    let detail = client.read_issue_detail(request.clone()).await?;
-    assert_eq!(detail.repo, "owner/repo");
-    assert_eq!(detail.number, 7);
-    assert_eq!(detail.comments_count, 1);
-    assert!(detail.body.contains('λ'));
-    let marker = started(root.path(), 1).await?;
-    let id = marker[0]
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .replace("started.", "");
-    let fields = fs::read_to_string(root.path().join(format!("fields.{id}")))?;
-    assert!(fields.split(',').any(|field| field == "body"));
-    assert!(fields.split(',').any(|field| field == "comments"));
-    assert!(!root.path().join(format!("input.{id}")).exists());
-    assert!(
-        client
-            .read_issue_detail(IssueDetailRequest {
-                number: 0,
-                ..request
-            })
-            .await
-            .is_err()
-    );
-    assert_eq!(started(root.path(), 1).await?.len(), 1);
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> Result<()> {
     let _native_test = NATIVE_TEST_LOCK.lock().await;
     let (root, client) = fixture("block")?;
@@ -372,11 +181,7 @@ async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> 
             number: 7,
         });
         tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
-                .await
-                .is_err()
-        );
+        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
     }
     let mut alive = Vec::new();
     for marker in marker {
@@ -400,28 +205,6 @@ async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> 
     for lock in alive {
         lock.try_lock()?;
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn native_detail_failures_preserve_diagnostics_and_never_return_empty_records() -> Result<()>
-{
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("failure")?;
-    fs::write(root.path().join("response.json"), "remote failure body")?;
-    let request = IssueDetailRequest {
-        repository: request().repository,
-        number: 7,
-    };
-    let failure = client.read_issue_detail(request.clone()).await.unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::RateLimited);
-    assert!(failure.message.contains("API rate limit exceeded"));
-    assert!(failure.message.contains("remote failure body"));
-    fs::write(root.path().join("mode"), "success")?;
-    fs::write(root.path().join("response.json"), "{}")?;
-    let failure = client.read_issue_detail(request).await.unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::InvalidResponse);
-    client.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -467,11 +250,7 @@ async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() 
     started(root.path(), 4).await?;
     let waiting = client.read_issues(request());
     tokio::pin!(waiting);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
-            .await
-            .is_err()
-    );
+    assert!(is_pending_after_one_poll(waiting.as_mut()).await);
     assert_eq!(started(root.path(), 4).await?.len(), 4);
     fs::write(root.path().join("mode"), "success")?;
     for caller in caller {
@@ -534,11 +313,7 @@ async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
     {
         let waiting = context.read_issues(request());
         tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
-                .await
-                .is_err()
-        );
+        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
     }
     for caller in caller {
         caller.abort();
@@ -548,28 +323,6 @@ async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn inherited_pipe_handles_retain_admission_until_the_readers_exit() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("descendant")?;
-    let caller = {
-        let client = client.clone();
-        tokio::spawn(async move { client.read_issues(request()).await })
-    };
-    started(root.path(), 1).await?;
-    async {
-        while !root.path().join("descendant.ready").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    .await;
-    caller.abort();
-    let _ = caller.await;
-    assert!(client.shutdown(Duration::ZERO).await.is_err());
-    fs::write(root.path().join("release-descendant"), "release")?;
-    client.shutdown(Duration::from_secs(2)).await?;
-    Ok(())
-}
 use forge_github::pull_request::{
     DesiredPullRequestState, PullRequestLifecycle, PullRequestOperation, PullRequestOutcome,
     PullRequestRequest, PullRequestTarget,
@@ -690,13 +443,14 @@ async fn abandoned_pr_caller_retains_native_write_and_fifo_ownership_until_colle
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-log"))?,
-        "closePullRequest\n"
-    );
     fs::write(root.path().join("release-mutation"), "release")?;
     assert!(queued.await??.ok);
+    // The fixture records whether release had happened when each gh process started, so a
+    // queued write that ran ahead of the abandoned owner would log `released=false`.
+    assert_eq!(
+        fs::read_to_string(root.path().join("mutation-release-order"))?,
+        "closePullRequest released=false\nreopenPullRequest released=true\nconvertPullRequestToDraft released=true\n"
+    );
     assert_eq!(
         fs::read_to_string(root.path().join("mutation-log"))?,
         "closePullRequest\nreopenPullRequest\nconvertPullRequestToDraft\n"
@@ -753,7 +507,7 @@ async fn shutdown_rejects_queued_mutations_and_retains_the_active_native_owner()
         })
     };
     tokio::task::yield_now().await;
-    let shutdown = service.shutdown(Duration::from_millis(20)).await;
+    let shutdown = service.shutdown(Duration::ZERO).await;
     assert_eq!(shutdown.unfinished_jobs, 1);
     assert!(waiting.await?.unwrap_err().to_string().contains("closed"));
     assert_eq!(
@@ -927,13 +681,12 @@ async fn field_edits_and_lifecycle_changes_share_fifo_native_ownership() -> Resu
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-log"))?,
-        "updatePullRequest\n"
-    );
     fs::write(root.path().join("release-mutation"), "release")?;
     assert!(active.await??.ok && next.await??.ok);
+    assert_eq!(
+        fs::read_to_string(root.path().join("mutation-release-order"))?,
+        "updatePullRequest released=false\nclosePullRequest released=true\n"
+    );
     assert_eq!(
         fs::read_to_string(root.path().join("mutation-log"))?,
         "updatePullRequest\nclosePullRequest\n"

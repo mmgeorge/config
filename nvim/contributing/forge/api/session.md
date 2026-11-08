@@ -339,7 +339,7 @@ For an existing caller `caller` and a distinct idle target `saved`, the complete
 {"id":42,"result":{"deleted":"saved","provider_session_preserved":true}}
 ```
 
-The [picker regression](../../../tests/forge/session_picker.lua) checks both identities, the [tab regression](../../../tests/forge/harness_session_picker_tabs.lua) checks that deletion closes another tab's view of the target, and the [built-host regression](../../../tests/forge/harness_host.lua) deletes an idle cached session while another session is running and rejects deletion of the caller itself.
+The [picker regression](../../../lua/forge/tests/unit/views/harness/session_picker.test.lua) checks both identities, the [tab regression](../../../lua/forge/tests/integration/views/harness/harness.test.lua) checks that deletion closes another tab's view of the target, and the [built-host regression](../../../lua/forge/tests/integration/views/harness/harness.test.lua) deletes an idle cached session while another session is running and rejects deletion of the caller itself.
 
 ## `session.document`
 
@@ -613,9 +613,9 @@ Apply an input or queue lifecycle operation.
 
 ### Contract
 
-Accepts [InputOperation](runtime-schemas.md#inputoperation): nonempty `id`, integer `control_revision` defaulting to zero, optional string `after_control`, and a required tagged [InputAction](runtime-schemas.md#inputaction). The seven action variants are `submit`, `retry`, `resume`, `reserve`, `commit`, `release`, and `remove`. Their exact fields and nested message/edit types are in the linked declarations.
+Accepts [InputOperation](runtime-schemas.md#inputoperation): nonempty `id`, integer `control_revision` defaulting to zero, optional string `after_control`, and a required tagged [InputAction](runtime-schemas.md#inputaction). The seven action variants are `submit`, `retry`, `resume`, `reserve`, `status::commit`, `release`, and `remove`. Their exact fields and nested message/edit types are in the linked declarations.
 
-`submit` accepts user-purpose input only. It requires a new nonempty message identity and nonblank text unless model configuration is present. `intent` is `auto` or `queue`. Client configuration can select only `model`, `effort`, `service_tier`, and `context_window`. Harness alone generates task-entry and task-continuation purposes. `reserve` captures a message revision for editing, `commit` validates every edit before changing the queue, and `release` drops that reservation. `remove` and `retry` require the captured editable revision. `resume` requires the current control revision.
+`submit` accepts user-purpose input only. It requires a new nonempty message identity and nonblank text unless model configuration is present. `intent` is `auto` or `queue`. Client configuration can select only `model`, `effort`, `service_tier`, and `context_window`. Harness alone generates task-entry and task-continuation purposes. `reserve` captures a message revision for editing, `status::commit` validates every edit before changing the queue, and `release` drops that reservation. `remove` and `retry` require the captured editable revision. `resume` requires the current control revision.
 
 A clarification uses the same `submit` operation with a top-level `target`.
 For independent questions, supply `{ "owner": "question", "question_id": "...", "revision": 1 }`.

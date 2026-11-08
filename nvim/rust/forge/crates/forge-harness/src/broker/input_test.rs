@@ -5,9 +5,11 @@ use super::super::{
     ProviderError, ProviderEvent, ProviderInput, Request, SessionEventKind, SettlementRequirement,
     SqliteStore, TimelineEntry, publication,
 };
-use super::test_support::{completed_message, planning_question_broker, repository};
+use super::test_support::{
+    completed_message, git_repository, planning_question_broker, repository,
+};
 use crate::provider::ScopeOwner;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -704,7 +706,7 @@ async fn accepted_steering_survives_response_failure() -> Result<()> {
 async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Result<()> {
     for accept_before_cancel in [false, true] {
         async {
-            let repository = repository();
+            let repository = git_repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let provider = Arc::new(BoundarySteeringProvider::new());
@@ -939,13 +941,12 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     assert!(futures_util::poll!(steering.as_mut()).is_pending());
     tokio::time::resume();
     provider.steering_release.add_permits(1);
-    let delivered =
-        tokio::time::timeout(std::time::Duration::from_secs(1), steering.as_mut()).await;
+    let delivered = steering.as_mut().await;
     cancellation.request();
     provider.inner.initial_release.add_permits(1);
     let _cancelled = running.await?;
 
-    delivered.context("steering was abandoned before its acknowledgment deadline")??;
+    delivered?;
     assert!(matches!(
         submission.record()?.delivery,
         crate::provider::submission::SubmissionState::Accepted { .. }

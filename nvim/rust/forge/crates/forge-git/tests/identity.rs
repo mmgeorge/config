@@ -1,32 +1,14 @@
-use std::{path::Path, process::Command};
+mod support;
 
 use forge_git::{RepositoryPath, discover_identity, resolve_argument, validate_path};
-
-fn git(root: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("commit.gpgsign=false")
-        .arg("-c")
-        .arg(format!(
-            "core.hooksPath={}",
-            root.join("disabled-fixture-hooks").display()
-        ))
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use support::{
+    add_detached_worktree, commit_index, head_commit, init_bare_repository, init_repository,
+};
 
 #[test]
 fn unborn_worktree_identity_is_stable_from_nested_paths() {
     let root = tempfile::tempdir().unwrap();
-    git(root.path(), &["init", "--quiet"]);
+    init_repository(root.path());
     let nested = root.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
     let file = nested.join("file.txt");
@@ -48,25 +30,9 @@ fn linked_worktrees_have_distinct_indexes_and_shared_storage_identity() {
     let root = tempfile::tempdir().unwrap();
     let main = root.path().join("main");
     std::fs::create_dir(&main).unwrap();
-    git(&main, &["init", "--quiet"]);
-    git(
-        &main,
-        &[
-            "-c",
-            "user.name=Forge fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "-m",
-            "initial",
-        ],
-    );
-    git(
-        &main,
-        &["worktree", "add", "--quiet", "--detach", "../linked"],
-    );
+    init_repository(&main);
+    commit_index(&main, "initial");
+    add_detached_worktree(&main, &root.path().join("linked"), head_commit(&main));
     let original = discover_identity(&main).unwrap().unwrap();
     let linked = discover_identity(&root.path().join("linked"))
         .unwrap()
@@ -81,7 +47,7 @@ fn linked_worktrees_have_distinct_indexes_and_shared_storage_identity() {
 #[test]
 fn bare_repository_has_storage_without_a_worktree() {
     let root = tempfile::tempdir().unwrap();
-    git(root.path(), &["init", "--bare", "--quiet"]);
+    init_bare_repository(root.path());
     let identity = discover_identity(root.path()).unwrap().unwrap();
     assert!(identity.worktree.is_none());
     assert!(identity.worktree_root.is_none());
@@ -185,7 +151,7 @@ fn path_validation_rejects_a_file_as_an_existing_parent() {
 fn missing_repository_and_invalid_repository_configuration_are_distinct() {
     let root = tempfile::tempdir().unwrap();
     assert!(discover_identity(root.path()).unwrap().is_none());
-    git(root.path(), &["init", "--quiet"]);
+    init_repository(root.path());
     std::fs::write(root.path().join(".git/config"), "[broken\n").unwrap();
     assert!(discover_identity(root.path()).is_err());
 }

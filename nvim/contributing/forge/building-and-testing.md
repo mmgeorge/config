@@ -23,7 +23,7 @@ Inside Harness, run the configured checks instead of these commands:
 | Lint | `rust-lint` |
 | Build | `rust-build` |
 
-`.forge.json` uses explicit dependencies only for the mock integration check, which needs the built executable. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
+No check declares a dependency on the build. Lua tests that launch the Forge host assume a current executable, so run `rust-build` after Rust changes and before `lua-test`. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
 
@@ -60,6 +60,10 @@ A positional filter selects tests whose names contain it. Select one test exactl
 
 Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after five seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it.
 
+Rust tests do not start shells. In every test build, `CheckSupervisor` answers check commands through a scripted runner instead of launching Nushell or PowerShell. By default it interprets `exit N`, `print` and `echo`, and writes a selection receipt for passing scoped checks. A test that needs other behavior calls `script_commands` with a closure that returns `ScriptedCheckOutcome` values. The closure can write the files a real script would, and `hold_until_cancelled` keeps a command running until its check is cancelled. Process ownership itself, including output capture and killing descendant processes, is tested where a real process is the point, in `forge-git`'s command tests.
+
+Broker tests take their workspace from `broker::test_support`. `repository()` returns a plain directory, which the broker opens without Git checkpoints, so most tests launch no Git process. Only tests that exercise checkpoints, rollback, or workspace changes use `git_repository()`. Under nextest, the `git-template` setup script ([`.config/git_template.nu`](../../rust/forge/.config/git_template.nu)) builds that seeded repository once per run under the OS temporary directory and exports its path, so each test copies it instead of running `git init` and `git commit`. Setup scripts are an experimental nextest feature, enabled in `.config/nextest.toml`. Outside nextest, `git_repository()` builds the repository itself.
+
 Add `--all-targets` to the check only when changed test or executable targets need it. Broaden to the workspace only when shared interfaces require it, and keep Cargo-heavy jobs serial. Record the command, deadline, exit status, and failing assertion or diagnostic.
 
 TypeScript projects run their existing type-check command first, such as `npm run typecheck`, with the project's package manager.
@@ -70,10 +74,11 @@ Test fixtures must use the current public check configuration. Task-specific ena
 
 ## Lua tests
 
-Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run exact fixtures, a suite, or the default selection of every fixture:
+Lua fixtures run only through `.forge/checks/lua-tests.nu`, which every Harness Lua check also calls. The runner gives each fixture a fresh headless Neovim, runs fixtures in parallel, and kills the whole process tree of any fixture still running after five seconds, reporting it as a timeout. Host fixtures launch the built executable, so build it first. Run a unit test file or one of its scenarios by name, an integration fixture by path, a suite, or the default selection of every test. [Editor tests](editor-tests.md) describes the unit and integration test layout:
 
 ```nu
-nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua
+nu .forge/checks/lua-tests.nu client::admission_queue
+nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua
 nu .forge/checks/lua-tests.nu --suite walkthrough
 nu .forge/checks/lua-tests.nu
 ```

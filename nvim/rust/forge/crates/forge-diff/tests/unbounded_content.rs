@@ -6,19 +6,33 @@ use forge_diff::{
     syntax::{DeclarationCalls, DeclarationIndex, DeclarationOverview},
 };
 
-#[test]
-fn declaration_owners_accept_complete_source_beyond_former_byte_limits() {
-    let source = format!(
-        "{}fn final_declaration() {{}}\n",
+fn source_beyond_former_byte_limit() -> String {
+    format!(
+        "{}fn final_declaration() {{}}
+",
         " ".repeat(8 * 1024 * 1024 + 1)
-    );
+    )
+}
+
+#[test]
+fn declaration_overview_accepts_complete_source_beyond_former_byte_limits() {
+    let source = source_beyond_former_byte_limit();
     let overview = DeclarationOverview::extract("large.rs", &source).unwrap();
     assert!(overview.contains("final_declaration"));
     DeclarationOverview::parse(
         "large.rs",
-        &format!("{}\n{overview}", " ".repeat(1024 * 1024)),
+        &format!(
+            "{}
+{overview}",
+            " ".repeat(1024 * 1024)
+        ),
     )
     .unwrap();
+}
+
+#[test]
+fn declaration_overview_calls_accept_complete_source_beyond_former_byte_limits() {
+    let source = source_beyond_former_byte_limit();
     let (overview, callable) =
         DeclarationOverview::extract_with_calls("large.rs", &source).unwrap();
     assert!(overview.contains("final_declaration"));
@@ -27,6 +41,11 @@ fn declaration_owners_accept_complete_source_beyond_former_byte_limits() {
             .iter()
             .any(|function| function.owner == "final_declaration")
     );
+}
+
+#[test]
+fn declaration_index_accepts_complete_source_beyond_former_byte_limits() {
+    let source = source_beyond_former_byte_limit();
     let index = DeclarationIndex::extract("large.rs", &source).unwrap();
     assert!(
         index
@@ -34,6 +53,11 @@ fn declaration_owners_accept_complete_source_beyond_former_byte_limits() {
             .iter()
             .any(|symbol| symbol.name == "final_declaration")
     );
+}
+
+#[test]
+fn declaration_calls_accept_complete_source_beyond_former_byte_limits() {
+    let source = source_beyond_former_byte_limit();
     assert!(
         !DeclarationCalls::extract("large.rs", &source, false)
             .unwrap()

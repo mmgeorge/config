@@ -1,4 +1,4 @@
-use super::test::{completed_interaction, planning_question_broker, repository};
+use super::test::{completed_interaction, git_repository, planning_question_broker};
 use super::*;
 use crate::exchange::{ExchangeChangeResult, ExchangeOutcome, ExchangePhase};
 
@@ -45,7 +45,7 @@ fn assert_preserved(broker: &HarnessBroker, exchange: &Exchange, previous: &Exch
 /// Recover a failed completion checkpoint without masking its error with an outcome conflict.
 #[tokio::test]
 async fn failed_completion_checkpoint_can_finalize_as_failed() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let before = initial(&mut broker).await;
@@ -112,7 +112,7 @@ async fn assert_checkpoint_commit_failure_preserves_comparison(
     recover_initial: bool,
 ) {
     {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let before = initial(&mut broker).await;
@@ -177,7 +177,7 @@ async fn assert_checkpoint_commit_failure_preserves_comparison(
 
 #[tokio::test]
 async fn checkpoint_comparison_failure_preserves_previous_comparison() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let before = initial(&mut broker).await;
@@ -221,7 +221,7 @@ async fn checkpoint_comparison_failure_preserves_previous_comparison() {
 
 #[tokio::test]
 async fn captured_workspace_result_survives_formatting_external_edits_and_reopening() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let before = initial(&mut broker).await;

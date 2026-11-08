@@ -217,6 +217,10 @@ impl RuntimeStatus {
             return Ok(None);
         };
         context.check_admission(forge_provider_api::ProviderOperation::Inspect)?;
+        #[cfg(test)]
+        if let Some(version) = super::in_memory_peer::version_for(program) {
+            return parse_claude_version(version.as_bytes()).map(Some);
+        }
         use tokio::io::AsyncReadExt;
         let mut command = forge_shell::process::command(program, arguments);
         command.arg("--version");

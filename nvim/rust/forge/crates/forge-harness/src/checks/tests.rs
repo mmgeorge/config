@@ -1,3 +1,4 @@
+use super::supervisor::ScriptedCheckOutcome;
 use super::*;
 use anyhow::Result;
 use std::{
@@ -72,6 +73,13 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
     .unwrap()
 }
 
+fn hold_until_cancelled() -> ScriptedCheckOutcome {
+    ScriptedCheckOutcome {
+        hold_until_cancelled: true,
+        ..ScriptedCheckOutcome::default()
+    }
+}
+
 fn direct_operation(command: &str, args: &[&str], inputs: Option<CheckInputMap>) -> CheckOperation {
     CheckOperation {
         input: false,
@@ -116,6 +124,16 @@ async fn source_changed_by_a_check_keeps_evidence_for_its_starting_inputs() -> R
         vec![definition("mutating", "'after' | save --force source.txt")],
     );
     let runner = make_runner(workspace.path(), data.path());
+    runner.script_commands(|request| {
+        assert_eq!(request.command, "'after' | save --force source.txt");
+        std::fs::write(
+            request.directory.join("source.txt"),
+            "after
+",
+        )
+        .expect("scripted check rewrites its source");
+        ScriptedCheckOutcome::default()
+    });
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
@@ -157,6 +175,26 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
     );
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
+    let invocations = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+    let recorded_invocations = Arc::clone(&invocations);
+    runner.script_commands(move |request| {
+        let (program, args) = request
+            .invocation
+            .expect("a direct check launches without shell source");
+        assert!(request.command.is_empty());
+        recorded_invocations
+            .lock()
+            .unwrap()
+            .push((program.to_owned(), args.to_vec()));
+        ScriptedCheckOutcome {
+            stdout: format!(
+                "{}
+",
+                args.last().expect("file argument")
+            ),
+            ..ScriptedCheckOutcome::default()
+        }
+    });
     let path = "src/spaces $value; [quoted].rs";
     let prepared = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
@@ -176,6 +214,17 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
     )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::Passed);
+    assert_eq!(
+        *invocations.lock().unwrap(),
+        [(
+            "nu".to_owned(),
+            vec![
+                "--no-config-file".to_owned(),
+                "echo.nu".to_owned(),
+                path.to_owned()
+            ]
+        )]
+    );
     assert_eq!(
         std::fs::read_to_string(&run.commands[0].stdout)?.trim(),
         path
@@ -271,6 +320,17 @@ async fn explicit_case_selection_rejects_empty_requests_without_running_the_help
     check.all = CheckOperation { input: true, args: None, inputs: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()};
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
+    runner.script_commands(|request| {
+        std::fs::write(request.directory.join("selected.txt"), "selected case")
+            .expect("scripted helper writes its marker");
+        std::fs::write(
+            request.receipt,
+            serde_json::to_vec(&serde_json::json!({"version": 1, "selection": request.selection}))
+                .unwrap(),
+        )
+        .expect("scripted helper writes its receipt");
+        ScriptedCheckOutcome::default()
+    });
     let case_selection = CheckSelection::Cases {
         cases: vec![CheckCase {
             target: None,
@@ -443,6 +503,12 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     };
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
+    runner.script_commands(|_| ScriptedCheckOutcome {
+        stdout: "no receipt
+"
+        .into(),
+        ..ScriptedCheckOutcome::default()
+    });
     let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         include: Vec::new(),
 
@@ -513,6 +579,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     let data = tempfile::tempdir()?;
     save(workspace.path(), vec![definition("slow", "sleep 5sec")]);
     let runner = make_runner(workspace.path(), data.path());
+    runner.script_commands(|_| hold_until_cancelled());
     let first = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),
         crate::checks::RunRequest::All,
@@ -576,6 +643,22 @@ async fn shell_timeout_kills_the_process_and_stops_the_check_run() -> Result<()>
         ],
     );
     let runner = make_runner(workspace.path(), data.path());
+    runner.script_commands(|request| {
+        if request.command.starts_with("print ready") {
+            ScriptedCheckOutcome {
+                stdout: "ready
+"
+                .into(),
+                hold_until_cancelled: true,
+                ..ScriptedCheckOutcome::default()
+            }
+        } else {
+            panic!(
+                "a command after the timed-out one must not start: {}",
+                request.command
+            )
+        }
+    });
     let mut settings = crate::settings::SettingsStore::open(data.path())?;
     settings.patch(
         crate::settings::SettingTarget {
@@ -635,15 +718,23 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
         )],
     );
     let runner = make_runner(workspace.path(), data.path());
+    let ready_marker = ready.clone();
+    runner.script_commands(move |_| {
+        std::fs::write(&ready_marker, "ready").expect("scripted command signals readiness");
+        hold_until_cancelled()
+    });
     let (sink, mut stream) = crate::broker::publication::channel();
     let filler = crate::broker::publication::SessionUpdate::CheckFailure {
         run_id: "backpressure-filler".into(),
         error: "x".repeat(16_384),
     };
-    while let Ok(result) =
-        tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await
-    {
-        result?;
+    // A bounded channel refuses a send exactly when it is full, so poll each send once.
+    loop {
+        let mut pending_send = std::pin::pin!(sink.send_wait(filler.clone()));
+        match futures_util::poll!(pending_send.as_mut()) {
+            std::task::Poll::Ready(result) => result?,
+            std::task::Poll::Pending => break,
+        }
     }
     let run = runner.prepare_request(
         crate::timeline::TimelineOwner::session("checks-test"),

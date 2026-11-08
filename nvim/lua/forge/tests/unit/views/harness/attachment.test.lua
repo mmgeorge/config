@@ -1,0 +1,165 @@
+-- Unit tests for `forge.views.harness.attachment` (attachment.lua). Each scenario row runs in its own
+-- headless Neovim: `.forge/checks/lua-tests.nu` passes the row's name as `arg[1]`.
+local scenarios = {
+  { name = "harness_attachments", run = function()
+vim.loader.enable(false)
+local attachment = require("forge.views.harness.attachment")
+local client = require("forge.client")
+local original_stat = vim.uv.fs_stat
+vim.uv.fs_stat = function(path, callback)
+  if not callback then return original_stat(path) end
+  if path:match("^/plan") then callback("ENOENT: missing", nil) else callback(nil, { type = "file" }) end
+end
+local requests, failures = {}, {}
+client.request = function(request_specification, callback)
+  local session_id = request_specification.session_id
+  local method = request_specification.method
+  local params = request_specification.params or {}
+
+  assert(method == "session.attachment.import" and session_id == "attachments")
+  requests[#requests + 1] = { params = params, callback = callback }
+end
+require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
+local buffer = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_set_current_buf(buffer)
+local previous_insert_after = vim.fn.maparg("d", "n", false, true)
+local previous_paste = vim.fn.maparg("p", "n", false, true)
+vim.keymap.set("n", "d", "a")
+vim.keymap.set("n", "p", "P")
+attachment.attach(buffer, "attachments")
+local function selection(number, kind)
+  return { id = string.rep(kind == "PDF" and "b" or "a", 64), label = "[" .. kind .. " #" .. number .. "]",
+    name = kind == "PDF" and "report.pdf" or "screen.png", media_type = kind == "PDF" and "application/pdf" or "image/png",
+    start = 0, ["end"] = #("[" .. kind .. " #" .. number .. "]") }
+end
+local function text() return table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n") end
+local function replace(source)
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, vim.split(source, "\n", { plain = true }))
+  attachment.restore(buffer, {})
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+end
+local function settle() vim.wait(20, function() return false end) end
+local success, failure = xpcall(function()
+  assert(vim.fn.maparg("d", "n", false, true).buffer == 0,
+    "attachment handling shadowed the user's insert-after mapping")
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(buffer, "n")) do
+    assert(mapping.lhs ~= "d" and mapping.lhs ~= "c" and mapping.lhs ~= "x"
+      and mapping.lhs ~= "p" and mapping.lhs ~= "P",
+      "attachment handling installed a hardcoded edit operator")
+  end
+  replace("ab")
+  vim.api.nvim_feedkeys(vim.keycode("dZ<Esc>"), "xt", false)
+  assert(text() == "aZb", "the user's insert-after mapping did not execute")
+  vim.fn.setreg('"', "Q")
+  vim.api.nvim_win_set_cursor(0, { 1, 1 })
+  vim.api.nvim_feedkeys("p", "xt", false)
+  settle()
+  assert(text() == "aQZb", "the user's paste direction was overridden")
+  vim.keymap.del("n", "d")
+  vim.keymap.del("n", "p")
+  replace("")
+  vim.api.nvim_paste('"C:\\shots\\my image.png"', false, -1)
+  settle()
+  assert(#requests == 1 and attachment.pending(buffer))
+  vim.api.nvim_buf_set_text(buffer, 0, 0, 0, 0, { "before " })
+  requests[1].callback(selection(1, "Image"))
+  settle()
+  assert(text() == "before [Image #1]")
+  local draft = attachment.capture(buffer)
+  assert(#draft.attachments == 1 and draft.attachments[1].start == 7)
+  assert(draft.attachments[1].id == string.rep("a", 64))
+  assert(not draft.text:find("forge%-attachment"))
+
+  vim.api.nvim_win_set_cursor(0, { 1, 7 })
+  vim.api.nvim_feedkeys("v9ly", "xt", false)
+  assert(vim.fn.getreg('"') == "[Image #1]")
+  vim.keymap.set("n", "gP", "p", { buffer = buffer })
+  vim.cmd.normal({ args = { "G$gP" }, bang = false })
+  settle()
+  assert(text() == "before [Image #1][Image #1]")
+  assert(#attachment.capture(buffer).attachments == 2, "copy lost its separate attachment state")
+  vim.api.nvim_win_set_cursor(0, { 1, 7 })
+  vim.keymap.set({ "n", "x" }, "gD", "d", { buffer = buffer })
+  vim.api.nvim_feedkeys("v9lgD", "xt", false)
+  assert(#attachment.capture(buffer).attachments == 1, "cut retained a deleted attachment")
+  vim.cmd.normal({ args = { "0P" }, bang = false })
+  settle()
+  assert(text() == "[Image #1]before [Image #1]")
+  assert(#attachment.capture(buffer).attachments == 2)
+
+  local saved = attachment.capture(buffer)
+  replace(saved.text)
+  assert(#attachment.capture(buffer).attachments == 0, "plain label text fabricated an attachment")
+  attachment.restore(buffer, saved.attachments)
+  assert(#attachment.capture(buffer).attachments == 2, "explicit draft restore lost attachments")
+  vim.api.nvim_feedkeys("ggyyGp", "xt", false)
+  settle()
+  assert(#attachment.capture(buffer).attachments == 4, "whole-line copy lost attachment objects")
+  vim.cmd("normal! u")
+  assert(#attachment.capture(buffer).attachments == 2, "undo lost the surviving attachment objects")
+  vim.api.nvim_feedkeys(vim.keycode("<C-r>"), "xt", false)
+  assert(#attachment.capture(buffer).attachments == 4, "redo failed to restore attachment objects")
+  replace("[Image #1](forge-attachment:broken) <image path=missing.png>")
+  assert(#attachment.capture(buffer).attachments == 0)
+  assert(#requests == 1, "literal marker syntax caused an import")
+  vim.api.nvim_feedkeys("ggyyGp", "xt", false)
+  settle()
+  assert(#attachment.capture(buffer).attachments == 0, "plain text copy reused a previous attachment")
+
+  replace("")
+  vim.api.nvim_paste("/tmp/my\\ image.png", false, 1)
+  vim.api.nvim_paste("", false, 3)
+  settle()
+  assert(requests[2].params.path == "/tmp/my image.png")
+  replace("newer draft")
+  requests[2].callback(selection(2, "Image"))
+  settle()
+  assert(text() == "newer draft" and #attachment.capture(buffer).attachments == 0)
+
+  replace("")
+  vim.api.nvim_paste("C:\\missing.pdf", false, -1)
+  settle()
+  requests[3].callback(nil, "file not found")
+  settle()
+  assert(text() == "C:\\missing.pdf" and failures[1] == "file not found")
+  replace("")
+  vim.api.nvim_paste('"C:\\one.png" "C:\\two.pdf"', false, -1)
+  settle()
+  requests[4].callback(selection(4, "Image"))
+  settle()
+  assert(requests[5].params.path == "C:\\two.pdf")
+  requests[5].callback(selection(5, "PDF"))
+  settle()
+  assert(text() == "[Image #4] [PDF #5]" and #attachment.capture(buffer).attachments == 2)
+  replace("")
+  vim.api.nvim_paste("/plan explain this", false, -1)
+  settle()
+  assert(#requests == 5 and text() == "/plan explain this")
+  replace("")
+  vim.api.nvim_paste("file:///C:/shots/my%20image.png", false, -1)
+  settle()
+  assert(requests[6].params.path:lower():gsub("\\", "/"):find("c:/shots/my image.png", 1, true))
+  requests[6].callback(selection(6, "Image"))
+  settle()
+  local owned = attachment.capture(buffer)
+  vim.api.nvim_buf_set_text(buffer, 0, 0, 0, 0, { string.rep("x", 4000) })
+  assert(attachment.capture(buffer).attachments[1].start == 4000)
+  replace(owned.text)
+  assert(#attachment.capture(buffer).attachments == 0)
+end, debug.traceback)
+vim.uv.fs_stat = original_stat
+pcall(vim.keymap.del, "n", "d")
+if next(previous_insert_after) then vim.fn.mapset("n", false, previous_insert_after) end
+pcall(vim.keymap.del, "n", "p")
+if next(previous_paste) then vim.fn.mapset("n", false, previous_paste) end
+if not success then error(failure) end
+print("harness_attachments: passed")
+vim.cmd("qa!")
+  end },
+}
+
+local selected = arg[1]
+for _, scenario in ipairs(scenarios) do
+  if scenario.name == selected then return scenario.run() end
+end
+error(("unknown scenario %q"):format(tostring(selected)))

@@ -25,64 +25,14 @@
           "nvim/lua/markdown_math/**",
           "nvim/lua/markdown_code.lua",
           "nvim/lua/plugins/forge.lua",
-          "nvim/tests/**/*.lua",
-          ".forge/checks/lua-tests.nu"
+          "nvim/lua/*/tests/**/*.lua",
+          ".forge/checks/lua-tests.nu",
+          "nvim/lua/git/**"
         ],
         "exclude": [
-          "nvim/tests/forge/background_host.lua",
-          "nvim/tests/forge/client_executable_copy.lua",
-          "nvim/tests/forge/client_callback_isolation.lua",
-          "nvim/tests/forge/commit_host.lua",
-          "nvim/tests/forge/commit_large_output_host.lua",
-          "nvim/tests/forge/commit_status_reuse.lua",
-          "nvim/tests/forge/commit_settings_host.lua",
-          "nvim/tests/forge/forge_client.lua",
-          "nvim/tests/forge/harness_control_responsiveness.lua",
-          "nvim/tests/forge/harness_checks_host.lua",
-          "nvim/tests/forge/harness_admission_host.lua",
-          "nvim/tests/forge/harness_provider_checklist_host.lua",
-          "nvim/tests/forge/harness_checkpoint_host.lua",
-          "nvim/tests/forge/harness_automatic_checks.lua",
-          "nvim/tests/forge/harness_attachments_host.lua",
-          "nvim/tests/forge/harness_approval_resume_host.lua",
-          "nvim/tests/forge/harness_message_folds_host.lua",
-          "nvim/tests/forge/harness_interrupt_host.lua",
-          "nvim/tests/forge/harness_input_timeout.lua",
-          "nvim/tests/forge/harness_host.lua",
-          "nvim/tests/forge/harness_tasks_host.lua",
-          "nvim/tests/forge/walkthrough_host.lua",
-          "nvim/tests/forge/harness_replan_host.lua",
-          "nvim/tests/forge/language_syntax_host.lua",
-          "nvim/tests/forge/plan_review_host.lua",
-          "nvim/tests/forge/harness_publication_restart_host.lua",
-          "nvim/tests/forge/markdown_viewport.lua",
-          "nvim/tests/forge/plan_review_calls_host.lua",
-          "nvim/tests/forge/plan_checks_host.lua",
-          "nvim/tests/forge/receive_initialize_host.lua",
-          "nvim/tests/forge/pr_context_host.lua",
-          "nvim/tests/forge/source_host.lua",
-          "nvim/tests/forge/semantic_execution_host.lua",
-          "nvim/tests/forge/status_recent_commits_host.lua",
-          "nvim/tests/forge/status_push_host.lua",
-          "nvim/tests/forge/status_popup_host.lua",
-          "nvim/tests/forge/status_ignore_staged_host.lua",
-          "nvim/tests/forge/status_host.lua",
-          "nvim/tests/forge/status_staging_host_flows.lua",
-          "nvim/tests/forge/status_staging_host_edges.lua",
-          "nvim/tests/forge/status_virtual_hunk_merge.lua",
-          "nvim/tests/forge/status_untracked_optimistic.lua",
-          "nvim/tests/forge/status_staging_source_changes.lua",
-          "nvim/tests/forge/status_word_wrap_host.lua",
-          "nvim/tests/forge/empty_diff_cursor.lua",
-          "nvim/tests/forge/harness_plan_checks.lua",
-          "nvim/tests/forge/harness_new.lua",
-          "nvim/rust/forge/crates/forge-providers/tests/fixtures/session_workflows_host.lua",
-          "nvim/tests/forge/harness_owned_agents_real.lua",
-          "nvim/tests/forge/plan_navigation_languages_host.lua",
-          "nvim/tests/forge/sidecar_manual.lua",
-          "nvim/tests/**/fixtures/**",
-          "nvim/tests/**/support/**",
-          "nvim/tests/forge/plan_review_question_response_host.lua"
+          "nvim/lua/*/tests/fixtures/**",
+          "nvim/lua/*/tests/support/**",
+          "nvim/lua/*/tests/plans/**"
         ]
       },
       "action": {
@@ -103,13 +53,13 @@
           },
           "fixture": {
             "type": "string",
-            "description": "Exact Lua fixture path",
+            "description": "Lua test file, test name, or name::scenario",
             "required": false,
             "default": ""
           },
           "suite": {
             "type": "string",
-            "description": "Feature suite, or affected for the suites covering the changed paths",
+            "description": "Source area (such as status, harness, or lsp), plugin or source directory, all, or affected for the tests covering the changed paths",
             "required": false,
             "default": "affected"
           }
@@ -117,44 +67,6 @@
         "label": "Run Lua tests",
         "category": "test",
         "input": true
-      }
-    },
-    "lua-test-mock-integration": {
-      "trigger": {
-        "paths": [
-          "nvim/lua/forge/**",
-          "nvim/rust/forge/**",
-          "nvim/tests/forge/support/review_host.lua"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          ".forge/checks/lua-tests.nu",
-          "check",
-          "mock-integration",
-          "--full"
-        ],
-        "inputs": {
-          "files": {
-            "type": "array",
-            "description": "Exact mock integration fixture paths (omit for the whole suite)",
-            "required": false,
-            "source": "changed_files"
-          }
-        },
-        "label": "Run Lua mock integration",
-        "category": "test",
-        "input": true,
-        "after": [
-          "rust-build"
-        ]
       }
     },
     "nushell-check": {

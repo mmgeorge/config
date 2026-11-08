@@ -2250,13 +2250,28 @@ impl HarnessBroker {
 mod tests {
     use super::*;
 
-    /// A successful native terminal racing collection cannot start checks behind its own gate.
+    /// A successful native terminal racing retained cancellation cannot start checks behind its own gate.
     #[tokio::test]
-    async fn collection_after_native_success_skips_new_automatic_work() -> Result<()> {
-        for disposition in [
+    async fn retained_cancellation_after_native_success_skips_new_automatic_work() -> Result<()> {
+        assert_collection_after_native_success_skips_new_automatic_work(
             ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::Retain),
+        )
+        .await
+    }
+
+    /// A successful native terminal racing restart cannot start checks behind its own gate.
+    #[tokio::test]
+    async fn restart_after_native_success_skips_new_automatic_work() -> Result<()> {
+        assert_collection_after_native_success_skips_new_automatic_work(
             ForegroundCollection::Restart,
-        ] {
+        )
+        .await
+    }
+
+    async fn assert_collection_after_native_success_skips_new_automatic_work(
+        disposition: ForegroundCollection,
+    ) -> Result<()> {
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -2266,7 +2281,7 @@ mod tests {
                 .configure_session(json!({"automatic_checks":true}))
                 .await?;
             std::fs::write(workspace.path().join(".forge.json"),
-                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["nu","--no-config-file","-c","print ok"],"category":"test"}}}}).to_string())?;
+                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["custom-runner","verify"],"category":"test"}}}}).to_string())?;
             let (sink, _updates) = publication::channel();
             let ForegroundDispatch::Admitting(mut admission) = broker.begin_foreground_dispatch(
                 Request {
@@ -2322,14 +2337,37 @@ mod tests {
         }
         Ok(())
     }
-    /// Native refusal and limits cannot start checks or repair after resource collection.
+    /// Native token limits cannot start checks or repair after resource collection.
     #[tokio::test]
-    async fn non_normal_completion_skips_new_automatic_work() -> Result<()> {
-        for reason in [
+    async fn token_limit_completion_skips_new_automatic_work() -> Result<()> {
+        assert_non_normal_completion_skips_new_automatic_work(
             forge_provider_api::turn::TurnCompletionReason::TokenLimit,
+        )
+        .await
+    }
+
+    /// Native request limits cannot start checks or repair after resource collection.
+    #[tokio::test]
+    async fn request_limit_completion_skips_new_automatic_work() -> Result<()> {
+        assert_non_normal_completion_skips_new_automatic_work(
             forge_provider_api::turn::TurnCompletionReason::RequestLimit,
+        )
+        .await
+    }
+
+    /// Native refusal cannot start checks or repair after resource collection.
+    #[tokio::test]
+    async fn refusal_completion_skips_new_automatic_work() -> Result<()> {
+        assert_non_normal_completion_skips_new_automatic_work(
             forge_provider_api::turn::TurnCompletionReason::Refusal,
-        ] {
+        )
+        .await
+    }
+
+    async fn assert_non_normal_completion_skips_new_automatic_work(
+        reason: forge_provider_api::turn::TurnCompletionReason,
+    ) -> Result<()> {
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -2339,7 +2377,7 @@ mod tests {
                 .configure_session(json!({"automatic_checks":true}))
                 .await?;
             std::fs::write(workspace.path().join(".forge.json"),
-                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["nu","--no-config-file","-c","print ok"],"category":"test"}}}}).to_string())?;
+                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["custom-runner","verify"],"category":"test"}}}}).to_string())?;
             let (sink, _updates) = publication::channel();
             let ForegroundDispatch::Admitting(mut admission) = broker.begin_foreground_dispatch(
                 Request {

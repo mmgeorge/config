@@ -1,7 +1,8 @@
-use std::time::Duration;
+mod support;
 
 use forge_github::model::GithubRepositoryId;
 use forge_github::queue::{RemoteCompletion, RemoteIntent, RemoteQueue, RemoteResource};
+use support::is_pending_after_one_poll;
 
 fn resource(hostname: &str, number: u64) -> RemoteResource {
     RemoteResource::new(
@@ -79,16 +80,8 @@ async fn same_resource_is_fifo_and_other_hosts_and_numbers_are_independent() {
         .unwrap()
         .ready();
     tokio::pin!(second, third);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1), &mut second)
-            .await
-            .is_err()
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1), &mut third)
-            .await
-            .is_err()
-    );
+    assert!(is_pending_after_one_poll(second.as_mut()).await);
+    assert!(is_pending_after_one_poll(third.as_mut()).await);
     for key in [resource("enterprise.test", 1), resource("github.com", 2)] {
         queue
             .enqueue(key, RemoteIntent::Mutation, 0)
@@ -101,11 +94,7 @@ async fn same_resource_is_fifo_and_other_hosts_and_numbers_are_independent() {
     }
     first.complete(RemoteCompletion::Confirmed).unwrap();
     let second = second.await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1), &mut third)
-            .await
-            .is_err()
-    );
+    assert!(is_pending_after_one_poll(third.as_mut()).await);
     second.complete(RemoteCompletion::Confirmed).unwrap();
     third
         .await
@@ -370,11 +359,7 @@ async fn all_comment_scopes_share_the_pr_fifo_and_reject_writes_queued_before_un
         )
         .unwrap();
     let mut waiting = Box::pin(second.ready());
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
-            .await
-            .is_err()
-    );
+    assert!(is_pending_after_one_poll(waiting.as_mut()).await);
     first.begin_mutation().unwrap();
     drop(first);
     assert!(waiting.await.is_err());

@@ -450,12 +450,41 @@ mod tests {
 
     /// Queue active phase guidance from the same workflow state that resume commits.
     #[tokio::test]
-    async fn resumed_execution_entry_uses_committed_phase_instead_of_stopped_state() -> Result<()> {
-        for (stopped, phase) in [
-            (PlanExecutionState::Stalled, crate::plan::PlanPhase::Resolve),
-            (PlanExecutionState::Paused, crate::plan::PlanPhase::Resolve),
-            (PlanExecutionState::Paused, crate::plan::PlanPhase::Checking),
-        ] {
+    async fn resumed_stalled_resolve_entry_uses_committed_phase_instead_of_stopped_state()
+    -> Result<()> {
+        assert_resumed_execution_entry_uses_committed_phase(
+            PlanExecutionState::Stalled,
+            crate::plan::PlanPhase::Resolve,
+        )
+        .await
+    }
+
+    /// Queue active phase guidance from the same workflow state that resume commits.
+    #[tokio::test]
+    async fn resumed_paused_resolve_entry_uses_committed_phase_instead_of_stopped_state()
+    -> Result<()> {
+        assert_resumed_execution_entry_uses_committed_phase(
+            PlanExecutionState::Paused,
+            crate::plan::PlanPhase::Resolve,
+        )
+        .await
+    }
+
+    /// Resumed Check reserves local work instead of a provider entry.
+    #[tokio::test]
+    async fn resumed_paused_checking_reserves_local_work_instead_of_provider_entry() -> Result<()> {
+        assert_resumed_execution_entry_uses_committed_phase(
+            PlanExecutionState::Paused,
+            crate::plan::PlanPhase::Checking,
+        )
+        .await
+    }
+
+    async fn assert_resumed_execution_entry_uses_committed_phase(
+        stopped: PlanExecutionState,
+        phase: crate::plan::PlanPhase,
+    ) -> Result<()> {
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =
@@ -557,7 +586,7 @@ mod tests {
                     .and_then(|turn| turn.continuation.as_ref())
                     .context("resumed Check must reserve local work")?;
                 assert_eq!(work.work, crate::task::TaskWork::Checks);
-                continue;
+                return Ok(());
             }
             let entry = resumed.entry.as_ref().context("resume entry missing")?;
             assert!(

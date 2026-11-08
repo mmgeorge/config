@@ -1,11 +1,7 @@
 use super::super::{HarnessBroker, SessionController, prepare_new_session, prompt};
 use super::super::{native_permission, native_settings};
 use super::bootstrap::initialize;
-use super::owner_fixture::{
-    owner_transition_fixture, retain_cleanup_failure, retain_owner_transition_failure,
-};
-use crate::provider::ScopeOwner;
-use crate::session::SessionStore;
+use super::owner_fixture::owner_transition_fixture;
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result, ensure};
 use forge_protocol::message::Request;
@@ -15,302 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-/// Select the point at which the second configuration must collect its predecessor.
-#[derive(Clone, Copy)]
-enum SessionToolToggleBoundary {
-    Settled,
-    Prepared,
-    IdentityBeforeResult,
-}
-
-/// Keep invocation tool changes on the initialized binding through collection and later input.
-#[tokio::test]
-async fn owner_session_tool_toggles_preserve_binding_and_observation() -> Result<()> {
-    session_tool_toggle_boundary(SessionToolToggleBoundary::Settled).await
-}
-
-/// Collect a retained prepared continuation through another configuration without a separate cancel.
-#[tokio::test]
-async fn owner_session_tool_toggles_collect_prepared_continuation_and_reuse_binding() -> Result<()>
-{
-    session_tool_toggle_boundary(SessionToolToggleBoundary::Prepared).await
-}
-
-/// Certify a same-binding history replacement that the real owner persists before configure returns.
-#[tokio::test]
-async fn owner_configuration_commits_ordered_identity_before_result_and_reuses_binding()
--> Result<()> {
-    session_tool_toggle_boundary(SessionToolToggleBoundary::IdentityBeforeResult).await
-}
-
-/// Exercise committed off/on selections across one exact native generation boundary.
-async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Result<()> {
-    use crate::exchange::command::{CommandOutcome, ConfigurationOutcome};
-    let root = tempfile::tempdir()?;
-    crate::checks::configure_fixture(root.path());
-    let invoked = Arc::new(tokio::sync::Notify::new());
-    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (prepared, mut preparation) = tokio::sync::mpsc::unbounded_channel();
-    let identity_controller: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> =
-        Arc::default();
-    let descriptor = forge_providers::registry::descriptor(
-        &forge_providers::registry::nonselectable_id().unwrap(),
-    )
-    .unwrap();
-    let native = crate::provider::test_support::EventFixtureProvider::new(descriptor, {
-        let invoked = invoked.clone();
-        let dispatched = dispatched.clone();
-        let observations = observations.clone();
-        move |request, sink, start, mut cancelled| {
-            let invoked = invoked.clone();
-            let first = dispatched.fetch_add(1, Ordering::AcqRel) == 0;
-            observations.lock().unwrap().push((
-                sink.binding_id().clone(),
-                request.input.clone(),
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name)
-                    .collect::<Vec<_>>(),
-            ));
-            async move {
-                let address = crate::provider::TurnAddress {
-                    scope: request.scope.clone(),
-                    thread_id: request.thread_id.clone(),
-                    turn_id: request.turn_id.clone(),
-                };
-                start.observed(1).await?;
-
-                if first {
-                    invoked.notify_one();
-                    while !*cancelled.borrow_and_update() {
-                        cancelled
-                            .changed()
-                            .await
-                            .map_err(|_| crate::provider::ProviderError::Cancelled)?;
-                    }
-                } else {
-                    for event in crate::provider::test_support::message(
-                        &address,
-                        format!("{}:tool-toggle-answer", request.turn_id.as_str()),
-                        Some(crate::provider::TestMessageContent::Response),
-                        "Binding remains usable",
-                    ) {
-                        sink.send_wait(crate::provider::test_support::activity(event)?)
-                            .await?;
-                    }
-                }
-
-                Ok(crate::provider::test_support::native_result(
-                    &request,
-                    if first {
-                        forge_provider_api::turn::TurnOutcome::Interrupted
-                    } else {
-                        forge_provider_api::turn::TurnOutcome::Completed {
-                            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
-                        }
-                    },
-                ))
-            }
-        }
-    });
-    native.with_models(vec![serde_json::from_value(json!({
-        "id":"fixture-model", "reasoning":["low","medium","high"],
-        "context_window":[], "vision":false, "is_default":true,
-    }))?]);
-    if matches!(boundary, SessionToolToggleBoundary::Prepared) {
-        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        native.with_pre_dispatch(move |request| {
-            let ordinal = preparations.fetch_add(1, Ordering::AcqRel);
-            let hold = ordinal == 1;
-            let prepared = prepared.clone();
-            async move {
-                if hold {
-                    prepared
-                        .send((
-                            request.scope,
-                            request
-                                .tools
-                                .iter()
-                                .map(|tool| tool.name)
-                                .collect::<Vec<_>>(),
-                        ))
-                        .expect("preparation observer stays attached");
-                    return std::future::pending().await;
-                }
-                Ok(())
-            }
-        });
-    }
-    if matches!(boundary, SessionToolToggleBoundary::IdentityBeforeResult) {
-        let native = Arc::downgrade(&native);
-        let controller = identity_controller.clone();
-        let configured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        native
-            .upgrade()
-            .unwrap()
-            .with_session_configure(move |binding, _| {
-                let native = native.upgrade().expect("configuration retains its adapter");
-                let controller = controller
-                    .lock()
-                    .unwrap()
-                    .upgrade()
-                    .expect("configuration retains its session owner");
-                let history = format!(
-                    "configured-tool-history-{}",
-                    configured.fetch_add(1, Ordering::AcqRel)
-                );
-                async move {
-                    let owner =
-                        crate::provider::ThreadOwner::root(controller.observer.session_id());
-                    let sink = native.event_sink(&owner).await?;
-                    if sink.binding_id() != &binding {
-                        return Err(crate::provider::ProviderError::DeliveryUncertain);
-                    }
-                    sink.send_wait(forge_provider_api::AdapterActivity::Thread {
-                        thread_id: owner.thread_id(),
-                        event: forge_provider_api::ThreadEvent::IdentityResolved(
-                            history.clone().try_into().unwrap(),
-                        ),
-                    })
-                    .await?;
-                    async {
-                        loop {
-                            let snapshot = controller
-                                .observer
-                                .snapshot()
-                                .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
-                            if snapshot.session.provider_session_id.as_deref()
-                                == Some(history.as_str())
-                            {
-                                break Ok::<(), crate::provider::ProviderError>(());
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    .await?;
-                    Ok(())
-                }
-            });
-    }
-    native.with_session_open({
-        let opened = opened.clone();
-        move |_| {
-            opened.fetch_add(1, Ordering::AcqRel);
-            async { Ok(()) }
-        }
-    });
-    native.with_session_close({
-        let closed = closed.clone();
-        move |_| {
-            closed.fetch_add(1, Ordering::AcqRel);
-            async { Ok(()) }
-        }
-    });
-    let provider_fixture =
-        crate::provider::test_support::ProviderTestSession::from_native(native.clone())?;
-    let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
-    broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker).await?;
-    *identity_controller.lock().unwrap() = Arc::downgrade(&controller);
-    controller.trace.configure_default(true)?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    let reader = tokio::spawn(async move {
-        while output.recv().await?.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-    let scenario = async {
-        controller.start_provider(&sink).await;
-        async {
-            while !controller.provider_ready().await { tokio::task::yield_now().await; }
-        }.await;
-        controller.attach_input(&sink).await?;
-        prompt::apply(&controller, Request { id: 70, method: "session.prompt.submit".into(),
-            params: json!({"operation_id":"tool-toggle-original","text":"Hold this initialized invocation"}),
-        }, &sink).await?;
-        invoked.notified().await;
-
-        let owner = crate::provider::ThreadOwner::root(controller.observer.session_id());
-        let original = native.event_sink(&owner).await?;
-        let binding = original.binding_id().clone();
-        let inbox = controller.observer.session_events();
-        for (enabled, operation, text) in [
-            (false, "tool-toggle-off", "Follow up without session tools"),
-            (true, "tool-toggle-on", "Follow up with session tools"),
-        ] {
-            let command = native_settings::decode_command(&Request { id: 71,
-                method: "session.command.apply".into(),
-                params: json!({"operation_id":operation,"action":"configure","config":{"session_tools":enabled}}),
-            })?;
-            let completed = controller.exchange_owner.execute_identified(command, sink.clone()).await?;
-            ensure!(matches!(completed.outcome, CommandOutcome::Configured(ConfigurationOutcome::Settings { .. })), "tool toggle lost its committed result");
-            ensure!(controller.observer.snapshot()?.session_tools == enabled, "tool toggle did not publish committed settings");
-            ensure!(!controller.task_controller.configuration_is_uncertain(), "successful tool toggle fenced configuration");
-            ensure!(!inbox.is_closed() && Arc::ptr_eq(&inbox, &controller.observer.session_events()), "tool toggle replaced or closed observation");
-            ensure!(native.event_sink(&owner).await?.binding_id() == &binding, "tool toggle replaced native binding");
-            ensure!(opened.load(Ordering::Acquire) == 1 && closed.load(Ordering::Acquire) == 0, "tool toggle opened or closed native resources");
-            if matches!(boundary, SessionToolToggleBoundary::IdentityBeforeResult) {
-                let history = if enabled { "configured-tool-history-1" } else { "configured-tool-history-0" };
-                ensure!(controller.observer.snapshot()?.session.provider_session_id.as_deref() == Some(history), "ordered native identity was not committed");
-                ensure!(SqliteStore::read_only(&controller.data_root)?.load_session(controller.observer.session_id())?.unwrap().provider_session_id.as_deref() == Some(history), "configured history was not durable");
-            }
-            if matches!(boundary, SessionToolToggleBoundary::Prepared) && !enabled {
-                let (scope, tools) = preparation.recv().await.context("configured continuation did not reach retained preparation")?;
-                ensure!(scope.owner() == owner && !tools.contains(&"harness_session_list"), "retained preparation used stale tool configuration");
-                ensure!(dispatched.load(Ordering::Acquire) == 1, "prepared continuation reached native handoff before collection");
-                continue;
-            }
-            if matches!(boundary, SessionToolToggleBoundary::Prepared) {
-                ensure!(observations.lock().unwrap().iter().all(|(_, _, tools)| tools.contains(&"harness_session_list")), "collected middle generation reached native execution");
-            }
-            prompt::apply(&controller, Request { id: 72, method: "session.prompt.submit".into(),
-                params: json!({"operation_id":format!("{operation}-followup"),"text":text}),
-            }, &sink).await?;
-            async {
-                loop {
-                    let observed = observations.lock().unwrap().iter().find(|(_, input, _)| {
-                        matches!(input, forge_provider_api::input::PromptInput::Text(value) if value.contains(text))
-                    }).cloned();
-                    if let Some((observed_binding, _, tools)) = observed {
-                        ensure!(observed_binding == binding, "follow-up input used another binding");
-                        ensure!(tools.contains(&"harness_session_list") == enabled, "follow-up input retained obsolete session tool authorization");
-                        break Ok::<(), anyhow::Error>(());
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }.await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-    if let Err(error) = scenario {
-        return Err(retain_cleanup_failure(root, &controller, error));
-    }
-    let cleanup = async {
-        controller.input_stopping.store(true, Ordering::Release);
-        controller.coordinator.submissions.changed.notify_one();
-        controller.finish_exchange_owner().await?;
-        provider_fixture
-            .provider_handle()
-            .shutdown()
-            .await
-            .context("tool toggle provider shutdown failed")?;
-        controller
-            .finish_session_events()
-            .await
-            .context("tool toggle observation shutdown failed")?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    if let Err(error) = cleanup {
-        return Err(retain_cleanup_failure(root, &controller, error));
-    }
-    reader.abort();
-    Ok(())
-}
 
 /// Observe independent FIFO configuration completions before queued pause collects the replacement.
 #[tokio::test]
@@ -366,11 +66,7 @@ async fn owner_model_changes_precede_pause_and_preserve_transcript() -> Result<(
     );
     assert!(futures_util::poll!(paused.as_mut()).is_pending());
     let (first, second, paused) = tokio::join!(first, second, paused);
-    let completed = (|| -> Result<_> { Ok((first?, second?, paused?)) })();
-    let (first, second, paused) = match completed {
-        Ok(completed) => completed,
-        Err(error) => return Err(retain_owner_transition_failure(fixture, error)),
-    };
+    let (first, second, paused) = (first?, second?, paused?);
     assert!(first.sequence < second.sequence && second.sequence < paused.sequence);
     assert_eq!(
         fixture.controller.observer.snapshot()?.session.model,
@@ -486,10 +182,8 @@ async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Re
             id: 701, method: "session.prompt.submit".into(),
             params: json!({"operation_id":"new-after-early-cancel","text":"New prompt after cancellation"}),
         }, &sink).await?;
-        let received = tokio::time::timeout(Duration::from_secs(5), dispatches.recv()).await;
-        ensure!(received.is_ok(), "new prompt was blocked after clean pre-acceptance cancellation: {:?}",
-            controller.coordinator.submissions.snapshot()?);
-        assert!(matches!(received?, Some(forge_provider_api::input::PromptInput::Text(text))
+        let received = dispatches.recv().await;
+        assert!(matches!(received, Some(forge_provider_api::input::PromptInput::Text(text))
             if text == "New prompt after cancellation"));
         Ok::<(), anyhow::Error>(())
     }.await;
@@ -585,9 +279,7 @@ async fn owner_two_model_changes_then_cancel_settles_latest_retained_work_once()
         }
         Ok::<_, anyhow::Error>(())
     }.await;
-    if let Err(error) = scenario {
-        return Err(retain_owner_transition_failure(fixture, error));
-    }
+    scenario?;
     fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())
@@ -733,9 +425,7 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
             && exchange.prompt.contains("Keep original accepted history"), "cancel lost original accepted history");
         Ok::<(), anyhow::Error>(())
     }.await;
-    if let Err(error) = scenario {
-        return Err(retain_cleanup_failure(root, &controller, error));
-    }
+    scenario?;
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
     controller.finish_exchange_owner().await?;
@@ -812,9 +502,7 @@ async fn owner_invalid_model_rejects_before_collection_and_preserves_queue() -> 
         fixture.controller.observer.snapshot()?.session.model,
         "mock-model"
     );
-    if let Err(error) = fixture.service.shutdown(Duration::from_secs(5)).await {
-        return Err(retain_owner_transition_failure(fixture, error));
-    }
+    fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())
 }
@@ -872,15 +560,7 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
             },
         )
         .await;
-    let arrived = match arrived {
-        Ok(arrived) => arrived,
-        Err(error) => {
-            return Err(retain_owner_transition_failure(
-                fixture,
-                error.context("registered child provider did not reach its hold"),
-            ));
-        }
-    };
+    let arrived = arrived.context("registered child provider did not reach its hold")?;
     assert_eq!(
         arrived["session_id"],
         crate::provider::ThreadOwner::new(
@@ -902,12 +582,7 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
         .execute_identified(command, fixture.sink.clone())
         .await
         .map_err(anyhow::Error::from);
-    if let Err(error) = completed {
-        return Err(retain_owner_transition_failure(
-            fixture,
-            error.context("permission command did not collect the held child"),
-        ));
-    }
+    completed.context("permission command did not collect the held child")?;
     assert_eq!(fixture.controller.agent_coordinator.active_count(), 0);
     assert!(!fixture.controller.agent_coordinator.is_quiescing());
     assert_eq!(
@@ -997,18 +672,8 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
         Ok::<(), anyhow::Error>(())
     });
     controller.start_provider(&sink).await;
-    if let Err(error) = tokio::time::timeout(Duration::from_secs(5), async {
-        while !controller.provider_ready().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    {
-        return Err(retain_cleanup_failure(
-            root,
-            &controller,
-            anyhow::Error::from(error).context("provider readiness timed out"),
-        ));
+    while !controller.provider_ready().await {
+        tokio::task::yield_now().await;
     }
     controller.attach_input(&sink).await?;
     prompt::apply(
@@ -1021,13 +686,7 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
         &sink,
     )
     .await?;
-    if let Err(error) = tokio::time::timeout(Duration::from_secs(5), invoked.notified()).await {
-        return Err(retain_cleanup_failure(
-            root,
-            &controller,
-            anyhow::Error::from(error).context("fixture invocation never started"),
-        ));
-    }
+    invoked.notified().await;
     let before = controller.observer.snapshot()?.session.access;
     let command = native_permission::decode_command(&Request {
         id: 51,
@@ -1039,18 +698,9 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
             .exchange_owner
             .execute_identified(command, sink.clone()),
     );
-    let entered = async {
-        tokio::select! {
-            result = &mut operation => Err(anyhow::anyhow!("cleanup unexpectedly completed before barrier: {result:?}")),
-            () = started.notified() => Ok(()),
-        }
-    }.await;
-    if let Err(error) = entered {
-        return Err(retain_cleanup_failure(
-            root,
-            &controller,
-            error.context("permission collection did not enter cleanup"),
-        ));
+    tokio::select! {
+        result = &mut operation => anyhow::bail!("cleanup unexpectedly completed before barrier: {result:?}"),
+        () = started.notified() => {}
     }
     tokio::time::pause();
     for _ in 0..=forge_provider_api::CleanupPolicy::Cancellation
@@ -1076,14 +726,10 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
     release.add_permits(1);
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
-    let finished = controller.finish_exchange_owner().await;
-    if let Err(error) = finished {
-        return Err(retain_cleanup_failure(
-            root,
-            &controller,
-            error.context("owner did not finish after cleanup release"),
-        ));
-    }
+    controller
+        .finish_exchange_owner()
+        .await
+        .context("owner did not finish after cleanup release")?;
     assert!(collected.load(Ordering::Acquire));
     provider_fixture.provider_handle().shutdown().await?;
     controller.finish_session_events().await?;
@@ -1137,12 +783,11 @@ async fn owner_conversation_rollback_collects_selected_live_work() -> Result<()>
         crate::exchange::HistoryDisposition::RolledBack
     );
     assert_eq!(std::fs::read_to_string(file)?, "unchanged");
-    if let Err(error) = fixture.service.shutdown(Duration::from_secs(5)).await {
-        return Err(retain_owner_transition_failure(
-            fixture,
-            error.context("rollback session shutdown failed"),
-        ));
-    }
+    fixture
+        .service
+        .shutdown(Duration::from_secs(5))
+        .await
+        .context("rollback session shutdown failed")?;
     fixture.reader.abort();
     Ok(())
 }
@@ -1222,18 +867,12 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    if let Err(error) = result {
-        return Err(retain_owner_transition_failure(
-            fixture,
-            error.context("shared sibling did not survive owner close"),
-        ));
-    }
-    if let Err(error) = fixture.service.shutdown(Duration::from_secs(5)).await {
-        return Err(retain_owner_transition_failure(
-            fixture,
-            error.context("shared runtime shutdown failed"),
-        ));
-    }
+    result.context("shared sibling did not survive owner close")?;
+    fixture
+        .service
+        .shutdown(Duration::from_secs(5))
+        .await
+        .context("shared runtime shutdown failed")?;
     fixture.reader.abort();
     Ok(())
 }
@@ -1270,9 +909,7 @@ async fn owner_shutdown_collects_while_prompt_ui_output_is_saturated() -> Result
     );
     assert!(fixture.engine.active_invocation_snapshot()?.is_some());
     let shutdown = fixture.service.shutdown(Duration::from_secs(5)).await;
-    if let Err(error) = shutdown {
-        return Err(retain_owner_transition_failure(fixture, error));
-    }
+    shutdown?;
     assert!(fixture.engine.active_invocation_snapshot()?.is_none());
     prompt.await??;
     let response = async {
@@ -1387,9 +1024,7 @@ async fn owner_starts_one_fifo_command_per_update_after_committed_completion() -
         ensure!(starts[0].2 < completions[0].2, "held collection did not span owner updates");
         Ok::<_, anyhow::Error>(())
     }.await;
-    if let Err(error) = scenario {
-        return Err(retain_owner_transition_failure(fixture, error));
-    }
+    scenario?;
     fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())

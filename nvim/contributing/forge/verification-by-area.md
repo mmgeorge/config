@@ -8,58 +8,22 @@ Run Rust filters as `cargo nextest run --cargo-profile dev --locked -p <package>
 
 | Area | Rust filters (`forge-harness` unless noted) | Editor fixtures |
 | --- | --- | --- |
-| Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | `harness_automatic_checks`, `harness_check_queue_host`, `harness_check_repair_resume_host` |
-| Plan review | `plan::` | `plan_review_document`, `plan_check_selection`, `plan_checks_host`, `plan_review_calls_host`, `plan_workspace_definition` |
-| Provider lifecycle | Exact selectors and package ownership below | `harness_prompt_lifecycle`, `harness_configuration_host` |
-| Input and queues | `broker::input_test::deferred_steering_cancellation_preserves_acceptance_boundary` | `harness_host` |
-| Transcript folds | None | `harness_message_folds_host` |
-| Agent LSP tools | None | `lsp_query`, `lsp_startup`, `lsp_lazy_startup`, `lsp_workspace` |
-| Background generation | `background::tests`, `compaction`, and `commit_message::` in `forge` | `background_host`, `commit_settings_host` |
-| Configuration controls | None | `picker`, `harness_settings`, `commit_settings_host` |
-| Provider registry | None | `provider_registry_config_reload` |
-| Harness tab labels | None | `harness_controller_native` |
+| Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | None |
+| Plan review | `plan::` | `document::document`, `checks::plan_check_selection`, `workspace_definition::plan_workspace_definition` |
+| Provider lifecycle | Exact selectors and package ownership below | `harness::prompt_lifecycle` |
+| Input and queues | `broker::input_test::deferred_steering_cancellation_preserves_acceptance_boundary` | None |
+| Transcript folds | None | `harness::message_folds` |
+| Agent LSP tools | None | `lsp/semantic.test.lua::lsp_query`, `startup::startup`, `startup::lazy_startup`, `semantic::workspace` |
+| Background generation | `background::tests`, `compaction`, and `commit_message::` in `forge` | `harness::background`, `commit_settings` |
+| Configuration controls | None | `picker::picker`, `settings::settings`, `commit_settings` |
+| Provider registry | None | `client::provider_registry_config_reload` |
+| Harness tab labels | None | `harness::controller_native` |
 
 ## Project checks
 
-Check resolution affects declared inputs, concrete commands, and the evidence the automatic gate accepts. The `checks::` tests cover typed inputs, literal argv substitution, callback receipts, evidence identity, cancellation, and prerequisite failures. They do not replace running the service through a real host.
-
-The host fixtures use a temporary workspace, and each proves a different boundary:
-
-| Fixture | Proves |
-| --- | --- |
-| `harness_automatic_checks` | The completion gate records one executed failure, one reused failure, a repair turn that stops without progress, and multi-check execution. |
-| `harness_check_queue_host` | Both timing choices, persistence, and validation after the final queued item is deleted. |
-| `harness_check_repair_resume_host` | A permission change that resumes an exchange keeps one exchange through its repair attempt. |
+Check resolution affects declared inputs, concrete commands, and the evidence the automatic gate accepts. The `checks::` tests cover typed inputs, literal argv substitution, callback receipts, evidence identity, cancellation, and prerequisite failures. These Rust tests own check behavior; no editor fixture repeats it.
 
 See [Extending project checks](extending-project-checks.md) when changing input binding or repository callbacks.
-
-## Plan rendering
-
-Build `forge` and the `plan_navigation_fixture` example, then run `plan_review_calls_host.lua` with a setting that selects what to verify. `forge_test_plan_behavior` verifies `Algorithm` and `Change` blocks and collapsed signatures. `forge_test_plan_flows` verifies flow rendering, symbol highlighting, and definition jumps.
-
-```nu
-nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_plan_behavior = true" nvim/tests/forge/plan_review_calls_host.lua
-```
-
-## Language navigation
-
-`plan_navigation_languages_host.lua` starts a mock Harness session and one real language server against a tiny copied project, then verifies definitions through PlanReview, including return navigation and that no extra server starts. Build its generator first:
-
-```nu
-cargo build --profile dev --locked -p forge-harness --example plan_navigation_fixture
-```
-
-Pass these globals through the Lua runner's `--lua` setup, and repeat with `'rust'` and `'lua'`:
-
-```nu
-nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_language = 'typescript'; local binary = require('forge.builder').binary_path(); vim.g.forge_test_executable = binary; vim.g.forge_test_fixture_generator = vim.fs.dirname(binary) .. '/examples/plan_navigation_fixture' .. (vim.fn.has('win32') == 1 and '.exe' or ''); vim.g.forge_test_tsgo = vim.fn.exepath('tsgo')" nvim/tests/forge/plan_navigation_languages_host.lua
-```
-
-Set `forge_test_rust_analyzer` when rustup cannot find the analyzer. The fixture uses temporary directories by default. Set `forge_test_scratch` only to keep a failed workspace, and delete it afterward.
-
-Rust fixture manifests are stored as `Cargo.toml.fixture` so the checked-in test
-sources do not become live Cargo workspaces. The shared fixture copier materializes
-them as `Cargo.toml` only in the temporary test directory and skips build output.
 
 ## Provider lifecycle
 

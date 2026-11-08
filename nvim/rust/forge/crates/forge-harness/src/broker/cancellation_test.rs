@@ -292,6 +292,8 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     let repository = super::test::repository();
     let data = tempfile::tempdir()?;
     let mut broker = super::test::planning_question_broker(repository.path(), data.path(), false);
+    // Checkpoint capture launches Git per prompt and has no bearing on terminal-failure classification.
+    broker.checkpoint = None;
     if matches!(failure, ProviderFailure::Stalled) {
         broker.session.tool_timeout = crate::session::InputTimeout {
             amount: 1,

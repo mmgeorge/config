@@ -1950,15 +1950,7 @@ mod test {
         let external = root.path().join("external");
         std::fs::create_dir(&workspace)?;
         std::fs::create_dir_all(external.join("nested"))?;
-        let initialized = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .arg(&external)
-            .output()?;
-        anyhow::ensure!(
-            initialized.status.success(),
-            "initialize approval fixture: {}",
-            String::from_utf8_lossy(&initialized.stderr)
-        );
+        forge_git::test_support::init_repository(&external);
         let settings_root = root.path().join("settings");
         let coordinator = PermissionCoordinator::transient(&workspace)?;
         coordinator.store().write().unwrap().set_rule_list(&[(

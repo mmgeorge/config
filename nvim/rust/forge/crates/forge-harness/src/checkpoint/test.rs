@@ -61,8 +61,12 @@ async fn reuses_unchanged_checkpoint_and_detects_external_dirty_edits() {
         .await
         .unwrap();
     assert!(removed.deleted.contains(&"tracked.txt".to_owned()));
-    git(repository.path(), &["add", "."]);
-    git(repository.path(), &["commit", "-qm", "external changes"]);
+    // Stage by name, because `ignored.tmp` exists and the in-process helper ignores `.gitignore`.
+    forge_git::test_support::stage_and_commit(
+        repository.path(),
+        &["tracked.txt", "new.txt"],
+        "external changes",
+    );
     let committed = checkpoint
         .capture(&store.objects, &repositories, "reuse", 7)
         .await
@@ -162,20 +166,19 @@ fn git(workspace: &Path, args: &[&str]) {
 
 fn repository() -> tempfile::TempDir {
     let temporary = tempfile::tempdir().unwrap();
-    git(temporary.path(), &["init", "-q"]);
-    git(
-        temporary.path(),
-        &["config", "user.email", "harness@example.invalid"],
-    );
-    git(temporary.path(), &["config", "user.name", "Harness Test"]);
+    forge_git::test_support::init_repository(temporary.path());
+    forge_git::test_support::set_identity(temporary.path());
     fs::write(
         temporary.path().join(".gitignore"),
         "ignored.tmp\ntarget/\n",
     )
     .unwrap();
     fs::write(temporary.path().join("tracked.txt"), "before\n").unwrap();
-    git(temporary.path(), &["add", "."]);
-    git(temporary.path(), &["commit", "-qm", "seed"]);
+    forge_git::test_support::stage_and_commit(
+        temporary.path(),
+        &[".gitignore", "tracked.txt"],
+        "seed",
+    );
     temporary
 }
 
@@ -275,9 +278,7 @@ fn cancelled_blocking_restore_keeps_admission_until_its_worker_exits() {
         let (release, release_receiver) = std::sync::mpsc::channel();
         let blocker = tokio::task::spawn_blocking(move || {
             started.send(()).unwrap();
-            release_receiver
-                .recv()
-                .unwrap();
+            release_receiver.recv().unwrap();
         });
         started_receiver.await.unwrap();
         let mut restoring = Box::pin(admitted.restore(objects));

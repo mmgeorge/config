@@ -106,7 +106,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancellation_retains_capacity_until_collected_and_wakes_every_waiter() {
         let store = Arc::new(DocumentAdmissionStore::default());
         let mut owner = Vec::new();

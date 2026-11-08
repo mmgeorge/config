@@ -242,14 +242,26 @@ async fn task_input_producer_reuses_original_entry_without_dispatch() -> Result<
 
 /// Native dispatch and later cancellation remain owned when no UI publisher has ever attached.
 #[tokio::test]
-async fn task_creation_without_transport_retains_publications_and_confirms_dispatch() -> Result<()>
-{
+async fn task_creation_without_transport_retains_publications_and_confirms_goal_dispatch()
+-> Result<()> {
+    task_creation_without_transport_case(crate::task::TaskKind::Goal).await
+}
+
+#[tokio::test]
+async fn task_creation_without_transport_retains_publications_and_confirms_plan_dispatch()
+-> Result<()> {
+    task_creation_without_transport_case(crate::task::TaskKind::Plan).await
+}
+
+/// Run one task kind, each in its own test so it reports independently and stays within the
+/// per-test time limit.
+async fn task_creation_without_transport_case(kind: crate::task::TaskKind) -> Result<()> {
     use crate::exchange::command::{
         CancelExchangeRequest, CancelledInputPolicy, Command, CommandOutcome, NewGoal, NewPlan,
         TaskCommand, TaskCommandOutcome,
     };
     use crate::provider::mock_response::MockResponseCommand;
-    for kind in [crate::task::TaskKind::Goal, crate::task::TaskKind::Plan] {
+    {
         let root = tempfile::tempdir()?;
         crate::checks::configure_fixture(root.path());
         let controller = receipt_test_controller(root.path()).await?;

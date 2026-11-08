@@ -2102,22 +2102,38 @@ mod tests {
         Ok(())
     }
 
-    /// Only positive journal retirement may restore an undispatched draft without native history proof.
+    #[derive(Clone, Copy)]
+    enum UndispatchedBoundary {
+        Prepared,
+        AlreadyPrevented,
+        Sending,
+    }
+
+    /// A prepared receipt restores the exact draft after cancellation.
     #[tokio::test]
-    async fn undispatched_cancellation_restores_exact_draft_but_unknown_sending_retains_history()
-    -> Result<()> {
+    async fn undispatched_prepared_cancellation_restores_exact_draft() -> Result<()> {
+        assert_undispatched_cancellation_boundary(UndispatchedBoundary::Prepared).await
+    }
+
+    /// A receipt already retired as cancelled restores the exact draft after cancellation.
+    #[tokio::test]
+    async fn undispatched_already_prevented_cancellation_restores_exact_draft() -> Result<()> {
+        assert_undispatched_cancellation_boundary(UndispatchedBoundary::AlreadyPrevented).await
+    }
+
+    /// An unknown sending receipt retains history instead of restoring the draft.
+    #[tokio::test]
+    async fn undispatched_unknown_sending_cancellation_retains_history() -> Result<()> {
+        assert_undispatched_cancellation_boundary(UndispatchedBoundary::Sending).await
+    }
+
+    /// Only positive journal retirement may restore an undispatched draft without native history proof.
+    async fn assert_undispatched_cancellation_boundary(
+        boundary: UndispatchedBoundary,
+    ) -> Result<()> {
         use crate::provider::submission::{SubmissionRetirement, SubmissionState};
-        #[derive(Clone, Copy)]
-        enum Boundary {
-            Prepared,
-            AlreadyPrevented,
-            Sending,
-        }
-        for boundary in [
-            Boundary::Prepared,
-            Boundary::AlreadyPrevented,
-            Boundary::Sending,
-        ] {
+        use UndispatchedBoundary as Boundary;
+        {
             let workspace = super::super::test::repository();
             let data = tempfile::tempdir()?;
             let mut broker =

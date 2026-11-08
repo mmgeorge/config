@@ -182,21 +182,9 @@ impl Fixture {
     }
     /// Collect original owners through the same shutdown sequence used by production callers.
     async fn close(self) -> Result<()> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.registry.begin_orderly_shutdown(),
-        )
-        .await
-        .context("fixture registry shutdown fence did not settle")??;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.session.as_provider().shutdown(),
-        )
-        .await
-        .context("fixture native shutdown did not settle")??;
-        tokio::time::timeout(std::time::Duration::from_secs(5), self.registry.close())
-            .await
-            .context("fixture execution owners did not collect")??;
+        self.registry.begin_orderly_shutdown().await?;
+        self.session.as_provider().shutdown().await?;
+        self.registry.close().await?;
         Ok(())
     }
 }
@@ -532,10 +520,7 @@ async fn submission_task_failure_is_normalized_and_fences_owner() -> Result<()> 
     });
     for owner in owners() {
         let (engine, _, _, result) = fixture.run(&owner, "panic").await?;
-        let error = match tokio::time::timeout(std::time::Duration::from_secs(3), result)
-            .await
-            .with_context(|| format!("native panic result did not settle for {owner:?}"))??
-        {
+        let error = match result.await? {
             Err(error) => error,
             Ok(_) => anyhow::bail!("panic completed successfully"),
         };

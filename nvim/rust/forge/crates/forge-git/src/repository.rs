@@ -396,7 +396,7 @@ mod tests {
     use crate::{
         reader::StatusProvider,
         snapshot::{HeadState, IndexStamp},
-        test_support::git,
+        test_support::init_repository,
     };
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn newer_request_supersedes_older_completion_and_duplicate_adoption() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let (identity, shared) = crate::identity::discover_repository(fixture.path())
             .unwrap()
             .unwrap();
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn invalidation_rejects_pending_results_and_clears_current_observation() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let (identity, shared) = crate::identity::discover_repository(fixture.path())
             .unwrap()
             .unwrap();
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn invalidated_handle_reopen_failure_preserves_previous_handle_until_retry() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let (identity, shared) = crate::identity::discover_repository(fixture.path())
             .unwrap()
             .unwrap();
@@ -505,14 +505,14 @@ mod tests {
     #[test]
     fn foreign_worktree_and_mismatched_read_generation_are_rejected() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let (identity, shared) = crate::identity::discover_repository(fixture.path())
             .unwrap()
             .unwrap();
         let repository = RepositoryState::new(identity, shared);
         let request = repository.begin_observation().unwrap();
         let foreign = tempfile::tempdir().unwrap();
-        git(foreign.path(), &["init", "--quiet"]);
+        init_repository(foreign.path());
         let foreign_identity = crate::discover_identity(foreign.path()).unwrap().unwrap();
         let mut incoming = result(&repository, request);
         incoming.value.worktree = foreign_identity.worktree.unwrap();
@@ -538,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn detached_snapshot_does_not_supersede_pending_observation() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let store = RepositoryStore::default();
         let repository = store
             .open(fixture.path().to_owned())

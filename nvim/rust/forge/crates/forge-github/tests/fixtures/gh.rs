@@ -4,19 +4,6 @@ use std::time::Duration;
 
 fn main() {
     let argument: Vec<_> = std::env::args_os().collect();
-    if argument
-        .get(1)
-        .is_some_and(|argument| argument == "--hold-pipe")
-    {
-        fs::write("descendant.ready", "ready").unwrap();
-        let started = std::time::Instant::now();
-        while !std::path::Path::new("release-descendant").exists()
-            && started.elapsed() < Duration::from_secs(2)
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        return;
-    }
     let id = std::process::id();
     if fs::read_to_string("mode").is_ok_and(|mode| mode == "review_read") {
         assert_eq!(argument[1], "api");
@@ -157,31 +144,6 @@ fn main() {
         std::io::stdout()
             .write_all(&fs::read(file).unwrap())
             .unwrap();
-        return;
-    }
-    if std::path::Path::new("source-identity.json").exists() {
-        assert_eq!(argument[1], "api");
-        assert_eq!(argument[2], "--hostname");
-        assert_eq!(argument[3], "enterprise.example");
-        assert_eq!(argument.len(), 7);
-        if argument[4] == "graphql" {
-            assert_eq!(argument[5], "--input");
-            fs::copy(&argument[6], "source-request.json").unwrap();
-            std::io::stdout()
-                .write_all(&fs::read("source-identity.json").unwrap())
-                .unwrap();
-        } else {
-            assert_eq!(argument[4], "--header");
-            assert_eq!(argument[5], "Accept: application/vnd.github.raw+json");
-            assert_eq!(
-                argument[6].to_str().unwrap(),
-                format!("repos/owner/repo/git/blobs/{}", "b".repeat(40))
-            );
-            fs::write("source-blob-read", "read").unwrap();
-            std::io::stdout()
-                .write_all(&fs::read("source-blob").unwrap())
-                .unwrap();
-        }
         return;
     }
     if argument.get(1).is_some_and(|argument| argument == "repo") {
@@ -479,6 +441,19 @@ fn main() {
                 .unwrap()
                 .write_all(format!("{mutation}\n").as_bytes())
                 .unwrap();
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("mutation-release-order")
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{mutation} released={}\n",
+                        std::path::Path::new("release-mutation").exists()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
             fs::write("mutation-started", mutation).unwrap();
             let started = std::time::Instant::now();
             while fs::read_to_string("mode").unwrap() == "pr_block"
@@ -543,13 +518,6 @@ fn main() {
                     break;
                 }
             }
-        }
-        "descendant" => {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--hold-pipe")
-                .spawn()
-                .unwrap();
-            let _ = child.try_wait();
         }
         "failure" => {
             std::io::stdout()

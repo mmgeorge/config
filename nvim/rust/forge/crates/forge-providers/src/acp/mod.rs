@@ -22,6 +22,8 @@ pub mod conversation;
 pub(crate) mod provider;
 
 #[cfg(test)]
+mod in_memory_peer;
+#[cfg(test)]
 mod session_fixture_test;
 #[cfg(test)]
 mod wire_fixture_test;

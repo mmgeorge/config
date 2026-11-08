@@ -195,9 +195,7 @@ mod tests {
             WorkBudget::new(0, None),
             move |_| {
                 started.send(()).unwrap();
-                blocked
-                    .recv()
-                    .unwrap();
+                blocked.recv().unwrap();
             },
         )
         .unwrap();

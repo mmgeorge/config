@@ -248,7 +248,7 @@ mod tests {
     use super::*;
 
     /// Keep a producer's handle when another select branch interrupts error collection.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_receive_retains_producer_for_collection() {
         let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         drop(sender);

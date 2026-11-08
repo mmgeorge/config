@@ -158,12 +158,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_preserves_original_on_conflict_and_cancel() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(directory.path())
-            .args(["init", "--quiet"])
-            .output()?;
-        ensure!(output.status.success(), "fixture Git init failed");
+        crate::test_support::init_repository(directory.path());
         let store = RepositoryStore::default();
         let repository = store.open(directory.path().to_owned()).await?.unwrap();
         let destination = directory.path().join(".forge.json");

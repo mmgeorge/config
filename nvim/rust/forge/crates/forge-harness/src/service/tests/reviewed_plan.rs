@@ -6,7 +6,6 @@ use forge_protocol::outbound::MessageSender;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Submit a valid declaration design through the real owner and normalized tool adapter.
 pub(super) async fn reviewed_execution_fixture(
@@ -134,43 +133,15 @@ async fn reviewed_fixture(
         id: 31, method: "session.command.apply".into(),
         params: json!({"operation_id":"fixture-plan","action":"attach_plan","plan_id":plan.id}),
     }, sink).await?;
-    let reviewed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(task) = controller.task_controller.current()?
-                && let crate::task::WorkflowSnapshot::Plan { plan } = task.workflow.clone()
-                && plan.artifact.state == crate::plan::PlanState::AwaitingReview
-                && controller.coordinator.execution.available_permits() > 0
-            {
-                break Ok::<_, anyhow::Error>(plan.artifact);
-            }
-            tokio::task::yield_now().await;
+    let plan = loop {
+        if let Some(task) = controller.task_controller.current()?
+            && let crate::task::WorkflowSnapshot::Plan { plan } = task.workflow.clone()
+            && plan.artifact.state == crate::plan::PlanState::AwaitingReview
+            && controller.coordinator.execution.available_permits() > 0
+        {
+            break plan.artifact;
         }
-    })
-    .await;
-    let plan = match reviewed {
-        Ok(result) => result?,
-        Err(error) => {
-            let snapshot = serde_json::to_value(controller.observer.snapshot()?)?;
-            let trace = controller.trace.clone();
-            let path = trace.session_status(session_id).path;
-            let tail = tokio::task::spawn_blocking(move || -> Result<String> {
-                trace.flush()?;
-                let content = std::fs::read_to_string(path)?;
-                Ok(content
-                    .lines()
-                    .rev()
-                    .take(80)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            })
-            .await??;
-            return Err(anyhow::Error::new(error).context(format!(
-                "fixture plan did not reach review; snapshot={snapshot}; trace:\n{tail}"
-            )));
-        }
+        tokio::task::yield_now().await;
     };
     let artifact_journal = std::path::Path::new(&plan.working_path)
         .parent()

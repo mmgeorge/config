@@ -20,7 +20,6 @@ futures-util = { workspace = true }
 hex = { workspace = true }
 jsonschema = { workspace = true }
 process-wrap = { workspace = true, features = ["tokio1", "job-object", "kill-on-drop", "process-group", "creation-flags"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 rusqlite = { workspace = true, features = ["bundled"] }
 schemars = { workspace = true }
 semver = { workspace = true }
@@ -43,6 +42,8 @@ toml = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 
 [dev-dependencies]
+forge-git = { workspace = true, features = ["test-fixtures"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 tree-sitter = { workspace = true }

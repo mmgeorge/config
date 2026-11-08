@@ -862,7 +862,6 @@ dependencies = [
  "forge-review",
  "forge-status",
  "forge-text",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",

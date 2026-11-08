@@ -498,16 +498,16 @@ impl Write for DigestWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::git;
+    use crate::test_support::{init_repository, set_config, stage};
 
     #[test]
     fn batch_rejects_changed_inputs_after_multiple_conversions() {
         for change in ["configuration", "attributes", "index"] {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path();
-            git(root, &["init", "--quiet"]);
-            git(root, &["config", "core.autocrlf", "false"]);
-            git(root, &["config", "core.safecrlf", "false"]);
+            init_repository(root);
+            set_config(root, "core", "autocrlf", "false");
+            set_config(root, "core", "safecrlf", "false");
             std::fs::write(root.join(".gitattributes"), "* text\n").unwrap();
             std::fs::write(root.join("first"), b"one\r\n").unwrap();
             std::fs::write(root.join("second"), b"two\r\n").unwrap();
@@ -532,14 +532,14 @@ mod tests {
                 .unwrap();
             match change {
                 "configuration" => {
-                    git(root, &["config", "core.autocrlf", "true"]);
+                    set_config(root, "core", "autocrlf", "true");
                 }
                 "attributes" => {
                     std::fs::write(root.join(".gitattributes"), "first -text\nsecond text\n")
                         .unwrap();
                 }
                 "index" => {
-                    git(root, &["add", "first"]);
+                    stage(root, &["first"]);
                 }
                 _ => unreachable!(),
             }
@@ -555,9 +555,9 @@ mod tests {
         for change in ["configuration", "attributes", "index"] {
             let fixture = tempfile::tempdir().unwrap();
             let root = fixture.path();
-            git(root, &["init", "--quiet"]);
-            git(root, &["config", "core.autocrlf", "false"]);
-            git(root, &["config", "core.safecrlf", "false"]);
+            init_repository(root);
+            set_config(root, "core", "autocrlf", "false");
+            set_config(root, "core", "safecrlf", "false");
             std::fs::write(root.join(".gitattributes"), "file text\n").unwrap();
             std::fs::write(root.join("file"), b"one\r\n").unwrap();
             let (repository, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
@@ -576,13 +576,13 @@ mod tests {
             };
             match change {
                 "configuration" => {
-                    git(root, &["config", "core.autocrlf", "true"]);
+                    set_config(root, "core", "autocrlf", "true");
                 }
                 "attributes" => {
                     std::fs::write(root.join(".gitattributes"), "file -text\n").unwrap()
                 }
                 "index" => {
-                    git(root, &["add", "file"]);
+                    stage(root, &["file"]);
                 }
                 _ => unreachable!(),
             }

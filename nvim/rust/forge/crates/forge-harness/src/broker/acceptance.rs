@@ -1300,51 +1300,17 @@ mod tests {
         Ok(())
     }
 
-    /// Retain explicit automatic acceptance until a command disables it during execution.
-    #[test]
-    fn execution_preflight_can_request_a_decision_when_the_session_default_is_unavailable()
-    -> Result<()> {
-        let (_workspace, _data, mut broker, plan) = reviewed_execution_fixture()?;
-        broker.session.approval_mode = ApprovalMode::Deny;
-        broker.capability.approval_mode_list = vec![ApprovalMode::Ask];
-        broker.save_session()?;
-        broker.snapshot()?;
-        let current = broker.task_controller.current()?;
-        let selection = crate::exchange::command::PlanExecutionSelection::capture(
-            &plan,
-            current.as_ref(),
-            crate::task::command::ExecuteSelection {
-                plan_compact: Some(false),
-                ..Default::default()
-            },
-        )?;
-        let validated = broker.observer.validate_plan_execution(
-            &crate::exchange::command::CommandId::new("missing-mode-decision")?,
-            &selection,
-        )?;
-        assert_eq!(validated.approval_modes(), &[ApprovalMode::Ask]);
-        assert!(validated.request().approval_mode.is_none());
-        assert!(
-            broker
-                .observer
-                .prepare_execution(validated.request(), 20, 100)
-                .is_err()
-        );
-        assert!(
-            broker
-                .store
-                .load_plan(&plan.id)?
-                .unwrap()
-                .accepted_revision
-                .is_none()
-        );
-        Ok(())
+    /// An execution in its Resolve phase with one accepted revision and a settled source exchange.
+    struct ResolvingExecution {
+        _workspace: tempfile::TempDir,
+        _data: tempfile::TempDir,
+        broker: HarnessBroker,
+        plan: PlanRecord,
+        exchange: Exchange,
     }
 
-    /// Retain explicit automatic acceptance until a command disables it during execution.
-    #[tokio::test]
-    async fn inline_execution_review_preserves_explicit_task_acceptance_policy() -> Result<()> {
-        let (_workspace, _data, mut broker, plan) = reviewed_execution_fixture()?;
+    async fn resolving_execution() -> Result<ResolvingExecution> {
+        let (workspace, data, mut broker, plan) = reviewed_execution_fixture()?;
         let digest = plan
             .review_digest
             .clone()
@@ -1366,7 +1332,7 @@ mod tests {
                 task.entry.as_mut().unwrap().delivery = crate::task::TaskInputDelivery::Accepted;
                 Ok(())
             })?;
-        let mut exchange: Exchange = serde_json::from_value(json!({
+        let exchange: Exchange = serde_json::from_value(json!({
             "id":"review-exchange","session_id":broker.session.id,
             "agent_id":broker.session.primary_agent_id,"ordinal":1,
             "prompt":"Revise ownership","state":"complete","kind":"plan_execution",
@@ -1374,116 +1340,176 @@ mod tests {
             "attributed_matches_checkpoint":true,"node_list":[]
         }))?;
         broker.store.save_exchange(&exchange)?;
-        for revision in 2..=5 {
-            if revision == 5 {
-                broker.dispatch_session_command(
-                    "session.command.apply",
-                    json!({"action":"plan_accept","enabled":false}),
-                )?;
-            }
-            let task = broker.task_controller.current()?.unwrap();
-            let execution = broker.current_execution()?.unwrap();
-            let mut document = broker
-                .plan_file
-                .read_working_document(&broker.session.id, &plan.id)?;
-            document.version += 1;
-            document.design.as_mut().unwrap().document.design =
-                format!("Keep state in its owner, revision {revision}.");
-            broker
-                .handle_execution_control(
-                    &execution.id,
-                    execution.generation,
-                    &task.permit(),
-                    ExecutionOperation::Draft(Box::new(document.clone())),
-                    &mut exchange,
-                )
-                .await?;
-            let task = broker.task_controller.current()?.unwrap();
-            let execution = broker.current_execution()?.unwrap();
-            let baseline = broker
-                .plan_file
-                .read_working_document(&broker.session.id, &plan.id)?;
-            broker
-                .handle_execution_control(
-                    &execution.id,
-                    execution.generation,
-                    &task.permit(),
-                    ExecutionOperation::Submit {
-                        baseline: Box::new(baseline),
-                        document: Box::new(document),
-                        reason: "Clarify ownership".into(),
-                    },
-                    &mut exchange,
-                )
-                .await?;
-            let submitted = broker.store.load_plan(&plan.id)?.unwrap();
-            if revision == 3 || revision == 4 {
-                assert_eq!(submitted.state, PlanState::Accepted);
-                assert_eq!(submitted.accepted_revision, Some(revision));
-                assert!(broker.task_controller.current()?.unwrap().auto_accept_plan);
-                continue;
-            }
-            assert_eq!(submitted.state, PlanState::AwaitingReview);
-            let waiting = broker.task_controller.current()?.unwrap();
-            assert_eq!(waiting.status(), crate::task::TaskStatus::Waiting);
-            assert_eq!(waiting.phase(), crate::task::TaskPhase::Resolve);
-            assert_eq!(waiting.next_action(), crate::task::TaskNextAction::Wait);
-            assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
-            if revision == 5 {
-                broker.task_controller.change(
-                    &mut broker.store,
-                    Some(&waiting.revision),
-                    crate::task::TaskChange::Pause,
-                    10,
-                )?;
-                broker.dispatch_session_command(
-                    "session.plan.accept",
-                    json!({"plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask","annotations":[]}),
-                )?;
-                let accepted_while_paused = broker.task_controller.current()?.unwrap();
-                assert_eq!(accepted_while_paused.id, waiting.id);
-                assert_eq!(
-                    accepted_while_paused.status(),
-                    crate::task::TaskStatus::Paused,
-                    "review acceptance overrode an explicit user pause"
-                );
-                assert_eq!(
-                    accepted_while_paused.phase(),
-                    crate::task::TaskPhase::Resolve
-                );
-                break;
-            }
-            let source = broker
-                .observer
-                .capture_plan_review(&plan.id, submitted.review_digest.as_deref().unwrap())?;
-            let line = source.rendered.navigation.anchor.first().unwrap().line;
-            let (_, events) = broker.dispatch_session_command(
-                "session.plan.accept",
-                json!({
-                    "plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask",
-                    "annotations":[{"start_line":line,"end_line":line,"body":"Clarify the owner."}]
-                }),
-            )?;
+        Ok(ResolvingExecution {
+            _workspace: workspace,
+            _data: data,
+            broker,
+            plan,
+            exchange,
+        })
+    }
+
+    /// Draft and submit one execution-owned revision, returning the stored plan it produced.
+    async fn submit_execution_revision(
+        execution_fixture: &mut ResolvingExecution,
+        revision: u32,
+    ) -> Result<PlanRecord> {
+        let ResolvingExecution {
+            broker,
+            plan,
+            exchange,
+            ..
+        } = execution_fixture;
+        let task = broker.task_controller.current()?.unwrap();
+        let execution = broker.current_execution()?.unwrap();
+        let mut document = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)?;
+        document.version += 1;
+        document.design.as_mut().unwrap().document.design =
+            format!("Keep state in its owner, revision {revision}.");
+        broker
+            .handle_execution_control(
+                &execution.id,
+                execution.generation,
+                &task.permit(),
+                ExecutionOperation::Draft(Box::new(document.clone())),
+                exchange,
+            )
+            .await?;
+        let task = broker.task_controller.current()?.unwrap();
+        let execution = broker.current_execution()?.unwrap();
+        let baseline = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)?;
+        broker
+            .handle_execution_control(
+                &execution.id,
+                execution.generation,
+                &task.permit(),
+                ExecutionOperation::Submit {
+                    baseline: Box::new(baseline),
+                    document: Box::new(document),
+                    reason: "Clarify ownership".into(),
+                },
+                exchange,
+            )
+            .await?;
+        Ok(broker.store.load_plan(&plan.id)?.unwrap())
+    }
+
+    /// Review annotations on an execution revision request changes and keep acceptance explicit.
+    #[tokio::test]
+    async fn inline_execution_review_annotations_request_changes() -> Result<()> {
+        let mut execution_fixture = resolving_execution().await?;
+        let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
+        let ResolvingExecution { broker, plan, .. } = &mut execution_fixture;
+        assert_eq!(submitted.state, PlanState::AwaitingReview);
+        let waiting = broker.task_controller.current()?.unwrap();
+        assert_eq!(waiting.status(), crate::task::TaskStatus::Waiting);
+        assert_eq!(waiting.phase(), crate::task::TaskPhase::Resolve);
+        assert_eq!(waiting.next_action(), crate::task::TaskNextAction::Wait);
+        assert!(!waiting.auto_accept_plan);
+        let source = broker
+            .observer
+            .capture_plan_review(&plan.id, submitted.review_digest.as_deref().unwrap())?;
+        let line = source.rendered.navigation.anchor.first().unwrap().line;
+        let (_, events) = broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({
+                "plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask",
+                "annotations":[{"start_line":line,"end_line":line,"body":"Clarify the owner."}]
+            }),
+        )?;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "plan_changes_requested")
+        );
+        let pending = broker.store.load_plan(&plan.id)?.unwrap();
+        assert_eq!(pending.state, PlanState::Revising);
+        assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
+        broker.dispatch_session_command(
+            "session.command.apply",
+            json!({"action":"plan_accept","enabled":true}),
+        )?;
+        let execution = broker.current_execution()?.unwrap();
+        assert!(
+            execution
+                .findings
+                .iter()
+                .any(|finding| finding.contains("Clarify the owner."))
+        );
+        Ok(())
+    }
+
+    /// Retain explicit automatic acceptance across successive execution revisions.
+    #[tokio::test]
+    async fn inline_execution_revisions_preserve_explicit_automatic_acceptance() -> Result<()> {
+        let mut execution_fixture = resolving_execution().await?;
+        execution_fixture.broker.dispatch_session_command(
+            "session.command.apply",
+            json!({"action":"plan_accept","enabled":true}),
+        )?;
+        for revision in 2..=3 {
+            let submitted = submit_execution_revision(&mut execution_fixture, revision).await?;
+            assert_eq!(submitted.state, PlanState::Accepted);
+            assert_eq!(submitted.accepted_revision, Some(revision));
             assert!(
-                events
-                    .iter()
-                    .any(|event| event.event == "plan_changes_requested")
-            );
-            let pending = broker.store.load_plan(&plan.id)?.unwrap();
-            assert_eq!(pending.state, PlanState::Revising);
-            assert!(!broker.task_controller.current()?.unwrap().auto_accept_plan);
-            broker.dispatch_session_command(
-                "session.command.apply",
-                json!({"action":"plan_accept","enabled":true}),
-            )?;
-            let execution = broker.current_execution()?.unwrap();
-            assert!(
-                execution
-                    .findings
-                    .iter()
-                    .any(|finding| finding.contains("Clarify the owner."))
+                execution_fixture
+                    .broker
+                    .task_controller
+                    .current()?
+                    .unwrap()
+                    .auto_accept_plan
             );
         }
+        Ok(())
+    }
+
+    /// A command that disables automatic acceptance makes the next revision wait, and accepting
+    /// that review while the task is paused must not override the pause.
+    #[tokio::test]
+    async fn inline_execution_review_after_disabled_acceptance_preserves_user_pause() -> Result<()>
+    {
+        let mut execution_fixture = resolving_execution().await?;
+        execution_fixture.broker.dispatch_session_command(
+            "session.command.apply",
+            json!({"action":"plan_accept","enabled":true}),
+        )?;
+        execution_fixture.broker.dispatch_session_command(
+            "session.command.apply",
+            json!({"action":"plan_accept","enabled":false}),
+        )?;
+        let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
+        let ResolvingExecution { broker, plan, .. } = &mut execution_fixture;
+        assert_eq!(submitted.state, PlanState::AwaitingReview);
+        let waiting = broker.task_controller.current()?.unwrap();
+        assert_eq!(waiting.status(), crate::task::TaskStatus::Waiting);
+        assert_eq!(waiting.phase(), crate::task::TaskPhase::Resolve);
+        assert_eq!(waiting.next_action(), crate::task::TaskNextAction::Wait);
+        assert!(!waiting.auto_accept_plan);
+        broker.task_controller.change(
+            &mut broker.store,
+            Some(&waiting.revision),
+            crate::task::TaskChange::Pause,
+            10,
+        )?;
+        broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({"plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask","annotations":[]}),
+        )?;
+        let accepted_while_paused = broker.task_controller.current()?.unwrap();
+        assert_eq!(accepted_while_paused.id, waiting.id);
+        assert_eq!(
+            accepted_while_paused.status(),
+            crate::task::TaskStatus::Paused,
+            "review acceptance overrode an explicit user pause"
+        );
+        assert_eq!(
+            accepted_while_paused.phase(),
+            crate::task::TaskPhase::Resolve
+        );
         Ok(())
     }
 }

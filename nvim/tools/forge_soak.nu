@@ -24,7 +24,7 @@ def main [
       let operation_started = date now
       let memory_before = process_memory_bytes
       let result = try {
-        run-external $nu.current-exe "--no-config-file" .forge/checks/lua-tests.nu $"nvim/tests/forge/($workflow).lua" | complete
+        run-external $nu.current-exe "--no-config-file" .forge/checks/lua-tests.nu $"nvim/lua/forge/tests/($workflow).lua" | complete
       } catch {|failure| {exit_code: 127, stdout: "", stderr: $failure.msg} }
       let entry = {
         iteration: $iteration

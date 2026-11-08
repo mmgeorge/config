@@ -403,13 +403,10 @@ mod tests {
         let old_call = tokio::spawn(async move { call_label(&old_client, &old_url, 1).await });
         entered.notified().await;
 
-        let old_server = Arc::new(old_server);
-        let closing_server = old_server.clone();
-        let mut closing = tokio::spawn(async move { closing_server.close().await });
+        // The handler has entered, so closing must park on that admitted call.
+        let mut closing = std::pin::pin!(old_server.close());
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut closing)
-                .await
-                .is_err(),
+            futures_util::poll!(closing.as_mut()).is_pending(),
             "retiring an invocation must wait for its already admitted call"
         );
         assert_eq!(
@@ -420,7 +417,7 @@ mod tests {
         release.notify_one();
         let old_response = old_call.await??;
         assert_eq!(old_response, "old invocation");
-        closing.await??;
+        closing.await?;
         assert_eq!(
             call_label(&client, &new_server.url, 3).await?,
             "new invocation"

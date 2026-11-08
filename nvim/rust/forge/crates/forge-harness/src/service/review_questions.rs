@@ -152,14 +152,10 @@ mod tests {
                 forge_provider_api::ProviderOperation::ThreadOpen,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ));
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            observe_answer(async { Err(failure.into()) }, updates),
-        )
-        .await
-        .context("failed child answer waited for retained producer destruction")?
-        .err()
-        .context("failed child initialization became a successful answer")?;
+        let error = observe_answer(async { Err(failure.into()) }, updates)
+            .await
+            .err()
+            .context("failed child initialization became a successful answer")?;
         assert!(
             matches!(error.downcast_ref::<crate::provider::ProviderError>(),
                 Some(crate::provider::ProviderError::Failure(failure))

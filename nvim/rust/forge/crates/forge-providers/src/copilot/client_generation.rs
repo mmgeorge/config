@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     /// A cancelled recovery waiter leaves the same SDK collection worker owned for a later join.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_collection_waiter_retains_worker_and_first_failure() {
         let (reader, _read_peer) = tokio::io::duplex(4096);
         let (writer, _write_peer) = tokio::io::duplex(4096);

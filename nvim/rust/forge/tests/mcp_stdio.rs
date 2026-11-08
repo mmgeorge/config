@@ -1,4 +1,4 @@
-use std::{process::Stdio, time::Duration};
+use std::process::Stdio;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,10 +35,7 @@ async fn fragmented_requests_preserve_order_and_notification_silence() {
     drop(input);
     for request_id in 1..=3 {
         let mut line = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), output.read_until(b'\n', &mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        output.read_until(b'\n', &mut line).await.unwrap();
         assert!(line.len() <= forge_protocol::MAX_FRAME_BYTES);
         let response: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(response["id"], request_id);
@@ -53,38 +50,20 @@ async fn fragmented_requests_preserve_order_and_notification_silence() {
         }
     }
     let mut extra = Vec::new();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), output.read_until(b'\n', &mut extra))
-            .await
-            .unwrap()
-            .unwrap(),
-        0
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success()
-    );
+    assert_eq!(output.read_until(b'\n', &mut extra).await.unwrap(), 0);
+    assert!(child.wait().await.unwrap().success());
 }
 
 #[tokio::test]
 async fn large_invalid_unterminated_input_reports_decode_failure_after_eof() {
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        input.write_all(&vec![b'x'; forge_protocol::MAX_FRAME_BYTES + 1]),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    drop(input);
-    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+    input
+        .write_all(&vec![b'x'; forge_protocol::MAX_FRAME_BYTES + 1])
         .await
-        .unwrap()
         .unwrap();
+    drop(input);
+    let output = child.wait_with_output().await.unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("decode Harness control MCP request"));
@@ -99,10 +78,7 @@ async fn truncated_json_fails_without_a_partial_response() {
         .await
         .unwrap();
     drop(input);
-    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
+    let output = child.wait_with_output().await.unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("decode Harness control MCP request"));
@@ -117,10 +93,7 @@ async fn large_requests_and_results_preserve_complete_content_and_request_order(
     let mut encoded = serde_json::to_vec(&request).unwrap();
     encoded.push(b'\n');
     assert!(encoded.len() > forge_protocol::MAX_FRAME_BYTES);
-    tokio::time::timeout(Duration::from_secs(5), input.write_all(&encoded))
-        .await
-        .unwrap()
-        .unwrap();
+    input.write_all(&encoded).await.unwrap();
     input
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"initialize\"}\n")
         .await
@@ -128,10 +101,7 @@ async fn large_requests_and_results_preserve_complete_content_and_request_order(
     drop(input);
     for request_id in [11, 12] {
         let mut line = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), output.read_until(b'\n', &mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        output.read_until(b'\n', &mut line).await.unwrap();
         let response: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(response["id"], request_id);
         if request_id == 11 {
@@ -144,11 +114,5 @@ async fn large_requests_and_results_preserve_complete_content_and_request_order(
             assert!(response.get("result").is_some());
         }
     }
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success()
-    );
+    assert!(child.wait().await.unwrap().success());
 }

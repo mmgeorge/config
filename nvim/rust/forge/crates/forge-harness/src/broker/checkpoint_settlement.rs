@@ -249,12 +249,12 @@ impl HarnessBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::test::{planning_question_broker, repository};
+    use crate::broker::test::{git_repository, planning_question_broker};
 
     /// An original completed invocation's workspace capture does not hold the broker mutex.
     #[tokio::test]
     async fn idle_checkpoint_capture_keeps_broker_available() -> Result<()> {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let mut exchange = super::super::test::completed_interaction(
@@ -302,7 +302,7 @@ mod tests {
     /// Discard an unlocked capture when initial checkpoint collection changed its baseline.
     #[tokio::test]
     async fn final_capture_rechecks_baseline_before_committing() -> Result<()> {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut exchange, _, _) = broker

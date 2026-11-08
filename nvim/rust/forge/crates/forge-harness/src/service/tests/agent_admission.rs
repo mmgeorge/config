@@ -6,7 +6,6 @@ use crate::agent::{
 use crate::exchange::agent_command::{AgentCommand, AgentOutcome};
 use crate::exchange::command::{Command, CommandId, CommandOutcome, CommandRequest, InputControl};
 use anyhow::{Context, Result, ensure};
-use std::time::Duration;
 
 /// Keep public owner control available while a child-start or follow-up waits outside the FIFO.
 #[tokio::test]
@@ -230,9 +229,9 @@ async fn saturated_child_admission(followup: bool) -> Result<()> {
         child_provider.shutdown().await?;
         controller.finish_session_events().await
     };
-    let teardown = tokio::time::timeout(Duration::from_secs(10), teardown).await;
+    let teardown = teardown.await;
     reader.abort();
     scenario?;
-    teardown.context("admission fixture teardown did not settle")??;
+    teardown?;
     Ok(())
 }

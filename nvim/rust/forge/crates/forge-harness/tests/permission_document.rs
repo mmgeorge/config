@@ -4,7 +4,6 @@ use forge_harness::provider::ProviderLaunch;
 use forge_harness::session::ApprovalMode;
 use forge_protocol::message::Request;
 use serde_json::json;
-use std::process::Command;
 
 #[test]
 fn repository_permission_document_matches_the_runtime_schema() {
@@ -23,15 +22,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
         json!({"checks":{}}).to_string(),
     )
     .unwrap();
-    assert!(
-        Command::new("git")
-            .arg("init")
-            .arg("--quiet")
-            .arg(&workspace)
-            .status()
-            .unwrap()
-            .success()
-    );
+    forge_git::test_support::init_repository(&workspace);
     let broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
         provider_launch_by_provider: Default::default(),

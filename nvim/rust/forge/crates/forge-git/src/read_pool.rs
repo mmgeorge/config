@@ -343,6 +343,17 @@ mod tests {
         .await;
     }
 
+    /// Polls once. Callers establish the pool's full-capacity state first, so the only possible
+    /// outcome of a correct wait is parking on the capacity signal.
+    async fn is_pending_after_one_poll<Waiting: Future>(
+        mut waiting: std::pin::Pin<&mut Waiting>,
+    ) -> bool {
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(waiting.as_mut().poll(context).is_pending())
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn waiting_reads_resume_after_collection_and_shutdown_wakes_waiters() {
         let pool = BlockingReadPool::new(1).unwrap();
@@ -350,22 +361,14 @@ mod tests {
         wait_for_native_completion(&first).await;
         let waiting = pool.submit_wait(8, |_| Ok("second"));
         tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
-                .await
-                .is_err()
-        );
+        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
         first.finish().await.unwrap();
         let second = (&mut waiting).await.unwrap();
         assert_eq!(second.finish().await.unwrap(), "second");
         let held = pool.submit(8, |_| Ok(())).unwrap();
         let waiting = pool.submit_wait(1, |_| Ok(()));
         tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
-                .await
-                .is_err()
-        );
+        assert!(is_pending_after_one_poll(waiting.as_mut()).await);
         pool.shutdown(Duration::ZERO).await;
         assert_eq!((&mut waiting).await.err(), Some(ReadAdmissionError::Closed));
         drop(held);

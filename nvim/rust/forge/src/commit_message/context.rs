@@ -392,54 +392,33 @@ fn empty() -> Result<ComparisonSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    fn git(root: &std::path::Path, arguments: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(arguments)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use forge_git::test_support::{
+        commit_index, init_repository, move_tracked, reset_index_to_head, set_config, set_identity,
+        stage, stage_all,
+    };
 
     #[tokio::test]
     async fn lfs_files_are_excluded_before_content_acquisition_in_every_comparison() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        git(root, &["init", "--quiet"]);
-        git(root, &["config", "user.name", "Forge Test"]);
-        git(root, &["config", "user.email", "forge@example.invalid"]);
-        git(root, &["config", "core.autocrlf", "false"]);
+        init_repository(root);
+        set_identity(root);
+        set_config(root, "core", "autocrlf", "false");
         std::fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
         for path in ["tracked.asset", "deleted.asset", "renamed.asset"] {
             std::fs::write(root.join(path), "original filtered content\n").unwrap();
         }
         std::fs::write(root.join("source.txt"), "before\n").unwrap();
-        let add = [
-            "-c",
-            "filter.lfs.process=",
-            "-c",
-            "filter.lfs.clean=",
-            "-c",
-            "filter.lfs.required=false",
-            "add",
-            ".",
-        ];
-        git(root, &add);
-        git(root, &["commit", "--quiet", "-m", "initial"]);
+        stage_all(root);
+        commit_index(root, "initial");
         let blocked = "echo invoked > filter-invoked; exit 9";
-        git(root, &["config", "filter.lfs.process", ""]);
-        git(root, &["config", "filter.lfs.clean", blocked]);
-        git(root, &["config", "filter.lfs.required", "true"]);
+        set_config(root, "filter \"lfs\"", "process", "");
+        set_config(root, "filter \"lfs\"", "clean", blocked);
+        set_config(root, "filter \"lfs\"", "required", "true");
         std::fs::write(root.join("tracked.asset"), "changed filtered content\n").unwrap();
         std::fs::write(root.join("untracked.asset"), "new filtered content\n").unwrap();
         std::fs::remove_file(root.join("deleted.asset")).unwrap();
-        git(root, &["mv", "renamed.asset", "replacement.txt"]);
+        move_tracked(root, "renamed.asset", "replacement.txt");
         std::fs::write(root.join("source.txt"), "after\n").unwrap();
         let store = RepositoryStore::default();
         let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
@@ -467,7 +446,7 @@ mod tests {
         assert_eq!(context.diff_pairs, 1);
         assert!(!root.join("filter-invoked").exists());
 
-        git(root, &add);
+        stage_all(root);
         std::fs::remove_file(root.join("tracked.asset")).unwrap();
         std::fs::remove_file(root.join("untracked.asset")).unwrap();
         for comparison in [
@@ -477,7 +456,7 @@ mod tests {
             Comparison::PullRequest,
         ] {
             if comparison == Comparison::LatestCommit {
-                git(root, &["commit", "--quiet", "-m", "changed"]);
+                commit_index(root, "changed");
             }
             if comparison == Comparison::PullRequest {
                 request.base = Some("HEAD^".into());
@@ -514,17 +493,16 @@ mod tests {
     async fn status_draft_prefers_staged_and_falls_back_to_non_ignored_unstaged() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        git(root, &["init", "--quiet"]);
-        git(root, &["config", "user.name", "Forge Test"]);
-        git(root, &["config", "user.email", "forge@example.invalid"]);
-        git(root, &["config", "core.autocrlf", "false"]);
+        init_repository(root);
+        set_identity(root);
+        set_config(root, "core", "autocrlf", "false");
         std::fs::write(root.join("tracked.txt"), "before\n").unwrap();
         std::fs::write(root.join("deleted.txt"), "removed\n").unwrap();
         std::fs::write(root.join(".gitignore"), "git-ignored.txt\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "--quiet", "-m", "initial"]);
+        stage_all(root);
+        commit_index(root, "initial");
         std::fs::write(root.join("tracked.txt"), "staged value\n").unwrap();
-        git(root, &["add", "tracked.txt"]);
+        stage(root, &["tracked.txt"]);
         std::fs::write(root.join("tracked.txt"), "worktree value\n").unwrap();
         std::fs::remove_file(root.join("deleted.txt")).unwrap();
         std::fs::write(root.join("untracked.txt"), "new value\n").unwrap();
@@ -578,14 +556,14 @@ mod tests {
         assert!(latest.contains("+ before") && latest.contains("+ removed"));
         assert!(!latest.contains("staged value") && !latest.contains("worktree value"));
         request.comparison = Comparison::Staged;
-        git(root, &["add", "excluded.txt"]);
+        stage(root, &["excluded.txt"]);
         let staged = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
             .unwrap();
         assert!(staged.contains("status ignored value"));
-        git(root, &["reset", "--quiet"]);
+        reset_index_to_head(root);
         assert!(
             collect(&store, &diff, &syntax, &request)
                 .await
@@ -606,7 +584,7 @@ mod tests {
                 && fallback.contains("- removed")
         );
         assert!(!fallback.contains("staged value") && !fallback.contains("ignored value"));
-        git(root, &["add", "excluded.txt"]);
+        stage(root, &["excluded.txt"]);
         assert!(
             collect(&store, &diff, &syntax, &request)
                 .await

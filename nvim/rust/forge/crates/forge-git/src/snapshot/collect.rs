@@ -457,19 +457,21 @@ fn rename_origin(change: &PathRecord) -> Option<&RepositoryPath> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::git;
+    use crate::test_support::{
+        commit_index, git, init_repository, set_config, set_head_branch, set_identity, stage,
+        stage_all,
+    };
 
     #[test]
     fn comparison_keeps_case_only_deletion_and_addition() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
-        git(root, &["config", "user.name", "Forge"]);
-        git(root, &["config", "user.email", "forge@example.invalid"]);
-        git(root, &["config", "core.ignorecase", "false"]);
+        init_repository(root);
+        set_identity(root);
+        set_config(root, "core", "ignorecase", "false");
         fs::write(root.join("before.txt"), "same\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "--quiet", "-m", "initial"]);
+        stage_all(root);
+        commit_index(root, "initial");
         fs::rename(root.join("before.txt"), root.join("BEFORE.txt")).unwrap();
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
@@ -491,9 +493,9 @@ mod tests {
     fn settlement_verifies_paths_without_reading_or_counting_sources() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         fs::write(root.join("staged"), "staged\n").unwrap();
-        git(root, &["add", "staged"]);
+        stage(root, &["staged"]);
         fs::write(root.join("staged"), "changed\nextra\n").unwrap();
         fs::write(root.join("untracked"), "new\n").unwrap();
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
@@ -523,9 +525,9 @@ mod tests {
     fn display_accepts_worktree_changes_without_broad_metadata_validation() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         fs::write(root.join("staged"), "staged\n").unwrap();
-        git(root, &["add", "staged"]);
+        stage(root, &["staged"]);
         fs::write(root.join("untracked"), "before\n").unwrap();
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
@@ -573,7 +575,7 @@ mod tests {
     fn display_accepts_new_paths_during_collection_and_refreshes_inventory() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         fs::write(root.join("before"), "before\n").unwrap();
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
@@ -620,7 +622,7 @@ mod tests {
     fn worktree_change_after_status_rejects_the_observation() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         fs::write(root.join("untracked"), "before").unwrap();
         for number in 0..128 {
             fs::write(root.join(format!("other-{number}")), "unchanged").unwrap();
@@ -655,7 +657,7 @@ mod tests {
     fn selected_metadata_preserves_order_and_checks_cancellation() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         for number in 0..320 {
             fs::write(root.join(format!("file-{number:04}")), number.to_string()).unwrap();
         }
@@ -689,9 +691,9 @@ mod tests {
     fn index_reencoding_with_identical_status_is_rejected() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         fs::write(root.join("staged"), "contents").unwrap();
-        git(root, &["add", "staged"]);
+        stage(root, &["staged"]);
         git(root, &["update-index", "--index-version=2"]);
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
@@ -716,7 +718,7 @@ mod tests {
     fn head_reference_change_with_identical_status_is_rejected() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet", "--initial-branch=main"]);
+        init_repository(root);
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
         let mut calls = 0;
@@ -728,7 +730,7 @@ mod tests {
             |check| {
                 calls += 1;
                 if calls == 2 {
-                    git(root, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+                    set_head_branch(root, "other");
                 }
                 StatusReader::status_native(&local, check)
             },
@@ -740,7 +742,7 @@ mod tests {
     fn new_path_during_status_collection_is_rejected() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let local = shared.to_thread_local();
         let mut calls = 0;

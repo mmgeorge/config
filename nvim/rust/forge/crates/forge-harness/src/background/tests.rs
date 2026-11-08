@@ -1,21 +1,8 @@
 use super::*;
 use crate::{provider::ProviderLaunch, storage::SqliteStore};
 use anyhow::Result;
+use forge_git::test_support::{commit_index, init_repository, set_identity};
 use std::{path::Path, sync::Arc};
-
-fn git(root: &Path, arguments: &[&str]) {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 fn manager() -> Arc<BackgroundManager> {
     let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
@@ -62,9 +49,8 @@ fn background_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf, std::p
     let root = fixture.path().join("repository");
     std::fs::create_dir(&root)?;
     let data = fixture.path().join("state");
-    git(&root, &["init", "-q", "-b", "main"]);
-    git(&root, &["config", "user.name", "Fixture"]);
-    git(&root, &["config", "user.email", "fixture@example.test"]);
+    init_repository(&root);
+    set_identity(&root);
     Ok((fixture, root, data))
 }
 
@@ -111,41 +97,20 @@ async fn background_resume_marks_interrupted_compaction_unconfirmed() -> Result<
 #[tokio::test]
 async fn history_keeps_ten_complete_messages_and_rejects_changed_head() -> Result<()> {
     let fixture = tempfile::tempdir()?;
-    git(fixture.path(), &["init", "-q", "-b", "main"]);
-    git(fixture.path(), &["config", "user.name", "Fixture"]);
-    git(
-        fixture.path(),
-        &["config", "user.email", "fixture@example.test"],
-    );
+    init_repository(fixture.path());
+    set_identity(fixture.path());
     for index in 0..12 {
-        git(
+        commit_index(
             fixture.path(),
-            &[
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                &format!("feat: entry {index}\n\nBody {index}"),
-            ],
+            &format!("feat: entry {index}\n\nBody {index}"),
         );
     }
-    let message = fixture.path().join("long-message.txt");
-    std::fs::write(
-        &message,
-        format!(
+    commit_index(
+        fixture.path(),
+        &format!(
             "feat: preserve full history\n\n{}\nlast-history-marker",
             "history ".repeat(70000)
         ),
-    )?;
-    git(
-        fixture.path(),
-        &[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-F",
-            message.to_str().unwrap(),
-        ],
     );
     let store = forge_git::store::RepositoryStore::default();
     let context = BackgroundContext::read(&store, fixture.path().to_str().unwrap()).await?;
@@ -153,10 +118,7 @@ async fn history_keeps_ten_complete_messages_and_rejects_changed_head() -> Resul
     assert!(!context.history.contains("entry 0\n"));
     assert!(context.history.contains("Body 11"));
     assert!(context.history.contains("last-history-marker") && context.history.len() > 500_000);
-    git(
-        fixture.path(),
-        &["commit", "-q", "--allow-empty", "-m", "feat: later"],
-    );
+    commit_index(fixture.path(), "feat: later");
     assert!(context.verify(&store).await.is_err());
     Ok(())
 }

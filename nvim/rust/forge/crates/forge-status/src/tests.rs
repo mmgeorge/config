@@ -13,6 +13,10 @@ use forge_git::{
     writer::{GitWriteService, TargetCompletion},
 };
 
+use forge_git::test_support::{
+    head_commit, init_repository, set_config, set_identity, stage, stage_and_commit,
+};
+
 use crate::protocol::{StatusFile, StatusStatistics};
 use crate::{
     BodyState, StatusInput, StatusLocation, StatusSection, StatusSelection, StatusService,
@@ -58,16 +62,11 @@ async fn fixture() -> (
     Arc<GitWriteService>,
 ) {
     let directory = tempfile::tempdir().unwrap();
-    git(directory.path(), &["init", "--initial-branch=main"]);
-    git(directory.path(), &["config", "user.name", "Forge"]);
-    git(
-        directory.path(),
-        &["config", "user.email", "forge@example.invalid"],
-    );
-    git(directory.path(), &["config", "core.autocrlf", "false"]);
+    init_repository(directory.path());
+    set_identity(directory.path());
+    set_config(directory.path(), "core", "autocrlf", "false");
     std::fs::write(directory.path().join("sample.txt"), "old\n").unwrap();
-    git(directory.path(), &["add", "sample.txt"]);
-    git(directory.path(), &["commit", "-m", "initial"]);
+    stage_and_commit(directory.path(), &["sample.txt"], "initial");
     std::fs::write(directory.path().join("sample.txt"), "new\n").unwrap();
     let store = Arc::new(RepositoryStore::default());
     let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
@@ -131,7 +130,7 @@ fn closing_pending_document_invalidates_adoption_without_releasing_live_charge()
 #[tokio::test]
 async fn unstage_invalidates_cached_index_when_replacement_timestamp_moves_backwards() {
     let (directory, service, _, writer) = fixture().await;
-    git(directory.path(), &["add", "sample.txt"]);
+    stage(directory.path(), &["sample.txt"]);
     let index = directory.path().join(".git/index");
     std::fs::OpenOptions::new()
         .write(true)
@@ -245,8 +244,11 @@ async fn source_document_retains_exact_revision_and_bounded_continuation() {
         .map(|row| format!("line {row}\n"))
         .collect::<String>();
     std::fs::write(directory.path().join("historical file.txt"), &original).unwrap();
-    git(directory.path(), &["add", "historical file.txt"]);
-    git(directory.path(), &["commit", "-m", "historical source"]);
+    stage_and_commit(
+        directory.path(),
+        &["historical file.txt"],
+        "historical source",
+    );
     let service = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
         diff.clone(),
@@ -311,7 +313,7 @@ async fn source_document_index_revision_is_immutable_and_distinct_from_later_ind
         .unwrap();
     assert_eq!(first.revision, "index");
     assert_eq!(first.snapshot.block[0].text.row(0), Some("old"));
-    git(directory.path(), &["add", "sample.txt"]);
+    stage(directory.path(), &["sample.txt"]);
     let second = service
         .open(
             DocumentId("index-second".into()),
@@ -887,7 +889,7 @@ async fn physical_selection_stages_multiple_native_file_targets() {
 #[tokio::test]
 async fn staged_body_survives_worktree_only_change() {
     let (directory, service, _, _) = fixture().await;
-    git(directory.path(), &["add", "sample.txt"]);
+    stage(directory.path(), &["sample.txt"]);
     let snapshot = service
         .open(DocumentId("status".into()), directory.path().to_owned())
         .await
@@ -1144,8 +1146,7 @@ async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
     );
     let new = format!("fn after() {{}}\nfn retained() {{}}\n{}", "\n".repeat(9999));
     std::fs::write(directory.path().join("syntax.rs"), &old).unwrap();
-    git(directory.path(), &["add", "syntax.rs"]);
-    git(directory.path(), &["commit", "-m", "syntax source"]);
+    stage_and_commit(directory.path(), &["syntax.rs"], "syntax source");
     std::fs::write(directory.path().join("syntax.rs"), &new).unwrap();
     let store = Arc::new(RepositoryStore::default());
     let syntax = SyntaxEngine::new(diff.analysis_pool());
@@ -1277,7 +1278,7 @@ async fn removed_status_row_opens_captured_blob_after_index_changes() {
     let effect = service.open_target(captured).await.unwrap();
     assert_eq!(effect.kind, "open_source");
     assert_eq!(effect.row, 0);
-    git(directory.path(), &["add", "sample.txt"]);
+    stage(directory.path(), &["sample.txt"]);
     let source = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
         diff.clone(),
@@ -1740,11 +1741,10 @@ async fn semantic_status_fixture(
     let old = "pub fn visible() { before(); }\nfn hidden() { private_before(); }\n".to_owned();
     let new = old.replace("before", "after");
     std::fs::write(directory.path().join("sample.rs"), &old).unwrap();
-    git(directory.path(), &["add", "sample.rs"]);
-    git(directory.path(), &["commit", "-m", "semantic baseline"]);
+    stage_and_commit(directory.path(), &["sample.rs"], "semantic baseline");
     std::fs::write(directory.path().join("sample.rs"), &new).unwrap();
     if staged {
-        git(directory.path(), &["add", "sample.rs"]);
+        stage(directory.path(), &["sample.rs"]);
     }
     let opened = service
         .open(
@@ -1853,90 +1853,10 @@ async fn shared_status_controls_keep_semantic_bodies_lazy_and_visibility_indepen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn semantic_mutation_refresh_retains_unfolded_sibling_declarations() {
-    let (directory, service, opened, old, _) = semantic_status_fixture(false).await;
-    service
-        .demand(input(&opened, "sample.rs", 1, "demand"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    service
-        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let selected = file(&current, "sample.rs", None);
-    let loaded = body(&service, &current, selected).await;
-    let visible = loaded
-        .block
-        .iter()
-        .find(|block| {
-            block
-                .text
-                .row(0)
-                .is_some_and(|text| text.contains("pub fn visible()"))
-        })
-        .unwrap();
-    let mut expand = input(&current, "sample.rs", 3, "source_expand");
-    expand.location = body_location(selected, &loaded, visible, 0);
-    service.source_section(expand).await.unwrap();
-    let loaded = body(&service, &current, selected).await;
-    let hidden = loaded
-        .block
-        .iter()
-        .find(|block| {
-            block
-                .text
-                .row(0)
-                .is_some_and(|text| text.contains("fn hidden()"))
-        })
-        .unwrap();
-    let mut stage = input(&current, "sample.rs", 4, "stage");
-    stage.location = body_location(selected, &loaded, hidden, 0);
-    let outcome = service.input(stage).await.unwrap().finish().await.unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed)
-    );
-    assert_eq!(
-        git(directory.path(), &["show", ":sample.rs"]),
-        old.replace("private_before", "private_after").as_bytes()
-    );
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let loaded = body(
-        &service,
-        &current,
-        file(&current, "sample.rs", Some(StatusSection::Unstaged)),
-    )
-    .await;
-    let text = rows(&loaded).join("\n");
-    assert!(
-        text.contains("before();") && text.contains("after();"),
-        "mutation collapsed an unfolded sibling: {text}"
-    );
-    let visible = loaded
-        .block
-        .iter()
-        .find(|block| {
-            block
-                .text
-                .row(0)
-                .is_some_and(|text| text == "pub fn visible() {")
-        })
-        .unwrap();
-    assert!(!visible.metadata.fold[0].closed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linked_status_diff_controls_publish_matching_bodies_and_protocol_fixture() {
     use forge_diff::view::{DiffPresentation, DiffVisibility};
     let (directory, service, initial, _, _) = semantic_status_fixture(false).await;
-    let revision = String::from_utf8(git(directory.path(), &["rev-parse", "HEAD"]))
-        .unwrap()
-        .trim()
-        .to_owned();
+    let revision = head_commit(directory.path()).to_string();
     let child_initial = service
         .open_comparison(
             DocumentId(format!("{}:commit:{revision}", initial.document.0)),

@@ -3,7 +3,7 @@ use super::super::{
     TurnRetracted, publication,
 };
 use super::test_support::{
-    PreparationProbe, checkpoint_fixture, planning_question_broker, repository,
+    PreparationProbe, checkpoint_fixture, git_repository, planning_question_broker, repository,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -285,7 +285,7 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
 async fn admission_precedes_preparation_and_settles_success_failure_and_cancellation() -> Result<()>
 {
     for outcome in ["complete", "fail", "cancel"] {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let preparation = Arc::new(PreparationProbe {

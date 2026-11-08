@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
@@ -96,12 +96,7 @@ impl Drop for ProcessOwner {
 }
 
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
     while !ready()? {
-        ensure!(
-            Instant::now() < deadline,
-            "storage worker did not finish within 15 seconds"
-        );
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())

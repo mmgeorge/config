@@ -43,8 +43,6 @@ mod review_delivery;
 mod review_diff;
 mod review_file_layout;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
-#[cfg(test)]
-pub(crate) use review_delivery::reconstruct;
 mod edit;
 pub(crate) mod edit_trace;
 pub(crate) mod event;

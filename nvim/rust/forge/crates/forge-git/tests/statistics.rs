@@ -8,21 +8,22 @@ use forge_diff::{
     workers::WorkPriority,
 };
 use forge_git::{snapshot::LineStats, store::RepositoryStore};
-use support::git;
+use support::{
+    commit_index, init_repository, move_tracked, set_config, set_identity, stage, stage_all,
+};
 
 fn fixture() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    git(root, &["init", "--quiet"]);
-    git(root, &["config", "core.autocrlf", "false"]);
-    git(root, &["config", "core.safecrlf", "false"]);
-    git(root, &["config", "user.name", "Forge"]);
-    git(root, &["config", "user.email", "forge@example.invalid"]);
+    init_repository(root);
+    set_config(root, "core", "autocrlf", "false");
+    set_config(root, "core", "safecrlf", "false");
+    set_identity(root);
     for name in ["staged", "unstaged", "both", "deleted", "renamed"] {
         std::fs::write(root.join(name), "original\n").unwrap();
     }
-    git(root, &["add", "."]);
-    git(root, &["commit", "--quiet", "-m", "base"]);
+    stage_all(root);
+    commit_index(root, "base");
     directory
 }
 
@@ -62,12 +63,12 @@ async fn counts_only_changed_sides_reuses_index_and_retains_display_analysis() {
     let root = directory.path();
     for name in ["staged", "both"] {
         std::fs::write(root.join(name), "original\nstaged\n").unwrap();
-        git(root, &["add", name]);
+        stage(root, &[name]);
     }
     std::fs::write(root.join("both"), "original\nstaged\nworktree\n").unwrap();
     std::fs::write(root.join("unstaged"), "original\nworktree\n").unwrap();
     std::fs::remove_file(root.join("deleted")).unwrap();
-    git(root, &["mv", "renamed", "destination"]);
+    move_tracked(root, "renamed", "destination");
     std::fs::write(root.join("untracked"), "first\r\nlast").unwrap();
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
@@ -166,10 +167,7 @@ async fn saturated_cache_preserves_exact_counts_and_unavailable_classification()
         "encoded working-tree-encoding=UTF-16LE\nfiltered filter=external\n",
     )
     .unwrap();
-    git(
-        root,
-        &["config", "filter.external.clean", "must-not-execute"],
-    );
+    set_config(root, "filter \"external\"", "clean", "must-not-execute");
     for (name, bytes) in [
         ("empty", b"".as_slice()),
         ("unterminated", b"one"),
@@ -236,13 +234,13 @@ async fn retained_worktree_analysis_rejects_changed_configuration_attributes_and
         assert!(prepared.load(&repository, &store).await.unwrap().is_some());
         match change {
             "configuration" => {
-                git(root, &["config", "core.autocrlf", "true"]);
+                set_config(root, "core", "autocrlf", "true");
             }
             "attributes" => {
                 std::fs::write(root.join(".git/info/attributes"), "unstaged -text\n").unwrap();
             }
             "index" => {
-                git(root, &["add", "unstaged"]);
+                stage(root, &["unstaged"]);
             }
             _ => unreachable!(),
         }
@@ -338,14 +336,14 @@ async fn count_cache_recomputes_changed_index_objects_without_explicit_invalidat
     let directory = fixture();
     let root = directory.path();
     std::fs::write(root.join("staged"), b"original\nfirst\n").unwrap();
-    git(root, &["add", "staged"]);
+    stage(root, &["staged"]);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     repository.observe(&store).await.unwrap();
     let (_, cached) = repository.observe_with_timing(&store).await.unwrap();
     assert_eq!(cached.line_stats_detail.source_reads, 0);
     std::fs::write(root.join("staged"), b"original\nfirst\nsecond\n").unwrap();
-    git(root, &["add", "staged"]);
+    stage(root, &["staged"]);
     let (changed, timing) = repository.observe_with_timing(&store).await.unwrap();
     assert_eq!(
         changed.path[0].change.staged_stats,

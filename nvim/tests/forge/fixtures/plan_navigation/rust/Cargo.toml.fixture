@@ -1,9 +1,0 @@
-[package]
-name = "plan-navigation-fixture"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tiny-value = { path = "dependency" }
-
-[workspace]

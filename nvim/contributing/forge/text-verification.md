@@ -12,7 +12,7 @@ The current `en-US-bigram-4` model preserves recognized English and configured v
 
 ## Latency
 
-The [measurement file](../../rust/forge/crates/forge-text/evaluation/windows-latency.json) records 120 completed words at 20 words per second in a fresh editor. All 120 corrections applied and redrew, and cold initialization took 1,782 ms while typing stayed usable. A paced benchmark fixture produced these numbers; it typed on a real-time cadence, so the suite no longer runs it, and `text_sustained_input` checks the same input without timing it.
+The [measurement file](../../rust/forge/crates/forge-text/evaluation/windows-latency.json) records 120 completed words at 20 words per second in a fresh editor. All 120 corrections applied and redrew, and cold initialization took 1,782 ms while typing stayed usable. A paced benchmark fixture produced these numbers; it typed on a real-time cadence, so the suite no longer runs it, and `text::sustained_input` checks the same input without timing it.
 
 | Measurement | p95 (ms) | p99 (ms) |
 | --- | ---: | ---: |
@@ -26,18 +26,18 @@ Single-sentence contexts with 10, 100, 1,000, and 10,000 preceding words reached
 Run fixtures through the Lua runner, which gives each one a fresh Neovim. Native fixtures use the already-built host and never build it:
 
 ```nu
-nu .forge/checks/lua-tests.nu nvim/tests/forge/text_context.lua
+nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/unit/text/context.test.lua
 ```
 
 | Fixture | Behavior checked |
 | --- | --- |
-| `text_context` | UTF-8 offsets, inline and fenced code, paths, and a 4,096-line paragraph |
-| `text_eligibility` | Lua Tree-sitter comments, code exclusion, and native guards |
-| `text_wordlist`, `text_wordlist_host` | Asynchronous file loading, reload, and spelling protection |
-| `text_stale_reply`, `text_async_lifecycle` | Continued typing, reply order, and host replacement |
-| `text_host` | Host initialization, wire decisions, and shutdown |
-| `text_sustained_input` | 120 consecutive corrections, and contexts up to 10,000 preceding words |
-| `harper_scopes_host` | Harper diagnostics, fixes, coordinates, and a document past its 120 KB default cutoff |
+| `context::context` | UTF-8 offsets, inline and fenced code, paths, and a 4,096-line paragraph |
+| `text::eligibility` | Lua Tree-sitter comments, code exclusion, and native guards |
+| `text/wordlist.test.lua::text_wordlist`, `text::wordlist` | Asynchronous file loading, reload, and spelling protection |
+| `text::stale_reply`, `text::async_lifecycle` | Continued typing, reply order, and host replacement |
+| `text::text` | Host initialization, wire decisions, and shutdown |
+| `text::sustained_input` | 120 consecutive corrections, and contexts up to 10,000 preceding words |
+| `text::harper_scopes` | Harper diagnostics, fixes, coordinates, and a document past its 120 KB default cutoff |
 
 Rust tests run with `cargo nextest run --cargo-profile dev --locked -p forge-text --lib -E 'test(=<exact-test-name>)'`. Harper changes need no native rebuild.
 

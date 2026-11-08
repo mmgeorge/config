@@ -366,15 +366,7 @@ mod test {
         let external = root.path().join("external/nested");
         std::fs::create_dir_all(&nested)?;
         std::fs::create_dir_all(&external)?;
-        let initialized = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .arg(&repository)
-            .output()?;
-        ensure!(
-            initialized.status.success(),
-            "initialize grant fixture: {}",
-            String::from_utf8_lossy(&initialized.stderr)
-        );
+        forge_git::test_support::init_repository(&repository);
         let policy = DirectoryPolicy {
             access: AccessPolicy::default(),
             workspace: dunce::canonicalize(root.path())?,

@@ -109,7 +109,7 @@ pub struct AcpLaunch<'a> {
 /// Retain reader collection across cancelled waiters and process-cleanup retries.
 enum DriverState {
     Starting,
-    Running(tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>),
+    Running(DriverTask),
     Collected,
 }
 
@@ -453,6 +453,85 @@ impl Drop for AcpTransportResources {
     }
 }
 
+type DriverTask = tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>;
+
+/// Launch the provider as an owned process with piped stdio.
+fn spawn_provider_process(
+    launch: &AcpLaunch<'_>,
+    program: &str,
+) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>, AcpConnectionError> {
+    let mut command = forge_shell::process::command(program, &launch.command[1..]);
+    command.envs(launch.environment);
+    if let Some(profile) = launch.profile {
+        command.env("GEMINI_HOME", profile);
+    }
+    command
+        .current_dir(launch.workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    forge_shell::process::spawn_owned(command).map_err(|source| AcpConnectionError::Process {
+        operation: "launch ACP provider",
+        source,
+    })
+}
+
+/// Run the native driver over one byte transport until it closes or is aborted.
+fn start_driver<Outgoing, Incoming>(
+    outgoing: Outgoing,
+    incoming: Incoming,
+    handler: Arc<dyn AcpHandler>,
+) -> (DriverTask, oneshot::Receiver<ConnectionTo<UntypedRole>>)
+where
+    Outgoing: futures_util::io::AsyncWrite + Send + 'static,
+    Incoming: futures_util::io::AsyncRead + Send + 'static,
+{
+    let transport = ByteStreams::new(outgoing, incoming);
+    let (connected, ready) = oneshot::channel();
+    let notification_handler = Arc::clone(&handler);
+    let driver = tokio::spawn(async move {
+        UntypedRole
+            .builder()
+            .name("forge-harness")
+            .on_receive_notification(
+                async move |notification: UntypedMessage, _context| {
+                    notification_handler
+                        .notification(notification.method(), notification.params().clone())
+                        .await
+                        .map_err(|error| {
+                            agent_client_protocol::util::internal_error(format!("{error:#}"))
+                        })
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: UntypedMessage, responder, context| {
+                    let handler = Arc::clone(&handler);
+                    context.spawn(async move {
+                        let response = handler
+                            .request(request.method(), request.params().clone())
+                            .await
+                            .map_err(|error| {
+                                agent_client_protocol::util::internal_error(format!("{error:#}"))
+                            });
+                        match response {
+                            Ok(value) => responder.respond(value),
+                            Err(error) => responder.respond_with_error(error),
+                        }
+                    })
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, async move |context| {
+                let _ = connected.send(context.clone());
+                context.incoming_closed().await;
+                Ok(())
+            })
+            .await
+    });
+    (driver, ready)
+}
+
 /// Own the native connection while the provider cleanup registry retains its process and reader.
 pub struct AcpConnection {
     connection: ConnectionTo<UntypedRole>,
@@ -496,22 +575,13 @@ impl AcpConnection {
             .ok_or(AcpConnectionError::Configuration(
                 "ACP provider command is empty",
             ))?;
-        let mut command = forge_shell::process::command(program, &launch.command[1..]);
-        command.envs(launch.environment);
-        if let Some(profile) = launch.profile {
-            command.env("GEMINI_HOME", profile);
-        }
-        command
-            .current_dir(launch.workspace)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        let process = forge_shell::process::spawn_owned(command).map_err(|source| {
-            AcpConnectionError::Process {
-                operation: "launch ACP provider",
-                source,
-            }
-        })?;
+        #[cfg(test)]
+        let (process, peer_streams) = match super::in_memory_peer::attach(program) {
+            Some(attached) => (attached.process, Some(attached.streams)),
+            None => (spawn_provider_process(&launch, program)?, None),
+        };
+        #[cfg(not(test))]
+        let process = spawn_provider_process(&launch, program)?;
         let resources = Arc::new(AcpTransportResources {
             state: Mutex::new(TransportState {
                 process,
@@ -536,61 +606,35 @@ impl AcpConnection {
                 "ACP startup was collected",
             ));
         }
-        let outgoing = retained
-            .process
-            .stdin()
-            .take()
-            .ok_or(AcpConnectionError::Configuration("ACP stdin missing"))?;
-        let incoming = retained
-            .process
-            .stdout()
-            .take()
-            .ok_or(AcpConnectionError::Configuration("ACP stdout missing"))?;
-        let transport = ByteStreams::new(outgoing.compat_write(), incoming.compat());
-        let (connected, ready) = oneshot::channel();
-        let notification_handler = Arc::clone(&handler);
-        let driver = tokio::spawn(async move {
-            UntypedRole
-                .builder()
-                .name("forge-harness")
-                .on_receive_notification(
-                    async move |notification: UntypedMessage, _context| {
-                        notification_handler
-                            .notification(notification.method(), notification.params().clone())
-                            .await
-                            .map_err(|error| {
-                                agent_client_protocol::util::internal_error(format!("{error:#}"))
-                            })
-                    },
-                    agent_client_protocol::on_receive_notification!(),
-                )
-                .on_receive_request(
-                    async move |request: UntypedMessage, responder, context| {
-                        let handler = Arc::clone(&handler);
-                        context.spawn(async move {
-                            let response = handler
-                                .request(request.method(), request.params().clone())
-                                .await
-                                .map_err(|error| {
-                                    agent_client_protocol::util::internal_error(format!(
-                                        "{error:#}"
-                                    ))
-                                });
-                            match response {
-                                Ok(value) => responder.respond(value),
-                                Err(error) => responder.respond_with_error(error),
-                            }
-                        })
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_with(transport, async move |context| {
-                    let _ = connected.send(context.clone());
-                    context.incoming_closed().await;
-                    Ok(())
-                })
-                .await
+        #[cfg(test)]
+        let attached_driver = peer_streams.map(|streams| {
+            start_driver(
+                streams.outgoing.compat_write(),
+                streams.incoming.compat(),
+                Arc::clone(&handler),
+            )
         });
+        #[cfg(not(test))]
+        let attached_driver: Option<(
+            DriverTask,
+            oneshot::Receiver<ConnectionTo<UntypedRole>>,
+        )> = None;
+        let (driver, ready) = match attached_driver {
+            Some(attached) => attached,
+            None => {
+                let outgoing = retained
+                    .process
+                    .stdin()
+                    .take()
+                    .ok_or(AcpConnectionError::Configuration("ACP stdin missing"))?;
+                let incoming = retained
+                    .process
+                    .stdout()
+                    .take()
+                    .ok_or(AcpConnectionError::Configuration("ACP stdout missing"))?;
+                start_driver(outgoing.compat_write(), incoming.compat(), handler)
+            }
+        };
         retained.driver = DriverState::Running(driver);
         drop(retained);
         // The retained operation owns the single deadline and keeps this driver collectible.

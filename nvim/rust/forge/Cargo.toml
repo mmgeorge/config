@@ -123,13 +123,14 @@ forge-providers = { workspace = true }
 forge-review = { workspace = true }
 forge-status = { workspace = true }
 forge-text = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
+forge-git = { workspace = true, features = ["test-fixtures"] }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 [profile.dev]

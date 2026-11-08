@@ -1,5 +1,8 @@
 mod support;
-use support::git;
+use support::{
+    commit_index, git, init_bare_repository, init_repository, init_sha256_repository, move_tracked,
+    stage, stage_conflict,
+};
 
 use forge_git::{
     RepositoryPath,
@@ -124,9 +127,9 @@ fn permits_empty_status_unknown_headers_and_sha256() {
 fn reads_real_git_staged_unstaged_rename_and_unborn_output() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     std::fs::write(root.join("tracked"), "initial\n").unwrap();
-    git(root, &["add", "tracked"]);
+    stage(root, &["tracked"]);
     let unborn = status(root);
     assert_eq!(unborn.len(), 1);
     assert_eq!(unborn[0].staged, ChangeKind::Added);
@@ -134,21 +137,9 @@ fn reads_real_git_staged_unstaged_rename_and_unborn_output() {
         panic!()
     };
     assert!(head.object.is_null());
-    git(
-        root,
-        &[
-            "-c",
-            "user.name=Forge",
-            "-c",
-            "user.email=forge@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "initial",
-        ],
-    );
+    commit_index(root, "initial");
     std::fs::write(root.join("tracked"), "staged\n").unwrap();
-    git(root, &["add", "tracked"]);
+    stage(root, &["tracked"]);
     std::fs::write(root.join("tracked"), "unstaged\n").unwrap();
     let changed = status(root);
     assert_eq!(changed.len(), 1);
@@ -156,8 +147,9 @@ fn reads_real_git_staged_unstaged_rename_and_unborn_output() {
         (changed[0].staged, changed[0].unstaged),
         (ChangeKind::Modified, ChangeKind::Modified)
     );
-    git(root, &["reset", "--hard", "HEAD"]);
-    git(root, &["mv", "tracked", "renamed with space"]);
+    std::fs::write(root.join("tracked"), "initial\n").unwrap();
+    stage(root, &["tracked"]);
+    move_tracked(root, "tracked", "renamed with space");
     std::fs::write(root.join("empty"), "").unwrap();
     let renamed = status(root);
     assert_eq!(renamed.len(), 2);
@@ -194,7 +186,7 @@ fn status(root: &std::path::Path) -> Vec<forge_git::snapshot::PathRecord> {
 #[tokio::test]
 async fn process_reader_uses_store_admission_and_reports_provider() {
     let directory = tempfile::tempdir().unwrap();
-    git(directory.path(), &["init", "--quiet"]);
+    init_repository(directory.path());
     std::fs::write(directory.path().join("new file"), "content\n").unwrap();
     let store = forge_git::store::RepositoryStore::new(4, 1).unwrap();
     let repository = store
@@ -226,12 +218,9 @@ async fn process_reader_uses_store_admission_and_reports_provider() {
 #[tokio::test]
 async fn process_reader_supports_sha256_and_rejects_bare_repositories() {
     let directory = tempfile::tempdir().unwrap();
-    git(
-        directory.path(),
-        &["init", "--quiet", "--object-format=sha256"],
-    );
+    init_sha256_repository(directory.path());
     std::fs::write(directory.path().join("staged"), "content\n").unwrap();
-    git(directory.path(), &["add", "staged"]);
+    stage(directory.path(), &["staged"]);
     let store = forge_git::store::RepositoryStore::new(4, 1).unwrap();
     let repository = store
         .open(directory.path().to_path_buf())
@@ -246,7 +235,7 @@ async fn process_reader_supports_sha256_and_rejects_bare_repositories() {
     };
     assert_eq!(index.object.kind(), gix::hash::Kind::Sha256);
     let bare = tempfile::tempdir().unwrap();
-    git(bare.path(), &["init", "--quiet", "--bare"]);
+    init_bare_repository(bare.path());
     let repository = store
         .open(bare.path().to_path_buf())
         .await
@@ -263,52 +252,12 @@ async fn process_reader_supports_sha256_and_rejects_bare_repositories() {
 fn reads_real_git_conflict_stage_objects() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     std::fs::write(root.join("conflicted"), "base\n").unwrap();
-    git(root, &["add", "conflicted"]);
-    git(
-        root,
-        &[
-            "-c",
-            "user.name=Forge",
-            "-c",
-            "user.email=forge@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "base",
-        ],
-    );
-    let base = git(root, &["rev-parse", "HEAD:conflicted"]);
-    std::fs::write(root.join("conflicted"), "ours\n").unwrap();
-    let ours = git(root, &["hash-object", "-w", "conflicted"]);
-    std::fs::write(root.join("conflicted"), "theirs\n").unwrap();
-    let theirs = git(root, &["hash-object", "-w", "conflicted"]);
-    let stage = [(1, base), (2, ours), (3, theirs)]
-        .map(|(number, object)| {
-            format!(
-                "100644 {} {number}\tconflicted\n",
-                String::from_utf8(object).unwrap().trim()
-            )
-        })
-        .concat();
+    stage(root, &["conflicted"]);
+    commit_index(root, "base");
     // Build a conflicted index without depending on branch names or merge drivers.
-    git(root, &["update-index", "--force-remove", "conflicted"]);
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["update-index", "--index-info"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stage.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
+    stage_conflict(root, "conflicted", b"base\n", b"ours\n", b"theirs\n");
     let record = status(root);
     let PathState::Conflict { base, ours, theirs } = &record[0].state else {
         panic!()

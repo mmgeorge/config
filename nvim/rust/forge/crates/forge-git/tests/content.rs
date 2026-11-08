@@ -1,6 +1,6 @@
 mod support;
 
-use std::{fs, path::Path};
+use std::fs;
 
 use forge_diff::source::{Representation, SourceVersion};
 use forge_git::{
@@ -11,20 +11,23 @@ use forge_git::{
     },
     store::RepositoryStore,
 };
-use support::git;
+use support::{
+    commit_index, git, init_repository, init_sha256_repository, resolve_revision, set_config,
+    set_reference, stage, stage_conflict, stage_gitlink, write_blob,
+};
 
 #[tokio::test]
 async fn staged_unstaged_and_head_sources_remain_distinct() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    git(root, &["config", "core.autocrlf", "false"]);
+    init_repository(root);
+    set_config(root, "core", "autocrlf", "false");
     fs::write(root.join("tracked"), b"head\r\n").unwrap();
-    git(root, &["add", "tracked"]);
-    commit(root);
-    let head = object(&git(root, &["rev-parse", "HEAD:tracked"]));
+    stage(root, &["tracked"]);
+    commit_index(root, "fixture");
+    let head = resolve_revision(root, "HEAD:tracked");
     fs::write(root.join("tracked"), b"staged\r\n").unwrap();
-    git(root, &["add", "tracked"]);
+    stage(root, &["tracked"]);
     fs::write(root.join("tracked"), b"worktree without newline").unwrap();
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
@@ -91,7 +94,7 @@ async fn staged_unstaged_and_head_sources_remain_distinct() {
 async fn missing_binary_encoding_size_and_source_identity_have_distinct_outcomes() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     fs::write(root.join("binary"), b"a\0b").unwrap();
     fs::write(root.join("encoding"), b"a\xffb").unwrap();
     fs::write(root.join("text"), b"original").unwrap();
@@ -157,18 +160,14 @@ async fn object_reads_ignore_replacement_refs_and_support_sha256() {
     for format in ["sha1", "sha256"] {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(
-            root,
-            &["init", "--quiet", &format!("--object-format={format}")],
-        );
-        fs::write(root.join("original"), b"original").unwrap();
-        fs::write(root.join("replacement"), b"replacement").unwrap();
-        let original = object(&git(root, &["hash-object", "-w", "original"]));
-        let replacement = object(&git(root, &["hash-object", "-w", "replacement"]));
-        git(
-            root,
-            &["replace", &original.to_string(), &replacement.to_string()],
-        );
+        if format == "sha256" {
+            init_sha256_repository(root);
+        } else {
+            init_repository(root);
+        }
+        let original = write_blob(root, b"original");
+        let replacement = write_blob(root, b"replacement");
+        set_reference(root, &format!("refs/replace/{original}"), replacement);
         let store = RepositoryStore::default();
         let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
         let loaded = ready(
@@ -187,13 +186,13 @@ async fn object_reads_ignore_replacement_refs_and_support_sha256() {
 async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_content() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     let bytes = b"content\r\n".repeat(1_000_000);
     fs::write(root.join("large"), &bytes).unwrap();
-    git(root, &["config", "core.autocrlf", "false"]);
-    git(root, &["add", "large"]);
-    commit(root);
-    let large = object(&git(root, &["rev-parse", "HEAD:large"]));
+    set_config(root, "core", "autocrlf", "false");
+    stage(root, &["large"]);
+    commit_index(root, "fixture");
+    let large = resolve_revision(root, "HEAD:large");
     git(root, &["gc", "--prune=now"]);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
@@ -216,7 +215,7 @@ async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_con
 #[tokio::test]
 async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
     let fixture = tempfile::tempdir().unwrap();
-    git(fixture.path(), &["init", "--quiet"]);
+    init_repository(fixture.path());
     let store = RepositoryStore::default();
     let repository = store
         .open(fixture.path().to_path_buf())
@@ -263,23 +262,8 @@ async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
 async fn conflict_stage_reads_select_exact_stage_and_literal_path() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    let mut tree = Vec::new();
-    for text in ["base\n", "ours\n", "theirs\n"] {
-        fs::write(root.join("[conflict]"), text).unwrap();
-        git(root, &["--literal-pathspecs", "add", "--", "[conflict]"]);
-        tree.push(
-            String::from_utf8(git(root, &["write-tree"]))
-                .unwrap()
-                .trim()
-                .to_owned(),
-        );
-    }
-    git(root, &["read-tree", "--empty"]);
-    git(
-        root,
-        &["read-tree", "-i", "-m", &tree[0], &tree[1], &tree[2]],
-    );
+    init_repository(root);
+    stage_conflict(root, "[conflict]", b"base\n", b"ours\n", b"theirs\n");
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     for (stage, text) in [
@@ -320,21 +304,13 @@ async fn conflict_stage_reads_select_exact_stage_and_literal_path() {
 async fn empty_missing_and_non_blob_objects_are_not_conflated() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     fs::write(root.join("empty"), b"").unwrap();
-    git(root, &["add", "empty"]);
-    commit(root);
-    let empty = object(&git(root, &["rev-parse", "HEAD:empty"]));
-    let commit = object(&git(root, &["rev-parse", "HEAD"]));
-    git(
-        root,
-        &[
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            &format!("160000,{commit},link"),
-        ],
-    );
+    stage(root, &["empty"]);
+    commit_index(root, "fixture");
+    let empty = resolve_revision(root, "HEAD:empty");
+    let commit = resolve_revision(root, "HEAD");
+    stage_gitlink(root, "link", commit);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     let loaded = ready(
@@ -388,7 +364,7 @@ async fn empty_missing_and_non_blob_objects_are_not_conflated() {
 async fn symlink_worktree_content_is_the_target_text() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     fs::write(root.join("target"), b"must not be read").unwrap();
     std::os::unix::fs::symlink("target", root.join("link")).unwrap();
     let store = RepositoryStore::default();
@@ -420,31 +396,9 @@ fn path(name: &str) -> RepositoryPath {
     RepositoryPath::new(name.as_bytes().to_vec()).unwrap()
 }
 
-fn object(output: &[u8]) -> gix::ObjectId {
-    gix::ObjectId::from_hex(output.trim_ascii()).unwrap()
-}
-
 fn ready(result: ContentResult) -> FileContent {
     match result {
         ContentResult::Ready(content) => content,
         other => panic!("{other:?}"),
     }
-}
-
-fn commit(root: &Path) {
-    git(
-        root,
-        &[
-            "-c",
-            "user.name=Forge",
-            "-c",
-            "user.email=forge@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    );
 }

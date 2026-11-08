@@ -3081,7 +3081,7 @@ mod tests {
         let saved_workspace = workspace.path().to_owned();
         let saved_data = data.path().to_owned();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            ensure!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&saved_workspace).status()?.success(), "fixture git initialization failed");
+            forge_git::test_support::init_repository(&saved_workspace);
             let mut store = crate::storage::SqliteStore::open(&saved_data)?;
             let connection = rusqlite::Connection::open(crate::storage::state::database(&saved_data))?;
             connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('session', ?1, 0, '{}')", [saved_workspace.to_string_lossy().as_ref()])?;

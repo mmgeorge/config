@@ -130,4 +130,4 @@ D:/.cache/nvim/rust-sidecar/forge/build --config profile.release.debug=0 --bin f
 in `nvim/rust/forge`. It exited 0 in 43.83 seconds with a 300-second timeout.
 Artifact: `D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`.
 Detailed commands and regression results are retained in
-`nvim/tests/forge/plans/status_contention.md`.
+`nvim/lua/forge/tests/plans/status_contention.md`.

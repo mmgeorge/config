@@ -197,13 +197,7 @@ async fn latest_configuration_waits_for_actual_child_end_and_preserves_canceled_
     }
     .await;
     reader.abort();
-    if let Err(error) = scenario {
-        return Err(super::owner_fixture::retain_cleanup_failure(
-            root,
-            &controller,
-            error,
-        ));
-    }
+    scenario?;
     cleanup?;
     Ok(())
 }

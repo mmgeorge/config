@@ -229,62 +229,160 @@ impl AcpHandler for IgnoreCallbacks {
     }
 }
 
+/// Port of the deterministic native-wire peer: one handler instance serves one connection.
+fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
+    let mut held_prompt: Option<Value> = None;
+    let mut held_authentication: Option<Value> = None;
+    Box::new(move |request| {
+        let method = request["method"].as_str().unwrap_or_default();
+        let mut outgoing = Vec::new();
+        let Some(request_id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
+            if method == "session/cancel"
+                && mode != "held_cancel"
+                && let Some(prompt_id) = held_prompt.take()
+            {
+                outgoing.push(json!({"id":prompt_id,"result":{"stopReason":"cancelled"}}));
+            }
+            return outgoing;
+        };
+        let mut result = json!({});
+        if method == "fixture/release"
+            && let Some(prompt_id) = held_prompt.take()
+        {
+            outgoing.push(json!({"id":prompt_id,"result":{"stopReason":"end_turn"}}));
+        }
+        if method == "authenticate" && mode == "held_auth" {
+            held_authentication = Some(request_id);
+            return outgoing;
+        }
+        if method == "fixture/release_auth"
+            && let Some(authentication_id) = held_authentication.take()
+        {
+            outgoing.push(json!({"id":authentication_id,"result":{}}));
+        }
+        if method == "initialize" {
+            let session_capabilities = match mode.as_str() {
+                "native_instructions" => Some(json!({"fork":{},"systemPrompt":{}})),
+                "fork_no_instructions" => Some(json!({"fork":{}})),
+                "disabled_extensions" => {
+                    Some(json!({"systemPrompt":{},"fork":false,"subagents":null}))
+                }
+                _ => None,
+            };
+            let mut capabilities = json!({"loadSession":true});
+            if let Some(session_capabilities) = session_capabilities {
+                capabilities["sessionCapabilities"] = session_capabilities;
+            }
+            result = json!({
+                "protocolVersion":1,
+                "agentInfo":{"version":"99.0.0"},
+                "agentCapabilities":capabilities,
+            });
+        }
+        if method == "session/load" && mode == "load_applied_error" {
+            outgoing.push(json!({
+                "id":request_id,
+                "error":{"code":-32603,"message":"private failure after native endpoint apply"},
+            }));
+            return outgoing;
+        }
+        if method == "session/new" || method == "session/load" {
+            let effort = json!({
+                "id":"effort","currentValue":"medium",
+                "options":[{"value":"low"},{"value":"medium"},{"value":"high"}],
+            });
+            result = if mode == "config_option_models" {
+                json!({
+                    "sessionId":"fixture",
+                    "configOptions":[
+                        {"id":"model","category":"model","currentValue":"default-model",
+                         "options":[{"value":"default-model"},{"value":"other"}]},
+                        effort,
+                    ],
+                })
+            } else {
+                json!({
+                    "sessionId":"fixture",
+                    "models":{
+                        "currentModelId":"default-model",
+                        "availableModels":[{"modelId":"default-model"},{"modelId":"other"}],
+                    },
+                    "configOptions":[effort],
+                })
+            };
+        }
+        if method == "session/fork" {
+            result = json!({"sessionId":"fork-child"});
+        }
+        if method == "session/prompt" || method == "_session/steering" {
+            if mode.starts_with("observed:") || mode == "held" || mode == "held_cancel" {
+                outgoing.push(json!({"method":"session/update","params":{
+                    "sessionId":"fixture",
+                    "update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"answer"},
+                    },
+                }}));
+            }
+            if matches!(mode.as_str(), "held" | "held_cancel" | "held_no_start")
+                && method == "session/prompt"
+            {
+                held_prompt = Some(request_id);
+                return outgoing;
+            }
+            if mode == "remote_error" {
+                outgoing.push(json!({
+                    "id":request_id,
+                    "error":{"code":-32603,"message":"private native error"},
+                }));
+                return outgoing;
+            }
+            if mode == "invalid_request" {
+                outgoing.push(json!({
+                    "id":request_id,
+                    "error":{"code":-32600,"message":"private invalid request detail"},
+                }));
+                return outgoing;
+            }
+            result = if method == "_session/steering" {
+                if mode == "promptRequired" {
+                    json!({"outcome":"promptRequired","reason":"noRunningTurn"})
+                } else {
+                    json!({"outcome":mode})
+                }
+            } else if mode == "invalid" {
+                json!({})
+            } else {
+                let stop_reason = match mode.strip_prefix("observed:") {
+                    Some(observed) => observed,
+                    None if mode == "cancelled" => "cancelled",
+                    None => "end_turn",
+                };
+                json!({"stopReason":stop_reason})
+            };
+        }
+        outgoing.push(json!({"id":request_id,"result":result}));
+        outgoing
+    })
+}
+
 struct WireFixture {
     _directory: tempfile::TempDir,
     connection: AcpConnection,
     command: Vec<String>,
+    peer: super::in_memory_peer::InMemoryPeer,
 }
 
 impl WireFixture {
     async fn start(mode: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let script = directory.path().join("peer.cjs");
-        let mode_path = directory.path().join("mode");
-        std::fs::write(&mode_path, mode)?;
-        std::fs::write(directory.path().join("native-version"), "2.1.302")?;
-        std::fs::write(
-            &script,
-            r#"
-const fs=require('node:fs');const readline=require('node:readline');
-if(process.argv.includes('--version')){console.log(fs.readFileSync(require('node:path').join(require('node:path').dirname(process.argv[2]),'native-version'),'utf8'));process.exit(0);}
-const write=value=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...value})+'\n');
-let heldPrompt;let heldAuthentication;
-fs.watch(process.argv[2],()=>{if(heldPrompt!==undefined&&fs.readFileSync(process.argv[2],'utf8')==='release_cancel'){write({id:heldPrompt,result:{stopReason:'end_turn'}});heldPrompt=undefined;}});
-readline.createInterface({input:process.stdin}).on('line',line=>{
- const request=JSON.parse(line);fs.appendFileSync(process.argv[2]+'.requests',JSON.stringify(request)+'\n');
- if(request.id===undefined){if(request.method==='session/cancel'&&heldPrompt&&fs.readFileSync(process.argv[2],'utf8')!=='held_cancel'){write({id:heldPrompt,result:{stopReason:'cancelled'}});heldPrompt=undefined;}return;}let result={};
- if(request.method==='fixture/release'&&heldPrompt){write({id:heldPrompt,result:{stopReason:'end_turn'}});heldPrompt=undefined;}
- if(request.method==='authenticate'&&fs.readFileSync(process.argv[2],'utf8')==='held_auth'){heldAuthentication=request.id;return;}
- if(request.method==='fixture/release_auth'&&heldAuthentication!==undefined){write({id:heldAuthentication,result:{}});heldAuthentication=undefined;}
- if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true,...(fs.readFileSync(process.argv[2],'utf8')==='native_instructions'?{sessionCapabilities:{fork:{},systemPrompt:{}}}:fs.readFileSync(process.argv[2],'utf8')==='fork_no_instructions'?{sessionCapabilities:{fork:{}}}:{})}};
- if(request.method==='initialize'&&fs.readFileSync(process.argv[2],'utf8')==='disabled_extensions')result.agentCapabilities.sessionCapabilities={systemPrompt:{},fork:false,subagents:null};
- if(request.method==='session/load'&&fs.readFileSync(process.argv[2],'utf8')==='load_applied_error'){
-  fs.writeFileSync(process.argv[2]+'.endpoint-applied',JSON.stringify(request.params.mcpServers));
-  write({id:request.id,error:{code:-32603,message:'private failure after native endpoint apply'}});return;
- }
- if(request.method==='session/new'||request.method==='session/load')result={sessionId:'fixture',models:{currentModelId:'default-model',availableModels:[{modelId:'default-model'},{modelId:'other'}]},configOptions:[{id:'effort',currentValue:'medium',options:[{value:'low'},{value:'medium'},{value:'high'}]}]};
- if((request.method==='session/new'||request.method==='session/load')&&fs.readFileSync(process.argv[2],'utf8')==='config_option_models')result={sessionId:'fixture',configOptions:[{id:'model',category:'model',currentValue:'default-model',options:[{value:'default-model'},{value:'other'}]},{id:'effort',currentValue:'medium',options:[{value:'low'},{value:'medium'},{value:'high'}]}]};
- if(request.method==='session/fork')result={sessionId:'fork-child'};
- if(request.method==='session/prompt'||request.method==='_session/steering'){
-  const mode=fs.readFileSync(process.argv[2],'utf8');
-  if(mode.startsWith('observed:')||mode==='held'||mode==='held_cancel')write({method:'session/update',params:{sessionId:'fixture',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'answer'}}}});
-  if((mode==='held'||mode==='held_cancel'||mode==='held_no_start')&&request.method==='session/prompt'){heldPrompt=request.id;return;}
-  if(mode==='remote_error'){write({id:request.id,error:{code:-32603,message:'private native error'}});return;}
-  if(mode==='invalid_request'){write({id:request.id,error:{code:-32600,message:'private invalid request detail'}});return;}
-  if(request.method==='_session/steering')result=mode==='promptRequired'?{outcome:'promptRequired',reason:'noRunningTurn'}:{outcome:mode};
-  else result=mode==='invalid'?{}:{stopReason:mode.startsWith('observed:')?mode.slice(9):mode==='cancelled'?'cancelled':'end_turn'};
- }
- write({id:request.id,result});
-});
-"#,
-        )?;
-        let node = forge_shell::process::executable("node")
-            .ok_or("Node.js is required by the ACP wire fixture")?;
-        let command = vec![
-            node.to_string_lossy().into_owned(),
-            script.to_string_lossy().into_owned(),
-            mode_path.to_string_lossy().into_owned(),
-        ];
+        let mode = mode.to_owned();
+        let peer = super::in_memory_peer::InMemoryPeer::register(
+            directory.path(),
+            "2.1.302",
+            Box::new(move || wire_peer_handler(mode.clone())),
+        );
+        let command = vec![peer.program()];
         let environment = BTreeMap::new();
         let workspace = directory.path().to_string_lossy().into_owned();
         let connection = AcpConnection::launch(
@@ -301,6 +399,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             _directory: directory,
             connection,
             command,
+            peer,
         })
     }
 
@@ -536,10 +635,10 @@ async fn config_option_model_catalog_marks_the_selected_model_and_accepts_implic
     }
     .await;
     assert_eq!(resolved, vec!["default-model"]);
-    let reasoning = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    let reasoning = fixture
+        .peer
+        .requests()
+        .into_iter()
         .filter(|request| {
             request["method"] == "session/set_config_option"
                 && request["params"]["configId"] == "effort"
@@ -599,12 +698,12 @@ async fn concurrent_resumes_admit_only_one_history_owner() {
     assert!(
         matches!(rejected, ProviderError::Failure(failure) if failure.operation() == forge_provider_api::ProviderOperation::ThreadOpen && failure.kind() == forge_provider_api::ProviderFailureKind::HistoryConflict)
     );
-    let requests =
-        std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
     assert_eq!(
-        requests
-            .lines()
-            .filter(|request| request.contains("session/load"))
+        fixture
+            .peer
+            .requests()
+            .iter()
+            .filter(|request| request["method"] == "session/load")
             .count(),
         1
     );
@@ -669,8 +768,7 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
         tools: None,
     });
     cases.push((mcp, ProviderFeature::McpLaunchRequirements));
-    let requests_path = fixture._directory.path().join("mode.requests");
-    let before = std::fs::read_to_string(&requests_path).unwrap();
+    let before = fixture.peer.requests();
     let profiles = runtime.join("provider-runtime/claude");
     let profile_count = std::fs::read_dir(&profiles).unwrap().count();
     for (index, (configuration, expected)) in cases.into_iter().enumerate() {
@@ -714,7 +812,7 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
             );
         }
         assert_eq!(
-            std::fs::read_to_string(&requests_path).unwrap(),
+            fixture.peer.requests(),
             before,
             "preflight performed native I/O"
         );
@@ -769,9 +867,12 @@ async fn accepted_prompt_cancelled_before_start_has_no_started_or_completed_turn
     });
     async {
         loop {
-            let log =
-                std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
-            if log.lines().any(|line| line.contains("session/prompt")) {
+            if fixture
+                .peer
+                .requests()
+                .iter()
+                .any(|request| request["method"] == "session/prompt")
+            {
                 break;
             }
             tokio::task::yield_now().await;

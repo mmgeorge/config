@@ -355,8 +355,27 @@ async fn provider_startup_registers_observation_without_native_open() -> Result<
 
 /// Clear only an unused saved identity, and leave established history for first-use resume.
 #[tokio::test]
-async fn provider_startup_retains_saved_history_until_first_use() -> Result<()> {
-    for (checkpoint, has_exchange) in [(None, false), (Some("durable-turn"), false), (None, true)] {
+async fn provider_startup_retains_saved_history_until_first_use_without_checkpoint() -> Result<()> {
+    provider_startup_retains_saved_history_case(None, false).await
+}
+
+#[tokio::test]
+async fn provider_startup_retains_saved_history_until_first_use_with_checkpoint() -> Result<()> {
+    provider_startup_retains_saved_history_case(Some("durable-turn"), false).await
+}
+
+#[tokio::test]
+async fn provider_startup_retains_saved_history_until_first_use_with_exchange() -> Result<()> {
+    provider_startup_retains_saved_history_case(None, true).await
+}
+
+/// Run one saved-identity variant, each in its own test so it reports independently and stays
+/// within the per-test time limit.
+async fn provider_startup_retains_saved_history_case(
+    checkpoint: Option<&str>,
+    has_exchange: bool,
+) -> Result<()> {
+    {
         let fixture = tempfile::tempdir()?;
         let parameters = json!({
             "workspace":fixture.path(), "data_root":fixture.path().join("data"),

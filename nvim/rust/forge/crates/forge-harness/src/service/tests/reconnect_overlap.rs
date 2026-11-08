@@ -202,10 +202,9 @@ async fn owner_reconnect_captures_latest_input_after_held_cancellation_publicati
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let cleanup =
-        tokio::time::timeout(Duration::from_secs(5), controller.finish_exchange_owner()).await;
+    let cleanup = controller.finish_exchange_owner().await;
     scenario?;
-    cleanup??;
+    cleanup?;
     Ok(())
 }
 

@@ -346,42 +346,18 @@ fn read_config(workspace: &Path) -> Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use forge_git::test_support::{
+        commit_index, head_commit, init_repository, set_config, set_identity, set_reference,
+    };
 
     use super::*;
-
-    fn git(workspace: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(arguments)
-            .output()
-            .unwrap();
-        assert!(
-            status.status.success(),
-            "{}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-    }
 
     #[tokio::test]
     async fn context_preserves_exact_commit_targets_and_repository_config() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        git(directory.path(), &["init", "--quiet"]);
-        git(
-            directory.path(),
-            &[
-                "-c",
-                "user.name=Forge",
-                "-c",
-                "user.email=forge@example.test",
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "feat: exact subject",
-            ],
-        );
+        init_repository(directory.path());
+        set_identity(directory.path());
+        commit_index(directory.path(), "feat: exact subject");
         let source =
             br##"{"issues":["12",3,3,0],"branch_prefix":"work/","preserved":{"enabled":true}}"##;
         std::fs::write(directory.path().join(".forge.json"), source)?;
@@ -438,61 +414,37 @@ mod tests {
     #[tokio::test]
     async fn context_resolves_configured_upstream_and_push_references() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        git(directory.path(), &["init", "--quiet"]);
-        git(
+        init_repository(directory.path());
+        set_identity(directory.path());
+        commit_index(directory.path(), "feat: tracked branch");
+        let branch = "main";
+        set_reference(
             directory.path(),
-            &[
-                "-c",
-                "user.name=Forge",
-                "-c",
-                "user.email=forge@example.test",
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "feat: tracked branch",
-            ],
+            &format!("refs/remotes/origin/{branch}"),
+            head_commit(directory.path()),
         );
-        let branch = Command::new("git")
-            .arg("-C")
-            .arg(directory.path())
-            .args(["branch", "--show-current"])
-            .output()?;
-        let branch = String::from_utf8(branch.stdout)?.trim().to_owned();
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        git(directory.path(), &["update-ref", &remote_ref, "HEAD"]);
-        git(
+        let remote = "remote \"origin\"";
+        set_config(
             directory.path(),
-            &[
-                "config",
-                "remote.origin.url",
-                "https://example.test/origin.git",
-            ],
+            remote,
+            "url",
+            "https://example.test/origin.git",
         );
-        git(
+        set_config(
             directory.path(),
-            &[
-                "config",
-                "remote.origin.fetch",
-                "+refs/heads/*:refs/remotes/origin/*",
-            ],
+            remote,
+            "fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
         );
-        git(
+        let tracking = format!("branch \"{branch}\"");
+        set_config(directory.path(), &tracking, "remote", "origin");
+        set_config(
             directory.path(),
-            &["config", &format!("branch.{branch}.remote"), "origin"],
+            &tracking,
+            "merge",
+            &format!("refs/heads/{branch}"),
         );
-        git(
-            directory.path(),
-            &[
-                "config",
-                &format!("branch.{branch}.merge"),
-                &format!("refs/heads/{branch}"),
-            ],
-        );
-        git(
-            directory.path(),
-            &["config", &format!("branch.{branch}.pushRemote"), "origin"],
-        );
+        set_config(directory.path(), &tracking, "pushRemote", "origin");
         let service = StatusContextService::new(Arc::new(RepositoryStore::default()));
         let context = service.collect(directory.path().to_owned()).await?;
         for commit in [context.upstream.as_ref(), context.push.as_ref()] {
@@ -506,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn unborn_head_and_invalid_config_are_distinct_results() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        git(directory.path(), &["init", "--quiet"]);
+        init_repository(directory.path());
         let service = StatusContextService::new(Arc::new(RepositoryStore::default()));
         let context = service.collect(directory.path().to_owned()).await?;
         assert!(context.head.is_none());

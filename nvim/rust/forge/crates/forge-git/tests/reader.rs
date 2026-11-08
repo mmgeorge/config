@@ -6,15 +6,14 @@ use forge_git::{
     snapshot::{HeadState, PathState, WorktreeStamp},
     store::RepositoryStore,
 };
-use support::git;
+use support::{
+    add_detached_worktree, git, head_commit, init_repository, move_tracked, stage, stage_and_commit,
+};
 
 #[tokio::test]
 async fn concurrent_document_observations_each_complete() {
     let fixture = tempfile::tempdir().unwrap();
-    git(
-        fixture.path(),
-        &["init", "--quiet", "--initial-branch=main"],
-    );
+    init_repository(fixture.path());
     let store = RepositoryStore::default();
     let repository = store
         .open(fixture.path().to_path_buf())
@@ -45,7 +44,7 @@ async fn concurrent_document_observations_each_complete() {
 async fn observation_adopts_unborn_then_born_head_and_distinct_sources() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet", "--initial-branch=main"]);
+    init_repository(root);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     let unborn = repository.observe(&store).await.unwrap();
@@ -55,10 +54,9 @@ async fn observation_adopts_unborn_then_born_head_and_distinct_sources() {
     assert!(unborn.index.index.is_none());
     assert!(unborn.path.is_empty());
     std::fs::write(root.join("tracked"), "base\n").unwrap();
-    git(root, &["add", "tracked"]);
-    commit(root);
+    stage_and_commit(root, &["tracked"], "base");
     std::fs::write(root.join("tracked"), "staged\n").unwrap();
-    git(root, &["add", "tracked"]);
+    stage(root, &["tracked"]);
     std::fs::write(root.join("tracked"), "unstaged contents\n").unwrap();
     let observed = repository.observe(&store).await.unwrap();
     assert!(observed.id > unborn.id);
@@ -87,9 +85,9 @@ async fn observation_adopts_unborn_then_born_head_and_distinct_sources() {
 async fn split_index_backing_files_are_part_of_the_observation() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     std::fs::write(root.join("tracked"), "base\n").unwrap();
-    git(root, &["add", "tracked"]);
+    stage(root, &["tracked"]);
     git(root, &["update-index", "--split-index"]);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
@@ -104,21 +102,11 @@ async fn linked_detached_worktrees_keep_independent_observations() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("main");
     std::fs::create_dir(&root).unwrap();
-    git(&root, &["init", "--quiet", "--initial-branch=main"]);
+    init_repository(&root);
     std::fs::write(root.join("tracked"), "base\n").unwrap();
-    git(&root, &["add", "tracked"]);
-    commit(&root);
+    stage_and_commit(&root, &["tracked"], "base");
     let linked = fixture.path().join("linked");
-    git(
-        &root,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            linked.to_str().unwrap(),
-            "HEAD",
-        ],
-    );
+    add_detached_worktree(&root, &linked, head_commit(&root));
     std::fs::write(root.join("tracked"), "modified\n").unwrap();
     let store = RepositoryStore::default();
     let main = store.open(root).await.unwrap().unwrap();
@@ -139,11 +127,10 @@ async fn linked_detached_worktrees_keep_independent_observations() {
 async fn rename_observation_leaves_worktree_metadata_unobserved() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     std::fs::write(root.join("origin"), "base\n").unwrap();
-    git(root, &["add", "origin"]);
-    commit(root);
-    git(root, &["mv", "origin", "destination"]);
+    stage_and_commit(root, &["origin"], "base");
+    move_tracked(root, "origin", "destination");
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     let observed = repository.observe(&store).await.unwrap();
@@ -156,10 +143,9 @@ async fn rename_observation_leaves_worktree_metadata_unobserved() {
 async fn unstaged_only_observation_preserves_head_baseline() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
-    git(root, &["init", "--quiet"]);
+    init_repository(root);
     std::fs::write(root.join("tracked"), "before\n").unwrap();
-    git(root, &["add", "tracked"]);
-    commit(root);
+    stage_and_commit(root, &["tracked"], "base");
     std::fs::write(root.join("tracked"), "after\n").unwrap();
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
@@ -169,22 +155,4 @@ async fn unstaged_only_observation_preserves_head_baseline() {
     };
     assert_eq!(head, index);
     assert!(!head.object.is_null());
-}
-
-fn commit(root: &std::path::Path) {
-    git(
-        root,
-        &[
-            "-c",
-            "user.name=Forge",
-            "-c",
-            "user.email=forge@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "base",
-        ],
-    );
 }

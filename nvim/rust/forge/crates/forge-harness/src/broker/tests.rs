@@ -21,7 +21,7 @@ mod workflow;
 use test_support::{
     PreparationProbe, check_fixture, checkpoint_fixture, completed_message, settle_managed_children,
 };
-pub(super) use test_support::{planning_question_broker, repository};
+pub(super) use test_support::{git_repository, planning_question_broker, repository};
 
 /// Attribute a native compaction observation to its explicit session operation.
 fn compaction_event(
@@ -171,7 +171,7 @@ fn automatic_check_fixture(
 
 #[tokio::test]
 async fn automatic_checks_default_off_until_explicitly_enabled() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker.session.shell = crate::session::CheckShell::Nushell;
@@ -220,7 +220,7 @@ async fn automatic_checks_default_off_until_explicitly_enabled() -> Result<()> {
 
 #[tokio::test]
 async fn automatic_checks_complete_when_remaining_queue_is_removed() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker
@@ -285,7 +285,7 @@ async fn automatic_checks_complete_when_remaining_queue_is_removed() -> Result<(
 
 #[tokio::test]
 async fn automatic_checks_repair_after_permission_resume_on_worker() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker
@@ -299,6 +299,19 @@ async fn automatic_checks_repair_after_permission_resume_on_worker() -> Result<(
         repository.path().to_owned(),
     )?;
     broker.provider = provider.provider_handle();
+    broker.check_runner.script_commands(|request| {
+        let repaired = std::fs::read_to_string(request.directory.join("seed.txt"))
+            .is_ok_and(|seed| seed.contains("fixed"));
+        crate::checks::ScriptedCheckOutcome {
+            stdout: if repaired {
+                "ok\n".into()
+            } else {
+                String::new()
+            },
+            exit_code: if repaired { 0 } else { 7 },
+            ..Default::default()
+        }
+    });
     std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }","label":"Verify","category":"test"}}}}).to_string())?;
     let (mut exchange, _, _) = broker
         .test_stage_interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
@@ -370,7 +383,7 @@ async fn interaction_future_has_bounded_inline_storage() {
 #[tokio::test]
 async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -> Result<()> {
     for native_rejection in [false, true] {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let rejection = Arc::new(PreparationProbe {
@@ -487,7 +500,7 @@ async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -
 #[tokio::test]
 async fn cancellation_cleanup_failure_collects_denied_baseline_without_native_rollback()
 -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let started = Arc::new(Notify::new());
@@ -529,25 +542,20 @@ async fn cancellation_cleanup_failure_collects_denied_baseline_without_native_ro
         started.notified().await;
         cancellation.request();
     };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        tokio::join!(
-            broker.run_interaction(
-                "Cancel with failed native cleanup".into(),
-                PromptMode::Chat,
-                Some(ExchangeAdmission::chat(
-                    "Cancel with failed native cleanup".into()
-                )),
-            ),
-            cancel,
-        )
-        .0
-    })
-    .await;
+    let result = tokio::join!(
+        broker.run_interaction(
+            "Cancel with failed native cleanup".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat(
+                "Cancel with failed native cleanup".into()
+            )),
+        ),
+        cancel,
+    )
+    .0;
     // Inspect while admission stays held, then release it even if verification failed.
     // An abandoned Git operation intentionally remains a safety fence for later workers.
     let verified: Result<()> = (|| {
-        let result = result
-            .context("native cleanup failure left the denied baseline waiting for external Git")?;
         let error = result
             .err()
             .context("failed native cleanup became success")?;
@@ -624,7 +632,7 @@ async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization(
     for (cleanup_before_completion, visible_output) in
         [(true, false), (false, false), (true, true), (false, true)]
     {
-        let repository = repository();
+        let repository = git_repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (provider, signals) = cleanup_retry_provider(&broker, visible_output, false);
@@ -681,22 +689,10 @@ async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization(
                 "Cancel after native dispatch".into(),
             )),
         );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(execution, cancel)
-        })
-        .await;
+        let result = tokio::join!(execution, cancel);
         held.finish(forge_git::mutation::OperationCompletion::Completed)?;
         repositories.writes.take_receipt(operation);
-        let (result, cancelled) = result.with_context(|| format!(
-            "native abort completion waited for checkpoint finalization; cleanup_before_completion={cleanup_before_completion}, visible_output={visible_output}, native_settled={}, cleanup_attempts={}, cancel_requested={}, stored={}",
-            signals.native_settled.load(Ordering::Acquire),
-            signals.attempt.load(Ordering::Acquire),
-            cancellation.is_requested(),
-            broker.store.list_exchange(&broker.session.id)
-                .and_then(|exchanges| Ok(serde_json::to_string(&exchanges)?))
-                .unwrap_or_else(|error| format!("read failed: {error:#}")),
-        ) + &format!("; trace={}", std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)
-            .unwrap_or_else(|error| format!("read failed: {error}"))))?;
+        let (result, cancelled) = result;
         cancelled?;
         let error = result.unwrap_err();
         let exchange = broker.store.list_exchange(&broker.session.id)?;
@@ -740,7 +736,7 @@ async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization(
 
 #[tokio::test]
 async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let started = Arc::new(tokio::sync::Notify::new());
@@ -870,7 +866,7 @@ async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> R
 
 #[tokio::test]
 async fn reopened_pause_finalizes_before_executing_the_admitted_prompt() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let session_id = broker.session.id.clone();
@@ -932,7 +928,7 @@ async fn reopened_pause_finalizes_before_executing_the_admitted_prompt() -> Resu
 
 #[tokio::test]
 async fn initial_checkpoint_failure_can_finalize_without_replaying_provider_work() -> Result<()> {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let occupied: Vec<_> = (0..4)
@@ -2808,7 +2804,7 @@ async fn cancelling_paused_restart_persists_goal_and_exchange_stop() {
 async fn goal_resume_retries_locked_checkpoint_before_provider_work() {
     use std::os::windows::fs::OpenOptionsExt;
 
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker.create_goal("Finish implementation".into()).unwrap();
@@ -3089,7 +3085,7 @@ async fn conversation_rollback_preserves_files_and_restarts_with_retained_contex
 
 #[tokio::test]
 async fn consecutive_rollbacks_follow_restored_workspace_history() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let mut exchange_id = Vec::new();
@@ -5269,7 +5265,7 @@ async fn native_execution_after_settlement_fences_reuse_without_reopening_histor
 
 #[tokio::test]
 async fn failed_checkpoint_finalization_persists_failure_and_blocks_provider_execution() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let mut exchange = completed_interaction("unfinished", &broker.session.id, Vec::new());
@@ -7803,7 +7799,7 @@ async fn broker_snapshots_use_the_committed_task_owner() {
 
 #[tokio::test]
 async fn pauses_an_active_goal_after_a_provider_failure() {
-    let repository = repository();
+    let repository = git_repository();
     let data = tempfile::tempdir().unwrap();
     let mut broker = HarnessBroker::initialize_with_clock(
         InitializeRequest {
@@ -8104,7 +8100,7 @@ async fn non_git_exchanges_save_reported_changes_without_initializing_repository
 
 #[tokio::test]
 async fn provider_and_command_changes_use_separate_diff_sources() {
-    let repository = repository();
+    let repository = git_repository();
     std::fs::write(repository.path().join(".gitignore"), "target/\n").unwrap();
     git(repository.path(), &["add", ".gitignore"]);
     git(repository.path(), &["commit", "-qm", "ignore build output"]);
@@ -8185,7 +8181,7 @@ async fn provider_and_command_changes_use_separate_diff_sources() {
 
 #[tokio::test]
 async fn matching_provider_and_checkpoint_changes_share_one_canonical_diff() {
-    let repository = repository();
+    let repository = git_repository();
     std::fs::write(repository.path().join(".gitignore"), "apps/\ntarget/\n").unwrap();
     git(repository.path(), &["add", ".gitignore"]);
     git(

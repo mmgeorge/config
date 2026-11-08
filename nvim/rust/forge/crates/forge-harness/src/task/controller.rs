@@ -2364,6 +2364,10 @@ mod tests {
         let (attempted, attempt) = std::sync::mpsc::channel();
         let (finished, finish) = std::sync::mpsc::channel();
 
+        let entries_before_writer = controller
+            .admission
+            .task_mutation_entry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         let premature = std::thread::scope(|threads| -> Result<_> {
             let writer_controller = controller.clone();
             let writer_permit = permit.clone();
@@ -2388,7 +2392,20 @@ mod tests {
                 Ok(())
             });
             attempt.recv()?;
-            let premature = finish.recv_timeout(std::time::Duration::from_millis(30));
+            // The writer entered the gate once. The revoker's entry proves it reached the gate
+            // that the writer still holds, so completion before release would break exclusion.
+            while controller
+                .admission
+                .task_mutation_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < entries_before_writer + 2
+            {
+                if finish.try_recv().is_ok() {
+                    anyhow::bail!("revocation finished before the plan writer released the gate");
+                }
+                std::thread::yield_now();
+            }
+            let premature = finish.try_recv();
             release.send(())?;
             writer.join().expect("plan writer fixture must not panic")?;
             revocation
@@ -2399,7 +2416,7 @@ mod tests {
 
         assert!(matches!(
             premature,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         assert_eq!(controller.current()?.unwrap().status(), TaskStatus::Paused);
         let error = controller

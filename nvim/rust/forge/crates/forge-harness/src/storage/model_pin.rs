@@ -102,24 +102,30 @@ mod test {
         let transaction = holder
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (started, waiting) = std::sync::mpsc::channel();
         let (completed, outcome) = std::sync::mpsc::channel();
+        // SQLite invokes the busy handler only after it finds the write lock held, so the
+        // handler marks the exact point where the contender parks behind the holder.
+        static BUSY_INVOCATION_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        contender.connection.busy_handler(Some(|_| {
+            BUSY_INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::yield_now();
+            true
+        }))?;
         let writer = std::thread::spawn(move || {
-            started.send(()).unwrap();
             completed
                 .send(contender.set("fixture-beta", "waiting-model", true))
                 .unwrap();
         });
-        waiting.recv()?;
+        while BUSY_INVOCATION_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
         assert!(matches!(
-            outcome.recv_timeout(std::time::Duration::from_millis(50)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            outcome.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         transaction.commit()?;
-        assert_eq!(
-            outcome.recv()??,
-            ["waiting-model"]
-        );
+        assert_eq!(outcome.recv()??, ["waiting-model"]);
         writer.join().unwrap();
         assert_eq!(holder.load("fixture-beta")?, ["waiting-model"]);
         Ok(())

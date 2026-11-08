@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use forge_git::read_pool::BlockingReadPool;
@@ -49,19 +49,9 @@ fn checkpoint_worker_emits_no_diagnostics() -> Result<()> {
 }
 
 fn wait_for_worker(child: &mut Child) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            ensure!(status.success(), "checkpoint worker failed: {status}");
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            anyhow::bail!("checkpoint worker did not exit within 10 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let status = child.wait()?;
+    ensure!(status.success(), "checkpoint worker failed: {status}");
+    Ok(())
 }
 
 #[tokio::test]

@@ -1,32 +1,13 @@
-use std::path::Path;
-use std::process::Command;
+mod support;
 
 use forge_git::coordinator::{MutationCoordinator, OperationState};
 use forge_git::mutation::{MutationScope, OperationCompletion};
 use forge_git::{RepositoryIdentity, discover_identity};
-
-fn git(root: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c"])
-        .arg(format!(
-            "core.hooksPath={}",
-            root.join("disabled-hooks").display()
-        ))
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use support::{add_detached_worktree, commit_index, head_commit, init_repository};
 
 fn fixture() -> (tempfile::TempDir, RepositoryIdentity) {
     let root = tempfile::tempdir().unwrap();
-    git(root.path(), &["init", "--quiet"]);
+    init_repository(root.path());
     let identity = discover_identity(root.path()).unwrap().unwrap();
     (root, identity)
 }
@@ -132,23 +113,11 @@ fn completed_receipts_consume_capacity_until_acknowledged() {
 #[test]
 fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
     let (root, identity) = fixture();
-    git(
+    commit_index(root.path(), "initial");
+    add_detached_worktree(
         root.path(),
-        &[
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "initial",
-            "--quiet",
-        ],
-    );
-    git(
-        root.path(),
-        &["worktree", "add", "--quiet", "--detach", "linked"],
+        &root.path().join("linked"),
+        head_commit(root.path()),
     );
     let linked = discover_identity(&root.path().join("linked"))
         .unwrap()

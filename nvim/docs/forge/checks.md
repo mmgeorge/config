@@ -292,19 +292,15 @@ Omit inputs for changed-file mapping, supply `files` for explicit paths, select
 a complete feature `suite`, or name one `fixture`:
 
 ```json
-{"check":"lua-test","inputs":{"fixture":"nvim/tests/forge/plan_check_selection.lua"}}
+{"check":"lua-test","inputs":{"fixture":"nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"}}
 {"check":"lua-test","inputs":{"suite":"walkthrough"}}
 ```
 
 `suite` defaults to `affected` and `fixture` defaults to an empty string.
-An exact fixture cannot be combined with a named or full suite. Existing feature
-names remain in the repository runner, not separate saved definitions.
-`lua-test-mock-integration` remains an explicit check with a `rust-build`
-prerequisite. The ordinary callback rejects that suite name and
-build-dependent fixtures rather than bypassing that prerequisite.
-Supply explicit `files` to `lua-test-mock-integration` to select individual
-fixtures while retaining the build prerequisite. Omitting inputs keeps the full
-saved suite.
+An exact fixture cannot be combined with a named or full suite. Area names such
+as `status` come from the mirrored test directories, not separate saved
+definitions. No Lua check declares a dependency on `rust-build`: tests that
+launch the Forge host assume a current executable.
 
 Check IDs use language/tool-first names, while display labels name the action.
 `rulesync-local-preview` and `rulesync-global-preview` only preview generation.

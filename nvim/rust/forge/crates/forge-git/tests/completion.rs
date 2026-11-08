@@ -2,25 +2,21 @@ mod support;
 
 use forge_git::{completion::RevisionProvider, store::RepositoryStore};
 use std::{fs, path::Path, sync::Arc};
-use support::git;
+use support::{
+    add_detached_worktree, create_branch, create_tag, git, head_commit, init_bare_repository,
+    init_repository, set_reference, set_symbolic_reference, stage_and_commit,
+};
 
 #[tokio::test]
 async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     initialize(root);
-    git(root, &["branch", "topic/nested"]);
-    git(root, &["branch", "feature-é"]);
-    git(root, &["tag", "main"]);
-    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    git(
-        root,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
+    create_branch(root, "topic/nested");
+    create_branch(root, "feature-é");
+    create_tag(root, "main");
+    set_reference(root, "refs/remotes/origin/main", head_commit(root));
+    set_symbolic_reference(root, "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
     let candidates = repository.refresh_revisions(&store).await.unwrap();
@@ -45,7 +41,7 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
         &candidates,
         &repository.current_revisions().unwrap()
     ));
-    git(root, &["branch", "added", "HEAD"]);
+    create_branch(root, "added");
     let refreshed = repository.refresh_revisions(&store).await.unwrap();
     assert!(refreshed.revision > candidates.revision);
     assert_ne!(refreshed.reference_digest, candidates.reference_digest);
@@ -78,9 +74,9 @@ async fn unborn_and_bare_repositories_return_valid_snapshots() {
         let root = fixture.path().join(if bare { "bare" } else { "worktree" });
         fs::create_dir(&root).unwrap();
         if bare {
-            git(&root, &["init", "--quiet", "--bare"]);
+            init_bare_repository(&root);
         } else {
-            git(&root, &["init", "--quiet"]);
+            init_repository(&root);
         }
         let repository = store.open(root).await.unwrap().unwrap();
         let candidates = repository.refresh_revisions(&store).await.unwrap();
@@ -95,16 +91,7 @@ async fn linked_worktree_storage_invalidation_clears_each_candidate_cache() {
     fs::create_dir(&root).unwrap();
     initialize(&root);
     let linked = fixture.path().join("linked");
-    git(
-        &root,
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "--detach",
-            linked.to_str().unwrap(),
-        ],
-    );
+    add_detached_worktree(&root, &linked, head_commit(&root));
     let store = RepositoryStore::default();
     let main = store.open(root).await.unwrap().unwrap();
     let linked = store.open(linked).await.unwrap().unwrap();
@@ -117,20 +104,7 @@ async fn linked_worktree_storage_invalidation_clears_each_candidate_cache() {
 }
 
 fn initialize(root: &Path) {
-    git(root, &["init", "--quiet", "--initial-branch=main"]);
+    init_repository(root);
     fs::write(root.join("file"), b"base\n").unwrap();
-    git(root, &["add", "file"]);
-    git(
-        root,
-        &[
-            "-c",
-            "user.name=Forge Test",
-            "-c",
-            "user.email=forge@example.test",
-            "commit",
-            "--quiet",
-            "-m",
-            "base",
-        ],
-    );
+    stage_and_commit(root, &["file"], "base");
 }

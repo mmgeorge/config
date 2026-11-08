@@ -2,63 +2,6 @@
 use forge_buffer::block::BufferBlock;
 #[cfg(test)]
 use forge_buffer::document::BufferDocument;
-#[cfg(test)]
-use std::collections::HashMap;
-
-#[cfg(test)]
-pub(crate) fn reconstruct(
-    previous: Option<&serde_json::Value>,
-    mut delivery: serde_json::Value,
-) -> serde_json::Value {
-    use forge_buffer::patch::{BufferSnapshot, apply_snapshot_reference};
-    let snapshot: BufferSnapshot = if let Some(previous) = previous {
-        assert!(
-            delivery.get("snapshot").is_none(),
-            "updates must not carry snapshots"
-        );
-        let mut snapshot = serde_json::from_value(previous["snapshot"].clone()).unwrap();
-        if !delivery["patch"].is_null() {
-            let patch = serde_json::from_value(delivery["patch"].clone()).unwrap();
-            snapshot = apply_snapshot_reference(&snapshot, &patch).unwrap();
-        }
-        snapshot
-    } else {
-        serde_json::from_value(delivery["snapshot"].clone()).unwrap()
-    };
-    let mut anchor = previous
-        .into_iter()
-        .flat_map(|previous| previous["source_row"].as_array().unwrap())
-        .map(|row| (row["id"].as_str().unwrap().to_owned(), row.clone()))
-        .collect::<HashMap<_, _>>();
-    for id in delivery["source_edit"]["remove"].as_array().unwrap() {
-        anchor.remove(id.as_str().unwrap());
-    }
-    for row in delivery["source_edit"]["upsert"].as_array().unwrap() {
-        anchor.insert(row["id"].as_str().unwrap().to_owned(), row.clone());
-    }
-    let mut rows = Vec::new();
-    for block in &snapshot.block {
-        for (position, text) in block.text.wire_rows().iter().enumerate() {
-            let mut row = anchor[&format!("{}:{position}", block.id.0)].clone();
-            row["text"] = serde_json::json!(text);
-            row["block"] = serde_json::json!(block.id);
-            row["position"] = serde_json::json!({"row":position,"column":0});
-            row["target"] = serde_json::json!(
-                block
-                    .metadata
-                    .target
-                    .iter()
-                    .find(|target| target.range.start.row <= position
-                        && position < target.range.end.row)
-                    .map(|target| &target.id)
-            );
-            rows.push(row);
-        }
-    }
-    delivery["snapshot"] = serde_json::to_value(snapshot).unwrap();
-    delivery["source_row"] = serde_json::json!(rows);
-    delivery
-}
 
 #[cfg(test)]
 mod tests {

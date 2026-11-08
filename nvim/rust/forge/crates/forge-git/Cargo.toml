@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `forge_git::test_support`, in-process fixture repositories, to dependents' tests.
+test-fixtures = []
+
 [dependencies]
 anyhow = { workspace = true }
 dunce = { workspace = true }

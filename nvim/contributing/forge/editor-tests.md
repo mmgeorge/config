@@ -2,53 +2,77 @@
 
 A Rust test cannot show that a keystroke reaches the right buffer, and a Lua mock cannot show that the real host keeps its queue. Editor fixtures close that gap by driving real Neovim, and host fixtures add the real Rust host. This guide explains which suite to use, how to run a fixture, and how to control provider timing without sleeping.
 
-Host fixtures need a built executable. See [Building and testing](building-and-testing.md).
+Tests that launch the Forge host assume a current executable. Run `rust-build` after Rust changes and before the Lua tests; see [Building and testing](building-and-testing.md).
+
+## Test layout
+
+Each plugin keeps its tests in `nvim/lua/<plugin>/tests/`, split by how much of the system a test exercises. Both halves mirror the plugin's source tree, so a source path names where its tests live. Every test file ends in `.test.lua`, and the runner finds tests by that suffix alone.
+
+| Kind | Location | Form |
+| --- | --- | --- |
+| Unit | `tests/unit/` at the source file's mirrored path: `nvim/lua/forge/views/status/status_context.lua` → `nvim/lua/forge/tests/unit/views/status/status_context.test.lua`, and `init.lua` → `init.test.lua` | One row per test in the file's `scenarios` table |
+| Integration | `tests/integration/` in the mirrored directory of the source area it drives, in the file named after that area: `views/status/` → `nvim/lua/forge/tests/integration/views/status/status.test.lua`, and a top-level module's area is a directory named after it, such as `integration/client/client.test.lua` for `client.lua` | One row per test in the area file's `scenarios` table |
+| Support | `tests/support/` for shared helpers, `tests/fixtures/` for data and shared setup scripts, `tests/plans/` for notes | Plain `.lua` or Markdown; never run as tests |
+
+Forge's integration areas are `buffer`, `client`, `git`, `lsp`, `review_document`, `text`, `walkthrough`, and, under `views/`, `harness`, `picker`, `plan_review`, and `status`. Each area name is also a suite. An integration test stays a standalone file in its area directory only when a row cannot hold it: when it reloads its own file in a child Neovim, such as `harness_markdown_layout.test.lua`, or dispatches its own scenarios, such as `plan_review_question_response.test.lua`. Load helpers by repository path, such as `dofile("nvim/lua/forge/tests/support/state.lua")`, at file scope.
+
+A test file declares its tests as rows at two-space indentation, which is how the runner finds them, and dispatches on `arg[1]`:
+
+```lua
+local scenarios = {
+  { name = "admission_queue", run = function()
+    -- arrange, act, and assert against forge.client
+  end },
+}
+
+local selected = arg[1]
+for _, scenario in ipairs(scenarios) do
+  if scenario.name == selected then return scenario.run() end
+end
+error(("unknown scenario %q"):format(tostring(selected)))
+```
+
+Add a new test as a row in the existing unit or area file rather than as a new file, and move a unit test file whenever its source file moves.
 
 ## Suites
 
-| Check | Runs | Provider |
-| --- | --- | --- |
-| `lua-test` | Ordinary module fixtures | None |
-| `lua-test-mock-integration` | Host fixtures | `MockProvider` or a simulated process, with no model requests |
-
-The `lua-test` check runs the ordinary suite, which excludes the mock integration suite; its default `affected` selection maps changed source paths to the feature suites that cover them. The registry rejects a fixture outside the mock suite submitted to the mock check, and the ordinary check rejects mock fixtures so they keep their `rust-build` prerequisite.
+The `lua-test` check runs every Lua test through the runner. Its default `affected` selection maps changed paths to tests. A changed test file runs itself; a changed Lua source file runs its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor; a source file with no area runs its plugin's whole test directory; and any other change, including a change under `tests/` or to the runner, runs every test. Its `suite` input accepts `all`, an area name such as `status`, which selects that area's unit and integration mirrors, or a directory under `nvim/lua`.
 
 ## Run a fixture
 
-`.forge/checks/lua-tests.nu` is the only way to run Lua fixtures, both inside Harness, where every Lua check calls it, and outside. Each fixture runs in its own fresh Neovim, `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" -l <fixture>`, from the repository root. The runner runs fixtures in parallel, by default on a sixth of the logical CPUs, because host fixtures contend for process launches and `git`, and kills the whole process tree of any fixture still running after five seconds, including the Forge host it launched. A killed fixture fails as a timeout, and a fixture that prints success but stays alive therefore fails too.
+`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` check calls it, and outside. Each scenario row, or each standalone file, runs in its own fresh Neovim, `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" -l <file> [scenario]`, from the repository root. The runner runs tests in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`, and kills the whole process tree of any test still running after five seconds, including the Forge host it launched. A killed test fails as a timeout, and a test that prints success but stays alive therefore fails too.
 
-Inside Harness, select a fixture through its check:
+Inside Harness, select tests through the check:
 
 ```text
-check_run({"check":"lua-test","inputs":{"fixture":"nvim/tests/forge/plan_check_selection.lua"}})
-check_run({"check":"lua-test-mock-integration","inputs":{"files":["nvim/tests/forge/harness_host.lua"]}})
+check_run({"check":"lua-test","inputs":{"fixture":"nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"}})
+check_run({"check":"lua-test","inputs":{"suite":"harness"}})
 ```
 
-Use `inputs:{"suite":"walkthrough"}` only when a whole feature needs coverage. Omitting `files` from an integration check selects its whole suite.
+Use a `suite` only when a whole area needs coverage.
 
-Outside Harness, call the runner directly. Without paths it runs every fixture:
+Outside Harness, call the runner directly. Without arguments it runs every test. Each argument is a test file, a source file (which selects its unit test), a directory, a test name (the file name without `.test.lua`, which selects every file with that name), or any of these followed by `::scenario`. A source directory selects both of its mirrors:
 
 ```nu
-nu .forge/checks/lua-tests.nu nvim/tests/forge/plan_check_selection.lua
-nu .forge/checks/lua-tests.nu --suite mock-integration --jobs 4
+nu .forge/checks/lua-tests.nu client                                 # unit/client.test.lua and integration/client/client.test.lua
+nu .forge/checks/lua-tests.nu client::admission_queue                # one scenario
+nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua
+nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp                     # unit and integration tests for lsp/
+nu .forge/checks/lua-tests.nu --suite status --jobs 4                # a source area as the suite
 nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/walkthrough.lua
 nu .forge/checks/lua-tests.nu
 ```
 
-The runner prints each fixture's result and duration as it finishes, then the slowest fixtures and a pass and fail count, and exits nonzero when any fixture fails. `--list` prints the selection without running it. Every fixture must finish within the five-second limit, and there are no per-fixture exceptions. A fixture that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed. The runner's `disabled_fixture_list` names the fixtures excluded from default selections because launch and sequencing overhead alone exceeds the limit, and [disabled slow tests](../../tests/forge/plans/disabled-slow-tests.md) records each one's measured duration. A fixture that takes a scenario name through `arg[1]`, such as `plan_review_question_response_host.lua`, is listed once per scenario as `<path>::<scenario>`; the runner discovers the scenarios from the fixture's `{ name = "...", run = ... }` rows and passes the name as `arg[1]`.
+The runner prints each test's result and duration as it finishes, then the slowest tests and a pass and fail count, and exits nonzero when any test fails. `--list` prints the selection without running it. Every test must finish within the five-second limit, and there are no per-test exceptions. A test that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed.
 
-Parameterized fixtures for languages and providers need the setup in [Verification by area](verification-by-area.md), and the runner rejects them without it. Pass that setup as Lua with `--lua`, which each fixture runs before it loads:
-
-```nu
-nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_plan_behavior = true" nvim/tests/forge/plan_review_calls_host.lua
-```
+`--lua` runs the given Lua before each selected test loads, for ad hoc setup such as `vim.g` values.
 
 ## Launch the host executable
 
-A host fixture launches the built Forge executable through `nvim/tests/forge/support/host_executable.lua`. Do not copy the executable into the fixture directory. Windows scans every new image before its first launch, and a scan of the 182 MB development build routinely outlasts a fixture's startup deadline. The helper acquires a lease from the builder's content-addressed executable cache under `stdpath("cache")`. That cache keeps one pinned copy per build, so repeated runs of the same build launch an image Windows has already scanned:
+A host fixture launches the built Forge executable through `nvim/lua/forge/tests/support/host_executable.lua`. Do not copy the executable into the fixture directory. Windows scans every new image before its first launch, and a scan of the 182 MB development build routinely outlasts a fixture's startup deadline. The helper acquires a lease from the builder's content-addressed executable cache under `stdpath("cache")`. That cache keeps one pinned copy per build, so repeated runs of the same build launch an image Windows has already scanned:
 
 ```lua
-local binary = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/host_executable.lua")()
+local binary = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
 ```
 
 The first fixture run after a rebuild still pays for one copy and scan of the new image.
@@ -57,10 +81,10 @@ The first fixture run after a rebuild still pays for one copy and scan of the ne
 
 A fixture never creates its workspace, data directory, or retained evidence inside the checkout. Git reports a nested repository as a single untracked entry, so a fixture workspace left in the checkout shows up in every later status, checkpoint, and Harness session of that checkout. Use `vim.fn.tempname()` for state that may disappear with the Neovim process, which deletes that directory on exit.
 
-A fixture that keeps diagnostics after a failure takes its directory from `nvim/tests/forge/support/evidence_directory.lua`. The helper creates a unique directory under `vim.uv.os_tmpdir()`, inside its `forge` subdirectory: `%TEMP%\forge` on Windows and `$TMPDIR/forge` on macOS. Resolve the helper at file scope, before the fixture changes directory:
+A fixture that keeps diagnostics after a failure takes its directory from `nvim/lua/forge/tests/support/evidence_directory.lua`. The helper creates a unique directory under `vim.uv.os_tmpdir()`, inside its `forge` subdirectory: `%TEMP%\forge` on Windows and `$TMPDIR/forge` on macOS. Resolve the helper at file scope, before the fixture changes directory:
 
 ```lua
-local fixture_evidence = dofile(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)) .. "/support/evidence_directory.lua")("harness-admission")
+local fixture_evidence = dofile("nvim/lua/forge/tests/support/evidence_directory.lua")("harness-admission")
 local workspace, data = fixture_evidence.path .. "/workspace", fixture_evidence.path .. "/data"
 ```
 
@@ -68,10 +92,10 @@ Call `fixture_evidence.release(passed)` only after the host process exits, becau
 
 ## Control provider timing
 
-An interaction test often has to act after the provider receives a prompt but before it responds. Elapsed-time sleeps make these tests flaky, so `nvim/tests/forge/support/mock_provider.lua` holds the real host's `MockProvider` through `session.provider.mock_response` instead. Create the hold before submitting, then wait for the prompt to arrive:
+An interaction test often has to act after the provider receives a prompt but before it responds. Elapsed-time sleeps make these tests flaky, so `nvim/lua/forge/tests/support/mock_provider.lua` holds the real host's `MockProvider` through `session.provider.mock_response` instead. Create the hold before submitting, then wait for the prompt to arrive:
 
 ```lua
-local mock = dofile("nvim/tests/forge/support/mock_provider.lua")
+local mock = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
 local hold = mock.hold(state.session.id, "chat")
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Test response timing" })
 controller.submit()
@@ -102,18 +126,10 @@ Fixtures answer the resulting approvals and review questions through shared help
 Read session state through `support/state.lua` in any fixture that opens the Harness view. `session.state.get` is the reconnect primitive, not a passive read. Its response carries a retained `owner_publication` page, and the host records that page as delivered once the response reaches output. A fixture that calls the method directly and discards the page consumes live events such as `activity_changed`, and the presentation then waits for an idle transition it will never receive. The helper calls `controller.synchronize_state`, which sends the client's publication cursor and replays the page through `snapshot.apply`:
 
 ```lua
-local state_snapshot = dofile(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h") .. "/support/state.lua")
+local state_snapshot = dofile("nvim/lua/forge/tests/support/state.lua")
 local snapshot = state_snapshot.get()
 ```
 
-Resolve the helper path at file scope, before the fixture changes directory, because `debug.getinfo` reports the path as `nvim -l` received it. Fixtures that test the method's own wire behavior, such as `request_independence_host.lua`, still issue it directly.
+Load the helper at file scope by its repository path, before the fixture changes directory, because the runner starts every test from the repository root. Fixtures that test the method's own wire behavior still issue it directly.
 
 Observe execution through `require("forge.views.harness.activity").busy(state)`, which reads the host-published `state.activity` phase. `session.prompt.submit` responds when the host admits the input, not when the turn finishes, so await a turn through activity or the concrete plan, question, or transcript state it produces. Lua unit fixtures without a host set activity through `support/activity.lua`, whose `set_busy` advances the activity revision the way a host publication does.
-
-## Submission races
-
-`harness_host.lua` runs `support/submission_races.lua` against the real Rust host, SQLite storage, Lua input reconciliation, and transcript presentation. Only the provider response and selected transport callbacks are controlled.
-
-The module asserts the split input model. Host-confirmed messages live in `state.input.confirmed` with a `delivery` state, while editor drafts that the host has not confirmed live in `state.input.drafts` with a `draft_state` of `pending`, `rejected`, or `unknown`. A lost submit acknowledgement is recovered through `session.command.status.get` inside `forge.command.dispatch`, never by resubmitting, so the lossy-transport case asserts exactly one submission. A rejected attachment draft stays recoverable without blocking later submissions, and `input_state.discard_rejected` removes it. A host replacement restores durably queued input as the same confirmed message and does not deliver it on startup.
-
-Add a race case to that module with an explicit provider or callback barrier, and assert durable exchange identity, queue contents, and preservation of newer composer text. Do not replace the Rust queue with a Lua mock, or depend on sleeps to order events. Every wait needs a diagnostic deadline, and teardown must restore intercepted callbacks and collect the isolated host when an assertion fails.

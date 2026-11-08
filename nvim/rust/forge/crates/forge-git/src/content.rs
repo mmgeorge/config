@@ -589,7 +589,7 @@ fn finish_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::git;
+    use crate::test_support::init_repository;
 
     #[test]
     fn complete_stream_preserves_content_beyond_former_limit() {
@@ -632,7 +632,7 @@ mod tests {
     fn worktree_change_after_open_rejects_acquisition() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
-        git(root, &["init", "--quiet"]);
+        init_repository(root);
         std::fs::write(root.join("file"), b"initial contents").unwrap();
         let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
         let mut local = shared.to_thread_local();

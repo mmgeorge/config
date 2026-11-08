@@ -188,6 +188,16 @@ pub(super) async fn check_fixture(
     manual: bool,
 ) -> HarnessBroker {
     let mut broker = planning_question_broker(repository, data, false);
+    // Fixture commands use PowerShell's `Write-Output`, which the default interpreter ignores.
+    broker.check_runner.script_commands(|request| {
+        match request.command.trim().strip_prefix("Write-Output ") {
+            Some(text) => crate::checks::ScriptedCheckOutcome {
+                stdout: format!("{}\n", text.trim().trim_matches(['\'', '"'])),
+                ..Default::default()
+            },
+            None => crate::checks::ScriptedCheckOutcome::interpret(request),
+        }
+    });
     let mut document = crate::plan::test_fixture("check-plan", "Check fixture");
     let mut design = crate::plan::DeclarationDesign::default();
     design.document.objective = "Check accepted commands".into();
@@ -299,20 +309,66 @@ pub(super) async fn check_fixture(
     broker
 }
 
-/// Create a committed Git repository with deterministic fixture identity and line endings.
+/// Create a plain workspace directory holding the seed file. The broker opens a non-Git workspace
+/// without checkpoints, so tests that do not exercise checkpoints, rollback, or workspace changes
+/// avoid every Git process launch.
 pub(in crate::broker) fn repository() -> tempfile::TempDir {
     let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temporary.path().join("seed.txt"),
+        "seed
+",
+    )
+    .unwrap();
+    temporary
+}
+
+/// Create a committed Git repository with deterministic fixture identity and line endings, for
+/// tests that exercise checkpoints, rollback, or workspace changes. Under nextest the
+/// `git-template` setup script builds this repository once per run and exports its path, so each
+/// test copies it instead of launching Git. Other runners build it directly.
+pub(in crate::broker) fn git_repository() -> tempfile::TempDir {
+    let temporary = tempfile::tempdir().unwrap();
+    if let Some(template) = std::env::var_os("FORGE_TEST_GIT_TEMPLATE") {
+        copy_directory_tree(Path::new(&template), temporary.path());
+        return temporary;
+    }
     git(temporary.path(), &["init", "-q"]);
-    git(temporary.path(), &["config", "core.autocrlf", "false"]);
-    git(
-        temporary.path(),
-        &["config", "user.email", "harness@example.invalid"],
+    // Appending the fixture identity directly avoids three `git config` process launches.
+    let config_path = temporary.path().join(".git").join("config");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(
+        "[core]
+	autocrlf = false
+[user]
+	email = harness@example.invalid
+	name = Harness Test
+",
     );
-    git(temporary.path(), &["config", "user.name", "Harness Test"]);
-    std::fs::write(temporary.path().join("seed.txt"), "seed\n").unwrap();
+    std::fs::write(&config_path, config).unwrap();
+    std::fs::write(
+        temporary.path().join("seed.txt"),
+        "seed
+",
+    )
+    .unwrap();
     git(temporary.path(), &["add", "."]);
     git(temporary.path(), &["commit", "-qm", "seed"]);
     temporary
+}
+
+/// Copy every file and directory below `source` into the existing `destination`.
+fn copy_directory_tree(source: &Path, destination: &Path) {
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_directory_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
 }
 
 /// Create a persisted broker with normalized planning and question behavior.

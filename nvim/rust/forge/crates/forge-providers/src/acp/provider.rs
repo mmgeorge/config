@@ -3620,36 +3620,59 @@ mod tests {
         .unwrap()
     }
 
+    /// Keep the failed-open peer registered for as long as its provider is in use.
+    struct FailedOpenFixture {
+        _directory: tempfile::TempDir,
+        _peer: super::super::in_memory_peer::InMemoryPeer,
+    }
+
+    /// Native peer behavior for opening: `missing_identity` makes loads fail and sessions anonymous.
+    fn failed_open_peer_handler(
+        missing_identity: bool,
+    ) -> super::super::in_memory_peer::PeerHandler {
+        Box::new(move |request| {
+            let method = request["method"].as_str().unwrap_or_default();
+            let Some(request_id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
+                return Vec::new();
+            };
+            let mut result = serde_json::json!({});
+            if method == "initialize" {
+                result = serde_json::json!({
+                    "protocolVersion":1,
+                    "agentInfo":{"version":"99.0.0"},
+                    "agentCapabilities":{"loadSession":true},
+                });
+            }
+            if method == "session/load" && missing_identity {
+                return vec![serde_json::json!({
+                    "id":request_id,
+                    "error":{"code":-32603,"message":"injected load failure"},
+                })];
+            }
+            if method == "session/new" || method == "session/load" {
+                result = if missing_identity {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"sessionId":"failed-open-history"})
+                };
+            }
+            vec![serde_json::json!({"id":request_id,"result":result})]
+        })
+    }
+
     /// Prepare a deterministic native peer whose open or initial configuration can fail.
     fn failed_open_fixture(
         missing_identity: bool,
-    ) -> (tempfile::TempDir, AcpProvider, SessionRequest) {
+    ) -> (FailedOpenFixture, AcpProvider, SessionRequest) {
         let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("failed-open.cjs");
-        std::fs::write(&script, r#"
-const readline=require('node:readline');
-if(process.argv.includes('--version')){console.log('2.1.302');process.exit(0);}
-readline.createInterface({input:process.stdin}).on('line',line=>{
- const request=JSON.parse(line);if(request.id===undefined)return;let result={};
- if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true}};
- if(request.method==='session/load'&&process.argv[2]==='missing'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32603,message:'injected load failure'}})+'\n');return;}
- if(request.method==='session/new'||request.method==='session/load')result=process.argv[2]==='missing'?{}:{sessionId:'failed-open-history'};
- process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
-});
-"#).unwrap();
-        let node = forge_shell::process::executable("node")
-            .expect("Node.js is required by the ACP failure fixture");
+        let peer = super::super::in_memory_peer::InMemoryPeer::register(
+            directory.path(),
+            "2.1.302",
+            Box::new(move || failed_open_peer_handler(missing_identity)),
+        );
         let provider = AcpProvider::new(
             forge_provider_api::ProviderId::new("antigravity").unwrap(),
-            vec![
-                node.to_string_lossy().into_owned(),
-                script.to_string_lossy().into_owned(),
-                if missing_identity {
-                    "missing".into()
-                } else {
-                    "valid".into()
-                },
-            ],
+            vec![peer.program()],
             directory.path().join("runtime"),
         )
         .unwrap();
@@ -3673,7 +3696,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             system_instructions: String::new(),
             trace: Arc::new(IgnoreTrace),
         };
-        (directory, provider, request)
+        (
+            FailedOpenFixture {
+                _directory: directory,
+                _peer: peer,
+            },
+            provider,
+            request,
+        )
     }
 
     /// Exact cancel must wait for queued native ownership to prove no future registration.

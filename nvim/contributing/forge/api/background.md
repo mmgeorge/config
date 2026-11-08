@@ -39,7 +39,7 @@ When no conversation exists for the branch, the result is `{sessions: [], sessio
 
 There is no progress callback for this request. Reads inspect local Git and SQLite state. Policy updates write local settings with a revision check, so a stale update cannot overwrite a newer value. A nested presentation change can mutate the in-memory document view but does not execute model work. Retrying reads is safe. After a policy-write response is lost, read the settings before attempting another write. Keep the captured workspace/session selector and document generation when adopting asynchronous results.
 
-An empty repository with no background conversation is covered by [the background host fixture](../../../../nvim/tests/forge/background_host.lua):
+An empty repository with no background conversation is covered by [the background host fixture](../../../../nvim/lua/forge/tests/integration/views/harness/harness.test.lua):
 
 ```json
 {"id":10,"method":"background.session.document","params":{"data_root":"/tmp/forge","workspace":"/tmp/repository"}}

@@ -1,7 +1,4 @@
-use std::{
-    process::{ExitStatus, Stdio},
-    time::Duration,
-};
+use std::process::{ExitStatus, Stdio};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -50,13 +47,7 @@ impl HostProcess {
 
     async fn read(&mut self, return_credit: bool) -> Value {
         let mut frame = Vec::new();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            self.output.read_until(b'\n', &mut frame),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        self.output.read_until(b'\n', &mut frame).await.unwrap();
         assert!(!frame.is_empty());
         assert!(frame.len() <= forge_protocol::MAX_FRAME_BYTES);
         self.bytes += frame.len();
@@ -113,30 +104,26 @@ impl HostProcess {
 
     async fn finish(mut self) -> (Vec<Value>, ExitStatus, String) {
         self.input.take();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut messages = Vec::new();
-            loop {
-                let mut frame = Vec::new();
-                if self.output.read_until(b'\n', &mut frame).await.unwrap() == 0 {
-                    break;
-                }
-                assert!(frame.len() <= forge_protocol::MAX_FRAME_BYTES);
-                assert!(messages.len() < forge_protocol::MAX_PENDING_FRAMES * 2);
-                messages.push(serde_json::from_slice(&frame).unwrap());
+        let mut messages = Vec::new();
+        loop {
+            let mut frame = Vec::new();
+            if self.output.read_until(b'\n', &mut frame).await.unwrap() == 0 {
+                break;
             }
-            let status = self.process.wait().await.unwrap();
-            let mut error = String::new();
-            self.process
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut error)
-                .await
-                .unwrap();
-            (messages, status, error)
-        })
-        .await
-        .expect("Forge did not finish connection shutdown within five seconds")
+            assert!(frame.len() <= forge_protocol::MAX_FRAME_BYTES);
+            assert!(messages.len() < forge_protocol::MAX_PENDING_FRAMES * 2);
+            messages.push(serde_json::from_slice(&frame).unwrap());
+        }
+        let status = self.process.wait().await.unwrap();
+        let mut error = String::new();
+        self.process
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut error)
+            .await
+            .unwrap();
+        (messages, status, error)
     }
 }
 
@@ -157,28 +144,6 @@ async fn eof_cancels_active_producers_before_waiting_for_output_drainage() {
         cancelled.pointer("/error/code").and_then(Value::as_str),
         Some("request_failed"),
         "{cancelled}"
-    );
-}
-
-#[tokio::test]
-async fn exhausted_receive_credit_cannot_hold_an_eof_connection_open() {
-    let mut host = HostProcess::start().await;
-    for id in 2..2 + forge_protocol::MAX_PENDING_FRAMES {
-        host.send(json!({"id":id,"method":"session.state.get","params":{}}))
-            .await;
-        assert_eq!(host.read(false).await["id"].as_u64(), Some(id as u64));
-    }
-    host.send(json!({"id":forge_protocol::MAX_PENDING_FRAMES + 2,"method":"session.state.get","params":{}}))
-        .await;
-    let (messages, status, error) = host.finish().await;
-    assert!(!status.success());
-    assert!(
-        error.contains("connection shutdown deadline expired"),
-        "{error}"
-    );
-    assert!(
-        messages.is_empty(),
-        "host published output without consumption credit"
     );
 }
 

@@ -1,32 +1,16 @@
-use std::path::Path;
-use std::process::Command;
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use forge_git::store::RepositoryStore;
-
-fn git(root: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c"])
-        .arg(format!(
-            "core.hooksPath={}",
-            root.join("disabled-hooks").display()
-        ))
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use support::{
+    add_detached_worktree, commit_index, head_commit, init_bare_repository, init_repository,
+};
 
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    git(root.path(), &["init", "--quiet"]);
+    init_repository(root.path());
     root
 }
 
@@ -169,31 +153,9 @@ async fn foreign_store_leases_are_rejected() {
 #[tokio::test]
 async fn linked_worktrees_share_invalidation_but_keep_separate_handles() {
     let root = fixture();
-    git(
-        root.path(),
-        &[
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "initial",
-            "--quiet",
-        ],
-    );
+    commit_index(root.path(), "initial");
     let linked = root.path().join("linked");
-    git(
-        root.path(),
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            "--quiet",
-            linked.to_str().unwrap(),
-        ],
-    );
+    add_detached_worktree(root.path(), &linked, head_commit(root.path()));
     let unrelated_root = fixture();
     let store = RepositoryStore::new(3, 2).unwrap();
     let main = store.open(root.path().to_owned()).await.unwrap().unwrap();
@@ -217,7 +179,7 @@ async fn bare_repository_and_missing_repository_remain_distinct() {
     let root = tempfile::tempdir().unwrap();
     let store = RepositoryStore::new(1, 1).unwrap();
     assert!(store.open(root.path().to_owned()).await.unwrap().is_none());
-    git(root.path(), &["init", "--bare", "--quiet"]);
+    init_bare_repository(root.path());
     let repository = store.open(root.path().to_owned()).await.unwrap().unwrap();
     assert!(repository.identity.worktree.is_none());
     assert!(

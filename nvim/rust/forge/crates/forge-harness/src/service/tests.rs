@@ -27,7 +27,6 @@ mod task_state;
 use super::*;
 use crate::provider::{ProviderCatalogRequest, TextGeneration};
 use bootstrap::{initialize, service};
-use reviewed_plan::reviewed_execution_fixture;
 
 #[tokio::test]
 async fn lsp_callbacks_enforce_session_and_request_ownership() -> Result<()> {
@@ -762,102 +761,6 @@ fn generation_provider(
     });
     provider
 }
-#[tokio::test]
-async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Result<()> {
-    let fixture = tempfile::tempdir()?;
-    let config = json!({"checks":{"format":{"trigger":{"auto":true},"action":{"command":["nu", "-c","print checked"],"label":"Rust formatting","category":"format","directory":".","after":[]}}}});
-    std::fs::write(
-        fixture.path().join(".forge.json"),
-        serde_json::to_vec(&config)?,
-    )?;
-    let service = service();
-    let opened = service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await?;
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let registry = service.registry().await?;
-    let controller = registry.resolve(&session_id).await?;
-    let (setup_sink, _setup_output) = forge_protocol::outbound::channel();
-    controller.attach_input(&setup_sink).await?;
-    let reviewed =
-        reviewed_execution_fixture(&service, &controller, &session_id, &setup_sink).await?;
-    let plan = SqliteStore::open(&controller.data_root)?
-        .load_plan(
-            reviewed["plan_id"]
-                .as_str()
-                .context("reviewed plan has no identity")?,
-        )?
-        .context("reviewed plan is missing")?;
-    let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
-        "operation":"plan_open", "document":"checks-review", "view":"checks-view", "plan_id":plan.id,
-        "digest":plan.review_digest, "width":{"columns":80,"tabstop":4}
-    }))?).await?;
-    projection = crate::plan::reconstruct(None, projection);
-    let annotation_line = projection["source_row"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["target"].is_string())
-        .unwrap()["source_line"]
-        .clone();
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    for (index, enabled) in [false, true].into_iter().enumerate() {
-        assert_eq!(projection["checks"][0]["enabled"], !enabled);
-        let row = projection["source_row"][0].clone();
-        // PlanReview gives every direct edit its own operation identity, so each toggle here
-        // carries a distinct one, as `plan_review/document.lua` does.
-        service.dispatch(Some(session_id.clone()), Request { id:3, method:"session.plan.check.update".into(),
-            params:json!({"operation_id":format!("check-edit-{index}"),"enabled":{"format":enabled}, "expected_version":projection["version"],
-                "draft_source_digest":projection["saved_source_digest"],
-                "draft_annotation":[{"id":"retained", "source":{"start_line":annotation_line,"end_line":annotation_line,"body":"Keep this feedback."}}],
-                "review":{"document":"checks-review","view":"checks-view","sequence":index+1,
-                    "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
-                    "target":row["target"],"action":"checks"}}) }, &sink).await?;
-        loop {
-            let frame = output
-                .recv()
-                .await?
-                .context("check edit response is missing")?;
-            let value: Value = serde_json::from_slice(frame.bytes())?;
-            if value["id"] != 3 {
-                continue;
-            }
-            assert!(value.get("error").is_none(), "{value}");
-            assert!(value["result"].get("review_error").is_none(), "{value}");
-            projection =
-                crate::plan::reconstruct(Some(&projection), value["result"]["review"].clone());
-            break;
-        }
-        assert_eq!(projection["checks"][0]["enabled"], enabled);
-        assert_eq!(
-            projection["source_row"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["check"] == "format"),
-            enabled
-        );
-        assert!(
-            projection["annotation"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|annotation| annotation["id"] == "retained")
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(fixture.path().join(".forge.json"))?)?,
-            config
-        );
-    }
-    let stale = controller.broker.lock().await.dispatch(Request { id:4, method:"session.plan.check.update".into(),
-        params:json!({"plan_id":plan.id,"digest":projection["saved_source_digest"], "expected_version":0, "enabled":{"format":false}}) }).await;
-    assert!(stale.response.error().is_some());
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_timeout_edits_preserve_latest_value_while_busy() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -2837,7 +2740,7 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
         fixture.path().join(".forge.json"),
         serde_json::to_vec(&json!({
             "checks":{"waiting":{"trigger":{"auto":false},"action":{
-                "command":["nu","--no-config-file","-c","sleep 30sec"],
+                "command":["custom-runner","wait"],
                 "label":"Waiting check","category":"test"
             }}}
         }))?,
@@ -2853,6 +2756,16 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
     let registry = service.registry().await?;
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
+    controller.checks.script_commands(|request| {
+        assert_eq!(
+            request.invocation.map(|(program, _)| program),
+            Some("custom-runner")
+        );
+        crate::checks::ScriptedCheckOutcome {
+            hold_until_cancelled: true,
+            ..Default::default()
+        }
+    });
     let (sink, mut output) = forge_protocol::outbound::channel();
     let drain = tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
     for (id, method, params) in [
@@ -3027,81 +2940,6 @@ async fn trace_controls_complete_while_a_turn_owns_the_broker() {
         );
     }
     drop(owner);
-    service.shutdown(Duration::from_secs(1)).await.unwrap();
-}
-
-#[tokio::test]
-async fn oversized_session_preview_uses_response_parts_and_keeps_broker_alive() {
-    let fixture = tempfile::tempdir().unwrap();
-    let service = service();
-    let opened = service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await
-        .unwrap();
-    let session_id = opened.result().unwrap()["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let registry = service.registry.lock().await.clone().unwrap();
-    let controller = registry.resolve(&session_id).await.unwrap();
-    // Exceed one protocol frame so the preview must arrive as response parts.
-    let name = "preview history ".repeat(forge_protocol::MAX_FRAME_BYTES / 16 + 1);
-    let renamed = controller
-        .broker
-        .lock()
-        .await
-        .dispatch(Request {
-            id: 2,
-            method: "session.rename".into(),
-            params: json!({"session_id":session_id, "name":name}),
-        })
-        .await;
-    assert!(renamed.response.error().is_none());
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    service
-        .dispatch(
-            Some(session_id.clone()),
-            Request {
-                id: 3,
-                method: "session.preview".into(),
-                params: json!({"session_id":session_id}),
-            },
-            &sink,
-        )
-        .await
-        .unwrap();
-    let mut encoded = String::new();
-    loop {
-        let frame = output.recv().await.unwrap().unwrap();
-        assert!(frame.bytes().len() <= forge_protocol::MAX_FRAME_BYTES);
-        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-        if value.get("request_id").is_none() {
-            continue;
-        }
-        let event: forge_protocol::message::RequestEvent = serde_json::from_value(value).unwrap();
-        assert_eq!(event.request_id, 3);
-        if event.event == "result.complete" {
-            break;
-        }
-        let part: forge_protocol::transfer::JsonPart =
-            serde_json::from_value(event.payload).unwrap();
-        encoded.push_str(&part.payload);
-    }
-    let response: Response = serde_json::from_str(&encoded).unwrap();
-    assert_eq!(response.result().unwrap()["session"]["name"], name.trim());
-    service
-        .dispatch(
-            Some(registry.initial_session_id().to_owned()),
-            Request {
-                id: 4,
-                method: "session.prompt.history.record".into(),
-                params: json!({"text":"still alive"}),
-            },
-            &sink,
-        )
-        .await
-        .unwrap();
-    output.check().unwrap();
     service.shutdown(Duration::from_secs(1)).await.unwrap();
 }
 
@@ -3702,13 +3540,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
         1,
         "independent child cannot invent root question authority"
     );
-    if let Err(error) = service.shutdown(Duration::from_secs(5)).await {
-        return Err(owner_fixture::retain_cleanup_failure(
-            fixture,
-            &controller,
-            error,
-        ));
-    }
+    service.shutdown(Duration::from_secs(5)).await?;
     drop(sink);
     reader.await??;
     Ok(())

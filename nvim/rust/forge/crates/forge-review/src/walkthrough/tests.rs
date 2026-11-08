@@ -1,5 +1,5 @@
 use super::*;
-use forge_git::command::{CommandLimits, read_command};
+use forge_git::test_support::{init_repository, set_config, set_identity, stage_and_commit};
 
 #[tokio::test]
 async fn composite_review_drains_all_chunks_with_an_anchor_after_the_first_chunk() {
@@ -51,43 +51,14 @@ async fn composite_review_drains_all_chunks_with_an_anchor_after_the_first_chunk
     service.close_collected(&document).await;
 }
 
-fn git(root: &std::path::Path, arguments: &[&str]) -> String {
-    let output = read_command(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(arguments),
-        CommandLimits {
-            stderr_bytes: 8192,
-            timeout: std::time::Duration::from_secs(10),
-        },
-        || Ok(()),
-    )
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
 async fn fixture(stale: bool) -> (tempfile::TempDir, WalkthroughService, DocumentId) {
     let (directory, head) = tokio::task::spawn_blocking(|| {
-        let directory = tempfile::Builder::new()
-            .prefix(".forge-walkthrough-")
-            .tempdir_in(std::env::current_dir().unwrap())
-            .unwrap();
-        git(directory.path(), &["init", "--initial-branch=main"]);
-        git(directory.path(), &["config", "user.name", "Forge Test"]);
-        git(
-            directory.path(),
-            &["config", "user.email", "forge@example.invalid"],
-        );
-        git(directory.path(), &["config", "core.autocrlf", "false"]);
+        let directory = tempfile::tempdir().unwrap();
+        init_repository(directory.path());
+        set_identity(directory.path());
+        set_config(directory.path(), "core", "autocrlf", "false");
         std::fs::write(directory.path().join("source.rs"), "fn captured() {}\n").unwrap();
-        git(directory.path(), &["add", "source.rs"]);
-        git(directory.path(), &["commit", "-m", "base"]);
-        let head = git(directory.path(), &["rev-parse", "HEAD"]);
+        let head = stage_and_commit(directory.path(), &["source.rs"], "base").to_string();
         (directory, head)
     })
     .await

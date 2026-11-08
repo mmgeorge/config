@@ -430,11 +430,7 @@ mod tests {
         let receiver = Mutex::new(receiver);
         Arc::get_mut(&mut engine).unwrap().compute = Arc::new(move |source| {
             notification.notify_one();
-            receiver
-                .lock()
-                .unwrap()
-                .recv()
-                .unwrap();
+            receiver.lock().unwrap().recv().unwrap();
             compute_hunks(source)
         });
         (engine, started, release)

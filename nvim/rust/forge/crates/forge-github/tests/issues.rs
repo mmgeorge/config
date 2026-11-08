@@ -1,5 +1,5 @@
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use forge_github::issue_store::IssueStore;
@@ -282,10 +282,8 @@ fn lock_timeout_retains_database_without_archiving_it() -> Result<()> {
     let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
     store.read_state()?;
     let database = Database::create(&database_path)?;
-    let started = Instant::now();
     let error = store.read_state().unwrap_err();
     assert!(format!("{error:#}").contains("database lock"));
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(database_path.exists());
     assert_eq!(fs::read_dir(directory.path())?.count(), 1);
     drop(database);

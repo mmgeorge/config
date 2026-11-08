@@ -55,6 +55,9 @@ pub(crate) struct RuntimeSnapshot {
 /// Read capability for a committed session projection. It cannot mutate session state.
 pub(crate) struct SessionAdmission {
     task_mutation: Mutex<()>,
+    /// Counts entries into the task mutation gate, including entries still waiting for it.
+    #[cfg(test)]
+    pub(crate) task_mutation_entry_count: std::sync::atomic::AtomicUsize,
     configuration_lane: Arc<tokio::sync::Mutex<()>>,
     configuration_uncertain: std::sync::atomic::AtomicBool,
     state: Mutex<PublishedAdmission>,
@@ -105,6 +108,9 @@ impl SessionAdmission {
         &self,
         commit: impl FnOnce() -> Result<Output>,
     ) -> Result<Output> {
+        #[cfg(test)]
+        self.task_mutation_entry_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Lock order is task mutation, SQLite transaction, then published admission state.
         let _guard = self
             .task_mutation
@@ -233,6 +239,8 @@ impl AdmissionRegistry {
         })?;
         let created = Arc::new(SessionAdmission {
             task_mutation: Mutex::new(()),
+            #[cfg(test)]
+            task_mutation_entry_count: std::sync::atomic::AtomicUsize::new(0),
             configuration_lane: Arc::new(tokio::sync::Mutex::new(())),
             configuration_uncertain: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(PublishedAdmission {

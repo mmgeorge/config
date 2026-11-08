@@ -297,7 +297,7 @@ fn build_candidates(bytes: &[u8], hash: gix::hash::Kind) -> Result<CandidateValu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::git;
+    use crate::test_support::init_repository;
 
     fn record(reference: &[u8], short: &[u8]) -> Vec<u8> {
         [
@@ -400,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn superseded_duplicate_and_invalidated_refreshes_cannot_replace_current_candidates() {
         let fixture = tempfile::tempdir().unwrap();
-        git(fixture.path(), &["init", "--quiet"]);
+        init_repository(fixture.path());
         let store = RepositoryStore::default();
         let repository = store
             .open(fixture.path().to_path_buf())

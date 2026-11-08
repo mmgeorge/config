@@ -8,19 +8,29 @@ use std::time::Duration;
 
 /// Logical goal controls commit before a provider that accepts only after its response.
 #[tokio::test]
-async fn live_goal_controls_commit_before_native_acceptance() -> Result<()> {
+async fn live_goal_complete_commits_before_native_acceptance() -> Result<()> {
+    live_goal_control_case("goal_complete", "summary", "All requested work is complete").await
+}
+
+/// A blocked goal control also commits before the provider accepts the submission.
+#[tokio::test]
+async fn live_goal_blocked_commits_before_native_acceptance() -> Result<()> {
+    live_goal_control_case(
+        "goal_blocked",
+        "reason",
+        "The required external input is unavailable",
+    )
+    .await
+}
+
+/// Run one goal control, each in its own test so it reports independently and stays within the
+/// per-test time limit.
+async fn live_goal_control_case(tool: &str, field: &str, message: &str) -> Result<()> {
     use crate::provider::mock_response::MockResponseCommand;
     use forge_provider_api::testing::{
         TestInputAcceptance, TestPromptScript, TestPromptStep, TestPromptTerminal,
     };
-    for (tool, field, message) in [
-        ("goal_complete", "summary", "All requested work is complete"),
-        (
-            "goal_blocked",
-            "reason",
-            "The required external input is unavailable",
-        ),
-    ] {
+    {
         let root = tempfile::tempdir()?;
         crate::checks::configure_fixture(root.path());
         let service = service();
@@ -59,7 +69,7 @@ async fn live_goal_controls_commit_before_native_acceptance() -> Result<()> {
             id: 2, method: "session.command.apply".into(),
             params: json!({"operation_id":"live-goal","action":"goal","text":"Finish the requested work"}),
         }, &sink).await?;
-        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        let settled = async {
             loop {
                 let store = SqliteStore::read_only(&controller.data_root)?;
                 if store
@@ -71,17 +81,9 @@ async fn live_goal_controls_commit_before_native_acceptance() -> Result<()> {
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await;
-        if let Err(error) = settled {
-            let trace = controller.trace.session_status(&session_id).path;
-            let retained = root.keep();
-            return Err(anyhow::Error::from(error)).context(format!(
-                "{tool} did not settle; fixture={}; trace={trace}",
-                retained.display()
-            ));
         }
-        settled??;
+        .await;
+        settled?;
         let store = SqliteStore::read_only(&controller.data_root)?;
         if tool == "goal_complete" {
             assert!(controller.task_controller.current()?.is_none());

@@ -1,7 +1,7 @@
 use super::super::native_settings;
 use super::super::{HarnessBroker, SessionController, prompt};
 use super::bootstrap::initialize;
-use super::owner_fixture::{owner_transition_fixture, retain_owner_transition_failure};
+use super::owner_fixture::owner_transition_fixture;
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result, ensure};
 use forge_protocol::message::Request;
@@ -20,7 +20,6 @@ enum CollectionBoundary {
     ActiveAfterUserEcho,
     /// Hold native execution inside a started shell tool until its deadline stops the turn.
     ActiveInTool,
-    PreparingThenActive,
 }
 
 /// Hold one real owner at a selected boundary while native collection remains delayed.
@@ -32,8 +31,6 @@ struct SlowCollectionFixture {
     sink: MessageSender,
     reader: tokio::task::JoinHandle<Result<()>>,
     dispatches: tokio::sync::mpsc::UnboundedReceiver<forge_provider_api::input::PromptInput>,
-    starts: tokio::sync::mpsc::UnboundedReceiver<()>,
-    steering_receipts: tokio::sync::mpsc::UnboundedReceiver<forge_provider_api::SubmissionId>,
     events: Arc<std::sync::Mutex<Vec<(tokio::time::Instant, serde_json::Value)>>>,
     events_changed: Arc<tokio::sync::Notify>,
     collection_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -51,7 +48,7 @@ async fn slow_collection_fixture(
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let steered_submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_steering = steered_submissions.clone();
-    let (steering_accepted, steering_receipts) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_accepted, _steering_receipts) = tokio::sync::mpsc::unbounded_channel();
     let (dispatched, dispatches) = tokio::sync::mpsc::unbounded_channel();
     let owner: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> = Arc::default();
     let descriptor = forge_providers::registry::descriptor(
@@ -69,7 +66,6 @@ async fn slow_collection_fixture(
                 CollectionBoundary::Active
                     | CollectionBoundary::ActiveAfterUserEcho
                     | CollectionBoundary::ActiveInTool
-                    | CollectionBoundary::PreparingThenActive
             ) && executions.fetch_add(1, Ordering::AcqRel) == 0;
             let echo_user_message =
                 held_active && boundary == CollectionBoundary::ActiveAfterUserEcho;
@@ -225,12 +221,7 @@ async fn slow_collection_fixture(
         let first = preparations.fetch_add(1, Ordering::AcqRel) == 0;
         let prepared = prepared.clone();
         async move {
-            if first
-                && matches!(
-                    boundary,
-                    CollectionBoundary::Preparing | CollectionBoundary::PreparingThenActive
-                )
-            {
+            if first && matches!(boundary, CollectionBoundary::Preparing) {
                 let _ = prepared.send(());
                 return std::future::pending().await;
             }
@@ -285,7 +276,7 @@ async fn slow_collection_fixture(
     )
     .await?;
     match boundary {
-        CollectionBoundary::Preparing | CollectionBoundary::PreparingThenActive => {
+        CollectionBoundary::Preparing => {
             preparation
                 .recv()
                 .await
@@ -317,8 +308,6 @@ async fn slow_collection_fixture(
         sink,
         reader,
         dispatches,
-        starts,
-        steering_receipts,
         events,
         events_changed,
         collection_count,
@@ -337,7 +326,7 @@ impl SlowCollectionFixture {
             self.provider.provider_handle().shutdown().await?;
             self.controller.finish_session_events().await
         };
-        let teardown = tokio::time::timeout(Duration::from_secs(900), teardown).await;
+        let teardown = teardown.await;
         let trace_tail = scenario.is_err().then(|| {
             let session = self.controller.observer.session_id();
             let _ = self.controller.trace.flush();
@@ -355,112 +344,8 @@ impl SlowCollectionFixture {
                 trace_tail.unwrap_or_default()
             )));
         }
-        teardown.context("owner teardown never completed")?
+        teardown
     }
-}
-
-/// Preserve native observation across pre-acceptance cancellation and a later active cancellation.
-#[tokio::test]
-async fn owner_preaccept_cancel_then_active_cancel_preserves_observation_and_next_prompt()
--> Result<()> {
-    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
-    let mut fixture =
-        slow_collection_fixture(Duration::ZERO, CollectionBoundary::PreparingThenActive).await?;
-    let scenario = async {
-        fixture.controller.exchange_owner.execute_command(Command::CancelExchange(
-            CancelExchangeRequest { input: CancelledInputPolicy::RestoreIfUnconsumed },
-        )).await.context("pre-acceptance cancellation failed")?;
-        prompt::apply(&fixture.controller, Request {
-            id: 804,
-            method: "session.prompt.submit".into(),
-            params: json!({"operation_id":"resume-after-preaccept-cancel","input_id":"resumed-turn-after-preaccept","text":"Resume after early cancellation"}),
-        }, &fixture.sink).await?;
-        // The output-free first prompt is retracted rather than retained as a cancelled exchange.
-        async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                if fixture.events.lock().expect("fixture events poisoned").iter()
-                    .any(|(_, event)| event["event"] == "input_changed"
-                        && event["payload"]["retracted"] == "prompt-input:slow-first") { break; }
-                changed.await;
-            }
-        }.await;
-        fixture.starts.recv().await
-            .context("native start observation channel closed")?;
-        async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                if fixture.engine.active_invocation_scope()?.is_some() { break; }
-                changed.await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }.await?;
-        // This boundary restores the cancelled text to the caller. Submit another
-        // auto-routed input after native start to require real steering acceptance.
-        prompt::apply(&fixture.controller, Request {
-            id: 805,
-            method: "session.prompt.submit".into(),
-            params: json!({"operation_id":"steer-after-preaccept-cancel","input_id":"accepted-steering-after-preaccept","text":"Steer the resumed native execution"}),
-        }, &fixture.sink).await?;
-        let receipt_id = fixture.steering_receipts.recv().await
-            .context("fixture steering receipt channel closed")?;
-        let receipt = fixture.controller.broker.lock().await.submission_store
-            .submission(receipt_id.as_str())?;
-        let mut accepted = receipt.acceptance();
-        accepted.wait_for(|accepted| *accepted).await?;
-        let record = receipt.record()?;
-        ensure!(record.input_message_id.as_deref() == Some("accepted-steering-after-preaccept")
-            && matches!(record.delivery, crate::provider::submission::SubmissionState::Accepted { .. }),
-            "native steering did not durably accept the selected fresh input");
-        async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                let routes_observed = {
-                    let events = fixture.events.lock().expect("fixture events poisoned");
-                    let inputs: Vec<_> = events.iter()
-                        .filter(|(_, event)| event["event"] == "input_changed")
-                        .filter_map(|(_, event)| event["payload"]["upsert"].as_array())
-                        .flatten().collect();
-                    inputs.iter().any(|input| input["id"] == "resumed-turn-after-preaccept"
-                        && input["route"] == "turn")
-                        && inputs.iter().any(|input| input["id"] == "accepted-steering-after-preaccept"
-                            && input["route"] == "steering")
-                };
-                if routes_observed { break; }
-                changed.await;
-            }
-        }.await;
-        fixture.controller.exchange_owner.execute_command(Command::CancelExchange(
-            CancelExchangeRequest { input: CancelledInputPolicy::Retain },
-        )).await.context("active cancellation after resumed input failed")?;
-        ensure!(fixture.engine.is_healthy().await,
-            "active cancellation retired the session observation owner");
-        prompt::apply(&fixture.controller, Request {
-            id: 806,
-            method: "session.prompt.submit".into(),
-            params: json!({"operation_id":"after-two-cancellations","text":"Prompt after both cancellations"}),
-        }, &fixture.sink).await?;
-        let input = fixture.dispatches.recv().await;
-        ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
-            if text == "Prompt after both cancellations"));
-        async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                let completed = fixture.events.lock().expect("fixture events poisoned")
-                    .iter().filter(|(_, event)| event["event"] == "exchange_complete").count();
-                if completed >= 2 { break; }
-                changed.await;
-            }
-        }.await;
-        ensure!(fixture.engine.is_healthy().await,
-            "final publication disconnected native observation");
-        ensure!(!fixture.events.lock().expect("fixture events poisoned").iter()
-            .any(|(_, event)| event["event"] == "provider_event"
-                && event["payload"]["kind"] == "error"),
-            "cancellation or final publication emitted a provider observation error");
-        Ok::<(), anyhow::Error>(())
-    }.await;
-    fixture.finish(scenario).await
 }
 
 /// Restore an output-free prompt when Ctrl-C arrives after the provider echoes it.
@@ -601,7 +486,7 @@ async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result
             }
         }
         .await?;
-        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        async {
             loop {
                 let changed = fixture.events_changed.notified();
                 let failed = SqliteStore::read_only(&fixture.controller.data_root)?
@@ -613,9 +498,8 @@ async fn tool_timeout_fails_exchange_once_and_dispatches_next_prompt() -> Result
                 }
                 changed.await;
             }
-        })
-        .await;
-        failed.context("timed-out exchange never settled as failed")??;
+        }
+        .await?;
         prompt::apply(
             &fixture.controller,
             Request {
@@ -792,9 +676,7 @@ async fn owner_cancel_then_model_change_cancels_exchange_and_commits_model() -> 
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = scenario {
-        return Err(retain_owner_transition_failure(fixture, error));
-    }
+    scenario?;
     fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())

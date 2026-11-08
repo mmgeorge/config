@@ -109,11 +109,7 @@ mod tests {
     fn saved_sources_use_immutable_checkpoint_objects_and_reject_foreign_provenance() -> Result<()>
     {
         let workspace = tempfile::tempdir()?;
-        let initialized = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(workspace.path())
-            .status()?;
-        assert!(initialized.success());
+        forge_git::test_support::init_repository(workspace.path());
         let data = tempfile::tempdir()?;
         let mut store = SqliteStore::open(data.path())?;
         let connection = rusqlite::Connection::open(crate::storage::state::database(data.path()))?;

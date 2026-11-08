@@ -285,13 +285,11 @@ mod tests {
         let mut connection = CodexConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            connection.failure.wait_for(|failure| failure.is_some()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        connection
+            .failure
+            .wait_for(|failure| failure.is_some())
+            .await
+            .unwrap();
         for sequence in 0..retained {
             assert_eq!(
                 connection.receive().await.unwrap().value.unwrap(),

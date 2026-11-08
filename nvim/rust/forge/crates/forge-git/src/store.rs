@@ -205,19 +205,11 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(["init", "--quiet"])
-                .output()
-                .unwrap();
-            assert!(output.status.success());
+            crate::test_support::init_repository(root.path());
             let store = RepositoryStore::new(1, 1).unwrap();
             let (release, release_receiver) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
-                release_receiver
-                    .recv()
-                    .unwrap();
+                release_receiver.recv().unwrap();
             });
             let mut opening = Box::pin(store.open(root.path().to_owned()));
             std::future::poll_fn(|context| {
