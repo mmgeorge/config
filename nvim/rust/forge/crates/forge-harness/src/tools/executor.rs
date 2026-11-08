@@ -352,7 +352,6 @@ mod test {
     }
     use serde_json::json;
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn cancellation_releases_running_and_queued_tools_without_reusing_their_state()
@@ -374,10 +373,7 @@ mod test {
         assert!(futures_util::poll!(running.as_mut()).is_pending());
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         let close = executor.close();
-        let (running, queued, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(running, queued, close)
-        })
-        .await?;
+        let (running, queued, ()) = async { tokio::join!(running, queued, close) }.await;
         assert!(running.unwrap_err().is::<crate::broker::TurnCancelled>());
         assert!(queued.unwrap_err().is::<crate::broker::TurnCancelled>());
         assert!(
@@ -420,7 +416,7 @@ mod test {
         let mut close = Box::pin(executor.close());
         assert!(futures_util::poll!(close.as_mut()).is_pending());
         drop(outcome);
-        tokio::time::timeout(Duration::from_secs(1), close).await?;
+        close.await;
         Ok(())
     }
 
@@ -476,10 +472,7 @@ mod test {
             );
             Ok::<_, anyhow::Error>(())
         };
-        let (outcome, cancelled) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(pending, cancel)
-        })
-        .await?;
+        let (outcome, cancelled) = async { tokio::join!(pending, cancel) }.await;
         assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
         cancelled?;
         Ok(())

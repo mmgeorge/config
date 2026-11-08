@@ -737,7 +737,6 @@ mod tests {
     use super::*;
     use crate::provider::test_support::EventFixtureProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     struct Trace;
     impl api::trace::ProviderTrace for Trace {
@@ -891,12 +890,12 @@ mod tests {
             if !drop_waiter {
                 assert!(waiter.await?.is_err());
             }
-            tokio::time::timeout(Duration::from_secs(3), async {
+            async {
                 while closed.load(Ordering::Acquire) == 0 {
                     tokio::task::yield_now().await;
                 }
-            })
-            .await?;
+            }
+            .await;
             jobs.shutdown().await?;
             assert_eq!(validated.load(Ordering::Acquire), 1);
             assert_eq!(closed.load(Ordering::Acquire), 1);

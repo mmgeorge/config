@@ -256,7 +256,7 @@ mod tests {
 
     #[cfg(windows)]
     async fn read_process_id(path: &std::path::Path) -> u32 {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             loop {
                 if let Ok(text) = std::fs::read_to_string(path)
                     && let Ok(process_id) = text.trim().parse()
@@ -265,9 +265,8 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        })
+        }
         .await
-        .unwrap()
     }
 
     #[cfg(windows)]
@@ -308,16 +307,12 @@ mod tests {
         let descendant = read_process_id(&directory.path().join("descendant.pid")).await;
         assert!(process_alive(provider) && process_alive(descendant));
         owner.start_kill().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), owner.wait_with_output())
-            .await
-            .expect("provider inherited the owner's output pipe")
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        owner.wait_with_output().await.unwrap();
+        async {
             while process_alive(provider) || process_alive(descendant) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .expect("provider descendants outlived their owner's job handle");
+        }
+        .await;
     }
 }

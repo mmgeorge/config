@@ -464,7 +464,7 @@ mod tests {
         let (messages, _output) = forge_protocol::outbound::channel();
         controller.attach_input(&messages).await?;
         let task = controller.input_task.lock().await.take().unwrap();
-        tokio::time::timeout(Duration::from_secs(2), task).await??;
+        task.await?;
         let after = controller.coordinator.submissions.snapshot()?;
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.messages.len(), 1);

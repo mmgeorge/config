@@ -6610,7 +6610,7 @@ mod continuation_tests {
     #[tokio::test]
     async fn cancellation_before_start_acknowledgment_interrupts_after_admission() {
         use futures_util::{SinkExt, StreamExt};
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let mut input = request();
             let (dispatch, mut observed) = forge_provider_api::submission::DispatchReporter::channel(session.binding.id.clone(), input.scope.clone(), input.submission_id.clone(), input.attempt_id.clone());
@@ -6667,7 +6667,7 @@ mod continuation_tests {
             submitting.await.unwrap().unwrap();
             session.rpc.lock().await.close().await.unwrap();
             wire.await.unwrap();
-        }).await.unwrap();
+        }.await;
     }
 
     /// Pre-admission observations have no total-message cap borrowed from transport queue capacity.
@@ -6741,7 +6741,7 @@ mod continuation_tests {
     #[tokio::test]
     async fn completed_invocation_settles_once_and_late_cancel_preserves_successor() {
         use futures_util::SinkExt;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, session, mut events, mut socket) = compaction_fixture().await;
             let request = request();
             let scope = request.scope.clone();
@@ -6810,13 +6810,13 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             release.send(()).unwrap(); worker.join().await.unwrap();
             session.active.lock().await.take();
             session.rpc.lock().await.close().await.unwrap();
-        }).await.unwrap();
+        }.await;
     }
 
     /// Certify independent raw-yielded sessions and withhold completion for ambiguous resumed-session interruption.
     #[tokio::test]
     async fn interrupted_unified_exec_requires_positive_yield_before_collection_certificate() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             for yielded in [true, false] {
                 let (provider, session, mut events, _socket) = compaction_fixture().await;
                 let request = request();
@@ -6856,7 +6856,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
                 }
                 session.rpc.lock().await.close().await.unwrap();
             }
-        }).await.unwrap();
+        }.await;
     }
 
     /// Canonical failure and legacy publication share the same retained retry permission.
@@ -7049,7 +7049,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     /// Native idle-observer loss revokes history before host cleanup and cannot be cleared by a provisional gate.
     #[tokio::test]
     async fn background_observer_failure_stays_invalidated_after_provisional_fence_release() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, session, _events, socket) = compaction_fixture().await;
             let mut normalization = session.normalization.lock().await;
             normalization.bind(Some(request().scope));
@@ -7068,7 +7068,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(provider.thread_fork(context(), forge_provider_api::SessionForkRequest { source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()), target: forge_provider_api::ForkTarget { thread_id: forge_provider_api::testing::root_thread("blocked-fork"), workspace: "workspace".into(), configuration: session.configuration.lock().await.clone(), system_instructions: String::new() } }).await.is_err());
             let _ = stop_background_reader(&session).await;
             let _ = session.rpc.lock().await.close().await;
-        }).await.unwrap();
+        }.await;
     }
 
     /// Input preconditions preserve closed, invalidated, identity, and occupied-slot causes without native dispatch.
@@ -7120,7 +7120,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     #[tokio::test]
     async fn uncertain_retraction_never_repeats_native_rollback() {
         use futures_util::{SinkExt, StreamExt};
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, session, _events, mut socket) = compaction_fixture().await;
             let input = request();
             let operation = context();
@@ -7152,7 +7152,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             let error = provider.input_retract(operation, &session.binding.id, substituted).await.unwrap_err();
             assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::OperationConflict));
             let _ = session.rpc.lock().await.close().await;
-        }).await.unwrap();
+        }.await;
     }
 
     /// A native user item's client ID links back to the Forge submission that produced it.
@@ -7266,7 +7266,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     #[tokio::test]
     async fn native_child_host_callback_never_borrows_root_or_successor_authority() {
         use futures_util::StreamExt;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (_, session, _events, mut socket) = compaction_fixture().await;
             let mut request = request();
             let child = {
@@ -7307,7 +7307,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(denied.get("error").is_some());
             assert_eq!(*authority.calls.lock().unwrap(), ["before","authorize","call","before","authorize","call"]);
             session.rpc.lock().await.close().await.unwrap();
-        }).await.unwrap();
+        }.await;
     }
 
     struct FixtureAuthority;

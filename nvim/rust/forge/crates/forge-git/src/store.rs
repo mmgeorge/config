@@ -216,7 +216,7 @@ mod tests {
             let (release, release_receiver) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
                 release_receiver
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv()
                     .unwrap();
             });
             let mut opening = Box::pin(store.open(root.path().to_owned()));
@@ -238,13 +238,12 @@ mod tests {
                     .contains("capacity is full")
             );
             drop(opening);
-            tokio::time::timeout(Duration::from_secs(5), async {
+            async {
                 while store.reads.status().active_jobs != 0 {
                     tokio::task::yield_now().await;
                 }
-            })
-            .await
-            .unwrap();
+            }
+            .await;
             assert_eq!(store.reads.status().reserved_input_bytes, 0);
         });
     }

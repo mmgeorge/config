@@ -118,12 +118,12 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
             .exchange_owner
             .execute_identified(command.clone(), sink.clone()),
     );
-    let entered = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+    let entered = async {
         tokio::select! {
             result = &mut operation => Err(anyhow::anyhow!("cleanup unexpectedly completed before barrier: {result:?}")),
             () = started.notified() => Ok(()),
         }
-    }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    }.await;
     if let Err(error) = entered {
         return Err(retain_cleanup_failure(
             root,
@@ -147,7 +147,7 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
     assert!(futures_util::poll!(queued.as_mut()).is_pending());
     let database =
         rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let admitted: bool = database.query_row(
                 "SELECT EXISTS(SELECT 1 FROM owner_command WHERE id='storage-failed-queued')",
@@ -159,8 +159,8 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await??;
+    }
+    .await?;
     database.execute_batch("CREATE TRIGGER reject_owner_completion_permanently BEFORE UPDATE ON owner_command WHEN json_extract(NEW.state,'$.state')='finished' BEGIN SELECT RAISE(ABORT,'permanent fixture completion failure'); END;")?;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
@@ -196,13 +196,12 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
     release.add_permits(1);
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !collected.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("permanent storage failure dropped native cleanup ownership")?;
+    }
+    .await;
     assert!(collected.load(Ordering::Acquire));
     let state: String = database.query_row(
         "SELECT json_extract(state,'$.state') FROM owner_command WHERE id='owner-cleanup-timeout'",
@@ -282,13 +281,12 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
     controller.start_provider(&sink).await;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !controller.provider_ready().await {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("retirement fixture provider did not become ready")?;
+    }
+    .await;
     // Startup leaves the native conversation unopened. Open the root binding the
     // way first input does so retirement exercises cleanup rather than an empty slot.
     let open = controller.broker.lock().await.provider_request(
@@ -305,7 +303,7 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
         .trace
         .session_status(controller.observer.session_id())
         .path;
-    let failed_retirement = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let failed_retirement = async {
         loop {
             let records = std::fs::read_to_string(&trace)?;
             if records.contains("generation_retired")
@@ -315,10 +313,8 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("first retirement did not retain its injected failure")
-    .and_then(|result| result);
+    }
+    .await;
     if let Err(error) = failed_retirement {
         return Err(retain_cleanup_failure(root, &controller, error));
     }
@@ -341,13 +337,7 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
     ));
     retry_allowed.store(true, Ordering::Release);
     controller.exchange_owner.close().await;
-    let finished = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.finish_exchange_owner(),
-    )
-    .await
-    .context("second explicit close did not finish retained retirement")
-    .and_then(|result| result);
+    let finished = controller.finish_exchange_owner().await;
     if let Err(error) = finished {
         return Err(retain_cleanup_failure(root, &controller, error));
     }

@@ -329,7 +329,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             }
             Ok::<_, anyhow::Error>(())
         };
-        let (result, observed) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        let (result, observed) = async {
             tokio::join!(
                 broker.run_interaction(
                     "Visible before provider preparation".into(),
@@ -340,8 +340,8 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
                 ),
                 observe
             )
-        })
-        .await?;
+        }
+        .await;
         observed?;
         match outcome {
             "complete" => {

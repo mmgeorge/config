@@ -1019,9 +1019,7 @@ mod tests {
             (initial, false),
         ] {
             native.publish_capabilities(&owner, reported).await?;
-            let event = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv())
-                .await??
-                .context("capability stream ended")?;
+            let event = stream.recv().await?.context("capability stream ended")?;
             if let Some((binding, sequence)) = &event.native {
                 broker.provider.event_consumed(binding, *sequence).await?;
             }
@@ -1156,12 +1154,11 @@ mod tests {
             }
             broker.session.resolved_model = successor.then(|| "successor-confirmed".into());
             if matches!(boundary, Boundary::RetiredBinding) {
-                tokio::time::timeout(std::time::Duration::from_secs(3), fixture.close()).await??;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    broker.provider.session_close_owner(&address.scope.owner()),
-                )
-                .await??;
+                fixture.close().await?;
+                broker
+                    .provider
+                    .session_close_owner(&address.scope.owner())
+                    .await?;
             }
             let updates = broker.observe_session_event(
                 crate::provider::session_execution::OwnerObservation::Event(
@@ -1190,7 +1187,7 @@ mod tests {
                         == Some("runtime_resolved")),
                 matches!(boundary, Boundary::Current)
             );
-            tokio::time::timeout(std::time::Duration::from_secs(3), fixture.close()).await??;
+            fixture.close().await?;
         }
         Ok(())
     }

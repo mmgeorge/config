@@ -2057,10 +2057,7 @@ mod test {
                 .authorize(ApprovalMode::Ask, permission, waiting_address, Some(&sink))
                 .await
         });
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
-            .await?
-            .unwrap()
-            .unwrap();
+        let event = stream.recv().await.unwrap().unwrap();
         let approval = approval(event);
         assert_eq!(approval.item_list.len(), 3);
         let answers = approval
@@ -2329,13 +2326,10 @@ mod test {
                         shell: Some(crate::permissions::shell::CommandShell::PowerShell),
                     }],
                 };
-                let failure = tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    coordinator.authorize(mode, request, None, Some(&sink)),
-                )
-                .await
-                .unwrap()
-                .unwrap_err();
+                let failure = coordinator
+                    .authorize(mode, request, None, Some(&sink))
+                    .await
+                    .unwrap_err();
                 assert!(
                     failure
                         .downcast_ref::<crate::permissions::matcher::CommandAnalysisError>()
@@ -2549,11 +2543,7 @@ mod test {
             .await
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowOnce);
-        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), event_stream.recv())
-            .await
-            .expect("manual resolution must reach the requesting execution")
-            .unwrap()
-            .unwrap();
+        let resolved = event_stream.recv().await.unwrap().unwrap();
         let OwnerObservation::Event(HarnessEvent::Host {
             event:
                 HostEvent::PermissionApproval {

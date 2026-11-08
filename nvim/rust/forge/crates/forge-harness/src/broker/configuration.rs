@@ -2399,7 +2399,7 @@ mod owned_tests {
                             }
                         };
                     let mut retained = Vec::new();
-                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    async {
                         loop {
                             retained.extend(broker.observer.session_events().drain()?);
                             if [&first_identity, &second_identity].iter().all(|expected| {
@@ -2410,9 +2410,8 @@ mod owned_tests {
                             tokio::task::yield_now().await;
                         }
                         Ok::<_, anyhow::Error>(())
-                    })
-                    .await
-                    .context("configured identity prefix was not retained")??;
+                    }
+                    .await?;
                     let prior_identity = retained
                         .iter()
                         .find(|event| is_identity(event, &first_identity))
@@ -2895,7 +2894,7 @@ mod owned_tests {
             .await?;
         // The open's host manifest precedes three native metadata events on the old stream.
         let mut queued = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        async {
             while queued.len() < 4 {
                 let observation = old_stream
                     .recv()
@@ -2907,15 +2906,9 @@ mod owned_tests {
                 queued.push(observation.event);
             }
             Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("fixture metadata did not reach its original host stream")??;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            broker.provider.session_close_owner(&owner),
-        )
-        .await
-        .context("old binding collection did not settle its consumed prefix")??;
+        }
+        .await?;
+        broker.provider.session_close_owner(&owner).await?;
         let mut current_stream = broker.provider.session_events(owner.clone()).await?;
         let current_history = broker
             .provider
@@ -2942,10 +2935,10 @@ mod owned_tests {
             })
             .await?;
         for _ in 0..3 {
-            let current =
-                tokio::time::timeout(std::time::Duration::from_secs(3), current_stream.recv())
-                    .await??
-                    .context("replacement stream ended")?;
+            let current = current_stream
+                .recv()
+                .await?
+                .context("replacement stream ended")?;
             if let Some((binding, sequence)) = &current.native {
                 broker.provider.event_consumed(binding, *sequence).await?;
             }
@@ -2970,12 +2963,7 @@ mod owned_tests {
         assert_eq!(broker.session.context_usage, context);
         assert_eq!(broker.session.provider_session_id, history);
         assert_eq!(serde_json::to_value(&broker.latest_manifest)?, manifest);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            broker.provider.shutdown(),
-        )
-        .await
-        .context("replacement binding collection did not settle its consumed prefix")??;
+        broker.provider.shutdown().await?;
         Ok(())
     }
 }

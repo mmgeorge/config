@@ -276,7 +276,7 @@ fn cancelled_blocking_restore_keeps_admission_until_its_worker_exits() {
         let blocker = tokio::task::spawn_blocking(move || {
             started.send(()).unwrap();
             release_receiver
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv()
                 .unwrap();
         });
         started_receiver.await.unwrap();
@@ -291,13 +291,12 @@ fn cancelled_blocking_restore_keeps_admission_until_its_worker_exits() {
         assert!(repositories.writes.usage().input_bytes > 0);
         release.send(()).unwrap();
         blocker.await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        async {
             while repositories.writes.usage().operations != 0 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         assert_eq!(
             fs::read_to_string(repository.path().join("tracked.txt")).unwrap(),
             "after\n"

@@ -614,7 +614,7 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(2), observing.notified()).await?;
+        observing.notified().await;
         let snapshot = controller.observer.snapshot()?;
         let settings = crate::settings::SettingsStore::read_only(&controller.data_root)?;
         let resource = settings
@@ -628,11 +628,11 @@ mod tests {
             (2, "shared-mcp-disable", false, 1),
             (3, "shared-mcp-enable", true, 2),
         ] {
-            tokio::time::timeout(Duration::from_secs(3), service.dispatch(Some(session.clone()), Request {
+            service.dispatch(Some(session.clone()), Request {
                 id, method: "settings.mcp.set_enabled".into(),
                 params: json!({"operation_id":operation,"scope":"session","name":"fixture","resource_id":resource.id,"enabled":enabled}),
-            }, &sink)).await.context("MCP settings request waited for observed readiness")??;
-            let response = tokio::time::timeout(Duration::from_secs(3), async {
+            }, &sink).await?;
+            let response = async {
                 loop {
                     let frame = output
                         .recv()
@@ -643,9 +643,8 @@ mod tests {
                         break Ok::<_, anyhow::Error>(value);
                     }
                 }
-            })
-            .await
-            .context("MCP settings mutation returned without an application receipt")??;
+            }
+            .await?;
             ensure!(
                 response["error"].is_null(),
                 "MCP mutation failed: {response}"

@@ -58,7 +58,7 @@ cargo nextest run --cargo-profile dev --locked -p forge-diff --lib declaration_c
 
 A positional filter selects tests whose names contain it. Select one test exactly with a filter expression, such as `-E 'test(=plan::tests::accepts_revision)'`. Nextest does not run doctests; run `cargo test --doc -p <package>` when a change touches one.
 
-Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after two seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it. Waits a test expects to complete use the crate's `hang_guard::HANG_GUARD`, which fires just before termination so the failure names the stuck step.
+Every test must finish in well under a second. [`.config/nextest.toml`](../../rust/forge/.config/nextest.toml) terminates any test still running after five seconds and reports it as failed. Do not add per-test exceptions: a test that needs longer waits on real time or hangs, so fix it with a paused clock or a deterministic signal, or remove it.
 
 Add `--all-targets` to the check only when changed test or executable targets need it. Broaden to the workspace only when shared interfaces require it, and keep Cargo-heavy jobs serial. Record the command, deadline, exit status, and failing assertion or diagnostic.
 

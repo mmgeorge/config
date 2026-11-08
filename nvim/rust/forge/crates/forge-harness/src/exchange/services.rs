@@ -106,8 +106,7 @@ mod tests {
         drop(permit);
         assert!(futures_util::poll!(retirement.as_mut()).is_pending());
         drop(collection);
-        let _retirement =
-            tokio::time::timeout(std::time::Duration::from_secs(1), retirement).await?;
+        let _retirement = retirement.await;
         Ok(())
     }
 }

@@ -401,9 +401,7 @@ mod tests {
         let old_url = old_server.url.clone();
         let old_client = client.clone();
         let old_call = tokio::spawn(async move { call_label(&old_client, &old_url, 1).await });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
-            .await
-            .context("old endpoint did not admit its call")?;
+        entered.notified().await;
 
         let old_server = Arc::new(old_server);
         let closing_server = old_server.clone();

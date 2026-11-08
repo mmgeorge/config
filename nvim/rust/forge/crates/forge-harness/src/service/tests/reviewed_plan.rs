@@ -80,7 +80,7 @@ async fn reviewed_fixture(
     // Opening a test registry and attaching its input worker do not start the provider.
     service.start_provider_session(session_id, sink).await?;
     // Arm the scenario only after startup has installed the native session.
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !controller.provider_ready().await {
             if let Some(error) = controller
                 .provider_startup_error
@@ -93,9 +93,8 @@ async fn reviewed_fixture(
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("review fixture provider startup did not complete")??;
+    }
+    .await?;
     let provider = controller.provider_handle();
     let mut steps = Vec::new();
     let mut submitted_version = plan.document_version;

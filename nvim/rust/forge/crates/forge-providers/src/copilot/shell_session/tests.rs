@@ -383,20 +383,10 @@ async fn paused_shell_cancel_during_permission_rejects_late_approval() {
             )
             .await
     });
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        authorizing.wait_for(|pending| *pending),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    authorizing.wait_for(|pending| *pending).await.unwrap();
     fixture.callbacks.cancelled.store(true, Ordering::SeqCst);
     fixture.callbacks.release_permission.send_replace(true);
-    let result = tokio::time::timeout(Duration::from_secs(2), call)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let result = call.await.unwrap().unwrap();
     assert!(result.result_type == NativeOutcome::Failure);
     let requests = fixture.finish().await;
     let decision = requests

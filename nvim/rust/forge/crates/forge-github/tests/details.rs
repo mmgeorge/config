@@ -124,7 +124,7 @@ async fn abandoned_caller_retains_detail_and_deletion_ownership_through_persiste
     let remote = Arc::new(DetailRemote::default());
     let service = GithubService::default();
     let caller = fetch(service.clone(), remote.clone(), store.clone());
-    tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
+    remote.started.notified().await;
     assert!(!store.read_detail(7)?.found);
     assert!(RepositoryLease::deletion(&root.path().join("repo")).is_err());
     caller.abort();
@@ -136,7 +136,7 @@ async fn abandoned_caller_retains_detail_and_deletion_ownership_through_persiste
             .is_err()
     );
     remote.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    async {
         loop {
             match RepositoryLease::deletion(&root.path().join("repo")) {
                 Ok(lease) => {
@@ -148,8 +148,8 @@ async fn abandoned_caller_retains_detail_and_deletion_ownership_through_persiste
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await??;
+    }
+    .await?;
     assert_eq!(store.read_detail(7)?.item.unwrap()["body"], "Remote body");
     let shutdown = service.shutdown(Duration::from_secs(1)).await;
     assert_eq!(shutdown.unfinished_jobs, 0);
@@ -165,7 +165,7 @@ async fn close_cancels_remote_detail_without_creating_a_cached_success() -> Resu
     let remote = Arc::new(DetailRemote::default());
     let service = GithubService::default();
     let caller = fetch(service.clone(), remote.clone(), store.clone());
-    tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
+    remote.started.notified().await;
     let shutdown = service.shutdown(Duration::from_secs(1)).await;
     assert_eq!(shutdown.unfinished_jobs, 0);
     assert!(caller.await?.unwrap_err().to_string().contains("closed"));
@@ -213,23 +213,17 @@ async fn detail_admission_keeps_blocking_storage_capacity_available() -> Result<
     for _ in 0..16 {
         let remote = Arc::new(DetailRemote::default());
         caller.push(fetch(service.clone(), remote.clone(), store.clone()));
-        tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
+        remote.started.notified().await;
     }
     assert!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            service.fetch_detail(Arc::new(DetailRemote::default()), store.clone(), request()),
-        )
-        .await?
-        .unwrap_err()
-        .to_string()
-        .contains("full")
+        service
+            .fetch_detail(Arc::new(DetailRemote::default()), store.clone(), request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("full")
     );
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        service.execute(store, IssueOperation::State {}),
-    )
-    .await??;
+    service.execute(store, IssueOperation::State {}).await?;
     assert_eq!(
         service
             .shutdown(Duration::from_secs(1))

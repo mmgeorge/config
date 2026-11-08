@@ -334,7 +334,7 @@ async fn remote_wait_and_abandoned_caller_retain_deletion_and_sync_exclusion() -
         let remote = remote.clone();
         tokio::spawn(async move { service.sync(remote, store, request, None).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), remote.started.notified()).await?;
+    remote.started.notified().await;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     let directory = root.path().join("repo");
@@ -505,7 +505,7 @@ async fn remote_job_limit_leaves_storage_capacity_and_rejects_excess_sync() -> R
         caller.push(tokio::spawn(async move {
             service.sync(task_remote, store, request, None).await
         }));
-        tokio::time::timeout(Duration::from_secs(2), remote.started.notified()).await?;
+        remote.started.notified().await;
     }
     assert!(
         service

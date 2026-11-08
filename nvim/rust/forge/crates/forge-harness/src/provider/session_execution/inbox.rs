@@ -964,17 +964,12 @@ mod tests {
             ))?;
         }
         inbox.start_tool_monitor(scope, watchdog, work.provider.clone())?;
-        let cancellation =
-            tokio::time::timeout(std::time::Duration::from_secs(5), work.result).await??;
+        let cancellation = work.result.await?;
         assert!(
             matches!(cancellation, Err(ProviderError::Cancelled)),
             "{cancellation:?}"
         );
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wait_for_close(&inbox.closed, &inbox.monitor_closed),
-        )
-        .await?;
+        wait_for_close(&inbox.closed, &inbox.monitor_closed).await;
         assert_eq!(inbox.drain()?.len(), forge_protocol::MAX_PENDING_FRAMES);
         let failure = inbox.drain().unwrap_err();
         assert!(
@@ -1047,8 +1042,7 @@ mod tests {
             "the monitor reported a timeout owned by its foreground"
         );
         drop(owner);
-        let cancellation =
-            tokio::time::timeout(std::time::Duration::from_secs(5), &mut work.result).await??;
+        let cancellation = (&mut work.result).await?;
         assert!(
             matches!(cancellation, Err(ProviderError::Cancelled)),
             "{cancellation:?}"

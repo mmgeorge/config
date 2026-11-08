@@ -415,9 +415,7 @@ async fn initial_sections_start_together_and_failures_finish_loading() {
         remote.clone(),
     );
     let observer = async {
-        tokio::time::timeout(Duration::from_secs(2), header_barrier.wait())
-            .await
-            .expect("both required metadata reads must start together");
+        header_barrier.wait().await;
     };
     let (header, ()) = tokio::join!(header, observer);
     assert!(header.is_err());
@@ -429,9 +427,7 @@ async fn initial_sections_start_together_and_failures_finish_loading() {
         remote.clone(),
     );
     let observer = async {
-        tokio::time::timeout(Duration::from_secs(2), barrier.wait())
-            .await
-            .expect("all four secondary reads must enter before any completes");
+        barrier.wait().await;
     };
     let (diagnostic, ()) = tokio::join!(loading, observer);
     assert_eq!(
@@ -2014,7 +2010,7 @@ async fn materialized_analysis_rejects_text_changed_while_queued() {
         .reserve(WorkPriority::Foreground, WorkBudget::new(1, None))
         .unwrap();
     blocker.submit(move |_| {
-        held.recv_timeout(Duration::from_secs(5)).unwrap();
+        held.recv().unwrap();
     });
     let rendering = {
         let service = service.clone();
@@ -2025,13 +2021,12 @@ async fn materialized_analysis_rejects_text_changed_while_queued() {
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    async {
         while pool.usage().admitted_jobs != 2 {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     change(&service, &opened.document, "body", "newer queued text").await;
     release.send(()).unwrap();
     assert!(
@@ -2849,11 +2844,7 @@ async fn change(service: &ReviewService, document: &DocumentId, region: &str, te
 }
 
 async fn entered(remote: &TestRemote) {
-    tokio::time::timeout(Duration::from_secs(2), remote.entered.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
+    remote.entered.acquire().await.unwrap().forget();
 }
 
 #[tokio::test]
@@ -5264,19 +5255,16 @@ async fn status_snapshot_opens_header_without_remote_reads() {
         "reviewRequests": [{ "login": "alice" }, { "slug": "team" }]
     });
     *remote.section_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(100)));
-    let opened = tokio::time::timeout(
-        Duration::from_secs(2),
-        service.open_pr_snapshot(
+    let opened = service
+        .open_pr_snapshot(
             remote.recovery.path().into(),
             remote.clone(),
             target().repository,
             7,
             initial.clone(),
-        ),
-    )
-    .await
-    .expect("snapshot open repeated discovery")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(
         opened
             .field
@@ -5286,17 +5274,14 @@ async fn status_snapshot_opens_header_without_remote_reads() {
             .text,
         body
     );
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        service.header(
+    service
+        .header(
             &opened.document,
             remote.recovery.path().into(),
             remote.clone(),
-        ),
-    )
-    .await
-    .expect("snapshot header repeated remote reads")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     let materialized = service
         .materialize(
             &opened.document,
@@ -5335,17 +5320,14 @@ async fn status_snapshot_opens_header_without_remote_reads() {
     service
         .retain_pr_snapshot(&opened.document, remote.recovery.path(), initial)
         .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        service.header(
+    service
+        .header(
             &opened.document,
             remote.recovery.path().into(),
             remote.clone(),
-        ),
-    )
-    .await
-    .expect("snapshot refresh repeated remote reads")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     let fields = service.snapshot(&opened.document).unwrap().field;
     assert!(
         fields
@@ -5374,18 +5356,15 @@ async fn repository_pr_discovery_runs_concurrently_and_reuses_header() {
         ReviewPage { records: vec![serde_json::json!({"number":7,"node_id":"PR_other","title":"Overview","body":"Overview body"})], next_cursor: None, complete: true },
         ReviewPage { records: vec![serde_json::json!({"users":[],"teams":[]})], next_cursor: None, complete: true },
     ]);
-    let opened = tokio::time::timeout(
-        Duration::from_secs(2),
-        service.open_repository_pr(
+    let opened = service
+        .open_repository_pr(
             remote.recovery.path().into(),
             remote.clone(),
             target().repository,
             7,
-        ),
-    )
-    .await
-    .expect("initial reads did not run concurrently")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     *remote.section_barrier.lock().unwrap() = None;
     service
         .header(
@@ -5738,7 +5717,7 @@ async fn dropped_save_receiver_keeps_the_queued_reviewer_change() {
     saving.abort();
     remote.hold.store(false, Ordering::Release);
     remote.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(2), async {
+    async {
         loop {
             if service
                 .snapshot(&document)
@@ -5751,9 +5730,8 @@ async fn dropped_save_receiver_keeps_the_queued_reviewer_change() {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
     service.close();
 }

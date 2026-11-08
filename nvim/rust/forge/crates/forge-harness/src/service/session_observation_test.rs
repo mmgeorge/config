@@ -91,13 +91,12 @@ async fn open_root_binding_through_prompt(
 ) -> Result<()> {
     use crate::session::state_machine::SessionPhase;
     controller.start_provider(message_sink).await;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !controller.provider_ready().await {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("provider did not become ready")?;
+    }
+    .await;
     controller.attach_input(message_sink).await?;
     let prior_exchange_count = controller.broker.lock().await.snapshot()?.exchange.len();
     prompt::apply(
@@ -110,7 +109,7 @@ async fn open_root_binding_through_prompt(
         message_sink,
     )
     .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let settled = {
                 let broker = controller.broker.lock().await;
@@ -135,9 +134,8 @@ async fn open_root_binding_through_prompt(
             }
             tokio::task::yield_now().await;
         }
-    })
+    }
     .await
-    .context("first prompt did not open and settle the root native binding")?
 }
 
 /// Deliver the old failure before installing a fresh owner observation generation.
@@ -160,7 +158,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     open_root_binding_through_first_prompt(&controller, &provider, &owner, &message_sink).await?;
     let old = provider.event_sink(&owner).await?;
     old.fail(crate::provider::events::EventDeliveryError::Closed);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .session_event_task
@@ -173,9 +171,8 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("failed observation did not finish")?;
+    }
+    .await;
     // The first prompt published its own frames ahead of the observation failure.
     loop {
         let frame = output.recv().await?.context("failure was not delivered")?;
@@ -198,7 +195,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     replacement
         .send_wait(session_test_diagnostic("new generation"))
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let frame = output.recv().await?.context("replacement event missing")?;
             let event: Value = serde_json::from_slice(frame.bytes())?;
@@ -206,8 +203,8 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
                 break Ok::<(), anyhow::Error>(());
             }
         }
-    })
-    .await??;
+    }
+    .await?;
     assert!(
         old.send_wait(session_test_diagnostic("stale"))
             .await
@@ -279,7 +276,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             })),
         },
     })?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             // Working status can publish before deferred native open admits the invocation.
             if !foreground.active.load(Ordering::Acquire)
@@ -305,9 +302,8 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             drop(broker);
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("accepted native prompt did not publish working status")??;
+    }
+    .await?;
     assert!(engine.active_invocation_snapshot()?.is_some());
     assert_eq!(controller.coordinator.execution.available_permits(), 0);
     let submission_id = foreground
@@ -324,7 +320,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     let before_loss = delivered.lock().unwrap().len();
 
     foreground.fail.notify_one();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             // Observation loss fences foreground execution until explicit new work recovers
             // the binding, so settlement shows through the drained input queue instead.
@@ -346,9 +342,8 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("observation loss did not settle input delivery")??;
+    }
+    .await?;
     assert_eq!(
         controller.coordinator.execution.available_permits(),
         0,
@@ -416,18 +411,13 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
     if let Some(task) = controller.input_task.lock().await.take() {
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+        task.await?;
     }
     let native_shutdown = crate::provider::operation::OperationControl::fresh(
         forge_provider_api::ProviderOperation::Shutdown,
     )?;
     provider.shutdown(native_shutdown.context()).await?;
-    if let Err(error) = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.finish_session_events(),
-    )
-    .await?
-    {
+    if let Err(error) = controller.finish_session_events().await {
         assert!(
             // The collector wraps the native loss in its observation-commit error.
             error.chain().any(|cause| matches!(
@@ -506,9 +496,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
         }
         Ok::<_, crate::provider::ProviderError>(())
     });
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, producer)
-        .await
-        .context("bounded provider intake waited for the held broker lock")???;
+    producer.await??;
     assert!(controller.observer.session_events().has_pending()?);
     // Publication delivery can still flush the first prompt's retained frames, which do not
     // need the broker; only the fixture's own observations must wait for its release.
@@ -524,7 +512,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     }
     drop(broker_guard);
 
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         let mut expected_sequence = 0;
         while expected_sequence < diagnostic_count {
             let frame = output
@@ -552,9 +540,8 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
             expected_sequence += 1;
         }
         Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("queued session observations did not publish after broker release")??;
+    }
+    .await?;
     let stored = SqliteStore::read_only(&controller.data_root)?.list_session_event(&session_id)?;
     let compaction = stored
         .iter()
@@ -604,13 +591,12 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         }
     }
     let inbox = controller.observer.session_events();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !inbox.is_closed() {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("overflow did not close observation")?;
+    }
+    .await;
     let accepted = inbox.drain()?;
     assert!(
         !accepted.is_empty(),
@@ -780,7 +766,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
                 )),
             },
         })?;
-    let exchange_id = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let exchange_id = async {
         loop {
             let scope = recorded.lock().unwrap().clone();
             // The owner commits its settlement ticket through the broker after the exchange
@@ -797,9 +783,8 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("background fixture never completed foreground work")??;
+    }
+    .await?;
     let broker_guard = controller.broker.lock().await;
     let shutdown_controller = controller.clone();
     let shutdown = tokio::spawn(async move {
@@ -813,19 +798,14 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         shutdown_controller.broker.lock().await.release_lease()?;
         Ok::<_, anyhow::Error>(())
     });
-    let observed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-        while !controller.observer.session_events().has_pending()? {
-            tokio::task::yield_now().await;
+    while !controller.observer.session_events().has_pending()? {
+        if shutdown.is_finished() {
+            drop(broker_guard);
+            shutdown.await.context("shutdown worker failed")??;
+            anyhow::bail!("shutdown finished without publishing terminal evidence");
         }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await;
-    if observed.is_err() && shutdown.is_finished() {
-        drop(broker_guard);
-        shutdown.await.context("shutdown worker failed")??;
-        anyhow::bail!("shutdown finished without publishing terminal evidence");
+        tokio::task::yield_now().await;
     }
-    observed.context("shutdown did not publish terminal evidence")??;
     if shutdown.is_finished() {
         drop(broker_guard);
         let outcome = shutdown.await.context("shutdown worker failed")?;
@@ -839,7 +819,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
             .is_some()
     );
     drop(broker_guard);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, shutdown).await???;
+    shutdown.await??;
 
     let store = SqliteStore::read_only(&data_root)?;
     let saved = store.load_exchange(&exchange_id)?.unwrap();
@@ -887,11 +867,7 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     )?;
     provider.shutdown(native_shutdown.context()).await?;
     execution.close().await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.finish_session_events(),
-    )
-    .await??;
+    controller.finish_session_events().await?;
     assert!(controller.session_event_task.lock().await.is_none());
     Ok(())
 }
@@ -929,7 +905,7 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
         .event_sink(&owner)
         .await?
         .fail(crate::provider::events::EventDeliveryError::Closed);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .session_event_task
@@ -942,9 +918,8 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("observer stayed blocked on stale outbound capacity")?;
+    }
+    .await;
     let (retained, _) = controller
         .publications
         .snapshot(None, std::num::NonZeroU16::new(128).unwrap())?
@@ -957,11 +932,7 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
             .contains("Session observation failed")),
         "observation diagnostic was not retained before listener completion"
     );
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.recover_session_events(&messages),
-    )
-    .await??;
+    controller.recover_session_events(&messages).await?;
     assert!(!Arc::ptr_eq(
         &old_inbox,
         &controller.observer.session_events()

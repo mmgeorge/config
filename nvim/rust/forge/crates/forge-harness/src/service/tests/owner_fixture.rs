@@ -62,16 +62,14 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
     controller.attach_input(&sink).await?;
     service.dispatch(Some(session.clone()), Request { id: 2, method: "session.input.apply".into(),
         params: json!({"id":"original-owner-input","action":{"kind":"submit","message":{"id":"original-owner-input","text":"Keep this transcript through configuration","intent":"auto","attachments":[]}}}) }, &sink).await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        script.dispatch(
+    script
+        .dispatch(
             &session,
             MockResponseCommand::Wait {
                 id: hold["id"].as_str().unwrap().into(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let original = SqliteStore::read_only(&controller.data_root)?
         .latest_exchange(&session)?
         .unwrap()

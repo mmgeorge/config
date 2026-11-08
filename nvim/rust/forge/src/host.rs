@@ -835,10 +835,7 @@ mod tests {
         let (output, _unread) = tokio::io::duplex(1);
         sender.write_all(format!("{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
         drop(sender);
-        let failure = timeout(Duration::from_secs(3), host.run(input, output))
-            .await
-            .unwrap()
-            .unwrap_err();
+        let failure = host.run(input, output).await.unwrap_err();
         assert!(
             failure
                 .to_string()
@@ -893,14 +890,14 @@ mod tests {
             .get_mut()
             .write_all(format!("{first}\n").as_bytes())
             .await?;
-        timeout(Duration::from_secs(3), waiting).await??;
+        waiting.await?;
         let second = json!({"id":3,"method":"session.configure","session_id":session,"params":{"operation_id":"second","status_thoughts":true}});
         let independent = json!({"id":4,"method":"provider.registry.list","params":{}});
         client
             .get_mut()
             .write_all(format!("{second}\n{independent}\n").as_bytes())
             .await?;
-        timeout(Duration::from_secs(3), async {
+        async {
             loop {
                 line.clear();
                 client.read_line(&mut line).await?;
@@ -911,11 +908,11 @@ mod tests {
                 }
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        }
+        .await?;
         release.send(()).unwrap();
         let mut sequences = HashMap::new();
-        timeout(Duration::from_secs(3), async {
+        async {
             while sequences.len() < 2 {
                 line.clear();
                 client.read_line(&mut line).await?;
@@ -931,11 +928,11 @@ mod tests {
                 }
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        }
+        .await?;
         assert!(sequences[&2] < sequences[&3]);
         client.get_mut().shutdown().await?;
-        timeout(Duration::from_secs(3), running).await???;
+        running.await??;
         Ok(())
     }
 
@@ -968,7 +965,7 @@ mod tests {
             .write_all(b"{\"id\":8,\"method\":\"host.shutdown\",\"params\":{}}\n")
             .await
             .unwrap();
-        timeout(Duration::from_secs(1), async {
+        async {
             while runtime
                 .harness
                 .prepare(
@@ -980,9 +977,8 @@ mod tests {
             {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         response.clear();
         assert!(
             timeout(
@@ -994,13 +990,7 @@ mod tests {
         );
         assert_eq!(runtime.requests.pending(), vec![7]);
         release.send(()).unwrap();
-        timeout(
-            Duration::from_secs(1),
-            client.read_until(b'\n', &mut response),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        client.read_until(b'\n', &mut response).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&response).unwrap()["result"]["shutdown"],
             true

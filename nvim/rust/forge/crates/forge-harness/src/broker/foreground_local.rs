@@ -316,8 +316,7 @@ mod tests {
             "timed approval was not pending"
         );
         anyhow::ensure!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), waiter).await???
-                == ApprovalResolution::TimedOut,
+            waiter.await?? == ApprovalResolution::TimedOut,
             "approval did not time out"
         );
         broker.input_purpose = crate::input::InputPurpose::QuestionContinuation {

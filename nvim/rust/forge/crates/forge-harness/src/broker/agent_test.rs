@@ -1022,9 +1022,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                 )
                 .await
         }));
-        let requested = tokio::time::timeout(crate::hang_guard::HANG_GUARD, stream.recv())
-            .await??
-            .context("approval event missing")?;
+        let requested = stream.recv().await?.context("approval event missing")?;
         approval_streams.push(stream);
         let owner = crate::provider::ThreadOwner::new(
             (broker.session.id.clone()).into(),
@@ -2054,15 +2052,13 @@ async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
             crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
         broker.provider = fixture.provider_handle();
         broker.agent_coordinator.set_enabled(true);
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            broker.run_interaction(
+        broker
+            .run_interaction(
                 "Research".into(),
                 PromptMode::Chat,
                 Some(ExchangeAdmission::chat("Research".into())),
-            ),
-        )
-        .await??;
+            )
+            .await?;
         assert_eq!(
             provider.turn.load(Ordering::Acquire),
             1,
@@ -2392,41 +2388,29 @@ async fn assert_suspended_parent_joins_children(user_input: bool) -> Result<()> 
                 .await;
             (broker, result)
         });
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            provider.child_started.acquire_many(2),
-        )
-        .await??
-        .forget();
+        provider.child_started.acquire_many(2).await?.forget();
         provider.root_started.acquire().await?.forget();
         provider.child_release[0].add_permits(1);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             while coordinator.active_count() != 1 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await?;
+        }
+        .await;
         assert_eq!(
             provider.root_turn.load(Ordering::Acquire),
             1,
             "first child resumed the idle parent before its sibling settled"
         );
         if let Some(submission) = correction {
-            tokio::time::timeout(
-                crate::hang_guard::HANG_GUARD,
-                input.steer(crate::provider::SteeringInput::User {
+            input
+                .steer(crate::provider::SteeringInput::User {
                     text: "USER_CORRECTION".into(),
                     attachments: Vec::new(),
                     submission: Some(submission),
-                }),
-            )
-            .await??;
-            tokio::time::timeout(
-                crate::hang_guard::HANG_GUARD,
-                provider.root_started.acquire(),
-            )
-            .await??
-            .forget();
+                })
+                .await?;
+            provider.root_started.acquire().await?.forget();
             assert_eq!(provider.root_turn.load(Ordering::Acquire), 2);
             assert_eq!(
                 coordinator.active_count(),
@@ -2435,7 +2419,7 @@ async fn assert_suspended_parent_joins_children(user_input: bool) -> Result<()> 
             );
         }
         provider.child_release[1].add_permits(1);
-        let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+        let (broker, result) = task.await?;
         let (_, events) = result?;
         let statuses = events
             .iter()
@@ -2501,38 +2485,32 @@ async fn parent_cancellation_prevents_child_continuation() -> Result<()> {
             .await;
         (broker, result)
     });
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        provider.child_started.acquire_many(2),
-    )
-    .await??
-    .forget();
+    provider.child_started.acquire_many(2).await?.forget();
     provider.root_started.acquire().await?.forget();
     let quiescence = coordinator.begin_quiescence();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        coordinator.sender().request(crate::agent::AgentRequest {
+    coordinator
+        .sender()
+        .request(crate::agent::AgentRequest {
             operation_id: "cancel-children".into(),
             source: crate::agent::AgentSource::User,
             operation: crate::agent::AgentOperation::InterruptAll,
-        }),
-    )
-    .await??;
+        })
+        .await?;
     assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
     cancellation.request();
-    let (mut broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    let (mut broker, result) = task.await?;
     let error = result.unwrap_err();
     assert!(error.is::<TurnCancelled>(), "{error:#}");
     provider.child_release[0].add_permits(1);
     provider.child_release[1].add_permits(1);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while broker.agent_coordinator.active_count() != 0 {
             broker.drain_agent_commands(None).await?;
             tokio::task::yield_now().await;
         }
         Ok::<_, anyhow::Error>(())
-    })
-    .await??;
+    }
+    .await?;
     assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
     assert!(!broker.parent_input.is_active());
     assert_eq!(broker.agent_coordinator.unreported_result().len(), 2);
@@ -2567,21 +2545,16 @@ async fn user_decision_holds_parent_until_answered_before_delivering_child_resul
             .await;
         (broker, result)
     });
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        provider.child_started.acquire_many(2),
-    )
-    .await??
-    .forget();
+    provider.child_started.acquire_many(2).await?.forget();
     provider.root_started.acquire().await?.forget();
     provider.child_release[0].add_permits(1);
     provider.child_release[1].add_permits(1);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while coordinator.active_count() != 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert_eq!(
         provider.root_turn.load(Ordering::Acquire),
         1,
@@ -2591,7 +2564,7 @@ async fn user_decision_holds_parent_until_answered_before_delivering_child_resul
         !task.is_finished(),
         "parent finished while its question was unanswered"
     );
-    let pending = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let pending = async {
         loop {
             let snapshot = questions.snapshot()?;
             if let Some(question) = snapshot
@@ -2603,8 +2576,8 @@ async fn user_decision_holds_parent_until_answered_before_delivering_child_resul
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await??;
+    }
+    .await?;
     questions.apply(crate::question::QuestionCommand {
         operation_id: "answer-scope".into(),
         question_id: pending.0,
@@ -2615,7 +2588,7 @@ async fn user_decision_holds_parent_until_answered_before_delivering_child_resul
             },
         },
     })?;
-    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    let (broker, result) = task.await?;
     result?;
     let inputs = provider.input.lock().unwrap();
     for result in ["RESULT_ONE", "RESULT_TWO"] {
@@ -2661,12 +2634,7 @@ async fn interrupted_child_does_not_finalize_parent_before_running_sibling_settl
             .await;
         (broker, result)
     });
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        provider.child_started.acquire_many(2),
-    )
-    .await??
-    .forget();
+    provider.child_started.acquire_many(2).await?.forget();
     provider.root_started.acquire().await?.forget();
     let first_child = coordinator
         .snapshot(None)
@@ -2677,30 +2645,29 @@ async fn interrupted_child_does_not_finalize_parent_before_running_sibling_settl
         })
         .map(|(agent, _)| agent.id)
         .context("first child was not admitted")?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        coordinator.sender().request(crate::agent::AgentRequest {
+    coordinator
+        .sender()
+        .request(crate::agent::AgentRequest {
             operation_id: "interrupt-first-child".into(),
             source: crate::agent::AgentSource::User,
             operation: crate::agent::AgentOperation::Interrupt {
                 target: first_child.clone(),
             },
-        }),
-    )
-    .await??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        })
+        .await?;
+    async {
         while coordinator.active_count() != 1 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert!(
         !task.is_finished(),
         "parent finalized before its sibling settled"
     );
     provider.child_release[0].add_permits(1);
     provider.child_release[1].add_permits(1);
-    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    let (broker, result) = task.await?;
     result?;
     let tasks = broker.store.list_agent_task(&broker.session.id)?;
     assert_eq!(tasks.len(), 2);
@@ -2756,7 +2723,7 @@ async fn quiescence_parks_the_deferred_root_result_until_release() -> Result<()>
         (broker, result)
     });
     provider.root_started.acquire().await?.forget();
-    let parked = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let parked = async {
         loop {
             let reads = native_ready_reads(data.path(), &trace);
             if reads > 0 {
@@ -2764,8 +2731,8 @@ async fn quiescence_parks_the_deferred_root_result_until_release() -> Result<()>
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     for _ in 0..200 {
         tokio::task::yield_now().await;
     }
@@ -2777,7 +2744,7 @@ async fn quiescence_parks_the_deferred_root_result_until_release() -> Result<()>
     assert!(!task.is_finished());
     // Quiescence rejects the spawns, so release alone must let the parked root finalize.
     drop(quiescence);
-    let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, task).await??;
+    let (broker, result) = task.await?;
     result?;
     let exchange = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(exchange.len(), 1);

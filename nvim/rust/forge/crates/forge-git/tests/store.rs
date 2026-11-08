@@ -104,7 +104,7 @@ async fn invalidation_rejects_a_native_result_started_before_the_change() {
         reader_store
             .read(reader_repository, 0, move |_, _| {
                 started.send(()).unwrap();
-                release_receiver.recv_timeout(Duration::from_secs(5))?;
+                release_receiver.recv()?;
                 Ok(42)
             })
             .await
@@ -134,7 +134,7 @@ async fn cancelled_waiter_cannot_evict_an_active_native_worker() {
         reader_store
             .read(repository, 0, move |_, _| {
                 started.send(()).unwrap();
-                release_receiver.recv_timeout(Duration::from_secs(5))?;
+                release_receiver.recv()?;
                 Ok(())
             })
             .await

@@ -284,11 +284,7 @@ async fn provider_failure_named_cancelled_remains_failed() -> Result<()> {
 /// under a paused clock.
 #[tokio::test]
 async fn shell_timeout_stops_execution_without_replaying_the_command() -> Result<()> {
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        assert_native_failure(ProviderFailure::Stalled),
-    )
-    .await?
+    assert_native_failure(ProviderFailure::Stalled).await
 }
 
 /// Exercise public dispatch, persisted exchange history, and reuse through the real broker.
@@ -692,7 +688,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         ));
         broker.turn_cancellation.request();
         release.notify_one();
-        let ready = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        let ready = async {
             loop {
                 match transaction.next().await? {
                     ForegroundSignal::Native(NativeForegroundSignal::NativeReady(
@@ -706,8 +702,8 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
                     _ => {}
                 }
             }
-        })
-        .await??;
+        }
+        .await?;
         assert_eq!(ready.is_ok(), succeeds);
         assert!(
             transaction.native.has_dispatched_task(),

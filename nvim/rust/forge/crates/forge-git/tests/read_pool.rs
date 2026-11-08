@@ -10,7 +10,7 @@ async fn dropped_waiter_retains_capacity_until_native_read_exits() {
     let task = pool
         .submit(8, move |cancellation| {
             started.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait.recv().unwrap();
             assert!(cancellation.is_requested());
             Ok(())
         })
@@ -82,7 +82,7 @@ async fn input_accounting_does_not_reject_jobs_based_on_content_size() {
     let (release, wait) = mpsc::channel();
     let first = pool
         .submit(5, move |_| {
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait.recv().unwrap();
             Ok(())
         })
         .unwrap();
@@ -142,7 +142,7 @@ fn cancelled_queued_work_retains_admission_and_never_runs_its_operation() {
         let first = pool
             .submit(4, move |_| {
                 started.send(()).unwrap();
-                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                wait.recv().unwrap();
                 Ok(())
             })
             .unwrap();
@@ -178,7 +178,7 @@ async fn cancelled_native_result_cannot_be_returned_as_success() {
     let task = pool
         .submit(4, move |_| {
             started.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait.recv().unwrap();
             Ok("late result")
         })
         .unwrap();

@@ -105,13 +105,10 @@ mod tests {
         request.command = Command::CancelExchange(CancelExchangeRequest {
             input: CancelledInputPolicy::RestoreIfUnconsumed,
         });
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            controller
-                .exchange_owner
-                .execute_identified(request, messages),
-        )
-        .await??;
+        controller
+            .exchange_owner
+            .execute_identified(request, messages)
+            .await?;
         let snapshot = controller.coordinator.submissions.snapshot()?;
         assert!(
             snapshot
@@ -152,7 +149,7 @@ mod tests {
                 .execute_identified(first_request.clone(), messages.clone()),
         );
         assert!(futures_util::poll!(first.as_mut()).is_pending());
-        tokio::time::timeout(Duration::from_secs(2), async {
+        async {
             loop {
                 let state = controller
                     .exchange_owner
@@ -164,8 +161,8 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        }
+        .await?;
         drop(first);
         let mut second = Box::pin(
             controller
@@ -180,7 +177,7 @@ mod tests {
             .context("second cancellation was not admitted")?;
         assert!(matches!(queued.state, CommandState::Queued { .. }));
         drop(gate);
-        let second = tokio::time::timeout(Duration::from_secs(2), second).await??;
+        let second = second.await?;
         assert!(matches!(
             second.outcome,
             CommandOutcome::Cancelled(CancellationOutcome::NoWork)
@@ -243,10 +240,7 @@ mod tests {
         );
         assert!(futures_util::poll!(resume.as_mut()).is_pending());
         drop(gate);
-        let (cancelled, resumed) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(cancel, resume)
-        })
-        .await?;
+        let (cancelled, resumed) = async { tokio::join!(cancel, resume) }.await;
         let cancelled = cancelled?;
         let resumed = resumed?;
         assert!(cancelled.sequence < resumed.sequence);

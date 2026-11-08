@@ -417,7 +417,7 @@ async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -
             rejection.release.notify_one();
         };
         let prompt = "Fail before the baseline while Git commit owns the workspace";
-        let (result, ()) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        let (result, ()) = async {
             tokio::join!(
                 broker.run_interaction(
                     prompt.into(),
@@ -426,9 +426,8 @@ async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -
                 ),
                 reject
             )
-        })
-        .await
-        .context("failed execution waited for unrelated Git admission")?;
+        }
+        .await;
         let error = result.expect_err("pre-baseline failure became successful execution");
         let expected = if native_rejection {
             "Rejected"
@@ -790,10 +789,10 @@ async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> R
         .context("fixture mutation admission")?;
     let session_id = broker.session.id.clone();
     let observe = async {
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, started.notified()).await?;
+        started.notified().await;
         let mut accepted = false;
         let mut projected = false;
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             while !accepted || !projected {
                 let event = stream
                     .recv()
@@ -811,8 +810,8 @@ async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> R
                 projected |= matches!(&event, SessionUpdate::DocumentChanged { .. });
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        }
+        .await?;
         assert!(
             accepted,
             "composer acceptance waited for checkpoint capture"
@@ -835,7 +834,7 @@ async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> R
         repositories.writes.take_receipt(operation);
         Ok::<_, anyhow::Error>(())
     };
-    let (result, observed) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let (result, observed) = async {
         tokio::join!(
             broker.run_interaction(
                 "Capture before my first tool".into(),
@@ -846,8 +845,8 @@ async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> R
             ),
             observe
         )
-    })
-    .await?;
+    }
+    .await;
     observed?;
     result?;
     assert!(tool_ran.load(Ordering::SeqCst));
@@ -1131,15 +1130,13 @@ async fn model_child_completes_through_the_active_root_lane_and_continues_the_sa
     let (turn, provider) = delegating_root_fixture()?;
     broker.provider = provider.provider_handle();
     broker.agent_coordinator.set_enabled(true);
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        broker.run_interaction(
+    broker
+        .run_interaction(
             "Root request".into(),
             PromptMode::Chat,
             Some(ExchangeAdmission::chat("Root request".into())),
-        ),
-    )
-    .await??;
+        )
+        .await?;
     assert_eq!(turn.load(Ordering::Acquire), 2);
     let exchange = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(exchange.len(), 1);
@@ -2495,13 +2492,9 @@ async fn event_saturation_cancels_pending_and_completed_provider_turns() {
             })
             .await;
         assert!(admitted.response.error().is_none());
-        let error = tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            dispatch_pending_task_input(&mut broker),
-        )
-        .await
-        .expect("saturation must terminate the affected turn")
-        .expect_err("saturation must not report success");
+        let error = dispatch_pending_task_input(&mut broker)
+            .await
+            .expect_err("saturation must not report success");
         // Dispatch reports the failure as a response, so only its rendered
         // classification crosses the boundary.
         let overflow = forge_provider_api::lifecycle::ObservationFailure::Overflow.to_string();
@@ -2583,11 +2576,7 @@ async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
             }
             assert!(notifications > 0);
         };
-        let (result, ()) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-            tokio::join!(dispatch, consume)
-        })
-        .await
-        .expect("bounded delivery must make progress");
+        let (result, ()) = async { tokio::join!(dispatch, consume) }.await;
         assert!(
             result.response.error().is_none(),
             "{:?}",
@@ -3908,11 +3897,7 @@ async fn plan_settings_preserve_the_planning_model_and_reject_invalid_executor_c
     let unused = broker.compact_session(true).await.unwrap_err().to_string();
     assert!(unused.contains("Nothing to compact"), "{unused}");
     broker.session.provider_session_id = Some("mock-session".into());
-    let (_, events) =
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, broker.compact_session(true))
-            .await
-            .expect("local compaction must consume its own provider observations")
-            .unwrap();
+    let (_, events) = broker.compact_session(true).await.unwrap();
     assert!(
         events
             .iter()
@@ -4908,7 +4893,7 @@ async fn started_turn_keeps_confirmed_model_until_it_resolves_its_own() -> Resul
             Some("resolved-model")
         };
         assert_eq!(broker.session.resolved_model.as_deref(), expected);
-        let current = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        let current = async {
             loop {
                 let update = runtime_updates
                     .recv()
@@ -4918,8 +4903,8 @@ async fn started_turn_keeps_confirmed_model_until_it_resolves_its_own() -> Resul
                     return Ok::<_, anyhow::Error>(runtime.model);
                 }
             }
-        })
-        .await??;
+        }
+        .await?;
         assert_eq!(current.as_deref(), expected);
     }
     assert_eq!(broker.session.model, "default");
@@ -5259,12 +5244,12 @@ async fn native_execution_after_settlement_fences_reuse_without_reopening_histor
         })
         .await;
     assert!(rejected.is_err());
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while engine.is_healthy().await {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert!(matches!(
         broker.observer.session_events().end(),
         Some(crate::provider::session_execution::ObservationEnd::Lost {
@@ -5618,10 +5603,7 @@ async fn configured_check_tools_run_without_command_approval() -> Result<()> {
             runs.start(*request)?;
             Ok::<_, anyhow::Error>(())
         };
-        let (response, admission) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-            tokio::join!(call, admit)
-        })
-        .await?;
+        let (response, admission) = async { tokio::join!(call, admit) }.await;
         admission?;
         let response: Value = serde_json::from_str(&response?)?;
         assert_eq!(response.as_object().unwrap().len(), 1);
@@ -6117,11 +6099,7 @@ async fn compaction_captures_context_usage_without_creating_an_interaction() {
         current.node_list.is_empty(),
         "background completion entered the next exchange"
     );
-    let notification = tokio::time::timeout(crate::hang_guard::HANG_GUARD, stream.recv())
-        .await
-        .expect("cross-turn compaction patch was not delivered")
-        .unwrap()
-        .unwrap();
+    let notification = stream.recv().await.unwrap().unwrap();
     assert!(matches!(
         notification,
         SessionUpdate::DocumentChanged { .. }

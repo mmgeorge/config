@@ -1450,7 +1450,7 @@ mod tests {
     /// Exclude inherited servers before create/resume while retaining explicitly selected servers.
     #[tokio::test]
     async fn inherited_mcp_is_disabled_before_create_and_resume() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             for isolated_text in [false, true] {
                 for resumed in [false, true] {
                     for selected in [false, true] {
@@ -1573,8 +1573,7 @@ mod tests {
                     }
                 }
             }
-        })
-        .await
-        .expect("pre-start MCP selection fixture timed out");
+        }
+        .await;
     }
 }

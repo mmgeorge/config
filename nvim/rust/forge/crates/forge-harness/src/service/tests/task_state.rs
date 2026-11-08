@@ -174,20 +174,16 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
             &sink,
         )
         .await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        script.dispatch(&session_id, MockResponseCommand::Wait { id: hold_id }),
-    )
-    .await??;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
     let store = SqliteStore::open(&controller.data_root)?;
     let original = store.latest_exchange(&session_id)?.unwrap().id;
     let request = goal_command_request(transport, action, 10);
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request.clone(), &sink),
-    )
-    .await??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    service
+        .dispatch(Some(session_id.clone()), request.clone(), &sink)
+        .await?;
+    async {
         loop {
             let current = controller.task_controller.current()?;
             let settled = if action == "pause" {
@@ -209,9 +205,8 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("task alias did not collect work and settle its queued directive")??;
+    }
+    .await?;
     let execution = controller.broker.lock().await.execution_registry();
     let active = execution
         .existing_owner(&crate::provider::ThreadOwner::root(&session_id))?
@@ -233,11 +228,9 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
             .unwrap()
             .is_ok()
     );
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request, &sink),
-    )
-    .await??;
+    service
+        .dispatch(Some(session_id.clone()), request, &sink)
+        .await?;
     assert_eq!(
         serde_json::to_value(controller.task_controller.current()?)?,
         before,
@@ -253,7 +246,7 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
     assert!(!*controller.cancellation.subscribe().borrow());
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
 
     Ok(())
 }
@@ -306,7 +299,7 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
         )
         .await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
-    let source = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let source = async {
         loop {
             if let Some(source) = store.latest_exchange(&session_id)?
                 && source.is_finished()
@@ -316,9 +309,8 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("initial prompt did not finish")??;
+    }
+    .await?;
     controller.task_controller.change(
         &mut store,
         None,
@@ -342,21 +334,17 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
         .await?;
     let hold_id = hold["id"].as_str().unwrap().to_owned();
     let request = goal_command_request(transport, "continue", 3);
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request.clone(), &sink),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    service
+        .dispatch(Some(session_id.clone()), request.clone(), &sink)
+        .await?;
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let task = serde_json::to_value(controller.task_controller.current()?)?;
     assert!(
         controller
@@ -370,11 +358,9 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
             .unwrap()
             .is_ok()
     );
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request, &sink),
-    )
-    .await??;
+    service
+        .dispatch(Some(session_id.clone()), request, &sink)
+        .await?;
     assert_eq!(
         serde_json::to_value(controller.task_controller.current()?)?,
         task
@@ -399,16 +385,16 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
     control
         .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert_eq!(store.list_exchange(&session_id)?.len(), 2);
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
 
     Ok(())
 }
@@ -456,16 +442,14 @@ async fn queued_input_edited_to_goal_starts_once_and_preserves_other_input() -> 
             &sink,
         )
         .await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let store = SqliteStore::open(&controller.data_root)?;
     let original = store.latest_exchange(&session_id)?.unwrap();
     controller.coordinator.submissions.apply(InputOperation {
@@ -554,7 +538,7 @@ async fn queued_input_edited_to_goal_starts_once_and_preserves_other_input() -> 
         .unwrap()
         .revision;
     let receipt_id = format!("input-command:queued:{revision}");
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .exchange_owner
@@ -578,25 +562,16 @@ async fn queued_input_edited_to_goal_starts_once_and_preserves_other_input() -> 
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .with_context(|| {
-        format!(
-            "edited goal command was not admitted; input={:?}; task={:?}",
-            controller.coordinator.submissions.snapshot(),
-            controller.task_controller.current()
-        )
-    })??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    }
+    .await?;
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: replacement["id"].as_str().unwrap().into(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let task = controller.task_controller.current()?.unwrap();
     assert_eq!(task.title(), "Preserve the edited intent");
     let event_count = store.list_session_event(&session_id)?.len();
@@ -666,16 +641,16 @@ async fn queued_input_edited_to_goal_starts_once_and_preserves_other_input() -> 
             &sink,
         )
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert_eq!(store.list_exchange(&session_id)?.len(), 2);
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
     Ok(())
 }
 
@@ -749,16 +724,14 @@ async fn plan_replacement_collects_prior_work_before_initial_dispatch_case(
                 },
             })?;
         }
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            control.dispatch(
+        control
+            .dispatch(
                 &session_id,
                 MockResponseCommand::Wait {
                     id: hold_id.clone(),
                 },
-            ),
-        )
-        .await??;
+            )
+            .await?;
         let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let original = store.latest_exchange(&session_id)?.unwrap();
         let request = Request {
@@ -767,17 +740,15 @@ async fn plan_replacement_collects_prior_work_before_initial_dispatch_case(
             params: json!({"operation_id":"replacement-plan","action":"plan","text":"Replacement plan"}),
         };
         service.prepare_task(Some(&session_id), &request).await?;
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(Some(session_id.clone()), request.clone(), &sink),
-        )
-        .await??;
+        service
+            .dispatch(Some(session_id.clone()), request.clone(), &sink)
+            .await?;
         let pending = controller.task_controller.current()?.unwrap();
         assert_eq!(pending.title(), "Replacement plan");
         assert!(!*controller.cancellation.subscribe().borrow());
         assert_eq!(store.list_exchange(&session_id)?.len(), 2);
         assert_ne!(store.latest_exchange(&session_id)?.unwrap().id, original.id);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             loop {
                 let current = controller.task_controller.current()?.unwrap();
                 if matches!(&current.workflow, crate::task::WorkflowSnapshot::Plan { plan }
@@ -788,9 +759,8 @@ async fn plan_replacement_collects_prior_work_before_initial_dispatch_case(
                 tokio::task::yield_now().await;
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .context("replacement plan did not reach review")??;
+        }
+        .await?;
         let current = controller.task_controller.current()?.unwrap();
         assert!(current.entry_accepted());
         let crate::task::WorkflowSnapshot::Plan { plan } = &current.workflow else {
@@ -822,7 +792,7 @@ async fn plan_replacement_collects_prior_work_before_initial_dispatch_case(
         assert_eq!(store.list_exchange(&session_id)?.len(), 2);
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+        reader.await??;
     }
     Ok(())
 }
@@ -882,16 +852,14 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
             })),
         },
     })?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
     let original = store
         .latest_exchange(&session_id)?
@@ -912,17 +880,13 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
         params: json!({"operation_id":"live-goal","action":"goal","text":"Finish startup work"}),
     };
     service.prepare_task(Some(&session_id), &request).await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request, &sink),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(&session_id, MockResponseCommand::Wait { id: goal_hold_id }),
-    )
-    .await??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    service
+        .dispatch(Some(session_id.clone()), request, &sink)
+        .await?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: goal_hold_id })
+        .await?;
+    async {
         loop {
             if controller
                 .task_controller
@@ -934,16 +898,14 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("initial goal input was not acknowledged")??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    }
+    .await?;
+    async {
         while !accepted_session.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("acknowledged task state was not published to the client")?;
+    }
+    .await;
     assert_eq!(controller.coordinator.execution.available_permits(), 0);
     assert!(!*controller.cancellation.subscribe().borrow());
     let task = controller.task_controller.current()?.unwrap();
@@ -1012,7 +974,7 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
             &sink,
         )
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .task_controller
@@ -1026,9 +988,8 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("resume was blocked by a stale failed entry")??;
+    }
+    .await?;
     assert!(
         !controller
             .coordinator
@@ -1050,19 +1011,17 @@ async fn running_goal_startup_collects_prior_work_and_preserves_stale_input_guar
         )
         .await?;
     assert!(!*controller.cancellation.subscribe().borrow());
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert!(controller.task_controller.current()?.is_none());
     assert_eq!(store.list_exchange(&session_id)?.len(), 3);
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader)
-        .await
-        .context("shutdown retained a session subscription sender")???;
+    reader.await??;
     Ok(())
 }
 
@@ -1102,16 +1061,12 @@ async fn clearing_running_goal_closes_its_parked_exchange() -> Result<()> {
         params: json!({"operation_id":"held-goal","action":"goal","text":"Hold the goal entry"}),
     };
     service.prepare_task(Some(&session_id), &request).await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request, &sink),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(&session_id, MockResponseCommand::Wait { id: hold_id }),
-    )
-    .await??;
+    service
+        .dispatch(Some(session_id.clone()), request, &sink)
+        .await?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
     let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
     let entry = store
         .latest_exchange(&session_id)?
@@ -1128,12 +1083,12 @@ async fn clearing_running_goal_closes_its_parked_exchange() -> Result<()> {
             &sink,
         )
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert!(controller.task_controller.current()?.is_none());
     // Task controls park collected work for a later admission; clearing schedules none.
     let settled = store
@@ -1154,7 +1109,7 @@ async fn clearing_running_goal_closes_its_parked_exchange() -> Result<()> {
     let publications =
         crate::exchange::SessionPublications::open(&controller.data_root, &session_id)?;
     let publication_limit = std::num::NonZeroU16::new(u16::MAX).unwrap();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let last_status = publications
                 .after(None, publication_limit)?
@@ -1171,14 +1126,11 @@ async fn clearing_running_goal_closes_its_parked_exchange() -> Result<()> {
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("clearing the goal left its published document finalizing")??;
+    }
+    .await?;
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader)
-        .await
-        .context("shutdown retained a session subscription sender")???;
+    reader.await??;
     Ok(())
 }
 
@@ -1222,19 +1174,14 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
         params: json!({"operation_id":"finalizing-goal","action":"goal","text":"Hold the goal entry"}),
     };
     service.prepare_task(Some(&session_id), &request).await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), request, &sink),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(&session_id, MockResponseCommand::Wait { id: hold_id }),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(Some(session_id.clone()), request, &sink)
+        .await?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 3,
@@ -1242,9 +1189,8 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
                 params: json!({"operation_id":"pause-finalizing-goal","action":"pause"}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
     let mut parked = store
         .latest_exchange(&session_id)?
@@ -1260,9 +1206,8 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
         .after(None, publication_limit)?
         .last()
         .map(|publication| publication.sequence());
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 4,
@@ -1270,9 +1215,8 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
                 params: json!({"operation_id":"clear-finalizing-goal","action":"clear"}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     assert!(controller.task_controller.current()?.is_none());
     let settled = store
         .load_exchange(&parked.id)?
@@ -1307,9 +1251,7 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
     );
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader)
-        .await
-        .context("shutdown retained a session subscription sender")???;
+    reader.await??;
     Ok(())
 }
 
@@ -1375,7 +1317,7 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
         true,
     )
     .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .task_controller
@@ -1386,9 +1328,8 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("terminal native acceptance was not acknowledged")??;
+    }
+    .await?;
     let store = SqliteStore::read_only(&controller.data_root)?;
     let plan_id = selection["plan_id"]
         .as_str()
@@ -1506,7 +1447,7 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
     .await;
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    let stale_refresh = tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    let stale_refresh = reader.await??;
     if delivered.is_err() || !stale_refresh.is_empty() {
         let retained_fixture = fixture.keep();
         anyhow::bail!(
@@ -1572,16 +1513,14 @@ async fn plan_accept_policy_controls_initial_submission_case(policy: &str) -> Re
             &sink,
         )
         .await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let before = controller.task_controller.current()?.unwrap();
     assert!(
         !before.auto_accept_plan,
@@ -1615,16 +1554,14 @@ async fn plan_accept_policy_controls_initial_submission_case(policy: &str) -> Re
         .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
         .await?;
     if enabled {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            control.dispatch(
+        control
+            .dispatch(
                 &session_id,
                 MockResponseCommand::Wait {
                     id: next_id.clone(),
                 },
-            ),
-        )
-        .await??;
+            )
+            .await?;
         let task = controller.task_controller.current()?.unwrap();
         assert!(task.auto_accept_plan);
         assert_eq!(
@@ -1643,7 +1580,7 @@ async fn plan_accept_policy_controls_initial_submission_case(policy: &str) -> Re
             crate::task::WorkflowSnapshot::Execute { .. }
         ));
     } else {
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             loop {
                 if let Some(task) = controller.task_controller.current()?
                     && let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow
@@ -1656,15 +1593,15 @@ async fn plan_accept_policy_controls_initial_submission_case(policy: &str) -> Re
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await??;
+        }
+        .await?;
     }
     control
         .dispatch(&session_id, MockResponseCommand::Cancel { id: next_id })
         .await?;
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
 
     Ok(())
 }
@@ -1847,16 +1784,14 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             &sink,
         )
         .await?;
-    let pending = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    let pending = control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let revising = decision != "accept-empty";
     assert_eq!(
         pending["mode"],
@@ -1930,16 +1865,14 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
             .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
             .await?;
         if decision == "request-on" {
-            tokio::time::timeout(
-                crate::hang_guard::HANG_GUARD,
-                control.dispatch(
+            control
+                .dispatch(
                     &session_id,
                     MockResponseCommand::Wait {
                         id: next_id.clone(),
                     },
-                ),
-            )
-            .await??;
+                )
+                .await?;
             let accepted = store.load_plan(plan_id)?.unwrap();
             assert_eq!(accepted.accepted_revision, Some(initial.model_revision + 1));
             assert!(
@@ -1954,7 +1887,7 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
                 crate::task::WorkflowSnapshot::Execute { .. }
             ));
         } else {
-            tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+            async {
                 loop {
                     let plan = store.load_plan(plan_id)?.unwrap();
                     if plan.state == crate::plan::PlanState::AwaitingReview
@@ -1972,8 +1905,8 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
                     }
                     tokio::task::yield_now().await;
                 }
-            })
-            .await??;
+            }
+            .await?;
         }
         control
             .dispatch(&session_id, MockResponseCommand::Cancel { id: next_id })
@@ -2004,7 +1937,7 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
         )));
     }
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
 
     Ok(())
 }
@@ -2092,17 +2025,14 @@ async fn reattaching_current_plan_preserves_active_work_and_rejects_foreign_sour
             resumed_input.error.is_none() && !resumed_input.suspended,
             "reattach input resume rejected: {resumed_input:?}"
         );
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            control.dispatch(
+        control
+            .dispatch(
                 &session_id,
                 MockResponseCommand::Wait {
                     id: hold_id.clone(),
                 },
-            ),
-        )
-        .await
-        .context("reattach: waiting for held chat provider response")??;
+            )
+            .await?;
         let mut store = SqliteStore::open(&controller.data_root)?;
         let held_exchange = store.latest_exchange(&session_id)?.unwrap();
         let count = store.list_exchange(&session_id)?.len();
@@ -2141,9 +2071,8 @@ async fn reattaching_current_plan_preserves_active_work_and_rejects_foreign_sour
             serde_json::to_value(controller.task_controller.current()?.unwrap())?,
             serde_json::to_value(&before)?
         );
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: 44,
@@ -2153,10 +2082,8 @@ async fn reattaching_current_plan_preserves_active_work_and_rejects_foreign_sour
                     }),
                 },
                 &sink,
-            ),
-        )
-        .await
-        .context("reattach: applying current plan selection")??;
+            )
+            .await?;
         let selected = controller.task_controller.current()?.unwrap();
         let crate::task::WorkflowSnapshot::Plan { plan } = &selected.workflow else {
             panic!("saved plan action did not select a Plan task")
@@ -2191,17 +2118,16 @@ async fn reattaching_current_plan_preserves_active_work_and_rejects_foreign_sour
                 &sink,
             )
             .await?;
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             while controller.coordinator.execution.available_permits() == 0 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .context("reattach: waiting for Clear to collect execution")?;
+        }
+        .await;
         assert_eq!(store.list_exchange(&session_id)?.len(), count);
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+        reader.await??;
     }
     Ok(())
 }
@@ -2388,7 +2314,7 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
     drop(admission);
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
     Ok(())
 }
 
@@ -2461,30 +2387,25 @@ async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_ca
                 }),
                 input_control: InputControl::AtExecution,
             };
-            let completed = tokio::time::timeout(
-                crate::hang_guard::HANG_GUARD,
-                controller
-                    .exchange_owner
-                    .execute_identified(request.clone(), sink.clone()),
-            )
-            .await?
-            .with_context(|| {
-                format!(
-                    "task creation kind={kind:?} index={index}; input={:?}; task={:?}",
-                    controller.coordinator.submissions.snapshot(),
-                    controller.task_controller.current()
-                )
-            })?;
+            let completed = controller
+                .exchange_owner
+                .execute_identified(request.clone(), sink.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "task creation kind={kind:?} index={index}; input={:?}; task={:?}",
+                        controller.coordinator.submissions.snapshot(),
+                        controller.task_controller.current()
+                    )
+                })?;
             let CommandOutcome::Task(TaskCommandOutcome::Started { task, input, .. }) =
                 &completed.outcome
             else {
                 anyhow::bail!("task startup did not confirm its initial input handoff")
             };
-            tokio::time::timeout(
-                crate::hang_guard::HANG_GUARD,
-                script.dispatch(&session_id, MockResponseCommand::Wait { id: hold }),
-            )
-            .await??;
+            script
+                .dispatch(&session_id, MockResponseCommand::Wait { id: hold })
+                .await?;
             let current = controller.task_controller.current()?.unwrap();
             assert_eq!(current.kind(), kind);
             if let Some(plan) = previous_plan.as_ref() {
@@ -2518,13 +2439,10 @@ async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_ca
         }
         let before = controller.task_controller.current()?.unwrap();
         let (request, original) = first.unwrap();
-        let replay = tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            controller
-                .exchange_owner
-                .execute_identified(request, sink.clone()),
-        )
-        .await??;
+        let replay = controller
+            .exchange_owner
+            .execute_identified(request, sink.clone())
+            .await?;
         assert_eq!(original.sequence, replay.sequence);
         assert_eq!(
             controller.task_controller.current()?.unwrap().revision,
@@ -2536,16 +2454,13 @@ async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_ca
                 .len(),
             2
         );
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            controller
-                .exchange_owner
-                .execute_command(Command::CancelExchange(Default::default())),
-        )
-        .await??;
+        controller
+            .exchange_owner
+            .execute_command(Command::CancelExchange(Default::default()))
+            .await?;
         service.shutdown(Duration::from_secs(2)).await?;
         drop(sink);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+        reader.await??;
     }
     Ok(())
 }
@@ -2592,29 +2507,26 @@ async fn unfinished_plan_attachment_dispatches_once_and_reattach_keeps_running_w
         Ok::<(), anyhow::Error>(())
     });
     controller.attach_input(&sink).await?;
-    let result = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.exchange_owner.execute_identified(
+    let result = controller
+        .exchange_owner
+        .execute_identified(
             CommandRequest {
                 id: CommandId::new("attach-unfinished-plan")?,
                 command: Command::Task(TaskCommand::AttachPlan(source)),
                 input_control: InputControl::AtExecution,
             },
             sink.clone(),
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let CommandOutcome::Task(TaskCommandOutcome::Started {
         task, input, scope, ..
     }) = result.outcome
     else {
         anyhow::bail!("unfinished plan attachment did not confirm its model handoff")
     };
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        script.dispatch(&session_id, MockResponseCommand::Wait { id: hold }),
-    )
-    .await??;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold })
+        .await?;
     let current = controller.task_controller.current()?.unwrap();
     let crate::task::WorkflowSnapshot::Plan { plan } = &current.workflow else {
         anyhow::bail!("attachment changed workflow kind")
@@ -2627,18 +2539,17 @@ async fn unfinished_plan_attachment_dispatches_once_and_reattach_keeps_running_w
             .load_plan(&prepared.record.id)?
             .unwrap(),
     )?;
-    let confirmation = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.exchange_owner.execute_identified(
+    let confirmation = controller
+        .exchange_owner
+        .execute_identified(
             CommandRequest {
                 id: CommandId::new("confirm-running-attachment")?,
                 command: Command::Task(TaskCommand::AttachPlan(current_source)),
                 input_control: InputControl::AtExecution,
             },
             sink.clone(),
-        ),
-    )
-    .await??;
+        )
+        .await?;
     assert!(matches!(
         confirmation.outcome,
         CommandOutcome::Task(TaskCommandOutcome::Attached { .. })
@@ -2654,18 +2565,15 @@ async fn unfinished_plan_attachment_dispatches_once_and_reattach_keeps_running_w
     );
     assert!(!store.latest_exchange(&session_id)?.unwrap().is_finished());
     assert!(Arc::ptr_eq(&provider, &controller.provider_handle()));
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller
-            .exchange_owner
-            .execute_command(Command::Task(TaskCommand::Clear(TaskSelection::capture(
-                &still_current,
-            )))),
-    )
-    .await??;
+    controller
+        .exchange_owner
+        .execute_command(Command::Task(TaskCommand::Clear(TaskSelection::capture(
+            &still_current,
+        ))))
+        .await?;
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
     Ok(())
 }
 
@@ -2719,10 +2627,7 @@ async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Res
                 config: None,
                 intent: crate::input::InputIntent::Queue,
             })));
-    let (paused, accepted) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-        tokio::join!(replay, following)
-    })
-    .await?;
+    let (paused, accepted) = async { tokio::join!(replay, following) }.await;
     assert!(matches!(
         paused?.outcome,
         CommandOutcome::Task(TaskCommandOutcome::Paused { .. })

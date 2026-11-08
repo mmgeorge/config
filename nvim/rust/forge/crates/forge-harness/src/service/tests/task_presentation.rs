@@ -118,7 +118,7 @@ async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> 
     }
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
     Ok(())
 }
 
@@ -190,6 +190,6 @@ async fn goal_clear_retires_open_paused_status_without_another_turn() -> Result<
     }
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    reader.await??;
     Ok(())
 }

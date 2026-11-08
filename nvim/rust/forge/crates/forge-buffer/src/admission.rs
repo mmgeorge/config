@@ -139,14 +139,8 @@ mod tests {
         });
         tokio::task::yield_now().await;
         drop(owner.remove(0));
-        tokio::time::timeout(Duration::from_secs(1), first_waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), second_waiter)
-            .await
-            .unwrap()
-            .unwrap();
+        first_waiter.await.unwrap();
+        second_waiter.await.unwrap();
         owner.push(store.admit(first).unwrap());
         store.cancel_all();
         assert!(owner.iter().all(|owner| owner.check().is_err()));

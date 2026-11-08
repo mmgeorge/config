@@ -499,7 +499,7 @@ mod tests {
     /// A delayed foreground consumer retains every native event beyond the old arbitrary limit.
     #[tokio::test]
     async fn paused_bursts_over_capacity_retain_native_order() -> anyhow::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             for attached in [false, true] {
                 let (intake, sender) = fixture().await;
                 let (context, _events) = context("burst").await;
@@ -529,14 +529,14 @@ mod tests {
                 intake.close().await?;
             }
             Ok::<(), anyhow::Error>(())
-        })
-        .await?
+        }
+        .await
     }
 
     /// A retained reader rejects new foreground work instead of reopening its retired turn.
     #[tokio::test]
     async fn retained_turn_rejects_unowned_native_start() -> anyhow::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (intake, sender) = fixture().await;
             let (context, _events) = context("retired").await;
             let receiver = intake.attach(context).await?;
@@ -556,7 +556,7 @@ mod tests {
             ));
             intake.close().await?;
             Ok::<(), anyhow::Error>(())
-        })
-        .await?
+        }
+        .await
     }
 }

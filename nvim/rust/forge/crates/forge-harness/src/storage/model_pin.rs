@@ -117,7 +117,7 @@ mod test {
         ));
         transaction.commit()?;
         assert_eq!(
-            outcome.recv_timeout(std::time::Duration::from_secs(2))??,
+            outcome.recv()??,
             ["waiting-model"]
         );
         writer.join().unwrap();

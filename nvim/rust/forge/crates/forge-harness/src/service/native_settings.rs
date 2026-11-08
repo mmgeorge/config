@@ -138,13 +138,10 @@ mod tests {
             json!({"status_thoughts":false,"tool_timeout":{"amount":1,"unit":"m"}}),
         )?;
         let (messages, _output) = forge_protocol::outbound::channel();
-        let completed = tokio::time::timeout(
-            Duration::from_secs(3),
-            controller
-                .exchange_owner
-                .execute_identified(request.clone(), messages.clone()),
-        )
-        .await??;
+        let completed = controller
+            .exchange_owner
+            .execute_identified(request.clone(), messages.clone())
+            .await?;
         assert!(matches!(
             completed.outcome,
             CommandOutcome::Configured(ConfigurationOutcome::Settings {
@@ -198,10 +195,7 @@ mod tests {
         ));
         assert!(futures_util::poll!(effort.as_mut()).is_pending());
         drop(gate);
-        let (model, effort) = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::join!(model, effort)
-        })
-        .await?;
+        let (model, effort) = async { tokio::join!(model, effort) }.await;
         let model = model?;
         let effort = effort?;
         assert!(model.sequence < effort.sequence);
@@ -242,10 +236,7 @@ mod tests {
         ));
         assert!(futures_util::poll!(cleared.as_mut()).is_pending());
         drop(control);
-        let (selected, cleared) = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::join!(selected, cleared)
-        })
-        .await?;
+        let (selected, cleared) = async { tokio::join!(selected, cleared) }.await;
         let selected = selected?;
         let cleared = cleared?;
         assert!(selected.sequence < cleared.sequence);

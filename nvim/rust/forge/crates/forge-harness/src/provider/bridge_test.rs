@@ -545,7 +545,7 @@ async fn bridge(
 async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
 -> anyhow::Result<()> {
     let stage = std::sync::Mutex::new("open original");
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+    async {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
         let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
@@ -692,8 +692,7 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
         );
         assert!(original_sink.capabilities_changed(capabilities).await.is_err());
         Ok::<_, anyhow::Error>(())
-    })
-    .await.map_err(|error| anyhow::anyhow!("{error} at {}", *stage.lock().unwrap()))?
+    }.await
 }
 
 /// A retained fork must replay the original source and target even after caller settings change.
@@ -833,16 +832,17 @@ async fn unexpected_native_eof_retains_failed_close_for_retry() -> anyhow::Resul
     let binding = session.initialized.get().unwrap().binding.id.clone();
     native.close_native_stream(&binding);
 
-    let error = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
-        .await?
+    let error = events
+        .recv()
+        .await
         .expect_err("unexpected native EOF was not reported to the host stream");
     assert!(matches!(error, EventDeliveryError::Closed));
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while native.retire_calls.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     let _ = bridge.shutdown().await;
     Ok(())
@@ -975,17 +975,11 @@ async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()
         .clone();
     assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
     native.close_native_stream(&binding);
-    assert!(
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
-            .await?
-            .is_err()
-    );
-    let error = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        bridge.wait_watermark(&owner, forge_provider_api::EventSequence::new(1)),
-    )
-    .await?
-    .unwrap_err();
+    assert!(events.recv().await.is_err());
+    let error = bridge
+        .wait_watermark(&owner, forge_provider_api::EventSequence::new(1))
+        .await
+        .unwrap_err();
     assert!(matches!(error, ProviderError::Observation(_)));
     let _ = bridge.shutdown().await;
     Ok(())
@@ -1050,7 +1044,7 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     let opening = bridge.clone();
     let worker = tokio::spawn(async move { opening.thread_open(request).await });
     native.open_started.notified().await;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, bridge.shutdown()).await??;
+    bridge.shutdown().await?;
     let error = worker
         .await?
         .expect_err("shutdown must interrupt the held open");
@@ -1080,12 +1074,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
     let query =
         tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
     native.terminal_started.notified().await;
-    let error = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        bridge.session_close_owner(&owner),
-    )
-    .await?
-    .unwrap_err();
+    let error = bridge.session_close_owner(&owner).await.unwrap_err();
     assert!(
         matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadClose && failure.kind() == ProviderFailureKind::Runtime)
     );
@@ -1117,11 +1106,7 @@ async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> 
     );
     native.terminal_release.notify_one();
     query.await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        bridge.session_close_owner(&owner),
-    )
-    .await??;
+    bridge.session_close_owner(&owner).await?;
     assert_eq!(native.retire_calls.load(Ordering::Acquire), 2);
     assert!(!native.sinks.lock().unwrap().contains_key(&binding));
     assert!(!bridge.sessions.lock().await.contains_key(&owner));

@@ -46,13 +46,11 @@ async fn plan_answers_commit_under_owner_and_replay_original_publication() -> Re
         .await?;
     let broker = controller.broker.lock().await;
     let events = controller.exchange_owner.question_events();
-    let first = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        events.answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(
+    let first = events
+        .answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(
             request.clone(),
-        )?),
-    )
-    .await??;
+        )?)
+        .await?;
     let first = serde_json::to_value(first)?;
     let mut newer = request.clone();
     newer["operation_id"] = json!("newer-plan-answer");

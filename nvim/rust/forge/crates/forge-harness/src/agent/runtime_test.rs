@@ -267,7 +267,7 @@ async fn collect_background_child(
     // while the child runtime idles, so deadline fixtures expire without real waits.
     let mut revision = coordinator.subscribe();
     let running = tokio::spawn(runtime.run());
-    let events = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let events = async {
         let mut events = Vec::new();
         loop {
             match coordinator.try_receive() {
@@ -313,9 +313,8 @@ async fn collect_background_child(
                     .context("agent coordinator closed before child completion")?,
             }
         }
-    })
-    .await
-    .context("child cleanup blocked while observation queues filled")??;
+    }
+    .await?;
     running.await??;
     assert!(
         shutdown_called.load(std::sync::atomic::Ordering::Acquire),

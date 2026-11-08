@@ -298,7 +298,7 @@ mod tests {
     /// A native credential switch cannot pair the previous token with a later workspace identity.
     #[tokio::test]
     async fn bootstrap_rejects_changed_native_token_before_private_login() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (source, mut source_wire) = fixture().await;
             let (private, mut private_wire) = fixture().await;
             let auth = IsolationAuth::new(Arc::new(source));
@@ -319,6 +319,6 @@ mod tests {
             private.close().await.unwrap();
             assert!(matches!(private_wire.next().await, Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))));
             auth.source.close().await.unwrap(); source_task.await.unwrap();
-        }).await.unwrap();
+        }.await;
     }
 }

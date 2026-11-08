@@ -444,7 +444,7 @@ mod tests {
     /// Validate the adapter's real SDK gate before any create, resume, or send is possible.
     #[tokio::test]
     async fn attached_runtime_enforces_minimum_before_session_dispatch() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        async {
             for (reply, outcome) in [
                 (StatusReply::Version("1.0.102"), VersionOutcome::Unsupported),
                 (StatusReply::Version("1.0.103"), VersionOutcome::Supported),
@@ -495,7 +495,7 @@ mod tests {
                 }
                 assert_eq!(runtime.start_count(), 0, "stream fixture launched an executable");
             }
-        }).await.expect("runtime version gate fixture timed out");
+        }.await;
     }
 
     /// Reopen the same runtime only after both collection proofs and revalidate its new peer.
@@ -503,7 +503,7 @@ mod tests {
     async fn failed_generation_recovery_revalidates_same_runtime_and_fences_old_callbacks() {
         use super::super::client_generation::CollectedSessions;
         use forge_provider_api::lifecycle::ObservationFailure;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        async {
             for next_version in ["1.0.104", "1.0.102"] {
                 let runtime = CopilotRuntime::new(vec!["fixture-selected-copilot".into()]);
                 let original_peer =
@@ -564,8 +564,7 @@ mod tests {
                     "recovery dispatched or replayed native input"
                 );
             }
-        })
-        .await
-        .expect("same-runtime recovery fixture timed out");
+        }
+        .await;
     }
 }

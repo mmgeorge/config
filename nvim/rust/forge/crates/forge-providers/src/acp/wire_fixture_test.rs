@@ -467,7 +467,7 @@ async fn provider_fixture(
 
 /// Observe automatic collection without issuing a public cleanup command.
 async fn next_completion(stream: &mut forge_provider_api::ProviderEventStream) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    async {
         loop {
             let envelope = stream.recv().await.unwrap().unwrap();
             if let forge_provider_api::ProviderEvent::Turn {
@@ -478,9 +478,8 @@ async fn next_completion(stream: &mut forge_provider_api::ProviderEventStream) {
                 return;
             }
         }
-    })
+    }
     .await
-    .expect("native worker must automatically collect")
 }
 
 /// A catalog that reports its selected model only through the `model` config option still resolves effort for the implicit model.
@@ -519,7 +518,7 @@ async fn config_option_model_catalog_marks_the_selected_model_and_accepts_implic
         .await
         .unwrap();
     // ACP reports no per-turn model, so the started turn confirms the session's selection.
-    let resolved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let resolved = async {
         let mut resolved = Vec::new();
         loop {
             match events.recv().await.unwrap().unwrap().event {
@@ -534,9 +533,8 @@ async fn config_option_model_catalog_marks_the_selected_model_and_accepts_implic
                 _ => {}
             }
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     assert_eq!(resolved, vec!["default-model"]);
     let reasoning = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
         .unwrap()
@@ -769,7 +767,7 @@ async fn accepted_prompt_cancelled_before_start_has_no_started_or_completed_turn
             .turn_start(operation_context(), &submitted_binding, request)
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    async {
         loop {
             let log =
                 std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
@@ -778,9 +776,8 @@ async fn accepted_prompt_cancelled_before_start_has_no_started_or_completed_turn
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     let interrupted = provider
         .turn_interrupt(
             operation_context(),

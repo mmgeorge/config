@@ -88,7 +88,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     }));
     assert!(transaction.accepts_steering());
     transaction.native.authorize_submission();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if matches!(
                 transaction.next().await?,
@@ -97,8 +97,8 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
                 break Ok::<(), anyhow::Error>(());
             }
         }
-    })
-    .await??;
+    }
+    .await?;
     assert!(!transaction.accepts_steering());
     // A result owned by a steering effect must settle before terminal evidence is re-exposed.
     let flight = transaction.steering.pending_deliveries.retain();
@@ -106,7 +106,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     assert!(futures_util::FutureExt::now_or_never(transaction.next()).is_none());
     drop(flight);
     assert!(matches!(
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, transaction.next()).await??,
+        transaction.next().await?,
         ForegroundSignal::Native(NativeForegroundSignal::NativeReady(_))
     ));
     transaction.acknowledge_native_result();
@@ -490,11 +490,8 @@ impl BoundarySteeringProvider {
     }
 }
 
-async fn await_boundary_barrier(semaphore: &tokio::sync::Semaphore, name: &str) -> Result<()> {
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, semaphore.acquire())
-        .await
-        .with_context(|| format!("boundary fixture timed out waiting for {name}"))??
-        .forget();
+async fn await_boundary_barrier(semaphore: &tokio::sync::Semaphore) -> Result<()> {
+    semaphore.acquire().await?.forget();
     Ok(())
 }
 
@@ -671,7 +668,7 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
             .await;
         (broker, result)
     });
-    await_boundary_barrier(&provider.initial_started, "initial native start").await?;
+    await_boundary_barrier(&provider.initial_started).await?;
     let pending = lane.steer(crate::provider::SteeringInput::User {
         text: "Retain café 東京".into(),
         attachments: Vec::new(),
@@ -680,11 +677,9 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     tokio::pin!(pending);
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
     provider.initial_release.add_permits(1);
-    let (_broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running).await??;
+    let (_broker, result) = running.await?;
     assert!(result.is_err());
-    let rejected = tokio::time::timeout(crate::hang_guard::HANG_GUARD, pending)
-        .await?
-        .unwrap_err();
+    let rejected = pending.await.unwrap_err();
     assert!(matches!(
         rejected.downcast_ref::<crate::provider::ProviderError>(),
         Some(crate::provider::ProviderError::Cancelled)
@@ -708,7 +703,7 @@ async fn accepted_steering_survives_response_failure() -> Result<()> {
 #[tokio::test]
 async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Result<()> {
     for accept_before_cancel in [false, true] {
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        async {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -736,7 +731,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                     .await;
                 (broker, result)
             });
-            await_boundary_barrier(&provider.initial_started, "initial native start").await?;
+            await_boundary_barrier(&provider.initial_started).await?;
             let submission = journal.prepare_input(
                 &catalog,
                 ProviderInput::from_text("boundary correction"),
@@ -749,27 +744,19 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                 submission: Some(submission.clone()),
             }));
             assert!(futures_util::poll!(steering.as_mut()).is_pending());
-            await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
+            await_boundary_barrier(&provider.steering_deferred).await?;
             provider.initial_release.add_permits(1);
-            await_boundary_barrier(&provider.continuation_started, "continuation preparation")
-                .await?;
+            await_boundary_barrier(&provider.continuation_started).await?;
             if accept_before_cancel {
                 provider.continuation_accept.add_permits(1);
-                tokio::time::timeout(crate::hang_guard::HANG_GUARD, &mut steering)
-                    .await
-                    .context("boundary fixture timed out waiting for continuation acceptance")??;
+                (&mut steering).await?;
             }
             cancellation.request();
-            let (broker, result) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running)
-                .await
-                .context("boundary fixture timed out collecting cancelled invocation")??;
+            let (broker, result) = running.await?;
             assert!(result.is_err());
             if !accept_before_cancel {
                 assert!(
-                    tokio::time::timeout(crate::hang_guard::HANG_GUARD, steering)
-                        .await
-                        .context("boundary fixture timed out resolving unaccepted input")?
-                        .is_err(),
+                    steering.await.is_err(),
                     "unaccepted steering was acknowledged after cancellation"
                 );
             }
@@ -793,14 +780,14 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                 usize::from(accept_before_cancel)
             );
             Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        }
+        .await?;
     }
     Ok(())
 }
 
 async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+    async {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -818,7 +805,7 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
             (broker, result)
         });
         tokio::select! {
-            started = await_boundary_barrier(&provider.initial_started, "initial native start") => started?,
+            started = await_boundary_barrier(&provider.initial_started) => started?,
             finished = &mut running => {
                 let (_, result) = finished?;
                 anyhow::bail!("boundary foreground ended before initial native start: {result:?}");
@@ -830,10 +817,10 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
             text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));
         assert!(futures_util::poll!(steering.as_mut()).is_pending());
-        await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
+        await_boundary_barrier(&provider.steering_deferred).await?;
         provider.initial_release.add_permits(1);
         tokio::select! {
-            prepared = await_boundary_barrier(&provider.continuation_started, "continuation preparation") => prepared?,
+            prepared = await_boundary_barrier(&provider.continuation_started) => prepared?,
             finished = &mut running => {
                 let (_, result) = finished?;
                 anyhow::bail!("foreground ended before continuation preparation: {result:?}");
@@ -843,11 +830,11 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         assert!(futures_util::poll!(steering.as_mut()).is_pending(),
             "a continuation was acknowledged while its journal still allowed requeueing");
         provider.continuation_accept.add_permits(1);
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, steering).await.context("boundary fixture timed out waiting for continuation acceptance")??;
+        steering.await?;
         assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { .. }));
         assert!(!running.is_finished(), "steering acknowledgement waited for the full provider response");
         provider.continuation_release.add_permits(1);
-        let (broker, result) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, running).await.context("boundary fixture timed out collecting continuation")??;
+        let (broker, result) = running.await?;
         if fail_response { assert!(result.is_err()); } else { result?; }
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1, "steering created a second exchange");
@@ -855,7 +842,7 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
             crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.text == "boundary correction" && prompt.id == "boundary-message")).count(), 1);
         assert_eq!(*provider.input.lock().unwrap(), ["initial request", "boundary correction"]);
         Ok::<(), anyhow::Error>(())
-    }).await?
+    }.await
 }
 
 /// Hold native steering admission while the original provider turn keeps running.
@@ -914,7 +901,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
             .await
     });
     tokio::select! {
-        started = await_boundary_barrier(&provider.inner.initial_started, "initial native start") => started?,
+        started = await_boundary_barrier(&provider.inner.initial_started) => started?,
         finished = &mut running => {
             anyhow::bail!("slow steering foreground ended before initial native start: {:?}", finished?);
         }
@@ -932,7 +919,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     }));
     assert!(futures_util::poll!(steering.as_mut()).is_pending());
     tokio::select! {
-        started = await_boundary_barrier(&provider.steering_started, "native steering admission") => started?,
+        started = await_boundary_barrier(&provider.steering_started) => started?,
         finished = &mut running => {
             anyhow::bail!("slow steering foreground ended before native steering admission: {:?}", finished?);
         }
@@ -956,9 +943,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
         tokio::time::timeout(std::time::Duration::from_secs(1), steering.as_mut()).await;
     cancellation.request();
     provider.inner.initial_release.add_permits(1);
-    let _cancelled = tokio::time::timeout(crate::hang_guard::HANG_GUARD, running)
-        .await
-        .context("steering fixture execution did not collect after cancellation")??;
+    let _cancelled = running.await?;
 
     delivered.context("steering was abandoned before its acknowledgment deadline")??;
     assert!(matches!(

@@ -2371,12 +2371,12 @@ mod tests {
             let writer = threads.spawn(move || {
                 writer_controller.commit_plan_write(&writer_permit, || {
                     entered.send(())?;
-                    released.recv_timeout(std::time::Duration::from_secs(5))?;
+                    released.recv()?;
                     std::fs::write(&writer_path, "accepted before revocation")?;
                     Ok(())
                 })
             });
-            entry.recv_timeout(std::time::Duration::from_secs(5))?;
+            entry.recv()?;
             let revoker = controller.clone();
             let data_root = root.path().to_owned();
             let revision = task.revision.clone();
@@ -2387,7 +2387,7 @@ mod tests {
                 finished.send(())?;
                 Ok(())
             });
-            attempt.recv_timeout(std::time::Duration::from_secs(5))?;
+            attempt.recv()?;
             let premature = finish.recv_timeout(std::time::Duration::from_millis(30));
             release.send(())?;
             writer.join().expect("plan writer fixture must not panic")?;

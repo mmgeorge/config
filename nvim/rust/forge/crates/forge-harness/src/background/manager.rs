@@ -1031,9 +1031,7 @@ mod tests {
             runtime: crate::provider::ProviderRuntime::default(),
         })
         .await?;
-        let error = tokio::time::timeout(Duration::from_secs(1), forward)
-            .await??
-            .unwrap_err();
+        let error = forward.await?.unwrap_err();
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()

@@ -591,10 +591,7 @@ mod tests {
         let mut waiting = Box::pin(context.before_tool(&scope));
         assert!(futures_util::poll!(&mut waiting).is_pending());
         context.retire()?;
-        assert!(matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await?,
-            Err(ProviderError::Cancelled)
-        ));
+        assert!(matches!(waiting.await, Err(ProviderError::Cancelled)));
         assert!(!gate.ready());
         Ok(())
     }

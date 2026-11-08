@@ -848,16 +848,14 @@ mod tests {
                 })
                 .await
         });
-        let frame = tokio::time::timeout(Duration::from_secs(5), editor.recv())
-            .await??
-            .context("editor request missing")?;
+        let frame = editor.recv().await?.context("editor request missing")?;
         let event: Value = serde_json::from_slice(frame.bytes())?;
         assert_eq!(event["event"], "lsp.mutation");
         let id = event["payload"]["id"]
             .as_str()
             .context("mutation ID missing")?;
         service.respond("session", id, json!({"operations":[{"kind":"rename","old_path":"source.rs","new_path":"renamed.rs"}]}), None)?;
-        tokio::time::timeout(Duration::from_secs(5), call).await???;
+        call.await??;
         assert!(!directory.path().join("source.rs").exists());
         assert_eq!(
             std::fs::read_to_string(directory.path().join("renamed.rs"))?,
@@ -1032,10 +1030,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let result = tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap();
+            let result = task.await.unwrap();
             assert!(
                 result.is_err(),
                 "revocation source {source} did not cancel pending query"

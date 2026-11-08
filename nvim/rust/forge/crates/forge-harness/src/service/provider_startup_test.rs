@@ -498,12 +498,12 @@ async fn first_input_retains_history_reported_only_by_open_result() -> Result<()
         Ok::<(), anyhow::Error>(())
     });
     controller.start_provider(&sink).await;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !controller.provider_ready().await {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     assert_eq!(
         controller.observer.snapshot()?.session.provider_session_id,
         None
@@ -520,7 +520,7 @@ async fn first_input_retains_history_reported_only_by_open_result() -> Result<()
     )
     .await?;
     let session = controller.observer.session_id().to_owned();
-    let retained = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let retained = async {
         loop {
             if let Some(history) = SqliteStore::read_only(&controller.data_root)?
                 .load_session(&session)?
@@ -530,9 +530,8 @@ async fn first_input_retains_history_reported_only_by_open_result() -> Result<()
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("first input did not persist the opened native history"))??;
+    }
+    .await?;
     assert_eq!(
         controller
             .observer

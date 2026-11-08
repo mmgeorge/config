@@ -174,10 +174,7 @@ async fn preparation_waits_for_earlier_staging_before_capturing_commit_index() {
             .all(|target| target.completion == TargetCompletion::Completed)
     );
     service.acknowledge(outcome.operation).unwrap();
-    let intent = tokio::time::timeout(Duration::from_secs(10), preparing)
-        .await
-        .unwrap()
-        .unwrap();
+    let intent = preparing.await.unwrap();
     let committed = service.submit(intent).unwrap().finish().await.unwrap();
     assert!(
         committed
@@ -473,16 +470,15 @@ async fn cancelled_waiter_keeps_recoverable_outcome_until_acknowledged() {
     drop(ticket);
     guard.finish(OperationCompletion::Completed).unwrap();
     store.writes.take_receipt(blocker);
-    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+    let outcome = async {
         loop {
             if let Some(outcome) = service.outcome(operation) {
                 break outcome;
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     assert_eq!(outcome.target[0].completion, TargetCompletion::NotStarted);
     assert_eq!(store.writes.usage().operations, 1);
     assert_eq!(

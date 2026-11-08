@@ -3079,11 +3079,7 @@ mod tests {
         assert!(store.admit(id.clone()).is_err());
         assert!(!close.is_finished());
         drop(admission);
-        tokio::time::timeout(std::time::Duration::from_secs(1), close)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        close.await.unwrap().unwrap();
         assert!(store.admit(id).is_ok());
     }
 

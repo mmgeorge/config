@@ -138,10 +138,7 @@ mod tests {
         );
         assert!(futures_util::poll!(cancel.as_mut()).is_pending());
         drop(gate);
-        let (first, second, cancel) = tokio::time::timeout(Duration::from_secs(3), async {
-            tokio::join!(first, second, cancel)
-        })
-        .await?;
+        let (first, second, cancel) = async { tokio::join!(first, second, cancel) }.await;
         let first = first?;
         let second = second?;
         let cancel = cancel?;

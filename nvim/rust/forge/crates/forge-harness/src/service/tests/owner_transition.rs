@@ -178,7 +178,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                         ),
                     })
                     .await?;
-                    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+                    async {
                         loop {
                             let snapshot = controller
                                 .observer
@@ -191,9 +191,8 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                             }
                             tokio::task::yield_now().await;
                         }
-                    })
-                    .await
-                    .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)??;
+                    }
+                    .await?;
                     Ok(())
                 }
             });
@@ -226,14 +225,14 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
     });
     let scenario = async {
         controller.start_provider(&sink).await;
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        async {
             while !controller.provider_ready().await { tokio::task::yield_now().await; }
-        }).await.context("tool toggle provider did not become ready")?;
+        }.await;
         controller.attach_input(&sink).await?;
         prompt::apply(&controller, Request { id: 70, method: "session.prompt.submit".into(),
             params: json!({"operation_id":"tool-toggle-original","text":"Hold this initialized invocation"}),
         }, &sink).await?;
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, invoked.notified()).await?;
+        invoked.notified().await;
 
         let owner = crate::provider::ThreadOwner::root(controller.observer.session_id());
         let original = native.event_sink(&owner).await?;
@@ -247,9 +246,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 method: "session.command.apply".into(),
                 params: json!({"operation_id":operation,"action":"configure","config":{"session_tools":enabled}}),
             })?;
-            let completed = tokio::time::timeout( crate::hang_guard::HANG_GUARD,
-                controller.exchange_owner.execute_identified(command, sink.clone()),
-            ).await.context("tool toggle did not commit")??;
+            let completed = controller.exchange_owner.execute_identified(command, sink.clone()).await?;
             ensure!(matches!(completed.outcome, CommandOutcome::Configured(ConfigurationOutcome::Settings { .. })), "tool toggle lost its committed result");
             ensure!(controller.observer.snapshot()?.session_tools == enabled, "tool toggle did not publish committed settings");
             ensure!(!controller.task_controller.configuration_is_uncertain(), "successful tool toggle fenced configuration");
@@ -262,8 +259,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 ensure!(SqliteStore::read_only(&controller.data_root)?.load_session(controller.observer.session_id())?.unwrap().provider_session_id.as_deref() == Some(history), "configured history was not durable");
             }
             if matches!(boundary, SessionToolToggleBoundary::Prepared) && !enabled {
-                let (scope, tools) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, preparation.recv())
-                    .await?.context("configured continuation did not reach retained preparation")?;
+                let (scope, tools) = preparation.recv().await.context("configured continuation did not reach retained preparation")?;
                 ensure!(scope.owner() == owner && !tools.contains(&"harness_session_list"), "retained preparation used stale tool configuration");
                 ensure!(dispatched.load(Ordering::Acquire) == 1, "prepared continuation reached native handoff before collection");
                 continue;
@@ -274,7 +270,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
             prompt::apply(&controller, Request { id: 72, method: "session.prompt.submit".into(),
                 params: json!({"operation_id":format!("{operation}-followup"),"text":text}),
             }, &sink).await?;
-            tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+            async {
                 loop {
                     let observed = observations.lock().unwrap().iter().find(|(_, input, _)| {
                         matches!(input, forge_provider_api::input::PromptInput::Text(value) if value.contains(text))
@@ -286,7 +282,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                     }
                     tokio::task::yield_now().await;
                 }
-            }).await.context("follow-up input did not reuse configured binding")??;
+            }.await?;
         }
         Ok::<(), anyhow::Error>(())
     }.await;
@@ -296,12 +292,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
     let cleanup = async {
         controller.input_stopping.store(true, Ordering::Release);
         controller.coordinator.submissions.changed.notify_one();
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            controller.finish_exchange_owner(),
-        )
-        .await
-        .context("tool toggle owner shutdown did not settle")??;
+        controller.finish_exchange_owner().await?;
         provider_fixture
             .provider_handle()
             .shutdown()
@@ -374,12 +365,8 @@ async fn owner_model_changes_precede_pause_and_preserve_transcript() -> Result<(
             .execute_identified(pause, fixture.sink.clone()),
     );
     assert!(futures_util::poll!(paused.as_mut()).is_pending());
-    let completed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-        tokio::join!(first, second, paused)
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|(first, second, paused)| Ok((first?, second?, paused?)));
+    let (first, second, paused) = tokio::join!(first, second, paused);
+    let completed = (|| -> Result<_> { Ok((first?, second?, paused?)) })();
     let (first, second, paused) = match completed {
         Ok(completed) => completed,
         Err(error) => return Err(retain_owner_transition_failure(fixture, error)),
@@ -490,7 +477,7 @@ async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Re
             id: 700, method: "session.prompt.submit".into(),
             params: json!({"operation_id":"first-before-acceptance","text":"First prompt"}),
         }, &sink).await?;
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, preparation.recv()).await?
+        preparation.recv().await
             .context("first input never reached pre-acceptance preparation")?;
         controller.exchange_owner.execute_command(Command::CancelExchange(CancelExchangeRequest {
             input: CancelledInputPolicy::RestoreIfUnconsumed,
@@ -552,7 +539,7 @@ async fn owner_two_model_changes_then_cancel_settles_latest_retained_work_once()
             input_control: InputControl::AtExecution,
         }, fixture.sink.clone()));
         assert!(futures_util::poll!(cancellation.as_mut()).is_pending());
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        async {
             loop {
                 let first = fixture.controller.exchange_owner.command_status(CommandId::new(ids[0])?).await?;
                 let second = fixture.controller.exchange_owner.command_status(CommandId::new(ids[1])?).await?;
@@ -564,11 +551,11 @@ async fn owner_two_model_changes_then_cancel_settles_latest_retained_work_once()
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.context("configuration/cancel intents did not remain in FIFO order")??;
+        }.await?;
         drop(barrier);
-        let (first, second, cancellation) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        let (first, second, cancellation) = async {
             tokio::join!(first, second, cancellation)
-        }).await.context("two model changes then cancel waited for held generation acknowledgments")?;
+        }.await;
         let (first, second, cancellation) = (first?, second?, cancellation?);
         ensure!(first.sequence < second.sequence && second.sequence < cancellation.sequence, "configuration and cancel completion receipts lost FIFO order");
         ensure!(matches!(first.outcome, CommandOutcome::Configured(ConfigurationOutcome::Settings { .. })), "first model change lost its own result");
@@ -692,9 +679,9 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
     });
     let scenario = async {
         controller.start_provider(&sink).await;
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        async {
             while !controller.provider_ready().await { tokio::task::yield_now().await; }
-        }).await.context("provider readiness timed out")?;
+        }.await;
         controller.attach_input(&sink).await?;
         controller.task_controller.change(&mut SqliteStore::open(&controller.data_root)?, None,
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
@@ -703,17 +690,15 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
         prompt::apply(&controller, Request { id: 50, method: "session.prompt.submit".into(),
             params: json!({"operation_id":"retained-original","text":"Keep original accepted history"}),
         }, &sink).await?;
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, invoked.notified()).await?;
+        invoked.notified().await;
         let session = controller.observer.session_id();
         let original = SqliteStore::read_only(&controller.data_root)?.latest_exchange(session)?.unwrap().id;
         let configure = |id: &str, model: &str| native_settings::decode_command(&Request {
             id: 51, method: "session.command.apply".into(),
             params: json!({"operation_id":id,"action":"configure","config":{"model":model}}),
         });
-        let first = tokio::time::timeout( crate::hang_guard::HANG_GUARD,
-            controller.exchange_owner.execute_identified(configure("retained-model-a", "mock-model")?, sink.clone()),
-        ).await.context("model A waited for replacement handoff")??;
-        let held = tokio::time::timeout( crate::hang_guard::HANG_GUARD, preparation.recv()).await?
+        let first = controller.exchange_owner.execute_identified(configure("retained-model-a", "mock-model")?, sink.clone()).await?;
+        let held = preparation.recv().await
             .context("configured successor never reached held preparation")?;
         ensure!(held.exchange_id.as_str() == original, "preparation changed exchange identity");
         ensure!(matches!(first.outcome, CommandOutcome::Configured(ConfigurationOutcome::Settings {
@@ -727,9 +712,9 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
             command: Command::CancelExchange(CancelExchangeRequest::default()),
             input_control: InputControl::AtExecution,
         }, sink.clone());
-        let (second, cancel) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        let (second, cancel) = async {
             tokio::join!(second, cancel)
-        }).await.context("queued configuration/cancel waited for undispatched replacement")?;
+        }.await;
         let (second, cancel) = (second?, cancel?);
         ensure!(first.sequence < second.sequence && second.sequence < cancel.sequence, "retained work lost FIFO order");
         ensure!(matches!(second.outcome, CommandOutcome::Configured(ConfigurationOutcome::Settings {
@@ -753,11 +738,7 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
     }
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.finish_exchange_owner(),
-    )
-    .await??;
+    controller.finish_exchange_owner().await?;
     provider_fixture.provider_handle().shutdown().await?;
     controller.finish_session_events().await?;
     reader.abort();
@@ -775,14 +756,11 @@ async fn owner_invalid_model_rejects_before_collection_and_preserves_queue() -> 
         method: "session.command.apply".into(),
         params: json!({"operation_id":"owner-invalid-model","action":"configure","config":{"model":"missing-owner-model"}}),
     })?;
-    let outcome = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        fixture
-            .controller
-            .exchange_owner
-            .execute_identified(rejected, fixture.sink.clone()),
-    )
-    .await?;
+    let outcome = fixture
+        .controller
+        .exchange_owner
+        .execute_identified(rejected, fixture.sink.clone())
+        .await;
     assert_eq!(
         outcome
             .as_ref()
@@ -825,14 +803,11 @@ async fn owner_invalid_model_rejects_before_collection_and_preserves_queue() -> 
         method: "session.command.apply".into(),
         params: json!({"operation_id":"owner-valid-model-after-rejection","action":"configure","config":{"model":"mock-model"}}),
     })?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        fixture
-            .controller
-            .exchange_owner
-            .execute_identified(valid, fixture.sink.clone()),
-    )
-    .await??;
+    fixture
+        .controller
+        .exchange_owner
+        .execute_identified(valid, fixture.sink.clone())
+        .await?;
     assert_eq!(
         fixture.controller.observer.snapshot()?.session.model,
         "mock-model"
@@ -889,18 +864,14 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
         .as_str()
         .context("spawned child identity missing")?
         .to_owned();
-    let arrived = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        script.dispatch(
+    let arrived = script
+        .dispatch(
             &fixture.session,
             MockResponseCommand::Wait {
                 id: child_hold["id"].as_str().unwrap().into(),
             },
-        ),
-    )
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result);
+        )
+        .await;
     let arrived = match arrived {
         Ok(arrived) => arrived,
         Err(error) => {
@@ -925,16 +896,12 @@ async fn owner_permission_change_collects_child_before_replacement() -> Result<(
         method: "session.command.apply".into(),
         params: json!({"operation_id":"owner-collect-child","action":"permission","change":{"kind":"set_approval","mode":"deny"}}),
     })?;
-    let completed = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        fixture
-            .controller
-            .exchange_owner
-            .execute_identified(command, fixture.sink.clone()),
-    )
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result.map_err(anyhow::Error::from));
+    let completed = fixture
+        .controller
+        .exchange_owner
+        .execute_identified(command, fixture.sink.clone())
+        .await
+        .map_err(anyhow::Error::from);
     if let Err(error) = completed {
         return Err(retain_owner_transition_failure(
             fixture,
@@ -1072,12 +1039,12 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
             .exchange_owner
             .execute_identified(command, sink.clone()),
     );
-    let entered = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+    let entered = async {
         tokio::select! {
             result = &mut operation => Err(anyhow::anyhow!("cleanup unexpectedly completed before barrier: {result:?}")),
             () = started.notified() => Ok(()),
         }
-    }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    }.await;
     if let Err(error) = entered {
         return Err(retain_cleanup_failure(
             root,
@@ -1109,13 +1076,7 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
     release.add_permits(1);
     controller.input_stopping.store(true, Ordering::Release);
     controller.coordinator.submissions.changed.notify_one();
-    let finished = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.finish_exchange_owner(),
-    )
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result);
+    let finished = controller.finish_exchange_owner().await;
     if let Err(error) = finished {
         return Err(retain_cleanup_failure(
             root,
@@ -1166,7 +1127,7 @@ async fn owner_conversation_rollback_collects_selected_live_work() -> Result<()>
             .execute_identified(request, fixture.sink.clone()),
     );
     assert!(futures_util::poll!(result.as_mut()).is_pending());
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, result).await??;
+    result.await?;
     assert!(fixture.engine.active_invocation_snapshot()?.is_none());
     assert_eq!(
         SqliteStore::read_only(&fixture.controller.data_root)?
@@ -1221,7 +1182,7 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
     sibling.attach_input(&fixture.sink).await?;
     prompt::apply(&sibling, Request { id: 701, method: "session.prompt.submit".into(),
         params: json!({"operation_id":"shared-sibling-input","text":"Keep running while another session closes"}) }, &fixture.sink).await?;
-    let result = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let result = async {
         script
             .dispatch(
                 &sibling_record.id,
@@ -1259,10 +1220,8 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result);
+    }
+    .await;
     if let Err(error) = result {
         return Err(retain_owner_transition_failure(
             fixture,
@@ -1304,31 +1263,19 @@ async fn owner_shutdown_collects_while_prompt_ui_output_is_saturated() -> Result
         prompt::apply(&controller, Request { id: 9001, method: "session.prompt.submit".into(),
             params: json!({"operation_id":"saturated-prompt","input_id":"saturated-prompt-input","text":"Retain this accepted input","queued":true}) }, &prompt_output).await
     });
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, attempting_output.notified())
-        .await
-        .context("prompt never reached its saturated UI output boundary")?;
+    attempting_output.notified().await;
     assert!(
         !output.is_closed(),
         "fixture must retain a live backpressured observer"
     );
     assert!(fixture.engine.active_invocation_snapshot()?.is_some());
-    let shutdown = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        fixture.service.shutdown(Duration::from_secs(5)),
-    )
-    .await
-    .context("UI backpressure prevented lifecycle shutdown collection")
-    .and_then(|result| result);
+    let shutdown = fixture.service.shutdown(Duration::from_secs(5)).await;
     if let Err(error) = shutdown {
         return Err(retain_owner_transition_failure(fixture, error));
     }
     assert!(fixture.engine.active_invocation_snapshot()?.is_none());
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, prompt)
-        .await
-        .context(
-            "presentation observer retained the service activity after input acceptance",
-        )???;
-    let response = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    prompt.await??;
+    let response = async {
         loop {
             let frame = receiver
                 .recv()
@@ -1339,9 +1286,8 @@ async fn owner_shutdown_collects_while_prompt_ui_output_is_saturated() -> Result
                 return Ok::<_, anyhow::Error>(value);
             }
         }
-    })
-    .await
-    .context("retained UI output was lost during shutdown")??;
+    }
+    .await?;
     assert_eq!(response["result"]["accepted"], true);
     assert_eq!(response["result"]["input_id"], "saturated-prompt-input");
     fixture.reader.abort();
@@ -1380,7 +1326,7 @@ async fn owner_starts_one_fifo_command_per_update_after_committed_completion() -
             request(ids[2], Command::ConfigureSession(ConfigurationChange::Permission(
                 PermissionChange::SetCheckEditing { enabled: false })))?, &fixture.sink));
         assert!(futures_util::poll!(disabled.as_mut()).is_pending());
-        tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        async {
             loop {
                 let first = fixture.controller.exchange_owner.command_status(CommandId::new(ids[0])?).await?;
                 let second = fixture.controller.exchange_owner.command_status(CommandId::new(ids[1])?).await?;
@@ -1392,11 +1338,11 @@ async fn owner_starts_one_fifo_command_per_update_after_committed_completion() -
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.context("owner did not retain asynchronous collection ahead of queued local commands")??;
+        }.await?;
         drop(collection_barrier);
-        let (cancelled, enabled, disabled) = tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+        let (cancelled, enabled, disabled) = async {
             tokio::join!(cancelled, enabled, disabled)
-        }).await.context("owner did not finish queued commands after collection was released")?;
+        }.await;
         let (cancelled, enabled, disabled) = (cancelled?, enabled?, disabled?);
         ensure!(cancelled.sequence < enabled.sequence && enabled.sequence < disabled.sequence, "completion receipts lost FIFO sequence");
         ensure!(matches!(cancelled.outcome, CommandOutcome::Cancelled(_)), "collection did not finish cancellation");

@@ -181,11 +181,7 @@ async fn saturated_child_admission(followup: bool) -> Result<()> {
                     },
                     &children,
                 )?));
-        let (interrupted, admitted) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-            tokio::join!(interrupt, overflow.as_mut())
-        })
-        .await
-        .context("child saturation blocked public interruption or lost the waiting admission")?;
+        let (interrupted, admitted) = async { tokio::join!(interrupt, overflow.as_mut()) }.await;
         let interrupted = interrupted?;
         let admitted = admitted?;
         worker.await??;

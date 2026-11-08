@@ -188,10 +188,7 @@ mod tests {
             10
         );
         drop(gate);
-        let (cancelled, configured) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(cancel, configure)
-        })
-        .await?;
+        let (cancelled, configured) = async { tokio::join!(cancel, configure) }.await;
         cancelled?;
         configured?;
         assert_eq!(

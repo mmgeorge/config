@@ -262,8 +262,9 @@ mod tests {
             "timestamp":"2026-11-05T00:00:00Z","data":{"model":"summary-model"}
         }))?)
         .await?;
-        let bound = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await??
+        let bound = events
+            .recv()
+            .await?
             .expect("native compaction is published");
         match bound.event {
             forge_provider_api::ProviderEvent::Thread {

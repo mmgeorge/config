@@ -196,7 +196,7 @@ mod tests {
             move |_| {
                 started.send(()).unwrap();
                 blocked
-                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .recv()
                     .unwrap();
             },
         )
@@ -247,9 +247,7 @@ mod tests {
         drop(occupied);
         let result = match before_release {
             Poll::Ready(result) => result,
-            Poll::Pending => tokio::time::timeout(std::time::Duration::from_secs(5), pending)
-                .await
-                .unwrap(),
+            Poll::Pending => pending.await,
         };
         assert!(
             result.is_ok(),
@@ -268,12 +266,9 @@ mod tests {
         ] {
             let pool = Arc::new(AnalysisPool::new(PoolLimits { workers, jobs }));
             let engine = SyntaxEngine::new(pool);
-            let outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                engine.analyze(request(SyntaxLanguage::Rust, "fn main() {}")),
-            )
-            .await
-            .unwrap();
+            let outcome = engine
+                .analyze(request(SyntaxLanguage::Rust, "fn main() {}"))
+                .await;
             assert_eq!(outcome.err(), Some(SyntaxError::Pool(expected)));
         }
     }

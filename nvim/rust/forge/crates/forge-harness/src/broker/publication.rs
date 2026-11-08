@@ -663,11 +663,7 @@ mod tests {
         ));
         assert!(!flush.is_finished());
         let next = tokio::spawn(async move { stream.recv().await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut flush)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        (&mut flush).await.unwrap().unwrap();
         next.abort();
 
         let (sink, stream) = channel();

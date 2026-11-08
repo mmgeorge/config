@@ -1959,14 +1959,9 @@ mod tests {
             };
             if abandoned {
                 drop(job);
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    registry.collect_cleanup(),
-                )
-                .await??;
+                registry.collect_cleanup().await?;
             } else {
-                let result =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), job.run()).await?;
+                let result = job.run().await;
                 assert!(matches!(result.outcome?, BaselineDisposition::Retained));
             }
             assert_eq!(

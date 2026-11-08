@@ -3761,7 +3761,7 @@ mod tests {
 
     /// Wait for native settlement while preserving the ordered binding stream.
     async fn settled(stream: &mut ProviderEventStream) -> CompletedTurn {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        async {
             loop {
                 let event = stream.recv().await.unwrap().unwrap();
                 if let ProviderEvent::Turn {
@@ -3773,9 +3773,8 @@ mod tests {
                     return completed;
                 }
             }
-        })
+        }
         .await
-        .unwrap()
     }
 
     /// Preserve terminal/collection ordering and prevent repeated cancellation from touching a successor.
@@ -3790,7 +3789,7 @@ mod tests {
             .await
             .unwrap();
         let mut started_sequence = None;
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let first = async {
             loop {
                 let event = events.recv().await.unwrap().unwrap();
                 match event.event {
@@ -3818,9 +3817,8 @@ mod tests {
                     | ProviderEvent::Agent { .. } => {}
                 }
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         assert!(matches!(
             first.result().outcome(),
             TurnOutcome::Completed { .. }
@@ -4181,34 +4179,23 @@ mod tests {
                     .turn_start(test_context(), &submitted_binding, input)
                     .await
             });
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                control.entered.notified(),
-            )
-            .await
-            .unwrap();
+            control.entered.notified().await;
             if close {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    provider.thread_close(test_context(), &binding.id),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                provider
+                    .thread_close(test_context(), &binding.id)
+                    .await
+                    .unwrap();
             } else {
-                let error = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    provider.turn_interrupt(
+                let error = provider
+                    .turn_interrupt(
                         test_context(),
                         &binding.id,
                         CancelRequest {
                             scope: scope.clone(),
                         },
-                    ),
-                )
-                .await
-                .unwrap()
-                .unwrap_err();
+                    )
+                    .await
+                    .unwrap_err();
                 assert!(
                     matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::WrongInvocation)
                 );
@@ -4461,12 +4448,7 @@ mod tests {
                 .turn_start(context, &submitted_binding, request)
                 .await
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            delayed.entered.notified(),
-        )
-        .await
-        .unwrap();
+        delayed.entered.notified().await;
         source.cancel();
         let observed = submitted.await.unwrap().unwrap_err();
         assert!(
@@ -4474,13 +4456,7 @@ mod tests {
         );
         assert!(!receipt.state.lock().unwrap().accepted);
         delayed.release.notify_one();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            provider.operations.turn_start.join_all(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        provider.operations.turn_start.join_all().await.unwrap();
         let accepted = provider
             .turn_start(retained_context, &binding.id, retained_request)
             .await

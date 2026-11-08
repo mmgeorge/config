@@ -249,7 +249,7 @@ async fn repository_users_distinguish_empty_pages_from_invalid_pages() -> Result
 }
 
 async fn started(root: &Path, count: usize) -> Result<Vec<PathBuf>> {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    async {
         loop {
             let marker = fs::read_dir(root)?
                 .filter_map(|entry| entry.ok())
@@ -266,8 +266,8 @@ async fn started(root: &Path, count: usize) -> Result<Vec<PathBuf>> {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?
+    }
+    .await
 }
 
 #[tokio::test]
@@ -478,7 +478,7 @@ async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() 
         caller.abort();
         let _ = caller.await;
     }
-    tokio::time::timeout(Duration::from_secs(3), &mut waiting).await??;
+    (&mut waiting).await?;
     assert_eq!(started(root.path(), 5).await?.len(), 5);
     client.shutdown(Duration::from_secs(2)).await?;
     Ok(())
@@ -557,12 +557,12 @@ async fn inherited_pipe_handles_retain_admission_until_the_readers_exit() -> Res
         tokio::spawn(async move { client.read_issues(request()).await })
     };
     started(root.path(), 1).await?;
-    tokio::time::timeout(Duration::from_secs(3), async {
+    async {
         while !root.path().join("descendant.ready").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    }
+    .await;
     caller.abort();
     let _ = caller.await;
     assert!(client.shutdown(Duration::ZERO).await.is_err());
@@ -668,12 +668,12 @@ async fn abandoned_pr_caller_retains_native_write_and_fifo_ownership_until_colle
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(3), async {
+    async {
         while !root.path().join("mutation-started").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    }
+    .await;
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     let queued = {
@@ -732,12 +732,12 @@ async fn shutdown_rejects_queued_mutations_and_retains_the_active_native_owner()
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(3), async {
+    async {
         while !root.path().join("mutation-started").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    }
+    .await;
     let waiting = {
         let service = service.clone();
         let client = client.clone();
@@ -907,12 +907,12 @@ async fn field_edits_and_lifecycle_changes_share_fifo_native_ownership() -> Resu
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(3), async {
+    async {
         while !root.path().join("mutation-started").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    }
+    .await;
     let next = {
         let service = service.clone();
         let client = client.clone();

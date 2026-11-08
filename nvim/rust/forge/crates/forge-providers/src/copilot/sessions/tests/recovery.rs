@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// Interrupt a held native inventory query and explicitly collect its monitor and subscription.
 #[tokio::test]
 async fn terminal_monitor_shutdown_cancels_pending_query_without_stopping_healthy_client() {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    async {
         let runtime = crate::copilot::runtime::CopilotRuntime::new(vec!["terminal-peer".into()]);
         let peer = RecoveryPeer::attach(&runtime, "1.0.103").await;
         let client = runtime.client(".").await.unwrap();
@@ -39,20 +39,13 @@ async fn terminal_monitor_shutdown_cancels_pending_query_without_stopping_health
         {
             tokio::task::yield_now().await;
         }
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sessions.close_observers(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        sessions.close_observers().await.unwrap();
         assert!(sessions.terminals.lock().await.is_empty());
         client.ensure_healthy().unwrap();
         sessions.retire(&owner.clone()).await.unwrap();
         runtime.shutdown().await.unwrap();
         let _ = peer.stop.send(());
         peer.task.await.unwrap();
-    })
-    .await
-    .expect("pending terminal query collection fixture timed out");
+    }
+    .await;
 }

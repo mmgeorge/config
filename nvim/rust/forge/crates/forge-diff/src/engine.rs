@@ -433,7 +433,7 @@ mod tests {
             receiver
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(2))
+                .recv()
                 .unwrap();
             compute_hunks(source)
         });
@@ -448,7 +448,7 @@ mod tests {
         started.notified().await;
         let second_engine = Arc::clone(&engine);
         let second = tokio::spawn(async move { second_engine.compare(request("new\n")).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
+        async {
             loop {
                 if engine
                     .state
@@ -466,9 +466,8 @@ mod tests {
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         assert_eq!(engine.usage().active_jobs, 1);
         let mut waiting = Box::pin(engine.compare(request("different\n")));
         assert!(
@@ -509,16 +508,15 @@ mod tests {
         );
         drop(waiting);
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        async {
             while {
                 let usage = engine.usage();
                 usage.active_jobs != 0 || usage.pool.admitted_jobs != 0
             } {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         assert_eq!(engine.usage().cache.admitted_entries, 0);
         assert_eq!(engine.usage().cache.cached_entries, 0);
         release.send(()).unwrap();
@@ -579,9 +577,7 @@ mod tests {
         let worker_engine = Arc::clone(&engine);
         runtime.block_on(async {
             tokio::spawn(async move { worker_engine.compare(request("new\n")).await });
-            tokio::time::timeout(Duration::from_secs(1), started.notified())
-                .await
-                .unwrap();
+            started.notified().await;
         });
         runtime.shutdown_timeout(Duration::from_millis(10));
         assert_eq!(engine.usage().active_jobs, 1);

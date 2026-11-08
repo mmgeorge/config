@@ -28,7 +28,7 @@ async fn priority_queues_preserve_fifo_and_cancelled_inputs_drop_before_capacity
         WorkBudget::new(10, None),
         move |_| {
             started.send(()).unwrap();
-            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            blocked.recv().unwrap();
         },
     )
     .unwrap();
@@ -107,7 +107,7 @@ async fn running_cancellation_and_shutdown_expiry_retain_native_admission() {
                         .starts_with("forge-analysis-")
                 );
                 started.send(()).unwrap();
-                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                blocked.recv().unwrap();
                 stopped.send(budget.check()).unwrap();
             },
         )
@@ -142,7 +142,7 @@ async fn promotion_preserves_admission_and_appends_after_existing_foreground_wor
             WorkBudget::new(10, None),
             move |_| {
                 started.send(()).unwrap();
-                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                blocked.recv().unwrap();
             },
         )
         .unwrap();

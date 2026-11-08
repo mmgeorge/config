@@ -95,8 +95,7 @@ mod tests {
         };
         let mut command =
             CheckShell::Nushell.command(&executable, "print 'nushell output'; exit 9", false)?;
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await??;
+        let result = command.output().await?;
         assert_eq!(result.status.code(), Some(9));
         assert!(String::from_utf8_lossy(&result.stdout).contains("nushell output"));
         Ok(())

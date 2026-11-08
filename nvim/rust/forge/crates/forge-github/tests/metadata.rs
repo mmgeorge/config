@@ -90,7 +90,7 @@ async fn metadata_retains_refresh_and_deletion_ownership_after_caller_drop() -> 
         let directory = directory.clone();
         async move { service.metadata(remote, directory, request()).await }
     });
-    tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
+    remote.started.notified().await;
     assert!(RepositoryLease::deletion(&directory).is_err());
     assert!(RepositoryLease::metadata(&directory).is_err());
     assert!(RepositoryLease::sync(&directory).is_ok());
@@ -108,7 +108,7 @@ async fn metadata_retains_refresh_and_deletion_ownership_after_caller_drop() -> 
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     remote.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    async {
         loop {
             if let Ok(lease) = RepositoryLease::deletion(&directory) {
                 drop(lease);
@@ -116,15 +116,11 @@ async fn metadata_retains_refresh_and_deletion_ownership_after_caller_drop() -> 
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    }
+    .await;
     let store = MetadataStore::new(directory.clone(), request().repository)?;
     assert_eq!(store.read()?.unwrap().contributors[0].login, "alice");
-    let cached = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.metadata(remote, directory, request()),
-    )
-    .await??;
+    let cached = service.metadata(remote, directory, request()).await?;
     assert_eq!(cached.contributors[0].name.as_deref(), Some("Alice"));
     service
         .execute(issue_store, IssueOperation::DeleteCache {})
@@ -152,7 +148,7 @@ async fn shutdown_cancels_metadata_without_publishing_and_releases_ownership() -
         let directory = directory.clone();
         async move { service.metadata(remote, directory, request()).await }
     });
-    tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
+    remote.started.notified().await;
     assert_eq!(
         service
             .shutdown(Duration::from_secs(1))
@@ -226,15 +222,13 @@ async fn legacy_metadata_remains_fresh_without_rewriting_its_path_or_contents() 
     );
     std::fs::write(directory.join("metadata.json"), &previous)?;
     let service = GithubService::default();
-    let metadata = tokio::time::timeout(
-        Duration::from_secs(1),
-        service.metadata(
+    let metadata = service
+        .metadata(
             Arc::new(MetadataRemote::default()),
             directory.clone(),
             request(),
-        ),
-    )
-    .await??;
+        )
+        .await?;
     assert_eq!(metadata.contributors[0].login, "legacy");
     assert_eq!(
         std::fs::read_to_string(directory.join("metadata.json"))?,

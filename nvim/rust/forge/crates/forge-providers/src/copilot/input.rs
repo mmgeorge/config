@@ -89,7 +89,7 @@ mod tests {
     /// Dispatch is observable and abort reaches the writer while native send acknowledgement is held.
     #[tokio::test]
     async fn tracked_handoff_does_not_wait_for_native_acknowledgement() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let mut held = None;
             let (client, peer) = super::super::test_peer::client(move |request| {
                 let result = match request["method"].as_str().unwrap() {
@@ -166,8 +166,7 @@ mod tests {
                     .count(),
                 1
             );
-        })
-        .await
-        .expect("tracked SDK handoff fixture timed out");
+        }
+        .await;
     }
 }

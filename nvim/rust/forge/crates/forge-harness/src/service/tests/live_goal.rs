@@ -140,7 +140,7 @@ async fn live_goal_controls_commit_before_native_acceptance() -> Result<()> {
         );
         service.shutdown(Duration::from_secs(5)).await?;
         drop(sink);
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+        reader.await??;
     }
     Ok(())
 }

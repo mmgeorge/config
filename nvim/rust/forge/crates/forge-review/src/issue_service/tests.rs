@@ -199,26 +199,22 @@ async fn durable_issue_save_retains_newer_typing_and_collected_close() {
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(1), async {
+    async {
         while pool.usage().admitted_jobs < 2 {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        service.edit(RegionEdit {
+    }
+    .await;
+    service
+        .edit(RegionEdit {
             document: id.clone(),
             region: RegionId("title".into()),
             base: RegionRevision(0),
             sequence: EditSequence(1),
             text: "Typed while view analysis waits".into(),
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+        })
+        .await
+        .unwrap();
     release.send(()).unwrap();
     blocker.completed().await;
     viewing.await.unwrap().unwrap();

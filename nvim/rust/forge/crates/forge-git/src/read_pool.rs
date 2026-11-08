@@ -335,13 +335,12 @@ mod tests {
     use super::*;
 
     async fn wait_for_native_completion<Output>(task: &ReadTask<Output>) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        async {
             while !task.handle.is_finished() {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
     }
 
     #[tokio::test]
@@ -357,10 +356,7 @@ mod tests {
                 .is_err()
         );
         first.finish().await.unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(1), &mut waiting)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = (&mut waiting).await.unwrap();
         assert_eq!(second.finish().await.unwrap(), "second");
         let held = pool.submit(8, |_| Ok(())).unwrap();
         let waiting = pool.submit_wait(1, |_| Ok(()));
@@ -371,13 +367,7 @@ mod tests {
                 .is_err()
         );
         pool.shutdown(Duration::ZERO).await;
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), &mut waiting)
-                .await
-                .unwrap()
-                .err(),
-            Some(ReadAdmissionError::Closed)
-        );
+        assert_eq!((&mut waiting).await.err(), Some(ReadAdmissionError::Closed));
         drop(held);
     }
 
@@ -401,13 +391,12 @@ mod tests {
             });
         }
         let mut completed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        async {
             while let Some(result) = jobs.join_next().await {
                 completed.push(result.unwrap());
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         completed.sort();
         assert_eq!(completed, (0..16).collect::<Vec<_>>());
         assert_eq!(pool.status().active_jobs, 0);

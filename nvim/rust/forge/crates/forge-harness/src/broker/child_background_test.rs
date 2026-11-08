@@ -185,7 +185,7 @@ async fn assert_managed_child_background_completion(
     let mut changed = broker.agent_coordinator.subscribe();
     let mut events = Vec::new();
     // Reduce runtime commands in production order while retaining the completion boundary.
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             while let Some(command) = broker.agent_coordinator.try_receive() {
                 match command {
@@ -250,9 +250,7 @@ async fn assert_managed_child_background_completion(
                 .await
                 .context("child command channel closed")?;
         }
-    })
-    .await
-    .context("child background delivery did not finish")??;
+    }.await?;
     // Verify the terminal transaction did not move child evidence into the root history.
     let task = broker
         .agent_coordinator

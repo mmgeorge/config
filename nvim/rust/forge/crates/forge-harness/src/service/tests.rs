@@ -467,9 +467,8 @@ async fn isolated_generation_never_acquires_another_editors_session_lease() -> R
     let controller = registry.resolve(&session_id).await?;
     let broker = controller.broker.lock().await;
     let generator = service();
-    let text = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        generator.generate_text(
+    let text = generator
+        .generate_text(
             TextGenerationConfig {
                 auto_compaction: Default::default(),
                 provider: crate::provider::ProviderLaunch {
@@ -485,9 +484,8 @@ async fn isolated_generation_never_acquires_another_editors_session_lease() -> R
             &before.workspace,
             TextGeneration::CommitMessage,
             "Staged diff:\n+change",
-        ),
-    )
-    .await??;
+        )
+        .await?;
     // An unscripted mock turn echoes its prompt ("Unscripted mock turns" in
     // `contributing/forge/editor-tests.md`), so the generated text proves the isolated request ran.
     assert_eq!(
@@ -947,8 +945,9 @@ async fn unchanged_question_relay_does_not_publish_refresh_notifications() -> Re
         .exchange_owner
         .reconcile_questions(Some(sink.clone()))
         .await?;
-    let initial = tokio::time::timeout(crate::hang_guard::HANG_GUARD, output.recv())
-        .await??
+    let initial = output
+        .recv()
+        .await?
         .context("initial question notification is missing")?;
     assert_eq!(
         serde_json::from_slice::<Value>(initial.bytes())?["event"],
@@ -977,8 +976,9 @@ async fn unchanged_question_relay_does_not_publish_refresh_notifications() -> Re
         .exchange_owner
         .reconcile_questions(Some(sink.clone()))
         .await?;
-    let changed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, output.recv())
-        .await??
+    let changed = output
+        .recv()
+        .await?
         .context("changed question notification is missing")?;
     assert_eq!(
         serde_json::from_slice::<Value>(changed.bytes())?["payload"]["questions"]
@@ -1149,9 +1149,8 @@ async fn persistent_question_answers_commit_and_relay_while_provider_owns_execut
             .is_none()
     );
     drop(control);
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 2,
@@ -1159,9 +1158,8 @@ async fn persistent_question_answers_commit_and_relay_while_provider_owns_execut
                 params: json!({"command": command}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     assert!(!controller.questions.snapshot()?.questions[0].pending());
     controller
         .exchange_owner
@@ -1202,8 +1200,7 @@ async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> 
     let execution = controller.coordinator.execution.acquire().await?;
     let broker = controller.broker.lock().await;
     let (sink, _output) = forge_protocol::outbound::channel();
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service.dispatch(
             Some(session_id.clone()),
             Request {
                 id: 2,
@@ -1211,9 +1208,7 @@ async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> 
                 params: json!({"approval_timeout":{"amount":2,"unit":"s"},"tool_timeout":{"amount":3,"unit":"m"}}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        ).await?;
     let approval = controller.permission.approval_timeout(&session_id)?;
     assert_eq!(approval.amount, 2);
     assert!(controller.coordinator.execution.try_acquire().is_err());
@@ -1261,9 +1256,8 @@ async fn check_editing_toggles_without_prompt_or_execution_admission() -> Result
                 .await?
                 .is_none()
         );
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: index as u64 + 2,
@@ -1271,9 +1265,8 @@ async fn check_editing_toggles_without_prompt_or_execution_admission() -> Result
                     params: json!({"enabled": enabled}),
                 },
                 &sink,
-            ),
-        )
-        .await??;
+            )
+            .await?;
         let snapshot = controller.observer.snapshot()?;
         assert_eq!(snapshot.check_editing, enabled);
         assert!(snapshot.exchange.is_empty());
@@ -1323,9 +1316,8 @@ async fn status_thought_settings_apply_and_persist_without_interrupting_a_busy_s
     let execution = controller.coordinator.execution.acquire().await?;
     let (sink, _output) = forge_protocol::outbound::channel();
     for (index, enabled) in [true, false].into_iter().enumerate() {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: index as u64 + 2,
@@ -1333,9 +1325,8 @@ async fn status_thought_settings_apply_and_persist_without_interrupting_a_busy_s
                     params: json!({"status_thoughts": enabled}),
                 },
                 &sink,
-            ),
-        )
-        .await??;
+            )
+            .await?;
         assert_eq!(controller.observer.snapshot()?.status_thoughts, enabled);
         assert!(controller.coordinator.execution.try_acquire().is_err());
         let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
@@ -1388,7 +1379,7 @@ async fn settings_application_orders_progress_and_retains_value_free_timeline() 
     service
         .dispatch(Some(session_id.clone()), request.clone(), &sink)
         .await?;
-    let state = tokio::time::timeout(crate::hang_guard::HANG_GUARD, observation).await???;
+    let state = observation.await??;
     assert_eq!(state, ["configured", "completed"]);
     let (retry_sink, mut retry_output) = forge_protocol::outbound::channel();
     service
@@ -1459,13 +1450,13 @@ async fn question_answers_commit_without_waiting_for_provider_execution() -> Res
     let _execution = controller.coordinator.execution.acquire().await?;
     let (sink, _output) = forge_protocol::outbound::channel();
     let answer = "retained answer ".repeat(4096);
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD, service.dispatch_admitted(
+    service.dispatch_admitted(
         Some(session_id.clone()), Request { id: 2, method: "session.question.answer".into(), params: json!({
             "_command":{"id":"answer"}, "operation_id":"answer",
             "target":{"owner":"interaction","id":"question-exchange","set_id":"set","revision":1},
             "question_id":"choice","response":{"kind":"other","text":answer}
         })}, &sink, None,
-    )).await??;
+    ).await?;
     assert_eq!(
         store
             .load_exchange("question-exchange")?
@@ -1704,9 +1695,8 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
     let broker = controller.broker.lock().await;
     let execution = controller.coordinator.execution.acquire().await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 2,
@@ -1714,9 +1704,8 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
                 params: json!({"operation":"hold","mode":"chat"}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let frame = output.recv().await?.context("missing hold response")?;
     let held: Value = serde_json::from_slice(frame.bytes())?;
     let hold_id = held["result"]["id"]
@@ -1782,9 +1771,8 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
         Ok::<_, anyhow::Error>(crate::provider::ProviderOutput { event, completion })
     });
     for (request_id, operation) in [(3, "wait"), (4, "release")] {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: request_id,
@@ -1792,9 +1780,8 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
                     params: json!({"operation":operation,"id":hold_id}),
                 },
                 &sink,
-            ),
-        )
-        .await??;
+            )
+            .await?;
         let result: Value = loop {
             let frame = output
                 .recv()
@@ -1813,7 +1800,7 @@ async fn mock_response_controls_bypass_active_execution_and_broker_lock() -> Res
             assert_eq!(result["result"]["released"], true);
         }
     }
-    let completed = tokio::time::timeout(crate::hang_guard::HANG_GUARD, prompt).await???;
+    let completed = prompt.await??;
     assert!(completed.event.iter().any(|event| matches!(
         event,
         crate::provider::HarnessEvent::Native { event: boxed_native_event, .. }  if matches!(boxed_native_event.as_ref(), crate::provider::ProviderEvent::Item { event: forge_provider_api::message::ItemEvent::Started(forge_provider_api::message::ItemStart::AgentMessage(message)), .. } if message.text == "Mock response: held prompt"))));
@@ -1894,9 +1881,8 @@ async fn model_pins_bypass_the_active_provider_broker_lock() {
             json!({"provider":forge_providers::registry::default_id().as_str()}),
         ),
     ] {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: 2,
@@ -1904,11 +1890,9 @@ async fn model_pins_bypass_the_active_provider_broker_lock() {
                     params: parameter,
                 },
                 &sink,
-            ),
-        )
-        .await
-        .expect("pins must not wait for provider execution")
-        .unwrap();
+            )
+            .await
+            .unwrap();
         let frame = output.recv().await.unwrap().unwrap();
         let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
         assert_eq!(value["result"], json!(["pinned-model"]));
@@ -1964,9 +1948,8 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
         ("session.preview", json!({"session_id":session_id})),
         ("permissions.document.open", json!({})),
     ] {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: 2,
@@ -1974,11 +1957,9 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
                     params,
                 },
                 &sink,
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("{method} waited for execution"))
-        .unwrap();
+            )
+            .await
+            .unwrap();
         // A state read reattaches the session event stream, so events may precede the response.
         let value = response_for(&mut output, 2).await.unwrap();
         assert!(value["error"].is_null(), "{method}: {value}");
@@ -1997,9 +1978,8 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
     assert_eq!(broker.snapshot().unwrap().session.name, "active rename");
     for (offset, method) in ["session.new"].into_iter().enumerate() {
         let request_id = 10 + offset as u64;
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: request_id,
@@ -2007,11 +1987,9 @@ async fn session_queries_complete_while_execution_owns_the_broker() {
                     params: json!({}),
                 },
                 &sink,
-            ),
-        )
-        .await
-        .expect("new sessions must not wait for source execution")
-        .unwrap();
+            )
+            .await
+            .unwrap();
         loop {
             let frame = output.recv().await.unwrap().unwrap();
             let response: Value = serde_json::from_slice(frame.bytes()).unwrap();
@@ -2046,9 +2024,8 @@ async fn attachment_import_bypasses_active_execution_and_retains_source_bytes() 
     let controller = registry.resolve(&session_id).await?;
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id),
             Request {
                 id: 2,
@@ -2056,9 +2033,8 @@ async fn attachment_import_bypasses_active_execution_and_retains_source_bytes() 
                 params: json!({"path":source, "number":3}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let frame = output
         .recv()
         .await?
@@ -2108,15 +2084,10 @@ async fn configuration_acknowledgement_does_not_wait_for_mcp_discovery() {
     // Configuration invalidates MCP discovery by revision; it must never wait for discovery itself.
     let discovery = controller.mcp_discovery.lock().await;
     let revision_before = controller.mcp_revision.load(Ordering::Acquire);
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(Some(session_id.clone()), Request {
+    service.dispatch(Some(session_id.clone()), Request {
             id: 2, method: "session.command.apply".into(),
             params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
-        }, &sink),
-    )
-    .await
-    .expect("configuration waited for MCP discovery")
+        }, &sink).await
     .unwrap();
     let value = response_for(&mut output, 2).await.unwrap();
     assert_eq!(value["result"]["state"], "completed", "{value}");
@@ -2150,9 +2121,8 @@ async fn root_model_catalog_bypasses_the_active_broker_lock() {
         .unwrap();
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 2,
@@ -2160,11 +2130,9 @@ async fn root_model_catalog_bypasses_the_active_broker_lock() {
                 params: json!({}),
             },
             &sink,
-        ),
-    )
-    .await
-    .expect("root model selection must remain available during provider execution")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     let frame = output.recv().await.unwrap().unwrap();
     let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
     assert_eq!(value["id"], 2, "{value}");
@@ -2272,19 +2240,12 @@ async fn binding_only_model_catalog_lists_from_the_open_root_binding() -> Result
         response_for(&mut control, 14).await?;
         Ok::<_, anyhow::Error>(models)
     };
-    let (_, models) = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
-        tokio::try_join!(submit, inspect)
-    })
-    .await??;
+    let (_, models) = async { tokio::try_join!(submit, inspect) }.await?;
     assert!(models["error"].is_null(), "{models}");
     assert_eq!(models["result"][0]["id"], "mock-model");
     // Between turns the binding remains open, so the catalog must still come from it.
     let controller = service.registry().await?.resolve(&session_id).await?;
-    let idle_execution = tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        controller.coordinator.execution.acquire(),
-    )
-    .await??;
+    let idle_execution = controller.coordinator.execution.acquire().await?;
     let idle = control_request(16, "session.provider.model.list", json!({})).await;
     drop(idle_execution);
     assert!(idle.is_ok(), "idle binding catalog failed: {idle:?}");
@@ -2385,9 +2346,8 @@ async fn child_model_catalog_bypasses_the_active_root_broker_lock() {
     let controller = registry.resolve(&session_id).await.unwrap();
     let broker = controller.broker.lock().await;
     let (sink, mut output) = forge_protocol::outbound::channel();
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 2,
@@ -2395,11 +2355,9 @@ async fn child_model_catalog_bypasses_the_active_root_broker_lock() {
                 params: json!({"provider":"mock"}),
             },
             &sink,
-        ),
-    )
-    .await
-    .expect("child model selection must remain available during root execution")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     loop {
         let frame = output.recv().await.unwrap().unwrap();
         let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
@@ -2537,9 +2495,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
             )
             .await
     });
-    let requested = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
-        .await??
-        .unwrap();
+    let requested = events.recv().await?.unwrap();
     controller
         .agent_coordinator
         .sender()
@@ -2549,7 +2505,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
             event: requested.into(),
         })
         .await?;
-    let requested_view = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let requested_view = async {
         loop {
             let frame = output.recv().await?.context("event stream ended")?;
             let value: Value = serde_json::from_slice(frame.bytes())?;
@@ -2557,8 +2513,8 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
                 return Ok::<_, anyhow::Error>(value["payload"]["data"].clone());
             }
         }
-    })
-    .await??;
+    }
+    .await?;
     // The wire request carries the child's owner; the editor answers by request and target IDs.
     assert_eq!(requested_view["execution_owner"]["agent_id"], agent_id);
     let approval_id = requested_view["request_id"].as_str().unwrap();
@@ -2585,9 +2541,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         pending.await??,
         crate::provider::approval::ApprovalResolution::AllowOnce
     );
-    let resolved = tokio::time::timeout(crate::hang_guard::HANG_GUARD, events.recv())
-        .await??
-        .unwrap();
+    let resolved = events.recv().await?.unwrap();
     assert!(matches!(
         &resolved,
         crate::provider::session_execution::OwnerObservation::Event(
@@ -2614,7 +2568,7 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
             event: resolved.into(),
         })
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let frame = output.recv().await?.context("event stream ended")?;
             let value: Value = serde_json::from_slice(frame.bytes())?;
@@ -2626,8 +2580,8 @@ async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
                 return Ok::<_, anyhow::Error>(());
             }
         }
-    })
-    .await??;
+    }
+    .await?;
     assert!(controller.permission.pending_list()?.is_empty());
     service.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -2680,12 +2634,12 @@ async fn queued_prompt_acknowledges_composer_admission_once() -> Result<()> {
         }
         Ok::<_, anyhow::Error>(frames)
     });
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, queued).await??;
+    queued.await?;
     controller.finish_prompt_workers().await?;
     drop(controller);
     service.shutdown(Duration::from_secs(1)).await?;
     drop(sink);
-    let frames = tokio::time::timeout(crate::hang_guard::HANG_GUARD, reader).await???;
+    let frames = reader.await??;
     let response = frames
         .iter()
         .find(|message| message["id"] == 2)
@@ -2748,10 +2702,10 @@ async fn queued_prompt_commits_input_without_acquiring_execution() -> Result<()>
     let controller = registry.resolve(registry.initial_session_id()).await?;
     let execution = controller.coordinator.execution.acquire().await?;
     let (sink, _output) = forge_protocol::outbound::channel();
-    tokio::time::timeout( crate::hang_guard::HANG_GUARD, prompt::apply(&controller, Request {
+    prompt::apply(&controller, Request {
         id: 2, method: "session.prompt.submit".into(),
         params: json!({"operation_id":"queued-prompt", "input_id":"queued-message", "text":"Wait for current work", "queued":true}),
-    }, &sink)).await??;
+    }, &sink).await?;
     let snapshot = controller.coordinator.submissions.snapshot()?;
     let message = snapshot
         .messages
@@ -2929,7 +2883,7 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
             )
             .await?;
     }
-    let run_id = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    let run_id = async {
         loop {
             if let Some(id) = controller.checks.active()? {
                 let run = controller.checks.status(&id, 100, false).await?;
@@ -2943,9 +2897,8 @@ async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("invocation check did not start")??;
+    }
+    .await?;
     assert!(controller.observer.snapshot()?.checks_running);
     service
         .dispatch(
@@ -2990,7 +2943,7 @@ async fn configuration_waits_for_maintenance_without_provider_cleanup() -> Resul
         );
         assert!(controller.coordinator.execution.try_acquire().is_err());
         drop(maintenance);
-        let admitted = tokio::time::timeout(crate::hang_guard::HANG_GUARD, acquisition).await??;
+        let admitted = acquisition.await?;
         assert!(controller.coordinator.execution.try_acquire().is_err());
         drop(admitted);
         assert!(controller.coordinator.execution.try_acquire().is_ok());
@@ -3051,9 +3004,8 @@ async fn trace_controls_complete_while_a_turn_owns_the_broker() {
         (4, "session.trace.clear", json!({})),
         (5, "host.trace.configure", json!({"enabled":false})),
     ] {
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id,
@@ -3061,11 +3013,9 @@ async fn trace_controls_complete_while_a_turn_owns_the_broker() {
                     params,
                 },
                 &sink,
-            ),
-        )
-        .await
-        .expect("trace control waited for the broker")
-        .unwrap();
+            )
+            .await
+            .unwrap();
         let frame = output.recv().await.unwrap().unwrap();
         let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
         assert_eq!(value["result"]["enabled"], id != 5);
@@ -3320,9 +3270,7 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
     controller.attach_input(&sink).await?;
     let mut commands = Vec::new();
     for id in ["first", "second", "third"] {
-        let command = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
-            .await?
-            .context("steering lane closed")?;
+        let command = active.receive().await.context("steering lane closed")?;
         assert_eq!(command.text, format!("steering {id}"));
         let submission = command
             .submission
@@ -3362,7 +3310,7 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
         ))?;
         command.complete(Ok(())).await;
     }
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let snapshot = controller.coordinator.submissions.snapshot()?;
             if snapshot.messages.len() == 1 && snapshot.messages[0].id == "queued" {
@@ -3371,8 +3319,8 @@ async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> R
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await??;
+    }
+    .await?;
     controller.coordinator.submissions.suspend(true, None)?;
     drop(active);
     drop(execution);
@@ -3435,9 +3383,7 @@ async fn cancelled_deferred_input_is_retracted_without_replay() -> Result<()> {
     }))?;
     controller.coordinator.submissions.apply(operation)?;
     controller.attach_input(&sink).await?;
-    let command = tokio::time::timeout(crate::hang_guard::HANG_GUARD, active.receive())
-        .await?
-        .context("missing deferred input")?;
+    let command = active.receive().await.context("missing deferred input")?;
     let submission = command
         .submission
         .as_ref()
@@ -3459,13 +3405,13 @@ async fn cancelled_deferred_input_is_retracted_without_replay() -> Result<()> {
             .iter()
             .any(|message| message.id == "deferred-input"))
     };
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while deferred_retained()? {
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await??;
+    }
+    .await?;
     assert_eq!(
         submission.record()?.delivery,
         crate::provider::submission::SubmissionState::Cancelled
@@ -3567,7 +3513,7 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             &sink,
         )
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             let ready = {
                 let broker = controller.broker.lock().await;
@@ -3585,9 +3531,8 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("root question and completion were not committed")??;
+    }
+    .await?;
     let (scope, engine) = {
         let mut broker = controller.broker.lock().await;
         let snapshot = broker.snapshot()?;
@@ -3697,9 +3642,9 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
         .as_str()
         .context("missing child agent")?
         .to_owned();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, child_started.notified()).await?;
+    child_started.notified().await;
     let store = SqliteStore::read_only(&controller.data_root)?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if let Some(child) = store.load_exchange(&child_task)?
                 && let Some(turn) = child.turn.first()
@@ -3714,10 +3659,10 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await??;
+    }
+    .await?;
     child_release.add_permits(1);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .agent_coordinator
@@ -3739,8 +3684,8 @@ async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await??;
+    }
+    .await?;
     let snapshot = controller.broker.lock().await.snapshot()?;
     let original = snapshot
         .exchange
@@ -3827,17 +3772,14 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
             .coordinator
             .submissions
             .apply(submit("active", InputIntent::Auto))?;
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            control.dispatch(
+        control
+            .dispatch(
                 &session_id,
                 MockResponseCommand::Wait {
                     id: hold["id"].as_str().unwrap().into(),
                 },
-            ),
-        )
-        .await
-        .context("active input did not reach its provider hold")??;
+            )
+            .await?;
         controller
             .coordinator
             .submissions
@@ -3866,9 +3808,8 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
             })
             .collect(),
         )?;
-        tokio::time::timeout(
-            crate::hang_guard::HANG_GUARD,
-            service.dispatch(
+        service
+            .dispatch(
                 Some(session_id.clone()),
                 Request {
                     id: 23,
@@ -3876,18 +3817,15 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
                     params,
                 },
                 &sink,
-            ),
-        )
-        .await
-        .context("cancel dispatch did not return")??;
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+            )
+            .await?;
+        async {
             while controller.coordinator.execution.available_permits() == 0 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .context("cancelled execution was not released")?;
-        tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        }
+        .await;
+        async {
             loop {
                 if let Some(response) = responses
                     .lock()
@@ -3904,9 +3842,8 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .context("cancel response was not delivered")??;
+        }
+        .await?;
         let store = SqliteStore::open(&controller.data_root)?;
         let exchanges = store.list_exchange(&session_id)?;
         assert_eq!(exchanges.len(), 1);
@@ -4050,16 +3987,14 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
         },
         &sink,
     ).await?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold["id"].as_str().unwrap().into(),
             },
-        ),
-    )
-    .await??;
+        )
+        .await?;
     controller
         .coordinator
         .submissions
@@ -4068,9 +4003,8 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
         controller.broker.try_lock().is_ok(),
         "fixture must exercise an unlocked broker"
     );
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 24,
@@ -4078,12 +4012,10 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
                 params: json!({"operation_id":"pause", "action":"pause"}),
             },
             &sink,
-        ),
-    )
-    .await??;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+        )
+        .await?;
+    service
+        .dispatch(
             Some(session_id.clone()),
             Request {
                 id: 23,
@@ -4091,16 +4023,15 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
                 params: json!({}),
             },
             &sink,
-        ),
-    )
-    .await??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        )
+        .await?;
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    }
+    .await;
+    async {
         loop {
             if let Some(response) = responses
                 .lock()
@@ -4117,10 +4048,10 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
             }
             tokio::task::yield_now().await;
         }
-    })
-    .await??;
+    }
+    .await?;
     for id in [22, 24] {
-        let response = tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        let response = async {
             loop {
                 let response = responses
                     .lock()
@@ -4133,9 +4064,8 @@ async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Res
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .with_context(|| format!("missing command response {id}"))?;
+        }
+        .await;
         anyhow::ensure!(
             response.get("error").is_none(),
             "command RPC failed: {response}"
@@ -4224,27 +4154,15 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
         .coordinator
         .submissions
         .apply(message("first", InputIntent::Auto))?;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        control.dispatch(
+    control
+        .dispatch(
             &session_id,
             MockResponseCommand::Wait {
                 id: hold_id.clone(),
             },
-        ),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "first input did not reach provider: queue={:?}, task={:?}",
-            controller.coordinator.submissions.snapshot(),
-            controller
-                .observer
-                .snapshot()
-                .map(|snapshot| snapshot.session.active_task)
         )
-    })??;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+        .await?;
+    async {
         loop {
             if controller
                 .coordinator
@@ -4262,9 +4180,8 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("input delivery boundary 2")??;
+    }
+    .await?;
     assert_eq!(
         controller.coordinator.execution.available_permits(),
         0,
@@ -4278,7 +4195,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
         .coordinator
         .submissions
         .apply(message("steered", InputIntent::Auto))?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if !controller
                 .coordinator
@@ -4293,9 +4210,8 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("input delivery boundary 3")??;
+    }
+    .await?;
     controller
         .coordinator
         .submissions
@@ -4314,12 +4230,12 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
     control
         .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
         .await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while controller.coordinator.execution.available_permits() == 0 {
             tokio::task::yield_now().await;
         }
-    })
-    .await?;
+    }
+    .await;
     let queued = controller
         .coordinator
         .submissions
@@ -4346,7 +4262,7 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
     })?;
     assert!(controller.coordinator.submissions.snapshot()?.suspended);
     controller.coordinator.submissions.suspend(false, None)?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             if controller
                 .coordinator
@@ -4360,17 +4276,15 @@ async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Resu
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("input delivery boundary 4")??;
+    }
+    .await?;
     assert_eq!(controller.coordinator.execution.available_permits(), 1);
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !execution_idle.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-    })
-    .await
-    .context("final input publication retained stale execution ownership")?;
+    }
+    .await;
     let exchange = SqliteStore::open(&controller.data_root)?.list_exchange(&session_id)?;
     assert_eq!(
         exchange
@@ -4437,7 +4351,7 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
             .await?;
     }
     controller.attach_input(&sink).await?;
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         while !controller
             .coordinator
             .submissions
@@ -4448,8 +4362,8 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
             tokio::task::yield_now().await;
         }
         Ok::<(), anyhow::Error>(())
-    })
-    .await??;
+    }
+    .await?;
     let exchange = SqliteStore::open(&controller.data_root)?.list_exchange(&session_id)?;
     assert_eq!(
         exchange
@@ -4550,9 +4464,8 @@ async fn reopening_active_and_deleting_idle_cached_sessions() -> Result<()> {
     }
     let execution = first.coordinator.execution.clone().acquire_owned().await?;
     let broker = first.broker.lock().await;
-    tokio::time::timeout(
-        crate::hang_guard::HANG_GUARD,
-        service.dispatch(
+    service
+        .dispatch(
             Some(second.id.clone()),
             Request {
                 id: 2,
@@ -4560,9 +4473,8 @@ async fn reopening_active_and_deleting_idle_cached_sessions() -> Result<()> {
                 params: json!({"session_id":first_id}),
             },
             &sink,
-        ),
-    )
-    .await??;
+        )
+        .await?;
     let frame = output.recv().await?.context("resume response is missing")?;
     let reply: Value = serde_json::from_slice(frame.bytes())?;
     assert_eq!(reply["result"]["session"]["id"], first_id);

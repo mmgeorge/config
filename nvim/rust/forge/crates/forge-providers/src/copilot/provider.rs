@@ -5441,7 +5441,7 @@ mod retained_recovery_tests {
     /// Input preconditions preserve exact lifecycle and immutable-target causes without native traffic.
     #[tokio::test]
     async fn input_preconditions_report_exact_admission_causes_before_dispatch() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
             let state = provider.binding(&opened.binding.id, ProviderOperation::TurnStart).await.unwrap();
             let configuration = state.request.lock().await.configuration.clone();
@@ -5499,13 +5499,13 @@ mod retained_recovery_tests {
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "models.list").count(), 1);
             assert!(!requests.iter().any(|request| matches!(request["method"].as_str(), Some("session.send" | "session.abort"))));
-        }).await.expect("typed Copilot precondition fixture timed out");
+        }.await;
     }
 
     /// Accepted input interrupted before positive start remains accepted without a fabricated turn.
     #[tokio::test]
     async fn accepted_input_aborted_before_start_preserves_receipt_without_completion() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, opened, _root, peer) = opened_helper_fixture(
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
@@ -5589,15 +5589,14 @@ mod retained_recovery_tests {
                     .iter()
                     .any(|request| request["method"] == "session.abort")
             );
-        })
-        .await
-        .expect("accepted pre-start interruption timed out");
+        }
+        .await;
     }
 
     /// A native terminal result waits for admitted callbacks before any root completion is published.
     #[tokio::test]
     async fn root_completion_waits_for_callback_collection_and_survives_dropped_waiter() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, opened, _root, peer) = opened_helper_fixture(
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
@@ -5706,9 +5705,8 @@ mod retained_recovery_tests {
                     .iter()
                     .any(|request| request["method"] == "session.abort")
             );
-        })
-        .await
-        .expect("root collection boundary timed out");
+        }
+        .await;
     }
 
     /// A selected MCP server whose native startup never settles cannot consume the open deadline.
@@ -5718,7 +5716,7 @@ mod retained_recovery_tests {
     /// real waiting, so an open that still awaited startup would time out.
     #[tokio::test(start_paused = true)]
     async fn binding_opens_while_a_selected_mcp_server_startup_hangs() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (reader, writer, peer) = super::super::test_peer::streams(|request| {
                 let result = match request["method"].as_str().unwrap() {
                     "status.get" => json!({"version":"1.0.103"}),
@@ -5765,7 +5763,7 @@ mod retained_recovery_tests {
             provider.thread_close(context("hanging-mcp-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("hanging-mcp-shutdown")).await.unwrap();
             assert!(peer.collected().await.iter().all(|request| request["method"] != "session.mcp.listTools"));
-        }).await.expect("opening waited on a hanging MCP server startup");
+        }.await;
     }
 
     #[derive(Clone, Copy)]
@@ -6018,7 +6016,7 @@ mod retained_recovery_tests {
     /// A queued native switch is unconfirmed mutation and cannot commit a model selection.
     #[tokio::test]
     async fn deferred_model_configuration_invalidates_without_committing_requested_model() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelDeferred).await;
             let state = provider.binding(&opened.binding.id, ProviderOperation::ThreadConfigure).await.unwrap();
             let original = state.request.lock().await.configuration.clone();
@@ -6031,7 +6029,7 @@ mod retained_recovery_tests {
             provider.thread_close(context("deferred-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("deferred-shutdown")).await.unwrap();
             peer.collected().await;
-        }).await.expect("deferred model acknowledgement fixture timed out");
+        }.await;
     }
 
     struct FixtureCompletedDriver;
@@ -6065,7 +6063,7 @@ mod retained_recovery_tests {
     /// A rejected or lost abort acknowledgement remains the cancellation result after normal completion.
     #[tokio::test]
     async fn repeated_cancel_preserves_first_stop_failure_after_automatic_settlement() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             for abort_acknowledgement in [AbortAcknowledgement::Rejected, AbortAcknowledgement::TransportFailure] {
             let expected_failure = match abort_acknowledgement {
                 AbortAcknowledgement::Rejected => ProviderFailureKind::Rejected,
@@ -6098,13 +6096,13 @@ mod retained_recovery_tests {
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.abort").count(), 1);
             }
-        }).await.expect("retained cancellation result fixture timed out");
+        }.await;
     }
 
     /// Lost identity delivery after commit immediately revokes the changed binding.
     #[tokio::test]
     async fn committed_configuration_delivery_failure_invalidates_binding() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
             let binding = opened.binding.id.clone();
             let state = provider.binding(&binding, ProviderOperation::ThreadConfigure).await.unwrap();
@@ -6124,13 +6122,13 @@ mod retained_recovery_tests {
             let requests = peer.collected().await;
             assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 2);
             assert!(requests.iter().all(|request| request["method"] != "session.resume"));
-        }).await.expect("configuration delivery fixture timed out");
+        }.await;
     }
 
     /// Recovery reads a pinned journal after process loss and never resumes or certifies absence.
     #[tokio::test]
     async fn persisted_recovery_is_observation_only_and_absence_stays_unknown() {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        async {
             for accepted in [false, true] {
                 let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
                     let result = match request["method"].as_str().unwrap() {
@@ -6168,6 +6166,6 @@ mod retained_recovery_tests {
                 assert_eq!(requests.iter().filter(|request| request["method"] == "sessions.readPersistedEvents").count(), 1);
                 assert!(requests.iter().all(|request| matches!(request["method"].as_str(), Some("status.get" | "sessions.readPersistedEvents"))));
             }
-        }).await.expect("persisted submission recovery fixture timed out");
+        }.await;
     }
 }

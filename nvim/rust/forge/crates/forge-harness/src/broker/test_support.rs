@@ -167,7 +167,7 @@ pub(super) async fn settle_managed_children(
 ) -> Result<Vec<SessionEvent>> {
     let mut revision = broker.agent_coordinator.subscribe();
     let mut event = Vec::new();
-    tokio::time::timeout(crate::hang_guard::HANG_GUARD, async {
+    async {
         loop {
             event.extend(broker.drain_agent_commands(None).await?);
             if broker.agent_coordinator.active_count() == 0 {
@@ -175,9 +175,8 @@ pub(super) async fn settle_managed_children(
             }
             revision.changed().await.context("child lane closed")?;
         }
-    })
-    .await
-    .context("managed child did not settle within five seconds")??;
+    }
+    .await?;
     Ok(event)
 }
 

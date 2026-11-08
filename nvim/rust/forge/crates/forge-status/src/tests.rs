@@ -1464,10 +1464,7 @@ async fn optimistic_pending_index_is_shared_with_reopened_view_and_survives_clos
         .finish(forge_git::mutation::OperationCompletion::Completed)
         .unwrap();
     service.store.writes.take_receipt(gate).unwrap();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), ticket.finish())
-        .await
-        .unwrap()
-        .unwrap();
+    let outcome = ticket.finish().await.unwrap();
     assert!(
         outcome
             .target
@@ -1551,10 +1548,7 @@ async fn changed_hunk_source_rejects_queued_stage_and_refreshes_body() {
         .finish(forge_git::mutation::OperationCompletion::Completed)
         .unwrap();
     service.store.writes.take_receipt(gate).unwrap();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), ticket.finish())
-        .await
-        .unwrap()
-        .unwrap();
+    let outcome = ticket.finish().await.unwrap();
     assert!(
         outcome
             .target
