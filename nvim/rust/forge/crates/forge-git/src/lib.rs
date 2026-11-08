@@ -25,5 +25,4 @@ extern crate self as forge_git;
 /// In-process fixture repositories for tests. Other crates enable the `test-fixtures` feature in
 /// their dev-dependencies instead of launching `git` to prepare repositories.
 #[cfg(any(test, feature = "test-fixtures"))]
-#[path = "../tests/support/mod.rs"]
 pub mod test_support;

@@ -396,7 +396,7 @@ pub struct DocumentInput {
 
 ## WriteRequest
 
-Source: [nvim/rust/forge/src/repository_write.rs](../../../rust/forge/src/repository_write.rs).
+Source: [nvim/rust/forge/src/runtime/repository_write.rs](../../../rust/forge/src/runtime/repository_write.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -424,7 +424,7 @@ pub(crate) enum WriteRequest {
 
 ## WriteAction
 
-Source: [nvim/rust/forge/src/repository_write.rs](../../../rust/forge/src/repository_write.rs).
+Source: [nvim/rust/forge/src/runtime/repository_write.rs](../../../rust/forge/src/runtime/repository_write.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -450,7 +450,7 @@ pub(crate) enum WriteAction {
 
 ## WalkthroughSource
 
-Source: [nvim/rust/forge/src/walkthrough_routes.rs](../../../rust/forge/src/walkthrough_routes.rs).
+Source: [nvim/rust/forge/src/router/walkthrough_routes.rs](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 ```rust
 #[derive(Serialize)]

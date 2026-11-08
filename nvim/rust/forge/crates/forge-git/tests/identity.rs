@@ -1,4 +1,4 @@
-mod support;
+use forge_git::test_support as support;
 
 use forge_git::{RepositoryPath, discover_identity, resolve_argument, validate_path};
 use support::{

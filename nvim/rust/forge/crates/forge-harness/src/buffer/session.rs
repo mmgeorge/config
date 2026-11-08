@@ -4317,5 +4317,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "session_status_test.rs"]
 mod status_test;

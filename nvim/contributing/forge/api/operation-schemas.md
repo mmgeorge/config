@@ -10,7 +10,7 @@ The tables describe input structure. Each method's namespace entry describes its
 
 ## repository.write / WriteRequest / trace
 
-Select `operation = "trace"`. The native declaration is in [WriteRequest](../../../rust/forge/src/repository_write.rs).
+Select `operation = "trace"`. The native declaration is in [WriteRequest](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ Producer: [nvim/lua/forge/git/write.lua:25](../../../../nvim/lua/forge/git/write
 
 ## repository.write / WriteRequest / prepare
 
-Select `operation = "prepare"`. The native declaration is in [WriteRequest](../../../rust/forge/src/repository_write.rs).
+Select `operation = "prepare"`. The native declaration is in [WriteRequest](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -33,7 +33,7 @@ Producer: [nvim/lua/forge/git/write.lua:150](../../../../nvim/lua/forge/git/writ
 
 ## repository.write / WriteRequest / submit
 
-Select `operation = "submit"`. The native declaration is in [WriteRequest](../../../rust/forge/src/repository_write.rs).
+Select `operation = "submit"`. The native declaration is in [WriteRequest](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ Producer: [nvim/lua/forge/git/write.lua:165](../../../../nvim/lua/forge/git/writ
 
 ## repository.write / WriteRequest / acknowledge
 
-Select `operation = "acknowledge"`. The native declaration is in [WriteRequest](../../../rust/forge/src/repository_write.rs).
+Select `operation = "acknowledge"`. The native declaration is in [WriteRequest](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -55,7 +55,7 @@ Producer: [nvim/lua/forge/git/write.lua:142](../../../../nvim/lua/forge/git/writ
 
 ## repository.write / WriteRequest / cancel
 
-Select `operation = "cancel"`. The native declaration is in [WriteRequest](../../../rust/forge/src/repository_write.rs).
+Select `operation = "cancel"`. The native declaration is in [WriteRequest](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -317,7 +317,7 @@ Producer: [nvim/lua/forge/source_document.lua:185](../../../../nvim/lua/forge/so
 
 ## github.issue.document / IssueRequest / open
 
-Select `operation = "open"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "open"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -332,7 +332,7 @@ Producer: [nvim/lua/github/issue_document.lua:510](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / snapshot
 
-Select `operation = "snapshot"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "snapshot"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -343,7 +343,7 @@ Producer: [nvim/lua/github/issue_document.lua:260](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / save
 
-Select `operation = "save"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "save"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -355,7 +355,7 @@ Producer: [nvim/lua/github/issue_document.lua:247](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / refresh
 
-Select `operation = "refresh"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "refresh"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -366,7 +366,7 @@ Producer: [nvim/lua/github/issue_document.lua:284](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / view
 
-Select `operation = "view"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "view"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -379,7 +379,7 @@ Producer: [nvim/lua/github/issue_document.lua:131](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / close_view
 
-Select `operation = "close_view"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "close_view"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -391,7 +391,7 @@ Producer: [nvim/lua/github/issue_document.lua:169](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / act
 
-Select `operation = "act"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "act"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -402,7 +402,7 @@ Producer: [nvim/lua/github/issue_document.lua:407](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / resolve
 
-Select `operation = "resolve"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "resolve"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -415,7 +415,7 @@ Producer: [nvim/lua/github/issue_document.lua:312](../../../../nvim/lua/github/i
 
 ## github.issue.document / IssueRequest / close
 
-Select `operation = "close"`. The native declaration is in [IssueRequest](../../../rust/forge/src/issue_routes.rs).
+Select `operation = "close"`. The native declaration is in [IssueRequest](../../../rust/forge/src/router/issue_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -426,7 +426,7 @@ Producer: [nvim/lua/github/issue_document.lua:190](../../../../nvim/lua/github/i
 
 ## github.notification.document / NotificationRequest / open
 
-Select `operation = "open"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "open"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -439,7 +439,7 @@ Producer: [nvim/lua/forge/notifications.lua:199](../../../../nvim/lua/forge/noti
 
 ## github.notification.document / NotificationRequest / snapshot
 
-Select `operation = "snapshot"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "snapshot"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -450,7 +450,7 @@ Producer: [nvim/lua/forge/notifications.lua:178](../../../../nvim/lua/forge/noti
 
 ## github.notification.document / NotificationRequest / view
 
-Select `operation = "view"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "view"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -463,7 +463,7 @@ Producer: [nvim/lua/forge/notifications.lua:83](../../../../nvim/lua/forge/notif
 
 ## github.notification.document / NotificationRequest / close_view
 
-Select `operation = "close_view"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "close_view"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -475,7 +475,7 @@ Producer: [nvim/lua/forge/notifications.lua:95](../../../../nvim/lua/forge/notif
 
 ## github.notification.document / NotificationRequest / act
 
-Select `operation = "act"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "act"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -486,7 +486,7 @@ Producer: [nvim/lua/forge/notifications.lua:109](../../../../nvim/lua/forge/noti
 
 ## github.notification.document / NotificationRequest / close
 
-Select `operation = "close"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/notification_routes.rs).
+Select `operation = "close"`. The native declaration is in [NotificationRequest](../../../rust/forge/src/router/notification_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -497,7 +497,7 @@ Producer: [nvim/lua/forge/notifications.lua:9](../../../../nvim/lua/forge/notifi
 
 ## repository.walkthrough.document / WalkthroughRequest / open
 
-Select `operation = "open"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "open"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -510,7 +510,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:247](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / snapshot
 
-Select `operation = "snapshot"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "snapshot"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -521,7 +521,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:224](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / view
 
-Select `operation = "view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -534,7 +534,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:49](../../../../nvim/lua/forge/walkthr
 
 ## repository.walkthrough.document / WalkthroughRequest / close_view
 
-Select `operation = "close_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "close_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -546,7 +546,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:38](../../../../nvim/lua/forge/walkthr
 
 ## repository.walkthrough.document / WalkthroughRequest / change
 
-Select `operation = "change"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "change"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -560,7 +560,7 @@ Producer: [nvim/lua/forge/source_document.lua:184](../../../../nvim/lua/forge/so
 
 ## repository.walkthrough.document / WalkthroughRequest / annotation_source
 
-Select `operation = "annotation_source"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "annotation_source"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -572,7 +572,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:166](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / annotation_snapshot
 
-Select `operation = "annotation_snapshot"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "annotation_snapshot"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -584,7 +584,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:197](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / annotation_view
 
-Select `operation = "annotation_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "annotation_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -598,7 +598,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:144](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / annotation_close_view
 
-Select `operation = "annotation_close_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "annotation_close_view"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -611,7 +611,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:130](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / annotation_close
 
-Select `operation = "annotation_close"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "annotation_close"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -623,7 +623,7 @@ Producer: [nvim/lua/forge/walkthrough.lua:112](../../../../nvim/lua/forge/walkth
 
 ## repository.walkthrough.document / WalkthroughRequest / close
 
-Select `operation = "close"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/walkthrough_routes.rs).
+Select `operation = "close"`. The native declaration is in [WalkthroughRequest](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -977,7 +977,7 @@ Producer: [nvim/lua/forge/views/harness/tool_output.lua:109](../../../../nvim/lu
 
 ## repository.write / WriteAction / create_branch
 
-Select `kind = "create_branch"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/repository_write.rs).
+Select `kind = "create_branch"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -988,7 +988,7 @@ Producer: [nvim/lua/forge/views/status/status_context.lua:157](../../../../nvim/
 
 ## repository.write / WriteAction / commit_editor
 
-Select `kind = "commit_editor"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/repository_write.rs).
+Select `kind = "commit_editor"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -1001,7 +1001,7 @@ Producer: [nvim/lua/forge/integrations/commit.lua:400](../../../../nvim/lua/forg
 
 ## repository.write / WriteAction / push
 
-Select `kind = "push"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/repository_write.rs).
+Select `kind = "push"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -1011,7 +1011,7 @@ Producer: [nvim/lua/forge/views/status/status_context.lua:145](../../../../nvim/
 
 ## repository.write / WriteAction / publish_branch
 
-Select `kind = "publish_branch"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/repository_write.rs).
+Select `kind = "publish_branch"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
@@ -1023,7 +1023,7 @@ Producer: [nvim/lua/github/open_pr.lua:596](../../../../nvim/lua/github/open_pr.
 
 ## repository.write / WriteAction / pull
 
-Select `kind = "pull"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/repository_write.rs).
+Select `kind = "pull"`. These fields belong to `action` inside the writer prepare request. The native declaration is in [WriteAction](../../../rust/forge/src/runtime/repository_write.rs).
 
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |

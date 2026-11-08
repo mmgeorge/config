@@ -8,7 +8,7 @@ pub mod credit;
 pub mod frame;
 pub mod input;
 pub mod message;
-pub mod method_policy;
+pub use forge_method_policy as method_policy;
 pub mod outbound;
 pub mod snapshot;
 pub mod transfer;

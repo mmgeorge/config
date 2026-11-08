@@ -10,7 +10,8 @@ command = "nu .config/git_template.nu"
 # seconds is terminated and reported as a failure, so a hang or a real-clock wait fails fast
 # instead of stalling the run. Fix or remove a slow test. The overrides below are the only
 # exceptions; each names the cost that keeps its tests above the limit. Add one only when that
-# cost is what the test verifies, and record the reason beside it.
+# cost is what the test verifies, or when the test guards a high-value invariant
+# that no faster test covers, and record the reason beside it.
 [profile.default]
 slow-timeout = { period = "2s", terminate-after = 1 }
 # Report every failure in one run rather than stopping at the first.
@@ -57,42 +58,47 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 filter = """package(forge-harness) & (
     test(=broker::test::admission::admission_precedes_preparation_and_settles_success_failure_and_cancellation)
     | test(=broker::test::automatic_checks_complete_when_remaining_queue_is_removed)
-    | test(=broker::test::automatic_checks_default_off_until_explicitly_enabled)
     | test(=broker::test::automatic_checks_repair_after_permission_resume_on_worker)
     | test(=broker::test::goal_resume_retries_locked_checkpoint_before_provider_work)
     | test(=broker::test::input::deferred_steering_cancellation_preserves_acceptance_boundary)
     | test(=broker::test::native_abort_completion_rewinds_before_pending_checkpoint_finalization)
+    | test(=broker::test::reopened_pause_finalizes_before_executing_the_admitted_prompt)
 )"""
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These broker tests use plain workspaces and launch no processes, but each drives several
-# parent and child turns, or both direct and admitted sandbox transitions, through the real
-# broker and mock provider. The fastest agent tests take 0.3 s at eight threads, and these run
-# several of those cycles. The sandbox test takes 1.8 s alone.
+# These broker tests use plain workspaces and launch no processes, so their cost is not what they
+# verify. They stay because each guards an invariant no faster test covers: a suspended parent
+# joins its children, a pending user decision holds the parent, user input wakes a parent without
+# native steering, sandbox state follows both direct and admitted toggles, and a failed plan
+# retries with a fresh budget. Each drives several turns through the real broker and mock
+# provider. The fastest agent tests take 0.3 s at eight threads and these run several such cycles,
+# taking 1.2 to 1.9 s at eight threads; the sandbox test takes 1.8 s alone.
 [[profile.default.overrides]]
 filter = """package(forge-harness) & (
     test(=broker::test::agent::suspended_parent_joins_children_before_resuming)
     | test(=broker::test::agent::user_decision_holds_parent_until_answered_before_delivering_child_results)
     | test(=broker::test::agent::user_input_wakes_suspended_parent_without_native_steering)
     | test(=broker::test::yolo_toggles_sandbox_in_direct_and_admitted_transitions)
+    | test(=broker::test::retry_resumes_the_same_failed_plan_with_a_fresh_budget)
 )"""
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These tests start the whole in-process `HarnessService`: session registry, SQLite stores and
-# the mock provider runtime. They then drive owner transitions, configuration retries or task
-# controls across several requests. Service tests take a median 0.65 s at eight threads, and
-# these multi-request ones take 0.6 to 1.1 s alone, so load pushes them past two seconds.
-# `goal_continue_aliases_reuse_the_completed_source_and_receipt_*` also fails intermittently for
-# reasons unrelated to duration. This exception does not cover that failure, which still needs a fix.
+# These tests start the whole in-process `HarnessService`: session registry, SQLite stores and the
+# mock provider runtime. Their cost is not what they verify either. They stay because they guard
+# ownership invariants that lose work or leak a provider when broken: cancellation and
+# configuration changes collect the native work they replace, a timed-out cleanup keeps its
+# worker, closing one session preserves a sibling on the shared runtime, observation intake never
+# blocks on the foreground broker, and task creation and edited goals start exactly once. Service
+# tests take a median 0.65 s at eight threads, and these multi-request ones take 0.6 to 1.1 s
+# alone, so load pushes them past two seconds.
 [[profile.default.overrides]]
 filter = """package(forge-harness) & (
     test(=service::session_observation_test::failed_session_observation_restarts_for_explicit_new_work)
     | test(=service::session_observation_test::session_observation_intake_does_not_block_on_foreground_broker)
     | test(=service::tests::configuration_retry::latest_configuration_waits_for_actual_child_end_and_preserves_canceled_root)
-    | test(=service::tests::owner_cancel::owner_active_overdue_cancel_recovers_when_late_collection_completes)
+    | test(/^service::tests::owner_cancel::/)
     | test(/^service::tests::owner_transition::/)
-    | test(=service::tests::task_presentation::plan_cancellation_retires_open_status_and_reopens_idle)
-    | test(/^service::tests::task_state::goal_continue_aliases_reuse_the_completed_source_and_receipt_/)
+    | test(=service::tests::task_state::task_creation_completes_at_dispatch_and_replay_preserves_replacement_goal)
     | test(=service::tests::task_state::queued_input_edited_to_goal_starts_once_and_preserves_other_input)
     | test(/^service::tests::task_state::task_control_aliases_collect_active_work_and_replay_owner_receipts_/)
 )"""

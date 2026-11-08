@@ -11142,5 +11142,4 @@ fn default_goal_max_turns() -> u32 {
 pub use forge_provider_api::error::TurnCancelled;
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod test;

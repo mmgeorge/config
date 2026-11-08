@@ -3,7 +3,6 @@ use forge_diff::cache::CacheLimits;
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair};
 
-#[path = "excerpt_regression_tests.rs"]
 mod regression;
 
 struct Fixture {

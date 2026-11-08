@@ -1354,5 +1354,4 @@ fn helper_identity(main_session_id: &str) -> SessionId {
 }
 
 #[cfg(test)]
-#[path = "shell_session/tests.rs"]
 mod tests;

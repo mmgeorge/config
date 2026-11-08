@@ -147,7 +147,7 @@ drop(guard);
 | --- | --- |
 | [invariant-apis.md](references/invariant-apis.md) | Designing public methods that read or mutate state, accessors, guards, transactions, or interior mutability |
 | [typed-boundaries.md](references/typed-boundaries.md) | Defining or changing traits, adapters, events, protocol messages, or code that parses external data |
-| [module-organization.md](references/module-organization.md) | Splitting, moving, or promoting modules, ordering trait implementations, or changing re-exports |
+| [module-organization.md](references/module-organization.md) | Splitting, moving, or promoting modules, placing test helpers or `#[path]` declarations, ordering trait implementations, or changing re-exports |
 | [type-modeling.md](references/type-modeling.md) | Adding domain types, newtypes, enums, state transitions, behavioral owners, private state aggregates, `Result` success or failure types, retained fields, constructors, operation names, or type-erased stores |
 | [control-flow.md](references/control-flow.md) | Restructuring method chains, naming intermediate stages, or extracting fallible helpers |
 | [error-handling.md](references/error-handling.md) | Adding or reshaping error types, error derives, or error conversions |

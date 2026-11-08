@@ -47,7 +47,7 @@ and hidden incompatible sessions remain stored.
 ## Verification evidence
 
 `agent/coordinator_test.rs` covers capacity reservations, duplicate admissions, foreign targets,
-queue limits, interruption, and request delivery. `broker/agent_test.rs` exercises provider routing
+queue limits, interruption, and request delivery. `broker/test/agent.rs` exercises provider routing
 and durable operation receipts through the real broker composition. Broker workflow tests cover
 manual follow-ups and automatic root continuation. Approval tests isolate siblings with identical
 provider request identifiers. Storage tests check atomic admission and restart recovery.

@@ -1,5 +1,4 @@
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
 
 use super::logs::LogSnapshot;

@@ -25,53 +25,32 @@ use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 use crate::task::command as session_command;
 
-#[path = "service/cancellation.rs"]
 mod cancellation;
-#[path = "service/check_completion.rs"]
 mod check_completion;
-#[path = "service/command.rs"]
 mod command;
-#[path = "service/compaction.rs"]
 mod compaction;
-#[path = "service/input.rs"]
 mod input_delivery;
 #[cfg(test)]
-#[path = "service/input_durability_test.rs"]
 mod input_durability_test;
-#[path = "service/local_configuration.rs"]
 mod local_configuration;
-#[path = "service/native_permission.rs"]
 mod native_permission;
-#[path = "service/native_settings.rs"]
 mod native_settings;
-#[path = "service/owner_commands.rs"]
 mod owner_commands;
 #[cfg(test)]
-#[path = "service/plan_question_event_test.rs"]
 mod plan_question_event_test;
-#[path = "service/prompt.rs"]
 mod prompt;
-#[path = "service/provider_lifecycle.rs"]
 mod provider_lifecycle;
 #[cfg(test)]
-#[path = "service/provider_startup_test.rs"]
 mod provider_startup_test;
 #[cfg(test)]
-#[path = "service/question_event_test.rs"]
 mod question_event_test;
 #[cfg(test)]
-#[path = "service/question_wait_test.rs"]
 mod question_wait_test;
-#[path = "service/reconnect.rs"]
 mod reconnect;
-#[path = "service/review_questions.rs"]
 mod review_questions;
 #[cfg(test)]
-#[path = "service/session_observation_test.rs"]
 mod session_observation_test;
-#[path = "service/shared.rs"]
 mod shared;
-#[path = "service/task_state.rs"]
 mod task_state;
 
 #[derive(Clone, Copy)]
@@ -2892,7 +2871,6 @@ fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
 }
 
 #[cfg(test)]
-#[path = "service/tests.rs"]
 mod tests;
 
 #[cfg(test)]

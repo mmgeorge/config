@@ -27,6 +27,8 @@ libc = { workspace = true }
 windows = { workspace = true, features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# Enables `test-fixtures` for this crate's own integration tests.
+forge-git = { path = ".", features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dev-dependencies]

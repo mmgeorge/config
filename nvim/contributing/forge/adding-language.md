@@ -26,7 +26,7 @@ All `crates/...` paths are relative to `nvim/rust/forge/`.
 5. **Integrate saved-plan behavior.** Review `crates/forge-harness/src/declaration/` and `src/plan/`, including `calls.rs`, `references.rs`, `workspace_definition.rs`, and `conformance.rs`. Decide which internal references can be validated and which stay unverified. Do not use the current workspace as proof that a changed proposal is valid.
 6. **Verify LSP selection.** Check `DeclarationOverview::filetype` against the client's `filetypes` and workspace root. Extend the mapping in `nvim/lua/forge/views/plan_review/workspace_definition.lua` rather than adding another per-language adapter.
 7. **Add tests.** Cover a local declaration, a relative dependency, and a member-reference case in the Rust declaration tests, and add a scenario row to `nvim/lua/forge/tests/integration/views/plan_review/plan_review.test.lua` when editor navigation changes.
-8. **Verify commit excerpts.** Exercise `SyntaxHandle::outline` against real source, and extend `src/commit_message/excerpt_tests.rs`. See [Commit-message excerpts](#commit-message-excerpts).
+8. **Verify commit excerpts.** Exercise `SyntaxHandle::outline` against real source, and extend `src/runtime/commit_message/excerpt/tests.rs`. See [Commit-message excerpts](#commit-message-excerpts).
 9. **Verify the complete path.** Run the targeted Rust tests, then the adapter tests and the real host fixture. Confirm the editor selects the actual definition token and can return to the plan. Update the relevant architecture chapter.
 
 To add a language to the agent LSP tools, also extend `SourceDeclaration` extraction with identifier coordinates, declaration and body ranges, nesting, and visibility, and leave unknown visibility explicit. Verify with [the host fixture](verification-by-area.md#agent-lsp-tools).
@@ -54,7 +54,7 @@ Commit generation uses `SyntaxLanguage::for_path` and the shared syntax engine, 
 - Added and removed callables keep only their signatures, including inline bodies.
 - Plain diff fallback works when no grammar is available or a declaration cannot be parsed.
 
-Signature-aware coverage currently tests Rust, TypeScript, JavaScript, Lua, Python, C, and C++. JSON, TOML, YAML, and CUE have diff-excerpt coverage. Keep the language matrix in `src/commit_message/excerpt_tests.rs` current. `excerpt_regression_tests.rs` also checks source order, callback ownership, and import filtering across languages. `nvim/lua/forge/tests/integration/buffer/language_syntax.test.lua` verifies rendered highlight colors in the rebuilt host.
+Signature-aware coverage currently tests Rust, TypeScript, JavaScript, Lua, Python, C, and C++. JSON, TOML, YAML, and CUE have diff-excerpt coverage. Keep the language matrix in `src/runtime/commit_message/excerpt/tests.rs` current. `excerpt_regression_tests.rs` also checks source order, callback ownership, and import filtering across languages. `nvim/lua/forge/tests/integration/buffer/language_syntax.test.lua` verifies rendered highlight colors in the rebuilt host.
 
 ## Troubleshooting
 

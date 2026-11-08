@@ -1,4 +1,4 @@
-mod support;
+use forge_git::test_support as support;
 
 use forge_git::{completion::RevisionProvider, store::RepositoryStore};
 use std::{fs, path::Path, sync::Arc};

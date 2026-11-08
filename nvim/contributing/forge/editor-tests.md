@@ -34,6 +34,25 @@ error(("unknown scenario %q"):format(tostring(selected)))
 
 Add a new test as a row in the existing unit or area file rather than as a new file, and move a unit test file whenever its source file moves.
 
+### mini.test files
+
+A test file may instead be a [mini.test](https://github.com/nvim-mini/mini.test) set, which replaces the row table and dispatcher with hooks, `MiniTest.expect`, child Neovim processes, and screenshots. `nvim/lua/forge/tests/unit/lsp/startup.test.lua` is the pilot. The file returns a `MiniTest.new_set()`, and the runner discovers its cases from top-level `T["name"] = ...` lines:
+
+```lua
+local MiniTest = require("mini.test")
+local T = MiniTest.new_set({ hooks = { post_case = function() require("forge.lsp.startup").close() end } })
+
+T["close_without_start"] = function()
+  MiniTest.expect.no_error(require("forge.lsp.startup").close)
+end
+
+return T
+```
+
+mini.test has no parallel execution, so the runner supplies it. It clones the pinned commit once into a commit-named directory beside the Nushell cache. It then runs each mini.test file as one shard, its cases sequentially in a single Neovim, through `nvim/lua/forge/tests/support/minitest_shard.lua`, and runs shards in parallel with every other test. The shard arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case. The runner's outer kill waits the shard's case count times five seconds, plus one second for that report. A timeout ends the shard, so later cases in the file do not run. `file::case` runs one case in its own shard.
+
+Cases in a shard share one process, so a case must leave no state behind. Capture and restore every replaced editor function in `pre_case` and `post_case` hooks, which run even when the case fails, and delete temporary directories through `MiniTest.finally`. A case that needs a pristine editor drives a child from `MiniTest.new_child_neovim()` and restarts it in `pre_case`.
+
 ## Suites
 
 The `lua-test` check runs every Lua test through the runner. Its default `affected` selection maps changed paths to tests. A changed test file runs itself; a changed Lua source file runs its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor; a source file with no area runs its plugin's whole test directory; and any other change, including a change under `tests/` or to the runner, runs every test. Its `suite` input accepts `all`, an area name such as `status`, which selects that area's unit and integration mirrors, or a directory under `nvim/lua`.

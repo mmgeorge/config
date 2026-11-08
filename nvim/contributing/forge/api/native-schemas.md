@@ -546,7 +546,7 @@ enum StatusContextRequest {
 
 ## CreationContextParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -558,7 +558,7 @@ struct CreationContextParams {
 
 ## ReviewSubmissionContextParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -574,7 +574,7 @@ struct ReviewSubmissionContextParams {
 
 ## NotificationPageParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -587,7 +587,7 @@ struct NotificationPageParams {
 
 ## ActorParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -600,7 +600,7 @@ struct ActorParams {
 
 ## ReviewMutateParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -613,7 +613,7 @@ struct ReviewMutateParams {
 
 ## RecoveryInspectParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -625,7 +625,7 @@ struct RecoveryInspectParams {
 
 ## RecoveryResolveParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -640,7 +640,7 @@ struct RecoveryResolveParams {
 
 ## RecoveryAcknowledgeParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -653,7 +653,7 @@ struct RecoveryAcknowledgeParams {
 
 ## RecoverySettleDraftParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -667,7 +667,7 @@ struct RecoverySettleDraftParams {
 
 ## ReviewDraftWriteParams
 
-Decoder source: [nvim/rust/forge/src/github_routes.rs](../../../rust/forge/src/github_routes.rs).
+Decoder source: [nvim/rust/forge/src/router/github_routes.rs](../../../rust/forge/src/router/github_routes.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -740,7 +740,7 @@ pub struct TextGenerationConfig {
 
 ## Comparison
 
-Decoder source: [nvim/rust/forge/src/commit_message/service.rs](../../../rust/forge/src/commit_message/service.rs).
+Decoder source: [nvim/rust/forge/src/runtime/commit_message/service.rs](../../../rust/forge/src/runtime/commit_message/service.rs).
 
 ```rust
 #[derive(Clone, Copy, Deserialize, PartialEq)]
@@ -756,7 +756,7 @@ pub enum Comparison {
 
 ## GenerationRequest
 
-Decoder source: [nvim/rust/forge/src/commit_message/service.rs](../../../rust/forge/src/commit_message/service.rs).
+Decoder source: [nvim/rust/forge/src/runtime/commit_message/service.rs](../../../rust/forge/src/runtime/commit_message/service.rs).
 
 ```rust
 #[derive(Deserialize)]
@@ -781,7 +781,7 @@ pub struct GenerationRequest {
 
 ## PromptPreview
 
-Decoder source: [nvim/rust/forge/src/commit_message/service.rs](../../../rust/forge/src/commit_message/service.rs).
+Decoder source: [nvim/rust/forge/src/runtime/commit_message/service.rs](../../../rust/forge/src/runtime/commit_message/service.rs).
 
 ```rust
 #[derive(Clone, Serialize)]
@@ -796,7 +796,7 @@ pub struct PromptPreview {
 
 ## GenerationResponse
 
-Decoder source: [nvim/rust/forge/src/commit_message/service.rs](../../../rust/forge/src/commit_message/service.rs).
+Decoder source: [nvim/rust/forge/src/runtime/commit_message/service.rs](../../../rust/forge/src/runtime/commit_message/service.rs).
 
 ```rust
 #[derive(Clone, Serialize)]

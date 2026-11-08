@@ -929,6 +929,7 @@ dependencies = [
  "anyhow",
  "dunce",
  "forge-diff",
+ "forge-git",
  "gix",
  "libc",
  "process-wrap",
@@ -998,9 +999,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-method-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "forge-protocol"
 version = "0.1.0"
 dependencies = [
+ "forge-method-policy",
  "serde",
  "serde_json",
  "tokio",

@@ -1,9 +1,7 @@
 use serde::Deserialize;
 use std::{collections::BTreeMap, error::Error, fmt::Write, fs, path::PathBuf};
 
-#[path = "src/method_policy.rs"]
-#[allow(dead_code)]
-mod method_policy;
+use forge_method_policy as method_policy;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,4 +1,4 @@
-mod support;
+use forge_git::test_support as support;
 use support::{
     commit_index, git, init_bare_repository, init_repository, init_sha256_repository, move_tracked,
     stage, stage_conflict,

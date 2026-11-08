@@ -1,4 +1,4 @@
-mod support;
+use forge_git::test_support as support;
 
 use forge_git::coordinator::{MutationCoordinator, OperationState};
 use forge_git::mutation::{MutationScope, OperationCompletion};

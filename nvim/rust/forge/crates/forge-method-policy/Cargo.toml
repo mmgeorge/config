@@ -1,0 +1,11 @@
+[package]
+name = "forge-method-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Its own crate because `forge-protocol`'s build script validates the method contract against
+# these types, and a build script can only share code through a build-dependency.
+[dependencies]
+serde = { workspace = true, features = ["derive"] }

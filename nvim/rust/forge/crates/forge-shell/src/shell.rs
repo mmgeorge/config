@@ -5,7 +5,6 @@ use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language, Node, Parser, Tree};
 
-#[path = "powershell_filter.rs"]
 mod powershell_filter;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

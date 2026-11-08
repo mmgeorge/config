@@ -7,7 +7,7 @@ license.workspace = true
 
 [workspace]
 resolver = "3"
-members = ["crates/forge-provider-api", "crates/forge-shell", "crates/forge-providers", "crates/forge-text", "crates/forge-buffer", "crates/forge-protocol", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status"]
+members = ["crates/forge-provider-api", "crates/forge-shell", "crates/forge-providers", "crates/forge-text", "crates/forge-buffer", "crates/forge-protocol", "crates/forge-method-policy", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status"]
 exclude = ["vendor/gix-path", "vendor/tree-sitter-powershell"]
 
 [workspace.package]
@@ -24,6 +24,7 @@ forge-git = { path = "crates/forge-git" }
 forge-github = { path = "crates/forge-github" }
 forge-harness = { path = "crates/forge-harness" }
 forge-protocol = { path = "crates/forge-protocol" }
+forge-method-policy = { path = "crates/forge-method-policy" }
 forge-providers = { path = "crates/forge-providers" }
 forge-review = { path = "crates/forge-review" }
 forge-shell = { path = "crates/forge-shell" }

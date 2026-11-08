@@ -19,15 +19,12 @@ use super::document::TranscriptEntry;
 use super::tool::ToolOutputView;
 use super::transcript::TranscriptRenderer;
 
-#[path = "projection/checks.rs"]
 mod checks;
 
 #[cfg(test)]
-#[path = "projection/change_results_test.rs"]
 mod change_results_test;
 
 #[cfg(test)]
-#[path = "projection/task_start_test.rs"]
 mod task_start_test;
 
 #[derive(Clone, Debug, Serialize)]

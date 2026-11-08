@@ -782,5 +782,4 @@ impl Drop for RestoreWait {
 }
 
 #[cfg(test)]
-#[path = "test.rs"]
 mod test;

@@ -23,13 +23,9 @@ use serde_json::{Value, json};
 
 use crate::{host::RoutedRequestEnvelope, runtime::ForgeRuntime};
 
-#[path = "github_routes.rs"]
 mod github_routes;
-#[path = "issue_routes.rs"]
 mod issue_routes;
-#[path = "notification_routes.rs"]
 mod notification_routes;
-#[path = "walkthrough_routes.rs"]
 mod walkthrough_routes;
 
 const PAGE_BYTES: usize = 128 * 1024;

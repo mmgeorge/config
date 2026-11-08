@@ -1,27 +1,14 @@
 use crate::provider::ScopeOwner;
-#[path = "tests/agent_admission.rs"]
 mod agent_admission;
-#[path = "tests/bootstrap.rs"]
 mod bootstrap;
-#[path = "tests/configuration_retry.rs"]
 mod configuration_retry;
-#[path = "tests/live_goal.rs"]
 mod live_goal;
-#[path = "tests/owner_cancel.rs"]
 mod owner_cancel;
-#[path = "tests/owner_fixture.rs"]
 mod owner_fixture;
-#[path = "tests/owner_storage_failure.rs"]
 mod owner_storage_failure;
-#[path = "tests/owner_transition.rs"]
 mod owner_transition;
-#[path = "tests/reconnect_overlap.rs"]
 mod reconnect_overlap;
-#[path = "tests/reviewed_plan.rs"]
-mod reviewed_plan;
-#[path = "tests/task_presentation.rs"]
 mod task_presentation;
-#[path = "tests/task_state.rs"]
 mod task_state;
 
 use super::*;

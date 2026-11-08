@@ -6,7 +6,6 @@ use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 use super::{ConfigurationFormat, SyntaxError, SyntaxLanguage};
 
 #[cfg(test)]
-#[path = "declaration_formatting_tests.rs"]
 mod formatting_tests;
 
 /// Extracts and validates body-free declarations using the bundled source grammars.

@@ -11,7 +11,7 @@ A language feature can work in one consumer and silently fail in another, becaus
 | Native syntax rendering | `forge-diff/src/syntax/assets.rs` and grammar dependencies | Highlight and injection captures |
 | Declaration planning | `DeclarationOverview::language` and its adapters | Body-free interfaces, imports, fields, and documentation |
 | Structural references | `declaration_index.rs`, `declaration_calls.rs`, and Harness plan modules | Scopes, callable owners, and source coordinates |
-| Commit-message excerpts | `SyntaxHandle::outline` and `src/commit_message/excerpt.rs` | Signatures and changed-body excerpts, with plain diff fallback |
+| Commit-message excerpts | `SyntaxHandle::outline` and `src/runtime/commit_message/excerpt.rs` | Signatures and changed-body excerpts, with plain diff fallback |
 | Workspace definitions and agent queries | The shared Lua LSP adapter and the running project server | Definitions, references, and diagnostics for real source |
 | Check invocation | Harness typed inputs and literal argv substitution | One configured command with recorded inputs |
 

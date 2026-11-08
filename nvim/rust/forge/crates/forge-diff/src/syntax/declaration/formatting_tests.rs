@@ -178,7 +178,7 @@ fn check_corpus(path: &str, source: &str) {
 fn rust_declaration_corpus_preserves_meaning() {
     check_corpus(
         "corpus.rs",
-        include_str!("../../tests/fixtures/declaration_formatting/rust.rs.txt"),
+        include_str!("../../../tests/fixtures/declaration_formatting/rust.rs.txt"),
     );
 }
 
@@ -186,7 +186,7 @@ fn rust_declaration_corpus_preserves_meaning() {
 fn tsx_declaration_corpus_preserves_meaning() {
     check_corpus(
         "corpus.tsx",
-        include_str!("../../tests/fixtures/declaration_formatting/tsx.tsx.txt"),
+        include_str!("../../../tests/fixtures/declaration_formatting/tsx.tsx.txt"),
     );
 }
 
@@ -194,7 +194,7 @@ fn tsx_declaration_corpus_preserves_meaning() {
 fn lua_declaration_corpus_preserves_meaning() {
     check_corpus(
         "corpus.lua",
-        include_str!("../../tests/fixtures/declaration_formatting/lua.lua.txt"),
+        include_str!("../../../tests/fixtures/declaration_formatting/lua.lua.txt"),
     );
 }
 

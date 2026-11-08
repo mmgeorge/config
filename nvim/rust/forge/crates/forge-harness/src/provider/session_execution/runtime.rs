@@ -4458,7 +4458,6 @@ fn not_admitted() -> ProviderError {
 }
 
 #[cfg(test)]
-#[path = "owner_conformance.rs"]
 mod owner_conformance;
 
 #[cfg(test)]

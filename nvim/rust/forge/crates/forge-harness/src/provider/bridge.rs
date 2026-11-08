@@ -17,15 +17,12 @@ use crate::tools::control_session::ControlSession;
 
 use super::{ProviderRequest, approval::PermissionCoordinator, operation::OperationControl};
 
-#[path = "observed_permissions.rs"]
 mod observed_permissions;
 pub(super) use observed_permissions::ObservedPermissionAuthority;
 
-#[path = "history_operation.rs"]
 mod history_operation;
 
 #[cfg(test)]
-#[path = "bridge_test.rs"]
 mod tests;
 
 /// Distinguish retained provenance from a generation still authorized to mutate session metadata.

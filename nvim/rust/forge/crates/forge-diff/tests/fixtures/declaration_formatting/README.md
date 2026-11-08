@@ -4,7 +4,7 @@ Formatting must preserve declaration structure and literal contents. Successful
 parsing alone is insufficient: moving a tuple field into a line comment produces
 valid Rust while deleting the field.
 
-The tests in `src/syntax/declaration_formatting_tests.rs` exercise the production
+The tests in `src/syntax/declaration/formatting_tests.rs` exercise the production
 `DeclarationOverview::format_with_width` and `present` entry points. A separate
 tree walk compares syntax nodes and leaf contents before and after formatting.
 It ignores comments and optional separators in the syntax comparison, then checks

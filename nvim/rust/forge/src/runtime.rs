@@ -10,9 +10,7 @@ use forge_review::service::ReviewService;
 
 pub(crate) const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
-#[path = "commit_message/mod.rs"]
 pub(crate) mod commit_message;
-#[path = "repository_write.rs"]
 pub(crate) mod repository_write;
 
 /// Owns shared repository resources for one host without opening a repository at construction.

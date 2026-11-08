@@ -28,7 +28,6 @@ type Result<T> = std::result::Result<T, Error>;
 use std::ops::Range;
 
 #[cfg(test)]
-#[path = "token_tests.rs"]
 mod token_tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

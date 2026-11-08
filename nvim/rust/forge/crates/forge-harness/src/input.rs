@@ -1088,11 +1088,9 @@ impl SessionInputQueue {
 }
 
 #[cfg(test)]
-#[path = "input/test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "input/durability_test.rs"]
 mod durability_test;
 
 /// Report whether task input sits outside native delivery, so retiring its task authority can

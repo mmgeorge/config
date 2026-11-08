@@ -12,7 +12,7 @@ Read the authenticated GitHub actor for a repository.
 - **Input:** directory and repository.
 - **Result and effects:** Returns actor identity.
 - **Boundary:** Authentication/network errors do not imply an unauthenticated empty actor.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -48,7 +48,7 @@ Open or operate on a native issue document.
 - **Input:** operation selects open, snapshot, save, refresh, view, close_view, act, resolve, or close; open includes document, directory, database, repository, and number.
 - **Result and effects:** Returns document delivery, save/action/recovery outcome, or collection result.
 - **Boundary:** save/act/resolve can mutate remote or durable draft state and require captured identities.
-- **Inspected source:** [`nvim/rust/forge/src/issue_routes.rs`](../../../rust/forge/src/issue_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/issue_routes.rs`](../../../rust/forge/src/router/issue_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -128,7 +128,7 @@ Open or operate on a native notification document.
 - **Input:** operation selects open, snapshot, view, close_view, act, or close; open includes document, workspace, and hostname.
 - **Result and effects:** Returns document delivery or action/close outcome.
 - **Boundary:** Actions can change remote notification state; snapshots are reads.
-- **Inspected source:** [`nvim/rust/forge/src/notification_routes.rs`](../../../rust/forge/src/notification_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/notification_routes.rs`](../../../rust/forge/src/router/notification_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -148,7 +148,7 @@ Read a page of GitHub notifications.
 - **Input:** directory and the typed notification read request.
 - **Result and effects:** Returns the requested notification page.
 - **Boundary:** Pagination and remote read errors remain distinct from an empty page.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -184,7 +184,7 @@ Collect the repository/branch context required for PR creation.
 - **Input:** directory.
 - **Result and effects:** Returns repository identity, branch, head commit, and creation metadata.
 - **Boundary:** This reads creation context and does not create a PR.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -200,7 +200,7 @@ Acknowledge a retained mutation outcome.
 - **Input:** resource and operation_id.
 - **Result and effects:** Returns acknowledged=true.
 - **Boundary:** Acknowledge the matching captured operation, not an unrelated request ID.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -216,7 +216,7 @@ Persist a settled draft and acknowledge the matching mutation.
 - **Input:** resource, operation_id, and draft.
 - **Result and effects:** Returns acknowledged=true.
 - **Boundary:** Draft settlement and acknowledgement follow the service's durable recovery boundary.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -234,7 +234,7 @@ Read retained recovery state for a resource.
 - **Input:** resource.
 - **Result and effects:** Returns the recovery record when present.
 - **Boundary:** An absent record is distinct from proof that a remote operation failed.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -250,7 +250,7 @@ Apply an explicit recovery resolution.
 - **Input:** directory, resource, operation_id, and typed resolution.
 - **Result and effects:** Returns the resolved recovery record.
 - **Boundary:** Resolution can inspect or link remote outcomes and must preserve the captured operation identity.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -694,7 +694,7 @@ Read a locally persisted draft for a GitHub resource.
 - **Input:** resource.
 - **Result and effects:** Returns the stored draft value.
 - **Boundary:** Reading a draft does not publish it to GitHub.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -710,7 +710,7 @@ Persist a draft for a GitHub resource.
 - **Input:** resource and draft.
 - **Result and effects:** Returns saved acknowledgement.
 - **Boundary:** This is local persistence, distinct from remote publication.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -726,7 +726,7 @@ Execute a captured GitHub review mutation.
 - **Input:** directory and typed ReviewMutationRequest.
 - **Result and effects:** Returns the mutation record/outcome.
 - **Boundary:** Retain the operation identity when remote acceptance is uncertain.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 
@@ -746,7 +746,7 @@ Read current remote context before submitting a review.
 - **Input:** directory, repository, number, optional pending_review_id, and expected comment/review items.
 - **Result and effects:** Returns submission context for validating the pending review.
 - **Boundary:** Changed remote state must be reconciled before submitting captured drafts.
-- **Inspected source:** [`nvim/rust/forge/src/github_routes.rs`](../../../rust/forge/src/github_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/github_routes.rs`](../../../rust/forge/src/router/github_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 

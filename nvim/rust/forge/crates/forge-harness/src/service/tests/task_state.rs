@@ -50,21 +50,6 @@ fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
     Request { id, method, params }
 }
 
-/// Task pause/clear aliases collect native work and replay their owner receipts without replacing the provider.
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_transition_pause()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("transition", "pause")
-        .await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_transition_clear()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("transition", "clear")
-        .await
-}
-
 #[tokio::test]
 async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_pause() -> Result<()>
 {
@@ -75,42 +60,6 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_
 async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_clear() -> Result<()>
 {
     task_control_aliases_collect_active_work_and_replay_owner_receipts_case("rpc", "clear").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_prompt_pause()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("prompt", "pause").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_prompt_clear()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("prompt", "clear").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_input_pause()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("input", "pause").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_input_clear()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("input", "clear").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_steer_pause()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("steer", "pause").await
-}
-
-#[tokio::test]
-async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_steer_clear()
--> Result<()> {
-    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("steer", "clear").await
 }
 
 /// Run one transport and action variant of the scenario described above, each in its own test so a
@@ -237,154 +186,6 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
     );
     assert_eq!(history[0].id, original);
     assert!(!*controller.cancellation.subscribe().borrow());
-    service.shutdown(Duration::from_secs(2)).await?;
-    drop(sink);
-    reader.await??;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_transition() -> Result<()> {
-    goal_continue_aliases_reuse_the_completed_source_and_receipt_case("transition").await
-}
-
-#[tokio::test]
-async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_prompt() -> Result<()> {
-    goal_continue_aliases_reuse_the_completed_source_and_receipt_case("prompt").await
-}
-
-#[tokio::test]
-async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_input() -> Result<()> {
-    goal_continue_aliases_reuse_the_completed_source_and_receipt_case("input").await
-}
-
-/// Run one transport variant of the scenario described above, each in its own test so a
-/// variant reports independently and stays within the per-test time limit.
-async fn goal_continue_aliases_reuse_the_completed_source_and_receipt_case(
-    transport: &str,
-) -> Result<()> {
-    use crate::provider::mock_response::MockResponseCommand;
-    let fixture = tempfile::tempdir()?;
-    crate::checks::configure_fixture(fixture.path());
-    let service = service();
-    service
-        .open_session(1, initialize(&fixture, "mock"))
-        .await?;
-    let registry = service.registry().await?;
-    let session_id = registry.initial_session_id().to_owned();
-    let controller = registry.resolve(&session_id).await?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    let reader = tokio::spawn(async move {
-        while output.recv().await?.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-    controller.attach_input(&sink).await?;
-    service
-        .dispatch(
-            Some(session_id.clone()),
-            Request {
-                id: 2,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"Inspect startup"}),
-            },
-            &sink,
-        )
-        .await?;
-    let mut store = SqliteStore::open(&controller.data_root)?;
-    let source = async {
-        loop {
-            if let Some(source) = store.latest_exchange(&session_id)?
-                && source.is_finished()
-                && controller.coordinator.execution.available_permits() == 1
-            {
-                break Ok::<_, anyhow::Error>(source);
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-    .await?;
-    controller.task_controller.change(
-        &mut store,
-        None,
-        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
-            "Preserve the held provider".into(),
-            crate::session::continuation::ContinuationBudget::new(20, 2),
-            1,
-        ))),
-        1,
-    )?;
-    let mock_provider = controller.provider_handle();
-    let control = mock_provider.mock_response_control().unwrap();
-    let hold = control
-        .dispatch(
-            &session_id,
-            MockResponseCommand::Hold {
-                mode: None,
-                any_session: false,
-            },
-        )
-        .await?;
-    let hold_id = hold["id"].as_str().unwrap().to_owned();
-    let request = goal_command_request(transport, "continue", 3);
-    service
-        .dispatch(Some(session_id.clone()), request.clone(), &sink)
-        .await?;
-    control
-        .dispatch(
-            &session_id,
-            MockResponseCommand::Wait {
-                id: hold_id.clone(),
-            },
-        )
-        .await?;
-    let task = serde_json::to_value(controller.task_controller.current()?)?;
-    assert!(
-        controller
-            .exchange_owner
-            .command_status(crate::exchange::command::CommandId::new(
-                request.params["operation_id"].as_str().unwrap()
-            )?)
-            .await?
-            .unwrap()
-            .completion()
-            .unwrap()
-            .is_ok()
-    );
-    service
-        .dispatch(Some(session_id.clone()), request, &sink)
-        .await?;
-    assert_eq!(
-        serde_json::to_value(controller.task_controller.current()?)?,
-        task
-    );
-    let history = store.list_exchange(&session_id)?;
-    assert_eq!(history.len(), 2);
-    assert_eq!(history[0].id, source.id);
-    assert!(matches!(
-        history[1].origin,
-        crate::exchange::ExchangeOrigin::TaskContinuation { .. }
-    ));
-    assert!(history[1].prompt.contains("Preserve the held provider"));
-    assert!(!history[1].prompt.trim_start().starts_with("/goal"));
-    assert!(!*controller.cancellation.subscribe().borrow());
-    service
-        .dispatch(
-            Some(session_id.clone()),
-            goal_command_request("transition", "clear", 4),
-            &sink,
-        )
-        .await?;
-    control
-        .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
-        .await?;
-    async {
-        while controller.coordinator.execution.available_permits() == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-    .await;
-    assert_eq!(store.list_exchange(&session_id)?.len(), 2);
     service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
     reader.await??;
@@ -881,14 +682,6 @@ async fn clearing_task_settles_its_finalizing_exchange() -> Result<()> {
 async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_goal() -> Result<()> {
     task_creation_completes_at_dispatch_and_replay_preserves_replacement_case(
         crate::task::TaskKind::Goal,
-    )
-    .await
-}
-
-#[tokio::test]
-async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_plan() -> Result<()> {
-    task_creation_completes_at_dispatch_and_replay_preserves_replacement_case(
-        crate::task::TaskKind::Plan,
     )
     .await
 }

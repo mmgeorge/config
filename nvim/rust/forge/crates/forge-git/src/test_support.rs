@@ -6,8 +6,8 @@
 //! Git behavior (clean/smudge filters, object identity, the writer, `merge-tree`) keep calling
 //! [`git`], which still launches the executable.
 //!
-//! The module is compiled both into every integration test binary and, through a `#[path]`
-//! attribute in `lib.rs`, into the library's unit tests.
+//! The library's unit tests use it directly. Integration tests and other crates' tests reach it as
+//! `forge_git::test_support` by enabling the `test-fixtures` feature in their dev-dependencies.
 #![allow(dead_code)]
 
 use std::path::Path;
@@ -227,8 +227,18 @@ pub fn reset_index_to_head(root: &Path) {
         .iter()
         .map(|entry| entry.path(&state).to_str().unwrap().to_owned())
         .collect::<Vec<_>>();
+    // Like `git reset`, record the worktree stat only for files whose content equals the `HEAD`
+    // blob. A modified file keeps the zero stat, so status rehashes it instead of trusting a stat
+    // that describes different content.
     for (entry, path) in state.entries_mut().iter_mut().zip(paths) {
-        if let Ok(metadata) = gix::index::fs::Metadata::from_path_no_follow(&root.join(path)) {
+        let absolute = root.join(path);
+        let Ok(content) = std::fs::read(&absolute) else {
+            continue;
+        };
+        if repository.find_blob(entry.id).unwrap().data != content {
+            continue;
+        }
+        if let Ok(metadata) = gix::index::fs::Metadata::from_path_no_follow(&absolute) {
             entry.stat = gix::index::entry::Stat::from_fs(&metadata).unwrap();
         }
     }

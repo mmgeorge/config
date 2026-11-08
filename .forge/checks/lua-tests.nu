@@ -17,9 +17,18 @@
 const repository_root = path self | path dirname | path dirname | path dirname
 const runner_path = path self
 const per_test_timeout = 5sec
+# A mini.test shard reports its own per-case timeout; the outer kill waits this much longer so the
+# shard can name the case that hung before the runner kills it.
+const minitest_report_grace = 1sec
 const startup_argument_list = [
   "--headless" "-i" "NONE" "-u" "NONE" "--cmd" "set rtp^=./nvim" "--cmd" "lua vim.loader.enable(false)"
 ]
+# mini.test test files return a `MiniTest.new_set()` and run as one shard per file through this
+# bootstrap. The runner clones the pinned mini.test commit once into a commit-named cache directory
+# and puts it on each shard's 'runtimepath'.
+const minitest_shard_path = "nvim/lua/forge/tests/support/minitest_shard.lua"
+const minitest_repository = "https://github.com/nvim-mini/mini.test"
+const minitest_commit = "0d0c3257cf799a6a1869fdb4bdda8f330bb63e03"
 
 # A fixture entry is a repository path, optionally followed by `::scenario` for fixtures that
 # take a scenario name through `arg[1]`.
@@ -82,14 +91,31 @@ def unit_test_for_source [relative: string] {
 # The scenario rows a test file declares as `{ name = "...", run = ... }` at two-space indentation.
 # A file with rows runs each row in its own Neovim, so no scenario shares the five-second budget
 # with another; a file without rows is one standalone script.
-def scenario_name_list [relative: string] {
+def scenario_row_name_list [relative: string] {
   open --raw ($repository_root | path join $relative) | lines
   | parse --regex '^  \{ name = "(?<name>[^"]+)", run = ' | get name
 }
 
-# A test file's entries: its scenario rows, or the file itself when it has none.
+# The top-level cases a mini.test file declares as `T["name"] = ...` at column zero.
+def minitest_case_name_list [relative: string] {
+  open --raw ($repository_root | path join $relative) | lines
+  | parse --regex '^T\["(?<name>[^"]+)"\] = ' | get name
+}
+
+def is_minitest_file [relative: string] {
+  not (minitest_case_name_list $relative | is-empty)
+}
+
+# The names `path::name` may select in a test file: its scenario rows or its mini.test cases.
+def scenario_name_list [relative: string] {
+  scenario_row_name_list $relative | append (minitest_case_name_list $relative)
+}
+
+# A test file's entries: the file itself as one shard when it is a mini.test file, its scenario
+# rows, or the file itself when it has neither.
 def expand_scenarios [relative: string] {
-  let names = scenario_name_list $relative
+  if (is_minitest_file $relative) { return [$relative] }
+  let names = scenario_row_name_list $relative
   if ($names | is-empty) { [$relative] } else { $names | each {|name| $"($relative)::($name)" } }
 }
 
@@ -243,6 +269,26 @@ def select_fixture_list [suite: string, path_list: list<string>, affected: bool]
   | each {|entry| validate_fixture $entry } | sort
 }
 
+# The pinned mini.test checkout, cloned on first use. A clone goes to a private pending directory
+# and is renamed into place, so concurrent runners never observe a partial checkout.
+def minitest_checkout [] {
+  let cache_root = $nu.cache-dir | path dirname | path join "forge-lua-tests"
+  let checkout = $cache_root | path join $"mini.test-($minitest_commit)"
+  if ($checkout | path join "lua/mini/test.lua" | path exists) { return $checkout }
+  mkdir $cache_root
+  let pending = $cache_root | path join $"pending-($nu.pid)"
+  rm -rf $pending
+  let clone = ^git clone --quiet --filter=blob:none $minitest_repository $pending | complete
+  let checkout_result = if $clone.exit_code == 0 { ^git -C $pending checkout --quiet --detach $minitest_commit | complete } else { $clone }
+  if $checkout_result.exit_code != 0 {
+    rm -rf $pending
+    error make {msg: $"Could not fetch mini.test ($minitest_commit): ($checkout_result.stderr | str trim)"}
+  }
+  try { mv $pending $checkout } catch { rm -rf $pending }
+  if not ($checkout | path join "lua/mini/test.lua" | path exists) { error make {msg: $"mini.test checkout is incomplete: ($checkout)"} }
+  $checkout
+}
+
 def publish_record [value: record, target_path: path] {
   let pending_path = $"($target_path).pending"
   $value | to json --raw | save --force $pending_path
@@ -302,7 +348,10 @@ def terminate_owned_tree [pid: int] {
 # Run one fixture under the deadline. A child Nushell worker publishes its PID, runs Neovim with
 # output redirected to files, and publishes the exit status, so a timeout can kill the tree and
 # still report the output written so far.
-def run_fixture [test: string, setup_list: list<string>] {
+#
+# A mini.test shard runs its cases one after another and enforces the per-case deadline itself, so
+# its outer deadline is the per-test deadline times its case count, plus the report grace.
+def run_fixture [test: string, setup_list: list<string>, minitest_directory: any] {
   let scratch_directory = mktemp -d
   let spec_path = $scratch_directory | path join "spec.json"
   let result_path = $scratch_directory | path join "result.json"
@@ -311,7 +360,17 @@ def run_fixture [test: string, setup_list: list<string>] {
   let setup_argument_list = $setup_list | each {|statement| ["--cmd" $"lua ($statement)"] } | flatten
   let fixture = split_fixture_entry $test
   let scenario_argument_list = if $fixture.scenario == null { [] } else { [$fixture.scenario] }
-  let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append ["-l" $fixture.path] | append $scenario_argument_list
+  let minitest = is_minitest_file $fixture.path
+  let script_argument_list = if $minitest {
+    ["--cmd" $"set rtp^=($minitest_directory | str replace --all '\' '/')" "-l" $minitest_shard_path $fixture.path]
+  } else {
+    ["-l" $fixture.path]
+  }
+  let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append $script_argument_list | append $scenario_argument_list
+  # Nested sets and parametrization make a shard's case count knowable only after collection, so
+  # a shard starts with a one-case deadline and extends it when mini.test reports its total.
+  mut deadline = if $minitest { $per_test_timeout + $minitest_report_grace } else { $per_test_timeout }
+  mut case_count_known = not $minitest
   {command: $command, output_path: $output_path} | to json --raw | save --force $spec_path
   let started = date now
   let worker_job = job spawn {
@@ -320,7 +379,14 @@ def run_fixture [test: string, setup_list: list<string>] {
     } catch { null }
   }
   mut worker_result: any = null
-  while $worker_result == null and (date now) - $started < $per_test_timeout {
+  while $worker_result == null and (date now) - $started < $deadline {
+    if not $case_count_known {
+      let reported = try { open --raw $output_path | ansi strip | parse --regex 'Total number of cases: (?<count>\d+)' } catch { [] }
+      if not ($reported | is-empty) {
+        $deadline = $per_test_timeout * ([($reported.0.count | into int) 1] | math max) + $minitest_report_grace
+        $case_count_known = true
+      }
+    }
     if ($result_path | path exists) {
       $worker_result = try { open $result_path } catch {|failure|
         {exit_code: 127, failure: $"Worker result is unreadable: ($failure.msg)"}
@@ -338,7 +404,7 @@ def run_fixture [test: string, setup_list: list<string>] {
   }
   let elapsed = (date now) - $started
   let outcome = if $worker_result != null {
-    let fixture_output = try { open --raw $output_path } catch { "" }
+    let fixture_output = try { open --raw $output_path | ansi strip } catch { "" }
     let fixture_error = $fixture_output =~ 'E[0-9]{3,}: (Lua chunk|Error executing lua|Vim)'
     let exit_status = if $worker_result.exit_code == 0 and $fixture_error { 1 } else { $worker_result.exit_code }
     let failure = $worker_result.failure? | default ""
@@ -350,8 +416,8 @@ def run_fixture [test: string, setup_list: list<string>] {
     } else {
       terminate_owned_tree $worker_pid
     }
-    let fixture_output = try { open --raw $output_path } catch { "" }
-    let note = $"Timed out after ($per_test_timeout); killed the process tree with ($termination.method), status ($termination.exit_status). ($termination.stderr)"
+    let fixture_output = try { open --raw $output_path | ansi strip } catch { "" }
+    let note = $"Timed out after ($deadline); killed the process tree with ($termination.method), status ($termination.exit_status). ($termination.stderr)"
     {state: "timed_out", exit_status: 124, output: ($fixture_output + "\n" + $note)}
   }
   try { job kill $worker_job } catch { null }
@@ -371,8 +437,11 @@ def format_outcome [outcome: record] {
 
 def run_fixture_list [test_list: list<string>, jobs: int, setup_list: list<string> = []] {
   cd $repository_root
+  # Fetch mini.test before the shards start, so parallel shards never race to clone it.
+  let uses_minitest = $test_list | any {|test| is_minitest_file (split_fixture_entry $test).path }
+  let minitest_directory = if $uses_minitest { minitest_checkout } else { null }
   let outcome_list = $test_list | par-each --threads $jobs {|test|
-    let outcome = run_fixture $test $setup_list
+    let outcome = run_fixture $test $setup_list $minitest_directory
     print (format_outcome $outcome)
     $outcome
   }

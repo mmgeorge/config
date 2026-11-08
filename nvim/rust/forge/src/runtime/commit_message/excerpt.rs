@@ -675,5 +675,4 @@ fn gap_text(rows: &[DiffRow<'_>], gap: &[usize]) -> String {
 }
 
 #[cfg(test)]
-#[path = "excerpt_tests.rs"]
 mod tests;

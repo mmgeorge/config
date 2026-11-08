@@ -137,67 +137,6 @@ impl HarnessBroker {
         Ok(result)
     }
 
-    /// Refreshes the read-only check projection before acceptance without altering design metadata.
-    #[cfg(test)]
-    pub(super) fn refresh_check_review(&mut self, plan_id: &str) -> Result<bool> {
-        let mut plan = self
-            .store
-            .load_plan(plan_id)?
-            .context("plan record is missing")?;
-        if plan.state != PlanState::AwaitingReview {
-            return Ok(false);
-        }
-        let mut document = self
-            .plan_file
-            .read_working_document(&self.session.id, plan_id)?;
-        let original = document.clone();
-        let Some(design) = &mut document.design else {
-            return Ok(false);
-        };
-        let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
-        let task = self
-            .task_controller
-            .current()?
-            .filter(|task| !task.status().terminal());
-        let overrides = self
-            .check_runner
-            .overrides(task.as_ref().map(|task| task.id.as_str()))?;
-        for definition in &mut snapshot.config.definitions {
-            if let Some(enabled) = overrides.enabled.get(&definition.id) {
-                definition.enabled = *enabled;
-            }
-            if let Some(scope) = overrides.scopes.get(&definition.id) {
-                definition.scope = *scope;
-            }
-        }
-        if design.check_configuration.as_ref() == Some(&snapshot) {
-            return Ok(false);
-        }
-        design.check_configuration = Some(snapshot);
-        let rendered = self.plan_file.render_review(&document)?;
-        let (_, _, digest) = self.plan_file.persist_review_draft_if_unchanged(
-            &self.session.id,
-            &original,
-            crate::plan::PlanReviewRevision::new(plan_id, document, rendered)?,
-            None,
-        )?;
-        plan.submitted_version = None;
-        plan.review_digest = Some(digest);
-        plan.review = None;
-        plan.updated_at_ms = self.clock.now_ms();
-        let task = self
-            .task_controller
-            .current()?
-            .context("planning task is missing")?;
-        self.task_controller.apply(
-            &mut self.store,
-            &task.permit(),
-            crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan)),
-            self.clock.now_ms(),
-        )?;
-        Ok(true)
-    }
-
     pub(super) async fn project_checks(
         &mut self,
         method: RuntimeMethod,

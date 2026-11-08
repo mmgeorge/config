@@ -403,5 +403,4 @@ fn child_delivery_error(error: crate::provider::events::EventDeliveryError) -> a
 }
 
 #[cfg(test)]
-#[path = "runtime_test.rs"]
 mod test;

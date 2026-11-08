@@ -40,5 +40,4 @@ pub use runtime::{ControlToolResult, ControlTurnContext};
 pub use stdio::run_stdio;
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod test;

@@ -146,7 +146,7 @@ Open or operate on a walkthrough and its annotation/source documents.
 - **Input:** operation selects open, snapshot, view, close_view, change, annotation_source, annotation_snapshot, annotation_view, annotation_close_view, annotation_close, or close.
 - **Result and effects:** Returns walkthrough/source/annotation snapshots, source-row information, or close results.
 - **Boundary:** Captured source/review identities and view widths are operation-specific and must remain current.
-- **Inspected source:** [`nvim/rust/forge/src/walkthrough_routes.rs`](../../../rust/forge/src/walkthrough_routes.rs).
+- **Inspected source:** [`nvim/rust/forge/src/router/walkthrough_routes.rs`](../../../rust/forge/src/router/walkthrough_routes.rs).
 
 **Transport:** Session ID forbidden. Readiness: `host`. Admission: `ordinary`. Recovery: `service`.
 

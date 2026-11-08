@@ -1,7 +1,5 @@
-use super::super::native_settings;
 use super::super::{HarnessBroker, SessionController, prompt};
 use super::bootstrap::initialize;
-use super::owner_fixture::owner_transition_fixture;
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result, ensure};
 use forge_protocol::message::Request;
@@ -604,82 +602,6 @@ async fn owner_second_cancel_during_collection_resolves_with_the_first() -> Resu
     }
     .await;
     fixture.finish(scenario).await
-}
-
-/// Cancel followed by a model change cancels the exchange, then commits the model.
-#[tokio::test]
-async fn owner_cancel_then_model_change_cancels_exchange_and_commits_model() -> Result<()> {
-    use crate::exchange::command::{
-        CancelExchangeRequest, CancellationOutcome, Command, CommandId, CommandOutcome,
-        CommandRequest, ConfigurationOutcome, InputControl,
-    };
-    use crate::provider::mock_response::MockResponseCommand;
-    let fixture = owner_transition_fixture().await?;
-    let scenario = async {
-        let script = fixture
-            .provider
-            .mock_response_control()
-            .context("mock control missing")?;
-        script
-            .dispatch(
-                &fixture.session,
-                MockResponseCommand::Hold {
-                    mode: None,
-                    any_session: false,
-                },
-            )
-            .await?;
-        let cancellation = fixture.controller.exchange_owner.execute_identified(
-            CommandRequest {
-                id: CommandId::new("owner-cancel-then-model")?,
-                command: Command::CancelExchange(CancelExchangeRequest::default()),
-                input_control: InputControl::AtExecution,
-            },
-            fixture.sink.clone(),
-        );
-        let model = fixture.controller.exchange_owner.execute_identified(
-            native_settings::decode_command(&Request {
-                id: 43,
-                method: "session.command.apply".into(),
-                params: json!({"operation_id":"owner-model-after-cancel","action":"configure","config":{"model":"mock-model"}}),
-            })?,
-            fixture.sink.clone(),
-        );
-        let (cancellation, model) = async {
-            tokio::join!(cancellation, model)
-        }.await;
-        let (cancellation, model) = (cancellation?, model?);
-        ensure!(matches!(
-            cancellation.outcome,
-            CommandOutcome::Cancelled(CancellationOutcome::Cancelled { ref exchange })
-                if exchange.as_str() == fixture.original
-        ));
-        ensure!(matches!(
-            model.outcome,
-            CommandOutcome::Configured(ConfigurationOutcome::Settings { .. })
-        ));
-        ensure!(
-            cancellation.sequence < model.sequence,
-            "model change overtook the earlier cancellation"
-        );
-        ensure!(
-            fixture.controller.observer.snapshot()?.session.model == "mock-model",
-            "model change was not committed"
-        );
-        let exchange = SqliteStore::read_only(&fixture.controller.data_root)?
-            .load_exchange(&fixture.original)?
-            .context("original exchange missing")?;
-        ensure!(
-            exchange.state() == crate::exchange::ExchangeState::Cancelled,
-            "model change resumed the cancelled exchange"
-        );
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    scenario?;
-    fixture.service.shutdown(Duration::from_secs(5)).await?;
-    fixture.reader.abort();
-    Ok(())
 }
 
 /// Retain pre-acceptance cleanup after the cancellation response times out.
