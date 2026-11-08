@@ -9,9 +9,9 @@ command = "nu .config/git_template.nu"
 # Every Forge test must be deterministic and nearly instant. A test still running after two
 # seconds is terminated and reported as a failure, so a hang or a real-clock wait fails fast
 # instead of stalling the run. Fix or remove a slow test. The overrides below are the only
-# exceptions; each names the cost that keeps its tests above the limit. Add one only when that
-# cost is what the test verifies, or when the test guards a high-value invariant
-# that no faster test covers, and record the reason beside it.
+# exceptions. Each matches a whole suite and names the cost its tests share, which is either what
+# the suite verifies or the fixture that its high-value invariants need. Record the reason beside
+# any new exception.
 [profile.default]
 slow-timeout = { period = "2s", terminate-after = 1 }
 # Report every failure in one run rather than stopping at the first.
@@ -24,82 +24,78 @@ test-threads = 8
 filter = "package(forge-harness)"
 setup = "git-template"
 
-# Exceptions get ten seconds: five times the slowest serial duration measured for any of them,
-# which still terminates a hang quickly.
+# Exceptions get ten seconds: five times the slowest serial duration measured in them, which still
+# terminates a hang quickly. Their tests take up to two seconds alone, so machine load alone
+# pushes them over the default limit.
 
-# These tests launch the built `forge` executable and talk to it over stdio, because the stdio
-# contract is what they verify. Each pays host process startup, and the GitHub tests among them
-# also launch the compiled `gh` fixture once per request.
+# Stdio suites: these tests launch the built `forge` executable and talk to it over stdio,
+# because the stdio contract is what they verify. Each pays host process startup, and the GitHub
+# tests among them also launch the compiled `gh` fixture once per request.
 [[profile.default.overrides]]
 filter = "package(forge) & (binary(repository_stdio) | binary(harness_broker_stdio))"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These tests verify the `gh` process contract: arguments, input files, admission, and reaping
-# abandoned children. Each test process compiles `tests/fixtures/gh.rs` with `rustc` once, which
-# costs about a second before the first request, then launches it per request. Replacing `gh`
-# with an in-process HTTP client removes this exception; see `octo-plan-followup.md` at the
-# repository root.
+# `gh` client suite: these tests verify the `gh` process contract, which covers arguments, input
+# files, admission and reaping abandoned children. Each test process compiles
+# `tests/fixtures/gh.rs` with `rustc` once, about a second before the first request, then launches
+# it per request. Replacing `gh` with an in-process HTTP client removes this exception; see
+# `octo-plan-followup.md` at the repository root.
 [[profile.default.overrides]]
 filter = "package(forge-github) & binary(gh_client)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# Checkpoint capture runs `git status` and `git ls-files` for every capture, about 170 ms per
-# capture on Windows, and these tests verify that real Git view of the worktree. The reuse test
-# captures seven times and takes 1.4 s alone.
+# Git writer suite: the writer's contract is how real Git applies its config, index and worktree
+# writes, so these tests launch `git` for both the write and the check.
 [[profile.default.overrides]]
-filter = "package(forge-harness) & test(/^checkpoint::capture::test::/)"
+filter = "package(forge-git) & test(/^writer::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These broker tests run turns in a Git workspace, and the broker captures a checkpoint before
-# and after each turn, so every turn adds the two Git launches above. They verify checkpoint
-# interaction: rollback on abort, a locked file blocking resume, and automatic checks triggered by
-# the checkpoint diff. Run alone, they take 0.8 to 2.0 s.
+# Status writer suite: status actions stage, unstage and discard through Git, and these tests
+# check the result against real `git diff --cached` and `git show`.
 [[profile.default.overrides]]
-filter = """package(forge-harness) & (
-    test(=broker::test::admission::admission_precedes_preparation_and_settles_success_failure_and_cancellation)
-    | test(=broker::test::automatic_checks_complete_when_remaining_queue_is_removed)
-    | test(=broker::test::automatic_checks_repair_after_permission_resume_on_worker)
-    | test(=broker::test::goal_resume_retries_locked_checkpoint_before_provider_work)
-    | test(=broker::test::input::deferred_steering_cancellation_preserves_acceptance_boundary)
-    | test(=broker::test::native_abort_completion_rewinds_before_pending_checkpoint_finalization)
-    | test(=broker::test::reopened_pause_finalizes_before_executing_the_admitted_prompt)
-)"""
+filter = "package(forge-status) & test(/^tests::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These broker tests use plain workspaces and launch no processes, so their cost is not what they
-# verify. They stay because each guards an invariant no faster test covers: a suspended parent
-# joins its children, a pending user decision holds the parent, user input wakes a parent without
-# native steering, sandbox state follows both direct and admitted toggles, and a failed plan
-# retries with a fresh budget. Each drives several turns through the real broker and mock
-# provider. The fastest agent tests take 0.3 s at eight threads and these run several such cycles,
-# taking 1.2 to 1.9 s at eight threads; the sandbox test takes 1.8 s alone.
+# Status source documents: bounded delivery is the contract, so the large-source test builds a
+# source of about 18 MB, which is larger than one transfer, and streams it in bounded chunks.
 [[profile.default.overrides]]
-filter = """package(forge-harness) & (
-    test(=broker::test::agent::suspended_parent_joins_children_before_resuming)
-    | test(=broker::test::agent::user_decision_holds_parent_until_answered_before_delivering_child_results)
-    | test(=broker::test::agent::user_input_wakes_suspended_parent_without_native_steering)
-    | test(=broker::test::yolo_toggles_sandbox_in_direct_and_admitted_transitions)
-    | test(=broker::test::retry_resumes_the_same_failed_plan_with_a_fresh_budget)
-)"""
+filter = "package(forge-status) & test(/^source_document::tests::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
-# These tests start the whole in-process `HarnessService`: session registry, SQLite stores and the
-# mock provider runtime. Their cost is not what they verify either. They stay because they guard
-# ownership invariants that lose work or leak a provider when broken: cancellation and
-# configuration changes collect the native work they replace, a timed-out cleanup keeps its
-# worker, closing one session preserves a sibling on the shared runtime, observation intake never
-# blocks on the foreground broker, and task creation and edited goals start exactly once. Service
-# tests take a median 0.65 s at eight threads, and these multi-request ones take 0.6 to 1.1 s
-# alone, so load pushes them past two seconds.
+# Spelling model suites: these tests decide corrections with the bundled model, built from the
+# 82,765-word unigram and 243,342-pair bigram dictionaries. Nextest runs every test in its own
+# process, so the shared `OnceLock` cannot reuse the model, and every test builds it again.
 [[profile.default.overrides]]
-filter = """package(forge-harness) & (
-    test(=service::session_observation_test::failed_session_observation_restarts_for_explicit_new_work)
-    | test(=service::session_observation_test::session_observation_intake_does_not_block_on_foreground_broker)
-    | test(=service::tests::configuration_retry::latest_configuration_waits_for_actual_child_end_and_preserves_canceled_root)
-    | test(/^service::tests::owner_cancel::/)
-    | test(/^service::tests::owner_transition::/)
-    | test(=service::tests::task_state::task_creation_completes_at_dispatch_and_replay_preserves_replacement_goal)
-    | test(=service::tests::task_state::queued_input_edited_to_goal_starts_once_and_preserves_other_input)
-    | test(/^service::tests::task_state::task_control_aliases_collect_active_work_and_replay_owner_receipts_/)
-)"""
+filter = "package(forge-text) & (test(/^model::tests::/) | test(/^service::tests::/))"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+# Checkpoint suite: capture runs `git status` and `git ls-files` each time, about 170 ms per
+# capture on Windows, and these tests verify that real Git view of the worktree.
+[[profile.default.overrides]]
+filter = "package(forge-harness) & test(/^checkpoint::/)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+# Broker suite: these tests drive turns, child agents, plans and checks through the real broker
+# and the mock provider. Tests on a Git workspace also pay a real checkpoint capture before and
+# after every turn, which is how they verify rollback, resume and automatic checks. Each test
+# runs several such turns.
+[[profile.default.overrides]]
+filter = "package(forge-harness) & test(/^broker::/)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+# Service suite: these tests start the whole in-process `HarnessService`, which covers the session
+# registry, SQLite stores and the mock provider runtime. They guard ownership invariants that
+# lose work or leak a provider when broken: cancellation and configuration changes collect the
+# work they replace, closing one session preserves its siblings, observation never blocks the
+# foreground broker, and tasks start exactly once. Service tests take a median 0.65 s at eight
+# threads, and the multi-request ones take up to two seconds.
+[[profile.default.overrides]]
+filter = "package(forge-harness) & test(/^service::/)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
+# Provider owner conformance suite: every scenario runs once for each owner implementation, and
+# the backpressure scenario pushes ordered output past queue capacity while a successor
+# interrupts, because surviving that volume is what it verifies.
+[[profile.default.overrides]]
+filter = "package(forge-harness) & test(/^provider::session_execution::runtime::owner_conformance::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
