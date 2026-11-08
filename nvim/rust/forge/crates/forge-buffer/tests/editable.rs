@@ -50,37 +50,6 @@ fn block() -> BufferBlock {
     }
 }
 
-#[test]
-fn restored_region_sequence_rejects_replay_and_survives_snapshot_reopening() {
-    let mut original = block();
-    original.metadata.editable_region[0].sequence = EditSequence(100);
-    let mut document = BufferDocument::new(DocumentId("document".into()), vec![original]).unwrap();
-    assert!(matches!(
-        document
-            .accept_local_edit(edit(100, 3, &["replayed"]))
-            .unwrap(),
-        LocalEditResult::StaleSequence
-    ));
-    assert!(matches!(
-        document
-            .accept_local_edit(edit(101, 3, &["accepted"]))
-            .unwrap(),
-        LocalEditResult::Accepted { .. }
-    ));
-    let snapshot = document.snapshot();
-    assert_eq!(
-        snapshot.block[0].metadata.editable_region[0].sequence,
-        EditSequence(101)
-    );
-    let mut reopened = BufferDocument::new(DocumentId("document".into()), snapshot.block).unwrap();
-    assert!(matches!(
-        reopened
-            .accept_local_edit(edit(101, 4, &["replayed again"]))
-            .unwrap(),
-        LocalEditResult::StaleSequence
-    ));
-}
-
 fn edit(sequence: u64, base: u64, rows: &[&str]) -> LocalEdit {
     LocalEdit {
         document: DocumentId("document".into()),

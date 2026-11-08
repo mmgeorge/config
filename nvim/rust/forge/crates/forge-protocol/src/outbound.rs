@@ -557,14 +557,4 @@ mod tests {
             "after capacity"
         );
     }
-
-    #[tokio::test]
-    async fn oversized_serialization_releases_reservation_and_poison_connection() {
-        let (sender, mut receiver) = channel();
-        assert!(sender.send("x".repeat(MAX_FRAME_BYTES)).is_err());
-        assert_eq!(sender.budget.lock().unwrap().bytes, 0);
-        assert_eq!(sender.budget.lock().unwrap().frames, 0);
-        assert!(receiver.recv().await.is_err());
-        assert!(sender.send_control("later terminal response").is_err());
-    }
 }

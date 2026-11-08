@@ -32,13 +32,7 @@ mod review_mutation;
 mod source;
 mod submission;
 pub use submission::{PendingReviewExpected, ReviewSubmissionContext};
-#[cfg(test)]
-mod scripted_tests;
 mod users;
-#[cfg(test)]
-pub(crate) use scripted::{ScriptedGhInvocation, ScriptedGhOutcome};
-#[cfg(test)]
-mod scripted;
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const ISSUE_QUERY: &str = "query($owner:String!, $name:String!, $states:[IssueState!], $cursor:String) { rateLimit { remaining } repository(owner:$owner, name:$name) { issues(first:100, after:$cursor, states:$states, orderBy:{field:UPDATED_AT, direction:DESC}) { totalCount pageInfo { hasNextPage endCursor } nodes { number title state url createdAt updatedAt labels(first:50) { nodes { name color description } } } } } }";
@@ -52,9 +46,6 @@ pub struct GhClient {
     executable: PathBuf,
     directory: PathBuf,
     requests: BlockingReadPool,
-    /// Answers every request in-process, so tests of decoding and routing start no `gh`.
-    #[cfg(test)]
-    scripted: Option<scripted::ScriptedGhRunner>,
 }
 
 /// Checkout context that exposes GitHub capabilities while sharing one native process owner.
@@ -145,8 +136,6 @@ impl GhClient {
             executable,
             directory: std::path::absolute(directory)?,
             requests: BlockingReadPool::new(4)?,
-            #[cfg(test)]
-            scripted: None,
         })
     }
 
@@ -352,8 +341,6 @@ impl GhClient {
         decode_bytes: usize,
         decode: impl FnOnce(Output) -> std::result::Result<Response, RemoteFailure> + Send + 'static,
     ) -> Result<std::result::Result<Response, RemoteFailure>> {
-        #[cfg(test)]
-        let scripted = self.scripted.clone();
         let executable = self.executable.clone();
         let input_bytes = encoded.as_ref().map_or(0, Vec::capacity)
             + executable.as_os_str().len()
@@ -365,16 +352,6 @@ impl GhClient {
             + decode_bytes;
         self.requests
             .submit_wait(input_bytes, move |cancellation| {
-                #[cfg(test)]
-                if let Some(runner) = scripted {
-                    cancellation.check()?;
-                    let output = runner(&ScriptedGhInvocation {
-                        argument,
-                        input: encoded,
-                    })
-                    .into_output();
-                    return Ok(decode(output));
-                }
                 let mut command = Command::new(executable);
                 command.current_dir(directory).args(argument);
                 let _input = if let Some(encoded) = encoded {

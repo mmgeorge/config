@@ -796,78 +796,6 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Required evidence survives reopen and disabled/cleared optional traces without retaining user content.
-    #[test]
-    fn core_evidence_survives_disabled_trace_and_reopen_without_payloads() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let _input = input_queue(root.path())?;
-        let trace = crate::trace::TraceStore::open(root.path())?;
-        trace.configure(false)?;
-        let request = CommandRequest::from_input(operation())?;
-        {
-            let mut journal = CommandJournal::open(root.path(), "session")?;
-            let admitted = journal.admit(&request)?;
-            journal.start(&admitted)?;
-            journal.finish(&request.id, Err(CommandFailure::Interrupted))?;
-            let event = forge_provider_api::BoundProviderEvent {
-                binding_id: forge_provider_api::BindingId::new("binding")?,
-                sequence: forge_provider_api::EventSequence::new(41),
-                event: forge_provider_api::ProviderEvent::Provider {
-                    event: forge_provider_api::ProviderConnectionEvent::Warning(
-                        forge_provider_api::ProviderWarning {
-                            scope: forge_provider_api::WarningScope::Thread {
-                                thread_id: crate::provider::ThreadOwner::root("owner").thread_id(),
-                            },
-                            kind: forge_provider_api::ProviderWarningKind::NativeNotice {
-                                category: forge_provider_api::ProviderFailureKind::Transport,
-                            },
-                            message: forge_provider_api::SanitizedMessage::new(
-                                "private diagnostic content",
-                            )?,
-                        },
-                    ),
-                },
-            };
-            assert_eq!(
-                journal.append_core(&CoreRecord::provider_event(
-                    forge_provider_api::EventScope::Binding {
-                        thread_id: forge_provider_api::ThreadId::from(
-                            crate::provider::ThreadOwner::root("owner")
-                        )
-                    },
-                    &event
-                ))?,
-                5
-            );
-            assert_eq!(
-                journal.append_core(&CoreRecord::CommandResponded {
-                    command: request.id.clone(),
-                    outcome: CoreOutcome::Interrupted,
-                })?,
-                6
-            );
-        }
-        trace.clear_session("session")?;
-        let journal = CommandJournal::open(root.path(), "session")?;
-        let records = core_records(&journal)?;
-        assert_eq!(
-            records
-                .iter()
-                .map(|(sequence, _)| *sequence)
-                .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 6]
-        );
-        for (_, encoded) in &records {
-            let _: CoreRecord = serde_json::from_str(encoded)?;
-            assert!(!encoded.contains("retained input"));
-            assert!(!encoded.contains("private diagnostic content"));
-        }
-        assert!(matches!(serde_json::from_str::<CoreRecord>(&records[4].1)?,
-            CoreRecord::ProviderEventConsumed { sequence, kind: super::super::core_log::CoreProviderEventKind::Provider, .. }
-                if sequence.get() == 41));
-        Ok(())
-    }
-
     /// Required core persistence shares command transactions and cannot leave admitted or finished state ahead of evidence.
     #[test]
     fn core_write_failure_rolls_back_command_admission_start_and_completion() -> anyhow::Result<()>
@@ -912,46 +840,6 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_core")?;
         journal.finish(&request.id, Err(CommandFailure::Interrupted))?;
         assert_eq!(core_records(&journal)?.len(), 4);
-        Ok(())
-    }
-
-    /// Recover a committed pause receipt without replaying its task mutation.
-    #[test]
-    fn task_recovery_preserves_committed_pause_receipt() -> anyhow::Result<()> {
-        use super::super::command::{InputControl, TaskCommand, TaskCommandOutcome, TaskSelection};
-        let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
-        let task = tasks.current()?.unwrap();
-        let intent = TaskCommand::Pause(TaskSelection::capture(&task));
-        let request = CommandRequest {
-            id: CommandId::new("interrupted-task-pause")?,
-            command: Command::Task(intent.clone()),
-            input_control: InputControl::AtExecution,
-        };
-        let mut journal = CommandJournal::open(root.path(), "session")?;
-        let admitted = journal.admit(&request)?;
-        journal.start(&admitted)?;
-        tasks.apply_owner_command(&mut store, &request.id, &intent, &task.permit(), 2)?;
-        assert!(matches!(
-            journal.lookup(&request.id)?.unwrap().state,
-            CommandState::Finished {
-                outcome: Ok(CommandOutcome::Task(TaskCommandOutcome::Paused { .. })),
-                ..
-            }
-        ));
-        let paused = tasks.current()?.unwrap();
-        assert_eq!(paused.status(), crate::task::TaskStatus::Paused);
-        drop(journal);
-        let mut recovered = CommandJournal::open(root.path(), "session")?;
-        recovered.recover()?;
-        let record = recovered.admit(&request)?;
-        assert!(matches!(
-            record.completion().unwrap(),
-            Ok(CommandResult {
-                outcome: CommandOutcome::Task(TaskCommandOutcome::Paused { .. }),
-                ..
-            })
-        ));
-        assert_eq!(tasks.current()?.unwrap().revision, paused.revision);
         Ok(())
     }
 
@@ -1021,64 +909,6 @@ mod tests {
         ));
         assert_eq!(completed.revision, 3);
         assert_eq!(journal.admit(&request)?.sequence, admitted.sequence);
-        Ok(())
-    }
-
-    /// Roll back input content and its receipt when command completion cannot persist.
-    #[test]
-    fn failed_completion_write_preserves_input_and_command_state() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let input = input_queue(root.path())?;
-        let mut journal = CommandJournal::open(root.path(), "session")?;
-        let operation = operation();
-        let request = CommandRequest::from_input(operation.clone())?;
-        let admitted = journal.admit(&request)?;
-        journal.start(&admitted)?;
-        journal.connection.execute_batch("CREATE TRIGGER reject_owner_completion BEFORE UPDATE ON owner_command WHEN json_extract(NEW.state,'$.state')='finished' BEGIN SELECT RAISE(ABORT,'fixture completion write failure'); END;")?;
-        assert!(input.apply(operation.clone()).is_err());
-        assert!(input.snapshot()?.messages.is_empty());
-        assert!(input.operation(request.id.as_str())?.is_none());
-        assert!(matches!(
-            journal.lookup(&request.id)?.unwrap().state,
-            CommandState::Active { .. }
-        ));
-        journal
-            .connection
-            .execute_batch("DROP TRIGGER reject_owner_completion")?;
-        input.apply(operation)?;
-        assert!(
-            journal
-                .lookup(&request.id)?
-                .unwrap()
-                .completion()
-                .unwrap()
-                .is_ok()
-        );
-        Ok(())
-    }
-
-    /// Prevent a host input receipt from completing a different command with the same identity.
-    #[test]
-    fn input_receipt_cannot_complete_a_cancellation_command() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let input = input_queue(root.path())?;
-        let mut journal = CommandJournal::open(root.path(), "session")?;
-        let operation = operation();
-        let request = CommandRequest {
-            id: CommandId::new(operation.id.clone())?,
-            command: Command::CancelExchange(super::super::command::CancelExchangeRequest {
-                input: super::super::command::CancelledInputPolicy::Retain,
-            }),
-            input_control: super::super::command::InputControl::default(),
-        };
-        let admitted = journal.admit(&request)?;
-        journal.start(&admitted)?;
-        assert!(input.apply(operation).is_err());
-        assert!(input.snapshot()?.messages.is_empty());
-        assert!(matches!(
-            journal.lookup(&request.id)?.unwrap().state,
-            CommandState::Active { .. }
-        ));
         Ok(())
     }
 

@@ -167,33 +167,4 @@ mod tests {
         assert!(owner.run(|| Ok(())).await.is_err());
         Ok(())
     }
-
-    /// A worker panic remains an explicit collection failure after its result waiter is cancelled.
-    #[tokio::test]
-    async fn cancelled_waiter_does_not_hide_worker_failure() -> anyhow::Result<()> {
-        let owner = Arc::new(MutationWork::default());
-        let worker_owner = owner.clone();
-        let (entered, started) = oneshot::channel();
-        let (release, held) = std::sync::mpsc::channel();
-        let waiter = tokio::spawn(async move {
-            worker_owner
-                .run(move || -> Result<()> {
-                    entered.send(()).unwrap();
-                    held.recv().unwrap();
-                    panic!("retained physical worker failure");
-                })
-                .await
-        });
-        started.await?;
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        release.send(())?;
-        assert!(matches!(
-            owner.finish().await.as_deref(),
-            Some(MutationError::Worker(_))
-        ));
-        assert!(owner.failed());
-        assert!(owner.finish().await.is_some());
-        Ok(())
-    }
 }

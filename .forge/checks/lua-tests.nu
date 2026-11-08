@@ -5,17 +5,8 @@
 # test file runs each top-level case in its own Neovim. Shards and cases run in parallel with bounded
 # concurrency. A case still running after five seconds fails as a timeout, and the runner kills the
 # whole process tree of a shard that outlives its one-minute limit. Tests that launch the Forge
-# host assume `rust-build` has produced a current executable.
-#
-#   nu .forge/checks/lua-tests.nu                         every test
-#   nu .forge/checks/lua-tests.nu client                  a test name: every file named client.test.lua
-#   nu .forge/checks/lua-tests.nu client::admission_queue one top-level case
-#   nu .forge/checks/lua-tests.nu nvim/lua/forge/client.lua  a source file's unit test
-#   nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp      a source directory's unit and integration mirrors
-#   nu .forge/checks/lua-tests.nu --suite status          a source area's unit and integration tests
-#   nu .forge/checks/lua-tests.nu --affected <paths>      mirrored unit tests and areas covering changed paths
-#   nu .forge/checks/lua-tests.nu --lua "<setup>" <entry> run Lua setup before each selected test
-#   nu --stdin .forge/checks/lua-tests.nu check <suite>   Harness check callback
+# host assume `rust-build` has produced a current executable. `nu .forge/checks/lua-tests.nu --help`
+# prints the selection forms and options documented on `main` below.
 const repository_root = path self | path dirname | path dirname | path dirname
 const runner_path = path self
 const per_case_timeout = 5sec
@@ -256,6 +247,21 @@ def select_fixture_list [suite: string, path_list: list<string>, affected: bool]
   | each {|entry| validate_fixture $entry } | sort
 }
 
+# Narrow a selection to the cases whose `path::case` entry matches `pattern`, a regular expression.
+# A unit file whose every case matches stays one shard; otherwise each matching case runs alone, so
+# a filter never runs a case it does not name.
+def filter_case_list [test_list: list<string>, pattern: string] {
+  $test_list | each {|entry|
+    if ($entry | str contains "::") {
+      if ($entry =~ $pattern) { [$entry] } else { [] }
+    } else {
+      let case_list = case_name_list $entry | each {|name| $"($entry)::($name)" }
+      let matching = $case_list | where {|candidate| $candidate =~ $pattern }
+      if ($matching | length) == ($case_list | length) { [$entry] } else { $matching }
+    }
+  } | flatten
+}
+
 # The pinned mini.test checkout, cloned on first use. A clone goes to a private pending directory
 # and is renamed into place, so concurrent runners never observe a partial checkout.
 def minitest_checkout [] {
@@ -439,17 +445,41 @@ def default_jobs [] {
 }
 
 # Run Forge Lua tests in parallel, each case under a five-second deadline.
+#
+# Positional arguments select tests; with none, `--suite` selects them. Each argument is one of:
+#   a test file        nvim/lua/forge/tests/unit/client.test.lua
+#   a test name        client: every file named client.test.lua, unit and integration
+#   one case           client::admission_queue, or a test file path followed by ::case
+#   a source file      nvim/lua/forge/client.lua: its mirrored unit test
+#   a directory        nvim/lua/forge/lsp: the unit and integration mirrors of a source directory,
+#                      or any directory under a plugin's tests/
+# `--filter` then keeps only the cases whose `path::case` entry matches a regular expression, so
+# `--filter rename` runs every case whose file or case name mentions renaming, and
+# `client --filter queue` runs only the queue cases of the client test files. Unit files run as one shard unless the filter excludes
+# some of their cases. `--list` prints the resolved selection as JSON instead of running it.
+#
+# Examples:
+#   nu .forge/checks/lua-tests.nu                                     every test
+#   nu .forge/checks/lua-tests.nu client::admission_queue             one case
+#   nu .forge/checks/lua-tests.nu --suite status                      a source area's unit and integration tests
+#   nu .forge/checks/lua-tests.nu --filter 'harper|wordlist'          every matching case in the repository
+#   nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/client.lua  tests covering changed paths
+#   nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_language = 'rust'" buffer  setup before each test
+#   nu --stdin .forge/checks/lua-tests.nu check <suite>               Harness check callback
 def main [
   ...test_path: string  # Test files, source files, directories, test names, or name::case; changed paths with --affected
   --suite: string = "all"  # all, a source area such as status, or a directory under nvim/lua
   --affected  # Treat the paths as changed repository paths and run the tests that cover them
+  --filter: string  # Regular expression a case's path::case entry must match to run
   --jobs: int  # Maximum concurrent fixtures; defaults to a sixth of the logical CPUs
   --list  # Print the selected fixtures as JSON without running them
   --lua: string  # Lua each fixture runs before loading, such as "vim.g.forge_test_language = 'rust'"
 ] {
   cd $repository_root
   let setup_list = if $lua == null { [] } else { [$lua] }
-  let test_list = select_fixture_list $suite $test_path $affected
+  let selected = select_fixture_list $suite $test_path $affected
+  let test_list = if $filter == null { $selected } else { filter_case_list $selected $filter }
+  if ($test_list | is-empty) { error make {msg: $"No selected case matches the filter: ($filter)"} }
   if $list {
     print ({suite: $suite, fixtures: $test_list} | to json --raw)
     return

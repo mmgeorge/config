@@ -92,8 +92,34 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 T["harness_markdown_layout"] = function()
   local child = MiniTest.new_child_neovim()
-  child.start({ "-u", vim.fs.joinpath(config_path, "init.lua") })
+  child.start({ "-u", "NONE" })
   MiniTest.finally(function() pcall(child.stop) end)
+  child.lua([[
+    local config_path = ...
+    local data = vim.fn.stdpath("data")
+    vim.opt.runtimepath:prepend(config_path)
+    vim.opt.runtimepath:append(data .. "/site")
+    vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+    vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
+    -- A mock math converter answers with fixed text art, so the case checks how Forge lays out
+    -- converter output rather than the installed converter.
+    local converter = require("markdown_math.dependency").executable_path()
+    require("render-markdown.lib.env").commands = function() return { converter } end
+    local integral = table.concat({
+      "                ⌠",
+      "L (x,ω ) = L  + ⎮ f  L  (n⋅ω ) dω",
+      " o    o     e   ⌡  r  i     i    i",
+      "                Ω",
+    }, "\n")
+    local system = vim.system
+    vim.system = function(command, options, on_exit)
+      if command[1] ~= converter then return system(command, options, on_exit) end
+      local output = options.stdin:find("\\int", 1, true) and integral or options.stdin:gsub("[_^{}\\]", "")
+      vim.schedule(function() on_exit({ code = 0, stdout = output, stderr = "" }) end)
+      return { wait = function() end, kill = function() end }
+    end
+    require("render-markdown").setup({})
+  ]], { config_path })
   child.api.nvim_ui_attach(120, 40, { rgb = true })
   child.lua("local path, indent = ...; vim.g.forge_markdown_layout_child=true; vim.g.forge_markdown_layout_indent=indent; dofile(path)", {test_path, vim.g.forge_markdown_layout_indent or 2})
   local function capture()
@@ -184,10 +210,10 @@ T["harness_markdown_layout"] = function()
   ]])
     local after_screen = capture()
     assert(after_screen[after_equation.row]:match("^%s*$"), "line after equation was concealed into its rendering")
-    child.api.nvim_input("s")
+    child.api.nvim_input("gk")
     wait_until(function()
       return table.concat(capture(), "\n"):find("\\int", 1, true)
-    end, "mapped upward entry did not reveal equation", { timeout_ms = 3000 })
+    end, "upward display-line motion did not reveal equation", { timeout_ms = 3000 })
     child.lua("vim.api.nvim_win_set_cursor(0, {7, 0})")
     wait_until(function()
       local screen = table.concat(capture(), "\n")
@@ -196,7 +222,7 @@ T["harness_markdown_layout"] = function()
     local previous = 7
     for _ = 1, 12 do
       local before = child.api.nvim_win_get_cursor(0)
-      child.api.nvim_input("t")
+      child.api.nvim_input("gj")
       wait_until(function()
         return not vim.deep_equal(child.api.nvim_win_get_cursor(0), before)
       end, "down motion did not advance", { timeout_ms = 3000 })

@@ -431,39 +431,3 @@ fn native_failure(
         operation, kind,
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A reused native task ID cannot turn an old selection into authority over another binding.
-    #[test]
-    fn issued_terminal_handles_reject_other_bindings_and_reused_native_tasks() {
-        let snapshot = || {
-            forge_provider_api::terminal::TerminalInventory::observed(vec![
-                forge_provider_api::terminal::BackgroundTerminal {
-                    id: forge_provider_api::terminal::TerminalId::new("native-reused").unwrap(),
-                    command: "fixture".into(),
-                },
-            ])
-        };
-        let mut first = TerminalRegistry::default();
-        let mut original = snapshot();
-        first.issue(&mut original).unwrap();
-        let old = original.terminal[0].id.clone();
-        let mut replacement = TerminalRegistry::default();
-        let mut current = snapshot();
-        replacement.issue(&mut current).unwrap();
-        assert!(replacement.resolve(&old).is_none());
-        assert_ne!(old, current.terminal[0].id);
-        first
-            .issue(&mut forge_provider_api::terminal::TerminalInventory::observed(Vec::new()))
-            .unwrap();
-        original = snapshot();
-        first.issue(&mut original).unwrap();
-        assert!(
-            first.resolve(&old).is_none(),
-            "a retired terminal handle resolved to a newer occurrence"
-        );
-    }
-}

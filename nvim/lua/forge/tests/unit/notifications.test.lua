@@ -7,8 +7,7 @@ local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 T["adapter"] = function()
-  local fixture = "D:/config/nvim/rust/forge/target/notification-fixture.json"
-  assert(vim.fn.filereadable(fixture) == 1, "run forge-review notification native test to generate snapshot fixture")
+  local fixture = "nvim/lua/forge/tests/fixtures/protocol/notification.json"
   local snapshot = vim.json.decode(table.concat(vim.fn.readfile(fixture), "\n"))
   local notifications = require("forge.notifications")
   vim.wo.number = true

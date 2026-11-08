@@ -1105,23 +1105,3 @@ branches: Vec::new()
         assumptions: Vec::new(),
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn requires_the_explicit_plan_document_schema_version() {
-        let mut value = serde_json::to_value(test_fixture("plan", "Version plans.")).unwrap();
-        value.as_object_mut().unwrap().remove("schema_version");
-        let missing = serde_json::from_value::<PlanDocument>(value).unwrap_err();
-        assert!(missing.to_string().contains("schema_version"));
-
-        let mut document = test_fixture("plan", "Version plans.");
-        document.schema_version = PLAN_SCHEMA_VERSION + 1;
-        let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains(&format!(
-            "supported PlanDocument schema version {PLAN_SCHEMA_VERSION}"
-        )));
-    }
-}

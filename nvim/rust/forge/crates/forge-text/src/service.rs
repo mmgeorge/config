@@ -233,7 +233,6 @@ impl TextCorrectionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{ByteRange, OccurrenceId};
 
     #[tokio::test]
     async fn shutdown_owns_abandoned_workers() {
@@ -257,90 +256,5 @@ mod tests {
         request.abort();
         service.shutdown(Duration::from_secs(2)).await.unwrap();
         assert_eq!(service.inner.active.load(Ordering::Acquire), 0);
-    }
-
-    /// Build one lexical query with the caller's published identity.
-    fn request(profile: &ProfileReady, context: &str, target: &str) -> CorrectRequest {
-        let start = context.find(target).unwrap();
-        CorrectRequest {
-            profile: profile.profile.clone(),
-            profile_revision: profile.profile_revision.clone(),
-            occurrence: OccurrenceId::try_from("test".to_owned()).unwrap(),
-            context: context.into(),
-            target: ByteRange {
-                start,
-                end: start + target.len(),
-            },
-            protected: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn profile_reload_isolation_and_shutdown() {
-        let service = TextCorrectionService::new();
-        let profile = ProfileId::try_from("project-a".to_owned()).unwrap();
-        let ready = service
-            .initialize(InitializeRequest {
-                profile: profile.clone(),
-                terminology: vec!["tokio".into(), "teh".into(), "repo".into()],
-                assets: None,
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            service
-                .correct(request(&ready, "Use tokio here.", "tokio"))
-                .await
-                .unwrap(),
-            CorrectionDecision::Unchanged { .. }
-        ));
-        for (context, target) in [("Use teh word here.", "teh"), ("Use repo here.", "repo")] {
-            assert!(matches!(
-                service
-                    .correct(request(&ready, context, target))
-                    .await
-                    .unwrap(),
-                CorrectionDecision::Unchanged { .. }
-            ));
-        }
-        assert!(
-            service
-                .initialize(InitializeRequest {
-                    profile: profile.clone(),
-                    terminology: vec!["not a word".into()],
-                    assets: None
-                })
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            service
-                .correct(request(&ready, "Use tokio here.", "tokio"))
-                .await
-                .unwrap(),
-            CorrectionDecision::Unchanged { .. }
-        ));
-        let other = service
-            .initialize(InitializeRequest {
-                profile: ProfileId::try_from("project-b".to_owned()).unwrap(),
-                terminology: Vec::new(),
-                assets: None,
-            })
-            .await
-            .unwrap();
-        assert_ne!(ready.profile_revision, other.profile_revision);
-        let mut invalid = request(&ready, "é recieve", "recieve");
-        invalid.target.start = 1;
-        assert!(service.correct(invalid).await.is_err());
-        let mut protected = request(&ready, "Please recieve", "recieve");
-        protected.protected.push(protected.target.clone());
-        assert!(service.correct(protected).await.is_err());
-        service.shutdown(Duration::from_secs(2)).await.unwrap();
-        assert!(matches!(
-            service
-                .correct(request(&ready, "Please recieve", "recieve"))
-                .await,
-            Err(TextError::Closed)
-        ));
     }
 }

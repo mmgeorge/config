@@ -48,8 +48,6 @@ struct CheckpointCapture {
     session_id: String,
     now_ms: i64,
     input_bytes: usize,
-    #[cfg(test)]
-    repository: Arc<RepositoryState>,
     // Dispose copied inputs before acknowledging their retained-byte receipt.
     admission: CaptureAdmission,
 }
@@ -110,84 +108,6 @@ impl Drop for CaptureAdmission {
         }
         let _ = self.repositories.writes.cancel(self.operation);
         self.repositories.writes.take_receipt(self.operation);
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct CheckpointRestore {
-    checkpoint: GitCheckpoint,
-    expected: CheckpointRecord,
-    target: CheckpointRecord,
-    repository: Arc<RepositoryState>,
-    repositories: Arc<RepositoryStore>,
-    operation: OperationId,
-    guard: Option<AdmissionGuard>,
-    started: bool,
-    acknowledge: bool,
-}
-
-#[cfg(test)]
-impl CheckpointRestore {
-    /// Runs existing source checks and filesystem restoration while retaining every mutation scope.
-    pub(crate) async fn restore(mut self, objects: ObjectStore) -> Result<()> {
-        let waiter = RestoreWait {
-            repositories: Arc::clone(&self.repositories),
-            operation: self.operation,
-        };
-        self.acknowledge = false;
-        let (mut owner, result) = tokio::task::spawn_blocking(move || {
-            let result = self.restore_owned(&objects);
-            (self, result)
-        })
-        .await
-        .context("checkpoint restore worker failed")?;
-        owner.acknowledge = true;
-        drop(waiter);
-        result
-    }
-
-    fn restore_owned(&mut self, objects: &ObjectStore) -> Result<()> {
-        anyhow::ensure!(
-            !self
-                .guard
-                .as_ref()
-                .context("checkpoint restore has no admission")?
-                .cancellation_requested(),
-            "checkpoint restore cancelled before execution"
-        );
-        self.started = true;
-        let result = self
-            .checkpoint
-            .restore(objects, &self.expected, &self.target);
-        let invalidation = self.repository.invalidate();
-        let completion = self
-            .guard
-            .take()
-            .context("checkpoint restore has no admission")?
-            .finish(if result.is_ok() {
-                OperationCompletion::Completed
-            } else {
-                OperationCompletion::Uncertain
-            });
-        result?;
-        invalidation?;
-        completion?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl Drop for CheckpointRestore {
-    fn drop(&mut self) {
-        if !self.started
-            && let Some(guard) = self.guard.take()
-        {
-            let _ = guard.finish(OperationCompletion::Failed);
-        }
-        let _ = self.repositories.writes.cancel(self.operation);
-        if self.acknowledge || !self.started {
-            self.repositories.writes.take_receipt(self.operation);
-        }
     }
 }
 
@@ -283,39 +203,6 @@ impl GitCheckpoint {
         result
     }
 
-    /// Acquires all scopes observed by rollback before validating or changing workspace files.
-    #[cfg(test)]
-    pub(crate) async fn admit_restore(
-        self,
-        repositories: Arc<RepositoryStore>,
-        expected: CheckpointRecord,
-        target: CheckpointRecord,
-    ) -> Result<CheckpointRestore> {
-        let input_bytes = checkpoint_retained_bytes(&expected)?
-            .checked_add(checkpoint_retained_bytes(&target)?)
-            .context("checkpoint input size overflow")?;
-        let repository = repositories
-            .open(self.workspace.clone())
-            .await?
-            .context("checkpoint repository is missing")?;
-        let operation = repositories
-            .writes
-            .admit(checkpoint_scopes(&repository)?, input_bytes)?;
-        let mut restore = CheckpointRestore {
-            checkpoint: self,
-            expected,
-            target,
-            repository,
-            repositories: Arc::clone(&repositories),
-            operation,
-            guard: None,
-            started: false,
-            acknowledge: true,
-        };
-        restore.guard = Some(repositories.writes.wait_start(operation)?.await?);
-        Ok(restore)
-    }
-
     /// Build a checkpoint adapter for one exact worktree root.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
@@ -391,8 +278,6 @@ impl GitCheckpoint {
             session_id,
             now_ms,
             input_bytes,
-            #[cfg(test)]
-            repository,
             admission: CaptureAdmission {
                 repositories: Arc::clone(&repositories),
                 operation,
@@ -575,23 +460,6 @@ impl GitCheckpoint {
             .map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))? = cached;
         Ok(record)
     }
-
-    /// Write a target checkpoint after validating the expected current checkpoint.
-    #[cfg(test)]
-    fn restore(
-        &self,
-        objects: &ObjectStore,
-        expected_current: &CheckpointRecord,
-        target: &CheckpointRecord,
-    ) -> Result<()> {
-        let preview = RestorePreview::prepare(objects, &self.workspace, expected_current, target)?;
-        anyhow::ensure!(
-            preview.warning.is_empty(),
-            "workspace diverged after the interaction completed"
-        );
-        let mut journal = RestoreJournal::begin(objects, preview)?;
-        journal.apply(objects, &mut || Ok(()))
-    }
 }
 
 fn checkpoint_scopes(repository: &RepositoryState) -> Result<Vec<MutationScope>> {
@@ -605,36 +473,6 @@ fn checkpoint_scopes(repository: &RepositoryState) -> Result<Vec<MutationScope>>
         MutationScope::WorktreeFiles(worktree),
         MutationScope::SharedRefs(repository.identity.storage.clone()),
     ])
-}
-
-#[cfg(test)]
-fn checkpoint_retained_bytes(record: &CheckpointRecord) -> Result<usize> {
-    let mut bytes = record
-        .file
-        .capacity()
-        .checked_mul(std::mem::size_of::<CheckpointFile>())
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CheckpointRecord>()))
-        .context("checkpoint input size overflow")?;
-    for value in [
-        &record.id,
-        &record.session_id,
-        &record.workspace,
-        &record.head,
-    ]
-    .into_iter()
-    .chain(
-        record
-            .file
-            .iter()
-            .flat_map(|file| [&file.path, &file.object_id]),
-    )
-    .chain(record.excluded.iter())
-    {
-        bytes = bytes
-            .checked_add(value.capacity())
-            .context("checkpoint input size overflow")?;
-    }
-    Ok(bytes)
 }
 
 /// Build the exact per-interaction diff between two durable checkpoints.

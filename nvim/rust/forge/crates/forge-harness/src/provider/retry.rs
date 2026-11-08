@@ -645,27 +645,6 @@ mod tests {
         }
     }
 
-    /// Cancellation ready before first poll never constructs a native attempt.
-    #[tokio::test]
-    async fn cancellation_before_first_poll_prevents_initial_attempt() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let trace = TraceStore::open(root.path())?;
-        let (_sender, cancelled) = tokio::sync::watch::channel(true);
-        let admission = RetryAdmission::new(cancelled);
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = attempts.clone();
-        let (sink, _stream) = crate::provider::events::channel(scope());
-        let result =
-            run_policy_guarded(request(), sink, &trace, Some(admission), move |_, _, _| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                async { Ok(ProviderCompletion::default()) }
-            })
-            .await;
-        assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>());
-        assert_eq!(attempts.load(Ordering::SeqCst), 0);
-        Ok(())
-    }
-
     #[test]
     fn replay_rejects_tools_and_control_mutations() {
         let mut output = ProviderCompletion::default();

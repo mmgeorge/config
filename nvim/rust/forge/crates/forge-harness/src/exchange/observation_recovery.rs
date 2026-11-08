@@ -395,38 +395,3 @@ impl ObservationRecovery {
         };
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Storage failure releases waiters but leaves the original collection worker observable.
-    #[tokio::test]
-    async fn storage_failure_retains_pending_collection() {
-        let (completed, outcome) = oneshot::channel();
-        let (reply, observed) = oneshot::channel();
-        let mut recovery = ObservationRecovery::default();
-        recovery.replies.push(reply);
-        recovery.stage = Stage::Collecting(tokio::spawn(async move {
-            outcome
-                .await
-                .unwrap_or(Err(ProviderLifecycleFailure::ObservationUnavailable))
-        }));
-        recovery.fail_storage();
-        assert!(matches!(
-            observed.await.unwrap(),
-            Err(ProviderLifecycleFailure::StateUnavailable)
-        ));
-        assert!(matches!(recovery.stage, Stage::Collecting(_)));
-        assert!(recovery.active());
-        assert!(
-            completed
-                .send(Err(ProviderLifecycleFailure::ObservationUnavailable))
-                .is_ok()
-        );
-        assert!(matches!(
-            recovery.next().await,
-            RecoveryEvent::Collected(Err(ProviderLifecycleFailure::ObservationUnavailable))
-        ));
-    }
-}

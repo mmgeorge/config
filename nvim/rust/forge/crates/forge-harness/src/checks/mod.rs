@@ -44,8 +44,6 @@ pub use selection::{
     CheckCase, CheckReceipt, CheckRunRequest, CheckSelection, RunRequest, SelectedChecks,
 };
 pub(crate) use supervisor::CheckAdmission;
-#[cfg(test)]
-pub(crate) use supervisor::ScriptedCheckOutcome;
 pub use supervisor::{CheckSupervisor, CheckSupervisorContext};
 pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::{CheckOverrides, ConfigureChecks};

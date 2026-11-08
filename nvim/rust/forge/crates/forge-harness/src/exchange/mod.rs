@@ -17,14 +17,14 @@ pub(crate) mod input_target;
 mod observation_recovery;
 pub(crate) mod provider_lifecycle;
 #[cfg(test)]
-pub(crate) use input_delivery::{InputDeliveryOffer, SteeringDeliveryOffer};
+pub(crate) use input_delivery::SteeringDeliveryOffer;
 mod input_readiness;
 mod input_receipts;
 pub(crate) use input_readiness::{
     InputQueuePolicy, InputReadiness, PendingInput, questions_block_task_work, select_pending_input,
 };
 #[cfg(test)]
-pub(crate) use input_receipts::{InputDispatchActivity, InputExecutionResult, InputReceiptFact};
+pub(crate) use input_receipts::InputReceiptFact;
 mod services;
 mod task_command;
 mod task_input;

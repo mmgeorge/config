@@ -7,15 +7,9 @@ use crate::provider::{
     PromptMode, Provider, ProviderId, ProviderInput, ProviderLaunch, ProviderRequest,
 };
 
-/// Builds one test adapter for each child admission.
-#[cfg(test)]
-pub(crate) type TestProviderBuilder = Arc<dyn Fn() -> Result<Arc<Provider>> + Send + Sync>;
-
 /// Resolves configured adapters while retaining the root's portable preference scope.
 #[derive(Clone)]
 pub struct AgentProviderFactory {
-    #[cfg(test)]
-    provider_builder_by_provider: HashMap<ProviderId, TestProviderBuilder>,
     launch_by_provider: HashMap<ProviderId, ProviderLaunch>,
     permission: Arc<crate::provider::approval::PermissionCoordinator>,
     trace: Arc<crate::trace::TraceStore>,
@@ -42,16 +36,10 @@ impl AgentProviderFactory {
             trace,
             settings_root,
             profiles,
-            #[cfg(test)]
-            provider_builder_by_provider: HashMap::new(),
         }
     }
 
     pub fn build(&self, provider: ProviderId) -> Result<Arc<Provider>> {
-        #[cfg(test)]
-        if let Some(builder) = self.provider_builder_by_provider.get(&provider) {
-            return builder();
-        }
         let launch = self
             .launch_by_provider
             .get(&provider)
@@ -111,19 +99,6 @@ impl AgentProviderFactory {
             models: model,
             capability,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register(&mut self, provider: Arc<Provider>) {
-        let kind = provider.descriptor().kind;
-        self.register_builder(kind, Arc::new(move || Ok(provider.clone())));
-    }
-
-    /// Build a fresh test adapter per child, matching production, where each child owns and
-    /// shuts down its own adapter.
-    #[cfg(test)]
-    pub(crate) fn register_builder(&mut self, kind: ProviderId, builder: TestProviderBuilder) {
-        self.provider_builder_by_provider.insert(kind, builder);
     }
 
     pub async fn resolve(

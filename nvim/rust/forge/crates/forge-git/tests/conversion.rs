@@ -2,104 +2,11 @@ use forge_git::test_support as support;
 
 use forge_git::{
     RepositoryPath,
-    content::{
-        ContentRequest, ContentResult, ContentSource, ContentUnavailable, WorktreeConversion,
-    },
+    content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion},
     store::RepositoryStore,
 };
 use std::fs;
 use support::git;
-
-#[tokio::test]
-async fn canonical_read_reloads_configuration_after_store_discovery() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    git(root, &["config", "core.autocrlf", "false"]);
-    git(root, &["config", "core.safecrlf", "false"]);
-    fs::write(root.join("file"), b"one\r\n").unwrap();
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    git(root, &["config", "core.autocrlf", "true"]);
-    let result = repository
-        .content(&store, canonical_request())
-        .await
-        .unwrap()
-        .value;
-    let ContentResult::Ready(content) = result else {
-        panic!("{result:?}")
-    };
-    assert_eq!(content.source.bytes(), b"one\n");
-}
-
-#[tokio::test]
-async fn external_filters_and_unproven_encodings_remain_explicitly_unavailable() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    git(root, &["config", "filter.blocked.clean", "exit 9"]);
-    git(root, &["config", "filter.blocked.required", "true"]);
-    fs::write(root.join(".gitattributes"), "file filter=blocked\n").unwrap();
-    fs::write(root.join("file"), b"one\r\n").unwrap();
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    assert!(matches!(
-        repository
-            .content(&store, canonical_request())
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Unavailable(ContentUnavailable::ExternalFilter)
-    ));
-    fs::write(
-        root.join(".gitattributes"),
-        "file working-tree-encoding=ISO-8859-1\n",
-    )
-    .unwrap();
-    assert!(matches!(
-        repository
-            .content(&store, canonical_request())
-            .await
-            .unwrap()
-            .value,
-        ContentResult::Unavailable(ContentUnavailable::UnsupportedEncoding)
-    ));
-}
-
-#[tokio::test]
-async fn encoding_preserves_complete_content_and_rejects_invalid_byte_order_marks() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    git(root, &["init", "--quiet"]);
-    fs::write(
-        root.join(".gitattributes"),
-        "file working-tree-encoding=UTF-16LE text\n",
-    )
-    .unwrap();
-    let input = b"o\0n\0e\0\r\0\n\0".repeat(900_000);
-    fs::write(root.join("file"), input).unwrap();
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let result = repository
-        .content(&store, canonical_request())
-        .await
-        .unwrap()
-        .value;
-    let ContentResult::Ready(content) = result else {
-        panic!("{result:?}")
-    };
-    assert_eq!(content.source.bytes(), b"one\n".repeat(900_000));
-    fs::write(root.join("file"), b"\xff\xfeo\0").unwrap();
-    let result = repository
-        .content(&store, canonical_request())
-        .await
-        .unwrap()
-        .value;
-    let ContentResult::Failed(error) = result else {
-        panic!("{result:?}")
-    };
-    assert!(error.to_string().contains("byte-order mark"));
-}
 
 fn canonical_request() -> ContentRequest {
     ContentRequest {

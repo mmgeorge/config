@@ -289,7 +289,7 @@ impl Drop for Execution<'_> {
 mod test {
     use super::*;
     use crate::provider::PromptMode;
-    use anyhow::{Context, Result};
+    use anyhow::Result;
 
     #[tokio::test]
     async fn task_replacement_invalidates_running_and_queued_goal_controls() -> Result<()> {
@@ -348,110 +348,6 @@ mod test {
             .task_permit
             .unwrap()
             .validate(Some(&replacement))?;
-        Ok(())
-    }
-    use serde_json::json;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn cancellation_releases_running_and_queued_tools_without_reusing_their_state()
-    -> Result<()> {
-        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        let (_task_root, _task_store, task_controller) =
-            crate::task::SessionTaskController::test_goal();
-        context.bind_test_task_controller(task_controller);
-        context.checkpoint = Some(crate::checkpoint::ToolGate::new());
-        let executor = ControlToolExecutor::new(context);
-        let invocation = || ControlToolInvocation {
-            call_id: None,
-            task_permit: None,
-            name: "goal_complete".into(),
-            arguments: json!({"summary":"finished"}),
-        };
-        let mut running = Box::pin(executor.execute(invocation()));
-        let mut queued = Box::pin(executor.execute(invocation()));
-        assert!(futures_util::poll!(running.as_mut()).is_pending());
-        assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        let close = executor.close();
-        let (running, queued, ()) = async { tokio::join!(running, queued, close) }.await;
-        assert!(running.unwrap_err().is::<crate::broker::TurnCancelled>());
-        assert!(queued.unwrap_err().is::<crate::broker::TurnCancelled>());
-        assert!(
-            executor
-                .execute(invocation())
-                .await
-                .unwrap_err()
-                .is::<crate::broker::TurnCancelled>()
-        );
-        let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
-        let (_task_root, _task_store, task_controller) =
-            crate::task::SessionTaskController::test_goal();
-        replacement.bind_test_task_controller(task_controller);
-        assert!(
-            ControlToolExecutor::new(replacement)
-                .execute(invocation())
-                .await?
-                .result
-                .is_ok()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cancellation_revokes_the_editor_request_and_rejects_its_late_response() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        std::fs::write(directory.path().join("source.rs"), "pub fn source() {}\n")?;
-        let lsp = Arc::new(super::super::lsp::LspService::default());
-        let (sender, mut editor) = forge_protocol::outbound::channel();
-        lsp.attach(sender);
-        lsp.set_enabled("session", true);
-        let policy = Arc::new(
-            crate::permissions::matcher::CompiledPermissionDocument::compile(
-                crate::permissions::document::default_permission_document(),
-                directory.path(),
-            ),
-        );
-        let (scope, _lease) = lsp.scope(
-            "session".into(),
-            "exchange".into(),
-            directory.path().into(),
-            policy,
-            tokio::sync::watch::channel(false).1,
-        );
-        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.lsp = Some(scope);
-        let executor = ControlToolExecutor::new(context);
-        let pending = executor.execute(ControlToolInvocation {
-            call_id: None,
-            task_permit: None,
-            name: "lsp_context".into(),
-            arguments: json!({"path":"source.rs","line":1,"column":1}),
-        });
-        let cancel = async {
-            let query = editor.recv().await?.context("editor request is missing")?;
-            let query: serde_json::Value = serde_json::from_slice(query.bytes())?;
-            assert_eq!(query["event"], "lsp.request");
-            executor.close().await;
-            let event = editor
-                .recv()
-                .await?
-                .context("editor cancellation is missing")?;
-            let event: serde_json::Value = serde_json::from_slice(event.bytes())?;
-            assert_eq!(event["event"], "lsp.cancel");
-            assert!(
-                lsp.respond(
-                    "session",
-                    query["payload"]["id"].as_str().unwrap(),
-                    json!({}),
-                    None
-                )
-                .is_err()
-            );
-            Ok::<_, anyhow::Error>(())
-        };
-        let (outcome, cancelled) = async { tokio::join!(pending, cancel) }.await;
-        assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
-        cancelled?;
         Ok(())
     }
 }

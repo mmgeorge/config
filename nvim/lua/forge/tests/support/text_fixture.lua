@@ -36,7 +36,7 @@ end
 
 local host_executable=dofile(vim.fs.dirname(debug.getinfo(1,'S').source:sub(2))..'/host_executable.lua')
 
-function M.native(options)
+function M.native()
   local fixture=M.open()
   -- The parent leases the built executable from the content-addressed cache, so the child
   -- launches an image Windows has already scanned instead of a fresh per-run copy.
@@ -84,11 +84,6 @@ function M.native(options)
     require('forge.text').attach(vim.api.nvim_get_current_buf())
     require('forge.text.service').initialize({root=vim.fn.getcwd()},function(result,error)text_ready=result;text_failure=error end)
   ]])
-  if options and options.cold_text then
-    fixture.type('i'..options.cold_text)
-    fixture.wait(options.cold_text)
-    assert(fixture.exec('return text_ready==nil'),'cold input fixture missed initialization')
-  end
   assert(vim.wait(15000,function()return fixture.exec('return text_ready~=nil or text_failure~=nil')end,10),
     'native model did not initialize')
   local failure=fixture.exec('return text_failure')

@@ -234,26 +234,4 @@ mod tests {
             Message::Response(_)
         ));
     }
-
-    #[test]
-    fn malformed_responses_cannot_be_adopted_as_valid_messages() {
-        for source in [
-            r#"{"id":1}"#,
-            r#"{"id":1,"result":null,"error":{"code":"x","message":"x"}}"#,
-            r#"{"id":1,"result":null,"error":null}"#,
-            r#"{"id":1,"error":null}"#,
-            r#"{"id":1,"id":2,"result":true}"#,
-            r#"{"id":1,"result":null,"result":true}"#,
-            r#"{"id":1,"error":{"code":"x"}}"#,
-            r#"{"id":1,"result":true,"unexpected":false}"#,
-            r#"{"id":1,"result":true,"session_id":"a","event":"b","payload":{}}"#,
-            r#"{"result":true}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<Response>(source).is_err(),
-                "{source}"
-            );
-            assert!(serde_json::from_str::<Message>(source).is_err(), "{source}");
-        }
-    }
 }

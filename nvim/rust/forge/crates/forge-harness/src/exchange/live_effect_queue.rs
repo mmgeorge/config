@@ -36,6 +36,3 @@ impl LiveEffectQueue {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

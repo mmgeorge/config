@@ -14,7 +14,7 @@ Each plugin keeps its tests in `nvim/lua/<plugin>/tests/`, split by how much of 
 | Integration | `tests/integration/` in the mirrored directory of the source area it drives, in the file named after that area: `views/status/` → `nvim/lua/forge/tests/integration/views/status/status.test.lua`, and a top-level module's area is a directory named after it, such as `integration/client/client.test.lua` for `client.lua` | One Neovim per top-level case |
 | Support | `tests/support/` for shared helpers, `tests/fixtures/` for data and shared setup scripts, `tests/plans/` for notes | Plain `.lua` or Markdown; never run as tests |
 
-Forge's integration areas are `buffer`, `client`, `git`, `lsp`, `review_document`, `text`, `walkthrough`, and, under `views/`, `harness`, `picker`, `plan_review`, and `status`. Each area name is also a suite. An integration test stays a standalone file in its area directory only when it reloads its own file in a child Neovim, such as `harness_markdown_layout.test.lua`, or shares a heavy `pre_once` setup across its cases, such as `plan_review_question_response.test.lua`. Load helpers by repository path, such as `dofile("nvim/lua/forge/tests/support/state.lua")`, at file scope.
+Forge's integration areas are `buffer`, `client`, `git`, `lsp`, `review_document`, `text`, `walkthrough`, and, under `views/`, `harness`, `picker`, `plan_review`, and `status`. Each area name is also a suite. An integration test stays a standalone file in its area directory only when it reloads its own file in a child Neovim, such as `harness_markdown_layout.test.lua`, or shares a heavy `pre_once` setup across its cases. Load helpers by repository path, such as `dofile("nvim/lua/forge/tests/support/state.lua")`, at file scope.
 
 A test file returns a `MiniTest.new_set()` whose hooks come from `support/isolation.lua`. It declares each test as a top-level `T["name"] = function() ... end` at column zero, which is how the runner finds cases:
 
@@ -59,6 +59,8 @@ A file that must reload itself in a fresh editor starts a child with `MiniTest.n
 | `notify.lua` | `capture({ min_level, notifications })` records `vim.notify` messages and, optionally, `forge.infra.notifications` reports, and offers `messages()`, `clear()`, and `assert_none()`. |
 | `mock_client.lua` | `record()` keeps every `forge.client.request`, and `respond(responses)` answers by method. Both accept `wrap_callback` and `copy_params`. |
 | `host.lua` | `start({ data, config, schedule_ensure })` launches the real host with temporary data and the pinned executable, and `stop()` returns whether its process was collected. |
+| `harper_server.lua` | `install()` replaces `vim.lsp.rpc.start` with an in-process Harper server that reports `RepeatedWords` and `SpellCheck` diagnostics, honors linter switches from `workspace/didChangeConfiguration`, and answers code actions, so Harper tests never need an installed `harper-ls`. Configure `harper.cmd = { vim.v.progpath }` so Forge finds an executable. |
+| `plan_review_host.lua` | `start({ lines })` answers PlanReview's host requests with a mock plan host that presents the lines, stores saved annotations, and holds each question until the case calls `answer(index, body)` or `fail(index, message)`. `open()` opens the review through the native controller, so close and reopen cases need no real host. |
 | `git_repository.lua` | `create({ path, branch, bare, files, message })` builds a fixture repository with a fixed identity, and `run(arguments, { text })` fails the case on a nonzero exit. |
 
 ## Suites
@@ -87,8 +89,12 @@ nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/unit/views/plan_review/checks
 nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp                     # unit and integration tests for lsp/
 nu .forge/checks/lua-tests.nu --suite status --jobs 4                # a source area as the suite
 nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/walkthrough.lua
+nu .forge/checks/lua-tests.nu --filter 'harper|wordlist'             # every case whose path::case matches
+nu .forge/checks/lua-tests.nu client --filter queue                  # narrow a selection to matching cases
 nu .forge/checks/lua-tests.nu
 ```
+
+`--filter` takes a regular expression and keeps only the selected cases whose `path::case` entry matches it. A unit file whose cases all match still runs as one shard; otherwise each matching case runs alone. `nu .forge/checks/lua-tests.nu --help` prints every selection form and option.
 
 The runner prints each test's result and duration as it finishes, then the slowest tests and a pass and fail count, and exits nonzero when any test fails. `--list` prints the selection without running it. Every case must finish within the five-second limit, and there are no per-test exceptions. A test that exceeds it because it waits on the real clock or hangs must be fixed with a deterministic signal or removed.
 
@@ -116,6 +122,29 @@ local workspace, data = fixture_evidence.path .. "/workspace", fixture_evidence.
 ```
 
 Call `fixture_evidence.release(passed)` only after the host process exits, because a running host holds files in the data directory open. A passing run removes the directory. A failing run keeps it, and the fixture reports its `failure.txt` path. A failure to remove the directory fails the fixture.
+
+## Replay recorded host payloads
+
+A Lua adapter test that replays host responses reads them from a recorded fixture committed under `nvim/lua/forge/tests/fixtures/protocol/`. A Rust test never writes a file that a Lua test reads. Generated files make the Lua test depend on which Rust tests ran last, they go stale silently when the wire format changes, and they land in the checkout.
+
+The Rust test that produces the same payload checks the recording instead of writing it. It passes its output to `forge_recorded_fixtures::assert_matches_recording`, which normalizes microsecond timings, UUIDs, and workspace paths, then compares the result with the committed file. On a mismatch the test writes the new output under the OS temporary directory's `forge/recorded-fixtures` folder and fails with the command that copies it over the recording. Nothing rewrites a recording automatically.
+
+Any change to a payload the host sends to Lua must keep its recordings current in the same change:
+
+1. Run the Rust tests for the changed area. A failing recording check names the fixture and its candidate file.
+2. Read the difference between the candidate and the recording, and confirm that each change is intended.
+3. Copy the candidate over the recording with the command the failure printed.
+4. Run the Lua tests that read the fixture, and update their expectations when the payload's meaning changed.
+
+| Recording | Rust check | Lua reader |
+|---|---|---|
+| `status-semantic.json` | `forge-status` `tests::linked_status_diff_controls_publish_matching_bodies_and_protocol_fixture` | `integration/views/status/status.test.lua` |
+| `saved-diff-controls.json` | `forge-status` `source_document::tests::saved_diff_controls_preserve_unclassified_patch_and_independent_options` | `unit/source_document.test.lua` |
+| `review-semantic.json` | `forge-review` `file_diff_controls_share_visibility_and_preserve_lazy_source_actions` | `unit/review_document.test.lua` |
+| `review-commit-semantic.json` | `forge-review` `commit_diff_controls_isolate_immutable_sources_and_preserve_them_on_refresh` | `unit/review_document.test.lua` |
+| `notification.json` | none | `unit/notifications.test.lua` |
+
+`notification.json` has no Rust check, because its producing test was removed. When the notification document snapshot changes, record a new snapshot from the host by hand and update the recording in the same change, or add a Rust check that produces it.
 
 ## Control provider timing
 

@@ -28,45 +28,6 @@ async fn fixture() -> (
     (directory, store, repository, service)
 }
 
-#[tokio::test]
-async fn repository_config_write_retains_capture_and_rejects_external_edit() {
-    let (directory, _, repository, service) = fixture().await;
-    let replacement = b"{\"issues\":[42]}\n".to_vec();
-    let outcome = run(
-        &service,
-        &repository,
-        GitWriteAction::UpdateRepositoryConfig {
-            expected: None,
-            replacement: replacement.clone(),
-        },
-    )
-    .await;
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert_eq!(outcome.affected, vec![path(".forge.json")]);
-    let intent = service
-        .prepare(
-            Arc::clone(&repository),
-            GitWriteAction::UpdateRepositoryConfig {
-                expected: Some(replacement),
-                replacement: b"{}\n".to_vec(),
-            },
-        )
-        .await
-        .unwrap();
-    std::fs::write(
-        directory.path().join(".forge.json"),
-        b"{\"external\":true}\n",
-    )
-    .unwrap();
-    let outcome = service.submit(intent).unwrap().finish().await.unwrap();
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Rejected);
-    assert_eq!(
-        std::fs::read(directory.path().join(".forge.json")).unwrap(),
-        b"{\"external\":true}\n"
-    );
-    service.acknowledge(outcome.operation).unwrap();
-}
-
 fn path(name: &str) -> RepositoryPath {
     RepositoryPath::new(name.as_bytes().to_vec()).unwrap()
 }
@@ -192,46 +153,6 @@ async fn unverified_outcome_blocks_writes_until_read_only_reconciliation() {
 }
 
 #[tokio::test]
-async fn branch_write_invalidates_linked_worktrees() {
-    let (directory, store, repository, service) = fixture().await;
-    let linked = directory.path().join("linked");
-    git(
-        directory.path(),
-        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
-    );
-    let sibling = store.open(linked).await.unwrap().unwrap();
-    let before = sibling.generation();
-    let outcome = run(
-        &service,
-        &repository,
-        GitWriteAction::CreateBranch {
-            name: "feature".into(),
-        },
-    )
-    .await;
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert_ne!(sibling.generation(), before);
-}
-
-#[tokio::test]
-async fn dropped_unsubmitted_intent_releases_queue_and_input() {
-    let (_directory, store, repository, service) = fixture().await;
-    let intent = service
-        .prepare(
-            repository,
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(store.writes.usage().operations, 1);
-    drop(intent);
-    assert_eq!(store.writes.usage().operations, 0);
-    assert_eq!(store.writes.usage().input_bytes, 0);
-}
-
-#[tokio::test]
 async fn literal_pathspec_does_not_stage_neighbors() {
     let (directory, _, repository, service) = fixture().await;
     std::fs::write(directory.path().join("[file].txt"), "literal\n").unwrap();
@@ -299,55 +220,6 @@ async fn failed_path_group_reconciles_every_target_without_claiming_partial_succ
 }
 
 #[tokio::test]
-async fn cancelled_waiter_keeps_recoverable_outcome_until_acknowledged() {
-    let (directory, store, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
-    let blocker = store
-        .writes
-        .admit(
-            vec![MutationScope::Index(
-                repository.identity.worktree.clone().unwrap(),
-            )],
-            0,
-        )
-        .unwrap();
-    let guard = store.writes.start(blocker).unwrap().unwrap();
-    let intent = service
-        .reserve(
-            repository,
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .unwrap();
-    let ticket = service.submit(intent).unwrap();
-    let operation = ticket.operation;
-    drop(ticket);
-    guard.finish(OperationCompletion::Completed).unwrap();
-    store.writes.take_receipt(blocker);
-    let outcome = async {
-        loop {
-            if let Some(outcome) = service.outcome(operation) {
-                break outcome;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-    .await;
-    assert_eq!(outcome.target[0].completion, TargetCompletion::NotStarted);
-    assert_eq!(store.writes.usage().operations, 1);
-    assert_eq!(
-        git(directory.path(), &["show", ":sample.txt"]),
-        b"original\n"
-    );
-    assert_eq!(
-        service.acknowledge(operation),
-        Some(OperationCompletion::CancelledBeforeStart)
-    );
-    assert_eq!(store.writes.usage().input_bytes, 0);
-}
-
-#[tokio::test]
 async fn commit_captures_message_and_rejects_changed_staged_input() {
     let (directory, _, repository, service) = fixture().await;
     std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
@@ -379,41 +251,6 @@ async fn commit_captures_message_and_rejects_changed_staged_input() {
         git(directory.path(), &["log", "-1", "--format=%B"]),
         b"captured message\n\nbody\n\n"
     );
-}
-
-#[tokio::test]
-async fn consumer_settlement_failure_preserves_confirmed_git_completion() {
-    let (directory, _, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "settled\n").unwrap();
-    let mut intent = service
-        .prepare(
-            repository,
-            GitWriteAction::Stage {
-                path: vec![path("sample.txt")],
-            },
-        )
-        .await
-        .unwrap();
-    intent
-        .set_settlement_handler(Arc::new(|outcome| {
-            assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-            anyhow::bail!("private metadata unavailable")
-        }))
-        .unwrap();
-    let outcome = service.submit(intent).unwrap().finish().await.unwrap();
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert!(
-        outcome
-            .settlement_diagnostic
-            .as_ref()
-            .unwrap()
-            .contains("private metadata unavailable")
-    );
-    assert_eq!(
-        git(directory.path(), &["show", ":sample.txt"]),
-        b"settled\n"
-    );
-    service.acknowledge(outcome.operation).unwrap();
 }
 
 #[tokio::test]

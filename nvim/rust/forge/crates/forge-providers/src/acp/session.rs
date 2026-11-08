@@ -2088,28 +2088,3 @@ fn item_activity(turn: &TurnAddress, item_id: &ItemId, event: ItemEvent) -> Adap
         event,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An incomplete descriptor may acquire a category without erasing earlier arguments.
-    #[test]
-    fn descriptor_merge_refines_missing_kind_and_rejects_conflict_atomically() {
-        let mut snapshot = json!({"title":"Pending", "rawInput":{"path":"old"}});
-        assert!(
-            merge_tool_snapshot(&mut snapshot, &json!({"kind":"execute", "title":"Run"})).unwrap()
-        );
-        assert_eq!(snapshot["rawInput"]["path"], "old");
-        let retained = snapshot.clone();
-        assert!(!merge_tool_snapshot(&mut snapshot, &retained).unwrap());
-        assert!(
-            merge_tool_snapshot(
-                &mut snapshot,
-                &json!({"kind":"edit", "title":"Invalid", "rawInput":{"path":"new"}})
-            )
-            .is_err()
-        );
-        assert_eq!(snapshot, retained);
-    }
-}

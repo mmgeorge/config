@@ -180,15 +180,6 @@ impl TraceStore {
         !self.admission.is_closed() && self.writer.enabled()
     }
 
-    /// Hold the next producer after capturing its logging epoch for deterministic races.
-    #[cfg(test)]
-    pub(crate) fn hold_serialization(
-        self: &Arc<Self>,
-    ) -> TraceResult<super::writer::TraceSerializationHold> {
-        self.ensure_open()?;
-        self.admission.hold_serialization(self.clone())
-    }
-
     /// Resolve the private path using the same traversal protection as the writer.
     pub(super) fn session_path(&self, session_id: &str) -> PathBuf {
         session_path(&self.root, session_id)

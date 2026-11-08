@@ -1,0 +1,275 @@
+{
+  "initial": {
+    "diff_view": {
+      "presentation": "full",
+      "visibility": "all"
+    },
+    "more": false,
+    "object": "6cc057ed37af76bc015d45052ad2247d9c292584f8dcf1dbd0c564415ff62225",
+    "revision": "diff",
+    "snapshot": {
+      "block": [
+        {
+          "id": "source:0",
+          "metadata": {
+            "decoration": [],
+            "editable_region": [],
+            "target": []
+          },
+          "text": [
+            "--- a/source.rs",
+            "+++ b/source.rs",
+            "@@ -20 +20 @@",
+            "-before();",
+            "+after();"
+          ]
+        }
+      ],
+      "document": "saved-control",
+      "revision": 1
+    },
+    "state": {
+      "state": "ready"
+    },
+    "title": "Saved diff"
+  },
+  "transition": [
+    {
+      "action": "toggle_presentation",
+      "delivery": {
+        "diff_view": {
+          "presentation": "semantic",
+          "visibility": "all"
+        },
+        "more": false,
+        "patch": {
+          "base": 1,
+          "base_blocks": 1,
+          "base_rows": 5,
+          "block_edit": [
+            {
+              "inserted": [
+                "source:diff:fallback"
+              ],
+              "removed_blocks": 0,
+              "start_block": 0
+            }
+          ],
+          "document": "saved-control",
+          "metadata_edit": [
+            {
+              "block": "source:diff:fallback",
+              "metadata": {
+                "decoration": [],
+                "editable_region": [],
+                "target": []
+              },
+              "row_count": 1
+            }
+          ],
+          "next": 2,
+          "next_blocks": 2,
+          "next_rows": 6,
+          "removed_block": [],
+          "text_edit": [
+            {
+              "removed_rows": 0,
+              "start_row": 0,
+              "text": [
+                "Unclassified source changes: complete captured sources are unavailable"
+              ]
+            }
+          ]
+        },
+        "state": {
+          "state": "ready"
+        }
+      },
+      "expected": {
+        "block": [
+          {
+            "id": "source:diff:fallback",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "Unclassified source changes: complete captured sources are unavailable"
+            ]
+          },
+          {
+            "id": "source:0",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "--- a/source.rs",
+              "+++ b/source.rs",
+              "@@ -20 +20 @@",
+              "-before();",
+              "+after();"
+            ]
+          }
+        ],
+        "document": "saved-control",
+        "revision": 2
+      }
+    },
+    {
+      "action": "toggle_visibility",
+      "delivery": {
+        "diff_view": {
+          "presentation": "semantic",
+          "visibility": "public"
+        },
+        "more": false,
+        "patch": null,
+        "state": {
+          "state": "ready"
+        }
+      },
+      "expected": {
+        "block": [
+          {
+            "id": "source:diff:fallback",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "Unclassified source changes: complete captured sources are unavailable"
+            ]
+          },
+          {
+            "id": "source:0",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "--- a/source.rs",
+              "+++ b/source.rs",
+              "@@ -20 +20 @@",
+              "-before();",
+              "+after();"
+            ]
+          }
+        ],
+        "document": "saved-control",
+        "revision": 2
+      }
+    },
+    {
+      "action": "toggle_presentation",
+      "delivery": {
+        "diff_view": {
+          "presentation": "full",
+          "visibility": "public"
+        },
+        "more": false,
+        "patch": null,
+        "state": {
+          "state": "ready"
+        }
+      },
+      "expected": {
+        "block": [
+          {
+            "id": "source:diff:fallback",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "Unclassified source changes: complete captured sources are unavailable"
+            ]
+          },
+          {
+            "id": "source:0",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "--- a/source.rs",
+              "+++ b/source.rs",
+              "@@ -20 +20 @@",
+              "-before();",
+              "+after();"
+            ]
+          }
+        ],
+        "document": "saved-control",
+        "revision": 2
+      }
+    },
+    {
+      "action": "toggle_visibility",
+      "delivery": {
+        "diff_view": {
+          "presentation": "full",
+          "visibility": "all"
+        },
+        "more": false,
+        "patch": {
+          "base": 2,
+          "base_blocks": 2,
+          "base_rows": 6,
+          "block_edit": [
+            {
+              "inserted": [],
+              "removed_blocks": 1,
+              "start_block": 0
+            }
+          ],
+          "document": "saved-control",
+          "metadata_edit": [],
+          "next": 3,
+          "next_blocks": 1,
+          "next_rows": 5,
+          "removed_block": [
+            "source:diff:fallback"
+          ],
+          "text_edit": [
+            {
+              "removed_rows": 1,
+              "start_row": 0,
+              "text": []
+            }
+          ]
+        },
+        "state": {
+          "state": "ready"
+        }
+      },
+      "expected": {
+        "block": [
+          {
+            "id": "source:0",
+            "metadata": {
+              "decoration": [],
+              "editable_region": [],
+              "target": []
+            },
+            "text": [
+              "--- a/source.rs",
+              "+++ b/source.rs",
+              "@@ -20 +20 @@",
+              "-before();",
+              "+after();"
+            ]
+          }
+        ],
+        "document": "saved-control",
+        "revision": 3
+      }
+    }
+  ]
+}

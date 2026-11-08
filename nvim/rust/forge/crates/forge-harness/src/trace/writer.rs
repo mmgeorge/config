@@ -128,8 +128,6 @@ enum Command {
 pub(super) struct Admission {
     closed: AtomicBool,
     commit: Mutex<()>,
-    #[cfg(test)]
-    serialization: Mutex<Option<SerializationBarrier>>,
 }
 
 impl Admission {
@@ -138,8 +136,6 @@ impl Admission {
         Self {
             closed: AtomicBool::new(false),
             commit: Mutex::new(()),
-            #[cfg(test)]
-            serialization: Mutex::new(None),
         }
     }
 
@@ -167,46 +163,6 @@ impl Admission {
             Ok(()) => Commit::Accepted,
             Err(mpsc::TrySendError::Full(_)) => Commit::Full,
             Err(mpsc::TrySendError::Disconnected(_)) => Commit::Obsolete,
-        }
-    }
-
-    /// Install a single owned barrier before the next record finishes serialization.
-    #[cfg(test)]
-    pub(super) fn hold_serialization(
-        &self,
-        owner: Arc<super::store::TraceStore>,
-    ) -> TraceResult<TraceSerializationHold> {
-        let (entered, received) = mpsc::channel();
-        let (release, resumed) = mpsc::channel();
-        let mut barrier = self
-            .serialization
-            .lock()
-            .map_err(|_| TraceError::Poisoned)?;
-        if barrier.is_some() {
-            return Err(TraceError::Poisoned);
-        }
-        *barrier = Some(SerializationBarrier {
-            entered,
-            release: resumed,
-        });
-        Ok(TraceSerializationHold {
-            entered: received,
-            release,
-            _owner: owner,
-        })
-    }
-
-    /// Suspend one test producer after capturing its receipt epoch and timestamp.
-    #[cfg(test)]
-    fn serialization_barrier(&self) {
-        let barrier = self
-            .serialization
-            .lock()
-            .ok()
-            .and_then(|mut barrier| barrier.take());
-        if let Some(barrier) = barrier {
-            let _ = barrier.entered.send(());
-            let _ = barrier.release.recv();
         }
     }
 }
@@ -314,8 +270,6 @@ impl TraceWriter {
                 .fetch_add(1, Ordering::Relaxed);
             return TraceAdmission::Saturated;
         };
-        #[cfg(test)]
-        admission.serialization_barrier();
         let record = BorrowedRecord {
             timestamp_ms: received_at,
             session_id,
@@ -416,37 +370,6 @@ impl Drop for TraceWriter {
     fn drop(&mut self) {
         let _ = self.close();
     }
-}
-
-/// Release a captured producer before releasing its owning trace lease.
-#[cfg(test)]
-#[must_use]
-pub(crate) struct TraceSerializationHold {
-    entered: mpsc::Receiver<()>,
-    release: mpsc::Sender<()>,
-    _owner: Arc<super::store::TraceStore>,
-}
-
-#[cfg(test)]
-impl TraceSerializationHold {
-    /// Wait until the actual producer captures its original logging epoch.
-    pub(crate) fn wait_entered(&self) -> TraceResult<()> {
-        self.entered.recv().map_err(|_| TraceError::Closed)
-    }
-}
-
-#[cfg(test)]
-impl Drop for TraceSerializationHold {
-    /// Resume the captured producer on normal and unwinding test exits.
-    fn drop(&mut self) {
-        let _ = self.release.send(());
-    }
-}
-
-#[cfg(test)]
-struct SerializationBarrier {
-    entered: mpsc::Sender<()>,
-    release: mpsc::Receiver<()>,
 }
 
 struct Shared {

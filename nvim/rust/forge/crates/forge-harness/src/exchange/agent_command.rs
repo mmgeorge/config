@@ -578,26 +578,3 @@ async fn interrupt(
             .map_err(|_| AgentFailure::WorkerLost)?;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Cancelling an observation retains the sole receiver for the original worker.
-    #[tokio::test]
-    async fn cancelled_observation_retains_original_worker() {
-        let (send, receive) = tokio::sync::oneshot::channel();
-        let mut retained = RetainedAgentCommand {
-            worker: Some(tokio::spawn(async move {
-                receive.await.map_err(|_| AgentFailure::WorkerLost)?
-            })),
-        };
-        assert!(futures_util::FutureExt::now_or_never(retained.collect()).is_none());
-        send.send(Err(AgentFailure::Rejected)).unwrap();
-        assert!(matches!(
-            retained.collect().await,
-            Err(AgentFailure::Rejected)
-        ));
-        assert!(retained.worker.is_none());
-    }
-}

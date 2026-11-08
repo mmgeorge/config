@@ -10,8 +10,7 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 T["saved_diff_controls"] = function()
   vim.o.columns = 160
-  local fixture_path = "nvim/rust/forge/target/saved-diff-controls-fixture.json"
-  assert(vim.fn.filereadable(fixture_path) == 1, "run saved_diff_controls_preserve_unclassified_patch_and_independent_options first")
+  local fixture_path = "nvim/lua/forge/tests/fixtures/protocol/saved-diff-controls.json"
   local fixture = vim.json.decode(table.concat(vim.fn.readfile(fixture_path), "\n"))
   local adapter = require("forge.source_document")
   local stage, pending, current = 0, nil, fixture.initial

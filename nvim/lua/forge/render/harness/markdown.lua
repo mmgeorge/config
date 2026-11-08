@@ -282,9 +282,13 @@ function M.render(buf, win, range_list)
       install_final_replacement_anchor()
       install_linear_sibling_count()
       local state = require("render-markdown.state")
+      -- A handler the editor configured wins; otherwise `markdown_math` converts math when the
+      -- editor provides it, and render-markdown's built-in handler renders it unconverted.
+      local math_handler = require("forge.integrations.markdown_math").module("display_handler")
+      local math_handler_by_language = math_handler and { markdown = math_handler, latex = math_handler.latex } or {}
       for _, language in ipairs({ "markdown", "latex" }) do
         state.custom_handlers[language] = handler(state.custom_handlers[language]
-          or (language == "latex" and require("markdown_math.display_handler").latex)
+          or math_handler_by_language[language]
           or require("render-markdown.handler." .. language))
       end
       vim.api.nvim_create_autocmd("BufWipeout", { callback = function(event) layout_ranges[event.buf] = nil end })

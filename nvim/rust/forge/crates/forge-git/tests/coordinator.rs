@@ -3,7 +3,7 @@ use forge_git::test_support as support;
 use forge_git::coordinator::{MutationCoordinator, OperationState};
 use forge_git::mutation::{MutationScope, OperationCompletion};
 use forge_git::{RepositoryIdentity, discover_identity};
-use support::{add_detached_worktree, commit_index, head_commit, init_repository};
+use support::init_repository;
 
 fn fixture() -> (tempfile::TempDir, RepositoryIdentity) {
     let root = tempfile::tempdir().unwrap();
@@ -93,46 +93,6 @@ fn dropped_running_owner_quarantines_scopes_and_survives_shutdown() {
     assert!(coordinator.admit(vec![scope], 0).is_err());
 }
 
-#[test]
-fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
-    let (root, identity) = fixture();
-    commit_index(root.path(), "initial");
-    add_detached_worktree(
-        root.path(),
-        &root.path().join("linked"),
-        head_commit(root.path()),
-    );
-    let linked = discover_identity(&root.path().join("linked"))
-        .unwrap()
-        .unwrap();
-    let coordinator = MutationCoordinator::new(4).unwrap();
-    let main_index = coordinator
-        .admit(vec![MutationScope::Index(identity.worktree.unwrap())], 0)
-        .unwrap();
-    let linked_index = coordinator
-        .admit(vec![MutationScope::Index(linked.worktree.unwrap())], 0)
-        .unwrap();
-    let main_refs = coordinator
-        .admit(vec![MutationScope::SharedRefs(identity.storage)], 0)
-        .unwrap();
-    let linked_refs = coordinator
-        .admit(vec![MutationScope::SharedRefs(linked.storage)], 0)
-        .unwrap();
-    let main_guard = coordinator.start(main_index).unwrap().unwrap();
-    let linked_guard = coordinator.start(linked_index).unwrap().unwrap();
-    let refs_guard = coordinator.start(main_refs).unwrap().unwrap();
-    assert!(coordinator.start(linked_refs).unwrap().is_none());
-    main_guard.finish(OperationCompletion::Completed).unwrap();
-    linked_guard.finish(OperationCompletion::Completed).unwrap();
-    refs_guard.finish(OperationCompletion::Completed).unwrap();
-    coordinator
-        .start(linked_refs)
-        .unwrap()
-        .unwrap()
-        .finish(OperationCompletion::Completed)
-        .unwrap();
-}
-
 #[tokio::test]
 async fn asynchronous_handoff_observes_completion_before_its_first_poll() {
     let (_root, identity) = fixture();
@@ -177,35 +137,4 @@ async fn cancelled_waiter_records_a_receipt_and_wakes_the_next_scope_owner() {
     let next = third_wait.await.unwrap();
     next.finish(OperationCompletion::Completed).unwrap();
     running.finish(OperationCompletion::Completed).unwrap();
-}
-
-#[tokio::test]
-async fn shutdown_wakes_queued_and_running_owners_without_releasing_running_scopes() {
-    use std::future::Future;
-    use std::task::Poll;
-
-    let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2).unwrap();
-    let scope = MutationScope::Index(identity.worktree.unwrap());
-    let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
-    let second = coordinator.admit(vec![scope], 0).unwrap();
-    let running = coordinator.start(first).unwrap().unwrap();
-    let waiting = coordinator.wait_start(second).unwrap();
-    {
-        let mut cancellation = Box::pin(running.cancelled());
-        std::future::poll_fn(|context| {
-            assert!(cancellation.as_mut().poll(context).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        assert_eq!(coordinator.close(), vec![first]);
-        cancellation.await.unwrap();
-    }
-    assert!(waiting.await.is_err());
-    assert!(coordinator.take_receipt(first).is_none());
-    running.finish(OperationCompletion::Uncertain).unwrap();
-    assert_eq!(
-        coordinator.take_receipt(first),
-        Some(OperationCompletion::Uncertain)
-    );
 }

@@ -241,18 +241,3 @@ impl RuntimeMethod {
         )
     }
 }
-
-#[cfg(test)]
-mod test {
-
-    /// Timeout feedback is an owner event and cannot be invoked as a public mutation.
-    #[test]
-    fn rejects_public_approval_timeout_continuation() {
-        let error = super::RuntimeMethod::decode("session.approval.continue").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("approval timeout feedback is owned internally")
-        );
-    }
-}

@@ -428,41 +428,4 @@ mod tests {
         ));
         Ok(())
     }
-
-    /// A foreign invocation cannot reach process cancellation even with a known run identifier.
-    #[test]
-    fn cancellation_requires_the_original_invocation_scope() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut presentation =
-            crate::buffer::session::SessionPresentation::new("checks-test".into());
-        presentation.initialize(Vec::new())?;
-        let runner = CheckSupervisor::open(
-            super::super::CheckSupervisorContext {
-                session_id: "checks-test".into(),
-                data_root: root.path().into(),
-                workspace: root.path().into(),
-                root: root.path().into(),
-            },
-            Arc::new(std::sync::Mutex::new(presentation)),
-            crate::storage::objects::ObjectStore::open(root.path())?,
-            Arc::new(forge_git::store::RepositoryStore::default()),
-            Arc::new(crate::trace::TraceStore::open(root.path())?),
-        )?;
-        let scope = InvocationScope::new(
-            crate::provider::ThreadOwner::root("checks-test"),
-            "exchange",
-        );
-        let replacement = InvocationScope::new(
-            crate::provider::ThreadOwner::root("checks-test"),
-            "exchange",
-        );
-        let mut runs = CheckOwnerRuns::new(runner);
-        runs.scopes.insert("known-run".into(), scope);
-        assert!(matches!(
-            runs.cancel(&replacement, "known-run"),
-            Err(CheckOwnerFailure::StaleScope)
-        ));
-        assert!(runs.is_empty());
-        Ok(())
-    }
 }

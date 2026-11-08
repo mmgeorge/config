@@ -78,8 +78,6 @@ mod plan_checks_update;
 pub(crate) mod plan_entry;
 mod project_checks;
 pub(crate) use check_admission::AutomaticCheckAction;
-#[cfg(test)]
-pub(crate) use plan_checks_update::{PlanChecksUpdateJob, PlanChecksUpdateResult};
 mod host_settlement;
 mod review_question;
 pub(crate) use observation::BrokerObserver;
@@ -695,11 +693,6 @@ pub(crate) enum ForegroundSignal {
         result: Box<Result<execution::ExecutionControlReport>>,
     },
     RevisionReview(crate::plan::revision_review::RevisionReviewRequest),
-    #[cfg(test)]
-    RevisionChecksUpdated {
-        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
-        result: Box<Result<PlanChecksUpdateResult>>,
-    },
     PlanScan,
     PlanScanned(Box<Result<execution::ExecutionScanResult>>),
     FinalCheckpoint(Result<checkpoint_settlement::FinalCheckpointResult>),
@@ -823,8 +816,6 @@ impl ForegroundSignal {
             Self::ExecutionControlEvidence { .. } => "ExecutionControlEvidence",
             Self::ExecutionControlReport { .. } => "ExecutionControlReport",
             Self::RevisionReview(..) => "RevisionReview",
-            #[cfg(test)]
-            Self::RevisionChecksUpdated { .. } => "RevisionChecksUpdated",
             Self::PlanScan => "PlanScan",
             Self::PlanScanned(..) => "PlanScanned",
             Self::FinalCheckpoint(..) => "FinalCheckpoint",
@@ -1024,11 +1015,6 @@ pub(crate) enum ForegroundJob {
         response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
         submission: bool,
     },
-    #[cfg(test)]
-    RevisionChecksUpdate {
-        job: Box<PlanChecksUpdateJob>,
-        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
-    },
     AgentResult {
         /// Keeps native completion behind a child-result steer whose acceptance is unapplied,
         /// so finalization cannot deliver the same report again as a continuation.
@@ -1125,8 +1111,6 @@ impl ForegroundJob {
             Self::PlanMutation(..) => "PlanMutation",
             Self::ExecutionControl { .. } => "ExecutionControl",
             Self::ExecutionControlReport { .. } => "ExecutionControlReport",
-            #[cfg(test)]
-            Self::RevisionChecksUpdate { .. } => "RevisionChecksUpdate",
             Self::AgentResult { .. } => "AgentResult",
             Self::AgentCancelApprovals { .. } => "AgentCancelApprovals",
             Self::AgentInterrupt { .. } => "AgentInterrupt",
@@ -1164,8 +1148,6 @@ impl ForegroundJob {
             | Self::ExecutionProgress(_)
             | Self::PlanSubmission(_)
             | Self::PlanMutation(_) => true,
-            #[cfg(test)]
-            Self::RevisionChecksUpdate { .. } => false,
             Self::AdmissionWorkspace(_)
             | Self::ProviderPrepare(_)
             | Self::QuestionCatalog(_)
@@ -1436,13 +1418,6 @@ impl ForegroundJob {
                 submission,
                 result: Box::new(job.run().await),
             }),
-            #[cfg(test)]
-            Self::RevisionChecksUpdate { job, response } => {
-                Ok(ForegroundSignal::RevisionChecksUpdated {
-                    response,
-                    result: Box::new(job.run().await),
-                })
-            }
             Self::AgentResult {
                 flight,
                 engine,
@@ -2260,9 +2235,6 @@ pub struct HarnessBroker {
     question_discussion: bool,
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
-    /// Replace the session owner's wait capacity so fixtures reach saturation with a few waits.
-    #[cfg(test)]
-    pub(crate) question_wait_capacity_for_test: Option<usize>,
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
@@ -2729,8 +2701,6 @@ impl HarnessBroker {
             question_model: None,
             question_discussion: false,
             question_events: None,
-            #[cfg(test)]
-            question_wait_capacity_for_test: None,
             questions,
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
@@ -3742,35 +3712,6 @@ impl HarnessBroker {
             )?;
         }
         Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
-    }
-
-    #[cfg(test)]
-    fn create_task(
-        &mut self,
-        kind: crate::task::TaskKind,
-        title: String,
-        plan_id: Option<String>,
-        _goal_id: Option<String>,
-    ) -> Result<()> {
-        let now_ms = self.clock.now_ms();
-        let task = if kind == crate::task::TaskKind::Plan {
-            crate::task::Task::plan(
-                self.store
-                    .load_plan(&plan_id.context("plan is required")?)?
-                    .context("plan is missing")?,
-                now_ms,
-            )?
-        } else {
-            crate::task::Task::goal(title, Default::default(), now_ms)
-        };
-        let current = self.task_controller.current()?;
-        self.task_controller.change(
-            &mut self.store,
-            current.as_ref().map(|task| &task.revision),
-            crate::task::TaskChange::Install(Box::new(task)),
-            now_ms,
-        )?;
-        Ok(())
     }
 
     /// Applies a transition only after the service has collected the previous owner.
@@ -8002,115 +7943,7 @@ impl HarnessBroker {
                 let _ = response.send(result);
                 Ok(ForegroundAction::Wait)
             }
-            #[cfg(test)]
-            RevisionReviewRequest::Decide {
-                method,
-                params,
-                response,
-            } => {
-                let validate = (|| {
-                    if let Some(authority) = &transaction.task_authority {
-                        authority.validate()?;
-                    }
-                    anyhow::ensure!(
-                        transaction.pending_revision.is_some(),
-                        "revision review is no longer active"
-                    );
-                    if let Some(id) = params.get("plan_id").and_then(Value::as_str) {
-                        anyhow::ensure!(
-                            self.current_plan_id()?.as_deref() == Some(id),
-                            "review decision belongs to another plan"
-                        );
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = validate {
-                    let _ = response.send(Err(error));
-                    return Ok(ForegroundAction::Wait);
-                }
-                if matches!(method, RuntimeMethod::SessionPlanCheckUpdate) {
-                    return match self.prepare_plan_checks_update(params) {
-                        Ok(job) => {
-                            transaction.revision_job_active = true;
-                            Ok(ForegroundAction::Effect(
-                                ForegroundJob::RevisionChecksUpdate {
-                                    job: Box::new(job),
-                                    response,
-                                },
-                            ))
-                        }
-                        Err(error) => {
-                            let _ = response.send(Err(error));
-                            Ok(ForegroundAction::Wait)
-                        }
-                    };
-                }
-                let edits_only = matches!(
-                    method,
-                    RuntimeMethod::SessionPlanEntityRename | RuntimeMethod::SessionPlanTestDelete
-                );
-                let result = match method {
-                    RuntimeMethod::SessionPlanChangesRequest => {
-                        self.dispatch_session_command("session.plan.changes.request", params)
-                    }
-                    RuntimeMethod::SessionPlanCancel => {
-                        self.dispatch_session_command("session.plan.cancel", params)
-                    }
-                    RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
-                    RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
-                    _ => Err(anyhow::anyhow!("unsupported revision review decision")),
-                };
-                if edits_only || result.is_err() {
-                    let _ = response.send(result);
-                    return Ok(ForegroundAction::Wait);
-                }
-                let (_, mut events) = result?;
-                transaction.state.interaction.set_awaiting_input(false);
-                transaction.state.interaction.resume(self.clock.now_ms())?;
-                self.store.save_exchange(&transaction.state.interaction)?;
-                let execution_id = self
-                    .current_execution()?
-                    .context("review has no execution")?
-                    .id;
-                let provider_response = self.revision_review_response(&execution_id)?;
-                events.retain(|event| event.event != "goal_continue_requested");
-                let patch = self.reconcile_timeline()?;
-                let snapshot = serde_json::to_value(self.snapshot()?)?;
-                let (provider, wait) = transaction
-                    .pending_revision
-                    .take()
-                    .context("revision review lost its provider wait")?;
-                drop(wait);
-                let _ = response.send(Ok((snapshot, events)));
-                let _ = provider.send(Ok(provider_response));
-                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
-                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
-                )))
-            }
         }
-    }
-
-    /// Revalidate and commit a completed revision check edit.
-    #[cfg(test)]
-    pub(crate) fn apply_foreground_revision_checks(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
-        result: Result<PlanChecksUpdateResult>,
-    ) -> ForegroundAction {
-        transaction.revision_job_active = false;
-        let result = result.and_then(|captured| {
-            if let Some(authority) = &transaction.task_authority {
-                authority.validate()?;
-            }
-            anyhow::ensure!(
-                transaction.pending_revision.is_some(),
-                "revision review is no longer active"
-            );
-            self.commit_plan_checks_update(captured)
-        });
-        let _ = response.send(result);
-        ForegroundAction::Wait
     }
 
     /// Capture a plan scan as owned work that can run without the broker lock.
@@ -9634,26 +9467,6 @@ impl HarnessBroker {
         )
     }
 
-    #[cfg(test)]
-    fn create_goal(&mut self, objective: String) -> Result<GoalRecord> {
-        let now_ms = self.clock.now_ms();
-        let mut task = crate::task::Task::goal(
-            objective,
-            crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 5),
-            now_ms,
-        );
-        task.request_entry("Continue the active goal".into(), now_ms)?;
-        let current = self.task_controller.current()?;
-        self.task_controller.change(
-            &mut self.store,
-            current.as_ref().map(|task| &task.revision),
-            crate::task::TaskChange::Install(Box::new(task)),
-            now_ms,
-        )?;
-        self.session.active_task = self.task_controller.current()?;
-        self.active_goal()
-    }
-
     fn apply_goal_evidence_strict(
         &mut self,
         evidence: crate::goal::TurnEvidence,
@@ -10199,17 +10012,6 @@ impl HarnessBroker {
                 attachments,
             },
         })
-    }
-
-    #[cfg(test)]
-    async fn rollback_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let (preview, _) = self.prepare_rollback(params).await?;
-        anyhow::ensure!(
-            preview["warning_count"].as_u64() == Some(0),
-            "restore requires confirmation of later changes"
-        );
-        self.apply_rollback(json!({"preview_id":preview["preview_id"]}))
-            .await
     }
 
     async fn restore_recovery(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {

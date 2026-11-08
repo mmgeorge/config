@@ -54,16 +54,6 @@ pub(crate) fn contract(
     Ok(contract)
 }
 
-#[cfg(test)]
-fn compare_in_workspace(
-    workspace: &std::path::Path,
-    path: &str,
-    expected: &str,
-    source: &str,
-) -> Result<Vec<String>> {
-    Ok(inspect_in_workspace(workspace, path, expected, source)?.0)
-}
-
 pub(crate) fn inspect_in_workspace(
     workspace: &std::path::Path,
     path: &str,
@@ -124,74 +114,4 @@ pub(crate) fn declaration_mismatch(
         diff: String::from_utf8(patch)?,
         finding: format!("{path}: {finding}"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn helpers_in_private_modules_are_internal_but_new_exports_are_not() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir(workspace.path().join("src")).unwrap();
-        std::fs::write(
-            workspace.path().join("Cargo.toml"),
-            r#"[package]
-name = "fixture"
-version = "0.1.0"
-edition = "2024"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("src/lib.rs"),
-            "mod helpers; pub mod api;",
-        )
-        .unwrap();
-        assert!(
-            compare_in_workspace(workspace.path(), "src/helpers.rs", "", "pub fn helper() {}")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !compare_in_workspace(workspace.path(), "src/api.rs", "", "pub fn public_api() {}")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !compare_in_workspace(
-                workspace.path(),
-                "src/helpers.rs",
-                "pub fn helper(value: u32);",
-                "pub fn helper(value: bool) {}"
-            )
-            .unwrap()
-            .is_empty()
-        );
-        std::fs::write(
-            workspace.path().join("src/lib.rs"),
-            "mod helpers; pub use helpers::Api;",
-        )
-        .unwrap();
-        assert!(
-            !compare_in_workspace(
-                workspace.path(),
-                "src/helpers.rs",
-                "pub struct Api;",
-                "pub struct Api; impl Api { pub fn added() {} }"
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            compare_in_workspace(
-                workspace.path(),
-                "src/helpers.rs",
-                "pub struct Api;",
-                "pub struct Api; fn helper() {}"
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
 }

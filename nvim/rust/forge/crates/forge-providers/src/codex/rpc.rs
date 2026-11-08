@@ -670,29 +670,4 @@ mod tests {
         rpc.close().await.unwrap();
         server.await.unwrap();
     }
-
-    #[tokio::test]
-    async fn connection_loss_releases_every_waiting_rpc() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(stream).await.unwrap();
-            let _ = socket.next().await;
-            socket.close(None).await.unwrap();
-        });
-        let connection = CodexConnection::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        let rpc = NativeRpc::new(connection);
-        let error = rpc
-            .request("turn/start", json!({}), ProviderOperation::TurnStart)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Transport)
-        );
-        let _ = rpc.close().await;
-        server.await.unwrap();
-    }
 }

@@ -1,10 +1,8 @@
 use super::super::{
-    Exchange, GoalRecord, GoalState, HarnessBroker, InitializeRequest, PlanExecutionRecord,
-    PlanState, ProviderEvent, ProviderLaunch, SessionEvent,
+    Exchange, HarnessBroker, InitializeRequest, ProviderEvent, ProviderLaunch, SessionEvent,
 };
-use super::{FixedClock, PlanFixtureBehavior, git, plan_fixture_provider, save_check_exchange};
+use super::{FixedClock, PlanFixtureBehavior, git, plan_fixture_provider};
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -178,135 +176,6 @@ pub(super) async fn settle_managed_children(
     }
     .await?;
     Ok(event)
-}
-
-/// Create an accepted execution workflow with persisted check definitions and baseline evidence.
-pub(super) async fn check_fixture(
-    repository: &Path,
-    data: &Path,
-    commands: Vec<String>,
-    manual: bool,
-) -> HarnessBroker {
-    let mut broker = planning_question_broker(repository, data, false);
-    // Fixture commands use PowerShell's `Write-Output`, which the default interpreter ignores.
-    broker.check_runner.script_commands(|request| {
-        match request.command.trim().strip_prefix("Write-Output ") {
-            Some(text) => crate::checks::ScriptedCheckOutcome {
-                stdout: format!("{}\n", text.trim().trim_matches(['\'', '"'])),
-                ..Default::default()
-            },
-            None => crate::checks::ScriptedCheckOutcome::interpret(request),
-        }
-    });
-    let mut document = crate::plan::test_fixture("check-plan", "Check fixture");
-    let mut design = crate::plan::DeclarationDesign::default();
-    design.document.objective = "Check accepted commands".into();
-    design.document.background = "A repository fixture".into();
-    design.document.design = "Harness owns the command gate".into();
-    let config = crate::checks::CheckConfig {
-        version: 2,
-        definitions: commands
-            .into_iter()
-            .enumerate()
-            .map(|(index, command)| crate::checks::CheckDefinition {
-                auto: true,
-                id: format!("check-{index}"),
-                name: format!("Check {index}"),
-                category: crate::checks::CheckCategory::Check,
-                purpose: crate::checks::CheckPurpose::Verify,
-                enabled: true,
-                area: "Fixture".into(),
-                trigger: crate::checks::CheckTrigger::AnyChange,
-                scope: Default::default(),
-                directory: ".".into(),
-                all: crate::checks::CheckOperation {
-                    input: false,
-                    args: None,
-                    inputs: None,
-                    command,
-                },
-                files: None,
-                cases: None,
-                depends_on: Vec::new(),
-            })
-            .collect(),
-    };
-    std::fs::write(
-        repository.join(".forge.json"),
-        serde_json::to_vec(&json!({"checks":config})).unwrap(),
-    )
-    .unwrap();
-    design.document.verification = if manual {
-        vec!["Observe manual result".into()]
-    } else {
-        Vec::new()
-    };
-    design
-        .proposed
-        .insert(".gitignore".into(), "/target/\n".into());
-    document.design = Some(design);
-    let mut plan = broker
-        .plan_file
-        .prepare_entry(&broker.session.id, "Run checks".into(), Some(document), 1)
-        .unwrap()
-        .record;
-    let (_, _, accepted_digest) = broker
-        .plan_file
-        .submit_document_revision(&broker.session.id, "check-plan", 1, 1)
-        .unwrap();
-    plan.state = PlanState::Accepted;
-    plan.model_revision = 1;
-    plan.accepted_revision = Some(1);
-    plan.review_digest = Some(accepted_digest.clone());
-    plan.accepted_digest = Some(accepted_digest);
-    plan.submitted_version = Some(plan.document_version);
-    broker.store.save_plan(&plan).unwrap();
-    std::fs::write(repository.join(".gitignore"), "/target/\n").unwrap();
-    let goal = GoalRecord {
-        id: "check-goal".into(),
-        session_id: broker.session.id.clone(),
-        objective: "Run checks".into(),
-        state: GoalState::Active,
-        continuation: Default::default(),
-        created_at_ms: 1,
-        updated_at_ms: 1,
-    };
-    broker.save_session().unwrap();
-    let baseline = broker.prepare_workspace_capture().run().await.unwrap();
-    broker.store.save_checkpoint(&baseline).unwrap();
-    std::fs::write(
-        repository.join(".gate-input"),
-        "Exercise the automated gate\n",
-    )
-    .unwrap();
-    let execution:PlanExecutionRecord=serde_json::from_value(json!({
-        "baseline_checkpoint":baseline.id,
-        "manual_verification":if manual { vec!["Observe manual result"] } else { Vec::new() },
-        "id":"check-execution","session_id":broker.session.id,"plan_id":"check-plan","goal_id":goal.id,
-        "state":"active","phase":"checking","original_revision":1,"revision":1,"generation":0,
-        "lifecycle":[],"findings":[],"progress":crate::plan::execution::SemanticProgress::default(),
-        "verification":[],"check_runs":[],"revision_history":[],"resume_after_review":false,
-        "observed_source":{},"observed_document_version":0,"observed_check":[],"created_at_ms":1
-    })).unwrap();
-    broker.store.save_plan_execution(&execution).unwrap();
-    let task = crate::task::Task::execute(
-        "Run checks".into(),
-        execution,
-        crate::session::continuation::ContinuationBudget::new(20, 2),
-        1,
-    )
-    .unwrap();
-    broker
-        .task_controller
-        .change(
-            &mut broker.store,
-            None,
-            crate::task::TaskChange::Install(Box::new(task)),
-            1,
-        )
-        .unwrap();
-    save_check_exchange(&mut broker, "check-exchange", true).unwrap();
-    broker
 }
 
 /// Create a plain workspace directory holding the seed file. The broker opens a non-Git workspace
@@ -498,29 +367,6 @@ pub(super) fn child_completed(
     let completed = crate::provider::test_support::completed_turn(address.scope.clone(), result)
         .expect("deterministic fixture native resources collect successfully");
     child_event(address, crate::provider::TurnEvent::Completed(completed))
-}
-
-/// Create a child tool lifecycle sequence for the shared fixture address.
-pub(super) fn child_tool(
-    address: &crate::provider::TurnAddress,
-    output: String,
-    status: crate::provider::ToolStatus,
-) -> Vec<ProviderEvent> {
-    let start =
-        forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
-            semantics: Default::default(),
-            name: "inspect".into(),
-            title: "Inspect compilation diagnostics".into(),
-            arguments: forge_provider_api::InspectableArguments::new(Value::Null),
-        });
-    let updates =
-        crate::turn::test_support::tool_updates(&start, status, Some(output), Default::default());
-    crate::provider::test_support::tool(
-        address,
-        format!("{}:same-provider-call", address.turn_id.as_str()),
-        start,
-        updates,
-    )
 }
 
 impl HarnessBroker {

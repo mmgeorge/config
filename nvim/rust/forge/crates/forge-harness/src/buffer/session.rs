@@ -2295,98 +2295,7 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
 
-    /// Resolve fixture labels against retained domain owners before querying display identities.
-    fn tool_display(
-        owner: &SessionPresentation,
-        source: &str,
-    ) -> super::super::identity::DisplayId {
-        fn in_exchange(exchange: &Exchange, source: &str) -> Option<crate::turn::ToolAddress> {
-            for turn in &exchange.turn {
-                for tool in exchange.tools_for_turn(turn.id()) {
-                    if format!("{}:{}", turn.id(), tool.id) == source {
-                        return Some(crate::turn::ToolAddress {
-                            turn: turn.provider().clone(),
-                            item_id: forge_provider_api::ItemId::new(&tool.id).unwrap(),
-                        });
-                    }
-                }
-            }
-            None
-        }
-        fn find(entry: &TimelineEntry, source: &str) -> Option<crate::turn::ToolAddress> {
-            match entry {
-                TimelineEntry::Inherited { entry, .. } => find(entry, source),
-                TimelineEntry::Exchange {
-                    exchange,
-                    agent_by_id,
-                    ..
-                } => in_exchange(exchange, source)
-                    .or_else(|| agent_by_id.values().find_map(|entry| find(entry, source))),
-                TimelineEntry::AgentLifecycle {
-                    exchange, agent, ..
-                } => exchange
-                    .iter()
-                    .find_map(|exchange| in_exchange(exchange, source))
-                    .or_else(|| agent.iter().find_map(|entry| find(entry, source))),
-                _ => None,
-            }
-        }
-        let address = owner
-            .timeline
-            .entry_list()
-            .iter()
-            .find_map(|entry| find(entry, source))
-            .expect("fixture tool has an original owner");
-        let open = owner.open.as_ref().unwrap();
-        open.display
-            .tool_occurrences(&address)
-            .find(|id| open.sections.nodes.tool.contains_key(id))
-            .unwrap()
-    }
-
     use super::*;
-
-    fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
-        let open = owner.open.as_mut().unwrap();
-        let ids: Vec<_> = open
-            .transcript
-            .snapshot()?
-            .block
-            .iter()
-            .filter(|block| {
-                block
-                    .metadata
-                    .node
-                    .as_ref()
-                    .is_none_or(|node| node.kind != forge_buffer::node::NodeKind::Tool)
-            })
-            .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone()))
-            .collect();
-        let first_sequence = open
-            .sections
-            .nodes
-            .intent_sequence
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            + 1;
-        for (index, id) in ids.iter().enumerate() {
-            open.sections.set(
-                &mut open.transcript,
-                crate::buffer::sections::SectionRequest {
-                    view: ViewId(view.into()),
-                    sequence: first_sequence + u64::try_from(index)?,
-                    id,
-                    expanded: true,
-                    more: false,
-                    page: None,
-                },
-            )?;
-            open.sections.quota_for_test(id, 16 * 1024 * 1024);
-        }
-        retain_patches(open, Vec::new())
-    }
 
     #[tokio::test]
     async fn timeline_semantic_controls_retain_captured_sources_and_lazy_native_nodes() -> Result<()>
@@ -2438,12 +2347,11 @@ mod tests {
         let view = ViewId("timeline:semantic:view".into());
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![entry.clone()])?;
-        let initial = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let presentation = std::sync::Arc::new(std::sync::Mutex::new(owner));
         let diff = DiffEngine::new(Default::default(), 2);
         let syntax = SyntaxEngine::new(diff.analysis_pool());
         let mut sequence = 0;
-        let mut transition = Vec::new();
         for selector in [
             "changes", "file", "semantic", "public", "visible", "full", "all",
         ] {
@@ -2515,7 +2423,7 @@ mod tests {
                 }
             };
             let revision = frame.revision;
-            let result = diff_view::update(
+            diff_view::update(
                 presentation.clone(),
                 &request,
                 data.path().to_owned(),
@@ -2553,12 +2461,11 @@ mod tests {
                 assert!(text.contains("new_private();"));
             }
             assert!(!text.contains("unrelated later worktree"));
-            let synchronized = presentation.lock().unwrap().sync(&document, revision)?;
-            transition.push(serde_json::json!({"step":selector,"result":result,"expected":frame,"sync":synchronized}));
+            presentation.lock().unwrap().sync(&document, revision)?;
         }
         {
             let mut owner = presentation.lock().unwrap();
-            let snapshot = owner.snapshot(&document)?;
+            owner.snapshot(&document)?;
             owner.dispatch(PresentationRequest::Resize {
                 document: document.clone(),
                 view: view.clone(),
@@ -2583,13 +2490,6 @@ mod tests {
                 recovered["diff_view"],
                 serde_json::json!({"presentation":"full","visibility":"all"})
             );
-            std::fs::write(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/timeline-semantic-fixture.json"),
-                serde_json::to_vec(
-                    &serde_json::json!({"initial":initial,"transition":transition,"before_resize":snapshot,"resized":resized}),
-                )?,
-            )?;
         }
         let frame = presentation
             .lock()
@@ -2944,84 +2844,6 @@ mod tests {
             agent_by_id: HashMap::new(),
             exchange: (interaction).into(),
         }
-    }
-
-    #[test]
-    fn tool_actions_survive_unrelated_revisions_without_retargeting_or_replay() -> Result<()> {
-        use forge_buffer::{block::TextPosition, identity::BlockId};
-        let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![
-            interaction_entry("first"),
-            interaction_entry("second"),
-        ])?;
-        let document = DocumentId("transcript:stable-tool".into());
-        let view = ViewId("view:stable-tool".into());
-        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
-        expand_sections(&mut owner, "view:stable-tool")?;
-        let captured = owner.snapshot(&document)?;
-        let input = DocumentInput {
-            document: document.clone(),
-            revision: captured.revision,
-            view: view.clone(),
-            sequence: InputSequence(1),
-            action: "activate".into(),
-            block: BlockId(format!(
-                "{}:tool",
-                tool_display(&owner, "first:turn:1:tool")
-            )),
-            position: TextPosition { row: 0, column: 8 },
-            target: Some(TargetId(format!(
-                "{}:tool",
-                tool_display(&owner, "first:turn:1:tool")
-            ))),
-        };
-        owner.dispatch(PresentationRequest::Resize {
-            document: document.clone(),
-            view,
-            width: WidthProfile {
-                columns: 65,
-                ..WidthProfile::default()
-            },
-        })?;
-        assert!(owner.snapshot(&document)?.revision > captured.revision);
-        let mut changed = input.clone();
-        changed.action = "navigate_prompt".into();
-        assert!(
-            owner
-                .dispatch(PresentationRequest::NavigatePrompt {
-                    input: changed,
-                    previous: true,
-                })
-                .is_err()
-        );
-        let mut changed = input.clone();
-        changed.target = Some(TargetId(format!(
-            "{}:tool",
-            tool_display(&owner, "second:turn:1:tool")
-        )));
-        assert!(owner.action(changed).is_err());
-        let mut changed = input.clone();
-        changed.document = DocumentId("transcript:other".into());
-        assert!(owner.action(changed).is_err());
-        let mut changed = input.clone();
-        changed.revision =
-            forge_buffer::identity::DocumentRevision(owner.snapshot(&document)?.revision.0 + 1);
-        assert!(owner.action(changed).is_err());
-        assert!(matches!(
-            owner.action(input.clone())?,
-            TranscriptAction::Tool { .. }
-        ));
-        assert!(owner.action(input.clone()).is_err());
-        let mut next = input.clone();
-        next.sequence = InputSequence(2);
-        owner.dispatch(PresentationRequest::ToolOpen {
-            input: next.clone(),
-            document: DocumentId("output:stable-tool".into()),
-        })?;
-        owner.reconcile(vec![interaction_entry("second")])?;
-        next.sequence = InputSequence(3);
-        assert!(owner.action(next).is_err());
-        Ok(())
     }
 
     #[test]

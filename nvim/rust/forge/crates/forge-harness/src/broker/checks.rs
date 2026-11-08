@@ -194,84 +194,6 @@ impl CheckPreparationFailure {
 }
 
 impl HarnessBroker {
-    /// Drive test fixtures through the same captured verification stages as the service.
-    #[cfg(test)]
-    pub(super) async fn run_checks(&mut self) -> Result<Vec<SessionEvent>> {
-        anyhow::ensure!(
-            self.agent_coordinator.active_count() == 0,
-            "child execution must settle before running verification checks. Wait for or interrupt active children first"
-        );
-        let task = self
-            .task_controller
-            .current()?
-            .context("check task was cleared")?;
-        let pending = task
-            .turn
-            .as_ref()
-            .and_then(|turn| turn.continuation.as_ref())
-            .is_some_and(|work| {
-                work.work.is_checks() && work.delivery == crate::task::TaskInputDelivery::Pending
-            });
-        if !pending {
-            let exchange = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .context("check fixture has no exchange")?;
-            let source = match &task.turn {
-                Some(turn) => crate::task::TaskTurnId {
-                    exchange_ordinal: turn.id.exchange_ordinal,
-                    turn_ordinal: turn
-                        .id
-                        .turn_ordinal
-                        .checked_add(1)
-                        .context("check fixture turn exhausted")?,
-                },
-                None => crate::task::TaskTurnId {
-                    exchange_ordinal: exchange.ordinal,
-                    turn_ordinal: exchange.turn.len(),
-                },
-            };
-            self.task_controller.reserve_checks(
-                &mut self.store,
-                &task.permit(),
-                source,
-                self.clock.now_ms(),
-            )?;
-        }
-        let task = self
-            .task_controller
-            .current()?
-            .context("check task disappeared")?;
-        let result = async {
-            let (mut state, scan) = self.begin_owned_task_checks()?;
-            let scan = scan.run().await?;
-            let run = self.prepare_owned_task_check_run(&mut state, scan)?;
-            let result = run.run().await?;
-            let scan = self.prepare_task_check_postscan(&state)?.run().await?;
-            let mut finalization = self.prepare_task_check_finalization(state, result, scan)?;
-            let report = finalization.capture_report().await?;
-            let publication = self.commit_task_check_finalization(finalization, report)?;
-            let (events, acknowledgment) = publication.run().await?;
-            self.acknowledge_owned_task_check(acknowledgment)?;
-            Ok::<_, anyhow::Error>(events)
-        }
-        .await;
-        match result {
-            Ok(events) => Ok(events),
-            Err(error) => {
-                let Some(publication) = self.prepare_task_check_start_failure(&task, &error)?
-                else {
-                    return Err(error);
-                };
-                let (handled, events, acknowledgment) = publication.run().await?;
-                if let Some(acknowledgment) = acknowledgment {
-                    self.acknowledge_owned_task_check(acknowledgment)?;
-                }
-                if handled { Ok(events) } else { Err(error) }
-            }
-        }
-    }
-
     /// Resolve accepted checks and task overrides identically for execution and reuse.
     fn execution_check_selection(
         &self,
@@ -334,18 +256,6 @@ impl HarnessBroker {
             workspace: self.prepare_workspace_capture(),
             expected: run.workspace_identity.clone(),
         })
-    }
-
-    /// Validate the latest passing checks against the current workspace.
-    #[cfg(test)]
-    pub(super) async fn execution_checks_are_current(
-        &mut self,
-        execution: &PlanExecutionRecord,
-        design: &crate::plan::DeclarationDesign,
-    ) -> Result<bool> {
-        self.prepare_execution_check_evidence(execution, design)?
-            .run()
-            .await
     }
 
     /// Persist a check outcome against the still-current execution contract.

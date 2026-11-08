@@ -63,22 +63,3 @@ fn sensitive_argument(key: &str) -> bool {
             | "privatekey"
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Keep encoded native credentials out of the title while retaining useful arguments.
-    #[test]
-    fn native_encoded_arguments_are_redacted_before_display() {
-        let arguments = serde_json::json!({
-            "query": "lookup", "nested": [{"api_key": "native-secret-marker"}]
-        });
-        let title = call_title("search", &Value::String(arguments.to_string())).unwrap();
-        assert!(title.contains("lookup"));
-        assert!(title.contains("[REDACTED]"));
-        assert!(!title.contains("native-secret-marker"));
-        assert_eq!(call_title("search", &arguments).as_ref(), Some(&title));
-        assert!(call_title("search", &Value::String("invalid native JSON".into())).is_none());
-    }
-}

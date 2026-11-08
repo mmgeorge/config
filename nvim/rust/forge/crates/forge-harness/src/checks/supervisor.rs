@@ -47,111 +47,6 @@ pub struct CheckSupervisor {
     owner: OnceLock<super::owner::CheckOwnerSender>,
     trace: Arc<crate::trace::TraceStore>,
     changed: tokio::sync::Notify,
-    command_expiry: CommandExpiry,
-    /// Selects how tests answer check commands; see [`ScriptedCheckRequest`].
-    #[cfg(test)]
-    test_command_runner: Mutex<TestCommandRunner>,
-}
-
-/// One check command that a test answers instead of launching its shell.
-#[cfg(test)]
-pub(crate) struct ScriptedCheckRequest<'request> {
-    /// Shell source for shell checks; empty for direct invocations.
-    pub command: &'request str,
-    /// Program and arguments of a direct invocation, which launches without a shell.
-    pub invocation: Option<(&'request str, &'request [String])>,
-    pub directory: &'request std::path::Path,
-    pub selection: &'request super::CheckSelection,
-    pub receipt: &'request std::path::Path,
-    pub scoped: bool,
-}
-
-/// Output and exit status that a test supplies for one check command.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ScriptedCheckOutcome {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    /// Keep the command running until its check is cancelled, as a long-running process would.
-    pub hold_until_cancelled: bool,
-}
-
-/// Answers one scripted check command.
-#[cfg(test)]
-pub(crate) type ScriptedCheckRunner =
-    Arc<dyn Fn(&ScriptedCheckRequest<'_>) -> ScriptedCheckOutcome + Send + Sync>;
-
-/// Rust tests never launch a check process, because shell startup dominates their duration and
-/// makes them depend on installed interpreters.
-#[cfg(test)]
-#[derive(Default)]
-enum TestCommandRunner {
-    /// Interpret `print`, `echo`, and `exit` commands; every other command passes silently.
-    #[default]
-    Default,
-    Custom(ScriptedCheckRunner),
-}
-
-#[cfg(test)]
-impl ScriptedCheckOutcome {
-    /// Interpret the small command vocabulary that check fixtures use.
-    pub(crate) fn interpret(request: &ScriptedCheckRequest<'_>) -> Self {
-        let command = request.command.trim();
-        let mut outcome = if let Some(code) = command.strip_prefix("exit ") {
-            Self {
-                exit_code: code.trim().parse().unwrap_or(1),
-                ..Self::default()
-            }
-        } else if let Some(text) = command
-            .strip_prefix("print ")
-            .or_else(|| command.strip_prefix("echo "))
-        {
-            Self {
-                stdout: format!("{}\n", text.trim().trim_matches(['\'', '"'])),
-                ..Self::default()
-            }
-        } else {
-            Self::default()
-        };
-        if request.scoped && outcome.exit_code == 0 {
-            if let Err(error) = std::fs::write(
-                request.receipt,
-                serde_json::to_vec(&serde_json::json!({
-                    "version": 1,
-                    "selection": request.selection,
-                }))
-                .expect("selection serializes"),
-            ) {
-                outcome.stderr = format!("scripted receipt write failed: {error}\n");
-                outcome.exit_code = 1;
-            }
-        }
-        outcome
-    }
-}
-
-/// Ends a running check command at its captured execution deadline.
-///
-/// Tests force expiry through this owner because a paused Tokio clock cannot auto-advance
-/// while Windows child pipes hold blocking reads, and real deadlines must not elapse in tests.
-#[derive(Default)]
-struct CommandExpiry {
-    #[cfg(test)]
-    forced: tokio::sync::Notify,
-}
-
-impl CommandExpiry {
-    /// Resolves when the deadline passes, or when a test has forced the next command to expire.
-    async fn wait(&self, deadline: tokio::time::Instant) {
-        #[cfg(test)]
-        tokio::select! {
-            () = tokio::time::sleep_until(deadline) => {},
-            () = self.forced.notified() => {},
-        }
-        #[cfg(not(test))]
-        tokio::time::sleep_until(deadline).await;
-    }
 }
 
 /// Check state and its matching presentation revision captured under one lock.
@@ -375,16 +270,7 @@ impl CheckSupervisor {
             owner: OnceLock::new(),
             trace,
             changed: Default::default(),
-            command_expiry: CommandExpiry::default(),
-            #[cfg(test)]
-            test_command_runner: Mutex::default(),
         }))
-    }
-
-    /// Expires the current or next check command as if its execution deadline had passed.
-    #[cfg(test)]
-    pub(crate) fn expire_command_deadline(&self) {
-        self.command_expiry.forced.notify_one();
     }
 
     /// Captures the source boundary before provider edits can affect check applicability.
@@ -1437,36 +1323,6 @@ impl CheckSupervisor {
             .unwrap_or_default()
             .require_expiry()?
             .duration();
-        #[cfg(test)]
-        if let Some(outcome) = self.scripted_outcome(&ScriptedCheckRequest {
-            command: if direct.is_some() {
-                ""
-            } else {
-                &run.commands[index].command
-            },
-            invocation: direct
-                .map(|invocation| (invocation.program.as_str(), invocation.args.as_slice())),
-            directory: &directory,
-            selection: &context.selection,
-            receipt: &context.receipt,
-            scoped,
-        })? {
-            let deadline = tokio::time::Instant::now() + timeout;
-            let scripted = self.complete_scripted(
-                run,
-                index,
-                context,
-                scoped,
-                outcome,
-                cancelled,
-                external_cancelled,
-            );
-            return tokio::select! {
-                biased;
-                result = scripted => result,
-                () = self.command_expiry.wait(deadline) => Err(CommandTimeout(timeout).into()),
-            };
-        }
         let mut child = crate::process::spawn_owned(command)
             .map_err(super::failure::CheckFailure::launch)
             .context("start configured check")?;
@@ -1591,76 +1447,12 @@ impl CheckSupervisor {
         let result = tokio::select! {
             biased;
             result = result => result,
-            () = self.command_expiry.wait(deadline) => Err(CommandTimeout(timeout).into()),
+            () = tokio::time::sleep_until(deadline) => Err(CommandTimeout(timeout).into()),
         };
         if result.is_err() {
             process.stop().await?;
         }
         result
-    }
-
-    /// Answer every later check command with `runner` instead of the default interpreter.
-    #[cfg(test)]
-    pub(crate) fn script_commands(
-        &self,
-        runner: impl Fn(&ScriptedCheckRequest<'_>) -> ScriptedCheckOutcome + Send + Sync + 'static,
-    ) {
-        *self
-            .test_command_runner
-            .lock()
-            .expect("test command runner lock is not poisoned") =
-            TestCommandRunner::Custom(Arc::new(runner));
-    }
-
-    /// Return the scripted outcome that replaces a command's process in tests.
-    #[cfg(test)]
-    fn scripted_outcome(
-        &self,
-        request: &ScriptedCheckRequest<'_>,
-    ) -> Result<Option<ScriptedCheckOutcome>> {
-        let runner = self
-            .test_command_runner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("test command runner lock poisoned"))?;
-        Ok(match &*runner {
-            TestCommandRunner::Default => Some(ScriptedCheckOutcome::interpret(request)),
-            TestCommandRunner::Custom(answer) => Some(answer(request)),
-        })
-    }
-
-    /// Record a scripted command's output as a process would, then finish it normally.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    async fn complete_scripted(
-        &self,
-        run: &mut PreparedCheckRun,
-        index: usize,
-        context: super::model::CheckCommand,
-        scoped: bool,
-        outcome: ScriptedCheckOutcome,
-        cancelled: &Arc<CheckCancellation>,
-        external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<()> {
-        if outcome.hold_until_cancelled {
-            cancelled.wait(external_cancelled.cloned()).await;
-        }
-        let killed = outcome.hold_until_cancelled;
-        let combined = format!("{}{}", outcome.stdout, outcome.stderr);
-        tokio::fs::write(&run.commands[index].stdout, outcome.stdout.as_bytes()).await?;
-        tokio::fs::write(&run.commands[index].stderr, outcome.stderr.as_bytes()).await?;
-        tokio::fs::write(&run.commands[index].output, combined.as_bytes()).await?;
-        run.commands[index].output_bytes += combined.len() as u64;
-        append_preview(&mut run.commands[index].preview, combined.as_bytes());
-        self.finish_command(
-            run,
-            index,
-            context,
-            scoped,
-            (!killed).then_some(outcome.exit_code),
-            !killed && outcome.exit_code == 0,
-            killed,
-        )
-        .await
     }
 
     /// Classify a finished command and collect its selection receipt and result report.
@@ -1865,22 +1657,6 @@ impl CheckSupervisor {
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
     )> {
         self.admit_and_launch(run, sink, external_cancelled, None)
-    }
-
-    /// Starts an owned check task without waiting for progress delivery.
-    /// Retains an optional source-work permit until the process is collected.
-    #[cfg(test)]
-    pub(crate) async fn start(
-        self: &Arc<Self>,
-        run: PreparedCheckRun,
-        sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
-        admission: Option<crate::command::ExecutionPermit>,
-    ) -> Result<String> {
-        let (id, _) = self
-            .launch(run, sink, external_cancelled, admission)
-            .await?;
-        Ok(id)
     }
 
     async fn launch(

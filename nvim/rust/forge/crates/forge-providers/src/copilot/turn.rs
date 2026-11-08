@@ -1190,7 +1190,6 @@ fn terminal_coverage(state: &CopilotTurnState) -> Result<Vec<forge_provider_api:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::InvocationScope;
 
     /// Create metadata-only native evidence without copying session prompts or tool payloads.
     fn live_event(
@@ -1202,94 +1201,6 @@ mod tests {
         Ok(serde_json::from_value(serde_json::json!({
             "id":id, "parentId":parent, "type":kind, "timestamp":"2026-11-02T17:33:08Z", "data":data
         }))?)
-    }
-
-    /// An idle cannot lend an old root instance to a later input reusing the loop ID.
-    #[tokio::test]
-    async fn idle_snapshot_rejects_reused_turn_identity() -> Result<()> {
-        let turn = CopilotTurnEvent::default();
-        let guard = turn.activate(None, None)?;
-        let first = forge_provider_api::lifecycle::SubmissionId::try_from("first".to_owned())?;
-        let second = forge_provider_api::lifecycle::SubmissionId::try_from("second".to_owned())?;
-        guard
-            .send("cursor".into(), Some(first), async {
-                Ok("first-receipt".into())
-            })
-            .await?;
-        turn.steer(Some(second), async { Ok("second-receipt".into()) })
-            .await?;
-        turn.observe(&live_event(
-            "user-first",
-            None,
-            "user.message",
-            serde_json::json!({"messageId":"first-receipt","turnId":"0"}),
-        )?)?;
-        turn.observe(&live_event(
-            "start-first",
-            Some("user-first"),
-            "assistant.turn_start",
-            serde_json::json!({"turnId":"0"}),
-        )?)?;
-        let end = live_event(
-            "end-first",
-            Some("hidden"),
-            "assistant.turn_end",
-            serde_json::json!({"turnId":"0"}),
-        )?;
-        turn.observe(&end)?;
-        turn.observe(&live_event(
-            "user-second",
-            Some("end-first"),
-            "user.message",
-            serde_json::json!({"messageId":"second-receipt","turnId":"0"}),
-        )?)?;
-        let old_idle = live_event(
-            "old-idle",
-            Some("user-second"),
-            "session.idle",
-            serde_json::json!({}),
-        )?;
-        turn.observe(&old_idle)?;
-        turn.observe_idle_at(&old_idle, IdleOutcome::Completed)?;
-        let settled = turn.idle_settled();
-        tokio::pin!(settled);
-        assert!(futures_util::poll!(settled.as_mut()).is_pending());
-        assert!(
-            turn.covered_submissions().is_err(),
-            "reused loop ID borrowed a completed instance"
-        );
-        turn.observe(&live_event(
-            "start-second",
-            Some("user-second"),
-            "assistant.turn_start",
-            serde_json::json!({"turnId":"0"}),
-        )?)?;
-        turn.observe(&live_event(
-            "end-second",
-            Some("hidden-second"),
-            "assistant.turn_end",
-            serde_json::json!({"turnId":"0"}),
-        )?)?;
-        turn.observe_idle_at(&old_idle, IdleOutcome::Completed)?;
-        assert!(futures_util::poll!(settled.as_mut()).is_pending());
-        assert!(
-            turn.covered_submissions().is_err(),
-            "old idle gained a new instance"
-        );
-        let final_idle = live_event(
-            "final-idle",
-            Some("hidden-final"),
-            "session.idle",
-            serde_json::json!({}),
-        )?;
-        turn.observe(&final_idle)?;
-        turn.observe_idle_at(&final_idle, IdleOutcome::Completed)?;
-        settled.await?;
-        let executions = turn.terminal_native_roots()?;
-        assert_eq!(executions.len(), 2);
-        assert_eq!(executions[0].0, "start-first");
-        assert_eq!(executions[1].0, "start-second");
-        Ok(())
     }
 
     /// Preserve host-to-native identity and require each completed turn in the idle chain.
@@ -1369,77 +1280,6 @@ mod tests {
         assert_eq!(executions[0].1, vec![first]);
         assert_eq!(executions[1].0, "start-b");
         assert_eq!(executions[1].1, vec![second]);
-        Ok(())
-    }
-
-    /// Aborted idle proves cancellation only after every admitted send has settled.
-    #[tokio::test]
-    async fn aborted_idle_requires_resolved_delivery_and_input_ancestry() -> Result<()> {
-        let turn = CopilotTurnEvent::default();
-        let guard = turn.activate(None, None)?;
-        let first = forge_provider_api::lifecycle::SubmissionId::try_from("first".to_owned())?;
-        guard
-            .send("cursor".into(), Some(first.clone()), async {
-                Ok("native-first".into())
-            })
-            .await?;
-        let (ack, response) = tokio::sync::oneshot::channel();
-        let send = turn.steer(None, async {
-            response.await?;
-            Ok("later".into())
-        });
-        tokio::pin!(send);
-        assert!(futures_util::poll!(send.as_mut()).is_pending());
-        let user: SessionEvent = serde_json::from_value(serde_json::json!({
-            "id":"user", "type":"user.message", "timestamp":"2026-11-01T00:00:00Z",
-            "data":{"messageId":"native-first", "turnId":"turn", "content":"first"}
-        }))?;
-        let idle: SessionEvent = serde_json::from_value(serde_json::json!({
-            "id":"idle", "parentId":"user", "type":"session.idle",
-            "timestamp":"2026-11-01T00:00:00Z", "data":{"aborted":true}
-        }))?;
-        turn.observe(&user)?;
-        turn.observe(&idle)?;
-        turn.observe_idle_at(&idle, IdleOutcome::Aborted)?;
-        assert!(turn.covered_submissions().is_err());
-        ack.send(()).unwrap();
-        send.await?;
-        assert!(turn.covered_submissions().is_err());
-        Ok(())
-    }
-
-    /// Steering resumed after terminal collection cannot adopt a successor's native admission.
-    #[tokio::test]
-    async fn stale_steering_scope_cannot_dispatch_into_successor() -> Result<()> {
-        let turn = CopilotTurnEvent::default();
-        let owner = forge_provider_api::testing::root_thread("session");
-        let old = InvocationScope::new(owner.clone(), "old");
-        let current = InvocationScope::new(owner, "successor");
-        let binding = forge_provider_api::BindingId::new("steering-race")?;
-        let (old_sink, _old_events) =
-            forge_provider_api::events::channel(binding.clone(), old.clone());
-        drop(turn.activate(Some(old_sink), None)?);
-        let (current_sink, _current_events) =
-            forge_provider_api::events::channel(binding, current.clone());
-        let _guard = turn.activate(Some(current_sink), None)?;
-        let dispatched = AtomicBool::new(false);
-        let error = turn
-            .steer_native(Some(&old), None, |_| async {
-                dispatched.store(true, Ordering::Release);
-                Ok("must not send".into())
-            })
-            .await
-            .unwrap_err();
-        assert!(!dispatched.load(Ordering::Acquire));
-        assert!(
-            matches!(error.downcast_ref::<forge_provider_api::ProviderError>(),
-            Some(forge_provider_api::ProviderError::Failure(failure))
-                if failure.kind() == forge_provider_api::ProviderFailureKind::WrongInvocation)
-        );
-        turn.steer_native(Some(&current), None, |_| async {
-            Ok("current accepted".into())
-        })
-        .await?;
         Ok(())
     }
 

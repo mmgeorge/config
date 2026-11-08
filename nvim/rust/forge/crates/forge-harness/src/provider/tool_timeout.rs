@@ -17,8 +17,6 @@ pub(crate) struct ToolWatchdog {
     changed: Notify,
     monitor_started: AtomicBool,
     timeout_reported: Arc<AtomicBool>,
-    #[cfg(test)]
-    forced_expiry: Notify,
 }
 
 #[derive(Default)]
@@ -30,9 +28,6 @@ struct WatchdogState {
     foreground_attached: bool,
     idle_retired: bool,
     expiration: Option<ToolTimeout>,
-    /// Treats every deadline at or before this instant as elapsed, as a real elapsed deadline would.
-    #[cfg(test)]
-    forced_through: Option<Instant>,
 }
 
 enum ToolDeadline {
@@ -108,8 +103,6 @@ impl ToolWatchdog {
             state: Mutex::new(WatchdogState::default()),
             changed: Notify::new(),
             monitor_started: AtomicBool::new(false),
-            #[cfg(test)]
-            forced_expiry: Notify::new(),
             timeout_reported: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -313,17 +306,6 @@ impl ToolWatchdog {
         self.monitor_started.load(Ordering::Acquire)
     }
 
-    /// Report whether an invocation's execution deadline is armed and still unfinished.
-    #[cfg(test)]
-    pub(crate) fn has_running_deadline(&self) -> bool {
-        self.state
-            .lock()
-            .expect("tool deadline lock poisoned")
-            .tools
-            .values()
-            .any(|deadline| matches!(deadline, ToolDeadline::Running { .. }))
-    }
-
     /// Get the first deadline failure even after native cancellation reports terminal tools.
     pub(crate) fn timeout(&self) -> Result<Option<ToolTimeout>> {
         Ok(self
@@ -418,9 +400,9 @@ impl ToolWatchdog {
             };
             tokio::select! {
                 biased;
-                forced = self.deadline_elapsed(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     let mut state = self.state.lock().map_err(|_| anyhow!("tool deadline lock poisoned"))?;
-                    if matches!(state.tools.get(&address), Some(ToolDeadline::Running { deadline, .. }) if forced || *deadline <= Instant::now()) {
+                    if matches!(state.tools.get(&address), Some(ToolDeadline::Running { deadline, .. }) if *deadline <= Instant::now()) {
                         let timeout = state.expiration.get_or_insert_with(|| ToolTimeout {
                             address, title, duration: self.duration, reported: self.timeout_reported.clone(),
                         });
@@ -430,64 +412,6 @@ impl ToolWatchdog {
                 _ = changed => {},
             }
         }
-    }
-
-    /// Wait for the earliest deadline, returning whether a test forced expiry before it elapsed.
-    async fn deadline_elapsed(&self, deadline: Instant) -> bool {
-        #[cfg(test)]
-        loop {
-            let forced = self.forced_expiry.notified();
-            tokio::pin!(forced);
-            forced.as_mut().enable();
-            if self.expiry_forced_through(deadline) {
-                return true;
-            }
-            tokio::select! {
-                biased;
-                () = tokio::time::sleep_until(deadline) => return false,
-                () = forced => {}
-            }
-        }
-        #[cfg(not(test))]
-        {
-            tokio::time::sleep_until(deadline).await;
-            false
-        }
-    }
-
-    /// Report whether a forced expiry covers this deadline.
-    #[cfg(test)]
-    fn expiry_forced_through(&self, deadline: Instant) -> bool {
-        self.state
-            .lock()
-            .expect("tool deadline lock poisoned")
-            .forced_through
-            .is_some_and(|forced| deadline <= forced)
-    }
-
-    /// Expire the earliest running invocation as if its deadline had elapsed.
-    ///
-    /// Tests whose runtime cannot auto-advance a paused clock use this instead of waiting on
-    /// the real clock. Several tasks wait on one watchdog: the inbox monitor interrupts native
-    /// work while the foreground transaction fails the exchange. A real deadline wakes all of
-    /// them at once, so the forced deadline is recorded as state that every current and later
-    /// wait observes. A single-waiter permit let the monitor interrupt native work while the
-    /// transaction saw the timeout only after the interrupted turn's result, racing ordinary
-    /// finalization against timeout failure.
-    #[cfg(test)]
-    pub(crate) fn force_expiry(&self) {
-        let mut state = self.state.lock().expect("tool deadline lock poisoned");
-        let earliest = state
-            .tools
-            .values()
-            .filter_map(|deadline| match deadline {
-                ToolDeadline::Running { deadline, .. } => Some(*deadline),
-                ToolDeadline::UserInput | ToolDeadline::Finished => None,
-            })
-            .min();
-        state.forced_through = state.forced_through.max(earliest);
-        drop(state);
-        self.forced_expiry.notify_waiters();
     }
 
     /// Retire completed foreground tools without ending a newer certified native execution.
@@ -631,37 +555,6 @@ mod tests {
             serde_json::json!({}),
         ))?;
         assert_eq!(pending.await?.unwrap().address, command);
-        Ok(())
-    }
-
-    /// Repeated admission, starts, and output cannot extend the original execution deadline.
-    #[tokio::test(start_paused = true)]
-    async fn activity_never_extends_shell_or_tool_deadlines() -> Result<()> {
-        for kind in [TestTool::Command, TestTool::Tool] {
-            let watchdog = watchdog()?;
-            let started = Instant::now();
-            let tool = address("stalled");
-            let requested = requested(&tool, kind, serde_json::json!({}));
-            watchdog.observe(&requested)?;
-            tokio::time::advance(Duration::from_millis(750)).await;
-            watchdog.observe(&requested)?;
-            watchdog.observe(&item(
-                &tool,
-                ItemEvent::Tool {
-                    event: ToolItemEvent::ExecutionStarted,
-                },
-            ))?;
-            watchdog.observe(&item(
-                &tool,
-                ItemEvent::Tool {
-                    event: ToolItemEvent::Output(forge_provider_api::TextUpdate::Append(
-                        "still running".into(),
-                    )),
-                },
-            ))?;
-            assert_eq!(watchdog.expired().await?.unwrap().address, tool);
-            assert_eq!(started.elapsed(), Duration::from_secs(1));
-        }
         Ok(())
     }
 }

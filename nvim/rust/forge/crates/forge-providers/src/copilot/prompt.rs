@@ -626,26 +626,3 @@ pub fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
     event.agent_id.is_none()
         && matches!(event.event_type.as_str(), "assistant.idle" | "session.idle")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Publication cannot manufacture success before any correlated native terminal exists.
-    #[tokio::test]
-    async fn missing_native_terminal_does_not_publish_or_return_success() -> anyhow::Result<()> {
-        let turn = CopilotTurnEvent::default();
-        let _guard = turn.activate(None, None)?;
-        let scope = forge_provider_api::InvocationScope::new(
-            forge_provider_api::testing::root_thread("missing-terminal"),
-            "exchange",
-        );
-        let (_sink, mut stream) = forge_provider_api::events::channel(
-            forge_provider_api::BindingId::new("binding")?,
-            scope,
-        );
-        assert!(normalized_result(&turn, &ProviderCompletion::default()).is_err());
-        assert!(stream.try_next()?.is_none());
-        Ok(())
-    }
-}

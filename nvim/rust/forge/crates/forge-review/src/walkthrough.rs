@@ -902,6 +902,3 @@ fn validate_input(document: &WalkthroughDocument, input: &DocumentInput) -> Resu
     );
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

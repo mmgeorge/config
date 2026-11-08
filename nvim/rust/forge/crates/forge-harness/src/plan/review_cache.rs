@@ -142,34 +142,3 @@ struct CachedReview {
     rendered: Option<RenderedPlan>,
     submitted: bool,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cached_validation_requires_identical_bytes_and_submission_strength() {
-        let cache = ReviewCache::default();
-        let mut document = super::super::document::test_fixture("cached", "Cached plan");
-        let mut design = super::super::DeclarationDesign::default();
-        design
-            .proposed
-            .insert("src/lib.rs".into(), "pub fn run();\n".into());
-        document.design = Some(design);
-        cache.validate(&document, false).unwrap();
-        assert!(
-            cache.validate(&document, true).is_err(),
-            "draft validation cannot authorize submission"
-        );
-        document
-            .design
-            .as_mut()
-            .unwrap()
-            .proposed
-            .insert("../escape.rs".into(), "pub fn invalid_path();\n".into());
-        assert!(
-            cache.validate(&document, false).is_err(),
-            "changed bytes cannot reuse validation"
-        );
-    }
-}

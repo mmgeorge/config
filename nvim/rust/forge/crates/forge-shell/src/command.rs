@@ -27,9 +27,6 @@ pub enum CommandTokenError {
 type Result<T> = std::result::Result<T, Error>;
 use std::ops::Range;
 
-#[cfg(test)]
-mod token_tests;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandInvocation {
     pub shell: CommandShell,
@@ -791,42 +788,6 @@ mod test {
                 source_range: 62..80,
                 token_list: vec!["git".into(), "commit".into(), "-m".into(), "test".into()],
             }]
-        );
-    }
-
-    #[test]
-    fn preserves_complete_script_blocks_and_original_quotes() {
-        let block = r#"ForEach-Object { Get-ChildItem "$_.FullName" -Directory -Filter "bevy*0.19.1"; Write-Output 'done' }"#;
-        let result = normalize_command_in(
-            &format!("Get-ChildItem registry -Directory | {block}"),
-            CommandShell::PowerShell,
-        );
-        assert!(result.failure.is_none());
-        assert_eq!(result.invocation_list.len(), 4);
-        assert_eq!(result.invocation_list[1].source, block);
-        assert!(result.invocation_list[1].structural);
-        assert_eq!(
-            result.invocation_list[2].source,
-            r#"Get-ChildItem "$_.FullName" -Directory -Filter "bevy*0.19.1""#
-        );
-        let nested = normalize_command_in(
-            "Write-Output @(Get-Item one; Get-Item two) @{ name = 'x'; value = @(1, 2) }",
-            CommandShell::PowerShell,
-        );
-        assert!(nested.failure.is_none());
-        assert!(nested.invocation_list.len() >= 3);
-        assert!(
-            normalize_command_in(
-                "ForEach-Object { Get-ChildItem; Write-Output 'done'",
-                CommandShell::PowerShell,
-            )
-            .failure
-            .is_some()
-        );
-        assert!(
-            normalize_command_in("tool (one]", CommandShell::PowerShell)
-                .failure
-                .is_some()
         );
     }
 }

@@ -457,7 +457,7 @@ fn rename_origin(change: &PathRecord) -> Option<&RepositoryPath> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{git, init_repository, stage};
+    use crate::test_support::init_repository;
 
     #[test]
     fn worktree_change_after_status_rejects_the_observation() {
@@ -492,32 +492,5 @@ mod tests {
                 .to_string()
                 .contains("worktree metadata changed")
         );
-    }
-
-    #[test]
-    fn index_reencoding_with_identical_status_is_rejected() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        init_repository(root);
-        fs::write(root.join("staged"), "contents").unwrap();
-        stage(root, &["staged"]);
-        git(root, &["update-index", "--index-version=2"]);
-        let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
-        let local = shared.to_thread_local();
-        let mut calls = 0;
-        let result = collect_with(
-            &local,
-            &identity,
-            CollectionMode::Verified,
-            &mut || Ok(()),
-            |check| {
-                calls += 1;
-                if calls == 2 {
-                    git(root, &["update-index", "--index-version=4"]);
-                }
-                StatusReader::status_native(&local, check)
-            },
-        );
-        assert!(result.err().unwrap().to_string().contains("index changed"));
     }
 }

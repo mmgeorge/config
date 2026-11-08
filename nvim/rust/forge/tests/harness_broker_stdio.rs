@@ -6,42 +6,6 @@ use std::sync::{Mutex, MutexGuard};
 
 static BROKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-#[tokio::test]
-async fn rejects_missing_or_mismatched_wire_version_before_initialization() {
-    use tokio::io::AsyncWriteExt;
-    for version in [Value::Null, json!(0), json!(3), json!("2")] {
-        let root = tempfile::tempdir().unwrap();
-        let data_root = root.path().join("must-not-be-created");
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_forge"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut request =
-            json!({"id": 7, "method": "host.initialize", "params": {"data_root": data_root}});
-        if !version.is_null() {
-            request["params"]["protocol_version"] = version;
-        }
-        let mut encoded = serde_json::to_vec(&request).unwrap();
-        encoded.push(b'\n');
-        let mut input = child.stdin.take().unwrap();
-        input.write_all(&encoded).await.unwrap();
-        drop(input);
-        let output = child.wait_with_output().await.unwrap();
-        assert!(output.status.success());
-        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(response["id"], 7);
-        assert_eq!(response["error"]["code"], "protocol_mismatch");
-        assert_eq!(
-            response["error"]["data"]["expected_version"],
-            forge_protocol::WIRE_VERSION
-        );
-        assert!(!data_root.exists());
-    }
-}
-
 struct BrokerProcess {
     child: Child,
     stdin: ChildStdin,

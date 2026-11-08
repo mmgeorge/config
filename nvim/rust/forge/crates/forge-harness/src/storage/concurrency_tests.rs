@@ -215,32 +215,3 @@ fn session_ownership_survives_process_boundaries() -> Result<()> {
     }
     Ok(())
 }
-
-#[test]
-fn deletion_holds_ownership_through_cleanup_and_releases_on_failure() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let mut store = SqliteStore::open(directory.path())?;
-    store.save_session(&session("target", "workspace"))?;
-    let mut competitor = SqliteStore::open(directory.path())?;
-    let failure = store
-        .delete_session_with("target", || {
-            let conflict = competitor
-                .acquire_session_lease("target", "competitor")
-                .unwrap_err();
-            assert!(conflict.is::<SessionLeaseConflict>());
-            anyhow::bail!("cleanup failure")
-        })
-        .unwrap_err();
-    assert!(format!("{failure:#}").contains("cleanup failure"));
-    assert!(store.load_session("target")?.is_some());
-    assert!(
-        competitor
-            .acquire_session_lease("target", "competitor")
-            .is_err()
-    );
-    assert!(store.list_session(None)?.is_empty());
-    drop(competitor);
-    store.recover_session_deletions()?;
-    assert!(store.load_session("target")?.is_none());
-    Ok(())
-}

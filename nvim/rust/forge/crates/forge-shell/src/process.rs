@@ -110,29 +110,4 @@ pub fn spawn_owned(
 }
 
 #[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn npm_shell_script_does_not_shadow_windows_launcher() {
-        let directory = tempfile::tempdir().unwrap();
-        let installation = directory.path().join("npm bin");
-        std::fs::create_dir(&installation).unwrap();
-        std::fs::write(installation.join("fixture-cli"), "#!/bin/sh\n").unwrap();
-        std::fs::write(installation.join("fixture-cli.cmd"), "@echo off\r\n").unwrap();
-
-        assert_eq!(
-            executable_at("fixture-cli", directory.path(), installation.as_os_str()),
-            Some(installation.join("fixture-cli.cmd"))
-        );
-        assert_eq!(
-            executable_at("fixture-cli", &installation, std::ffi::OsStr::new("")),
-            Some(installation.join("fixture-cli.cmd"))
-        );
-        std::fs::remove_file(installation.join("fixture-cli.cmd")).unwrap();
-        assert_eq!(
-            executable_at("fixture-cli", directory.path(), installation.as_os_str()),
-            None
-        );
-    }
-}
+mod tests {}

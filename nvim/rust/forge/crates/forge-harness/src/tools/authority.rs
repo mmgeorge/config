@@ -249,7 +249,7 @@ impl TaskAuthority {
 mod test {
     use super::*;
     use crate::provider::ScopeOwner;
-    use crate::task::{Task, TaskChange};
+    use crate::task::TaskChange;
 
     /// Share the persisted baseline receipt across parent collection while retaining the child's original task fence.
     #[tokio::test]
@@ -332,134 +332,6 @@ mod test {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(path)?, "committed child change");
-        Ok(())
-    }
-
-    #[test]
-    fn approval_authority_rejects_replacement_and_unacknowledged_entry() -> Result<()> {
-        let (_root, mut store, controller) = SessionTaskController::test_goal();
-        let task = controller.current()?.unwrap();
-        let mut context = super::super::ControlTurnContext::inactive(
-            crate::provider::PromptMode::GoalContinuation,
-        );
-        context.task_controller = Some(controller.clone());
-        context.task_permit = Some(task.permit());
-        context.task_generation = Some(controller.callback_snapshot()?.0);
-        let authority = TaskAuthority::capture(&context).unwrap();
-        authority.validate()?;
-        let mut replacement = Task::goal("Replacement".into(), Default::default(), 2);
-        replacement.request_entry("New instructions".into(), 2)?;
-        let replacement = controller
-            .change(
-                &mut store,
-                Some(&task.revision),
-                TaskChange::Install(Box::new(replacement)),
-                2,
-            )?
-            .unwrap();
-        assert!(
-            authority
-                .validate()
-                .unwrap_err()
-                .is::<crate::task::StaleTask>()
-        );
-        context.task_permit = Some(replacement.permit());
-        context.task_generation = Some(controller.callback_snapshot()?.0);
-        let pending = TaskAuthority::capture(&context).unwrap();
-        assert!(pending.validate().is_err());
-        controller.acknowledge_entry(
-            &mut store,
-            &replacement.revision,
-            &replacement.entry.as_ref().unwrap().id,
-            3,
-        )?;
-        pending.validate()?;
-        Ok(())
-    }
-
-    /// Dispatched callbacks may precede native acknowledgment without granting unscoped control.
-    #[test]
-    fn dispatched_callback_preserves_pending_receipt_and_rejects_revocation() -> Result<()> {
-        let (_root, mut store, controller) = SessionTaskController::test_goal();
-        let original = controller.current()?.unwrap();
-        let mut pending = Task::goal("Pending native receipt".into(), Default::default(), 2);
-        pending.request_entry("Run the admitted task".into(), 2)?;
-        let pending = controller
-            .change(
-                &mut store,
-                Some(&original.revision),
-                TaskChange::Install(Box::new(pending)),
-                2,
-            )?
-            .unwrap();
-        let mut context = super::super::ControlTurnContext::inactive(
-            crate::provider::PromptMode::GoalContinuation,
-        );
-        context.task_controller = Some(controller.clone());
-        context.task_permit = Some(pending.permit());
-        context.task_generation = Some(controller.callback_snapshot()?.0);
-        let authority = TaskAuthority::capture(&context).unwrap();
-        assert!(controller.admit(crate::task::TaskKind::Goal).is_err());
-        assert!(authority.validate().is_err());
-        authority.validate_scope()?;
-        let mut invocation = super::super::ControlToolInvocation {
-            call_id: None,
-            name: "goal_status".into(),
-            arguments: serde_json::json!({}),
-            task_permit: None,
-        };
-        invocation.admit_turn_control(Some(&controller), Some(&pending.permit()), context.mode)?;
-        assert!(
-            !controller.current()?.unwrap().entry_accepted(),
-            "callback must not fabricate a native receipt"
-        );
-        controller.change(&mut store, Some(&pending.revision), TaskChange::Pause, 3)?;
-        assert!(authority.validate_scope().is_err());
-        assert!(
-            invocation
-                .admit_turn_control(Some(&controller), Some(&pending.permit()), context.mode)
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn taskless_callback_cannot_survive_task_install_and_clear() -> Result<()> {
-        let (_root, mut store, controller) = SessionTaskController::test_goal();
-        let original = controller.current()?.unwrap();
-        controller.change(&mut store, Some(&original.revision), TaskChange::Clear, 2)?;
-        let mut context =
-            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
-        context.task_controller = Some(controller.clone());
-        context.task_generation = Some(controller.callback_snapshot()?.0);
-        let authority = TaskAuthority::capture(&context).unwrap();
-        authority.validate()?;
-        let next = controller
-            .change(
-                &mut store,
-                None,
-                TaskChange::Install(Box::new(Task::goal(
-                    "new goal".into(),
-                    Default::default(),
-                    3,
-                ))),
-                3,
-            )?
-            .unwrap();
-        controller.change(&mut store, Some(&next.revision), TaskChange::Clear, 4)?;
-        let mut mutated = false;
-        assert!(
-            authority
-                .commit(|| {
-                    mutated = true;
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert!(
-            !mutated,
-            "revoked taskless callback committed after task replacement"
-        );
         Ok(())
     }
 

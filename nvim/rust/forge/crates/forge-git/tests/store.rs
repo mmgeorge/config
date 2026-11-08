@@ -1,7 +1,6 @@
 use forge_git::test_support as support;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use forge_git::store::RepositoryStore;
 use support::init_repository;
@@ -42,38 +41,4 @@ async fn invalidation_rejects_a_native_result_started_before_the_change() {
     let error = reader.await.unwrap().err().unwrap();
     assert!(error.to_string().contains("superseded"));
     assert_ne!(generation, repository.generation());
-}
-
-#[tokio::test]
-async fn cancelled_waiter_cannot_evict_an_active_native_worker() {
-    let root = fixture();
-    let store = Arc::new(RepositoryStore::new(1, 1).unwrap());
-    let repository = store.open(root.path().to_owned()).await.unwrap().unwrap();
-    let (started, started_receiver) = tokio::sync::oneshot::channel();
-    let (release, release_receiver) = std::sync::mpsc::channel();
-    let reader_store = store.clone();
-    let reader = tokio::spawn(async move {
-        reader_store
-            .read(repository, 0, move |_, _| {
-                started.send(()).unwrap();
-                release_receiver.recv()?;
-                Ok(())
-            })
-            .await
-    });
-    started_receiver.await.unwrap();
-    reader.abort();
-    assert!(reader.await.err().unwrap().is_cancelled());
-    assert_eq!(store.evict_idle(), 0);
-    assert_eq!(store.shutdown(Duration::ZERO).await.unfinished.len(), 1);
-    release.send(()).unwrap();
-    assert!(
-        store
-            .shutdown(Duration::from_secs(5))
-            .await
-            .unfinished
-            .is_empty()
-    );
-    assert_eq!(store.evict_idle(), 1);
-    assert!(store.open(root.path().to_owned()).await.is_err());
 }

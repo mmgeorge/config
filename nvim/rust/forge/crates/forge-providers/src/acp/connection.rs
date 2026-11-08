@@ -120,8 +120,6 @@ pub(super) struct AcpCleanup {
     parent: Option<Arc<std::sync::Mutex<Vec<AcpResource>>>>,
     admission: Arc<std::sync::atomic::AtomicBool>,
     parent_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(test)]
-    injected_collection_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for AcpCleanup {
@@ -131,8 +129,6 @@ impl Default for AcpCleanup {
             parent: None,
             admission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             parent_admission: None,
-            #[cfg(test)]
-            injected_collection_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -150,8 +146,6 @@ impl AcpCleanup {
                     .unwrap_or(&self.admission)
                     .clone(),
             ),
-            #[cfg(test)]
-            injected_collection_failures: self.injected_collection_failures.clone(),
         }
     }
 
@@ -164,8 +158,6 @@ impl AcpCleanup {
             path: profile.path().to_owned(),
             profile: Mutex::new(Some(profile)),
             collected: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            injected_failures: std::sync::atomic::AtomicUsize::new(0),
         });
         self.retain(AcpResource::Profile(profile.clone()));
         profile
@@ -307,8 +299,6 @@ pub(super) struct AcpProfile {
     path: std::path::PathBuf,
     profile: Mutex<Option<crate::profile::ResourceProfile>>,
     collected: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    injected_failures: std::sync::atomic::AtomicUsize,
 }
 
 impl AcpProfile {
@@ -323,24 +313,6 @@ impl AcpProfile {
         operation: forge_provider_api::ProviderOperation,
     ) -> Result<(), forge_provider_api::ProviderError> {
         let mut profile = self.profile.lock().await;
-        #[cfg(test)]
-        if self
-            .injected_failures
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(forge_provider_api::ProviderFailure::new(
-                operation,
-                forge_provider_api::ProviderFailureKind::Runtime,
-            )
-            .at_phase(
-                forge_provider_api::ProviderPhase::Collection,
-                forge_provider_api::FailureDisposition::Invalidated,
-            )
-            .into());
-        }
         if let Some(profile) = profile.as_mut() {
             profile
                 .close()
@@ -381,8 +353,6 @@ struct AcpTransportResources {
     state: Mutex<TransportState>,
     first_failure: Mutex<Option<forge_provider_api::ProviderError>>,
     collected: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    injected_failures: std::sync::atomic::AtomicUsize,
 }
 
 struct TransportState {
@@ -394,19 +364,6 @@ struct TransportState {
 impl AcpTransportResources {
     /// Collect independent native phases while retaining handles for cancellation and retry.
     async fn shutdown(&self) -> Result<(), AcpConnectionError> {
-        #[cfg(test)]
-        if self
-            .injected_failures
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(AcpConnectionError::Collection {
-                process: Some(std::io::Error::other("injected process collection failure")),
-                reader: None,
-            });
-        }
         let mut state = self.state.lock().await;
         let process_failure = if state.process_collected {
             None
@@ -590,12 +547,6 @@ impl AcpConnection {
             }),
             first_failure: Mutex::new(None),
             collected: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            injected_failures: std::sync::atomic::AtomicUsize::new(
-                cleanup
-                    .injected_collection_failures
-                    .swap(0, Ordering::AcqRel),
-            ),
         });
         cleanup.retain(AcpResource::Native(resources.clone()));
         let mut retained = resources.state.lock().await;

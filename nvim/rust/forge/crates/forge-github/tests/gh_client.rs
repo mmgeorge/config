@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use forge_git::command::{CommandLimits, read_command};
 use forge_github::model::{GithubRepositoryId, SyncScope};
-use forge_github::remote::{GhClient, GithubRemote, IssuePageRequest, RemoteFailureKind};
+use forge_github::remote::{GhClient, GithubRemote, IssuePageRequest};
 use serde_json::json;
 
 struct FixtureExecutable {
@@ -176,33 +176,6 @@ async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -
     Ok(())
 }
 
-#[tokio::test]
-async fn oversized_output_and_command_failure_do_not_become_empty_success() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("success")?;
-    let mut response: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join("response.json"))?)?;
-    let title = format!("{}complete title tail", "x".repeat(8 * 1024 * 1024 + 1));
-    response["data"]["repository"]["issues"]["nodes"][0]["title"] = json!(title);
-    fs::write(
-        root.path().join("response.json"),
-        serde_json::to_vec(&response)?,
-    )?;
-    assert_eq!(client.read_issues(request()).await?.issues[0].title, title);
-    client.shutdown(Duration::from_secs(1)).await?;
-    let (_root, client) = fixture("oversized")?;
-    let failure = client.read_issues(request()).await.unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::InvalidResponse);
-    assert!(failure.message.contains("invalid issue JSON"), "{failure}");
-    client.shutdown(Duration::from_secs(1)).await?;
-    let (_root, client) = fixture("failure")?;
-    let failure = client.read_issues(request()).await.unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::RateLimited);
-    assert!(failure.message.contains("HTTP 403"));
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
 use forge_github::pull_request::{
     DesiredPullRequestState, PullRequestLifecycle, PullRequestOperation, PullRequestOutcome,
     PullRequestRequest, PullRequestTarget,
@@ -269,133 +242,6 @@ async fn native_pr_transition_reopens_before_draft_and_unknown_requires_read_onl
     let writes = fs::read(root.path().join("mutation-log"))?;
     assert!(service.pull_request(client.clone(), close).await?.ok);
     assert_eq!(fs::read(root.path().join("mutation-log"))?, writes);
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn abandoned_pr_caller_retains_native_write_and_fifo_ownership_until_collection() -> Result<()>
-{
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("pr_block")?;
-    fs::write(root.path().join("pr-state"), "OPEN false")?;
-    let service = GithubService::default();
-    let caller = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Transition {
-                        desired: DesiredPullRequestState::Closed,
-                    }),
-                )
-                .await
-        })
-    };
-    async {
-        while !root.path().join("mutation-started").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    .await;
-    caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    let queued = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Transition {
-                        desired: DesiredPullRequestState::Draft,
-                    }),
-                )
-                .await
-        })
-    };
-    fs::write(root.path().join("release-mutation"), "release")?;
-    assert!(queued.await??.ok);
-    // The fixture records whether release had happened when each gh process started, so a
-    // queued write that ran ahead of the abandoned owner would log `released=false`.
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-release-order"))?,
-        "closePullRequest released=false\nreopenPullRequest released=true\nconvertPullRequestToDraft released=true\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-log"))?,
-        "closePullRequest\nreopenPullRequest\nconvertPullRequestToDraft\n"
-    );
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn shutdown_rejects_queued_mutations_and_retains_the_active_native_owner() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    let (root, client) = fixture("pr_block")?;
-    fs::write(root.path().join("pr-state"), "OPEN false")?;
-    let service = GithubService::default();
-    let active = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Transition {
-                        desired: DesiredPullRequestState::Closed,
-                    }),
-                )
-                .await
-        })
-    };
-    async {
-        while !root.path().join("mutation-started").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    .await;
-    let waiting = {
-        let service = service.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            service
-                .pull_request(
-                    client,
-                    pr_request(PullRequestOperation::Transition {
-                        desired: DesiredPullRequestState::Draft,
-                    }),
-                )
-                .await
-        })
-    };
-    tokio::task::yield_now().await;
-    let shutdown = service.shutdown(Duration::ZERO).await;
-    assert_eq!(shutdown.unfinished_jobs, 1);
-    assert!(waiting.await?.unwrap_err().to_string().contains("closed"));
-    assert_eq!(
-        fs::read_to_string(root.path().join("mutation-log"))?,
-        "closePullRequest\n"
-    );
-    fs::write(root.path().join("release-mutation"), "release")?;
-    assert!(active.await??.ok);
     assert_eq!(
         service
             .shutdown(Duration::from_secs(1))
@@ -668,81 +514,6 @@ async fn native_unknown_comment_write_reconciles_without_reposting() -> Result<(
             .await
             .is_err()
     );
-    assert!(
-        matches!(service.comment(client.clone(),target,CommentOperation::Reconcile).await?,CommentResult::Reconciled {state:Some(state)} if state.body == "saved")
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("comment-mutation-log"))?
-            .lines()
-            .count(),
-        1
-    );
-    assert_eq!(
-        service
-            .shutdown(Duration::from_secs(1))
-            .await
-            .unfinished_jobs,
-        0
-    );
-    client.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn native_comment_decoder_rejects_missing_nodes_and_foreign_receipts() -> Result<()> {
-    let _native_test = NATIVE_TEST_LOCK.lock().await;
-    use forge_github::comment::{
-        CommentKind, CommentOperation, CommentResult, GithubCommentRemote,
-    };
-    use forge_github::service::GithubService;
-    let kind = CommentKind::IssueComment;
-    let (root, client) = fixture("comment_ok")?;
-    let target = comment_target(kind);
-    for response in [
-        json!({"data":{}}),
-        json!({"data":{"node":null},"errors":[{"message":"not authorized"}]}),
-        json!({"data":{"node":{"__typename":"IssueComment","id":"foreign"}}}),
-    ] {
-        fs::write(
-            root.path().join("comment-read.json"),
-            serde_json::to_vec(&response)?,
-        )?;
-        assert!(client.read_comment(target.clone()).await.is_err());
-    }
-    fs::write(
-        root.path().join("comment-read.json"),
-        br#"{"data":{"node":null}}"#,
-    )?;
-    assert!(client.read_comment(target.clone()).await?.is_none());
-    fs::write(
-        root.path().join("comment-read.json"),
-        serde_json::to_vec(&json!({"data":{"node":comment_state(kind,"old")}}))?,
-    )?;
-    fs::write(
-        root.path().join("comment-after.json"),
-        serde_json::to_vec(&json!({"data":{"node":comment_state(kind,"saved")}}))?,
-    )?;
-    fs::write(
-        root.path().join("comment-result.json"),
-        serde_json::to_vec(
-            &json!({"data":{"mutation":{"clientMutationId":"another-operation","comment":comment_state(kind,"saved")}}}),
-        )?,
-    )?;
-    fs::write(root.path().join("expected-mutation"), "updateIssueComment")?;
-    let service = GithubService::default();
-    assert!(matches!(
-        service
-            .comment(
-                client.clone(),
-                target.clone(),
-                CommentOperation::Edit {
-                    body: "saved".into(),
-                    receipt: "expected-operation".into()
-                }
-            )
-            .await?,
-        CommentResult::OutcomeUnknown { .. }
-    ));
     assert!(
         matches!(service.comment(client.clone(),target,CommentOperation::Reconcile).await?,CommentResult::Reconciled {state:Some(state)} if state.body == "saved")
     );

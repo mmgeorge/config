@@ -78,8 +78,6 @@ pub(super) struct SectionProjection {
     quota: HashMap<String, PageQuota>,
     entry_sections: HashMap<String, Vec<String>>,
     pending: HashSet<String>,
-    #[cfg(test)]
-    pub projected_entries: usize,
 }
 
 struct ToolBodyChange {
@@ -132,8 +130,6 @@ impl SectionProjection {
             quota: HashMap::new(),
             entry_sections,
             pending: HashSet::new(),
-            #[cfg(test)]
-            projected_entries: 0,
         };
         source.dirty.clear();
         source.block_dirty.clear();
@@ -295,10 +291,6 @@ impl SectionProjection {
         for id in &dirty {
             if source.entry_position(id).is_none() {
                 continue;
-            }
-            #[cfg(test)]
-            {
-                self.projected_entries += 1;
             }
             let original = source.source_entry(id)?;
             for block in &original.block {
@@ -579,11 +571,6 @@ impl SectionProjection {
                 .blocks(document.document.revision(), start..end + 1)?
                 .collect(),
         })
-    }
-
-    #[cfg(test)]
-    pub fn quota_for_test(&mut self, id: &str, bytes: usize) {
-        self.quota.insert(id.into(), PageQuota::bytes(bytes));
     }
 
     /// Drops intent only when a canonical entry is deleted, not when the scope changes.

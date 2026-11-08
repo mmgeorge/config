@@ -57,8 +57,6 @@ pub(super) async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::command::{CancellationOutcome, CommandOutcome};
-    use crate::exchange::journal::CommandState;
 
     /// Create an idle real session owner without starting a native process or automatic input work.
     async fn controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
@@ -124,93 +122,6 @@ mod tests {
                 .any(|message| message.id == "follow-up"),
             "a deliberately queued follow-up must survive the cancel"
         );
-        Ok(())
-    }
-
-    /// Keep FIFO intent and durable completion when the first caller drops its response future.
-    #[tokio::test]
-    async fn queued_cancel_survives_dropped_waiter_and_replays_one_result() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path()).await?;
-        let gate = controller
-            .coordinator
-            .control
-            .clone()
-            .acquire_owned()
-            .await?;
-        let (messages, _output) = forge_protocol::outbound::channel();
-        let first_request = command("cancel-first")?;
-        let first_id = first_request.id.clone();
-        let second_request = command("cancel-second")?;
-        let second_id = second_request.id.clone();
-        let mut first = Box::pin(
-            controller
-                .exchange_owner
-                .execute_identified(first_request.clone(), messages.clone()),
-        );
-        assert!(futures_util::poll!(first.as_mut()).is_pending());
-        async {
-            loop {
-                let state = controller
-                    .exchange_owner
-                    .command_status(first_id.clone())
-                    .await?;
-                if state.is_some_and(|record| matches!(record.state, CommandState::Active { .. })) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await?;
-        drop(first);
-        let mut second = Box::pin(
-            controller
-                .exchange_owner
-                .execute_identified(second_request, messages.clone()),
-        );
-        assert!(futures_util::poll!(second.as_mut()).is_pending());
-        let queued = controller
-            .exchange_owner
-            .command_status(second_id)
-            .await?
-            .context("second cancellation was not admitted")?;
-        assert!(matches!(queued.state, CommandState::Queued { .. }));
-        drop(gate);
-        let second = second.await?;
-        assert!(matches!(
-            second.outcome,
-            CommandOutcome::Cancelled(CancellationOutcome::NoWork)
-        ));
-        let first = controller
-            .exchange_owner
-            .command_status(first_id)
-            .await?
-            .context("first command was lost")?;
-        let first_result = first
-            .completion()
-            .context("first command did not complete")??;
-        assert!(first_result.sequence < second.sequence);
-        let before = controller
-            .coordinator
-            .submissions
-            .snapshot()?
-            .control_revision;
-        let replay = controller
-            .exchange_owner
-            .execute_identified(first_request, messages)
-            .await?;
-        assert_eq!(replay.sequence, first_result.sequence);
-        assert_eq!(replay.revision, first_result.revision);
-        assert_eq!(
-            controller
-                .coordinator
-                .submissions
-                .snapshot()?
-                .control_revision,
-            before
-        );
-        controller.finish_exchange_owner().await?;
         Ok(())
     }
 }

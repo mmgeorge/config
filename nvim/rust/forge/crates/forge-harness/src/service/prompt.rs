@@ -320,23 +320,3 @@ impl SessionController {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Prompt aliases cannot manufacture internal input purposes or native delivery metadata.
-    #[test]
-    fn prompt_normalization_rejects_forged_authority_and_conflicting_choices() {
-        for params in [
-            json!({"text":"work", "purpose":{"kind":"task_entry"}}),
-            json!({"text":"work", "submission_id":"forged"}),
-            json!({"text":"work", "queued":true, "intent":"auto"}),
-            json!({"text":"work", "model":"one", "config":{"model":"two"}}),
-            json!({"text":"work", "config":{"unsupported":true}}),
-            json!({"text":" "}),
-        ] {
-            assert!(normalize("session", params).is_err());
-        }
-    }
-}

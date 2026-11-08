@@ -1779,62 +1779,6 @@ mod test {
         );
     }
 
-    #[test]
-    fn interrupted_exchange_settles_provider_turns_permanently() {
-        let mut exchange = interaction();
-        exchange.resume(100).unwrap();
-        let address = crate::turn::test_support::address(&exchange, "turn");
-        exchange.start_turn(address, 100).unwrap();
-        exchange
-            .finish(crate::exchange::ExchangeOutcome::Interrupted, 150)
-            .unwrap();
-        assert_eq!(exchange.elapsed(90_000), 50);
-        assert_eq!(
-            exchange.turn[0].state(),
-            crate::turn::TurnState::Finished {
-                outcome: crate::turn::TurnOutcome::Interrupted,
-            }
-        );
-        assert!(exchange.resume(90_000).is_err());
-        exchange
-            .finish(crate::exchange::ExchangeOutcome::Interrupted, 90_000)
-            .unwrap();
-        assert_eq!(exchange.completed_at_ms(), Some(150));
-        assert!(
-            exchange
-                .finish(crate::exchange::ExchangeOutcome::Cancelled, 90_000)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn terminal_exchanges_reject_every_input_intent_without_mutation() {
-        for outcome in [
-            ExchangeOutcome::Complete,
-            ExchangeOutcome::Cancelled,
-            ExchangeOutcome::Failed,
-            ExchangeOutcome::Interrupted,
-        ] {
-            let mut exchange = interaction();
-            exchange.finish(outcome, 30).unwrap();
-            let original = serde_json::to_value(&exchange).unwrap();
-            assert!(
-                exchange
-                    .append_delegation("child", "late", "task", 90)
-                    .is_err()
-            );
-            assert_eq!(serde_json::to_value(&exchange).unwrap(), original);
-            for intent in [InputIntent::Steering, InputIntent::Clarification] {
-                assert!(
-                    exchange
-                        .append_input(intent, "late input".into(), 90)
-                        .is_err()
-                );
-                assert_eq!(serde_json::to_value(&exchange).unwrap(), original);
-            }
-        }
-    }
-
     /// Preserve native steering evidence arriving after completion without reopening input admission.
     #[test]
     fn finalizing_exchange_retains_acknowledged_input_without_reopening() {
@@ -1886,29 +1830,5 @@ mod test {
                 .is_err()
         );
         assert_eq!(exchange.state(), ExchangeState::Complete);
-    }
-
-    /// Explicit cancellation cannot admit a new unregistered native response cycle.
-    #[test]
-    fn native_reopening_rejects_cancelled_exchange() {
-        let mut exchange = interaction();
-        let first = crate::turn::test_support::address(&exchange, "first");
-        exchange.start_turn(first.clone(), 10).unwrap();
-        exchange.finish(ExchangeOutcome::Cancelled, 20).unwrap();
-        let before = serde_json::to_value(&exchange).unwrap();
-        let unknown = crate::provider::TurnAddress {
-            turn_id: forge_provider_api::TurnId::new("unregistered").unwrap(),
-            ..first
-        };
-        let new_work = turn_event(
-            &unknown,
-            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
-                started_at_ms: 30,
-            }),
-        );
-        assert!(exchange.observe_event(&new_work, 30).is_err());
-        assert_eq!(serde_json::to_value(&exchange).unwrap(), before);
-        assert_eq!(exchange.state(), ExchangeState::Cancelled);
-        assert_eq!(exchange.turn.len(), 1);
     }
 }

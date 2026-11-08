@@ -369,25 +369,3 @@ pub fn channel(scope: impl Into<EventScope>) -> (HarnessEventSink, HarnessEventS
         HarnessEventStream { receiver },
     )
 }
-
-/// Build a direct native-child accounting intake from an actual ownership-registry proof.
-#[cfg(test)]
-pub(crate) fn observed_file_sink_fixture(
-    association: &super::ObservedAgentAssociation,
-) -> Result<
-    (
-        HarnessEventSink,
-        tokio::sync::mpsc::UnboundedReceiver<
-            Result<super::bridge::ProviderObservation, EventDeliveryError>,
-        >,
-    ),
-    EventDeliveryError,
-> {
-    let scope = association
-        .turn()
-        .ok_or(EventDeliveryError::InvalidTransportData)?;
-    let (parent, _) = channel(association.parent().clone());
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let sink = parent.observed_invocation_sink(scope, association.binding_id().clone(), sender)?;
-    Ok((sink, receiver))
-}

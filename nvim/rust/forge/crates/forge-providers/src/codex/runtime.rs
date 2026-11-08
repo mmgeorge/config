@@ -64,8 +64,6 @@ pub struct CodexRuntime {
     server: Mutex<Option<CodexAppServer>>,
     start_count: AtomicU64,
     closed: AtomicBool,
-    #[cfg(test)]
-    fixture_endpoint: Option<String>,
 }
 
 impl CodexRuntime {
@@ -77,8 +75,6 @@ impl CodexRuntime {
             server: Mutex::new(None),
             start_count: AtomicU64::new(0),
             closed: AtomicBool::new(false),
-            #[cfg(test)]
-            fixture_endpoint: None,
         }
     }
 
@@ -96,12 +92,6 @@ impl CodexRuntime {
             !self.closed.load(Ordering::Acquire),
             "shared Codex runtime is shut down"
         );
-        #[cfg(test)]
-        if let Some(endpoint) = &self.fixture_endpoint {
-            return CodexConnection::connect(endpoint)
-                .await
-                .map_err(anyhow::Error::from);
-        }
         let running = match server.as_mut() {
             Some(server) => server.child.try_wait()?.is_none(),
             None => false,

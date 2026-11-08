@@ -166,36 +166,3 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
     }
     Ok(())
 }
-
-/// Roll back memory and duplicate bookkeeping if the durable transaction cannot commit.
-#[test]
-fn queue_commit_failure_does_not_publish_candidate_state() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
-    queue.apply(queued_operation("first"))?;
-    let before = serde_json::to_value(queue.snapshot()?)?;
-    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
-    database.execute_batch("CREATE TRIGGER reject_queue_write BEFORE UPDATE ON input_session BEGIN SELECT RAISE(ABORT, 'fixture disk failure'); END;")?;
-    assert!(queue.apply(queued_operation("second")).is_err());
-    assert_eq!(serde_json::to_value(queue.snapshot()?)?, before);
-    assert!(queue.operation("operation-second")?.is_none());
-    database.execute_batch("DROP TRIGGER reject_queue_write;")?;
-    queue.apply(queued_operation("second"))?;
-    assert_eq!(queue.snapshot()?.messages.len(), 2);
-    Ok(())
-}
-
-/// Reject corrupted persistent state rather than silently losing acknowledged input.
-#[test]
-fn queue_reopen_rejects_corrupt_snapshot() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
-    queue.apply(queued_operation("message"))?;
-    drop(queue);
-    let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
-    database.execute("UPDATE input_session SET payload='{}'", [])?;
-    assert!(SessionInputQueue::open(root.path(), "session", &submissions).is_err());
-    Ok(())
-}

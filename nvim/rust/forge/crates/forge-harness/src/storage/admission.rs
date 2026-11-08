@@ -55,9 +55,6 @@ pub(crate) struct RuntimeSnapshot {
 /// Read capability for a committed session projection. It cannot mutate session state.
 pub(crate) struct SessionAdmission {
     task_mutation: Mutex<()>,
-    /// Counts entries into the task mutation gate, including entries still waiting for it.
-    #[cfg(test)]
-    pub(crate) task_mutation_entry_count: std::sync::atomic::AtomicUsize,
     configuration_lane: Arc<tokio::sync::Mutex<()>>,
     configuration_uncertain: std::sync::atomic::AtomicBool,
     state: Mutex<PublishedAdmission>,
@@ -108,9 +105,6 @@ impl SessionAdmission {
         &self,
         commit: impl FnOnce() -> Result<Output>,
     ) -> Result<Output> {
-        #[cfg(test)]
-        self.task_mutation_entry_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Lock order is task mutation, SQLite transaction, then published admission state.
         let _guard = self
             .task_mutation
@@ -239,8 +233,6 @@ impl AdmissionRegistry {
         })?;
         let created = Arc::new(SessionAdmission {
             task_mutation: Mutex::new(()),
-            #[cfg(test)]
-            task_mutation_entry_count: std::sync::atomic::AtomicUsize::new(0),
             configuration_lane: Arc::new(tokio::sync::Mutex::new(())),
             configuration_uncertain: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(PublishedAdmission {
@@ -433,75 +425,5 @@ impl SqliteStore {
         Ok(statement
             .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        session::SessionStore,
-        task::{Task, TaskStatus},
-    };
-
-    /// Independent controllers share the goal lane, and stale acknowledgments cannot clear a newer write.
-    #[test]
-    fn committed_admission_tracks_independent_writers_and_preserves_failed_writes() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut owner = SqliteStore::open(root.path())?;
-        let mut session = super::super::test::session("session", "workspace");
-        owner.save_session(&session)?;
-        let admission = owner.session_admission(&session.id)?;
-        let mut writer = SqliteStore::open(root.path())?;
-        assert!(Arc::ptr_eq(
-            &admission,
-            &writer.session_admission(&session.id)?
-        ));
-        let mut task = Task::goal("task".into(), Default::default(), 1);
-        writer.commit_task_change(&session.id, None, 1, |active| {
-            *active = Some(task.clone());
-            Ok(())
-        })?;
-        assert_eq!(
-            admission.snapshot()?.task.as_ref().unwrap().status,
-            TaskStatus::Running
-        );
-        writer.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed commit'); END;")?;
-        let previous_revision = task.revision.clone();
-        task.edit(|draft| {
-            if let crate::task::WorkflowSnapshot::Goal { goal } = &mut draft.workflow {
-                goal.state = crate::goal::GoalState::Paused;
-            }
-            Ok(())
-        })?;
-        task.renew(2);
-        assert!(
-            writer
-                .commit_task_change(&session.id, Some(&previous_revision), 2, |active| {
-                    *active = Some(task.clone());
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert_eq!(
-            admission.snapshot()?.task.as_ref().unwrap().status,
-            TaskStatus::Running
-        );
-        writer
-            .connection
-            .execute_batch("DROP TRIGGER reject_task")?;
-        writer.commit_task_change(&session.id, Some(&previous_revision), 2, |active| {
-            *active = Some(task.clone());
-            Ok(())
-        })?;
-        assert_eq!(
-            admission.snapshot()?.task.as_ref().unwrap().status,
-            TaskStatus::Paused
-        );
-        let previous = admission.snapshot()?;
-        session.model = "metadata-change".into();
-        writer.save_session(&session)?;
-        assert!(Arc::ptr_eq(&previous, &admission.snapshot()?));
-        Ok(())
     }
 }

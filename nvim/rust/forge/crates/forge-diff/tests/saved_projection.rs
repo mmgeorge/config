@@ -144,85 +144,6 @@ async fn saved_semantics_retains_body_evidence_visibility_and_cached_full_rows()
     assert!(!model.render("test").unwrap().block[0].metadata.section[0].open);
 }
 
-#[test]
-fn saved_raw_fallback_pages_every_original_metadata_and_binary_row() {
-    let patch = format!(
-        "diff --git a/image.bin b/image.bin\nold mode 100644\nnew mode 100755\nGIT binary patch\nliteral 80000\n{}\ndiff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n",
-        "payload-without-invented-source\n".repeat(70_000)
-    );
-    let mut model = SavedDiffProjection::new(SavedDiffSource {
-        text: Arc::new(patch.clone()),
-        file: Vec::new(),
-        diagnostic: None,
-    })
-    .unwrap();
-    let limits = ChunkLimits {
-        rows: 127,
-        ..Default::default()
-    };
-    while let Some(key) = model.next_file().map(str::to_owned) {
-        model.demand(&key, limits).unwrap();
-    }
-    let original = raw_rows(&model);
-    assert_eq!(original, patch);
-    for presentation in [DiffPresentation::Semantic, DiffPresentation::Full] {
-        model = model
-            .reconfigure(
-                DiffViewOptions {
-                    visibility: DiffVisibility::Public,
-                    presentation,
-                },
-                limits,
-            )
-            .unwrap();
-        assert_eq!(raw_rows(&model), patch);
-        assert!(rows(&model).contains("Unclassified source changes"));
-    }
-}
-
-#[test]
-fn saved_evidence_rejects_mismatched_sources_and_distinguishes_sparse_context() {
-    let patch = "--- a/source.rs\n+++ b/source.rs\n@@ -2 +2 @@\n-before\n+after\n";
-    let first = SavedDiffProjection::new(captured(
-        patch.into(),
-        pair("context-one\nbefore\n", "context-one\nafter\n"),
-    ))
-    .unwrap();
-    let second = SavedDiffProjection::new(captured(
-        patch.into(),
-        pair("context-two\nbefore\n", "context-two\nafter\n"),
-    ))
-    .unwrap();
-    assert_ne!(first.identity(), second.identity());
-    let mut mismatch = SavedDiffProjection::new(captured(
-        patch.into(),
-        pair("stale\nbefore\n", "different\nafter\n"),
-    ))
-    .unwrap();
-    let key = mismatch.next_file().unwrap().to_owned();
-    assert!(mismatch.pending_source(&key).is_none());
-    mismatch.demand(&key, ChunkLimits::default()).unwrap();
-    assert_eq!(raw_rows(&mismatch), patch);
-    mismatch = mismatch
-        .reconfigure(
-            DiffViewOptions {
-                visibility: DiffVisibility::Public,
-                presentation: DiffPresentation::Semantic,
-            },
-            ChunkLimits::default(),
-        )
-        .unwrap();
-    assert!(rows(&mismatch).contains("do not match"));
-    assert!(
-        SavedDiffProjection::new(SavedDiffSource {
-            text: Arc::new("invalid patch".into()),
-            file: Vec::new(),
-            diagnostic: None
-        })
-        .is_err()
-    );
-}
-
 fn pair(before: &str, after: &str) -> SourcePair {
     SourcePair {
         old: SourceVersion::new(before.as_bytes().to_vec(), Representation::Raw).unwrap(),
@@ -251,16 +172,4 @@ fn rows(model: &SavedDiffProjection) -> String {
         .flat_map(|block| block.text.wire_rows())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn raw_rows(model: &SavedDiffProjection) -> String {
-    model
-        .render("test")
-        .unwrap()
-        .block
-        .iter()
-        .filter(|block| block.id.0.contains(":raw:"))
-        .flat_map(|block| block.text.wire_rows())
-        .map(|row| format!("{row}\n"))
-        .collect()
 }

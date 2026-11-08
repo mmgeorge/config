@@ -673,6 +673,3 @@ fn gap_text(rows: &[DiffRow<'_>], gap: &[usize]) -> String {
         .count();
     format!("  ... {} lines (+{added} -{removed})\n", gap.len())
 }
-
-#[cfg(test)]
-mod tests;

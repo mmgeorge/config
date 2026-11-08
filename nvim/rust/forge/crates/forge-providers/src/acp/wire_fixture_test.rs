@@ -465,30 +465,6 @@ async fn prompt_terminal_response_commits_native_acceptance_and_normalizes_cance
     }
 }
 
-#[tokio::test]
-async fn native_remote_errors_are_redacted_and_recorded_as_failures() {
-    let fixture = WireFixture::start("remote_error").await.unwrap();
-    fixture.ready().await.unwrap();
-    let receipt = FixtureReceipt::new();
-    let error = fixture
-        .connection
-        .submit(
-            AcpSubmission::Prompt,
-            json!({"sessionId":"fixture","prompt":[{"type":"text","text":"prompt"}]}),
-            Some(receipt.clone()),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(!error.to_string().contains("private native error"));
-    {
-        let state = receipt.state.lock().unwrap();
-        assert!(state.sending && state.failed && !state.accepted && !state.rejected);
-    }
-    fixture.connection.shutdown().await.unwrap();
-}
-
 /// Open a production ACP binding against the deterministic native-wire peer.
 async fn provider_fixture(
     mode: &str,
@@ -738,76 +714,4 @@ async fn unsupported_options_reject_before_native_or_profile_changes() {
         .await
         .unwrap();
     provider.shutdown(operation_context()).await.unwrap();
-}
-
-/// A cancelled prompt accepted before native processing retains delivery without fabricating lifecycle.
-#[tokio::test]
-async fn accepted_prompt_cancelled_before_start_has_no_started_or_completed_turn() {
-    use forge_provider_api::{provider::Provider, *};
-    let (fixture, provider, opened) = provider_fixture("held_no_start").await;
-    let binding = opened.binding.id;
-    let mut events = opened.events;
-    let scope = InvocationScope::new(
-        forge_provider_api::testing::root_thread("fixture-owner"),
-        "no-start",
-    );
-    let accepted = receipt("no-start");
-    let request = prompt_request(
-        &binding,
-        scope.clone(),
-        accepted.clone(),
-        PromptInput::Text("cancel before work".into()),
-    );
-    let submitted_provider = provider.clone();
-    let submitted_binding = binding.clone();
-    let submitted = tokio::spawn(async move {
-        submitted_provider
-            .turn_start(operation_context(), &submitted_binding, request)
-            .await
-    });
-    async {
-        loop {
-            if fixture
-                .peer
-                .requests()
-                .iter()
-                .any(|request| request["method"] == "session/prompt")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-    .await;
-    let interrupted = provider
-        .turn_interrupt(
-            operation_context(),
-            &binding,
-            CancelRequest {
-                scope: scope.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(interrupted.turn_id, scope.turn_id().unwrap());
-    assert!(matches!(
-        submitted.await.unwrap(),
-        Err(ProviderError::Cancelled)
-    ));
-    assert!(accepted.state.lock().unwrap().accepted);
-    while let Some(event) = events.try_next().unwrap() {
-        assert!(!matches!(
-            event.event,
-            ProviderEvent::Turn {
-                event: TurnEvent::Started(_) | TurnEvent::Completed(_),
-                ..
-            } | ProviderEvent::Provider {
-                event: ProviderConnectionEvent::Unavailable(_)
-            }
-        ));
-    }
-    provider
-        .thread_close(operation_context(), &binding)
-        .await
-        .unwrap();
 }

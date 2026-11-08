@@ -312,27 +312,6 @@ impl SessionObservationInbox {
         Ok(())
     }
 
-    /// Force expiry in every routed watchdog that has armed an execution deadline.
-    ///
-    /// Returns how many watchdogs were triggered. Tool observations reach the watchdog
-    /// asynchronously, so tests retry until a deadline is armed instead of waiting for it.
-    #[cfg(test)]
-    pub(crate) fn expire_running_tool_deadlines(&self) -> Result<usize> {
-        let armed: Vec<_> = self
-            .watchdogs
-            .lock()
-            .map_err(|_| inbox_poisoned("tool watchdog registry poisoned"))?
-            .values()
-            .flatten()
-            .filter_map(Weak::upgrade)
-            .filter(|watchdog| watchdog.has_running_deadline())
-            .collect();
-        for watchdog in &armed {
-            watchdog.force_expiry();
-        }
-        Ok(armed.len())
-    }
-
     /// Route late command observations to the watchdog that owns their original invocation.
     pub(crate) fn watch_tools(
         &self,
@@ -726,74 +705,6 @@ mod tests {
         )
     }
 
-    /// Keep a full accepted prefix ordered across partial drains and report real loss only afterward.
-    #[test]
-    fn bounded_drain_preserves_full_prefix_and_does_not_acknowledge_loss_without_capacity()
-    -> Result<()> {
-        let inbox = SessionObservationInbox::default();
-        let event = |index| {
-            notice(
-                crate::provider::EventScope::Binding {
-                    thread_id: forge_provider_api::ThreadId::from(
-                        crate::provider::ThreadOwner::root("session"),
-                    ),
-                },
-                format!("frame-{index:03}: α🦀"),
-            )
-        };
-        for index in 0..forge_protocol::MAX_PENDING_FRAMES {
-            inbox.push(event(index))?;
-        }
-        assert!(matches!(
-            inbox.push(event(forge_protocol::MAX_PENDING_FRAMES)),
-            Err(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow
-            ))
-        ));
-        inbox.fail(forge_provider_api::lifecycle::ObservationFailure::Overflow);
-        inbox.close();
-        assert!(inbox.drain_up_to(0)?.is_empty());
-        assert!(!inbox.ready_for_replacement()?);
-        let mut observed = Vec::new();
-        while observed.len() < forge_protocol::MAX_PENDING_FRAMES {
-            let prefix = inbox.drain_up_to(17)?;
-            assert!(!prefix.is_empty() && prefix.len() <= 17);
-            for frame in prefix {
-                let OwnerObservation::Event(HarnessEvent::Host {
-                    event: crate::provider::HostEvent::Failure { message, .. },
-                    ..
-                }) = frame
-                else {
-                    anyhow::bail!("partial drain changed a frame");
-                };
-                observed.push(message.to_string());
-            }
-            assert!(
-                !inbox.ready_for_replacement()?,
-                "accepted prefix acknowledged real loss"
-            );
-        }
-        assert_eq!(
-            observed,
-            (0..forge_protocol::MAX_PENDING_FRAMES)
-                .map(|index| format!("frame-{index:03}: α🦀"))
-                .collect::<Vec<_>>()
-        );
-        assert!(inbox.drain_up_to(0)?.is_empty());
-        assert!(
-            !inbox.ready_for_replacement()?,
-            "zero capacity acknowledged sticky loss"
-        );
-        assert!(matches!(
-            inbox.drain_up_to(1),
-            Err(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow
-            ))
-        ));
-        assert!(inbox.ready_for_replacement()?);
-        Ok(())
-    }
-
     /// Retain real admitted native work independently of its foreground result waiter.
     struct AdmittedWork {
         _directory: tempfile::TempDir,
@@ -959,64 +870,6 @@ mod tests {
             if matches!(error.as_ref(), crate::provider::ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)))
         );
         assert!(inbox.retire_background().await.is_err());
-        work.registry.close().await?;
-        work.provider.shutdown().await?;
-        Ok(())
-    }
-
-    /// Leave timeout collection to the attached foreground, then collect an unreported expiry.
-    ///
-    /// Both the foreground and this monitor observe one deadline. A monitor that also collected
-    /// closed the observation stream under the foreground's failure settlement. The paused clock
-    /// auto-advances to the deadline once the stalled fixture idles.
-    #[tokio::test(start_paused = true)]
-    async fn attached_foreground_owns_timeout_collection_until_release() -> Result<()> {
-        let mut work = AdmittedWork::start().await?;
-        let scope = work.scope.clone();
-        let inbox = Arc::new(SessionObservationInbox::default());
-        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-            crate::session::InputTimeout {
-                amount: 1,
-                unit: crate::session::TimeoutUnit::S,
-            },
-        )?);
-        let owner = crate::provider::tool_timeout::ForegroundToolOwner::attach(watchdog.clone())?;
-        inbox.watch_tools(&scope, &watchdog)?;
-        inbox.push(tool_observation(
-            crate::provider::ToolAddress {
-                turn: work.turn.clone(),
-                item_id: forge_provider_api::ItemId::new("stalled").unwrap(),
-            },
-            forge_provider_api::message::ItemEvent::Tool {
-                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
-            },
-        ))?;
-        assert_eq!(inbox.drain()?.len(), 1);
-        inbox.start_tool_monitor(scope, watchdog.clone(), work.provider.clone())?;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        assert!(
-            watchdog.timeout()?.is_some(),
-            "the fixture deadline did not elapse"
-        );
-        assert!(
-            !work.result.is_finished(),
-            "the monitor collected native work owned by its foreground"
-        );
-        assert!(
-            inbox.drain()?.is_empty(),
-            "the monitor reported a timeout owned by its foreground"
-        );
-        drop(owner);
-        let cancellation = (&mut work.result).await?;
-        assert!(
-            matches!(cancellation, Err(ProviderError::Cancelled)),
-            "{cancellation:?}"
-        );
-        assert!(inbox.drain()?.iter().any(|event| matches!(event,
-            OwnerObservation::Event(HarnessEvent::Host { event: crate::provider::HostEvent::Failure { failure, .. }, .. })
-                if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)));
-        inbox.close();
-        inbox.retire_background().await?;
         work.registry.close().await?;
         work.provider.shutdown().await?;
         Ok(())

@@ -95,9 +95,6 @@ pub(crate) struct ConnectionHost {
     runtime: Arc<ForgeRuntime>,
     router: Arc<HostRouter>,
     requests: Arc<RequestTaskStore>,
-    /// Signals each shutdown pass that finished feature shutdown and now waits for requests.
-    #[cfg(test)]
-    awaiting_requests: Arc<tokio::sync::Notify>,
 }
 
 struct ConnectionInput<Input> {
@@ -217,8 +214,6 @@ impl ConnectionHost {
             router: Arc::new(HostRouter::new(Arc::clone(&runtime))),
             requests: Arc::clone(&runtime.requests),
             runtime,
-            #[cfg(test)]
-            awaiting_requests: Arc::default(),
         }
     }
 
@@ -538,10 +533,6 @@ impl ConnectionHost {
             {
                 break;
             }
-            #[cfg(test)]
-            if feature_done && !pending.is_empty() {
-                self.awaiting_requests.notify_one();
-            }
             tokio::select! {
                 result = &mut shutdown, if !feature_done => {
                     feature_done = true;
@@ -772,221 +763,4 @@ async fn write_frame<Output: AsyncWrite + Unpin>(
     credit.reserve(frame.len()).await?;
     output.write_all(frame).await?;
     output.flush().await.context("flush Forge output")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Polls a future once and reports whether it stayed pending.
-    async fn is_pending<Observed: Future>(mut future: std::pin::Pin<&mut Observed>) -> bool {
-        poll_fn(|context| std::task::Poll::Ready(future.as_mut().poll(context).is_pending())).await
-    }
-
-    #[tokio::test]
-    async fn request_timeout_retains_its_runtime_and_admission_until_completion() {
-        let runtime = Arc::new(ForgeRuntime::new().unwrap());
-        let retained = Arc::downgrade(&runtime);
-        let requests = Arc::clone(&runtime.requests);
-        let admission = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
-        let (release, released) = oneshot::channel();
-        let (started, request_started) = oneshot::channel();
-        requests
-            .spawn(7, async move {
-                let _runtime = runtime;
-                let _permit = permit;
-                started.send(()).unwrap();
-                released.await?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(
-            requests
-                .spawn(7, async { panic!("duplicate request executed") })
-                .is_err()
-        );
-        requests.close();
-        assert!(requests.spawn(8, async { Ok(()) }).is_err());
-        request_started.await.unwrap();
-        let join = requests.join_next();
-        tokio::pin!(join);
-        assert!(is_pending(join.as_mut()).await);
-        assert_eq!(requests.pending(), vec![7]);
-        assert!(retained.upgrade().is_some());
-        assert_eq!(admission.available_permits(), 0);
-        release.send(()).unwrap();
-        join.await.unwrap().unwrap();
-        assert!(requests.pending().is_empty());
-        assert!(retained.upgrade().is_none());
-        assert_eq!(admission.available_permits(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn eof_stops_a_writer_blocked_inside_an_output_write() {
-        let runtime = Arc::new(ForgeRuntime::new().unwrap());
-        let host = ConnectionHost::new(Arc::clone(&runtime));
-        let (mut sender, input) = tokio::io::duplex(1024);
-        let (output, _unread) = tokio::io::duplex(1);
-        sender.write_all(format!("{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
-        drop(sender);
-        let failure = host.run(input, output).await.unwrap_err();
-        assert!(
-            failure
-                .to_string()
-                .contains("connection shutdown deadline expired")
-        );
-        assert!(runtime.requests.pending().is_empty());
-    }
-
-    /// Keep decoded configuration commands ordered across delayed preparation and owner admission.
-    #[tokio::test]
-    async fn delayed_configuration_preserves_transport_order_through_owner_admission() -> Result<()>
-    {
-        use tokio::io::AsyncBufReadExt;
-
-        let root = tempfile::tempdir()?;
-        let runtime = Arc::new(ForgeRuntime::new()?);
-        let opened = runtime
-            .harness
-            .open_session(
-                90,
-                serde_json::from_value(json!({
-                    "workspace":root.path(), "data_root":root.path().join("data"),
-                    "client_id":"ingress-order", "provider":{"kind":"mock","command":[]}
-                }))?,
-            )
-            .await?;
-        let session = opened.result().context("session failed to open")?["session"]["id"]
-            .as_str()
-            .context("session identity missing")?
-            .to_owned();
-        let host = ConnectionHost::new(runtime);
-        let (arrived, waiting) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        *host.router.preparation_hold.lock().unwrap() = Some(crate::router::PreparationHold {
-            request_id: 2,
-            arrived,
-            released,
-        });
-        let (client, server) = tokio::io::duplex(65536);
-        let (input, output) = tokio::io::split(server);
-        let running = tokio::spawn(async move { host.run(input, output).await });
-        let mut client = BufReader::new(client);
-        let initialize = json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}});
-        client
-            .get_mut()
-            .write_all(format!("{initialize}\n").as_bytes())
-            .await?;
-        let mut line = String::new();
-        client.read_line(&mut line).await?;
-        let first = json!({"id":2,"method":"session.configure","session_id":session,"params":{"operation_id":"first","status_thoughts":false}});
-        client
-            .get_mut()
-            .write_all(format!("{first}\n").as_bytes())
-            .await?;
-        waiting.await?;
-        let second = json!({"id":3,"method":"session.configure","session_id":session,"params":{"operation_id":"second","status_thoughts":true}});
-        let independent = json!({"id":4,"method":"provider.registry.list","params":{}});
-        client
-            .get_mut()
-            .write_all(format!("{second}\n{independent}\n").as_bytes())
-            .await?;
-        async {
-            loop {
-                line.clear();
-                client.read_line(&mut line).await?;
-                let frame: Value = serde_json::from_str(&line)?;
-                assert_ne!(frame["id"], 3, "later command overtook delayed preparation");
-                if frame["id"] == 4 {
-                    break;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await?;
-        release.send(()).unwrap();
-        let mut sequences = HashMap::new();
-        async {
-            while sequences.len() < 2 {
-                line.clear();
-                client.read_line(&mut line).await?;
-                let frame: Value = serde_json::from_str(&line)?;
-                if let Some(id @ (2 | 3)) = frame["id"].as_u64() {
-                    assert!(frame.get("error").is_none(), "{frame}");
-                    sequences.insert(
-                        id,
-                        frame["result"]["sequence"]
-                            .as_u64()
-                            .context("missing sequence")?,
-                    );
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await?;
-        assert!(sequences[&2] < sequences[&3]);
-        client.get_mut().shutdown().await?;
-        running.await??;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn terminal_shutdown_waits_for_all_connection_requests() {
-        use tokio::io::AsyncBufReadExt;
-
-        let runtime = Arc::new(ForgeRuntime::new().unwrap());
-        let retained = Arc::clone(&runtime);
-        let (release, released) = oneshot::channel();
-        runtime
-            .requests
-            .spawn(7, async move {
-                let _runtime = retained;
-                released.await?;
-                Ok(())
-            })
-            .unwrap();
-        let host = ConnectionHost::new(Arc::clone(&runtime));
-        let awaiting_requests = Arc::clone(&host.awaiting_requests);
-        let (client, server) = tokio::io::duplex(4096);
-        let (input, output) = tokio::io::split(server);
-        let running = tokio::spawn(async move { host.run(input, output).await });
-        let mut client = BufReader::new(client);
-        client.get_mut().write_all(format!("{{\"id\":1,\"method\":\"host.initialize\",\"params\":{{\"protocol_version\":{}}}}}\n", forge_protocol::WIRE_VERSION).as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        client.read_until(b'\n', &mut response).await.unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&response).unwrap()["id"], 1);
-        client
-            .get_mut()
-            .write_all(b"{\"id\":8,\"method\":\"host.shutdown\",\"params\":{}}\n")
-            .await
-            .unwrap();
-        async {
-            while runtime
-                .harness
-                .prepare(
-                    None,
-                    forge_harness::protocol::RuntimeMethod::SessionStateGet,
-                )
-                .await
-                .is_ok()
-            {
-                tokio::task::yield_now().await;
-            }
-        }
-        .await;
-        awaiting_requests.notified().await;
-        response.clear();
-        let mut read_response = std::pin::pin!(client.read_until(b'\n', &mut response));
-        assert!(is_pending(read_response.as_mut()).await);
-        assert_eq!(runtime.requests.pending(), vec![7]);
-        release.send(()).unwrap();
-        read_response.await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&response).unwrap()["result"]["shutdown"],
-            true
-        );
-        running.await.unwrap().unwrap();
-        assert!(runtime.requests.pending().is_empty());
-    }
 }

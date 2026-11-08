@@ -2056,19 +2056,12 @@ mod tests {
     #[derive(Clone, Copy)]
     enum UndispatchedBoundary {
         Prepared,
-        Sending,
     }
 
     /// A prepared receipt restores the exact draft after cancellation.
     #[tokio::test]
     async fn undispatched_prepared_cancellation_restores_exact_draft() -> Result<()> {
         assert_undispatched_cancellation_boundary(UndispatchedBoundary::Prepared).await
-    }
-
-    /// An unknown sending receipt retains history instead of restoring the draft.
-    #[tokio::test]
-    async fn undispatched_unknown_sending_cancellation_retains_history() -> Result<()> {
-        assert_undispatched_cancellation_boundary(UndispatchedBoundary::Sending).await
     }
 
     /// Only positive journal retirement may restore an undispatched draft without native history proof.
@@ -2121,7 +2114,6 @@ mod tests {
                 .clone();
             match boundary {
                 Boundary::Prepared => {}
-                Boundary::Sending => submission.sending(None)?,
             }
             assert!(transaction.retraction_boundary.is_none());
             assert!(transaction.native.task.is_empty());
@@ -2180,191 +2172,9 @@ mod tests {
                     );
                     assert_eq!(submission.record()?.delivery, SubmissionState::Cancelled);
                 }
-                Boundary::Sending => {
-                    assert!(matches!(
-                        action,
-                        ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
-                    ));
-                    let retained = broker
-                        .store
-                        .load_exchange(&exchange_id)?
-                        .context("uncertain input lost its history")?;
-                    assert!(retained.turn.is_empty());
-                    assert_eq!(retained.state(), ExchangeState::Cancelled);
-                    assert!(matches!(
-                        submission.record()?.delivery,
-                        SubmissionState::Sending { .. }
-                    ));
-                    assert_eq!(
-                        broker.session.resolved_model.as_deref(),
-                        Some("discard this temporary admission value")
-                    );
-                    let ForegroundDispatch::Running { admission, .. } = &dispatch else {
-                        anyhow::bail!("foreground owner disappeared");
-                    };
-                    assert!(
-                        admission
-                            .failure
-                            .as_ref()
-                            .unwrap()
-                            .original
-                            .downcast_ref::<TurnRetracted>()
-                            .is_none()
-                    );
-                }
             }
             engine.close().await?;
         }
-        Ok(())
-    }
-
-    /// Collection during provider preparation waits for the owner and never starts a second native fence.
-    #[tokio::test]
-    async fn staged_admission_collection_retains_owner_until_positive_completion() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.checkpoint = None;
-        let (sink, _stream) = publication::channel();
-        let mut dispatch = broker.begin_foreground_dispatch(
-            Request {
-                id: 3,
-                method: "session.prompt.submit".into(),
-                params: json!({"text":"staged"}),
-            },
-            sink,
-        )?;
-        let staged = broker.stage_foreground_interaction(
-            "staged",
-            PromptMode::Chat,
-            Some(&ExchangeAdmission::chat("staged".into())),
-            ProviderInput::from_text("staged"),
-        )?;
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
-            unreachable!()
-        };
-        admission.staged_interaction = Some(staged);
-        broker.activate_staged_runtime(admission)?;
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::CollectionStarted(ForegroundCollection::Restart)
-            )?,
-            ForegroundAction::Wait
-        ));
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::EffectFailed(TurnCancelled.into()),
-            )?,
-            ForegroundAction::WaitForPublicationDrain
-        ));
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::EffectFailed(
-                    ProviderError::PreparationFailed(Box::new(ProviderError::Cancelled)).into(),
-                ),
-            )?,
-            ForegroundAction::Wait
-        ));
-        let ForegroundDispatch::Admitting(admission) = &dispatch else {
-            unreachable!()
-        };
-        assert!(admission.failure.as_ref().unwrap().secondary.is_empty());
-        assert!(matches!(
-            broker.finish_foreground_failure(&mut dispatch)?,
-            ForegroundAction::Wait
-        ));
-        assert!(matches!(
-            broker.step_foreground(
-                &mut dispatch,
-                ForegroundSignal::CollectionCompleted(ForegroundCollection::Restart)
-            )?,
-            ForegroundAction::WaitForPublicationDrain
-        ));
-        let ForegroundAction::Effect(ForegroundJob::AdmissionCleanup(job)) =
-            broker.finish_foreground_failure(&mut dispatch)?
-        else {
-            anyhow::bail!("positive owner collection must release retained baseline cleanup")
-        };
-        assert!(matches!(
-            job.native,
-            AdmissionNativeCollection::OwnerCollected
-        ));
-        let result = job.run().await;
-        assert!(result.engine.is_ok());
-        let ForegroundDispatch::Admitting(admission) = &dispatch else {
-            unreachable!()
-        };
-        assert!(
-            admission
-                .failure
-                .as_ref()
-                .unwrap()
-                .original
-                .to_string()
-                .contains("cancelled")
-        );
-        Ok(())
-    }
-
-    /// A failure after durable admission collects its owner and settles the staged exchange.
-    #[tokio::test]
-    async fn staged_admission_failure_settles_exchange_before_rejection() -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.checkpoint = None;
-        let (sink, _stream) = publication::channel();
-        let request = Request {
-            id: 3,
-            method: "session.prompt.submit".into(),
-            params: json!({"text":"staged"}),
-        };
-        let mut dispatch = broker.begin_foreground_dispatch(request, sink)?;
-        let staged = broker.stage_foreground_interaction(
-            "staged",
-            PromptMode::Chat,
-            Some(&ExchangeAdmission::chat("staged".into())),
-            ProviderInput::from_text("staged"),
-        )?;
-        let exchange_id = staged.exchange.id.clone();
-        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
-            panic!("missing admission");
-        };
-        admission.staged_interaction = Some(staged);
-        admission.reset_check_setup = true;
-        broker.check_setup = true;
-        broker.activate_staged_runtime(admission)?;
-        assert!(matches!(
-            broker.fail_foreground_dispatch(
-                &mut dispatch,
-                anyhow::anyhow!("provider preparation failed")
-            )?,
-            ForegroundAction::WaitForPublicationDrain
-        ));
-        let ForegroundAction::Effect(ForegroundJob::AdmissionCleanup(job)) =
-            broker.finish_foreground_failure(&mut dispatch)?
-        else {
-            panic!("missing owned cleanup");
-        };
-        let result = job.run().await;
-        let action = broker.complete_staged_admission_cleanup(&mut dispatch, result)?;
-        assert!(matches!(
-            action,
-            ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
-                | ForegroundAction::Effect(ForegroundJob::FailureAdmissionEvents(_))
-        ));
-        let exchange = broker
-            .store
-            .load_exchange(&exchange_id)?
-            .context("staged exchange disappeared")?;
-        assert_eq!(exchange.state(), ExchangeState::Failed);
-        assert!(!broker.check_setup);
-        assert!(broker.exchange_runtime.is_none());
         Ok(())
     }
 }

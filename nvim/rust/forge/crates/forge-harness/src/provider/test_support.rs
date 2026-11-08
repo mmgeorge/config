@@ -11,25 +11,6 @@ use super::{
     TurnAddress,
 };
 
-/// Build the normalized provider mock behind the production Harness bridge.
-pub(crate) fn build_mock(
-    root: std::path::PathBuf,
-    permissions: Arc<super::approval::PermissionCoordinator>,
-    trace: Arc<crate::trace::TraceStore>,
-) -> anyhow::Result<Arc<super::Provider>> {
-    let native = forge_providers::registry::nonselectable_id()
-        .ok_or_else(|| anyhow::anyhow!("registry has no test provider"))?;
-    super::build(
-        super::ProviderLaunch {
-            kind: native,
-            command: Vec::new(),
-        },
-        permissions,
-        trace,
-        root,
-    )
-}
-
 /// Use registry-advertised capabilities for normalized lifecycle fixtures.
 pub(crate) fn fixture_capability() -> super::ProviderCapability {
     let id = forge_providers::registry::nonselectable_id().expect("registry has a test provider");
@@ -149,26 +130,6 @@ pub(crate) fn message(
     };
     [ItemEvent::Started(start), ItemEvent::Completed(completion)]
         .into_iter()
-        .map(|event| ProviderEvent::Item {
-            thread_id: turn.thread_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            item_id: item_id.clone(),
-            event,
-        })
-        .collect()
-}
-
-/// Build native tool item observations from the shared normalized value vocabulary.
-pub(crate) fn tool(
-    turn: &TurnAddress,
-    id: String,
-    start: forge_provider_api::message::ItemStart,
-    update: impl IntoIterator<Item = forge_provider_api::message::ItemEvent>,
-) -> Vec<ProviderEvent> {
-    let item_id =
-        forge_provider_api::ItemId::new(id).expect("fixture tool item identity is nonempty");
-    std::iter::once(forge_provider_api::message::ItemEvent::Started(start))
-        .chain(update)
         .map(|event| ProviderEvent::Item {
             thread_id: turn.thread_id.clone(),
             turn_id: turn.turn_id.clone(),

@@ -1,4 +1,5 @@
 local MiniTest = require("mini.test")
+local gh_fixture = dofile("nvim/lua/github/tests/support/gh_fixture.lua")
 local eq = MiniTest.expect.equality
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
@@ -303,18 +304,12 @@ T["issue_index"] = function()
 
   local binary = vim.fs.joinpath(vim.fn.getcwd(), "nvim", "rust", "forge", "target", "debug", "forge")
   issue_index._set_storage_runner_for_test(nil)
-  local fixture = vim.fs.joinpath(test_root, "gh")
-  if vim.fn.has("win32") == 1 then binary, fixture = binary .. ".exe", fixture .. ".exe" end
+  if vim.fn.has("win32") == 1 then binary = binary .. ".exe" end
   assert(vim.fn.executable(binary) == 1, "build the Forge debug executable before native issue tests")
-  local compiled
-  vim.system({ "rustup", "run", "1.94.0", "rustc", "--edition=2024",
-    "nvim/rust/forge/crates/forge-github/tests/fixtures/gh.rs", "-o", fixture },
-    { text = true, stdout = true, stderr = true, timeout = 30000 }, function(result) compiled = result end)
-  wait_until(function() return compiled ~= nil end, "native gh fixture compilation did not finish", 4000)
-  eq(compiled.code, 0, { fail_reason = "native gh fixture compilation failed: " .. tostring(compiled.stderr) })
+  local gh_directory = gh_fixture.directory()
   host_builder.ensure = function(callback) callback({ ok = true, path = binary }) end
   host_client._host_set_launcher_for_test(function(command, options, on_exit)
-    options.env = { PATH = test_root }
+    options.env = { PATH = gh_directory }
     return vim.system(command, options, on_exit)
   end)
   local native_repo = "mmgeorge/native-repo"

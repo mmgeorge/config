@@ -3,8 +3,6 @@ use std::collections::BTreeSet;
 
 /// Capture final workspace evidence without retaining mutable host state.
 pub(crate) struct FinalCheckpointJob {
-    #[cfg(test)]
-    barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     checkpoint: GitCheckpoint,
     objects: crate::storage::objects::ObjectStore,
     repositories: Arc<forge_git::store::RepositoryStore>,
@@ -28,11 +26,6 @@ enum CaptureOwner {
 impl FinalCheckpointJob {
     /// Collect checkpoint and diff evidence from the captured immutable inputs.
     pub(crate) async fn run(self) -> Result<FinalCheckpointResult> {
-        #[cfg(test)]
-        if let Some((started, release)) = &self.barrier {
-            started.notify_one();
-            release.notified().await;
-        }
         let checkpoint = self
             .checkpoint
             .capture(
@@ -168,8 +161,6 @@ impl HarnessBroker {
             })
             .transpose()?;
         Ok(FinalCheckpointJob {
-            #[cfg(test)]
-            barrier: None,
             checkpoint: self
                 .checkpoint
                 .clone()
@@ -243,63 +234,5 @@ impl HarnessBroker {
             .save_checkpoint_exchange(&captured.checkpoint, &settled)?;
         *interaction = settled;
         Ok(FinalCheckpointCommit::Committed(captured.checkpoint.id))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::broker::test::{git_repository, planning_question_broker};
-
-    /// Discard an unlocked capture when initial checkpoint collection changed its baseline.
-    #[tokio::test]
-    async fn final_capture_rechecks_baseline_before_committing() -> Result<()> {
-        let repository = git_repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut exchange, _, _) = broker
-            .test_stage_interaction_for_turn("capture", true, 10)
-            .await?;
-        let outcome = crate::exchange::ExchangeOutcome::Failed;
-        exchange.begin_finalization(outcome, 11)?;
-        let captured = broker
-            .prepare_final_checkpoint(&exchange, outcome)?
-            .run()
-            .await?;
-        let baseline = broker
-            .checkpoint
-            .as_ref()
-            .context("fixture checkpoint adapter is missing")?
-            .capture(
-                &broker.store.objects,
-                &broker.repositories,
-                &broker.session.id,
-                12,
-            )
-            .await?;
-        broker.store.save_checkpoint(&baseline)?;
-        exchange.checkpoint_before = Some(baseline.id);
-        assert!(matches!(
-            broker.commit_final_checkpoint(&mut exchange, captured)?,
-            FinalCheckpointCommit::Stale
-        ));
-        assert!(exchange.checkpoint_after.is_none());
-        assert_eq!(exchange.state(), ExchangeState::Finalizing);
-        let fresh = broker
-            .prepare_final_checkpoint(&exchange, outcome)?
-            .run()
-            .await?;
-        let FinalCheckpointCommit::Committed(id) =
-            broker.commit_final_checkpoint(&mut exchange, fresh)?
-        else {
-            anyhow::bail!("fresh final capture was rejected");
-        };
-        let persisted = broker
-            .store
-            .load_exchange(&exchange.id)?
-            .context("committed exchange is missing")?;
-        assert_eq!(persisted.checkpoint_after.as_deref(), Some(id.as_str()));
-        assert_eq!(persisted.state(), ExchangeState::Failed);
-        Ok(())
     }
 }

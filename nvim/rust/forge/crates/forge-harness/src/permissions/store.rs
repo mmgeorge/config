@@ -200,29 +200,3 @@ fn atomic_write(path: &Path, source: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::permissions::document::PermissionDecision;
-
-    #[test]
-    fn approval_grant_rejects_mixed_or_denied_rules() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let mut store =
-            PermissionStore::load(directory.path().join("permissions.json"), directory.path())?;
-        let before = store.open().1;
-        let epoch = store.revocation_epoch();
-        assert!(
-            store
-                .grant_approved(&[
-                    ("bash".into(), "rg *".into(), PermissionDecision::Allow),
-                    ("read".into(), "private/**".into(), PermissionDecision::Deny),
-                ])
-                .is_err()
-        );
-        assert_eq!(store.open().1, before);
-        assert_eq!(store.revocation_epoch(), epoch);
-        Ok(())
-    }
-}

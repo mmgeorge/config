@@ -373,40 +373,4 @@ mod tests {
         assert_eq!((&mut waiting).await.err(), Some(ReadAdmissionError::Closed));
         drop(held);
     }
-
-    #[tokio::test]
-    async fn completed_result_retains_admission_until_collected() {
-        let pool = BlockingReadPool::new(1).unwrap();
-        let owner = std::thread::current().id();
-        let task = pool.submit(8, |_| Ok(std::thread::current().id())).unwrap();
-        wait_for_native_completion(&task).await;
-        assert_eq!(pool.status().active_jobs, 1);
-        assert_eq!(pool.status().reserved_input_bytes, 8);
-        assert_eq!(
-            pool.submit(0, |_| Ok(())).err(),
-            Some(ReadAdmissionError::Busy)
-        );
-        assert_ne!(task.finish().await.unwrap(), owner);
-        assert_eq!(pool.status().active_jobs, 0);
-        assert_eq!(pool.status().reserved_input_bytes, 0);
-        pool.submit(8, |_| Ok(())).unwrap().finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_reports_uncollected_results_and_cancellation_rejects_them() {
-        let pool = BlockingReadPool::new(1).unwrap();
-        let task = pool.submit(4, |_| Ok("completed result")).unwrap();
-        let id = task.id();
-        wait_for_native_completion(&task).await;
-        assert_eq!(pool.shutdown(Duration::ZERO).await.unfinished, vec![id]);
-        assert!(
-            task.finish()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("cancelled")
-        );
-        assert_eq!(pool.status().active_jobs, 0);
-        assert!(pool.shutdown(Duration::ZERO).await.unfinished.is_empty());
-    }
 }

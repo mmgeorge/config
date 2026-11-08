@@ -505,15 +505,6 @@ enum StatusSubscription {
 pub(crate) struct HostRouter {
     host: Arc<ForgeRuntime>,
     status_events: std::sync::Mutex<StatusSubscription>,
-    #[cfg(test)]
-    pub(crate) preparation_hold: std::sync::Mutex<Option<PreparationHold>>,
-}
-
-#[cfg(test)]
-pub(crate) struct PreparationHold {
-    pub(crate) request_id: u64,
-    pub(crate) arrived: tokio::sync::oneshot::Sender<()>,
-    pub(crate) released: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl HostRouter {
@@ -521,8 +512,6 @@ impl HostRouter {
         Self {
             host,
             status_events: std::sync::Mutex::new(StatusSubscription::Idle),
-            #[cfg(test)]
-            preparation_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -530,24 +519,6 @@ impl HostRouter {
         &self,
         envelope: &mut RoutedRequestEnvelope,
     ) -> Result<RoutedMethod> {
-        #[cfg(test)]
-        {
-            let held = {
-                let mut hold = self.preparation_hold.lock().unwrap();
-                if hold
-                    .as_ref()
-                    .is_some_and(|hold| hold.request_id == envelope.request.id)
-                {
-                    hold.take()
-                } else {
-                    None
-                }
-            };
-            if let Some(held) = held {
-                let _ = held.arrived.send(());
-                held.released.await?;
-            }
-        }
         envelope.validate_context()?;
         let mut method = decode_method(&envelope.request.method)?;
         if matches!(method, RoutedMethod::Runtime(_)) {

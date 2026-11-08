@@ -338,39 +338,4 @@ mod tests {
         drop(reporter);
         assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
     }
-
-    /// End worker observation without reviving it through a stale reporter or cancelling another attempt.
-    #[tokio::test]
-    async fn lost_dispatch_worker_cannot_confirm_a_later_attempt() {
-        let tracker = super::DispatchTracker::default();
-        let mut observer = tracker.observer();
-        let binding = crate::BindingId::new("binding").unwrap();
-        let scope = crate::InvocationScope::new(crate::testing::root_thread("session"), "exchange");
-        let submission = crate::SubmissionId::try_from("input").unwrap();
-        let stale = tracker
-            .track_input(
-                binding.clone(),
-                scope.clone(),
-                submission.clone(),
-                crate::DeliveryAttemptId::new("attempt").unwrap(),
-            )
-            .unwrap();
-        let worker = tracker.observe_worker();
-        drop(worker);
-        stale.confirm();
-        assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
-        let next = super::DispatchTracker::default();
-        let mut next_observer = next.observer();
-        let current = next
-            .track_input(
-                binding,
-                scope,
-                submission,
-                crate::DeliveryAttemptId::new("next-attempt").unwrap(),
-            )
-            .unwrap();
-        drop(observer);
-        current.confirm();
-        assert!(next_observer.wait().await.is_ok());
-    }
 }

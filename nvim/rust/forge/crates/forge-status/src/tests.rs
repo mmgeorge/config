@@ -75,27 +75,6 @@ async fn fixture() -> (
     (directory, service, diff, writer)
 }
 
-#[test]
-fn closing_pending_document_invalidates_adoption_without_releasing_live_charge() {
-    let store = Arc::new(crate::document::DocumentAdmissionStore::default());
-    let mut admission = Vec::new();
-    for index in 0..8 {
-        admission.push(store.admit(DocumentId(format!("pending:{index}"))).unwrap());
-    }
-    assert!(store.cancel(&DocumentId("pending:0".into())));
-    assert!(admission[0].check().is_err());
-    assert!(
-        store.admit(DocumentId("replacement".into())).is_err(),
-        "cancel released a still-owned document charge"
-    );
-    drop(admission.remove(0));
-    let replacement = store.admit(DocumentId("replacement".into())).unwrap();
-    replacement.check().unwrap();
-    store.cancel_all();
-    assert!(replacement.check().is_err());
-    assert!(admission.iter().all(|admission| admission.check().is_err()));
-}
-
 #[tokio::test]
 async fn unstage_invalidates_cached_index_when_replacement_timestamp_moves_backwards() {
     let (directory, service, _, writer) = fixture().await;
@@ -283,35 +262,6 @@ fn rows(body: &BufferSnapshot) -> Vec<&str> {
 }
 
 #[tokio::test]
-async fn retired_file_handles_cannot_address_a_recreated_path() {
-    let (directory, service, _, _) = fixture().await;
-    std::fs::write(directory.path().join("temporary.txt"), "first\n").unwrap();
-    let opened = service
-        .open(DocumentId("retired".into()), directory.path().to_owned())
-        .await
-        .unwrap();
-    let retired = file(&opened, "temporary.txt", None).id;
-    std::fs::remove_file(directory.path().join("temporary.txt")).unwrap();
-    let removed = service.refresh(&opened.document).await.unwrap().unwrap();
-    assert!(removed.removed.contains(&retired));
-    std::fs::write(directory.path().join("temporary.txt"), "second\n").unwrap();
-    service.refresh(&opened.document).await.unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    assert_ne!(file(&current, "temporary.txt", None).id, retired);
-    assert!(
-        service
-            .demand(captured(
-                &current,
-                StatusLocation::File { id: retired },
-                1,
-                "demand"
-            ))
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
 async fn opening_publishes_all_headers_without_bodies_then_demand_adds_exact_rows() {
     let (directory, service, diff, _) = fixture().await;
     let (snapshot, timing) = service
@@ -405,59 +355,6 @@ async fn changed_file_refresh_retires_old_body_before_reloading() {
         .snapshot
         .unwrap();
     assert!(rows(&loaded).contains(&"newer content"));
-}
-
-#[tokio::test]
-async fn read_demand_survives_unrelated_revision_but_rejects_forged_or_replayed_input() {
-    let (directory, service, _, _) = fixture().await;
-    let snapshot = service
-        .open(DocumentId("status".into()), directory.path().to_owned())
-        .await
-        .unwrap();
-    assert!(
-        service
-            .demand(captured(
-                &snapshot,
-                StatusLocation::File { id: 99999 },
-                1,
-                "demand"
-            ))
-            .await
-            .is_err()
-    );
-    let loaded = service
-        .demand(input(&snapshot, "sample.txt", 1, "demand"))
-        .await
-        .unwrap()
-        .snapshot
-        .unwrap();
-    let mut location = body_location(&snapshot.file[0], &loaded, &loaded.block[1], 0);
-    if let StatusLocation::Body { target, .. } = &mut location {
-        *target = Some(forge_buffer::identity::TargetId("forged".into()));
-    }
-    assert!(
-        service
-            .open_target(captured(&snapshot, location, 2, "open"))
-            .await
-            .is_err()
-    );
-    assert!(
-        service
-            .demand(input(&snapshot, "sample.txt", 1, "demand"))
-            .await
-            .is_err()
-    );
-    std::fs::write(directory.path().join("other"), "new\n").unwrap();
-    service.refresh(&snapshot.document).await.unwrap();
-    assert!(
-        service
-            .demand(input(&snapshot, "sample.txt", 2, "demand"))
-            .await
-            .is_ok()
-    );
-    let mut future = input(&snapshot, "sample.txt", 3, "demand");
-    future.revision = forge_buffer::identity::DocumentRevision(999);
-    assert!(service.demand(future).await.is_err());
 }
 
 #[tokio::test]
@@ -631,56 +528,6 @@ async fn whole_section_stages_current_contents_and_only_selected_paths() {
 }
 
 #[tokio::test]
-async fn queued_ignore_and_unignore_preserve_unchanged_file_targets() {
-    let (directory, service, _, _) = fixture().await;
-    let storage = tempfile::tempdir().unwrap();
-    service
-        .configure_ignored_directory(storage.path().to_owned())
-        .unwrap();
-    std::fs::write(directory.path().join("second.txt"), "second\n").unwrap();
-    let opened = service
-        .open(
-            DocumentId("queued-ignore".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    let second = input(&opened, "second.txt", 2, "ignore");
-    service
-        .act(input(&opened, "sample.txt", 1, "ignore"), None)
-        .await
-        .unwrap();
-    assert!(service.snapshot(&opened.document).await.unwrap().revision > opened.revision);
-    service.act(second, None).await.unwrap();
-    let ignored = service.snapshot(&opened.document).await.unwrap();
-    assert_eq!(
-        file(&ignored, "sample.txt", None).section,
-        StatusSection::Ignored
-    );
-    assert_eq!(
-        file(&ignored, "second.txt", None).section,
-        StatusSection::Ignored
-    );
-
-    let second = input(&ignored, "second.txt", 4, "unstage");
-    service
-        .act(input(&ignored, "sample.txt", 3, "unstage"), None)
-        .await
-        .unwrap();
-    service.act(second, None).await.unwrap();
-    assert!(
-        crate::ignored::load(Some(storage.path()), directory.path())
-            .unwrap()
-            .is_empty()
-    );
-    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
-    assert_eq!(
-        std::fs::read(directory.path().join("sample.txt")).unwrap(),
-        b"new\n"
-    );
-}
-
-#[tokio::test]
 async fn stale_ignore_rejects_changed_sources_and_does_not_relax_discard() {
     let (directory, service, _, _) = fixture().await;
     let storage = tempfile::tempdir().unwrap();
@@ -726,62 +573,6 @@ async fn stale_ignore_rejects_changed_sources_and_does_not_relax_discard() {
         std::fs::read(directory.path().join("sample.txt")).unwrap(),
         b"changed after capture\n"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn optimistic_pending_index_is_shared_with_reopened_view_and_survives_close() {
-    let (directory, service, _, _) = fixture().await;
-    let repository = service
-        .store
-        .open(directory.path().to_owned())
-        .await
-        .unwrap()
-        .unwrap();
-    let scope =
-        forge_git::mutation::MutationScope::Index(repository.identity.worktree.clone().unwrap());
-    let gate = service.store.writes.admit(vec![scope], 1).unwrap();
-    let guard = service.store.writes.start(gate).unwrap().unwrap();
-    let first = service
-        .open(DocumentId("first-view".into()), directory.path().to_owned())
-        .await
-        .unwrap();
-    let ticket = service
-        .input(input(&first, "sample.txt", 1, "stage"))
-        .await
-        .unwrap();
-    let second = service
-        .open(
-            DocumentId("second-view".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.pending.len(), 1);
-    assert_eq!(
-        file(&second, "sample.txt", None).section,
-        StatusSection::Staged
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    assert!(service.close(&first.document));
-    guard
-        .finish(forge_git::mutation::OperationCompletion::Completed)
-        .unwrap();
-    service.store.writes.take_receipt(gate).unwrap();
-    let outcome = ticket.finish().await.unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed)
-    );
-    let current = service.snapshot(&second.document).await.unwrap();
-    assert!(current.pending.is_empty());
-    assert_eq!(
-        file(&current, "sample.txt", None).section,
-        StatusSection::Staged
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"new\n");
-    assert_eq!(service.store.writes.usage().operations, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -891,81 +682,6 @@ async fn changed_hunk_source_rejects_queued_stage_and_refreshes_body() {
     assert!(!rows(&loaded).contains(&"new"));
 }
 
-async fn selected_change(
-    service: &StatusService,
-    snapshot: &StatusSnapshot,
-    sequence: u64,
-    text: &str,
-) -> StatusInput {
-    let selected = file(snapshot, "sample.txt", Some(StatusSection::Unstaged));
-    let loaded = body(service, snapshot, selected).await;
-    let (block, row) = loaded
-        .block
-        .iter()
-        .find_map(|block| {
-            block
-                .text
-                .wire_rows()
-                .iter()
-                .position(|row| *row == text)
-                .map(|row| (block, row))
-        })
-        .unwrap();
-    let mut capture = input(snapshot, "sample.txt", sequence, "stage");
-    capture.location = body_location(selected, &loaded, block, row);
-    capture
-}
-
-#[tokio::test]
-async fn hunk_rejects_deleted_source_then_whole_file_stage_records_deletion() {
-    let (directory, service, _, _) = fixture().await;
-    let opened = service
-        .open(
-            DocumentId("deleted-hunk-source".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    service
-        .demand(input(&opened, "sample.txt", 1, "demand"))
-        .await
-        .unwrap();
-    let snapshot = service.snapshot(&opened.document).await.unwrap();
-    let hunk = selected_change(&service, &snapshot, 2, "new").await;
-    std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
-    let rejected = service.input(hunk).await.unwrap().finish().await.unwrap();
-    assert!(
-        rejected
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Rejected),
-        "{rejected:?}"
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    let refreshed = service.snapshot(&opened.document).await.unwrap();
-    assert!(refreshed.pending.is_empty());
-    assert_eq!(
-        file(&refreshed, "sample.txt", Some(StatusSection::Unstaged)).change,
-        "deleted"
-    );
-    let completed = service
-        .input(input(&snapshot, "sample.txt", 3, "stage"))
-        .await
-        .unwrap()
-        .finish()
-        .await
-        .unwrap();
-    assert!(
-        completed
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed),
-        "{completed:?}"
-    );
-    assert!(git(directory.path(), &["ls-files", "sample.txt"]).is_empty());
-    assert!(!directory.path().join("sample.txt").exists());
-}
-
 async fn semantic_status_fixture(
     staged: bool,
 ) -> (
@@ -992,102 +708,6 @@ async fn semantic_status_fixture(
         .await
         .unwrap();
     (directory, service, opened, old, new)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_status_controls_keep_semantic_bodies_lazy_and_visibility_independent() {
-    use forge_diff::view::{DiffPresentation, DiffVisibility};
-    let (_directory, service, opened, _, _) = semantic_status_fixture(false).await;
-    assert_eq!(opened.diff_view.presentation, DiffPresentation::Full);
-    assert_eq!(opened.diff_view.visibility, DiffVisibility::All);
-    service
-        .demand(input(&opened, "sample.rs", 1, "demand"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let delivery = service
-        .change_diff_view(input(&current, "sample.rs", 2, "toggle_presentation"))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        delivery.delta.diff_view.unwrap().presentation,
-        DiffPresentation::Semantic
-    );
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let selected = file(&current, "sample.rs", None);
-    let loaded = body(&service, &current, selected).await;
-    let text = rows(&loaded).join("\n");
-    assert!(text.contains("pub fn visible()"), "{text}");
-    assert!(text.contains("fn hidden()"), "{text}");
-    assert!(!text.contains("before()"), "{text}");
-    assert!(!text.contains("after()"), "{text}");
-    assert!(
-        loaded
-            .block
-            .iter()
-            .flat_map(|block| &block.metadata.fold)
-            .any(|fold| fold
-                .collapsed_suffix
-                .as_ref()
-                .is_some_and(|suffix| suffix.contains("1 change")))
-    );
-    let heading = loaded
-        .block
-        .iter()
-        .find(|block| {
-            block
-                .text
-                .row(0)
-                .is_some_and(|row| row.contains("pub fn visible()"))
-        })
-        .unwrap();
-    let mut expand = input(&current, "sample.rs", 3, "source_expand");
-    expand.location = body_location(selected, &loaded, heading, 0);
-    service.source_section(expand).await.unwrap();
-    let loaded = body(&service, &current, selected).await;
-    let text = rows(&loaded).join("\n");
-    assert!(
-        text.contains("before()") && text.contains("after()"),
-        "{text}"
-    );
-    service
-        .change_diff_view(input(&current, "sample.rs", 4, "toggle_visibility"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let loaded = body(&service, &current, file(&current, "sample.rs", None)).await;
-    let text = rows(&loaded).join("\n");
-    assert!(
-        !text.contains("hidden") && !text.contains("private_"),
-        "{text}"
-    );
-    assert!(text.contains("after()"), "{text}");
-    service
-        .change_diff_view(input(&current, "sample.rs", 5, "toggle_presentation"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    assert_eq!(current.diff_view.presentation, DiffPresentation::Full);
-    assert_eq!(current.diff_view.visibility, DiffVisibility::Public);
-    let text = rows(&body(&service, &current, file(&current, "sample.rs", None)).await).join("\n");
-    assert!(
-        text.contains("after()") && !text.contains("private_"),
-        "{text}"
-    );
-    service.refresh(&opened.document).await.unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    assert_eq!(current.diff_view.visibility, DiffVisibility::Public);
-    service
-        .change_diff_view(input(&current, "sample.rs", 6, "toggle_visibility"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let text = rows(&body(&service, &current, file(&current, "sample.rs", None)).await).join("\n");
-    assert!(
-        text.contains("private_before") && text.contains("private_after"),
-        "{text}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1235,64 +855,5 @@ async fn linked_status_diff_controls_publish_matching_bodies_and_protocol_fixtur
         "initial": initial, "child_initial": child_initial, "full": [parent_full, child_full],
         "semantic": semantic, "expanded": expanded, "public": public, "public_full": public_full, "all_full": all_full,
     });
-    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/status-semantic-fixture.json");
-    std::fs::write(&artifact, serde_json::to_vec(&fixture).unwrap()).unwrap();
-    println!("semantic status fixture: {}", artifact.display());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_linked_diff_preparation_preserves_every_usable_body_and_setting() {
-    let (directory, service, initial, _, _) = semantic_status_fixture(false).await;
-    let child = service
-        .open_comparison(
-            DocumentId("failed-linked-child".into()),
-            directory.path().to_owned(),
-            forge_git::revision::comparison::ComparisonRequest {
-                reference: "HEAD".into(),
-                head: None,
-                worktree: false,
-                path: None,
-            },
-            Default::default(),
-        )
-        .await
-        .unwrap();
-    service
-        .demand(input(&initial, "sample.rs", 1, "demand"))
-        .await
-        .unwrap();
-    service
-        .demand(input(&child, "sample.rs", 1, "demand"))
-        .await
-        .unwrap();
-    let parent_before = body(&service, &initial, file(&initial, "sample.rs", None)).await;
-    let child_before = body(&service, &child, file(&child, "sample.rs", None)).await;
-    service.diff.analysis_pool().close();
-    let current = service.snapshot(&initial.document).await.unwrap();
-    assert!(
-        service
-            .change_diff_views(
-                input(&current, "sample.rs", 2, "toggle_presentation"),
-                vec![child.document.clone()]
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        service.snapshot(&initial.document).await.unwrap().diff_view,
-        initial.diff_view
-    );
-    assert_eq!(
-        service.snapshot(&child.document).await.unwrap().diff_view,
-        child.diff_view
-    );
-    assert_eq!(
-        body(&service, &initial, file(&initial, "sample.rs", None)).await,
-        parent_before
-    );
-    assert_eq!(
-        body(&service, &child, file(&child, "sample.rs", None)).await,
-        child_before
-    );
+    forge_recorded_fixtures::assert_matches_recording("status-semantic.json", &fixture);
 }

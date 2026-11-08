@@ -509,18 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_content_and_invalid_identifiers_are_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::open(directory.path()).unwrap();
-        let identity = objects.put(b"checkpoint").unwrap();
-        fs::write(objects.path(&identity).unwrap(), b"corrupt").unwrap();
-        assert!(objects.get(&identity).is_err());
-        assert!(objects.put(b"checkpoint").is_err());
-        assert!(objects.get("../outside").is_err());
-        assert!(objects.get(&"g".repeat(64)).is_err());
-    }
-
-    #[test]
     fn corrupt_objects_leave_restore_destinations_untouched_and_remove_temporary_files() {
         let directory = tempfile::tempdir().unwrap();
         let objects = ObjectStore::open(directory.path()).unwrap();

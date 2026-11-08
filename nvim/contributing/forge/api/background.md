@@ -74,7 +74,7 @@ A preferences object has two required fields: `auto_compaction: {enabled: boolea
 
 The result is `{revision, settings}`. Saved auto-compaction replaces the fallback policy, and saved model selections override matching default provider keys. An untouched store reports revision zero. Updates atomically save the provider preferences and advance the settings revision. No progress or asynchronous provider events accompany the response. This method performs local storage I/O and never contacts a provider or edits an interactive task. Invalid preferences and stale revisions leave the previous settings usable. After an unknown write outcome, read the current revision before deciding whether to update again.
 
-The default read shape is verified by `defaults_persist_and_reject_stale_updates` in [the settings source](../../../rust/forge/src/runtime/commit_message/settings.rs):
+An untouched store reads as follows; [the settings source](../../../rust/forge/src/runtime/commit_message/settings.rs) defines the defaults:
 
 ```json
 {"id":11,"method":"background.settings","params":{"data_root":"/tmp/forge","defaults":{"auto_compaction":{"enabled":true,"threshold_tokens":128000},"models":{"codex":{"model":"gpt-6-luna","thinking":"low"}}}}}

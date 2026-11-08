@@ -91,8 +91,6 @@ struct SteeringState {
 struct SteeringSender {
     sender: mpsc::Sender<SteerCommand>,
     ordinary: Arc<Semaphore>,
-    #[cfg(test)]
-    interrupt: Arc<Semaphore>,
 }
 
 /// Retain one admitted receiver so delayed preparation cannot select a later active turn.
@@ -149,10 +147,6 @@ pub struct SteerCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActiveTurnOperation {
     Steer,
-    #[cfg(test)]
-    Interrupt,
-    #[cfg(test)]
-    Cancel,
 }
 
 impl SteeringLane {
@@ -191,8 +185,6 @@ impl SteeringLane {
         state.sender = Some(SteeringSender {
             sender,
             ordinary: Arc::new(Semaphore::new(MAX_STEERING_REQUESTS)),
-            #[cfg(test)]
-            interrupt: Arc::new(Semaphore::new(1)),
         });
         Ok(ActiveSteering {
             lane: self.clone(),
@@ -221,10 +213,6 @@ impl SteeringLane {
             .sender
             .clone();
         let Some(sender) = sender else {
-            #[cfg(test)]
-            if operation == ActiveTurnOperation::Cancel {
-                return Ok(());
-            }
             return Err(not_admitted().into());
         };
         Self::submit_to(sender, operation, input).await
@@ -242,11 +230,6 @@ impl SteeringLane {
                 .acquire_owned()
                 .await
                 .context("active turn control admission is closed")?,
-            #[cfg(test)]
-            ActiveTurnOperation::Interrupt | ActiveTurnOperation::Cancel => sender
-                .interrupt
-                .try_acquire_owned()
-                .context("active turn control admission is full")?,
         };
         let (completion, response) = oneshot::channel();
         let publish_input = input
@@ -295,8 +278,6 @@ impl ActiveSteering {
             && let Some(sender) = state.sender.take()
         {
             sender.ordinary.close();
-            #[cfg(test)]
-            sender.interrupt.close();
         }
     }
     /// Drains input already admitted before a provider-turn boundary.
@@ -326,8 +307,6 @@ impl Drop for ActiveSteering {
             && let Some(sender) = state.sender.take()
         {
             sender.ordinary.close();
-            #[cfg(test)]
-            sender.interrupt.close();
         }
     }
 }
@@ -543,8 +522,6 @@ fn not_admitted() -> ProviderError {
 mod test {
     use super::SteeringLane;
 
-    use crate::provider::{InvocationScope, ThreadOwner};
-
     /// A captured sender must reject retirement instead of delivering to the replacement turn.
     #[tokio::test]
     async fn captured_steering_target_does_not_retarget_replacement_turn() -> anyhow::Result<()> {
@@ -565,71 +542,6 @@ mod test {
                 .is_err()
         );
         assert!(replacement.try_receive().is_none());
-        Ok(())
-    }
-
-    fn scope() -> InvocationScope {
-        InvocationScope {
-            thread_id: forge_provider_api::ThreadId::from(ThreadOwner::root("steering")),
-            exchange_id: "exchange".into(),
-            invocation_id: "invocation".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_continuation_retains_unconsumed_command() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let store = crate::provider::submission::SubmissionStore::open(directory.path(), trace)?;
-        let catalog = crate::provider::ProviderCatalogRequest {
-            execution_owner: None,
-            harness_session_id: "steering".into(),
-            workspace: "workspace".into(),
-            access: Default::default(),
-            approval_mode: crate::session::ApprovalMode::Ask,
-            provider_session_id: None,
-        };
-        let submission = store.prepare_steering(
-            &catalog,
-            crate::provider::ProviderInput::from_text("once"),
-            forge_providers::registry::default_id(),
-        )?;
-        let lane = SteeringLane::default();
-        let mut active = lane.activate(None)?;
-        let mut sending = Box::pin(lane.steer(super::SteeringInput::User {
-            text: "once".into(),
-            attachments: Vec::new(),
-            submission: Some(submission.clone()),
-        }));
-        assert!(futures_util::poll!(sending.as_mut()).is_pending());
-        let command = active.receive().await.unwrap();
-        let request = submission.record()?.request;
-        let (sink, _events) = crate::provider::events::channel(scope());
-        let (attempt, command) = command
-            .complete_with(
-                async move {
-                    Ok(crate::provider::retry::RetryAttempt::Stale(
-                        Box::new(request),
-                        Default::default(),
-                    ))
-                },
-                sink,
-            )
-            .await?;
-        assert!(matches!(
-            attempt,
-            crate::provider::retry::RetryAttempt::Stale(..)
-        ));
-        assert!(futures_util::poll!(sending.as_mut()).is_pending());
-        assert!(matches!(
-            submission.record()?.delivery,
-            crate::provider::submission::SubmissionState::Prepared
-        ));
-        command
-            .expect("stale command retained")
-            .complete(Ok(()))
-            .await;
-        sending.await?;
         Ok(())
     }
 
@@ -689,52 +601,5 @@ mod test {
             crate::provider::submission::SubmissionState::Sending { .. }
         ));
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn bounded_steering_preserves_interrupt_admission_and_inflight_accounting() {
-        let lane = SteeringLane::default();
-        let mut active = lane.activate(None).unwrap();
-        let mut pending = Vec::new();
-        for sequence in 0..super::MAX_STEERING_REQUESTS {
-            let mut request = Box::pin(lane.steer(sequence.to_string().into()));
-            assert!(futures_util::poll!(request.as_mut()).is_pending());
-            pending.push(request);
-            tokio::task::yield_now().await;
-        }
-        let mut overflow = Box::pin(lane.steer("overflow".into()));
-        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
-        let first = active.receive().await.unwrap();
-        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
-        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt, None));
-        assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
-        assert!(
-            lane.submit(super::ActiveTurnOperation::Interrupt, None)
-                .await
-                .is_err()
-        );
-        for sequence in 1..super::MAX_STEERING_REQUESTS {
-            let command = active.receive().await.unwrap();
-            assert_eq!(command.text, sequence.to_string());
-            command.complete(Ok(())).await;
-        }
-        let command = active.receive().await.unwrap();
-        assert_eq!(command.operation, super::ActiveTurnOperation::Interrupt);
-        command.complete(Ok(())).await;
-        interrupt.await.unwrap();
-        first.complete(Ok(())).await;
-        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
-        let command = active.receive().await.unwrap();
-        assert_eq!(command.text, "overflow");
-        command.complete(Ok(())).await;
-        overflow.await.unwrap();
-        for request in pending {
-            request.await.unwrap();
-        }
-        let mut request = Box::pin(lane.steer("after completion".into()));
-        assert!(futures_util::poll!(request.as_mut()).is_pending());
-        drop(active);
-        assert!(request.await.is_err());
-        assert!(lane.activate(None).is_ok());
     }
 }

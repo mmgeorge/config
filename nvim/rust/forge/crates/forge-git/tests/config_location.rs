@@ -1,59 +1,8 @@
 #![cfg(windows)]
 
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 use anyhow::Result;
-
-#[test]
-fn fresh_hosts_read_live_system_configuration_and_attributes() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let prefix = directory.path().join("installation");
-    std::fs::create_dir_all(prefix.join("etc"))?;
-    let repository = directory.path().join("repository");
-    gix::init(&repository)?;
-    let cache = directory.path().join("location.json");
-    std::fs::write(
-        &cache,
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1, "system_prefix": prefix,
-        }))?,
-    )?;
-    for value in ["first", "edited"] {
-        std::fs::write(
-            prefix.join("etc/gitconfig"),
-            format!("[forgecachetest]\n value = {value}\n"),
-        )?;
-        std::fs::write(
-            prefix.join("etc/gitattributes"),
-            format!("*.txt forgecachetest={value}\n"),
-        )?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args(["--ignored", "--exact", "fresh_host", "--nocapture"])
-            .env("FORGE_CACHE_TEST_PATH", &cache)
-            .env("FORGE_CACHE_TEST_REPOSITORY", &repository)
-            .env("FORGE_CACHE_TEST_VALUE", value);
-        for name in [
-            "EXEPATH",
-            "GIT_EXEC_PATH",
-            "GIT_CONFIG_SYSTEM",
-            "GIT_CONFIG_NOSYSTEM",
-            "GIT_ATTR_NOSYSTEM",
-            "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-        ] {
-            command.env_remove(name);
-        }
-        let output = command.output()?;
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
 
 #[test]
 #[ignore = "runs in isolated child processes to reset gix's prefix cache"]

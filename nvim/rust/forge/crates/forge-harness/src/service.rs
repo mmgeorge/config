@@ -1345,11 +1345,6 @@ impl SessionController {
             &catalog_request.harness_session_id,
         )?;
         broker.question_events = Some(exchange_owner.question_events());
-        #[cfg(test)]
-        let exchange_driver = match broker.question_wait_capacity_for_test {
-            Some(capacity) => exchange_driver.with_question_wait_capacity(capacity),
-            None => exchange_driver,
-        };
         let publications = Arc::new(crate::exchange::SessionPublications::open(
             &broker.data_root,
             &catalog_request.harness_session_id,

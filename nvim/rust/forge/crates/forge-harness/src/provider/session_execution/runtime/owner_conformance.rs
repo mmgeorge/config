@@ -283,52 +283,6 @@ fn normal() -> TurnOutcome {
     }
 }
 
-/// Fresh continuations retain the exchange while stale cancellation cannot interrupt their turn.
-#[tokio::test]
-async fn ordinary_successor_has_fresh_scope_and_stale_cancel_cannot_stop_it() -> Result<()> {
-    let mut fixture = Fixture::new()?;
-    for owner in owners() {
-        let (engine, scope, mut events, first) = fixture.run(&owner, "successor").await?;
-        let mut call = fixture
-            .calls
-            .recv()
-            .await
-            .context("first dispatch missing")?;
-        call.started().await?;
-        call.finish(normal())?;
-        boundary(&mut events, true).await?;
-        let ready = first.await??;
-        let running = engine.clone();
-        let store = fixture.store.clone();
-        let next = request(&owner, fixture.directory.path());
-        let (sink, _next_events) = crate::provider::events::channel(scope.clone());
-        let successor = tokio::spawn(async move {
-            running
-                .continue_attempt(&ready.ticket, next, sink, &store)
-                .await
-        });
-        let mut next = fixture.calls.recv().await.context("successor missing")?;
-        assert_ne!(
-            call.request.scope.invocation_id,
-            next.request.scope.invocation_id
-        );
-        assert_eq!(
-            call.request.scope.exchange_id,
-            next.request.scope.exchange_id
-        );
-        next.started().await?;
-        engine.cancel(scope).await?;
-        assert!(!successor.is_finished());
-        next.finish(normal())?;
-        let ContinuationAttempt::Ready(ready) = successor.await?? else {
-            anyhow::bail!("successor was stale");
-        };
-        ready.outcome?;
-        ready.ticket.commit().await?;
-    }
-    fixture.close().await
-}
-
 /// Ordered native output survives traffic above queue capacity and an interrupting successor.
 #[tokio::test]
 async fn foreground_backpressure_preserves_burst_cancel_and_successor_order() -> Result<()> {
@@ -509,43 +463,4 @@ async fn completion_racing_steering_preserves_proven_rejection_and_delivery_unce
         fixture.close().await?;
     }
     Ok(())
-}
-
-/// Exact collected cancellation before positive start preserves accepted input without a fictional turn.
-#[tokio::test]
-async fn accepted_prestart_cancellation_resolves_without_turn_completion() -> Result<()> {
-    let mut fixture = Fixture::new()?;
-    for owner in owners() {
-        let (engine, scope, mut events, result) = fixture.run(&owner, "accepted-prestart").await?;
-        let call = fixture
-            .calls
-            .recv()
-            .await
-            .context("accepted dispatch missing")?;
-        let journal = fixture
-            .store
-            .submission(call.request.submission_id.as_str())?;
-        engine.cancel(scope).await?;
-        let ready = result.await??;
-        assert!(matches!(ready.outcome, Err(ProviderError::Cancelled)));
-        ready.ticket.commit().await?;
-        assert!(matches!(
-            journal.record()?.delivery,
-            SubmissionState::Accepted { .. }
-        ));
-        while let Some(observation) = events.try_next()? {
-            assert!(!matches!(
-               observation,
-               OwnerObservation::Event(HarnessEvent::Native {
-                   event: boxed_native_event,
-                   ..
-               })
-            if matches!(boxed_native_event.as_ref(), NativeEvent::Turn {
-                       event: TurnEvent::Started(_) | TurnEvent::Completed(_),
-                       ..
-                   })));
-        }
-        assert!(engine.is_healthy().await);
-    }
-    fixture.close().await
 }

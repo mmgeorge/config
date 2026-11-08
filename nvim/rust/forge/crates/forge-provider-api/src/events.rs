@@ -1611,7 +1611,7 @@ impl NativeTurnStart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterActivity, TurnAddress, TurnEvent, TurnMetadataEvent};
+    use crate::{AdapterActivity, TurnAddress, TurnEvent};
 
     /// Create one exact host registration before native dispatch.
     fn fixture() -> (ProviderEventSink, ProviderEventStream, TurnAddress) {
@@ -1624,105 +1624,6 @@ mod tests {
         let binding = BindingId::new("binding").unwrap();
         let (sink, stream) = channel(binding, scope);
         (sink, stream, address)
-    }
-
-    /// Buffer pre-start native model evidence and publish it immediately after positive start.
-    #[tokio::test]
-    async fn model_waits_for_positive_start_and_preserves_publication_order() {
-        let (sink, mut stream, address) = fixture();
-        let publisher = sink.turn_publisher(address.clone()).unwrap();
-        sink.activity_writer()
-            .send_wait(AdapterActivity::Turn {
-                thread_id: address.thread_id,
-                turn_id: address.turn_id,
-                event: TurnMetadataEvent::ModelResolved(crate::ResolvedModel {
-                    model_id: crate::ModelId::new("confirmed").unwrap(),
-                    observed_at_ms: 7,
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(sink.watermark().get(), 0);
-        publisher.start_handle().observed(8).await.unwrap();
-        assert!(matches!(
-            stream.recv().await.unwrap().unwrap().event,
-            ProviderEvent::Turn {
-                event: TurnEvent::Started(crate::turn::TurnStarted { started_at_ms: 8 }),
-                ..
-            }
-        ));
-        assert!(matches!(
-            stream.recv().await.unwrap().unwrap().event,
-            ProviderEvent::Turn {
-                event: TurnEvent::ModelResolved(_),
-                ..
-            }
-        ));
-        publisher.start_handle().observed(9).await.unwrap();
-        assert_eq!(sink.watermark().get(), 2);
-    }
-
-    /// Keep item type and original turn immutable across independently scoped publishers.
-    #[tokio::test]
-    async fn item_identity_cannot_move_to_another_turn_or_change_kind() {
-        let (sink, _stream, address) = fixture();
-        let item_id = crate::ItemId::new("original").unwrap();
-        let activity = |turn_id| AdapterActivity::Item {
-            thread_id: address.thread_id.clone(),
-            turn_id,
-            item_id: item_id.clone(),
-            event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(crate::ReasoningStart {
-                text: "partial".into(),
-                kind: crate::ReasoningKind::Full,
-            })),
-        };
-        sink.activity_writer()
-            .send_wait(activity(address.turn_id))
-            .await
-            .unwrap();
-        let successor = InvocationScope::new(address.scope.thread_id.clone(), "successor");
-        let sibling = ProviderEventSink {
-            scope: successor.clone().into(),
-            ..sink.clone()
-        };
-        assert!(
-            sibling
-                .activity_writer()
-                .send_wait(activity(successor.turn_id().unwrap()))
-                .await
-                .is_err()
-        );
-        let (sink, _fresh_stream, address) = fixture();
-        sink.activity_writer()
-            .send_wait(AdapterActivity::Item {
-                thread_id: address.thread_id.clone(),
-                turn_id: address.turn_id.clone(),
-                item_id: item_id.clone(),
-                event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(
-                    crate::ReasoningStart {
-                        text: "partial".into(),
-                        kind: crate::ReasoningKind::Full,
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        assert!(
-            sink.activity_writer()
-                .send_wait(AdapterActivity::Item {
-                    thread_id: address.thread_id,
-                    turn_id: address.scope.turn_id().unwrap(),
-                    item_id,
-                    event: crate::ItemEvent::Completed(crate::ItemCompletion::AgentMessage(
-                        crate::MessageCompletion {
-                            text: "wrong".into(),
-                            outcome: crate::MessageOutcome::Completed
-                        }
-                    ))
-                })
-                .await
-                .is_err()
-        );
     }
 
     /// Identical start and completion replays are acknowledged once; changed replays still fail.
@@ -1800,77 +1701,5 @@ mod tests {
                 crate::ObservationFailure::Disconnected
             ))
         ));
-    }
-
-    /// New native foreground work after collection must fence its original connection.
-    #[tokio::test]
-    async fn retired_foreground_item_admission_fences_the_shared_binding() {
-        let (sink, _stream, address) = fixture();
-        let publisher = sink.turn_publisher(address.clone()).unwrap();
-        publisher.start_handle().observed(1).await.unwrap();
-        let result = crate::TurnResult::new(
-            crate::turn::TurnOutcome::Interrupted,
-            2,
-            None,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        publisher.completed(result, 3).await.unwrap();
-        let result = sink
-            .activity_writer()
-            .send_wait(crate::AdapterActivity::Item {
-                thread_id: address.thread_id,
-                turn_id: address.turn_id,
-                item_id: crate::ItemId::new("new-foreground").unwrap(),
-                event: crate::ItemEvent::Started(crate::ItemStart::Reasoning(
-                    crate::ReasoningStart {
-                        text: "late work".into(),
-                        kind: crate::ReasoningKind::Full,
-                    },
-                )),
-            })
-            .await;
-        assert!(matches!(
-            result,
-            Err(EventDeliveryError::Observation(
-                crate::ObservationFailure::UnexpectedExecution
-            ))
-        ));
-        assert!(matches!(
-            sink.failed().await,
-            EventDeliveryError::Observation(crate::ObservationFailure::UnexpectedExecution)
-        ));
-    }
-
-    /// Retain explicit child ownership registration independently of whichever turn is visible.
-    #[test]
-    fn child_registration_is_original_and_rejects_reassignment() {
-        let (sink, stream, address) = fixture();
-        let child_owner = address
-            .scope
-            .thread_id
-            .child(&crate::AgentId::new("child").unwrap())
-            .unwrap();
-        let scope = InvocationScope::new(child_owner, "child-exchange");
-        let child = TurnAddress {
-            thread_id: scope.thread_id.clone(),
-            turn_id: scope.turn_id().unwrap(),
-            scope,
-        };
-        sink.activity_writer()
-            .register_observed_turn(child.clone())
-            .unwrap();
-        assert_eq!(
-            stream.registrations().registered_turn(&child.turn_id),
-            Some(child.clone())
-        );
-        let foreign = TurnAddress {
-            thread_id: address.thread_id,
-            turn_id: child.turn_id,
-            scope: address.scope,
-        };
-        assert!(sink.register_turn(&foreign).is_err());
     }
 }

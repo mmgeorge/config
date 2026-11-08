@@ -108,4 +108,71 @@ T["rule_actions"] = function()
   assert(#notifications == previous_notifications, "malformed reload was published to Harper")
 end
 
+T["dictionary_actions"] = function()
+  local wordlist_path = temp.file("wordlist.txt", { "# Version-controlled vocabulary", "repo" })
+  local cache = temp.directory("cache")
+  local stdpath = vim.fn.stdpath
+  vim.fn.stdpath = function(kind) return kind == "cache" and cache or stdpath(kind) end
+  local text_correction = { wordlist = wordlist_path, terminology = {}, project_terms = {} }
+  package.loaded["forge.infra.config"] = { options = { text_correction = text_correction,
+    harper = { enabled = true, cmd = { vim.v.progpath }, disabled_rules = false, settings = { linters = { SpellCheck = true } } } } }
+  package.loaded["forge.text"] = { invalidate = function() end }
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local notifications = {}
+  local captured
+  local client = { id = 1, is_stopped = function() return false end,
+    notify = function(_, method, params) notifications[#notifications + 1] = { method = method, params = params } return true end }
+  vim.lsp.start = function(settings) captured = settings client.settings = settings.settings return client.id end
+  vim.lsp.get_client_by_id = function() return client end
+  local buffer = buffer_support.scratch({ "Use recieve spelling." }, { name = "ForgeTest://dictionary" })
+  vim.api.nvim_set_current_buf(buffer)
+  local uri = vim.uri_from_bufnr(buffer)
+  local word_range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 11 } }
+  -- Harper offers its user, workspace, and file dictionaries in both command shapes beside an edit.
+  vim.lsp.rpc.start = function()
+    return { notify = function() return true end, request = function(_, _, callback)
+      callback(nil, {
+        { title = 'Replace with "receive"', edit = { changes = { [uri] = { { range = word_range, newText = "receive" } } } } },
+        { title = "Add to user dictionary", command = { command = "HarperAddToUserDict", arguments = { "recieve" } } },
+        { title = "Add to workspace dictionary", command = { command = "HarperAddToWSDict", arguments = { "recieve" } } },
+        { title = "Add to file dictionary", command = "HarperAddToFileDict", arguments = { "recieve" } },
+      })
+      return true
+    end }
+  end
+  local harper = require("forge.text.harper")
+  harper.attach(buffer, { kind = "prose", root = vim.fn.getcwd() })
+  wait_until(function() return captured ~= nil end, "Harper attach did not start a language client", { timeout_ms = 2000 })
+  local initial_dictionary = captured.settings["harper-ls"].userDictPath
+  assert(vim.fs.normalize(initial_dictionary) ~= vim.fs.normalize(wordlist_path), "Harper received the commented source wordlist")
+  assert(vim.tbl_contains(vim.fn.readfile(initial_dictionary), "repo"), "published dictionary omitted the configured wordlist")
+  local connection = captured.cmd({})
+  local function titles()
+    local offered
+    connection.request("textDocument/codeAction", { textDocument = { uri = uri }, range = word_range,
+      context = { diagnostics = {} } }, function(failure, value) assert(not failure, failure) offered = value end)
+    return offered, vim.tbl_map(function(action) return action.title end, offered)
+  end
+
+  local offered, offered_titles = titles()
+  eq(offered_titles, { 'Replace with "receive"', 'Add "recieve" to the global dictionary' })
+  text_correction.wordlist = false
+  eq(select(2, titles()), { 'Replace with "receive"' }, { fail_reason = "a disabled wordlist still offered dictionary actions" })
+  text_correction.wordlist = wordlist_path
+  offered = titles()
+  captured.commands[offered[2].command.command](offered[2].command)
+  wait_until(function() return client.settings["harper-ls"].userDictPath ~= initial_dictionary end,
+    "adding a word did not refresh Harper's dictionary", { timeout_ms = 2000, context = function() return vim.inspect(errors:messages()) end })
+  local saved = vim.fn.readfile(wordlist_path)
+  eq(saved[1], "# Version-controlled vocabulary", { fail_reason = "adding a word rewrote the wordlist's comments" })
+  assert(vim.tbl_contains(saved, "recieve"), vim.inspect(saved))
+  assert(vim.tbl_contains(vim.fn.readfile(client.settings["harper-ls"].userDictPath), "recieve"),
+    "the refreshed Harper dictionary omitted the accepted word")
+  eq(vim.tbl_map(function(notification) return notification.method end, notifications),
+    { "workspace/didChangeConfiguration", "textDocument/didChange" })
+  eq(notifications[2].params.contentChanges[1].text, "Use recieve spelling.",
+    { fail_reason = "Harper did not recheck the unsaved editor text" })
+  eq(#errors, 0, { fail_reason = vim.inspect(errors:messages()) })
+end
+
 return T

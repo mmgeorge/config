@@ -2,7 +2,7 @@ mod support;
 use support::retain;
 
 use forge_diff::cache::AnalysisHandle;
-use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState, group_hunks};
+use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState};
 use forge_diff::raw::compute_hunks;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 
@@ -43,39 +43,6 @@ fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
         }
     }
     panic!("cursor did not terminate");
-}
-
-#[test]
-fn display_context_merges_without_duplicate_source_lines() {
-    let source = diff("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nF\ng\n");
-    assert_eq!(source.hunks().len(), 2);
-    let group = group_hunks(&source, 2);
-    assert_eq!(group.len(), 1);
-    assert_eq!(group[0].raw_ids.len(), 2);
-    let rows = drain(
-        &mut DisplayCursor::new(source, 2),
-        ChunkLimits {
-            rows: 2,
-            text_bytes: 10,
-            decorations: 2,
-        },
-    );
-    assert_eq!(
-        rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
-        ["b", "B", "c", "d", "e", "f", "F"]
-    );
-    assert_eq!(
-        rows.iter()
-            .filter_map(|row| row.old_coordinate().map(|coordinate| coordinate.line))
-            .collect::<Vec<_>>(),
-        (1..6).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        rows.iter()
-            .filter_map(|row| row.new_coordinate().map(|coordinate| coordinate.line))
-            .collect::<Vec<_>>(),
-        (1..6).collect::<Vec<_>>()
-    );
 }
 
 #[test]

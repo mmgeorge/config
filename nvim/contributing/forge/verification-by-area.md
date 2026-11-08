@@ -8,20 +8,20 @@ Run Rust filters as `cargo nextest run --cargo-profile dev --locked -p <package>
 
 | Area | Rust filters (`forge-harness` unless noted) | Editor fixtures |
 | --- | --- | --- |
-| Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | None |
+| Project checks | `checks::` | None |
 | Plan review | `plan::` | `document::document`, `checks::plan_check_selection`, `workspace_definition::plan_workspace_definition` |
 | Provider lifecycle | Exact selectors and package ownership below | `harness::prompt_lifecycle` |
-| Input and queues | `broker::input_test::deferred_steering_cancellation_preserves_acceptance_boundary` | None |
+| Input and queues | `broker::test::input::` | None |
 | Transcript folds | None | `harness::message_folds` |
 | Agent LSP tools | None | `lsp/semantic.test.lua::lsp_query`, `startup::startup`, `startup::lazy_startup`, `semantic::workspace` |
-| Background generation | `background::tests`, `compaction`, and `commit_message::` in `forge` | `harness::background`, `commit_settings` |
+| Background generation | `compaction` and `commit_message::` in `forge` | `harness::background`, `commit_settings` |
 | Configuration controls | None | `picker::picker`, `settings::settings`, `commit_settings` |
 | Provider registry | None | `client::provider_registry_config_reload` |
 | Harness tab labels | None | `harness::controller_native` |
 
 ## Project checks
 
-Check resolution affects declared inputs, concrete commands, and the evidence the automatic gate accepts. The `checks::` tests cover typed inputs, literal argv substitution, callback receipts, evidence identity, cancellation, and prerequisite failures. These Rust tests own check behavior; no editor fixture repeats it.
+Check resolution affects declared inputs, concrete commands, and the evidence the automatic gate accepts. The `checks::` tests cover durable tool receipts and revoked configuration callbacks. Check command execution has no Rust test, because `CheckSupervisor` launches every command as a real process; verify a change to command execution manually and record the command and result.
 
 See [Extending project checks](extending-project-checks.md) when changing input binding or repository callbacks.
 

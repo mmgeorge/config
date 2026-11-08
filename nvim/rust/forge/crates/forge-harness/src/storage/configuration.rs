@@ -23,11 +23,6 @@ struct PendingConfiguration {
 }
 
 impl SqliteStore {
-    #[cfg(test)]
-    pub(crate) fn execute_configuration_test_sql(&self, sql: &str) -> Result<()> {
-        self.connection.execute_batch(sql)?;
-        Ok(())
-    }
     pub(super) fn ensure_no_configuration_intent(
         connection: &Connection,
         session: &str,

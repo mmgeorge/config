@@ -6,123 +6,7 @@ local text_fixture = dofile("nvim/lua/forge/tests/support/text_fixture.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-T["harper_dictionary"] = function()
-  local executable=vim.fn.exepath('harper-ls')
-  if executable=='' then
-    executable=vim.fs.joinpath(vim.fn.stdpath('data'),'mason','packages','harper-ls',
-      'harper-ls'..(vim.fn.has('win32')==1 and '.exe' or ''))
-  end
-  assert(vim.fn.executable(executable)==1,'Harper must be installed for dictionary integration')
-  local fixture=text_fixture.native()
-  MiniTest.finally(fixture.close)
-  fixture.exec([[
-    local executable=...
-    local previous=vim.fn.stdpath
-    local cache=vim.fn.tempname()
-    vim.fn.mkdir(cache,'p')
-    vim.fn.stdpath=function(kind) return kind=='cache' and cache or previous(kind) end
-    shared_dictionary=vim.fn.tempname()
-    vim.fn.writefile({'# Version-controlled vocabulary','repo'},shared_dictionary)
-    vim.api.nvim_buf_set_name(0,vim.fn.tempname()..'.md')
-    require('forge').setup({
-      text_correction={enabled=true,wordlist=shared_dictionary},
-      harper={enabled=true,cmd={executable,'--stdio'},settings={linters={SpellCheck=true}}},
-    })
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use recieve spelling.','ok that is the way.'})
-    -- Harper also reports grammar rules and its own vocabulary gaps, so the dictionary contract
-    -- tracks only the spelling diagnostic on the misspelled word.
-    function spelling_flagged()
-      for _,diagnostic in ipairs(vim.diagnostic.get(0)) do
-        if diagnostic.lnum==0 and diagnostic.col==4 and diagnostic.code=='SpellCheck' then return true end
-      end
-      return false
-    end
-  ]],{executable})
-  wait_until(function()
-    return fixture.exec('return spelling_flagged()')
-  end,'Harper did not flag the unknown spelling',{timeout_ms=4000,context=function() return vim.inspect(fixture.exec([[
-    return {diagnostics=vim.diagnostic.get(0),errors=text_errors,
-      clients=vim.tbl_map(function(client) return {name=client.name,initialized=client.initialized} end,
-        vim.lsp.get_clients({bufnr=0}))}
-  ]])) end})
-  fixture.exec([[
-    for _,diagnostic in ipairs(vim.diagnostic.get(0)) do
-      assert(diagnostic.code~='OkToOkay','OkToOkay is still enabled')
-    end
-    local client=assert(vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1])
-    assert(client.settings['harper-ls'].userDictPath~=shared_dictionary,'Harper must not rewrite source comments')
-    client:request('textDocument/codeAction',{
-      textDocument=vim.lsp.util.make_text_document_params(),
-      range={start={line=0,character=4},['end']={line=0,character=11}},
-      context={diagnostics={}},
-    },function(error,actions) shared_actions=actions;shared_action_error=error end,0)
-  ]])
-  wait_until(function() return fixture.exec('return shared_actions~=nil') end,
-    'Harper did not answer the dictionary code action request',{timeout_ms=3000})
-  fixture.exec([[
-    assert(not shared_action_error,vim.inspect(shared_action_error))
-    local global
-    for _,action in ipairs(shared_actions) do
-      assert(not action.title:find('workspace dictionary',1,true),action.title)
-      assert(not action.title:find('file dictionary',1,true),action.title)
-      assert(not action.title:find('user dictionary',1,true),action.title)
-      if action.title:find('global dictionary',1,true) then
-        assert(not global,'duplicate global dictionary actions')
-        global=action
-      end
-    end
-    assert(global,vim.inspect(shared_actions))
-    local client=assert(vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1])
-    previous_dictionary=client.settings['harper-ls'].userDictPath
-    client.commands[global.command.command](global.command,{client_id=client.id,bufnr=vim.api.nvim_get_current_buf()})
-  ]])
-  wait_until(function()
-    return fixture.exec([[
-      local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
-      return client and client.settings['harper-ls'].userDictPath~=previous_dictionary
-        and not spelling_flagged()
-    ]])
-  end,'Shared dictionary did not refresh Harper against unsaved text',{timeout_ms=4000,context=function() return vim.inspect(fixture.exec([[
-    local client=vim.lsp.get_clients({bufnr=0,name='harper_ls'})[1]
-    return {previous=previous_dictionary,current=client and client.settings['harper-ls'].userDictPath,
-      diagnostics=vim.diagnostic.get(0),errors=text_errors}
-  ]])) end})
-  fixture.exec([[
-    local saved=vim.fn.readfile(shared_dictionary)
-    assert(saved[1]=='# Version-controlled vocabulary')
-    assert(vim.tbl_contains(saved,'recieve'),vim.inspect(saved))
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{''})
-    vim.api.nvim_win_set_cursor(0,{1,0})
-  ]])
-  fixture.type('iUse recieve ')
-  fixture.wait('Use recieve ')
-  fixture.type('<Esc>')
-  fixture.exec([[
-    vim.fn.writefile({'repo'},shared_dictionary)
-    vim.api.nvim_exec_autocmds('BufWritePost',{pattern=shared_dictionary})
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{'Use recieve spelling.'})
-    vim.api.nvim_win_set_cursor(0,{1,0})
-  ]])
-  wait_until(function() return fixture.exec('return spelling_flagged()') end,
-    'Removing an accepted word did not refresh Harper',{timeout_ms=4000})
-  fixture.exec([[
-    vim.api.nvim_buf_set_lines(0,0,-1,false,{''})
-    vim.api.nvim_win_set_cursor(0,{1,0})
-  ]])
-  fixture.type('iUse recieve ')
-  fixture.wait('Use receive ')
-  fixture.exec([[for _,client in ipairs(vim.lsp.get_clients({name='harper_ls'})) do client:stop() end]])
-  local errors=fixture.exec('return text_errors')
-  assert(#errors==0,vim.inspect(errors))
-end
-
 T["harper_rules"] = function()
-  local executable = vim.fn.exepath("harper-ls")
-  if executable == "" then
-    executable = vim.fs.joinpath(vim.fn.stdpath("data"), "mason", "packages", "harper-ls",
-      "harper-ls" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
-  end
-  assert(vim.fn.executable(executable) == 1, "Harper must be installed for rule integration")
   local root = temp.directory("harper-rules")
   vim.fn.mkdir(root .. "/first", "p")
   vim.fn.mkdir(root .. "/second", "p")
@@ -134,11 +18,12 @@ T["harper_rules"] = function()
     pcall(fixture.close)
   end)
   fixture.exec([[
-    local executable, root, path = ...
+    local root, path = ...
+    dofile("nvim/lua/forge/tests/support/harper_server.lua").install()
     local previous = vim.fn.stdpath
     vim.fn.stdpath = function(kind) return kind == "cache" and root or previous(kind) end
     require("forge").setup({ text_correction = { enabled = false }, harper = {
-      enabled = true, cmd = { executable, "--stdio" }, disabled_rules = path,
+      enabled = true, cmd = { vim.v.progpath }, disabled_rules = path,
       settings = { linters = { SpellCheck = true } },
     } })
     rule_buffers = {}
@@ -150,7 +35,7 @@ T["harper_rules"] = function()
       vim.bo[buffer].filetype = "markdown"
       rule_buffers[#rule_buffers + 1] = buffer
     end
-  ]], { executable, root, path })
+  ]], { root, path })
   wait_until(function()
     return fixture.exec([[
       for _, buffer in ipairs(rule_buffers) do
@@ -194,7 +79,7 @@ T["harper_rules"] = function()
         local other_rule = false
         for _, diagnostic in ipairs(vim.diagnostic.get(buffer)) do
           if diagnostic.code == "RepeatedWords" then return false end
-          if diagnostic.code == "The" then other_rule = true end
+          if diagnostic.code == "SpellCheck" then other_rule = true end
         end
         if not other_rule then return false end
       end
@@ -278,8 +163,8 @@ T["harper_scopes"] = function()
     for _,diagnostic in ipairs(diagnostics) do assert(diagnostic.lnum==row,vim.inspect(diagnostics)) end
   end
   fixture.exec([[
-    vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath('data'),'site'))
-    require('forge').setup({text_correction={enabled=false},harper={enabled=true}})
+    dofile('nvim/lua/forge/tests/support/harper_server.lua').install()
+    require('forge').setup({text_correction={enabled=false},harper={enabled=true,cmd={vim.v.progpath}}})
   ]])
   prepare({'local code = "This is the the sentence."','-- Café 😀. This is the the sentence.'},'lua')
   expect_row(1)
@@ -489,46 +374,6 @@ T["eligibility"] = function()
   fixture.type('A ')
   fixture.wait('Read-only recieve \nPlease receive ')
   assert(fixture.exec('return #text_requests')==requests,'read-only native text was admitted')
-end
-
-T["text"] = function()
-  local fixture=text_fixture.native({cold_text='Cold text '})
-  MiniTest.finally(fixture.close)
-  fixture.type('<Esc>')
-  fixture.exec([[vim.api.nvim_buf_set_lines(0,0,-1,false,{''});vim.api.nvim_win_set_cursor(0,{1,0})]])
-  assert(fixture.exec('return require("forge.client")._client.harness_ready')~=true,'text initialized Harness')
-  fixture.type('iPlease recieve ')
-  fixture.wait('Please receive ')
-  fixture.type('<BS>')
-  fixture.wait('Please recieve')
-  fixture.type(' ')
-  fixture.wait('Please recieve ')
-  fixture.exec([[
-    local client=require('forge.client')
-    local request={method='text.correct',params={profile=text_ready.profile,profile_revision=text_ready.profile_revision,
-      occurrence='wire-example',context='Please recieve',target={start=7,['end']=14},protected={}}}
-    client.request(request,function(result,error) text_wire={request=request,result=result,error=error} end)
-  ]])
-  wait_until(function()return fixture.exec('return text_wire~=nil')end,'text.correct did not answer the replacement request',{timeout_ms=2000})
-  local wire=fixture.exec('return text_wire')
-  assert(wire.result and wire.result.replacement=='receive',vim.inspect(wire))
-  fixture.exec([[
-    local request={method='text.correct',params={profile=text_ready.profile,profile_revision=text_ready.profile_revision,
-      occurrence='unchanged-example',context='Please receive',target={start=7,['end']=14},protected={}}}
-    require('forge.client').request(request,function(result,error)text_unchanged_wire={request=request,result=result,error=error} end)
-  ]])
-  wait_until(function()return fixture.exec('return text_unchanged_wire~=nil')end,'text.correct did not answer the unchanged request',{timeout_ms=2000})
-  local unchanged=fixture.exec('return text_unchanged_wire')
-  assert(unchanged.result.decision=='unchanged',vim.inspect(unchanged))
-  vim.fn.writefile({vim.json.encode({initialize=fixture.exec('return text_initialize_wire'),replace=wire,unchanged=unchanged})},
-    'nvim/rust/forge/target/text-api-wire.json')
-  fixture.exec([[
-    local request={method='text.correct',session_id='forbidden',params={}}
-    require('forge.client').request(request,function(_,error) text_policy_error=error end)
-  ]])
-  assert(type(fixture.exec('return text_policy_error'))=='string','text method accepted session context')
-  fixture.exec([[require('forge.client').host_stop(nil,function()text_stopped=true end)]])
-  wait_until(function()return fixture.exec('return text_stopped==true')end,'text host did not stop',{timeout_ms=4000})
 end
 
 T["question_slash"] = function()

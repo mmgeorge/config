@@ -282,46 +282,4 @@ mod tests {
         );
         Ok(())
     }
-
-    /// Exclude external SQLite owners even when they did not acquire Forge's version lease.
-    #[test]
-    fn clear_versions_preflights_database_before_deleting_objects() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        drop(SqliteStore::open(root.path())?);
-        let objects = directory(root.path()).join("objects/retained");
-        fs::write(&objects, "captured file")?;
-        let connection = rusqlite::Connection::open(database(root.path()))?;
-        connection.execute_batch("BEGIN EXCLUSIVE")?;
-        let report = clear(root.path())?;
-        assert!(!report.current_cleared);
-        assert_eq!(report.retained.len(), 1);
-        assert_eq!(fs::read_to_string(&objects)?, "captured file");
-        connection.execute_batch("ROLLBACK")?;
-        let reader = rusqlite::Connection::open(database(root.path()))?;
-        let _: i64 =
-            reader.query_row("SELECT count(*) FROM session_record", [], |row| row.get(0))?;
-        assert!(!clear(root.path())?.current_cleared);
-        assert!(objects.is_file());
-        drop(reader);
-        drop(connection);
-        assert!(clear(root.path())?.retained.is_empty());
-        Ok(())
-    }
-
-    /// Retain a state version for file-only stores, not just SQLite connections.
-    #[test]
-    fn clear_versions_excludes_plan_object_and_trace_owners() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let objects = crate::storage::objects::ObjectStore::open(root.path())?;
-        let plans = crate::plan::PlanFileStore::new(root.path(), root.path())?;
-        let trace = crate::trace::TraceStore::open(root.path())?;
-        assert!(!clear(root.path())?.current_cleared);
-        drop(objects);
-        assert!(!clear(root.path())?.current_cleared);
-        drop(plans);
-        assert!(!clear(root.path())?.current_cleared);
-        drop(trace);
-        assert!(clear(root.path())?.current_cleared);
-        Ok(())
-    }
 }

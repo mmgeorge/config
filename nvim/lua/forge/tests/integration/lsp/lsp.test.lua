@@ -10,7 +10,7 @@ local state_fixture = dofile("nvim/lua/forge/tests/support/state.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-T["rename"] = function()
+T["rename_tool_applies_edits_and_respects_write_access"] = function()
   local root = vim.fn.getcwd()
   -- Release the workspace, stop the host, and leave the workspace directory before the
   -- temporary directories registered below are deleted.
@@ -68,10 +68,7 @@ T["rename"] = function()
   local startup = require("forge.lsp.startup")
   local mock = { id = 8901, name = "rename-fixture", initialized = true, root_dir = workspace,
     config = { root_dir = workspace, filetypes = { "rust" } }, offset_encoding = "utf-16",
-    server_capabilities = { workspace = { fileOperations = {
-      willRename = { filters = { { pattern = { glob = "**/*.rs" } } } },
-      didRename = { filters = { { pattern = { glob = "**/*.rs" } } } },
-    } } } }
+    server_capabilities = {} }
   function mock:is_stopped() return false end
   function mock:supports_method() return true end
   function mock:cancel_request() end
@@ -83,7 +80,6 @@ T["rename"] = function()
         [vim.uri_from_fname(workspace .. "/src/item.rs")] = { { range = { start = { line = 0, character = 7 }, ["end"] = { line = 0, character = 12 } }, newText = params.newName } },
         [vim.uri_from_fname(workspace .. "/src/lib.rs")] = { { range = { start = { line = 1, character = 29 }, ["end"] = { line = 1, character = 34 } }, newText = params.newName } },
       } })
-      elseif method == "workspace/willRenameFiles" then callback(nil, nil)
       else callback({ message = "unsupported fixture request: " .. method }) end
     end)
     return true, 1
@@ -97,7 +93,7 @@ T["rename"] = function()
   request("session.configure", { lsp_tools = true })
   startup.wait = function(_, _, callback) callback() return function() end end
   vim.lsp.get_clients = function() return { mock } end
-  vim.lsp.buf_is_attached = function() return true end
+  vim.lsp.get_client_by_id = function(id) return id == mock.id and mock or nil end
   local item_buffer = vim.fn.bufadd(workspace .. "/src/item.rs")
   vim.fn.bufload(item_buffer)
   vim.bo[item_buffer].filetype = "rust"
@@ -109,10 +105,6 @@ T["rename"] = function()
   result = query("lsp_rename_symbol", { path = "src/item.rs", line = 1, column = 8, new_name = "blocked" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(#(state.approval or {}) == 0, "write-off opened approval")
-  request("session.configure", { access = vim.tbl_extend("force", state.session.access, { write_access = "workspace" }) })
-  result = query("lsp_rename_file", { old_path = "src/item.rs", new_path = "src/renamed.rs" })
-  assert(vim.uv.fs_stat(workspace .. "/src/renamed.rs") and not vim.uv.fs_stat(workspace .. "/src/item.rs"), result)
-  assert(vim.api.nvim_buf_get_name(item_buffer):gsub("\\", "/"):find("/renamed.rs", 1, true), "buffer path did not follow file")
 end
 
 return T

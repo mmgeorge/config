@@ -369,10 +369,6 @@ impl HarnessBroker {
             ForegroundSignal::RevisionReview(request) => {
                 self.apply_foreground_revision(transaction, request)
             }
-            #[cfg(test)]
-            ForegroundSignal::RevisionChecksUpdated { response, result } => {
-                Ok(self.apply_foreground_revision_checks(transaction, response, *result))
-            }
             // A scan is ordinary work that collection's closed effect gate keeps staged. Finalization
             // would then wait on a result that only arrives once the collecting command times out.
             ForegroundSignal::PlanScan if transaction.collection.is_some() => {

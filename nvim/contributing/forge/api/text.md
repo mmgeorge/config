@@ -47,5 +47,3 @@ The authoritative request and result types are [contract.rs](../../../rust/forge
 ## Captured exchanges
 
 The [historical native-host fixture capture](examples/text-exchange.json) contains actual client specifications and decoded results from `en-US-bigram-1` for initialization, a contextual replacement, and an unchanged decision. Its `then` to `than` example describes the earlier policy and is no longer an automatic correction. The capture preserves model/profile revisions and occurrence tokens; transport request identifiers belong to the existing envelope and are not part of these method parameters.
-
-`text_host.lua` writes a current capture to `nvim/rust/forge/target/text-api-wire.json` against the rebuilt executable, using `recieve` to `receive` as its replacement example. It also checks cold-start typing, Backspace rejection, forbidden session context, provider independence, and host shutdown.

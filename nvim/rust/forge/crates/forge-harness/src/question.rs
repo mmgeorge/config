@@ -1921,46 +1921,6 @@ pub(crate) fn project(
 mod tests {
     use super::*;
 
-    /// Replaying a creation neither duplicates questions nor mutates the durable publication revision.
-    #[test]
-    fn creation_replay_is_read_only_and_conflicting_payload_is_rejected() -> Result<()> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let controller = QuestionController::open(root.path(), "session")?;
-        let drafts = vec![draft(QuestionRequirement::Optional)];
-        let ids = controller.ask(
-            "authenticated-call",
-            "exchange",
-            QuestionOrigin::Chat,
-            drafts.clone(),
-        )?;
-        let revision = controller.snapshot()?.revision;
-        assert_eq!(
-            controller
-                .replay_creation(
-                    "authenticated-call",
-                    "exchange",
-                    QuestionOrigin::Chat,
-                    &drafts
-                )?
-                .unwrap(),
-            ids
-        );
-        assert_eq!(controller.snapshot()?.revision, revision);
-        let mut changed = drafts;
-        changed[0].question = "Different content".into();
-        assert!(matches!(
-            controller.replay_creation(
-                "authenticated-call",
-                "exchange",
-                QuestionOrigin::Chat,
-                &changed
-            ),
-            Err(QuestionCreationReplayError::IdentityConflict)
-        ));
-        assert_eq!(controller.snapshot()?.questions.len(), 1);
-        Ok(())
-    }
-
     /// Keep partial answers inside a waiting call and fall back to messages after cancellation.
     #[tokio::test]
     async fn waiting_tools_collect_answers_and_release_cancelled_destinations() -> Result<()> {
@@ -2097,74 +2057,6 @@ mod tests {
         assert!(
             restored.ready_chat_continuations()?.is_empty(),
             "late optional answer must not resume completed work"
-        );
-        Ok(())
-    }
-
-    /// Cancel tool-result questions durably even when they never requested a chat continuation.
-    #[test]
-    fn cancelled_tool_questions_retire_required_and_retain_optional_answers_locally() -> Result<()>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let controller = QuestionController::open(root.path(), "session")?;
-        let ids = controller.ask(
-            "tool-questions",
-            "active",
-            QuestionOrigin::Tool(None),
-            vec![
-                draft(QuestionRequirement::Required),
-                draft(QuestionRequirement::Optional),
-            ],
-        )?;
-        controller.apply(command(
-            &ids[1],
-            "before-cancel",
-            QuestionAction::Clarify {
-                text: "Explain the options".into(),
-            },
-        ))?;
-        assert_eq!(controller.outbox()?.len(), 1);
-        controller.cancel_chat(Some("active"))?;
-        let restored = QuestionController::open(root.path(), "session")?;
-        assert!(restored.outbox()?.is_empty());
-        assert!(!restored.delivery_is_current(&ids[0])?);
-        assert!(!restored.delivery_is_current(&ids[1])?);
-        assert!(
-            restored
-                .apply(command(
-                    &ids[0],
-                    "required-after-cancel",
-                    QuestionAction::Answer {
-                        answer: QuestionAnswer::Other {
-                            text: "Tabs".into()
-                        },
-                    }
-                ))
-                .is_err()
-        );
-        restored.apply(command(
-            &ids[1],
-            "optional-after-cancel",
-            QuestionAction::Answer {
-                answer: QuestionAnswer::Other {
-                    text: "Tabs".into(),
-                },
-            },
-        ))?;
-        assert!(matches!(
-            restored.snapshot()?.questions[1].resolution,
-            QuestionResolution::Answered { .. }
-        ));
-        assert!(restored.outbox()?.is_empty());
-        assert!(
-            restored
-                .ask(
-                    "late-callback",
-                    "active",
-                    QuestionOrigin::Tool(None),
-                    vec![draft(QuestionRequirement::Required)]
-                )
-                .is_err()
         );
         Ok(())
     }

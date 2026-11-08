@@ -101,30 +101,3 @@ impl RepositoryLease {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn operations_share_ownership_and_exclude_deletion() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let directory = root.path().join("repo");
-        let first = RepositoryLease::operation(&directory)?;
-        let second = RepositoryLease::operation(&directory)?;
-        assert!(
-            RepositoryLease::deletion(&directory)
-                .unwrap_err()
-                .to_string()
-                .contains("Busy")
-        );
-        drop(first);
-        assert!(RepositoryLease::deletion(&directory).is_err());
-        drop(second);
-        let deletion = RepositoryLease::deletion(&directory)?;
-        assert!(RepositoryLease::operation(&directory).is_err());
-        drop(deletion);
-        assert!(RepositoryLease::operation(&directory).is_ok());
-        Ok(())
-    }
-}

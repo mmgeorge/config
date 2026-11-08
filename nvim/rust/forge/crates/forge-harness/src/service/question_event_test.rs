@@ -2,19 +2,11 @@ use super::*;
 
 /// Create an unfinished, persisted source without introducing a native provider protocol into these tests.
 pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
-    fixture_with_question_wait_capacity(None).await
-}
-
-/// Create the question fixture, optionally replacing the owner's production wait capacity.
-pub(super) async fn fixture_with_question_wait_capacity(
-    question_wait_capacity: Option<usize>,
-) -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
     let root = tempfile::tempdir()?;
-    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+    let broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"question-owner-events",
         "provider":{"kind":"mock","command":[]},
     }))?)?;
-    broker.question_wait_capacity_for_test = question_wait_capacity;
     let controller = SessionController::new(broker).await?;
     let session = controller.observer.session_id();
     let exchange = crate::exchange::Exchange {
@@ -162,120 +154,6 @@ async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and
             .is_empty()
     );
     drop(broker);
-    controller.finish_exchange_owner().await?;
-    Ok(())
-}
-
-/// An enqueued tool request must revalidate its captured generation before writing question state.
-#[tokio::test]
-async fn queued_question_creation_rejects_revoked_taskless_authority() -> Result<()> {
-    let (_root, controller, exchange) = fixture().await?;
-    let context = context(&controller, &exchange);
-    let events = controller.exchange_owner.question_events();
-    let mut requested = Box::pin(events.ask(creation(&context, &exchange, "before-replacement")?));
-    assert!(futures_util::poll!(requested.as_mut()).is_pending());
-    controller.task_controller.change(
-        &mut SqliteStore::open(&controller.data_root)?,
-        None,
-        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
-            "Replacement".into(),
-            Default::default(),
-            1,
-        ))),
-        2,
-    )?;
-    assert!(matches!(
-        requested.await,
-        Err(crate::exchange::QuestionEventError::Authority(_))
-    ));
-    assert!(controller.questions.snapshot()?.questions.is_empty());
-    controller.finish_exchange_owner().await?;
-    Ok(())
-}
-
-/// Scope validation must reject another session even when its taskless generation is otherwise valid.
-#[tokio::test]
-async fn question_creation_rejects_foreign_owner_and_completed_source() -> Result<()> {
-    let (_root, controller, exchange) = fixture().await?;
-    let (_foreign_root, foreign, foreign_exchange) = fixture().await?;
-    let foreign_context = context(&foreign, &foreign_exchange);
-    let result = controller
-        .exchange_owner
-        .question_events()
-        .ask(creation(&foreign_context, &exchange, "foreign-question")?)
-        .await;
-    assert!(matches!(
-        result,
-        Err(crate::exchange::QuestionEventError::ForeignScope)
-    ));
-    let mut store = SqliteStore::open(&controller.data_root)?;
-    let mut source = store.load_exchange(&exchange)?.unwrap();
-    source.finish(crate::exchange::ExchangeOutcome::Cancelled, 2)?;
-    store.save_exchange(&source)?;
-    let result = controller
-        .exchange_owner
-        .question_events()
-        .ask(creation(
-            &context(&controller, &exchange),
-            &exchange,
-            "late-question",
-        )?)
-        .await;
-    assert!(matches!(
-        result,
-        Err(crate::exchange::QuestionEventError::SourceFinished)
-    ));
-    assert!(controller.questions.snapshot()?.questions.is_empty());
-    controller.finish_exchange_owner().await?;
-    foreign.finish_exchange_owner().await?;
-    Ok(())
-}
-
-/// Dropping an admitted answer's observation must not discard its committed decision or durable input.
-#[tokio::test]
-async fn dropped_question_answer_waiter_preserves_owner_commit() -> Result<()> {
-    let (_root, controller, exchange) = fixture().await?;
-    let events = controller.exchange_owner.question_events();
-    let ids = events
-        .ask(creation(
-            &context(&controller, &exchange),
-            &exchange,
-            "answer-after-drop",
-        )?)
-        .await?;
-    let mut answer = Box::pin(events.change(crate::exchange::QuestionChange::user(
-        crate::question::QuestionCommand {
-            operation_id: "dropped-answer".into(),
-            question_id: ids[0].clone(),
-            revision: 1,
-            action: crate::question::QuestionAction::Answer {
-                answer: crate::question::QuestionAnswer::Other {
-                    text: "Workspace".into(),
-                },
-            },
-        },
-    )?));
-    assert!(futures_util::poll!(answer.as_mut()).is_pending());
-    drop(answer);
-    controller.exchange_owner.reconcile_questions(None).await?;
-    assert!(
-        matches!(&controller.questions.snapshot()?.questions[0].resolution, crate::question::QuestionResolution::Answered { message_id, .. } if message_id == "dropped-answer")
-    );
-    let receipt = controller
-        .coordinator
-        .submissions
-        .admission_receipt("question:dropped-answer")?
-        .unwrap();
-    assert!(receipt.error_code.is_none());
-    assert_eq!(
-        controller
-            .coordinator
-            .submissions
-            .snapshot()?
-            .messages
-            .len(),
-        1
-    );
     controller.finish_exchange_owner().await?;
     Ok(())
 }

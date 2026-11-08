@@ -1229,9 +1229,8 @@ end
 
 T["semantic"] = function()
   local commit_fixture = vim.g.forge_commit_semantic_fixture == true
-  local fixture_path = "nvim/rust/forge/target/" .. (commit_fixture and "review-commit-semantic-fixture.json" or "review-semantic-fixture.json")
-  assert(vim.fn.filereadable(fixture_path) == 1,
-    "run file_diff_controls_share_visibility_and_preserve_lazy_source_actions first")
+  local fixture_path = "nvim/lua/forge/tests/fixtures/protocol/"
+    .. (commit_fixture and "review-commit-semantic.json" or "review-semantic.json")
   local fixture = vim.json.decode(table.concat(vim.fn.readfile(fixture_path), "\n"))
   local adapter = require("forge.review_document")
   local nodes = require("forge.nodes")

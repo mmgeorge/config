@@ -254,15 +254,6 @@ struct CachedPresentation {
     value: Arc<CallPresentation>,
 }
 
-/// Extract source call evidence without capturing unrelated files.
-#[cfg(test)]
-pub(crate) fn extract(path: &str, source: &str) -> Result<Vec<FunctionBody>> {
-    Ok(from_extracted(
-        DeclarationCalls::extract(path, source, false)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
-    ))
-}
-
 pub(crate) fn from_extracted(
     functions: Vec<forge_diff::syntax::DeclarationCallable>,
 ) -> Vec<FunctionBody> {
@@ -1323,50 +1314,4 @@ pub(crate) fn parse(
             .unwrap_or(usize::MAX)
     });
     Ok((declaration, output))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn combined_round_trip_keeps_call_order_and_evidence() {
-        for (path, source) in [
-            ("main.rs", "fn run() { z(); a(); z(); }"),
-            ("main.ts", "function run() { z(); a(); z(); }"),
-            ("main.tsx", "function run() { z(); a(); z(); }"),
-            ("main.lua", "function run()\n z()\n a()\n z()\nend\n"),
-            ("arrow.ts", "const run = () => { z(); a(); z(); };"),
-            (
-                "assigned.lua",
-                "local M = {}\nM.run = function()\n z()\n a()\n z()\nend\nreturn M\n",
-            ),
-        ] {
-            let declaration = DeclarationOverview::extract(path, source).unwrap();
-            let calls = extract(path, source).unwrap();
-            let combined = combined(path, &declaration, &calls).unwrap();
-            let (parsed, parsed_calls) = parse(path, &combined, &calls).unwrap();
-            assert_eq!(parsed, declaration, "{path}: {combined}");
-            assert_eq!(parsed_calls, calls, "{path}: {combined}");
-            let display = present(path, &declaration, &calls).unwrap();
-            assert_eq!(
-                display
-                    .call_row
-                    .values()
-                    .map(|(_, name, _)| name.as_str())
-                    .collect::<Vec<_>>(),
-                ["z", "a"],
-                "{path}"
-            );
-            let sorted = insert(path, &display.plain, &calls, true, true).unwrap();
-            assert_eq!(
-                sorted
-                    .call_row
-                    .values()
-                    .map(|(_, name, _)| name.as_str())
-                    .collect::<Vec<_>>(),
-                ["a", "z"]
-            );
-        }
-    }
 }

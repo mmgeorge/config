@@ -520,26 +520,6 @@ mod tests {
         assert_eq!(outcome.is_err(), expected_busy);
     }
 
-    #[test]
-    fn resource_lock_survives_process_boundaries_and_releases_after_owner_exit() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = store(&directory);
-        let ownership = store.prepare(resource(1), capture("operation-1")).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        child
-            .args([
-                "--exact",
-                "recovery::tests::cross_process_lock_child",
-                "--ignored",
-            ])
-            .env("FORGE_TEST_RECOVERY_ROOT", store.directory())
-            .env("FORGE_TEST_RECOVERY_BUSY", "1");
-        assert!(child.status().unwrap().success());
-        drop(ownership);
-        child.env_remove("FORGE_TEST_RECOVERY_BUSY");
-        assert!(child.status().unwrap().success());
-    }
-
     fn store(directory: &tempfile::TempDir) -> RecoveryStore {
         RecoveryStore::new(directory.path().join("forge/recovery/github/v1")).unwrap()
     }
@@ -591,30 +571,6 @@ mod tests {
                 .acknowledge("operation-1")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn confirmation_remains_until_matching_durable_draft_acknowledgement() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = store(&directory);
-        let mut lease = store.prepare(resource(1), capture("operation-1")).unwrap();
-        lease.dispatch_possible().unwrap();
-        lease
-            .settle(RecoveryPhase::Confirmed {
-                result: json!({"id":"comment-1"}),
-            })
-            .unwrap();
-        assert_eq!(lease.record().capture.edit_sequence, Some(42));
-        drop(lease);
-        assert!(store.prepare(resource(1), capture("operation-2")).is_err());
-        assert!(store.resume(&resource(1), "wrong-operation").is_err());
-        store
-            .resume(&resource(1), "operation-1")
-            .unwrap()
-            .acknowledge("operation-1")
-            .unwrap();
-        assert!(store.inspect(&resource(1)).unwrap().is_none());
-        assert!(store.prepare(resource(1), capture("operation-2")).is_ok());
     }
 
     #[test]

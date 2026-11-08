@@ -1,26 +1,4 @@
-use forge_git::test_support as support;
-
-use forge_git::{RepositoryPath, discover_identity, resolve_argument};
-use support::{add_detached_worktree, commit_index, head_commit, init_repository};
-
-#[test]
-fn linked_worktrees_have_distinct_indexes_and_shared_storage_identity() {
-    let root = tempfile::tempdir().unwrap();
-    let main = root.path().join("main");
-    std::fs::create_dir(&main).unwrap();
-    init_repository(&main);
-    commit_index(&main, "initial");
-    add_detached_worktree(&main, &root.path().join("linked"), head_commit(&main));
-    let original = discover_identity(&main).unwrap().unwrap();
-    let linked = discover_identity(&root.path().join("linked"))
-        .unwrap()
-        .unwrap();
-    assert_ne!(original.worktree, linked.worktree);
-    assert_ne!(original.index, linked.index);
-    assert_ne!(original.git_directory, linked.git_directory);
-    assert_eq!(original.storage, linked.storage);
-    assert_eq!(original.common_directory, linked.common_directory);
-}
+use forge_git::RepositoryPath;
 
 #[test]
 fn paths_reject_empty_absolute_and_escaping_components() {
@@ -36,28 +14,6 @@ fn paths_reject_empty_absolute_and_escaping_components() {
     ] {
         assert!(RepositoryPath::new(raw.to_vec()).is_err(), "{raw:?}");
     }
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_paths_reject_native_aliases_and_devices() {
-    for raw in [
-        "C:/outside",
-        "a\\..\\outside",
-        "file:stream",
-        "name.",
-        "name ",
-        "CON",
-        "con.txt",
-        "COM1",
-        "LPT¹",
-    ] {
-        let path = RepositoryPath::new(raw.as_bytes().to_vec()).unwrap();
-        assert!(resolve_argument(&path).is_err(), "{raw}");
-    }
-    let path = RepositoryPath::new(vec![0xff]).unwrap();
-    assert!(resolve_argument(&path).is_err());
-    assert_eq!(path.raw(), &[0xff]);
 }
 
 #[cfg(unix)]

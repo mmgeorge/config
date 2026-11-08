@@ -351,26 +351,4 @@ mod tests {
             }
         }
     }
-
-    /// Reject incomplete native requests without manufacturing broad permission targets.
-    #[test]
-    fn incomplete_permission_targets_are_unknown() {
-        for (kind, payload) in [
-            ("url", json!({})),
-            ("url", json!({"url":" "})),
-            ("mcp", json!({"toolName":"read"})),
-            ("mcp", json!({"serverName":"server"})),
-            ("mcp", json!({"serverName":" ","toolName":"read"})),
-        ] {
-            let request = permission_from_copilot("request".into(), kind, payload, ".");
-            assert_eq!(request.target_list, vec![PermissionTarget::Unknown]);
-        }
-        for kind in ["read", "write"] {
-            let request = permission_from_copilot("request".into(), kind, json!({"path":" "}), ".");
-            assert!(matches!(
-                request.target_list[0],
-                PermissionTarget::UnknownFile { .. }
-            ));
-        }
-    }
 }

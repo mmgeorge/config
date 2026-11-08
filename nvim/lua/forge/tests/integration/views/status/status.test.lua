@@ -237,7 +237,9 @@ T["commit_large_output"] = function()
   assert(console:find("fixture-hook-rejected", 1, true), "commit console omitted hook rejection")
 end
 
-T["commit_parent_exit"] = function()
+-- Opens a real `git commit --amend` editor in a headless parent Neovim, ends the parent by
+-- `shutdown`, and checks that Git exits promptly without changing HEAD, the index, or its lock.
+local function assert_commit_parent_exit(shutdown)
   local config_root = vim.fn.getcwd() .. "/nvim"
   local parent_process, git_process, parent_channel
 
@@ -252,67 +254,69 @@ T["commit_parent_exit"] = function()
   repository.run({ "add", "tracked.txt" })
   local original_index = repository.run({ "write-tree" })
 
-  for ordinal, shutdown in ipairs({ "quit", "terminate", "abort" }) do
-    local server = vim.fn.has("win32") == 1
-      and ("\\\\.\\pipe\\forge-commit-parent-%d-%d"):format(vim.fn.getpid(), ordinal)
-      or vim.fn.tempname()
-    local setup = ([[
-      require("forge.git.write").execute = function(_, action)
-        vim.g.commit_parent_test_action = action
-        return function() end
-      end
-      require("forge.integrations.commit").commit({
-        win = vim.api.nvim_get_current_win(), workspace = %q, amend = true,
-      })
-    ]]):format(repository.path)
-    parent_process = vim.system({ vim.v.progpath, "--headless", "--clean", "--noplugin",
-      "--listen", server, "-c", "set runtimepath^=" .. vim.fn.fnameescape(config_root),
-      "-c", "lua " .. setup }, { text = true, stdout = true, stderr = true })
-    parent_channel = nil
-    wait_until(function()
-      local connected, channel = pcall(vim.fn.sockconnect, "pipe", server, { rpc = true })
-      if connected and channel ~= 0 then parent_channel = channel return true end
-      return false
-    end, "parent editor server did not start", { timeout_ms = 4000 })
-    local action
-    wait_until(function()
-      action = vim.rpcrequest(parent_channel, "nvim_exec_lua", "return vim.g.commit_parent_test_action", {})
-      return type(action) == "table"
-    end, "parent did not prepare commit editor", { timeout_ms = 4000 })
-
-    local result
-    git_process = vim.system({ "git", "-C", repository.path, "commit", "--amend", "--only" }, {
-      text = true, stdout = true, stderr = true, timeout = 15000,
-      env = { GIT_EDITOR = action.command, NVIM = action.nvim_server },
-    }, function(outcome) result = outcome end)
-    wait_until(function()
-      return vim.rpcrequest(parent_channel, "nvim_exec_lua",
-        "return vim.b.forge_commit_buffer == true", {})
-    end, "commit editor did not open", { timeout_ms = 4000 })
-    assert(vim.uv.fs_stat(repository.path .. "/.git/index.lock"), "amend did not hold index lock")
-
-    local started = vim.uv.hrtime()
-    if shutdown == "terminate" then
-      parent_process:kill(9)
-    elseif shutdown == "quit" then
-      vim.rpcnotify(parent_channel, "nvim_command", "qa!")
-    else
-      vim.rpcrequest(parent_channel, "nvim_exec_lua",
-        "vim.fn.maparg('<C-q>', 'n', false, true).callback()", {})
+  local server = vim.fn.has("win32") == 1
+    and ("\\\\.\\pipe\\forge-commit-parent-%d-%s"):format(vim.fn.getpid(), shutdown)
+    or vim.fn.tempname()
+  local setup = ([[
+    require("forge.git.write").execute = function(_, action)
+      vim.g.commit_parent_test_action = action
+      return function() end
     end
-    wait_until(function() return result ~= nil end, shutdown .. " left Git waiting", { timeout_ms = 4000 })
-    assert(result.code ~= 0 and result.code ~= 124, shutdown .. " did not abort Git promptly")
-    assert(not vim.uv.fs_stat(repository.path .. "/.git/index.lock"), shutdown .. " retained index.lock")
-    assert(repository.run({ "rev-parse", "HEAD" }) == original_head, shutdown .. " changed HEAD")
-    assert(repository.run({ "write-tree" }) == original_index, shutdown .. " changed staged content")
-    MiniTest.add_note(("commit parent %s released Git and lock in %.0f ms"):format(shutdown,
-      (vim.uv.hrtime() - started) / 1e6))
-    if shutdown == "abort" then vim.rpcnotify(parent_channel, "nvim_command", "qa!") end
-    parent_process:wait(2000)
-    pcall(vim.fn.chanclose, parent_channel)
-    parent_process, git_process, parent_channel = nil, nil, nil
+    require("forge.integrations.commit").commit({
+      win = vim.api.nvim_get_current_win(), workspace = %q, amend = true,
+    })
+  ]]):format(repository.path)
+  parent_process = vim.system({ vim.v.progpath, "--headless", "--clean", "--noplugin",
+    "--listen", server, "-c", "set runtimepath^=" .. vim.fn.fnameescape(config_root),
+    "-c", "lua " .. setup }, { text = true, stdout = true, stderr = true })
+  parent_channel = nil
+  wait_until(function()
+    local connected, channel = pcall(vim.fn.sockconnect, "pipe", server, { rpc = true })
+    if connected and channel ~= 0 then parent_channel = channel return true end
+    return false
+  end, "parent editor server did not start", { timeout_ms = 4000 })
+  local action
+  wait_until(function()
+    action = vim.rpcrequest(parent_channel, "nvim_exec_lua", "return vim.g.commit_parent_test_action", {})
+    return type(action) == "table"
+  end, "parent did not prepare commit editor", { timeout_ms = 4000 })
+
+  local result
+  git_process = vim.system({ "git", "-C", repository.path, "commit", "--amend", "--only" }, {
+    text = true, stdout = true, stderr = true, timeout = 15000,
+    env = { GIT_EDITOR = action.command, NVIM = action.nvim_server },
+  }, function(outcome) result = outcome end)
+  wait_until(function()
+    return vim.rpcrequest(parent_channel, "nvim_exec_lua",
+      "return vim.b.forge_commit_buffer == true", {})
+  end, "commit editor did not open", { timeout_ms = 4000 })
+  assert(vim.uv.fs_stat(repository.path .. "/.git/index.lock"), "amend did not hold index lock")
+
+  local started = vim.uv.hrtime()
+  if shutdown == "terminate" then
+    parent_process:kill(9)
+  elseif shutdown == "quit" then
+    vim.rpcnotify(parent_channel, "nvim_command", "qa!")
+  else
+    vim.rpcrequest(parent_channel, "nvim_exec_lua",
+      "vim.fn.maparg('<C-q>', 'n', false, true).callback()", {})
   end
+  wait_until(function() return result ~= nil end, shutdown .. " left Git waiting", { timeout_ms = 4000 })
+  assert(result.code ~= 0 and result.code ~= 124, shutdown .. " did not abort Git promptly")
+  assert(not vim.uv.fs_stat(repository.path .. "/.git/index.lock"), shutdown .. " retained index.lock")
+  assert(repository.run({ "rev-parse", "HEAD" }) == original_head, shutdown .. " changed HEAD")
+  assert(repository.run({ "write-tree" }) == original_index, shutdown .. " changed staged content")
+  MiniTest.add_note(("commit parent %s released Git and lock in %.0f ms"):format(shutdown,
+    (vim.uv.hrtime() - started) / 1e6))
+  if shutdown == "abort" then vim.rpcnotify(parent_channel, "nvim_command", "qa!") end
+  parent_process:wait(2000)
+  pcall(vim.fn.chanclose, parent_channel)
+  parent_process, git_process, parent_channel = nil, nil, nil
 end
+
+T["commit_parent_exit_quit"] = function() assert_commit_parent_exit("quit") end
+T["commit_parent_exit_terminate"] = function() assert_commit_parent_exit("terminate") end
+T["commit_parent_exit_abort"] = function() assert_commit_parent_exit("abort") end
 
 T["commit_scope"] = function()
   host.start({ schedule_ensure = false })
@@ -1035,7 +1039,7 @@ T["diff_controls"] = function()
   local status = require("forge.status")
   local render = require("forge.status_render")
   local nodes = require("forge.nodes")
-  local artifact = root .. "/nvim/rust/forge/target/status-semantic-fixture.json"
+  local artifact = root .. "/nvim/lua/forge/tests/fixtures/protocol/status-semantic.json"
   local fixture = vim.json.decode(table.concat(vim.fn.readfile(artifact), "\n"))
   local original_document = fixture.initial.document
   local controls, sections = {}, {}

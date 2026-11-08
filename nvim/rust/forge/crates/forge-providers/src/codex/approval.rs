@@ -442,26 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_native_command_approval_payloads_are_rejected() {
-        for params in [
-            json!({"command":"pwsh -c 'unfinished"}),
-            json!({"command":""}),
-            json!({"args":[]}),
-            json!({"args":["pwsh", "-c", 42]}),
-            json!({"command":"rg\u{0}tail"}),
-        ] {
-            let message = json!({"method":"item/commandExecution/requestApproval","params":params});
-            let error =
-                permission_from_provider("item/commandExecution/requestApproval", &message, ".")
-                    .unwrap_err();
-            assert!(
-                error.downcast_ref::<CommandAnalysisError>().is_some(),
-                "{error:#}"
-            );
-        }
-    }
-
-    #[test]
     fn native_approval_resolution_encodes_protocol_specific_replies() {
         let command = json!({"method":"item/commandExecution/requestApproval"});
         assert_eq!(

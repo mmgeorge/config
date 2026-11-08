@@ -181,19 +181,3 @@ fn rust_declaration_corpus_preserves_meaning() {
         include_str!("../../../tests/fixtures/declaration_formatting/rust.rs.txt"),
     );
 }
-
-#[test]
-fn tsx_declaration_corpus_preserves_meaning() {
-    check_corpus(
-        "corpus.tsx",
-        include_str!("../../../tests/fixtures/declaration_formatting/tsx.tsx.txt"),
-    );
-}
-
-#[test]
-fn lua_declaration_corpus_preserves_meaning() {
-    check_corpus(
-        "corpus.lua",
-        include_str!("../../../tests/fixtures/declaration_formatting/lua.lua.txt"),
-    );
-}

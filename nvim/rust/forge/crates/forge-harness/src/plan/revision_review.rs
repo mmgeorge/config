@@ -1,14 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-#[cfg(test)]
-use forge_protocol::message::SessionEvent;
-#[cfg(test)]
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-
-#[cfg(test)]
-use crate::protocol::RuntimeMethod;
 
 /// Routes review reads and decisions to the broker retaining a provider tool call.
 #[derive(Default)]
@@ -66,31 +59,6 @@ impl RevisionReview {
             .context("revision review source capture was interrupted")?
             .map(Some)
     }
-
-    /// Commit one explicit decision through the waiting turn's persistence owner.
-    #[cfg(test)]
-    pub(crate) async fn decide(
-        &self,
-        method: RuntimeMethod,
-        params: Value,
-    ) -> Result<Option<(Value, Vec<SessionEvent>)>> {
-        let Some(sender) = self.sender()? else {
-            return Ok(None);
-        };
-        let (response, receive) = oneshot::channel();
-        sender
-            .send(RevisionReviewRequest::Decide {
-                method,
-                params,
-                response,
-            })
-            .await
-            .context("revision review closed before the decision")?;
-        receive
-            .await
-            .context("revision review decision was interrupted")?
-            .map(Some)
-    }
 }
 
 /// Keeps review admission alive only while its provider tool response is pending.
@@ -120,42 +88,4 @@ pub(crate) enum RevisionReviewRequest {
         revision: Option<u32>,
         response: oneshot::Sender<Result<super::review_source::PlanReviewSource>>,
     },
-    #[cfg(test)]
-    Decide {
-        method: RuntimeMethod,
-        params: Value,
-        response: oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
-    },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn dropping_the_owner_releases_pending_requests_and_allows_another_review() {
-        let review = Arc::new(RevisionReview::default());
-        let mut wait = review.open().unwrap();
-        assert!(review.open().is_err());
-        let caller = Arc::clone(&review);
-        let pending = tokio::spawn(async move {
-            caller
-                .decide(RuntimeMethod::SessionPlanCancel, Value::Null)
-                .await
-        });
-        let request = wait.receiver.recv().await.unwrap();
-        drop(wait);
-        drop(request);
-        let error = pending.await.unwrap().unwrap_err();
-        assert!(error.to_string().contains("interrupted"));
-        assert!(
-            review
-                .decide(RuntimeMethod::SessionPlanCancel, Value::Null)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let reopened = review.open().unwrap();
-        drop(reopened);
-    }
 }

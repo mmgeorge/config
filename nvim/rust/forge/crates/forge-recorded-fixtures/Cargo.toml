@@ -1,0 +1,10 @@
+[package]
+name = "forge-recorded-fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Test-only: compares Rust protocol output with the recorded fixtures that Lua tests read.
+[dependencies]
+serde_json = { workspace = true }

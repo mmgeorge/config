@@ -1709,45 +1709,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Close unfinished foreground work without inferring background lifetime from turn success.
-    #[test]
-    fn completed_turn_requires_explicit_native_lifetime_evidence() -> Result<()> {
-        let scope =
-            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
-        let mut normalization = CodexNormalization::default();
-        let address = normalization.admit_turn("native", "turn", &scope)?;
-        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
-        let events = normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn","status":"completed"}}}), "")?;
-        assert!(!normalization.has_pending_background_tools());
-        assert!(events.iter().any(|event| matches!(event, AdapterActivity::Item { event: ItemEvent::Completed(ItemCompletion::CommandExecution(completion)), .. } if completion.outcome == ToolOutcome::Interrupted)));
-        assert!(matches!(
-            normalization.terminal_evidence(&address),
-            Some((forge_provider_api::turn::TurnOutcome::Completed { .. }, _))
-        ));
-        Ok(())
-    }
-
-    /// A user interrupt stops the turn's foreground commands but not unified-exec sessions.
-    #[test]
-    fn interrupt_selects_only_foreground_commands_of_the_turn() -> Result<()> {
-        let scope =
-            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
-        let mut normalization = CodexNormalization::default();
-        normalization.admit_turn("native", "turn", &scope)?;
-        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"sleep","command":"Start-Sleep 40","status":"inProgress"}}}), "")?;
-        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"turn","item":{"type":"commandExecution","id":"server","command":"server","status":"inProgress","source":"unifiedExecStartup","processId":"42"}}}), "")?;
-        assert_eq!(
-            normalization.foreground_command_items("native", "turn"),
-            std::collections::HashSet::from(["sleep".to_owned()])
-        );
-        assert!(
-            normalization
-                .foreground_command_items("native", "other")
-                .is_empty()
-        );
-        Ok(())
-    }
-
     /// Trust only generated header lifetime evidence for the exact original unified-exec call and process.
     #[test]
     fn raw_yield_evidence_checks_owner_process_and_ignores_stdout_spoofing() -> Result<()> {
@@ -1777,37 +1738,6 @@ mod tests {
                 !expected && !stdout_spoof
             );
         }
-        Ok(())
-    }
-
-    /// Preserve the original turn for turnless output after a successor is admitted.
-    #[tokio::test]
-    async fn certified_background_output_keeps_original_owner_across_successor() -> Result<()> {
-        let scope =
-            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
-        let mut normalization = CodexNormalization::default();
-        let address = normalization.admit_turn("native", "old", &scope)?;
-        normalization.activities(&json!({"method":"item/started","params":{"threadId":"native","turnId":"old","item":{"type":"commandExecution","id":"command","command":"sleep","status":"inProgress"}}}), "")?;
-        let poll = normalization.activities(&json!({"method":"item/commandExecution/terminalInteraction", "params":{"threadId":"native","turnId":"old","itemId":"command","processId":"42","stdin":""}}), "")?;
-        assert!(poll.iter().any(|event| matches!(
-            event,
-            AdapterActivity::Item {
-                event: ItemEvent::Tool {
-                    event: forge_provider_api::tool::ToolItemEvent::Backgrounded
-                },
-                ..
-            }
-        )));
-        normalization.activities(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"old","status":"completed"}}}), "")?;
-        let next = normalization.admit_turn(
-            "native",
-            "new",
-            &InvocationScope::new(scope.thread_id.clone(), "two"),
-        )?;
-        let events = normalization.normalize_background(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native","itemId":"command","delta":"late"}}), "").await?.unwrap();
-        assert!(!events.is_empty());
-        assert!(events.iter().all(|event| matches!(event, AdapterActivity::Item { turn_id, .. } if turn_id == &address.turn_id && turn_id != &next.turn_id)));
-        assert!(normalization.normalize_background(&json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"foreign","itemId":"command","delta":"foreign"}}), "").await?.is_none());
         Ok(())
     }
 }

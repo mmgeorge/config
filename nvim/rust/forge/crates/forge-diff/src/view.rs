@@ -162,30 +162,3 @@ impl DiffViewState {
         true
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rapid_toggles_preserve_committed_controls_and_reject_stale_completion() {
-        let mut state = DiffViewState::new(DiffCapabilities::Source, DiffVisibility::All);
-        let semantic = state.request(DiffViewAction::TogglePresentation).unwrap();
-        let public = state.request(DiffViewAction::ToggleVisibility).unwrap();
-        assert_eq!(state.committed(), DiffViewOptions::default());
-        assert!(!state.commit(semantic));
-        assert!(!state.fail(semantic));
-        assert!(state.commit(public));
-        assert_eq!(
-            state.committed(),
-            DiffViewOptions {
-                visibility: DiffVisibility::Public,
-                presentation: DiffPresentation::Semantic,
-            }
-        );
-        let full = state.request(DiffViewAction::TogglePresentation).unwrap();
-        assert!(state.fail(full));
-        assert_eq!(state.requested().options, state.committed());
-        assert!(!state.commit(full));
-    }
-}

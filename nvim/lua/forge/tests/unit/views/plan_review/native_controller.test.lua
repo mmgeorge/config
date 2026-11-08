@@ -334,4 +334,296 @@ T["submission_close"] = function()
   assert(not require("forge.views.harness.activity").busy(harness) and notice[#notice].message:find("Submission failed", 1, true))
 end
 
+-- The plan the question cases review: a requirement in prose and one declaration.
+local question_plan_lines = {
+  "Requirements",
+  "",
+  "Preserve the requested behavior at its owning boundary.",
+  "",
+  "pub fn requested_change();",
+}
+local requirement = "Preserve the requested behavior at its owning boundary."
+
+local function row_containing(scene, literal, first_row)
+  return assert(buffer_support.find_row(scene.review.buf, literal, { first_row = first_row }),
+    "missing review text: " .. literal .. "\n" .. buffer_support.text(scene.review.buf))
+end
+
+local function focus_source(scene, literal)
+  vim.api.nvim_set_current_win(scene.review.win)
+  vim.api.nvim_win_set_cursor(scene.review.win, { row_containing(scene, literal or "requested_change"), 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = scene.review.buf })
+end
+
+local function question_review()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = question_plan_lines })
+  local scene = { host = plan_host, review = plan_host.open(), notices = notify.capture() }
+  scene.comments = require("forge.draft_comments")
+  focus_source(scene)
+  return scene
+end
+
+-- Creates a question with `A` or a comment with `C` at the cursor, or over the visual selection,
+-- and replaces its body.
+local function add_message(scene, key, body)
+  local count = #scene.comments.capture(scene.review.buf)
+  vim.api.nvim_set_current_win(scene.review.win)
+  local visual = vim.api.nvim_get_mode().mode:match("^[vV\22]") ~= nil
+  keymap.invoke(key, { buffer = scene.review.buf, mode = visual and "x" or "n" })
+  vim.cmd("stopinsert")
+  if vim.api.nvim_get_mode().mode:match("^[vV\22]") then keymap.feed("<Esc>", "nx") end
+  local message = scene.comments.capture(scene.review.buf)[count + 1]
+  assert(message, key .. " did not create a message")
+  assert(scene.comments.focus(scene.review.buf, message.id))
+  local row = vim.api.nvim_win_get_cursor(scene.review.win)[1] - 1
+  vim.api.nvim_buf_set_lines(scene.review.buf, row, row + 1, false, { body })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = scene.review.buf })
+  message = scene.comments.capture(scene.review.buf)[count + 1]
+  eq(message.source.body, body, { fail_reason = "editing did not populate the new message" })
+  return message
+end
+
+local function save(scene)
+  vim.api.nvim_set_current_win(scene.review.win)
+  vim.cmd("write")
+end
+
+local function leave_question(scene, id)
+  vim.api.nvim_set_current_win(scene.review.win)
+  vim.api.nvim_win_set_cursor(scene.review.win, { 1, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = scene.review.buf })
+  local compact = vim.iter(scene.review.owner.comment_state.range_list):any(function(range)
+    return tostring(range.annotation.id) == tostring(id) and range.compact
+  end)
+  assert(compact, "leaving the question did not collapse its thread")
+  return vim.api.nvim_win_get_cursor(scene.review.win)
+end
+
+local function reopen(scene)
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  local state = require("forge.session").harness
+  eq(state.plan_review, nil, { fail_reason = "saved PlanReview did not close" })
+  scene.review = scene.host.open()
+end
+
+-- `options.others_pending` marks a review in which another question still awaits its answer, so
+-- only this question's own progress row must be gone.
+local function assert_answer(scene, question, body, options)
+  local question_row = row_containing(scene, question.source.body)
+  local answer_row = row_containing(scene, body, question_row + 1)
+  assert(answer_row > question_row, "answer did not appear below its question")
+  if options and options.others_pending then
+    local progress_row = buffer_support.find_row(scene.review.buf, "Generating response", { first_row = question_row + 1 })
+    assert(not progress_row or progress_row > answer_row, "completed question retained its progress row")
+  else
+    assert(not buffer_support.text(scene.review.buf):find("Generating response", 1, true), "completed question retained its progress row")
+  end
+  local reply = scene.review.owner.reply_by_id[tostring(question.id)]
+  assert(reply and reply.question_body == question.source.body, "answer attached to a different question")
+  assert(not vim.bo[scene.review.buf].modified, "completed answer left the saved question dirty")
+end
+
+local function ask(scene, body, answer)
+  local question = add_message(scene, "A", body)
+  save(scene)
+  scene.host.answer(#scene.host.answers, answer)
+  assert_answer(scene, question, answer)
+  return question
+end
+
+T["answer arrives after cursor leaves question"] = function()
+  local scene = question_review()
+  local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+  save(scene)
+  local cursor = leave_question(scene, question.id)
+  scene.host.answer(1, "The caller owns it.")
+  assert_answer(scene, question, "The caller owns it.")
+  eq(vim.api.nvim_win_get_cursor(scene.review.win), cursor, { fail_reason = "answer moved the cursor back to its question" })
+  assert(scene.comments.focus(scene.review.buf, question.id))
+  assert_answer(scene, question, "The caller owns it.")
+end
+
+T["close and reopen preserves question and answer"] = function()
+  local scene = question_review()
+  local question = ask(scene, "Why does requested_change own this behavior?", "The caller owns it.")
+  leave_question(scene, question.id)
+  reopen(scene)
+  assert_answer(scene, question, "The caller owns it.")
+  assert(scene.comments.focus(scene.review.buf, question.id))
+  assert_answer(scene, question, "The caller owns it.")
+end
+
+T["prose question stays on its requirement after reopening"] = function()
+  local scene = question_review()
+  focus_source(scene, requirement)
+  local question = ask(scene, "Why must the registry retain this ownership boundary?", "The registry owns it.")
+  leave_question(scene, question.id)
+  reopen(scene)
+  assert_answer(scene, question, "The registry owns it.")
+  assert(row_containing(scene, question.source.body) > row_containing(scene, requirement),
+    "question moved before the requirement it describes")
+  reopen(scene)
+  assert_answer(scene, question, "The registry owns it.")
+end
+
+T["prose comment preserves both selected range endpoints"] = function()
+  local scene = question_review()
+  focus_source(scene, "Requirements")
+  local heading_row = vim.api.nvim_win_get_cursor(scene.review.win)[1]
+  keymap.feed("V" .. string.rep("<Down>", row_containing(scene, requirement, heading_row) - heading_row))
+  local comment = add_message(scene, "C", "Keep this requirement attached to its heading.")
+  assert(comment.source.end_line > comment.source.start_line, "comment did not capture the selected range")
+  save(scene)
+  assert(not scene.review.owner.saving, "range comment did not save")
+  reopen(scene)
+  eq(scene.comments.capture(scene.review.buf)[1].source, comment.source,
+    { fail_reason = "reopening changed the comment's source range" })
+  assert(row_containing(scene, comment.source.body) > row_containing(scene, requirement),
+    "range comment moved before the end of its selected source")
+end
+
+T["answer completes while another tab owns the cursor"] = function()
+  local scene = question_review()
+  local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+  save(scene)
+  vim.api.nvim_set_current_tabpage(scene.review.return_tab)
+  local window = vim.api.nvim_get_current_win()
+  local cursor = vim.api.nvim_win_get_cursor(window)
+  scene.host.answer(1, "The caller owns it.")
+  eq(vim.api.nvim_get_current_win(), window, { fail_reason = "answer stole focus from another tab" })
+  eq(vim.api.nvim_win_get_cursor(window), cursor, { fail_reason = "answer moved another tab's cursor" })
+  assert_answer(scene, question, "The caller owns it.")
+  scene.host.open()
+  eq(vim.api.nvim_get_current_tabpage(), scene.review.tab, { fail_reason = "review did not regain focus" })
+  assert_answer(scene, question, "The caller owns it.")
+end
+
+T["unsaved comment survives closing and reopening the plan"] = function()
+  local scene = question_review()
+  local comment = add_message(scene, "C", "Retain this unsaved review comment.")
+  assert(vim.bo[scene.review.buf].modified, "new comment was not dirty")
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  eq(vim.api.nvim_get_current_tabpage(), scene.review.return_tab, { fail_reason = "dirty PlanReview did not return to Harness" })
+  scene.review = scene.host.open()
+  assert(buffer_support.text(scene.review.buf):find(comment.source.body, 1, true), "reopening discarded the unsaved comment")
+  assert(vim.bo[scene.review.buf].modified, "reopening cleared the unsaved marker")
+  save(scene)
+  assert(not scene.review.owner.saving, "reopened comment did not save")
+  reopen(scene)
+  assert(buffer_support.text(scene.review.buf):find(comment.source.body, 1, true), "saving discarded the recovered comment")
+  assert(not vim.bo[scene.review.buf].modified, "saved recovered comment remained dirty")
+end
+
+T["wiped review buffer settles its answer and can reopen"] = function()
+  local scene = question_review()
+  local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+  save(scene)
+  local owner = scene.review.owner
+  vim.api.nvim_buf_delete(scene.review.buf, { force = true })
+  scene.host.answer(1, "The caller owns it.")
+  assert(not owner.saving, "closed review retained a completed answer operation")
+  scene.review = scene.host.open()
+  assert(vim.api.nvim_buf_is_valid(scene.review.buf), "wiped PlanReview did not reopen")
+  assert_answer(scene, question, "The caller owns it.")
+end
+
+T["wiped review settles a failed answer and allows retry"] = function()
+  local scene = question_review()
+  local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+  save(scene)
+  local owner = scene.review.owner
+  vim.api.nvim_buf_delete(scene.review.buf, { force = true })
+  scene.host.fail(1, "Provider unavailable")
+  assert(not owner.saving, "closed review retained a failed answer operation")
+  eq(#scene.notices, 1, { fail_reason = "failed closed review did not report one failure" })
+  scene.notices:clear()
+  scene.review = scene.host.open()
+  assert(vim.api.nvim_buf_is_valid(scene.review.buf), "failed wiped review did not reopen")
+  save(scene)
+  scene.host.answer(#scene.host.answers, "The caller owns it.")
+  assert_answer(scene, question, "The caller owns it.")
+end
+
+local function pending_progress(scene, question)
+  local question_row = row_containing(scene, question.source.body)
+  row_containing(scene, "Generating response · mock-model · Thinking: high", question_row + 1)
+  eq(scene.review.owner.reply_by_id[tostring(question.id)], nil, { fail_reason = "pending question already has an answer" })
+end
+
+T["one save sends one answer request per question"] = function()
+  local scene = question_review()
+  local first = add_message(scene, "A", "Why does the first declaration exist?")
+  focus_source(scene)
+  local second = add_message(scene, "A", "Why does the second declaration exist?")
+  save(scene)
+  eq(scene.host.saves, 1, { fail_reason = "two questions took more than one save" })
+  eq(vim.tbl_map(function(request) return request.question_id end, scene.host.answers),
+    { tostring(first.id), tostring(second.id) }, { fail_reason = "each question did not get its own answer request" })
+  pending_progress(scene, first)
+  pending_progress(scene, second)
+  scene.host.answer(2, "The second caller owns it.")
+  assert_answer(scene, second, "The second caller owns it.", { others_pending = true })
+  pending_progress(scene, first)
+  assert(scene.review.owner.saving, "the pending first answer lost its lifecycle owner")
+  scene.host.answer(1, "The first caller owns it.")
+  assert_answer(scene, first, "The first caller owns it.")
+  assert_answer(scene, second, "The second caller owns it.")
+  assert(not scene.review.owner.saving, "answered questions left the review saving")
+end
+
+T["later question completes while the first answer is pending"] = function()
+  local scene = question_review()
+  local first = add_message(scene, "A", "Why does the first caller own this behavior?")
+  save(scene)
+  focus_source(scene)
+  local second = add_message(scene, "A", "Which second caller uses this interface?")
+  save(scene)
+  eq(scene.host.answers[2].question_id, tostring(second.id), { fail_reason = "second save did not ask the second question" })
+  scene.host.answer(2, "The second caller uses it.")
+  assert_answer(scene, second, "The second caller uses it.", { others_pending = true })
+  pending_progress(scene, first)
+  assert(scene.review.owner.saving, "the pending first answer lost its lifecycle owner")
+  scene.host.answer(1, "The first caller owns it.")
+  assert_answer(scene, first, "The first caller owns it.")
+  assert_answer(scene, second, "The second caller uses it.")
+end
+
+T["failed answer clears only its own question"] = function()
+  local scene = question_review()
+  local first = add_message(scene, "A", "Why does the first declaration exist?")
+  focus_source(scene)
+  local second = add_message(scene, "A", "Why does the second declaration exist?")
+  save(scene)
+  scene.host.fail(1, "Provider unavailable")
+  eq(#scene.notices, 1, { fail_reason = "the failed answer did not report one failure" })
+  local first_row = row_containing(scene, first.source.body)
+  local second_row = row_containing(scene, second.source.body)
+  local progress_row = buffer_support.find_row(scene.review.buf, "Generating response", { first_row = first_row + 1 })
+  assert(progress_row and progress_row > second_row, "the failure cleared the other question's pending answer")
+  scene.host.answer(2, "The second caller owns it.")
+  assert_answer(scene, second, "The second caller owns it.")
+  eq(scene.review.owner.reply_by_id[tostring(first.id)], nil, { fail_reason = "the failed question gained an answer" })
+end
+
+T["close during pending answer retains review then reopens"] = function()
+  local scene = question_review()
+  local question = add_message(scene, "A", "Why does requested_change own this behavior?")
+  save(scene)
+  pending_progress(scene, question)
+  local review = scene.review
+  vim.api.nvim_set_current_win(review.win)
+  keymap.feed("q")
+  eq(require("forge.session").harness.plan_review, review, { fail_reason = "closing dropped a pending question" })
+  local messages = scene.notices:messages()
+  assert(#messages == 1 and messages[1]:find("explicit operation in progress", 1, true),
+    "pending close omitted its explanation: " .. vim.inspect(messages))
+  leave_question(scene, question.id)
+  scene.host.answer(1, "The caller owns it.")
+  reopen(scene)
+  assert_answer(scene, question, "The caller owns it.")
+end
+
 return T

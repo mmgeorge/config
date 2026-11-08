@@ -423,27 +423,6 @@ impl ExchangeOwner {
             .context("review answer owner closed before completion")?
     }
 
-    /// Offer eligible new-turn input; the owner claims and executes it independently of this waiter.
-    #[cfg(test)]
-    pub(crate) async fn offer_input(
-        &self,
-        offer: InputDeliveryOffer,
-        messages: MessageSender,
-    ) -> Result<bool, InputOfferError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(OwnerEvent::InputOffer {
-                offer,
-                messages,
-                reply: InputOfferReply::Offered(reply),
-            })
-            .await
-            .map_err(|_| InputOfferError::OwnerClosed)?;
-        response
-            .await
-            .map_err(|_| InputOfferError::ObservationLost)?
-    }
-
     /// Offer steering without claiming it or owning its subsequent transport lifetime.
     #[cfg(test)]
     pub(crate) async fn offer_steering(
@@ -626,13 +605,6 @@ struct PendingReconnect {
 }
 
 impl ExchangeDriver {
-    /// Replace the wait capacity before the driver starts, so fixtures saturate it with a few waits.
-    #[cfg(test)]
-    pub(crate) fn with_question_wait_capacity(mut self, capacity: usize) -> Self {
-        self.question_waits = super::question_wait::QuestionWaits::with_capacity(capacity);
-        self
-    }
-
     /// Select task delivery from owned work, rather than inferring it from semaphore availability.
     fn task_delivery_gate(
         &self,

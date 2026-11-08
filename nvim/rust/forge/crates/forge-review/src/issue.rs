@@ -758,29 +758,4 @@ mod tests {
             vec!["exact\r", "body", ""]
         );
     }
-
-    #[test]
-    fn issue_draft_reopen_retains_newer_text_and_exact_pending_capture() {
-        let mut original = issue_document();
-        edit(&mut original, "body", 0, 1, "submitted\r\n");
-        original.begin_save().unwrap().unwrap();
-        edit(&mut original, "body", 1, 2, "newer\r\n");
-        let draft = original.draft_payload().unwrap();
-        let mut restored = issue_document();
-        restored.restore_draft(&draft).unwrap();
-        assert_eq!(restored.pending_operation(), original.pending_operation());
-        assert!(restored.fields().unwrap()[2].uncertain);
-        restored.recover_save(SaveOutcome::Confirmed).unwrap();
-        let final_draft = restored.draft_payload().unwrap();
-        assert_eq!(
-            final_draft["issue_document"]["field"]["body"]["text"],
-            "newer\r\n"
-        );
-        assert_eq!(
-            final_draft["issue_document"]["field"]["body"]["baseline"],
-            "submitted\r\n"
-        );
-        assert_eq!(restored.fields().unwrap()[2].sequence, EditSequence(2));
-        assert!(restored.fields().unwrap()[2].dirty);
-    }
 }

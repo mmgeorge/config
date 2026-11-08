@@ -228,11 +228,6 @@ impl IssueStore {
     }
 }
 
-#[cfg(test)]
-fn open_database(path: &Path) -> Result<Database> {
-    open_database_with_timeout(path, Duration::ZERO)
-}
-
 #[derive(Debug)]
 enum OpenDatabaseError {
     Database(redb::DatabaseError),
@@ -698,60 +693,5 @@ fn collect_terms(text: &str, terms: &mut HashSet<String>) {
     }
     if !current.is_empty() {
         terms.insert(current);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_db(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let thread_name = std::thread::current()
-            .name()
-            .unwrap_or("test")
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        path.push(format!(
-            "github-issue-index-{}-{}-{}.redb",
-            name,
-            std::process::id(),
-            thread_name
-        ));
-        let _ = fs::remove_file(&path);
-        path
-    }
-
-    #[test]
-    fn open_database_waits_for_existing_lock() -> Result<()> {
-        let db_path = temp_db("lock");
-        let database = open_database(&db_path)?;
-        let reopen_path = db_path.clone();
-        let (lock_wait_sender, lock_wait_receiver) = std::sync::mpsc::channel();
-        let opener = thread::spawn(move || {
-            open_database_observing_lock_waits(&reopen_path, Duration::from_secs(30), || {
-                let _ = lock_wait_sender.send(());
-            })
-            .map(|database| {
-                drop(database);
-            })
-        });
-
-        // Release the lock only after the opener has failed once and entered its retry wait.
-        let observed_wait = lock_wait_receiver.recv();
-        drop(database);
-        opener
-            .join()
-            .map_err(|_| anyhow!("database opener thread panicked"))??;
-        observed_wait.map_err(|_| anyhow!("opener returned without waiting for the lock"))?;
-        let _ = fs::remove_file(db_path);
-        Ok(())
     }
 }

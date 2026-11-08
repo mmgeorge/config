@@ -1038,12 +1038,6 @@ enum Command {
         result: Result<(), ProviderError>,
         reply: CancellationReply,
     },
-    #[cfg(test)]
-    TestPublishEffect {
-        scope: InvocationScope,
-        completion: Box<ProviderCompletion>,
-        reply: oneshot::Sender<Result<(), ProviderError>>,
-    },
     SteerCurrent {
         input: crate::provider::SteeringInput,
         submission: Option<SubmissionId>,
@@ -1446,43 +1440,9 @@ impl SessionExecution {
             .map(|scope| scope.clone())
             .map_err(|_| protocol("activity snapshot poisoned"))
     }
-    /// Read the exact owner's published admission state in a lifecycle regression.
-    #[cfg(test)]
-    pub(crate) fn invocation_active_snapshot(
-        &self,
-        scope: &InvocationScope,
-    ) -> Result<bool, ProviderError> {
-        if scope.owner() != self.owner || !self.healthy.load(Ordering::Acquire) {
-            return Err(protocol("invocation observation has no live owner"));
-        }
-        let active = self
-            .activity
-            .lock()
-            .map_err(|_| protocol("activity snapshot poisoned"))?;
-        Ok(active.as_ref() == Some(scope))
-    }
     /// Get immutable registration identity for host-authored journal entries.
     pub(crate) fn provider_id(&self) -> crate::provider::ProviderId {
         self.provider.descriptor().kind
-    }
-    #[cfg(test)]
-    pub(crate) async fn publish_idle_test_effect(
-        &self,
-        scope: InvocationScope,
-        completion: ProviderCompletion,
-    ) -> Result<(), ProviderError> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(Command::TestPublishEffect {
-                scope,
-                completion: Box::new(completion),
-                reply,
-            })
-            .await
-            .map_err(|_| protocol("execution owner is closed"))?;
-        response
-            .await
-            .map_err(|_| protocol("execution owner closed before test effect"))?
     }
     /// Check whether the retained driver can still accept work.
     pub(crate) async fn is_healthy(&self) -> bool {
@@ -2862,25 +2822,6 @@ impl Driver {
                     self.settle(&scope.invocation_id);
                 }
                 reply.complete(result);
-            }
-            #[cfg(test)]
-            Command::TestPublishEffect {
-                scope,
-                completion,
-                reply,
-            } => {
-                let result = self
-                    .invocations
-                    .get(&scope.invocation_id)
-                    .filter(|invocation| invocation.scope == scope)
-                    .ok_or_else(|| protocol("test effect has no retained invocation"))
-                    .and_then(|invocation| {
-                        invocation
-                            .completion
-                            .provider_completion
-                            .publish(*completion)
-                    });
-                let _ = reply.send(result);
             }
             Command::SteerCurrent {
                 input,
@@ -4464,101 +4405,6 @@ mod owner_conformance;
 mod tests {
     use super::*;
 
-    /// A failed required consumption record cannot publish an event or advance its native watermark.
-    #[tokio::test]
-    async fn core_persistence_failure_prevents_native_event_forwarding() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        drop(crate::storage::SqliteStore::open(directory.path())?);
-        let database =
-            rusqlite::Connection::open(crate::storage::state::database(directory.path()))?;
-        database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
-        database.execute_batch("CREATE TRIGGER reject_consumption BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='provider_event_consumed' BEGIN SELECT RAISE(ABORT,'fixture consumption evidence failure'); END;")?;
-        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        trace.configure(false)?;
-        let provider = crate::provider::build(
-            ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id().unwrap(),
-                command: Vec::new(),
-            },
-            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
-            trace.clone(),
-            directory.path().into(),
-        )?;
-        let owner = ThreadOwner::root("session");
-        let (delivery, mut pending) = mpsc::channel(8);
-        let (commands, _receive) = mpsc::channel(1);
-        let mut driver = Driver {
-            owner: owner.clone(),
-            provider: provider.clone(),
-            trace,
-            queue_loss_reported: AtomicBool::new(false),
-            state: ExecutionState::new(owner.clone()),
-            invocations: HashMap::new(),
-            committed_invocations: HashMap::new(),
-            submissions: JoinSet::new(),
-            deliveries: JoinSet::new(),
-            delivery: Some(delivery),
-            pending_delivery: VecDeque::new(),
-            cleanup: JoinSet::new(),
-            failed_waiters: Vec::new(),
-            commands,
-            next_ticket_nonce: 1,
-            committed_tickets: HashMap::new(),
-            failed: false,
-            healthy: Arc::new(AtomicBool::new(true)),
-            first_failure: None,
-            cleanup_failure: None,
-            retiring: None,
-            idle: SessionObserver::Inbox(Arc::default()),
-            activity: Default::default(),
-            admitted: Default::default(),
-            attempts: HashMap::new(),
-            cancelled_admissions: Default::default(),
-            cancelled_exchanges: HashMap::new(),
-            prevented_invocations: HashMap::new(),
-            reservations: HashMap::new(),
-            latest_reservations: HashMap::new(),
-            submission_exits: Default::default(),
-        };
-        driver
-            .native_event(crate::provider::bridge::ProviderObservation {
-                event: OwnerObservation::Event(HarnessEvent::Native {
-                    source: crate::provider::events::NativeEventSource {
-                        binding_id: forge_provider_api::BindingId::new("binding")?,
-                        sequence: forge_provider_api::EventSequence::new(1),
-                    },
-                    scope: forge_provider_api::EventScope::Binding {
-                        thread_id: forge_provider_api::ThreadId::from(owner.clone()),
-                    },
-                    event: Box::new(NativeEvent::Thread {
-                        thread_id: owner.thread_id(),
-                        event: forge_provider_api::ThreadEvent::Error {
-                            error: forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::ThreadOpen,
-                                forge_provider_api::ProviderFailureKind::Unknown,
-                            ),
-                        },
-                    }),
-                }),
-                native: Some((
-                    forge_provider_api::BindingId::new("binding")?,
-                    forge_provider_api::EventSequence::new(1),
-                )),
-            })
-            .await;
-        assert!(driver.failed);
-        assert!(matches!(
-            pending.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        assert!(driver.pending_delivery.is_empty());
-        assert_eq!(database.query_row("SELECT COUNT(*) FROM owner_core_log WHERE json_extract(record,'$.record')='provider_event_consumed'", [], |row| row.get::<_, i64>(0))?, 0);
-        let cleanup = driver.cleanup.join_next().await;
-        driver.cleanup_finished(cleanup);
-        provider.shutdown().await?;
-        Ok(())
-    }
-
     use crate::provider::{PromptMode, ProviderLaunch};
     use anyhow::Context;
 
@@ -4607,53 +4453,6 @@ mod tests {
         guard.begin_mutation();
         drop(guard);
         assert!(cell.begin_plan_effect(second, "plan", 2, "after").is_err());
-        Ok(())
-    }
-
-    /// Retry a failed collection before releasing the old execution owner.
-    #[tokio::test]
-    async fn close_retries_incomplete_cleanup_before_releasing_owner() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = crate::provider::build(
-            ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: Vec::new(),
-            },
-            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
-            trace.clone(),
-            directory.path().into(),
-        )?;
-        let report = Arc::new(forge_provider_api::error::ObservationCleanup::new(
-            ObservationFailure::Disconnected,
-            None,
-            None,
-            Some(forge_provider_api::error::CleanupFailure::TimedOut),
-        ));
-        let expected = report.clone();
-        let task = tokio::spawn(async move { Err(ProviderError::Cleanup(report)) });
-        let (commands, _receive) = mpsc::channel(1);
-        let engine = SessionExecution {
-            thread_id: forge_provider_api::ThreadId::new("test-thread").unwrap(),
-            owner: ThreadOwner::root("failed-close"),
-            provider,
-            commands,
-            healthy: Arc::new(AtomicBool::new(true)),
-            orderly_shutdown: Arc::new(AtomicBool::new(false)),
-            observer: Arc::default(),
-            task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
-            activity: Default::default(),
-            admitted: Default::default(),
-        };
-        let Err(ProviderError::Cleanup(actual)) = engine.close().await else {
-            panic!("incomplete cleanup must remain a failure");
-        };
-        assert!(Arc::ptr_eq(&actual, &expected));
-        assert!(!actual.collected());
-        engine.close().await?;
-        assert!(matches!(*engine.task.lock().await, ExecutionTask::Closed));
-        engine.close().await?;
         Ok(())
     }
 

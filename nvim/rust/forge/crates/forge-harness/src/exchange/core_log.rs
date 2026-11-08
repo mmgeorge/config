@@ -79,20 +79,6 @@ impl CoreRecord {
             evidence: CoreProviderEvidence::from_event(event),
         }
     }
-
-    /// Capture event correlation for durable log fixtures without retaining message content.
-    #[cfg(test)]
-    pub(crate) fn provider_event(
-        scope: EventScope,
-        event: &forge_provider_api::BoundProviderEvent,
-    ) -> Self {
-        Self::provider_event_metadata(
-            event.binding_id.clone(),
-            event.sequence,
-            scope,
-            &event.event,
-        )
-    }
 }
 
 /// Preserve native completion and failures independently of successful input acceptance.

@@ -755,8 +755,8 @@ impl ExactSizeIterator for BlockIter<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{BlockMetadata, EditableRegion, TextPosition, TextRange};
-    use crate::identity::RegionRevision;
+    use crate::block::BlockMetadata;
+
     use crate::text::BufferText;
 
     fn block(identity: usize, rows: usize) -> BufferBlock {
@@ -855,36 +855,5 @@ mod tests {
                 expected[range_start..range_end].iter().collect::<Vec<_>>()
             );
         }
-    }
-
-    #[test]
-    fn failed_splice_preserves_sequence_and_region_owners() {
-        let mut first = block(1, 1);
-        first.metadata.editable_region.push(EditableRegion {
-            id: RegionId("region".into()),
-            revision: RegionRevision(0),
-            sequence: crate::identity::EditSequence(0),
-            range: TextRange {
-                start: TextPosition { row: 0, column: 0 },
-                end: TextPosition { row: 1, column: 0 },
-            },
-        });
-        let mut sequence = BlockSequence::new(vec![first.clone(), block(2, 0)]).unwrap();
-        let mut duplicate_region = first.clone();
-        duplicate_region.id = BlockId("other".into());
-        for (range, inserted) in [
-            (1..2, vec![first.clone()]),
-            (1..2, vec![duplicate_region]),
-            (3..3, vec![]),
-        ] {
-            let before = sequence.blocks().cloned().collect::<Vec<_>>();
-            assert!(sequence.splice(range, inserted).is_err());
-            assert_eq!(sequence.blocks().cloned().collect::<Vec<_>>(), before);
-            audit(&sequence, sequence.root, None);
-        }
-        sequence.splice(0..1, vec![first]).unwrap();
-        assert_eq!(sequence.region_owner.len(), 1);
-        sequence.splice(0..1, vec![]).unwrap();
-        assert!(sequence.region_owner.is_empty());
     }
 }

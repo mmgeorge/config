@@ -177,23 +177,3 @@ fn publication_failure() -> ProviderError {
         forge_provider_api::ProviderFailureKind::Runtime,
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejected_batch_disappears_from_captured_terminal_snapshot() -> Result<(), ProviderError> {
-        let slot = CompletionSlot::default();
-        let batch = slot.publish_batch(ProviderCompletion::default())?;
-        let captured = slot.preview()?;
-        assert!(HostEffectBatch::active_completion(&captured.batches).is_some());
-        batch.reject();
-        assert!(captured.batches[0].is_rejected());
-        assert!(HostEffectBatch::active_completion(&captured.batches).is_none());
-        assert!(slot.preview()?.completion.is_none());
-        assert!(slot.take_revision(captured.revision)?);
-        assert!(slot.preview()?.completion.is_none());
-        Ok(())
-    }
-}

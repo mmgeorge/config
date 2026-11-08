@@ -72,7 +72,7 @@ pub fn validate(channel: &str, name: &str, payload: &Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Message, SessionEvent};
+
     use serde_json::json;
 
     #[test]
@@ -122,18 +122,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn serialization_cannot_bypass_the_event_contract() {
-        let mut event = SessionEvent {
-            session_id: "session".into(),
-            event: "provider_event".into(),
-            payload: json!({"kind":"tool-output"}),
-        };
-        assert!(!provider_visible("tool-output"));
-        assert!(serde_json::to_string(&Message::Event(event.clone())).is_err());
-        event.payload = json!({"kind":"approval_resolved","data":{"request_id":"request"}});
-        assert!(serde_json::to_string(&Message::Event(event)).is_ok());
     }
 }

@@ -398,22 +398,6 @@ impl EventFixtureProvider {
         self.clone()
     }
 
-    /// Reject a native configuration admission before changing its applied fixture state.
-    pub fn with_session_configure_guard<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
-    where
-        F: Fn(BindingId, SessionConfiguration) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
-    {
-        *self
-            .configure_guard
-            .write()
-            .expect("fixture configure guard lock is not poisoned") =
-            Some(Arc::new(move |binding, configuration| {
-                Box::pin(handler(binding, configuration))
-            }));
-        self.clone()
-    }
-
     /// Observe confirmed configuration before capturing its result watermark and capability snapshot.
     pub fn with_session_configure<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
     where
@@ -567,17 +551,6 @@ impl EventFixtureProvider {
         self.clone()
     }
 
-    /// Script configured and observed discovery through the retained typed MCP query.
-    pub fn with_mcp_list<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
-    where
-        F: Fn(McpQuery) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<McpDefinition>, ProviderError>> + Send + 'static,
-    {
-        *self.mcp.write().expect("fixture MCP lock is not poisoned") =
-            Some(Arc::new(move |query| Box::pin(handler(query))));
-        self.clone()
-    }
-
     /// Clone a binding-scoped sink for capability, identity, and background observations.
     pub async fn event_sink(
         &self,
@@ -600,32 +573,6 @@ impl EventFixtureProvider {
             .await?
             .sink
             .activity_writer())
-    }
-
-    /// Publish capabilities through the actual owning fixture connection runtime.
-    pub async fn publish_capabilities(
-        &self,
-        owner: &ThreadOwner,
-        capabilities: CapabilityManifest,
-    ) -> Result<(), ProviderError> {
-        let binding = self
-            .owners
-            .lock()
-            .await
-            .get(owner)
-            .cloned()
-            .ok_or_else(|| {
-                fixture_error(
-                    ProviderOperation::ThreadOpen,
-                    ProviderFailureKind::SessionMissing,
-                )
-            })?;
-        self.session(&binding, ProviderOperation::ThreadOpen)
-            .await?
-            .sink
-            .capabilities_changed(capabilities)
-            .await
-            .map_err(Into::into)
     }
 
     /// Bind the original retained stream to an exact invocation for event injection.

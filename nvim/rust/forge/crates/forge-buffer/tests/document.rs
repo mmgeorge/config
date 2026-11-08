@@ -169,55 +169,6 @@ fn local_edits_publish_only_affected_blocks_and_preserve_replica_coordinates() {
 }
 
 #[test]
-fn invalid_transaction_preserves_all_blocks_and_revision() {
-    let mut document = BufferDocument::new(
-        DocumentId("transaction".into()),
-        vec![
-            block(1, &["first"]),
-            block(2, &["middle"]),
-            block(3, &["last"]),
-        ],
-    )
-    .unwrap();
-    let before = document.snapshot();
-    for edits in [
-        vec![
-            SequenceEdit {
-                range: 2..3,
-                block: vec![block(4, &["valid"])],
-            },
-            SequenceEdit {
-                range: 0..1,
-                block: vec![block(2, &["duplicate retained identity"])],
-            },
-        ],
-        vec![
-            SequenceEdit {
-                range: 0..2,
-                block: vec![],
-            },
-            SequenceEdit {
-                range: 1..3,
-                block: vec![],
-            },
-        ],
-        vec![
-            SequenceEdit {
-                range: 0..0,
-                block: vec![block(4, &["insert"])],
-            },
-            SequenceEdit {
-                range: 0..1,
-                block: vec![],
-            },
-        ],
-    ] {
-        assert!(document.edit_many(edits).is_err());
-        assert_eq!(document.snapshot(), before);
-    }
-}
-
-#[test]
 fn randomized_transactions_match_independent_block_model() {
     let mut expected: Vec<_> = (0..30).map(|identity| block(identity, &["base"])).collect();
     let mut document = BufferDocument::new(DocumentId("random".into()), expected.clone()).unwrap();

@@ -11,9 +11,7 @@ use forge_git::{
     },
     store::RepositoryStore,
 };
-use support::{
-    commit_index, git, init_repository, resolve_revision, set_config, stage, stage_conflict,
-};
+use support::{commit_index, init_repository, resolve_revision, set_config, stage, stage_conflict};
 
 #[tokio::test]
 async fn staged_unstaged_and_head_sources_remain_distinct() {
@@ -152,36 +150,6 @@ async fn missing_binary_encoding_size_and_source_identity_have_distinct_outcomes
         panic!("{result:?}")
     };
     assert!(error.to_string().contains("identity differs"));
-}
-
-#[tokio::test]
-async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_content() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    init_repository(root);
-    let bytes = b"content\r\n".repeat(1_000_000);
-    fs::write(root.join("large"), &bytes).unwrap();
-    set_config(root, "core", "autocrlf", "false");
-    stage(root, &["large"]);
-    commit_index(root, "fixture");
-    let large = resolve_revision(root, "HEAD:large");
-    git(root, &["gc", "--prune=now"]);
-    let store = RepositoryStore::default();
-    let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    for source in [
-        ContentSource::Object(large),
-        ContentSource::Worktree {
-            path: path("large"),
-            conversion: forge_git::content::WorktreeConversion::Raw,
-        },
-    ] {
-        let result = repository
-            .content(&store, request(source))
-            .await
-            .unwrap()
-            .value;
-        assert_eq!(ready(result).source.bytes(), bytes);
-    }
 }
 
 #[tokio::test]

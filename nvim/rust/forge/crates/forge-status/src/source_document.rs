@@ -773,11 +773,10 @@ mod tests {
         );
         assert_eq!(syntax.usage().active_jobs, 0);
         assert_eq!(diff.analysis_pool().usage().admitted_jobs, 0);
-        std::fs::write(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/saved-diff-controls-fixture.json"),
-            serde_json::to_vec(&serde_json::json!({"initial":opened,"transition":transition}))?,
-        )?;
+        forge_recorded_fixtures::assert_matches_recording(
+            "saved-diff-controls.json",
+            &serde_json::json!({"initial":opened,"transition":transition}),
+        );
         Ok(())
     }
 }

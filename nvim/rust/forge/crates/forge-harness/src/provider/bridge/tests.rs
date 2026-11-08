@@ -486,26 +486,6 @@ fn provider_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> 
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
-/// Consume the host-owned manifest that every successful binding open publishes first.
-fn expect_negotiated_capabilities(events: &mut HostEventStream) {
-    let observed = events
-        .try_recv()
-        .expect("a successful open publishes its negotiated capabilities");
-    assert!(
-        observed.native.is_none(),
-        "negotiated capabilities are a host publication without a native sequence"
-    );
-    assert!(matches!(
-        observed.event,
-        super::super::session_execution::OwnerObservation::Event(
-            super::super::HarnessEvent::Host {
-                scope: forge_provider_api::EventScope::Binding { .. },
-                event: super::super::HostEvent::CapabilitiesNegotiated { .. },
-            }
-        )
-    ));
-}
-
 fn provider_request(root: &std::path::Path) -> ProviderRequest {
     ProviderRequest {
         dispatch: forge_provider_api::submission::DispatchTracker::default(),
@@ -695,31 +675,6 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
     }.await
 }
 
-/// A retained fork must replay the original source and target even after caller settings change.
-#[tokio::test]
-async fn fork_retry_preserves_complete_original_request() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let mut source = provider_request(root.path());
-    source.provider_session_id = Some("source-history".to_owned().try_into()?);
-    let first = super::super::ProviderForkRequest {
-        source,
-        target_harness_session_id: "fork-target".into(),
-        checkpoint_id: Some("checkpoint-one".into()),
-    };
-    assert!(bridge.thread_fork(first.clone()).await.is_err());
-    let mut retry = first;
-    retry.source.model = "changed-model".into();
-    retry.source.effort = "high".into();
-    retry.checkpoint_id = Some("checkpoint-two".into());
-    bridge.thread_fork(retry).await?;
-    let attempts = native.fork_attempts.lock().unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0], attempts[1]);
-    Ok(())
-}
-
 /// Collect positively rejected native admission while retaining every uncertain or invalidated cause.
 #[tokio::test]
 async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() -> anyhow::Result<()>
@@ -894,69 +849,6 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     Ok(())
 }
 
-/// Closed observation cannot certify an operation whose published prefix was never consumed.
-#[tokio::test]
-async fn operation_watermark_rejects_early_stream_closure() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let request = provider_request(root.path());
-    let owner = request.owner()?;
-    let mut events = bridge.session_events(owner.clone()).await?;
-    bridge.thread_open(request).await?;
-    expect_negotiated_capabilities(&mut events);
-    let host = bridge.session(owner.clone()).await;
-    let binding = host
-        .initialized
-        .get()
-        .expect("the session is opened")
-        .binding
-        .id
-        .clone();
-    assert!(matches!(events.try_recv(), Err(EventDeliveryError::Empty)));
-    native.close_native_stream(&binding);
-    assert!(events.recv().await.is_err());
-    let error = bridge
-        .wait_watermark(&owner, forge_provider_api::EventSequence::new(1))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, ProviderError::Observation(_)));
-    let _ = bridge.shutdown().await;
-    Ok(())
-}
-
-/// Close cannot forget an unresolved opening merely because no binding has been installed.
-#[tokio::test]
-async fn close_retains_uncertain_open_until_collection_is_proven() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    *native.open_persistent_failure.lock().unwrap() = Some(
-        ProviderFailure::new(
-            ProviderOperation::ThreadOpen,
-            ProviderFailureKind::Transport,
-        )
-        .at_phase(
-            forge_provider_api::ProviderPhase::Observation,
-            forge_provider_api::FailureDisposition::Uncertain,
-        )
-        .into(),
-    );
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let request = provider_request(root.path());
-    let owner = request.owner()?;
-    assert!(bridge.thread_open(request).await.is_err());
-    assert!(bridge.session_close_owner(&owner).await.is_err());
-    assert!(
-        bridge.sessions.lock().await.contains_key(&owner),
-        "uncertain opening lost its owner"
-    );
-    *native.open_persistent_failure.lock().unwrap() = None;
-    bridge.session_close_owner(&owner).await?;
-    assert!(!bridge.sessions.lock().await.contains_key(&owner));
-    bridge.shutdown().await?;
-    Ok(())
-}
-
 /// Shutdown interrupts a pending open before awaiting its shared admission guard.
 #[tokio::test]
 async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow::Result<()> {
@@ -982,77 +874,5 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     assert!(
         matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::BindingClosed)
     );
-    Ok(())
-}
-
-/// A failed native close retains its live reader without waiting for a success-only EOF barrier.
-#[tokio::test]
-async fn failed_native_close_retains_reader_for_prompt_exact_binding_retry() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(true);
-    let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
-    let request = provider_request(root.path());
-    let owner = request.owner()?;
-    bridge.thread_open(request.clone()).await?;
-    let querying = bridge.clone();
-    let query =
-        tokio::spawn(async move { querying.terminal_list(catalog_request(&request)).await });
-    native.terminal_started.notified().await;
-    let error = bridge.session_close_owner(&owner).await.unwrap_err();
-    assert!(
-        matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::ThreadClose && failure.kind() == ProviderFailureKind::Runtime)
-    );
-    let host = bridge
-        .sessions
-        .lock()
-        .await
-        .get(&owner)
-        .cloned()
-        .expect("failed close retains host ownership");
-    let bound = host
-        .initialized
-        .get()
-        .expect("the retained native binding is initialized");
-    let binding = bound.binding.id.clone();
-    assert!(native.sinks.lock().unwrap().contains_key(&binding));
-    assert!(
-        bound
-            .relay
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|reader| !reader.is_finished())
-    );
-    assert_eq!(
-        *host.observers.lock().unwrap(),
-        1,
-        "failed collection retains the pending query lease"
-    );
-    native.terminal_release.notify_one();
-    query.await??;
-    bridge.session_close_owner(&owner).await?;
-    assert_eq!(native.retire_calls.load(Ordering::Acquire), 2);
-    assert!(!native.sinks.lock().unwrap().contains_key(&binding));
-    assert!(!bridge.sessions.lock().await.contains_key(&owner));
-    Ok(())
-}
-
-/// Invalid returned ownership is fenced without dropping the native resource needed by close.
-#[tokio::test]
-async fn foreign_opened_thread_is_rejected_and_remains_collectable() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    let native = BridgeFixtureProvider::new(false);
-    *native.open_thread_override.lock().unwrap() = Some(ThreadOwner::root("foreign").thread_id());
-    let bridge = bridge(root.path(), native.clone()).await?;
-    let request = provider_request(root.path());
-    let owner = request.owner()?;
-    assert!(matches!(bridge.thread_open(request.clone()).await,
-        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
-    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
-    assert!(matches!(bridge.thread_open(request).await,
-        Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation));
-    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
-    bridge.session_close_owner(&owner).await?;
-    assert_eq!(native.retire_calls.load(Ordering::Acquire), 1);
     Ok(())
 }

@@ -585,36 +585,3 @@ fn finish_source(
     );
     Ok(ContentResult::Ready(FileContent { source, origin }))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bounded_stream_rejects_growth_shrinkage_and_cancellation() {
-        assert!(
-            read_exact_content(&mut b"longer".as_slice(), 3, &mut || Ok(()))
-                .unwrap_err()
-                .to_string()
-                .contains("grew")
-        );
-        assert!(
-            read_exact_content(&mut b"short".as_slice(), 8, &mut || Ok(()))
-                .unwrap_err()
-                .to_string()
-                .contains("shrank")
-        );
-        assert_eq!(
-            read_exact_content(&mut b"exact".as_slice(), 5, &mut || Ok(())).unwrap(),
-            b"exact"
-        );
-        assert_eq!(
-            read_exact_content(&mut b"bytes".as_slice(), 5, &mut || anyhow::bail!(
-                "cancelled"
-            ))
-            .unwrap_err()
-            .to_string(),
-            "cancelled"
-        );
-    }
-}

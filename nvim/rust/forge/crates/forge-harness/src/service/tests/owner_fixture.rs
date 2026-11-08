@@ -9,15 +9,16 @@ use std::sync::Arc;
 
 /// Keep real owner admission and held generic provider work under deterministic test control.
 pub(super) struct OwnerTransitionFixture {
-    pub(super) root: tempfile::TempDir,
+    /// Keeps the workspace directory alive for the fixture's lifetime.
+    _root: tempfile::TempDir,
     pub(super) service: HarnessService,
     pub(super) controller: Arc<SessionController>,
     pub(super) session: String,
     pub(super) provider: Arc<crate::provider::Provider>,
-    pub(super) engine: Arc<crate::provider::session_execution::SessionExecution>,
+    /// Holds the root execution owner so the held invocation stays admitted.
+    _engine: Arc<crate::provider::session_execution::SessionExecution>,
     pub(super) sink: MessageSender,
     pub(super) reader: tokio::task::JoinHandle<Result<()>>,
-    pub(super) original: String,
 }
 
 /// Start one held root invocation without using retired restart or cancellation flags.
@@ -70,23 +71,18 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
             },
         )
         .await?;
-    let original = SqliteStore::read_only(&controller.data_root)?
-        .latest_exchange(&session)?
-        .unwrap()
-        .id;
     let execution_registry = controller.broker.lock().await.execution_registry();
     let engine = execution_registry
         .owner(crate::provider::ThreadOwner::root(&session))
         .await?;
     Ok(OwnerTransitionFixture {
-        root,
+        _root: root,
         service,
         controller,
         session,
         provider,
-        engine,
+        _engine: engine,
         sink,
         reader,
-        original,
     })
 }

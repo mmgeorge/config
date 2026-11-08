@@ -21,6 +21,8 @@ Use the `neovim-lua-dev` skill for all Lua and Neovim plugin work. It owns curso
   nu .forge/checks/lua-tests.nu nvim/lua/forge/lsp                # unit and integration tests for lsp/
   nu .forge/checks/lua-tests.nu --suite status                    # a source area's unit and integration tests
   nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/client.lua  # tests covering changed paths
+  nu .forge/checks/lua-tests.nu --filter 'harper|wordlist'        # cases whose path::case matches a regex
+  nu .forge/checks/lua-tests.nu client --filter queue             # narrow any selection by the same regex
   nu .forge/checks/lua-tests.nu --list client                     # print the selection without running it
   ```
 

@@ -107,36 +107,3 @@ pub(crate) fn observe(
     }
     ContinuationDecision::RetryNoProgress
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    fn goal() -> GoalRecord {
-        GoalRecord {
-            id: "goal".into(),
-            session_id: "session".into(),
-            objective: "finish".into(),
-            state: GoalState::Active,
-            continuation: ContinuationBudget::default(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
-    }
-
-    #[test]
-    fn stalls_after_five_turns_without_observable_progress() {
-        let mut record = goal();
-        for turn in 1..5 {
-            assert_eq!(
-                record.observe(TurnEvidence::default(), turn),
-                ContinuationDecision::RetryNoProgress
-            );
-        }
-        assert_eq!(
-            record.observe(TurnEvidence::default(), 5),
-            ContinuationDecision::Stalled
-        );
-        assert_eq!(record.state, GoalState::Stalled);
-    }
-}

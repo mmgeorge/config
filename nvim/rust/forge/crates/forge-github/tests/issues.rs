@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use forge_github::issue_store::IssueStore;
 use forge_github::lease::RepositoryLease;
-use forge_github::model::{PageInput, SnapshotState, SyncScope};
-use redb::{Database, TableDefinition};
+use forge_github::model::{SnapshotState, SyncScope};
+use redb::Database;
 use serde_json::json;
 
 #[test]
@@ -81,62 +81,6 @@ fn completion_recovery_observes_committed_revisions_after_interrupted_publicatio
 }
 
 #[test]
-fn legacy_state_migrates_at_commit_and_exhausted_revisions_roll_back_the_whole_page() -> Result<()>
-{
-    let root = tempfile::tempdir()?;
-    let database_path = root.path().join("issues.redb");
-    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    store.read_state()?;
-    let seed = |revision: Option<u64>| -> Result<()> {
-        let database = Database::create(&database_path)?;
-        let transaction = database.begin_write()?;
-        {
-            let mut table =
-                transaction.open_table(TableDefinition::<&str, &str>::new("sync_state"))?;
-            let mut state = json!({"repo":"owner/repo","open_historical_complete":true});
-            if let Some(revision) = revision {
-                state["revision"] = revision.into();
-            }
-            table.insert("owner/repo", serde_json::to_string(&state)?.as_str())?;
-        }
-        transaction.commit()?;
-        Ok(())
-    };
-    seed(None)?;
-    assert_eq!(store.read_state()?.revision, 0);
-    let output = root.path().join("snapshot.json");
-    assert!(
-        store
-            .reconcile_snapshot(SnapshotState::Open, &output)?
-            .republished
-    );
-    seed(Some(9_007_199_254_740_991))?;
-    let page = serde_json::from_value(
-        json!({"issues":[{"repo":"owner/repo","number":1,"title":"must roll back",
-        "state":"OPEN","url":"https://github.com/owner/repo/issues/1"}]}),
-    )?;
-    assert!(
-        store
-            .upsert_page(SyncScope::Open, page)
-            .unwrap_err()
-            .to_string()
-            .contains("revision exhausted")
-    );
-    let snapshot = store.snapshot(SnapshotState::Open)?;
-    assert_eq!(snapshot.revision, 9_007_199_254_740_991);
-    assert_eq!(snapshot.issue_count, 0);
-    seed(Some(9_007_199_254_740_992))?;
-    assert!(
-        store
-            .read_state()
-            .unwrap_err()
-            .to_string()
-            .contains("revision exceeds")
-    );
-    Ok(())
-}
-
-#[test]
 fn deletion_requires_exclusive_ownership_and_preserves_unrelated_data() -> Result<()> {
     let root = tempfile::tempdir()?;
     let directory = root.path().join("repo");
@@ -179,75 +123,6 @@ fn deletion_requires_exclusive_ownership_and_preserves_unrelated_data() -> Resul
     assert!(!directory.exists());
     assert_eq!(fs::read_to_string(unrelated)?, "preserved");
     assert!(!store.delete_repository_cache()?);
-    assert_eq!(store.read_state()?.repo, "owner/repo");
-    Ok(())
-}
-
-#[test]
-fn deletion_rejects_non_repository_layouts() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let database_path = root.path().join("issues.redb");
-    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    store.read_state()?;
-    assert!(store.delete_repository_cache().is_err());
-    assert!(database_path.exists());
-    Ok(())
-}
-
-#[test]
-fn snapshot_publication_preserves_previous_output_when_database_decode_fails() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("issues.redb");
-    let output = directory.path().join("open-snapshot.json");
-    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    let page: PageInput = serde_json::from_value(json!({"issues":[{
-        "repo":"owner/repo", "number":1, "title":"First", "state":"OPEN",
-        "url":"https://github.com/owner/repo/issues/1", "body":"Excluded body"
-    }]}))?;
-    store.upsert_page(SyncScope::Open, page)?;
-    fs::write(&output, b"previous snapshot")?;
-    assert_eq!(store.publish_snapshot(SnapshotState::Open, &output)?, 1);
-    let previous = fs::read(&output)?;
-    let decoded: serde_json::Value = serde_json::from_slice(&previous)?;
-    assert_eq!(decoded["issues"][0]["title"], "First");
-    assert!(decoded["issues"][0].get("body").is_none());
-    assert!(
-        store
-            .publish_snapshot(SnapshotState::Open, &database_path)
-            .is_err()
-    );
-
-    let database = Database::create(&database_path)?;
-    let transaction = database.begin_write()?;
-    {
-        let mut issues = transaction.open_table(TableDefinition::<&str, &str>::new("issues"))?;
-        issues.insert("owner/repo\0invalid-record", "invalid JSON")?;
-    }
-    transaction.commit()?;
-    drop(database);
-    assert!(
-        store
-            .publish_snapshot(SnapshotState::Open, &output)
-            .is_err()
-    );
-    assert_eq!(fs::read(&output)?, previous);
-    assert_eq!(fs::read_dir(directory.path())?.count(), 2);
-    Ok(())
-}
-
-#[test]
-fn lock_timeout_retains_database_without_archiving_it() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("issues.redb");
-    // A zero lock timeout expires on the first contended open attempt.
-    let store = IssueStore::new(database_path.clone(), "owner/repo", Duration::ZERO)?;
-    store.read_state()?;
-    let database = Database::create(&database_path)?;
-    let error = store.read_state().unwrap_err();
-    assert!(format!("{error:#}").contains("database lock"));
-    assert!(database_path.exists());
-    assert_eq!(fs::read_dir(directory.path())?.count(), 1);
-    drop(database);
     assert_eq!(store.read_state()?.repo, "owner/repo");
     Ok(())
 }

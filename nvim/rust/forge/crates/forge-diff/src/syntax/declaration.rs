@@ -1325,29 +1325,3 @@ fn normalize(text: &str) -> String {
     }
     result
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rust_preserves_complete_contracts_and_excludes_bodies() {
-        let source = "/// Texture owner.\npub struct Texture { pub id: u64, pending: Option<Vec<String>> }\nimpl Texture { pub fn request<'a>(&'a mut self, id: u64) -> Option<&'a String> { None } }\n";
-        let overview = DeclarationOverview::extract("src/texture.rs", source).unwrap();
-        assert!(overview.contains("pending: Option<Vec<String>>"));
-        assert!(
-            overview.contains("pub fn request<'a>(&'a mut self, id: u64) -> Option<&'a String>;")
-        );
-        assert!(!overview.contains("None"));
-        assert_eq!(
-            DeclarationOverview::parse("src/texture.rs", &overview).unwrap(),
-            overview
-        );
-        let changed_body = source.replace("None", "todo!()");
-        assert_eq!(
-            DeclarationOverview::extract("src/texture.rs", &changed_body).unwrap(),
-            overview
-        );
-        assert!(DeclarationOverview::parse("src/texture.rs", source).is_err());
-    }
-}

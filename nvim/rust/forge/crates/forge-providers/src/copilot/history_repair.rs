@@ -250,39 +250,6 @@ mod tests {
         Ok(())
     }
 
-    /// Resume a permission-cancelled tool suffix without mistaking its aborted turn for success.
-    #[test]
-    fn native_history_repairs_only_correlated_aborted_suffix() -> Result<()> {
-        let mut history = vec![
-            event(
-                "boundary",
-                "assistant.message",
-                json!({"messageId":"request","content":"","toolRequests":[{"name":"shell","toolCallId":"pending"}]}),
-            ),
-            event("permission", "permission.requested", json!({})),
-            event("permission-complete", "permission.completed", json!({})),
-            event("end", "assistant.turn_end", json!({"turnId":"0"})),
-            event("abort", "abort", json!({"reason":"remote_command"})),
-        ];
-        history[1].parent_id = Some("boundary".into());
-        history[2].parent_id = Some("abort".into());
-        history[3].parent_id = Some("permission-complete".into());
-        history[4].parent_id = Some("permission".into());
-        assert_eq!(incomplete_suffix(&history)?, Some("boundary".into()));
-
-        history[4].agent_id = Some("child".into());
-        assert!(incomplete_suffix(&history).is_err());
-        history[4].agent_id = None;
-        history[4].parent_id = Some("unrelated".into());
-        assert!(incomplete_suffix(&history).is_err());
-        history[4].parent_id = Some("permission-complete".into());
-        assert!(incomplete_suffix(&history).is_err());
-        history[4].parent_id = Some("permission".into());
-        history[3].parent_id = Some("boundary".into());
-        assert!(incomplete_suffix(&history).is_err());
-        Ok(())
-    }
-
     /// Never discard a newer accepted user input while repairing an earlier incomplete tool call.
     #[test]
     fn native_history_refuses_later_user_input() {

@@ -64,16 +64,6 @@ pub(super) struct DisplayProjection<'registry> {
 }
 
 impl DisplayRegistry {
-    #[cfg(test)]
-    pub(super) fn tool_occurrences<'registry>(
-        &'registry self,
-        source: &'registry ToolAddress,
-    ) -> impl Iterator<Item = DisplayId> + 'registry {
-        self.id.iter().filter_map(move |(key, id)| {
-            matches!(&key.source, DisplaySource::Tool(address) if address == source).then_some(*id)
-        })
-    }
-
     pub(super) fn project(&mut self, owner: String) -> DisplayProjection<'_> {
         DisplayProjection {
             registry: self,

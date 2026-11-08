@@ -1,0 +1,445 @@
+{
+  "document": "notification-test",
+  "revision": 1,
+  "block": [
+    {
+      "id": "notifications:hint",
+      "text": [
+        "Hint: <tab> expand | <cr> open | b browse | S save | U unread | D done | r refresh | q close",
+        ""
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Unread",
+      "text": [
+        "Unread:"
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:1",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "5d778120-3f96-4d31-a51d-495f9005290c",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:2",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "e8b4762d-a430-40c2-b6a0-dad82610518b",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:3",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "47cbc3fb-21a6-4da9-896a-949604204d99",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:4",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "86e07f03-5d60-49f4-8787-228bfc6ee22c",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:5",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "b63a53a3-27b7-422d-bd62-f99aa241da66",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:6",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "d55be487-9a9e-4ff6-b3ed-805285618f9f",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:7",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "517a48d2-b83e-4c0e-93db-7b9e51ced8a1",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:8",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "c2fc6405-77b0-429e-8249-8d0de9a5f783",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:9",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "64204679-7ebf-4544-90b9-d7f85e904611",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:10",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "7d4136e7-f7f2-42f8-b3b8-bfd3446b136f",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:11",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "491c0f86-64cc-434b-8ca3-6b5a966545d7",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:12",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "4d616dae-7adf-43de-9663-d90a5e66e181",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notification:9007199254740993",
+      "text": [
+        "#7 Literal *title* and [brackets] (...)"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "fe3e6d0a-56ce-4be3-80f5-2372501989ab",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Unread:separator",
+      "text": [
+        ""
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Saved",
+      "text": [
+        "Saved:"
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Saved:none",
+      "text": [
+        "none"
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Saved:separator",
+      "text": [
+        ""
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Done",
+      "text": [
+        "Done:"
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:Done:none",
+      "text": [
+        "none"
+      ],
+      "metadata": {
+        "target": [],
+        "decoration": [],
+        "editable_region": []
+      }
+    },
+    {
+      "id": "notifications:page",
+      "text": [
+        "Load more notifications"
+      ],
+      "metadata": {
+        "target": [
+          {
+            "id": "notifications:page",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    }
+  ]
+}

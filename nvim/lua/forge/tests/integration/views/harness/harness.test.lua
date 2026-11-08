@@ -2170,20 +2170,25 @@ local success, failure = xpcall(function()
   assert(opened.session.provider_session_id == nil or opened.session.provider_session_id == vim.NIL,
     "startup allocated a native conversation: " .. vim.inspect(opened.session.provider_session_id))
 
-  prompt({ checklist_step({
-    { content = "Read the owner", status = "completed" },
-    { content = "Move the types", status = "in_progress" },
-    { content = "Document it", status = "pending" },
-  }) }, "Report the checklist.")
+  -- Each provider replacement updates the canonical checklist rather than appending stale rows.
+  prompt({
+    checklist_step({ { content = "Read the owner", status = "completed" }, { content = "Move the types", status = "in_progress" } }),
+    checklist_step({ { content = "Ship it", status = "in_progress" }, { content = "Verify it", status = "in_progress" },
+      { content = "Document it", status = "pending" } }),
+    checklist_step({ { content = "Ship it", status = "completed" }, { content = "Verify it", status = "in_progress" },
+      { content = "Document it", status = "pending" } }),
+  }, "Report the checklist.")
   local first = request("session.state.get")
   assert(type(first.session.provider_session_id) == "string" and first.session.provider_session_id ~= "",
     "the first input did not open a native conversation")
-  wait_until(function() return count("Provider-reported checklist · 1/3 completed · Fixture plan") > 0 end, "checklist heading did not render", { timeout_ms = 4000 })
-  open_section("Provider-reported checklist · 1/3 completed · Fixture plan")
-  wait_until(function() return count("[x] Read the owner") > 0 end, "checklist rows did not open", { timeout_ms = 4000 })
-  for _, row in ipairs({ "[x] Read the owner", "[>] Move the types · in progress", "[ ] Document it" }) do
+  local heading = "Provider-reported checklist · 1/3 completed · Fixture plan"
+  wait_until(function() return count(heading) > 0 end, "checklist heading did not render", { timeout_ms = 4000 })
+  open_section(heading)
+  wait_until(function() return count("[x] Ship it") > 0 end, "checklist rows did not open", { timeout_ms = 4000 })
+  for _, row in ipairs({ "[x] Ship it", "[>] Verify it · in progress", "[ ] Document it" }) do
     assert(count(row) == 1, "missing checklist row " .. row .. "\n" .. table.concat(transcript(), "\n"))
   end
+  assert(count("Read the owner") == 0 and count("[>] Ship it") == 0, "replacement kept a stale entry")
 
   -- A later exchange without a checklist neither repeats nor fabricates progress.
   local transcript_window = vim.fn.bufwinid(state.transcript_buf)
@@ -2192,17 +2197,6 @@ local success, failure = xpcall(function()
   prompt({}, "Answer without a checklist.")
   assert(count("Provider-reported checklist") == 1, "a checklist-free exchange fabricated a checklist section")
   assert(vim.api.nvim_win_get_cursor(transcript_window)[1] == 1, "transcript refresh moved the cursor")
-
-  -- A provider replacement updates the canonical state rather than appending stale rows.
-  prompt({
-    checklist_step({ { content = "Ship it", status = "in_progress" }, { content = "Verify it", status = "in_progress" } }),
-    checklist_step({ { content = "Ship it", status = "completed" }, { content = "Verify it", status = "in_progress" } }),
-  }, "Update the checklist.")
-  wait_until(function() return count("Provider-reported checklist · 1/2 completed · Fixture plan") > 0 end, "replaced checklist did not render", { timeout_ms = 4000 })
-  open_section("Provider-reported checklist · 1/2 completed · Fixture plan")
-  wait_until(function() return count("[x] Ship it") > 0 end, "replaced checklist rows did not open", { timeout_ms = 4000 })
-  assert(count("[x] Ship it") == 1 and count("[>] Ship it") == 0, "replacement duplicated an entry")
-  assert(count("[>] Verify it · in progress") == 1, "in-progress entry was not shown")
   diagnostics:assert_none()
 end, debug.traceback)
 if not success then

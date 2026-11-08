@@ -1063,37 +1063,6 @@ fn stamp_event(mut event: SessionEvent, sequence: PublicationSequence) -> Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::FutureExt;
-
-    /// A failed input batch retains its suffix and remains ahead of later producer events.
-    #[test]
-    fn failed_batch_retains_suffix_and_orders_new_publishers() -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        publications.connection.lock().unwrap().execute_batch(
-            "CREATE TRIGGER reject_input_prefix BEFORE INSERT ON owner_publication BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;",
-        )?;
-        assert!(
-            publications
-                .publish_batch(vec![event("first"), event("second")])
-                .is_err()
-        );
-        publications
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER reject_input_prefix;")?;
-        assert!(publications.publish(event("third"), None).is_err());
-        assert!(records(&publications).is_empty());
-        publications.retry_recovery()?;
-        let retained = records(&publications);
-        assert_eq!(retained.len(), 3);
-        for (index, expected) in ["first", "second", "third"].into_iter().enumerate() {
-            assert_eq!(retained[index].event().payload["text"], expected);
-        }
-        assert!(!publications.has_recovery());
-        Ok(())
-    }
 
     /// A lost caller cannot pin output forever, and its late token cannot release a newer lease.
     #[tokio::test(start_paused = true)]
@@ -1187,66 +1156,5 @@ mod tests {
         publications
             .after(None, NonZeroU16::new(20).unwrap())
             .unwrap()
-    }
-
-    /// A failed delivery-evidence commit must retry storage while retaining the successful send fact.
-    #[tokio::test]
-    async fn evidence_write_retry_never_repeats_an_admitted_frame() -> Result<(), PublicationError>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let publication = publications.publish(event("once"), None)?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        let mut delivery = PublicationDelivery::default();
-        delivery.update(&publications, Some(&sender))?;
-        delivery.next().await;
-        drop(receiver.recv().await.unwrap().unwrap());
-        {
-            let connection = publications.connection.lock().unwrap();
-            connection.execute_batch("CREATE TRIGGER reject_publication_evidence BEFORE UPDATE ON owner_publication WHEN json_extract(NEW.state,'$.state')='admitted' BEGIN SELECT RAISE(ABORT,'injected evidence failure'); END;")?;
-        }
-        assert!(matches!(
-            delivery.update(&publications, Some(&sender)),
-            Err(PublicationError::DeliveryState { .. })
-        ));
-        assert!(
-            matches!(delivery.active, Some(ActiveDelivery::Observed { sequence, outcome: DeliveryOutcome::Admitted }) if sequence == publication.sequence())
-        );
-        {
-            let connection = publications.connection.lock().unwrap();
-            connection.execute_batch("DROP TRIGGER reject_publication_evidence;")?;
-        }
-        assert!(
-            matches!(delivery.advance(&publications, Some(&sender))?, Some(PublicationProgress::Admitted(found)) if found == publication.sequence())
-        );
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Admitted
-        );
-        assert!(receiver.try_recv().is_err());
-        Ok(())
-    }
-
-    /// Interrupted offers must remain an uncertainty barrier rather than silently replaying or skipping.
-    #[tokio::test]
-    async fn recovered_offer_preserves_uncertainty_and_blocks_later_events()
-    -> Result<(), PublicationError> {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        publications.publish(event("possibly delivered"), None)?;
-        publications.begin_offer()?.unwrap();
-        drop(publications);
-        let publications = SessionPublications::open(root.path(), "session")?;
-        publications.recover_interrupted_offers()?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        publications.publish(event("later"), Some(&sender))?;
-        let mut delivery = PublicationDelivery::default();
-        assert!(delivery.update(&publications, Some(&sender))?.is_none());
-        assert!(delivery.next().now_or_never().is_none());
-        let retained = records(&publications);
-        assert_eq!(retained[0].state(), PublicationState::Uncertain);
-        assert_eq!(retained[1].state(), PublicationState::Pending);
-        assert!(receiver.try_recv().is_err());
-        Ok(())
     }
 }

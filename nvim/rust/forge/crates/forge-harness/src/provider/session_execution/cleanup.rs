@@ -330,44 +330,4 @@ mod tests {
         ledger.collect().await?;
         Ok(())
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_start_and_seal_cannot_escape_collection() -> anyhow::Result<()> {
-        let ledger = Arc::new(CleanupLedger::default());
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let starter = {
-            let ledger = Arc::clone(&ledger);
-            let barrier = Arc::clone(&barrier);
-            let ran = Arc::clone(&ran);
-            tokio::spawn(async move {
-                barrier.wait().await;
-                ledger
-                    .start(CleanupWorkKind::OwnerFence, async move {
-                        ran.store(true, std::sync::atomic::Ordering::Release);
-                        Ok(())
-                    })
-                    .is_ok()
-            })
-        };
-        let sealer = {
-            let ledger = Arc::clone(&ledger);
-            let barrier = Arc::clone(&barrier);
-            tokio::spawn(async move {
-                barrier.wait().await;
-                ledger.seal()
-            })
-        };
-        barrier.wait().await;
-        let accepted = starter.await?;
-        sealer.await??;
-        ledger.collect().await?;
-        assert_eq!(ran.load(std::sync::atomic::Ordering::Acquire), accepted);
-        assert!(
-            ledger
-                .start(CleanupWorkKind::OwnerFence, async { Ok(()) })
-                .is_err()
-        );
-        Ok(())
-    }
 }

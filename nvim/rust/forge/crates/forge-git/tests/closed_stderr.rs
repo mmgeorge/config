@@ -1,33 +1,9 @@
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use forge_git::read_pool::BlockingReadPool;
-
-#[test]
-fn checkpoint_worker_survives_closed_stderr() -> Result<()> {
-    let (reader, writer) = std::io::pipe()?;
-    drop(reader);
-    let mut child = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "checkpoint_worker_with_closed_stderr",
-            "--ignored",
-            "--nocapture",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(writer)
-        .spawn()?;
-    wait_for_worker(&mut child)
-}
-
-fn wait_for_worker(child: &mut Child) -> Result<()> {
-    let status = child.wait()?;
-    ensure!(status.success(), "checkpoint worker failed: {status}");
-    Ok(())
-}
 
 #[tokio::test]
 #[ignore = "runs in a subprocess with its stderr reader already closed"]

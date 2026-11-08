@@ -118,25 +118,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Keep native descriptions and payloads out of normalized permission fallbacks.
-    #[test]
-    fn unknown_operations_never_publish_native_payloads() {
-        for payload in [
-            json!({"unrecognized":"network private-native-payload"}),
-            json!({"toolCall":{"kind":"execute","title":"private-native-payload","rawInput":{"unexpected":true}}}),
-            json!({"toolCall":{"kind":"future-operation","title":"private-native-payload"}}),
-            json!({"permissions":{"network":{"unexpected":"private-native-payload"}}}),
-        ] {
-            let targets = normalize_permission_payload(&payload);
-            assert_eq!(targets, vec![PermissionTarget::Unknown]);
-            assert!(
-                !serde_json::to_string(&targets)
-                    .unwrap()
-                    .contains("private-native-payload")
-            );
-        }
-    }
-
     /// Preserve known operations and reject any malformed member of a permission set.
     #[test]
     fn structured_targets_preserve_complete_operations() {

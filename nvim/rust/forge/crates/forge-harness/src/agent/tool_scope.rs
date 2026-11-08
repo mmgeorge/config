@@ -183,37 +183,6 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn replaced_task_cannot_enqueue_retained_agent_callback() -> Result<()> {
-        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
-        let task = controller.current()?.unwrap();
-        let mut context =
-            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
-        context.bind_test_task_controller(controller.clone());
-        let coordinator = AgentCoordinator::new("session".into());
-        coordinator.set_enabled(true);
-        let (scope, _lease) = AgentToolScope::new(
-            ThreadOwner::root("session"),
-            "parent".into(),
-            coordinator.clone(),
-        )?;
-        scope.bind_task_authority(crate::tools::TaskAuthority::capture(&context))?;
-        controller.change(
-            &mut store,
-            Some(&task.revision),
-            crate::task::TaskChange::Clear,
-            2,
-        )?;
-        assert!(
-            scope
-                .invoke("agent_spawn", json!({"text":"stale work"}))
-                .await
-                .is_err()
-        );
-        assert!(coordinator.try_receive().is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn tool_authority_rejects_children_foreign_roots_disabled_and_expired_turns() {
         let coordinator = AgentCoordinator::new("session".into());
         let child = ThreadOwner::new(

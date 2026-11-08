@@ -51,8 +51,6 @@ pub struct ProviderBridge {
     binding_collection: Arc<BindingCollection>,
     admission: tokio::sync::RwLock<()>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
-    consumption_entered: tokio::sync::Notify,
 }
 
 /// Retain ambiguous native generations until provider-wide collection proves all resources closed.
@@ -451,8 +449,6 @@ impl ProviderBridge {
             retired_bindings: Default::default(),
             admission: tokio::sync::RwLock::new(()),
             closed,
-            #[cfg(test)]
-            consumption_entered: tokio::sync::Notify::new(),
         }
     }
 
@@ -2602,8 +2598,6 @@ impl ProviderBridge {
         binding: &BindingId,
         sequence: forge_provider_api::EventSequence,
     ) -> Result<(), ProviderError> {
-        #[cfg(test)]
-        self.consumption_entered.notify_waiters();
         let original = self
             .ownership
             .lock()

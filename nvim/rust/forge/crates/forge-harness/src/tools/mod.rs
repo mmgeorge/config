@@ -33,8 +33,6 @@ pub use questions::{
     plan_question_input_schema, question_answer_input_schema, question_withdraw_input_schema,
 };
 pub use registry::{ControlToolDefinition, ControlToolRegistry};
-#[cfg(test)]
-pub(crate) use runtime::ControlToolRuntime;
 pub(crate) use runtime::ProviderExecutionPreview;
 pub use runtime::{ControlToolResult, ControlTurnContext};
 pub use stdio::run_stdio;

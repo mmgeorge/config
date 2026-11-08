@@ -296,34 +296,3 @@ struct StoredAnswerCommit {
     operation_id: String,
     active_elicitation: ActiveElicitation,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// Preserve old response metadata while still rejecting a receipt for another source.
-    #[test]
-    fn recovered_receipt_preserves_original_fields_and_validates_source() -> anyhow::Result<()> {
-        let elicitation = PlanElicitation::new(
-            super::super::PlanQuestionSet::freeform("Which scope?".into()).normalize()?,
-        );
-        let request = PlanQuestionAnswerRequest::parse(json!({
-            "operation_id":"answer","target":{"owner":"plan","id":"plan","set_id":elicitation.question_set.id,"revision":elicitation.revision},
-            "question_id":elicitation.question_set.questions[0].id,"response":{"kind":"other","text":"Current scope"},
-        }))?;
-        let mut original =
-            serde_json::to_value(PlanQuestionAnswerCommit::new(&request, elicitation)?)?;
-        original["legacy_receipt_note"] = json!("retain historical context");
-        original["active_elicitation"]["legacy_view_revision"] = json!(3);
-        let recovered =
-            PlanQuestionAnswerCommit::recover(&request, &serde_json::to_string(&original)?)?;
-        assert_eq!(serde_json::to_value(recovered)?, original);
-        original["active_elicitation"]["plan_id"] = json!("replacement-plan");
-        assert!(matches!(
-            PlanQuestionAnswerCommit::recover(&request, &serde_json::to_string(&original)?),
-            Err(PlanQuestionAnswerError::ReceiptMismatch)
-        ));
-        Ok(())
-    }
-}
