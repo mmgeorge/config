@@ -678,51 +678,62 @@ impl AcpConversation {
     /// Decode native model and reasoning choices for the host catalog.
     pub async fn models(&self) -> Result<Vec<ProviderModel>> {
         let catalog = self.state.catalog().await;
-        let model_list = catalog
-            .pointer("/models/availableModels")
-            .and_then(Value::as_array)
-            .or_else(|| {
-                find_option(&catalog, "model").and_then(|option| option["options"].as_array())
-            });
-        let current_model = current_model_id(&catalog);
-        let mut result = Vec::new();
-        for model in model_list.into_iter().flatten() {
-            let Some(id) = model["modelId"]
+        let vision = self
+            .initialized
+            .pointer("/agentCapabilities/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            == Some(true);
+        Ok(decode_model_catalog(&catalog, vision))
+    }
+}
+
+/// Decode a session catalog's model entries from the legacy model state or the `model` config option.
+///
+/// Both shapes carry a human-readable `name` beside the selection value. Claude's adapter versions
+/// that name from the alias's resolved model (`opus` is named `Opus 5.5`), so it becomes the label
+/// while the alias stays the `id` that model selection sends back.
+pub(super) fn decode_model_catalog(catalog: &Value, vision: bool) -> Vec<ProviderModel> {
+    let model_list = catalog
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+        .or_else(|| find_option(catalog, "model").and_then(|option| option["options"].as_array()));
+    let current_model = current_model_id(catalog);
+    let reasoning: Vec<String> = find_option(catalog, "thought_level")
+        .or_else(|| find_option(catalog, "effort"))
+        .and_then(|option| option["options"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["value"].as_str().map(str::to_owned))
+        .collect();
+    let non_empty = |value: &Value| {
+        value
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    };
+    model_list
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["modelId"]
                 .as_str()
-                .or_else(|| model["value"].as_str())
-            else {
-                continue;
-            };
-            let reasoning: Vec<String> = find_option(&catalog, "thought_level")
-                .or_else(|| find_option(&catalog, "effort"))
-                .and_then(|option| option["options"].as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|option| option["value"].as_str().map(str::to_owned))
-                .collect();
-            result.push(ProviderModel {
+                .or_else(|| model["value"].as_str())?;
+            Some(ProviderModel {
                 service_tiers: vec![forge_provider_api::ServiceTier::Standard],
                 id: id.into(),
-                reasoning,
+                label: non_empty(&model["name"]),
+                reasoning: reasoning.clone(),
                 default_reasoning: None,
                 selected_reasoning: None,
                 context_window: Vec::new(),
                 default_context_window: None,
                 selected_context_window: None,
-                vision: self
-                    .initialized
-                    .pointer("/agentCapabilities/promptCapabilities/image")
-                    .and_then(Value::as_bool)
-                    == Some(true),
-                description: model["description"]
-                    .as_str()
-                    .or_else(|| model["name"].as_str())
-                    .map(str::to_owned),
+                vision,
+                description: non_empty(&model["description"]),
                 is_default: current_model == Some(id),
-            });
-        }
-        Ok(result)
-    }
+            })
+        })
+        .collect()
 }
 
 /// Read the session's selected model from the legacy model state or the newer `model` config option.
@@ -806,4 +817,70 @@ fn find_option<'catalog>(catalog: &'catalog Value, category: &str) -> Option<&'c
         .as_array()?
         .iter()
         .find(|option| option["category"] == category || option["id"] == category)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_model_state_labels_aliases_with_versioned_names() {
+        let catalog = json!({
+            "models":{
+                "currentModelId":"opus",
+                "availableModels":[
+                    {"modelId":"opus","name":"Opus 5.5","description":"Most capable for complex work"},
+                    {"modelId":"haiku","name":" ","description":""},
+                ],
+            },
+            "configOptions":[{"id":"effort","options":[{"value":"low"},{"value":"high"}]}],
+        });
+
+        let models = decode_model_catalog(&catalog, true);
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "opus");
+        assert_eq!(models[0].label.as_deref(), Some("Opus 5.5"));
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("Most capable for complex work")
+        );
+        assert!(models[0].is_default);
+        assert!(models[0].vision);
+        assert_eq!(models[0].reasoning, ["low", "high"]);
+        assert_eq!(models[1].id, "haiku");
+        assert_eq!(models[1].label, None);
+        assert_eq!(models[1].description, None);
+        assert!(!models[1].is_default);
+    }
+
+    #[test]
+    fn model_config_option_labels_values_with_option_names() {
+        let catalog = json!({
+            "configOptions":[{
+                "id":"model","category":"model","currentValue":"sonnet",
+                "options":[{"value":"sonnet","name":"Sonnet 5.5"},{"value":"custom-model"}],
+            }],
+        });
+
+        let models = decode_model_catalog(&catalog, false);
+
+        assert_eq!(models[0].id, "sonnet");
+        assert_eq!(models[0].label.as_deref(), Some("Sonnet 5.5"));
+        assert!(models[0].is_default);
+        assert_eq!(models[1].id, "custom-model");
+        assert_eq!(models[1].label, None);
+    }
+
+    #[test]
+    fn absent_label_is_omitted_from_the_host_payload() {
+        let models = decode_model_catalog(
+            &json!({"models":{"availableModels":[{"modelId":"plain"}]}}),
+            false,
+        );
+
+        let payload = serde_json::to_value(&models[0]).expect("model serializes");
+
+        assert!(payload.get("label").is_none());
+    }
 }

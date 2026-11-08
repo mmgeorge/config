@@ -683,7 +683,8 @@ function M.open(state, host, resume_state)
       local catalog_disabled = not main_catalog.model_list and (main_catalog.failure or "Loading models") or nil
       local ask_disabled = not ask.model and "Enable Override to change Ask settings." or catalog_disabled
       local main = {
-        field("main-model", "choice", active.model or "Default", nil,
+        field("main-model", "choice", active.model
+          and require("forge.views.harness.model_options").label(main_catalog.model_list, active.model) or "Default", nil,
           not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
         field("main-thinking", "choice", active.effort or "Default", "Thinking",
           not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
@@ -736,7 +737,9 @@ function M.open(state, host, resume_state)
                 not ask.model and (not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled) or nil),
             }),
             row("models", "ask-model", "Ask model", "Model", {
-              field("ask-model", "choice", ask.model or active.resolved_model or active.model or "Default", nil,
+              field("ask-model", "choice", (ask.model or active.resolved_model or active.model)
+                and require("forge.views.harness.model_options").label(main_catalog.model_list,
+                  ask.model or active.resolved_model or active.model) or "Default", nil,
                 ask_disabled or not capability.model_selection and "Model selection is unavailable for this provider" or nil),
               field("ask-thinking", "choice", ask.model and (ask.effort or "Default") or (active.effort or "Default"), "Thinking",
                 ask_disabled or not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or nil),

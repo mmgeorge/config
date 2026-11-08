@@ -305,7 +305,10 @@ fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
                     "sessionId":"fixture",
                     "models":{
                         "currentModelId":"default-model",
-                        "availableModels":[{"modelId":"default-model"},{"modelId":"other"}],
+                        "availableModels":[
+                            {"modelId":"default-model"},
+                            {"modelId":"other","name":"Other 1.0"},
+                        ],
                     },
                     "configOptions":[effort],
                 })
@@ -598,6 +601,54 @@ fn operation_context() -> forge_provider_api::OperationContext {
         cancellation,
     )
     .unwrap()
+}
+
+/// Workspace discovery reads models from a disposable, unpersisted session before any binding exists.
+#[tokio::test]
+async fn workspace_model_list_reads_a_disposable_unpersisted_session() {
+    use forge_provider_api::provider::Provider;
+    let fixture = WireFixture::start("ok").await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+    let provider = fixture.claude_provider(fixture._directory.path().join("runtime"));
+    let workspace = fixture._directory.path().to_string_lossy().into_owned();
+
+    let models = provider
+        .model_list(
+            operation_context(),
+            forge_provider_api::QueryContext::Workspace(forge_provider_api::WorkspaceContext {
+                workspace: workspace.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let summary: Vec<_> = models
+        .iter()
+        .map(|model| (model.id.as_str(), model.label.as_deref(), model.is_default))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("default-model", None, true),
+            ("other", Some("Other 1.0"), false)
+        ]
+    );
+    let session_new: Vec<_> = fixture
+        .peer
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "session/new")
+        .collect();
+    let discovery = session_new
+        .last()
+        .expect("discovery opened a native session");
+    assert_eq!(discovery["params"]["cwd"], workspace.as_str());
+    assert_eq!(discovery["params"]["mcpServers"], json!([]));
+    assert_eq!(
+        discovery["params"]["_meta"]["claudeCode"]["options"],
+        json!({"persistSession":false,"strictMcpConfig":true})
+    );
+    provider.shutdown(operation_context()).await.unwrap();
 }
 
 /// Invalid options must leave existing history, resources and invocation admission untouched.

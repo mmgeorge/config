@@ -9,6 +9,19 @@ function M.find(models, id)
   end
 end
 
+--- Name a model by the provider's display label, falling back to its selection id.
+--- Only an exact id match is labeled, so the `default` selection keeps its own name rather
+--- than borrowing the label of whichever model the provider currently marks as default.
+---@param models table[]?
+---@param id string
+---@return string
+function M.label(models, id)
+  for _, model in ipairs(models or {}) do
+    if model.id == id then return model.label or id end
+  end
+  return id
+end
+
 ---@param model table?
 ---@param capability table
 ---@return string[]

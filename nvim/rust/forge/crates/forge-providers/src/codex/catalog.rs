@@ -271,6 +271,11 @@ pub fn parse_model_catalog(result: &Value) -> Vec<ProviderModel> {
                     })
                     .collect(),
                 id: id.to_owned(),
+                label: model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned),
                 default_reasoning: model
                     .get("defaultReasoningEffort")
                     .and_then(Value::as_str)

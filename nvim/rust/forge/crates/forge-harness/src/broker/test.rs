@@ -2551,6 +2551,7 @@ fn preference_provider() -> anyhow::Result<crate::provider::test_support::Provid
     .with_models(vec![
         forge_provider_api::ProviderModel {
             id: "gpt-5.6".into(),
+            label: None,
             service_tiers: vec![
                 forge_provider_api::ServiceTier::Standard,
                 forge_provider_api::ServiceTier::Fast,
@@ -2577,6 +2578,7 @@ fn preference_provider() -> anyhow::Result<crate::provider::test_support::Provid
         },
         forge_provider_api::ProviderModel {
             id: "gpt-5.4".into(),
+            label: None,
             service_tiers: vec![
                 forge_provider_api::ServiceTier::Standard,
                 forge_provider_api::ServiceTier::Fast,

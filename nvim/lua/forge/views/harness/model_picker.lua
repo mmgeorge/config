@@ -178,7 +178,7 @@ function ModelPicker.open(options)
     for index, model in ipairs(model_list) do
       if model.id == selected_model_id then selected_index = index end
       local active = model.id == selected_model_id and active_field(model) or nil
-      local model_label = (pinned_id_set[model.id] and "* " or "  ") .. model.id
+      local model_label = (pinned_id_set[model.id] and "* " or "  ") .. (model.label or model.id)
       local columns = { model_label }
       if layout.reasoning.width > 0 then
         columns[#columns + 1] = picker_field.render(model.picker_reasoning, active == "reasoning", layout.reasoning)

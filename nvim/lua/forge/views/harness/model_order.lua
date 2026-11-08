@@ -2,7 +2,8 @@ local ModelOrder = {}
 
 ---@class ForgeHarnessModel
 ---@field service_tiers? string[] Supported processing tiers from the provider's model catalog.
----@field id string
+---@field id string Native selection value, such as the alias `opus`.
+---@field label? string Provider display name, such as `Opus 5.5`.
 ---@field reasoning? string[]
 ---@field default_reasoning? string
 ---@field selected_reasoning? string

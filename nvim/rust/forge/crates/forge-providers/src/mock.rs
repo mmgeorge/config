@@ -1989,6 +1989,7 @@ impl MockProvider {
                 ServiceTier::Ultrafast,
             ],
             id: "mock-model".into(),
+            label: None,
             reasoning: vec!["low".into(), "medium".into(), "high".into()],
             default_reasoning: Some("medium".into()),
             selected_reasoning,

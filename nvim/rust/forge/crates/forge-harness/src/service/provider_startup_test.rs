@@ -37,6 +37,7 @@ impl Provider for StartupProvider {
         context.check_admission(ProviderOperation::ModelList)?;
         Ok(vec![forge_provider_api::ProviderModel {
             id: "fixture-model".into(),
+            label: None,
             service_tiers: vec![forge_provider_api::ServiceTier::Ultrafast],
             reasoning: vec!["high".into()],
             default_reasoning: Some("high".into()),

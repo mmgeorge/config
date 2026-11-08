@@ -41,6 +41,7 @@ pub fn model_descriptor(model: Model) -> ProviderModel {
     ProviderModel {
         service_tiers: vec![forge_provider_api::ServiceTier::Standard],
         is_default: model.id == "auto",
+        label: Some(model.name).filter(|name| !name.trim().is_empty()),
         id: model.id,
         reasoning: ordered_efforts(model.supported_reasoning_efforts.unwrap_or_default()),
         default_reasoning: model.default_reasoning_effort,

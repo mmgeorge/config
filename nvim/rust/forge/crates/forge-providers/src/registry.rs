@@ -245,6 +245,23 @@ pub fn default_id() -> ProviderId {
     select("codex").expect("the registry default is registered")
 }
 
+/// Get the provider Background generation uses when settings name none: the registry default
+/// when it supports Background sessions, otherwise the first selectable provider that does.
+pub fn background_default_id() -> Option<ProviderId> {
+    let supports = |entry: &&RegistryEntry| capability(entry.id).integration.background_generation;
+    REGISTRATIONS
+        .iter()
+        .find(|entry| entry.id == default_id().as_str())
+        .filter(supports)
+        .or_else(|| {
+            REGISTRATIONS
+                .iter()
+                .filter(|entry| entry.selectable)
+                .find(supports)
+        })
+        .map(|entry| ProviderId::new(entry.id).expect("registry IDs are valid"))
+}
+
 /// Get the first provider identity excluded from interactive selection, when one exists.
 pub fn nonselectable_id() -> Option<ProviderId> {
     REGISTRATIONS

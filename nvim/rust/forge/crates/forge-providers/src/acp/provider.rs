@@ -2017,14 +2017,12 @@ impl AcpProvider {
     async fn list_models(
         &self,
         request: forge_provider_api::catalog::QueryContext,
+        cleanup: super::connection::AcpCleanup,
     ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
         let binding = match request {
             forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
-            forge_provider_api::catalog::QueryContext::Workspace(_) => {
-                return Err(forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::ModelSelection,
-                )
-                .into());
+            forge_provider_api::catalog::QueryContext::Workspace(workspace) => {
+                return self.workspace_models(&workspace.workspace, &cleanup).await;
             }
         };
         let session = self.binding(&binding, ProviderOperation::ModelList)?;
@@ -2131,6 +2129,86 @@ impl AcpProvider {
             .clone();
         drop(retained);
         task.join().await
+    }
+
+    /// Read the model catalog for a workspace that has no live binding.
+    ///
+    /// ACP publishes models only in a session response, so discovery opens a disposable session
+    /// with no tools, MCP servers, or instructions, and always collects its process. Claude's
+    /// session is not persisted, so discovery leaves no transcript in the user's history.
+    async fn workspace_models(
+        &self,
+        workspace: &str,
+        cleanup: &super::connection::AcpCleanup,
+    ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
+        let runtime = self.runtime.status();
+        if !runtime.available {
+            return Err(failure(
+                ProviderOperation::ModelList,
+                ProviderFailureKind::Runtime,
+            ));
+        }
+        let profile =
+            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
+        let connection = super::AcpConnection::launch_retained(
+            super::AcpLaunch {
+                command: &runtime.command,
+                environment: &runtime.environment,
+                workspace,
+                profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
+            },
+            Arc::new(AcpSessionState::new_binding(
+                self.kind,
+                self.admission.clone(),
+            )),
+            cleanup,
+        )
+        .await
+        .map_err(|_| failure(ProviderOperation::ModelList, ProviderFailureKind::Transport))?;
+        let requirement = super::conversation::runtime_requirement(
+            self.kind,
+            runtime
+                .command
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "ACP".into()),
+        )?;
+        let protocol = || failure(ProviderOperation::ModelList, ProviderFailureKind::Protocol);
+        let result = async {
+            let initialized = connection
+                .request("initialize", initialize_params())
+                .await
+                .map_err(|_| protocol())?;
+            super::conversation::validate_initialization(&requirement, &initialized)?;
+            let mut parameter = serde_json::json!({"cwd":workspace,"mcpServers":[]});
+            if self.kind == AcpKind::Claude {
+                parameter["_meta"] = serde_json::json!({"claudeCode":{"options":{
+                    "persistSession":false,"strictMcpConfig":true}}});
+            }
+            let session = connection
+                .request("session/new", parameter)
+                .await
+                .map_err(|_| protocol())?;
+            let vision = initialized
+                .pointer("/agentCapabilities/promptCapabilities/image")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            Ok(super::conversation::decode_model_catalog(&session, vision))
+        }
+        .await;
+        let collected = cleanup
+            .shutdown()
+            .await
+            .map_err(|error| with_operation(ProviderOperation::ModelList, error));
+        match (result, collected) {
+            (Ok(models), Ok(())) => Ok(models),
+            (Err(cause), Ok(())) => Err(cause),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
+                cause: Box::new(cause),
+                cleanup: Box::new(cleanup),
+            }),
+        }
     }
 
     /// Inspect native initialization capabilities and always collect its temporary process.
@@ -2655,21 +2733,25 @@ impl forge_provider_api::provider::Provider for AcpProvider {
     ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
         let provider = self.clone();
         let payload = query.clone();
+        // Workspace discovery owns a disposable native process; interruption must collect it.
+        let cleanup = self.cleanup.scope();
+        let interrupt_cleanup = cleanup.clone();
         self.operations
             .models
             .observe(
                 context,
                 ProviderOperation::ModelList,
                 payload,
-                async move { provider.list_models(query).await },
+                async move { provider.list_models(query, cleanup).await },
                 move |interruption| {
+                    interrupt_cleanup.close_admission();
                     Interruption::new(
                         interruption.failure(
                             ProviderOperation::ModelList,
                             ProviderPhase::Observation,
                             FailureDisposition::Unchanged,
                         ),
-                        async { Ok(()) },
+                        async move { interrupt_cleanup.shutdown().await },
                     )
                 },
             )

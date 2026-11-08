@@ -2342,6 +2342,7 @@ mod tests {
         let before = broker.session.clone();
         let catalog = vec![crate::provider::ProviderModel {
             id: "task-executor".into(),
+            label: None,
             reasoning: vec!["high".into()],
             service_tiers: vec![crate::provider::ServiceTier::Standard],
             default_reasoning: None,

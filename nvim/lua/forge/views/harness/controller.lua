@@ -206,10 +206,15 @@ local function status_text()
     and (active_session.access or {}).sandbox == false
   local configured_model = active_session.model or config.options.harness.model
   local confirmed_model = type(active_session.resolved_model) == "string" and active_session.resolved_model or nil
-  local model = confirmed_model or (configured_model .. " (unconfirmed)")
+  local model_catalog = state.model_provider == active_session.provider and state.model_list or nil
+  local model_options = require("forge.views.harness.model_options")
+  local model = confirmed_model and model_options.label(model_catalog, confirmed_model)
+    or (model_options.label(model_catalog, configured_model) .. " (unconfirmed)")
   local effort = selected_setting(state, "effort")
   local selected_model = selected_setting(state, "model")
-  if selected_model ~= configured_model then model = selected_model .. " (requested)" end
+  if selected_model ~= configured_model then
+    model = model_options.label(model_catalog, selected_model) .. " (requested)"
+  end
   local tier = selected_setting(state, "service_tier")
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
   local model_text = ("%s %s"):format(model, effort)
@@ -609,6 +614,11 @@ local function on_event(event, payload)
       state.session.provider_label = runtime.provider
       state.session.resolved_model = type(runtime.model) == "string" and runtime.model or nil
       M.refresh_winbar()
+      -- A resolved runtime has a live provider session, so its catalog can now name the model.
+      -- A catalog failure leaves the id in the status line; the model picker reports such failures.
+      require("forge.views.harness.provider_catalog").models(false, function(model_list)
+        if model_list then M.refresh_winbar() end
+      end)
     elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
       M.refresh_winbar()

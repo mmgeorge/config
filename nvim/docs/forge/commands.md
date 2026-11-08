@@ -610,6 +610,15 @@ Use `/checks edit on/off` to control check-authoring permission.
 Unsupported controls explain their restriction, and provider setup and Windows
 sandbox options appear only where applicable.
 
+The model picker, configuration page, and winbar name each model by the
+provider's display name, such as `Opus 5.5`, when the provider publishes one.
+Claude Code advertises aliases such as `opus` whose display name carries the
+concrete version, and `/model` still accepts and completes the alias. Models
+without a display name keep their identifier. The winbar shows the identifier
+until the provider session reports its model catalog. Before a Claude Code or
+Antigravity session's first message, `/model` starts a short-lived adapter to
+read the catalog, so the first listing takes a few seconds.
+
 The model picker's **Context** value uses the provider's explicit context limit.
 For the active model and tier, it uses the live session limit shown in the winbar.
 Copilot tiers without an explicit numeric limit display their identifier, such as

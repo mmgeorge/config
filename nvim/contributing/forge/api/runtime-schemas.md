@@ -764,7 +764,12 @@ Source: [model.rs](../../../rust/forge/crates/forge-provider-api/src/model.rs).
 /// Represents one model and the controls advertised by its provider.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderModel {
+    /// Native selection value sent back to the provider, such as an alias like `opus`.
     pub id: String,
+    /// Provider-published display name, such as `Opus 5.5`, which can name the concrete
+    /// model behind an alias `id`. Views fall back to `id` when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     /// Service tiers explicitly advertised for this model.
     pub service_tiers: Vec<ServiceTier>,

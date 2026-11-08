@@ -709,6 +709,7 @@ impl RoutingProvider {
         );
         let model = forge_provider_api::ProviderModel {
             id: "fixture-model".into(),
+            label: None,
             service_tiers: vec![
                 forge_provider_api::ServiceTier::Standard,
                 forge_provider_api::ServiceTier::Fast,

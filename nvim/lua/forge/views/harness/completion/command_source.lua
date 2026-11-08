@@ -334,9 +334,11 @@ function CommandSource:get_completions(_, callback)
     self:request_model_list(function(model_list)
       local model_completion_list = {}
       for index, model in ipairs(model_list or {}) do
+        local detail = model.label and model.description and (model.label .. " · " .. model.description)
+          or model.label or model.description or "Provider model"
         model_completion_list[#model_completion_list + 1] = value_completion(
           model.id,
-          model.description or model.label or "Provider model",
+          detail,
           row,
           model_start - 1,
           cursor_column
