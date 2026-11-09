@@ -9,27 +9,12 @@ pub(crate) fn create(
     skills: &[SkillDefinition],
 ) -> Result<crate::profile::ResourceProfile, ProviderError> {
     let profile = match kind {
-        super::AcpKind::Claude => claude(root, skills),
         super::AcpKind::Antigravity => {
             let home = native_home()?;
             antigravity(root, skills, &home)
         }
     };
     profile.map_err(|error| error.into_provider_error(ProviderOperation::ThreadOpen))
-}
-
-fn claude(
-    root: &Path,
-    skills: &[SkillDefinition],
-) -> Result<crate::profile::ResourceProfile, crate::profile::ProfileError> {
-    let mut profile = crate::profile::ResourceProfile::create(root, "claude")?;
-    std::fs::create_dir_all(profile.path().join(".claude-plugin"))?;
-    std::fs::write(
-        profile.path().join(".claude-plugin/plugin.json"),
-        r#"{"name":"forge-managed","version":"1.0.0","description":"Forge session skill selection"}"#,
-    )?;
-    profile.bind_skills(skills, "skills")?;
-    Ok(profile)
 }
 
 fn antigravity(

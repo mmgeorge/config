@@ -37,22 +37,8 @@ pub struct ConversationOptions {
     pub control_endpoint: Option<forge_provider_api::session::HostToolEndpoint>,
     pub mcp_servers: Vec<Value>,
     pub resources: Vec<McpDefinition>,
-    pub profile: PathBuf,
-    pub skills: Vec<String>,
     /// Preserve host base instructions independently from per-invocation guidance.
     pub system_instructions: String,
-}
-
-/// Prepare the complete native target configuration for one durable fork.
-pub(super) struct ForkConfiguration<'a> {
-    pub workspace: &'a str,
-    pub mcp_servers: Vec<Value>,
-    pub skills: &'a [String],
-    pub profile: &'a std::path::Path,
-    pub model: Option<&'a str>,
-    pub effort: Option<&'a str>,
-    /// Replace source instructions with the separately owned target's instructions.
-    pub system_instructions: &'a str,
 }
 
 enum InstructionDelivery {
@@ -68,8 +54,6 @@ pub struct AcpConversation {
     initialized: Value,
     configuration: tokio::sync::Mutex<Value>,
     instructions: InstructionDelivery,
-    fork_targets:
-        tokio::sync::Mutex<std::collections::HashMap<forge_provider_api::OperationId, String>>,
 }
 
 impl AcpConversation {
@@ -78,7 +62,7 @@ impl AcpConversation {
         launch: AcpLaunch<'_>,
         state: Arc<AcpSessionState>,
         options: ConversationOptions,
-        cleanup: &super::connection::AcpCleanup,
+        cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Self, ProviderError> {
         let runtime = PathBuf::from(launch.command.first().map(String::as_str).unwrap_or("ACP"));
         let requirement = runtime_requirement(options.kind, runtime)?;
@@ -105,7 +89,7 @@ impl AcpConversation {
         let mut parameter = json!({"cwd":options.workspace,"mcpServers":servers});
         let instructions = if initialized.pointer("/agentCapabilities/sessionCapabilities/systemPrompt").is_some_and(Value::is_object) {
             append_system_instructions(&mut parameter, &options.system_instructions);
-            // Claude retains its original system prompt on resume until compaction.
+            // Native adapters can retain their original system prompt on resume until compaction.
             // Supply current instructions as input too so resume cannot defer the host contract.
             InstructionDelivery::NativeAppend {
                 resumed_prelude: options.session_id.as_ref().map(|_| options.system_instructions.clone()),
@@ -125,26 +109,9 @@ impl AcpConversation {
         state
             .update_catalog(json!({"mcpResources": resource_status}))
             .await;
-        if options.kind == ProviderKind::Claude {
-            // ACP 0.99.1 passes SDK 0.3.312 options through on new/load/fork.
-            // Verbatim input blocks slash-command dispatch; denied tools cannot start native goals.
-            parameter["_meta"] = json!({"claudeCode":{"emitRawSDKMessages":true,"options":{
-                "strictMcpConfig":true,"verbatimPrompts":true,
-                "disallowedTools":["Agent","Task","ProposeGoal","CronCreate","RemoteTrigger","ScheduleWakeup"]}}});
-            parameter["_meta"]["claudeCode"]["options"]["settings"] =
-                json!({"permissions":{"ask":["*"]}});
-            parameter["_meta"]["claudeCode"]["options"]["plugins"] = json!([
-                {"type":"local","path":options.profile}
-            ]);
-            parameter["_meta"]["claudeCode"]["options"]["skills"] = json!(
-                options.skills.iter().map(|name| format!("forge-managed:{name}"))
-                    .collect::<Vec<_>>()
-            );
-        } else {
-            // ACP 1.4.5 exposes schedule by default, including through read-only policy.
-            // Its persisted built-in filter keeps continuation authority with Harness.
-            parameter["_meta"] = json!({"antigravity":{"disabledTools":["schedule"]}});
-        }
+        // ACP 1.4.5 exposes schedule by default, including through read-only policy.
+        // Its persisted built-in filter keeps continuation authority with Harness.
+        parameter["_meta"] = json!({"antigravity":{"disabledTools":["schedule"]}});
         let response = if let Some(id) = &options.session_id {
             parameter["sessionId"] = json!(id);
             ensure!(
@@ -176,7 +143,6 @@ impl AcpConversation {
                 initialized,
                 configuration: tokio::sync::Mutex::new(configuration),
                 instructions,
-                fork_targets: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             Err(error) => {
                 // Keep a login-required rejection distinct so the user learns to sign in
@@ -242,32 +208,6 @@ impl AcpConversation {
             }
             InstructionDelivery::PromptPrelude(text) => (!text.is_empty()).then_some(text),
         }
-    }
-
-    /// Reject a fork whose target instructions cannot be retained by the native history.
-    pub(super) fn validate_fork_instructions(
-        &self,
-        instructions: &str,
-    ) -> Result<(), ProviderError> {
-        if !instructions.is_empty()
-            && matches!(self.instructions, InstructionDelivery::PromptPrelude(_))
-        {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeFork,
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Send a native operation while preserving its transport error category.
-    pub async fn request(&self, method: &str, parameter: Value) -> Result<Value, ProviderError> {
-        self.transport
-            .request(method, parameter)
-            .await
-            .map_err(|error| {
-                crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadCompact)
-            })
     }
 
     /// Reload retained history with the exact invocation-owned host MCP endpoint.
@@ -360,8 +300,6 @@ impl AcpConversation {
     pub(super) async fn configure_resources(
         &self,
         servers: Vec<Value>,
-        skills: &[String],
-        profile: &std::path::Path,
     ) -> Result<(), ProviderError> {
         let mut configuration = self.configuration.lock().await.clone();
         let endpoint = configuration["mcpServers"]
@@ -378,15 +316,6 @@ impl AcpConversation {
         }
         configuration["mcpServers"] = json!(servers);
         configuration["sessionId"] = json!(self.id);
-        if let Some(options) = configuration.pointer_mut("/_meta/claudeCode/options") {
-            options["plugins"] = json!([{"type":"local","path":profile}]);
-            options["skills"] = json!(
-                skills
-                    .iter()
-                    .map(|name| format!("forge-managed:{name}"))
-                    .collect::<Vec<_>>()
-            );
-        }
         let _history_replay = self.state.suppress_history_replay()?;
         let response = self
             .transport
@@ -436,145 +365,11 @@ impl AcpConversation {
         self.transport.prompt_end(input)
     }
 
-    /// Submit steering and retain the adapter's typed lifecycle limitation.
-    pub async fn steer(
-        &self,
-        parameter: Value,
-        receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
-    ) -> Result<super::submission::SteeringAcceptance, ProviderError> {
-        self.transport.submit_steering(parameter, receipt).await
-    }
-
     /// Interrupt this conversation while retaining the outstanding prompt's terminal response.
     pub fn cancel(&self) -> Result<(), ProviderError> {
         self.transport.cancel(&self.id).map_err(|error| {
             crate::error::acp(error, forge_provider_api::ProviderOperation::TurnInterrupt)
         })
-    }
-
-    /// Stop and collect the owned native process.
-    pub async fn shutdown(&self) -> Result<(), ProviderError> {
-        self.transport.shutdown().await.map_err(|error| {
-            crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadClose)
-        })
-    }
-
-    /// Fork the negotiated configuration and reject a reused source identity.
-    pub(super) async fn fork(
-        &self,
-        operation_id: &forge_provider_api::OperationId,
-        target: ForkConfiguration<'_>,
-    ) -> Result<String, ProviderError> {
-        let ForkConfiguration {
-            workspace,
-            mcp_servers,
-            skills,
-            profile,
-            model,
-            effort,
-            system_instructions,
-        } = target;
-        self.validate_fork_instructions(system_instructions)?;
-        if !self
-            .initialized
-            .pointer("/agentCapabilities/sessionCapabilities/fork")
-            .is_some_and(Value::is_object)
-        {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeFork,
-            )
-            .into());
-        }
-        async {
-            let mut configuration = self.configuration.lock().await.clone();
-            configuration["sessionId"] = json!(self.id);
-            configuration["cwd"] = json!(workspace);
-            configuration["mcpServers"] = json!(mcp_servers);
-            if matches!(self.instructions, InstructionDelivery::NativeAppend { .. }) {
-                append_system_instructions(&mut configuration, system_instructions);
-            }
-            if let Some(options) = configuration.pointer_mut("/_meta/claudeCode/options") {
-                options["plugins"] = json!([{"type":"local","path":profile}]);
-                options["skills"] = json!(
-                    skills
-                        .iter()
-                        .map(|name| format!("forge-managed:{name}"))
-                        .collect::<Vec<_>>()
-                );
-            }
-            let response = self
-                .transport
-                .request("session/fork", configuration)
-                .await
-                .map_err(|error| {
-                    crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadFork)
-                })?;
-            let id = response["sessionId"]
-                .as_str()
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| acp_failure(forge_provider_api::ProviderFailureKind::Protocol))?
-                .to_owned();
-            if id == self.id {
-                return Err(acp_failure(
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                ));
-            }
-            self.fork_targets
-                .lock()
-                .await
-                .insert(operation_id.clone(), id.clone());
-            let catalog = self.state.catalog().await.clone();
-            if let Some(model) = model {
-                if let Some(option) = find_option(&catalog, "model") {
-                    self.transport
-                        .request(
-                            "session/set_config_option",
-                            json!({
-                                "sessionId":id,"configId":option["id"],"value":model
-                            }),
-                        )
-                        .await
-                        .map_err(|error| {
-                            crate::error::acp(
-                                error,
-                                forge_provider_api::ProviderOperation::ThreadFork,
-                            )
-                        })?;
-                } else {
-                    self.transport
-                        .request("session/set_model", json!({"sessionId":id,"modelId":model}))
-                        .await
-                        .map_err(|error| {
-                            crate::error::acp(
-                                error,
-                                forge_provider_api::ProviderOperation::ThreadFork,
-                            )
-                        })?;
-                }
-            }
-            if let Some(effort) = effort {
-                let option = find_option(&catalog, "thought_level")
-                    .or_else(|| find_option(&catalog, "effort"))
-                    .ok_or({
-                        forge_provider_api::capability::UnsupportedCapability(
-                            forge_provider_api::capability::ProviderFeature::EffortSelection,
-                        )
-                    })?;
-                self.transport
-                    .request(
-                        "session/set_config_option",
-                        json!({
-                            "sessionId":id,"configId":option["id"],"value":effort
-                        }),
-                    )
-                    .await
-                    .map_err(|error| {
-                        crate::error::acp(error, forge_provider_api::ProviderOperation::ThreadFork)
-                    })?;
-            }
-            Ok(id)
-        }
-        .await
     }
 
     /// Apply native model, reasoning, and plan mode settings.
@@ -698,9 +493,8 @@ impl AcpConversation {
 
 /// Decode a session catalog's model entries from the legacy model state or the `model` config option.
 ///
-/// Both shapes carry a human-readable `name` beside the selection value. Claude's adapter versions
-/// that name from the alias's resolved model (`opus` is named `Opus 5.5`), so it becomes the label
-/// while the alias stays the `id` that model selection sends back.
+/// Both shapes carry a human-readable `name` beside the selection value, which becomes the label
+/// while the value stays the `id` that model selection sends back.
 pub(super) fn decode_model_catalog(catalog: &Value, vision: bool) -> Vec<ProviderModel> {
     let model_list = catalog
         .pointer("/models/availableModels")
@@ -761,7 +555,6 @@ pub fn runtime_requirement(
     runtime: PathBuf,
 ) -> Result<forge_provider_api::version::RuntimeRequirement, ProviderError> {
     let minimum = match kind {
-        ProviderKind::Claude => semver::Version::new(0, 99, 1),
         ProviderKind::Antigravity => semver::Version::new(1, 4, 5),
     };
     Ok(forge_provider_api::version::RuntimeRequirement::new(

@@ -58,7 +58,7 @@ fn drain(stream: &mut events::ProviderEventStream) -> Vec<forge_provider_api::Pr
 
 #[tokio::test]
 async fn native_message_and_tool_updates_publish_normalized_addresses_and_outcomes() {
-    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    let (state, _, mut stream) = activate(AcpKind::Antigravity).await;
     state
         .notification(
             "session/update",
@@ -159,7 +159,7 @@ fn message_classifications(
 
 #[tokio::test]
 async fn late_update_for_an_earlier_tool_keeps_the_final_answer_a_response() {
-    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    let (state, _, mut stream) = activate(AcpKind::Antigravity).await;
     let session_update = |update: serde_json::Value| {
         let state = state.clone();
         async move {
@@ -206,7 +206,7 @@ async fn late_update_for_an_earlier_tool_keeps_the_final_answer_a_response() {
 
 #[tokio::test]
 async fn native_message_ids_split_adjacent_prose_into_separate_messages() {
-    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    let (state, _, mut stream) = activate(AcpKind::Antigravity).await;
     for (native_message_id, text) in [
         (Some("msg-1"), "first "),
         (Some("msg-1"), "message"),
@@ -253,7 +253,7 @@ async fn native_message_ids_split_adjacent_prose_into_separate_messages() {
 
 #[tokio::test]
 async fn native_permission_callback_receives_a_normalized_target_and_once_choice() {
-    let (state, permission, _stream) = activate(AcpKind::Claude).await;
+    let (state, permission, _stream) = activate(AcpKind::Antigravity).await;
     state
         .notification(
             "session/update",

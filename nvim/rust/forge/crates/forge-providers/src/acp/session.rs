@@ -546,38 +546,8 @@ impl AcpSessionState {
             || self.capabilities.read().await.is_some()
     }
 
-    pub async fn begin_compaction(
-        &self,
-        session_id: &str,
-        sink: ProviderEventSink,
-    ) -> Result<(), ProviderError> {
-        if sink.scope().invocation().is_some() {
-            return Err(provider_failure(ProviderFailureKind::Rejected));
-        }
-        if self.active.read().await.is_some() {
-            return Err(provider_failure(ProviderFailureKind::Rejected));
-        }
-        *self.output.lock().await = forge_provider_api::completion::ProviderCompletion::default();
-        self.compaction.lock().await.clear();
-        *self.operation.write().await = Some(ActiveOperation {
-            session_id: session_id.into(),
-            sink,
-        });
-        Ok(())
-    }
-
     pub async fn finish_compaction(&self) {
         *self.operation.write().await = None;
-    }
-
-    /// Get the most recently observed compaction result for the active operation.
-    pub async fn latest_compaction(&self) -> Option<Compaction> {
-        self.compaction
-            .lock()
-            .await
-            .values()
-            .max_by_key(|compaction| compaction.started_at_ms.or(compaction.completed_at_ms))
-            .cloned()
     }
 
     pub async fn has_active_work(&self) -> bool {
@@ -1066,71 +1036,6 @@ impl AcpSessionState {
 
 impl AcpSessionState {
     async fn handle_notification(&self, method: &str, parameter: Value) -> Result<()> {
-        if self.history_replay.load(Ordering::Acquire) && method == "_claude/sdkMessage" {
-            return Ok(());
-        }
-        if method == "_claude/sdkMessage" && self.kind == ProviderKind::Claude {
-            if !self.has_observation_context().await {
-                return Ok(());
-            }
-            let message = &parameter["message"];
-            if message["type"] == "result" {
-                let usage = &message["usage"];
-                let input = usage["input_tokens"]
-                    .as_u64()
-                    .zip(usage["cache_read_input_tokens"].as_u64())
-                    .zip(usage["cache_creation_input_tokens"].as_u64())
-                    .and_then(|((input, read), created)| {
-                        input.checked_add(read)?.checked_add(created)
-                    });
-                let usage = forge_provider_api::usage::TokenUsage {
-                    input,
-                    cached_input: usage["cache_read_input_tokens"].as_u64(),
-                    reasoning: None,
-                    output: usage["output_tokens"].as_u64(),
-                };
-                let id = message["uuid"]
-                    .as_str()
-                    .filter(|id| !id.trim().is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::Protocol,
-                        )
-                    })?;
-                let invalid = || {
-                    ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::Protocol,
-                    )
-                };
-                let report = TurnUsageReport::accounting(
-                    forge_provider_api::identity::UsageReportId::new(id).map_err(|_| invalid())?,
-                    super::children::timestamp(),
-                    Some(usage),
-                    message["duration_ms"].as_u64(),
-                )
-                .map_err(|_| invalid())?;
-                let observed_address = self
-                    .children
-                    .lock()
-                    .await
-                    .address(parameter["sessionId"].as_str().unwrap_or_default(), true)
-                    .ok_or_else(invalid)?;
-                let address = self
-                    .usage_owner
-                    .lock()
-                    .await
-                    .entry(report.report_id().clone())
-                    .or_insert(observed_address)
-                    .clone();
-                self.emit(AdapterActivity::Turn {
-                    thread_id: address.thread_id,
-                    turn_id: address.turn_id,
-                    event: TurnMetadataEvent::Usage(report),
-                })
-                .await?;
-            }
-            return Ok(());
-        }
         if method != "session/update" {
             return Ok(());
         }

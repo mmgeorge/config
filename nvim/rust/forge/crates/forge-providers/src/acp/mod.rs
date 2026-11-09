@@ -8,7 +8,7 @@ mod profile;
 mod response;
 
 pub use connection::{AcpConnection, AcpConnectionError, AcpHandler, AcpLaunch, AcpRemoteFailure};
-pub(crate) use response::{PromptOutcome, validate_prompt_response};
+pub(crate) use response::PromptOutcome;
 pub mod runtime;
 
 pub mod submission;

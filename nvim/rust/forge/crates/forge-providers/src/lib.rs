@@ -4,6 +4,7 @@
 #![recursion_limit = "256"]
 
 mod acp;
+mod claude;
 mod codex;
 mod copilot;
 mod mock;
@@ -16,6 +17,7 @@ mod turn_runner;
 
 mod error;
 mod profile;
+mod resource_cleanup;
 
 mod permission_input;
 pub mod registry;

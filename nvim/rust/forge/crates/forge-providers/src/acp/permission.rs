@@ -7,25 +7,14 @@ use serde_json::Value;
 pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<PermissionRequest> {
     let input = &tool["rawInput"];
     let mut target_list = Vec::new();
-    let native_tool = tool
-        .pointer("/_meta/claudeCode/toolName")
-        .and_then(Value::as_str);
-    let mcp = tool.pointer("/_meta/mcp");
-    let mcp_target = mcp
-        .and_then(|metadata| {
-            let name = metadata["tool"].as_str()?;
-            Some(
-                metadata["server"]
-                    .as_str()
-                    .map_or_else(|| name.to_owned(), |server| format!("{server}/{name}")),
-            )
-        })
-        .or_else(|| {
-            native_tool.and_then(|name| {
-                let (server, name) = name.strip_prefix("mcp__")?.split_once("__")?;
-                Some(format!("{server}/{name}"))
-            })
-        });
+    let mcp_target = tool.pointer("/_meta/mcp").and_then(|metadata| {
+        let name = metadata["tool"].as_str()?;
+        Some(
+            metadata["server"]
+                .as_str()
+                .map_or_else(|| name.to_owned(), |server| format!("{server}/{name}")),
+        )
+    });
     if let Some(target) = mcp_target {
         target_list.push(
             match target
@@ -93,9 +82,6 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
                 );
             }
         }
-        if tool["kind"] == "search" {
-            paths.extend(searched_directory(native_tool, input));
-        }
         anyhow::ensure!(
             paths.is_empty()
                 || matches!(
@@ -121,7 +107,7 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
                         operation: forge_provider_api::access::DirectoryOperation::Write,
                     })
                 }
-                _ => target_list.extend(native_tool_targets(native_tool, tool)),
+                _ => target_list.extend(native_tool_targets(tool)),
             }
         }
     }
@@ -133,57 +119,18 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
     })
 }
 
-/// Return the directory a Claude Code search reads beyond any explicit `path`.
-///
-/// `Glob` and `Grep` search the session's working directory when they omit `path`, and Claude
-/// Code reports no location for them, so without this the request reaches Harness as a read of
-/// an unknown file and always asks. A `Glob` pattern can also leave its base directory through
-/// `..` or an absolute prefix, so the read target is the pattern's literal prefix joined onto the
-/// base rather than the base alone. Workspace resolution then checks that directory against the
-/// read scope like any other read.
-fn searched_directory(native_tool: Option<&str>, input: &Value) -> Option<String> {
-    let base = input["path"]
-        .as_str()
-        .filter(|path| !path.trim().is_empty());
-    match native_tool? {
-        "Glob" => {
-            let pattern = input["pattern"].as_str().unwrap_or_default();
-            let prefix = pattern
-                .split(['/', '\\'])
-                .take_while(|component| !component.contains(['*', '?', '[', '{']))
-                .collect::<Vec<_>>()
-                .join("/");
-            if std::path::Path::new(&prefix).is_absolute() || pattern.starts_with(['/', '\\']) {
-                return Some(if prefix.is_empty() {
-                    "/".into()
-                } else {
-                    prefix
-                });
-            }
-            let base = base.unwrap_or(".");
-            Some(if prefix.is_empty() {
-                base.to_owned()
-            } else {
-                format!("{}/{prefix}", base.trim_end_matches(['/', '\\']))
-            })
-        }
-        "Grep" if base.is_none() => Some(".".into()),
-        _ => None,
-    }
-}
-
 /// Name of the MCP server through which Harness exposes its own control tools.
 pub(super) const HOST_TOOL_SERVER: &str = "forge-harness-control";
 
 /// Normalize a native tool that carries no file, command, network, or MCP target.
 ///
-/// Claude Code asks permission for its own tools such as `ToolSearch` and `Skill`. Denying them
-/// as unknown operations silently blocks Harness workflows, because the agent discovers deferred
-/// Harness control tools through `ToolSearch`. Loading only Harness control tool schemas carries
-/// those tools' own host authority; any other native tool asks under its native name.
-fn native_tool_targets(native_tool: Option<&str>, tool: &Value) -> Vec<PermissionTarget> {
-    let Some(name) = native_tool
-        .or_else(|| tool["title"].as_str())
+/// Agents ask permission for their own tools, such as a tool search. Denying them as unknown
+/// operations silently blocks Harness workflows, because the agent discovers deferred Harness
+/// control tools through that search. Loading only Harness control tool schemas carries those
+/// tools' own host authority; any other native tool asks under its native name.
+fn native_tool_targets(tool: &Value) -> Vec<PermissionTarget> {
+    let Some(name) = tool["title"]
+        .as_str()
         .map(str::trim)
         .filter(|name| !name.is_empty())
     else {
@@ -226,7 +173,7 @@ mod tests {
     #[test]
     fn includes_every_location_and_diff_path_and_rejects_partial_targets() -> anyhow::Result<()> {
         let request = permission_request(
-            ProviderKind::Claude,
+            ProviderKind::Antigravity,
             &json!({
                 "kind":"move","locations":[{"path":"before.rs"}],
                 "content":[{"type":"diff","path":"after.rs"}],"rawInput":{"path":"third.rs"}
@@ -241,7 +188,7 @@ mod tests {
         }));
         assert!(
             permission_request(
-                ProviderKind::Claude,
+                ProviderKind::Antigravity,
                 &json!({
                     "kind":"edit","locations":[{"path":"valid"},{}]
                 })
@@ -250,55 +197,10 @@ mod tests {
         );
         Ok(())
     }
-    /// A Claude Code search without `path` reads the working directory, and a Glob pattern's
-    /// literal prefix extends the read target, so escaping patterns stay visible to the scope.
-    #[test]
-    fn claude_searches_read_their_searched_directory() {
-        let reads = |raw_input: Value, tool_name: &str| {
-            permission_request(
-                ProviderKind::Claude,
-                &json!({
-                    "kind":"search","locations":[],"rawInput":raw_input,
-                    "_meta":{"claudeCode":{"toolName":tool_name}}
-                }),
-            )
-            .unwrap()
-            .target_list
-        };
-        let read = |path: &str| PermissionTarget::Read { path: path.into() };
-        assert_eq!(
-            reads(json!({"pattern":"nvim/crates/tests/**/*.rs"}), "Glob"),
-            [read("./nvim/crates/tests")]
-        );
-        assert_eq!(reads(json!({"pattern":"**/*.rs"}), "Glob"), [read(".")]);
-        let escaping = reads(json!({"path":"src","pattern":"../../**"}), "Glob");
-        assert!(escaping.contains(&read("src")));
-        assert!(escaping.contains(&read("src/../..")));
-        assert_eq!(
-            reads(json!({"pattern":"/etc/*.conf"}), "Glob"),
-            [read("/etc")]
-        );
-        assert_eq!(reads(json!({"pattern":"fn main"}), "Grep"), [read(".")]);
-        assert_eq!(
-            reads(json!({"path":"src","pattern":"fn main"}), "Grep"),
-            [read("src")]
-        );
-        assert!(matches!(
-            permission_request(
-                ProviderKind::Claude,
-                &json!({"kind":"search","rawInput":{"query":"x"}}),
-            )
-            .unwrap()
-            .target_list
-            .as_slice(),
-            [PermissionTarget::UnknownFile { .. }]
-        ));
-    }
-
     /// An opaque path-bearing native operation cannot gain write authority through a read decision.
     #[test]
     fn path_permissions_require_positive_native_read_or_write_semantics() {
-        for provider in [ProviderKind::Claude, ProviderKind::Antigravity] {
+        for provider in [ProviderKind::Antigravity] {
             for kind in [Value::Null, json!("other"), json!("future")] {
                 assert!(
                     permission_request(provider, &json!({"kind":kind, "rawInput":{"path":"file"}}))

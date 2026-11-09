@@ -34,11 +34,6 @@ impl NativePromptEnd {
     }
 }
 
-/// Validate the native completed-turn response before acknowledging delivery.
-pub(crate) fn validate_prompt_response(value: Value) -> Result<(), serde_json::Error> {
-    serde_json::from_value::<agent_client_protocol::schema::v1::PromptResponse>(value).map(|_| ())
-}
-
 /// Decode known ACP stop reasons without treating missing or unknown values as success.
 pub(crate) fn prompt_outcome(value: &Value) -> Result<PromptOutcome, serde_json::Error> {
     use agent_client_protocol::schema::v1::StopReason;

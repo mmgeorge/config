@@ -1,7 +1,7 @@
 //! Serve ACP provider commands from in-process peers so tests need no external executable.
 //!
 //! A test registers a peer under a unique executable file name. `AcpConnection::launch_retained`
-//! and `RuntimeStatus::provider_version` consult this registry before spawning, so the production
+//! consults this registry before spawning, so the production
 //! resolver, cleanup graph and newline-delimited JSON-RPC framing all run unchanged. Only the
 //! operating-system process is replaced: the connection receives duplex streams plus an inert
 //! child handle whose collection always succeeds.
@@ -19,7 +19,6 @@ pub(super) type PeerHandler = Box<dyn FnMut(&Value) -> Vec<Value> + Send>;
 pub(super) type PeerHandlerFactory = Box<dyn Fn() -> PeerHandler + Send + Sync>;
 
 struct PeerDefinition {
-    version: String,
     requests: Arc<Mutex<Vec<Value>>>,
     handler_factory: PeerHandlerFactory,
 }
@@ -39,11 +38,7 @@ impl InMemoryPeer {
     ///
     /// The placeholder lets `forge_shell::process::executable` resolve the program exactly as it
     /// resolves a real adapter. It is never executed.
-    pub(super) fn register(
-        directory: &Path,
-        version: &str,
-        handler_factory: PeerHandlerFactory,
-    ) -> Self {
+    pub(super) fn register(directory: &Path, handler_factory: PeerHandlerFactory) -> Self {
         let registry_key = format!("acp-in-memory-peer-{}.exe", uuid::Uuid::new_v4());
         let program = directory.join(&registry_key);
         std::fs::write(&program, b"").expect("write placeholder peer executable");
@@ -54,7 +49,6 @@ impl InMemoryPeer {
                 .expect("mark placeholder peer executable");
         }
         let definition = Arc::new(PeerDefinition {
-            version: version.to_owned(),
             requests: Arc::default(),
             handler_factory,
         });
@@ -100,11 +94,6 @@ fn lookup(program: &str) -> Option<Arc<PeerDefinition>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(name)
         .cloned()
-}
-
-/// Get the version a registered peer reports for `--version`, if `program` selects one.
-pub(super) fn version_for(program: &str) -> Option<String> {
-    lookup(program).map(|definition| definition.version.clone())
 }
 
 /// The client side of one in-memory connection.

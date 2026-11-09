@@ -382,3 +382,39 @@ async fn conversation_undo_rewinds_native_history_and_keeps_provider_session() -
     reader.abort();
     scenario
 }
+
+/// Input to a forked child waits for its native fork. A failed fork refuses the input rather than
+/// opening fresh provider history that lacks the forked conversation.
+#[tokio::test]
+async fn forked_child_input_waits_for_native_fork() -> Result<()> {
+    let fixture = owner_transition_fixture().await?;
+    let registry = fixture.service.registry().await?;
+    // The held source invocation makes the native fork fail as executing.
+    let (child, gate) = super::super::start_session_fork(
+        registry.clone(),
+        fixture.session.clone(),
+        json!({"session_id": fixture.session}),
+        None,
+        crate::session::SessionPurpose::Conversation,
+        &fixture.sink,
+    )
+    .await?;
+    let child_id = child.broker.lock().await.snapshot()?.session.id;
+    let submitted = fixture
+        .service
+        .dispatch(
+            Some(child_id),
+            Request {
+                id: 30,
+                method: "session.input.apply".into(),
+                params: json!({"id":"forked-input","action":{"kind":"submit","message":{"id":"forked-input","text":"What word did I ask you to remember?","intent":"auto","attachments":[]}}}),
+            },
+            &fixture.sink,
+        )
+        .await;
+
+    assert!(gate.wait().await.is_err(), "the held source fails the native fork");
+    let error = submitted.expect_err("input must not run before the fork is ready");
+    assert!(format!("{error:#}").contains("ExecutionActive"), "{error:#}");
+    Ok(())
+}

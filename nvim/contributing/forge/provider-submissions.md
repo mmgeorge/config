@@ -33,7 +33,7 @@ A successful local write is not evidence of acceptance. Each adapter relies on w
 | --- | --- | --- |
 | Codex | Successful native `turn/start` or `turn/steer` response | Exact client UUID in fully paginated native history. |
 | Copilot | Native `session.send` message ID | One exact unclaimed primary user message after the saved history cursor. |
-| Claude ACP v1 | Valid prompt completion, or documented steering acceptance | Keep the uncertainty and block replay. Only documented idle steering rejection proves nonconsumption. |
+| Claude Code stream-json | `command_lifecycle` reports the input `uuid` as queued or later | Exact previously accepted receipt; otherwise keep the uncertainty and block replay. |
 | Antigravity ACP v1 | Valid prompt completion | Keep the uncertainty and block replay. |
 
 Mock has no remote delivery boundary, and records local acceptance before processing.
@@ -50,11 +50,15 @@ Copilot captures a native event-log cursor and the exact rendered prompt before 
 
 SDK 1.0.26 documents that cancelling after its writer commits a frame can lose the response while the CLI still processes the message, and `MessageOptions` has no caller-supplied identity. See [Copilot's send implementation](https://github.com/github/copilot-sdk/blob/main/rust/src/session.rs).
 
+### Claude Code
+
+Claude Code runs as `claude -p` with stream-json input and output. Every user frame Forge writes carries a client-minted `uuid`, and the CLI answers each one with `command_lifecycle` frames (`queued`, `started`, `completed`) that echo it. `deliver_input` in `claude/provider.rs` commits `Sending` with a token naming the session, the input `uuid`, and the journal attempt before the write, and commits `Accepted` only after the CLI reports that `uuid` as queued or later; the write alone proves nothing. Reconciliation returns `Accepted` only for an exact previously accepted receipt and `Unknown` otherwise, because the CLI offers no read-only history query.
+
+Steering writes another user frame into the running process. The CLI either folds it into the current model turn, completing its command before the turn's `result`, or leaves it queued at that `result` and starts a follow-up CLI turn for it. `ClaudeSessionState` therefore ends a Forge turn at a `result` only when none of the turn's tracked commands is still queued or unseen. A steer that arrives after the turn end is decided fails with `PreparationFailed` and a rejected receipt, so Harness delivers it as a new prompt instead of losing it.
+
 ### ACP
 
-Claude and Antigravity use [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Both providers commit the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`.
-
-Claude's minimum supported 0.99.1 adapter advertises the [`_session/steering` extension](https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.99.1/src/acp-agent.ts). With `idleBehavior: "promptRequired"`, only the exact `promptRequired` / `noRunningTurn` response proves the input was not queued, so only that response returns it to `Prepared`. Antigravity does not advertise steering.
+Antigravity uses [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Forge commits the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`. Antigravity does not advertise steering.
 
 The [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) makes `session/prompt` return when the message enters the conversation. Forge negotiates v1, and must not apply v2 semantics to a v1 connection.
 
@@ -72,8 +76,8 @@ Test the write-before-acknowledge crash, acknowledgment commit failure, expired 
 
 ## Verification and diagnostics
 
-Verify the journal and generic lifecycle fixtures in `forge-harness` and native classifiers and wire fixtures in `forge-providers`. Start with the affected compiler checks, then select the exact regression names from the changed module. ACP simulated peers need Node.js, without provider credentials.
+Verify the journal and generic lifecycle fixtures in `forge-harness` and native classifiers and wire fixtures in `forge-providers`. Start with the affected compiler checks, then select the exact regression names from the changed module. ACP simulated peers run in memory and need no provider credentials.
 
-After rebuilding, run `nvim/lua/forge/tests/integration/views/harness/harness.test.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_kind` set to `"claude"` and `"antigravity"`, and `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`. It asserts that uncertain delivery blocks the next native send and keeps the original error.
+After rebuilding, run `nvim/lua/forge/tests/integration/views/harness/harness.test.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`; the fixture drives Antigravity through a simulated ACP peer. It asserts that uncertain delivery blocks the next native send and keeps the original error.
 
 With tracing enabled, `provider.submission` log entries record delivery transitions, input IDs, attempt IDs, and owners. Native correlation tokens and receipt bytes remain private and are not logged.

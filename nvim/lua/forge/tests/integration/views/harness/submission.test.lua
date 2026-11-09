@@ -1,9 +1,9 @@
 if vim.g.forge_acp_fixture_grid then
   local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
   local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
-  local kind = vim.g.forge_acp_fixture_kind or "claude"
+  local kind = "antigravity"
   local lost = vim.g.forge_acp_fixture_lost_ack == true
-  local runtime_version = kind == "antigravity" and "1.4.5" or "0.99.1"
+  local runtime_version = "1.4.5"
   local root, workspace, data = vim.fn.getcwd(), vim.fn.tempname(), vim.fn.tempname()
   vim.fn.mkdir(workspace, "p")
   vim.fn.mkdir(data, "p")
@@ -202,13 +202,12 @@ T["submission"] = function()
   MiniTest.finally(function() pcall(child.stop) end)
   child.api.nvim_ui_attach(120, 42, { rgb = true })
   child.lua([[
-    local kind, lost = ...
+    local lost = ...
     vim.g.forge_acp_fixture_grid = true
-    vim.g.forge_acp_fixture_kind = kind
     vim.g.forge_acp_fixture_lost_ack = lost
     vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim')
     dofile('nvim/lua/forge/tests/integration/views/harness/submission.test.lua')
-  ]], { vim.g.forge_acp_fixture_kind or "claude", vim.g.forge_acp_fixture_lost_ack == true })
+  ]], { vim.g.forge_acp_fixture_lost_ack == true })
 end
 
 return T

@@ -404,8 +404,9 @@ or **Conversation and files** to restore its checkpoint too. Conversation-only
 rollback works without a file checkpoint. Confirming conversation rollback collects
 active execution before changing history and leaves the task paused. An unfinished
 restore requires recovery first. Rollback rewinds the provider's own conversation, so it
-requires a provider that supports native rewind (Codex and Copilot). With Claude or
+requires a provider that supports native rewind (Codex, Copilot, and Claude). With
 Antigravity, `/undo` reports that conversation rollback is unsupported and changes nothing.
+Claude can rewind only to the end of an earlier interaction, not before the first one.
 
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending
@@ -455,7 +456,8 @@ This decision uses current focus, not previous scrolling or cursor movement.
 Focused transcripts and folded responses keep their reading position.
 Skipped reveals do not run later when focus changes.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
-Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
+Claude Code always streams summarized thinking. Antigravity retains provider-defined summary detail
+through its ACP integration.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
 `oS` opens the complete current status in a readable view, including content taller than
 the status split. Press `q` there to return. Configure or disable that binding through

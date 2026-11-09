@@ -41,7 +41,9 @@ impl ConversationRewind {
             self.provider
                 .thread_rewind(native.request.clone(), native.after.clone())
                 .await
-                .map_err(|error| anyhow::anyhow!("provider conversation rewind failed: {error}"))?;
+                .map_err(|error| {
+                    anyhow::Error::new(error).context("provider conversation rewind failed")
+                })?;
         }
         Ok(())
     }

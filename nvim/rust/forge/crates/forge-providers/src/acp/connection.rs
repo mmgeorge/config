@@ -113,241 +113,6 @@ enum DriverState {
     Collected,
 }
 
-/// Retain native resources from spawn through successful collection, including failed opens.
-#[derive(Clone)]
-pub(super) struct AcpCleanup {
-    resources: Arc<std::sync::Mutex<Vec<AcpResource>>>,
-    parent: Option<Arc<std::sync::Mutex<Vec<AcpResource>>>>,
-    admission: Arc<std::sync::atomic::AtomicBool>,
-    parent_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
-}
-
-impl Default for AcpCleanup {
-    fn default() -> Self {
-        Self {
-            resources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            parent: None,
-            admission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            parent_admission: None,
-        }
-    }
-}
-
-impl AcpCleanup {
-    /// Create an operation-local cleanup scope while preserving provider shutdown ownership.
-    pub(super) fn scope(&self) -> Self {
-        Self {
-            resources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            parent: Some(self.parent.as_ref().unwrap_or(&self.resources).clone()),
-            admission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            parent_admission: Some(
-                self.parent_admission
-                    .as_ref()
-                    .unwrap_or(&self.admission)
-                    .clone(),
-            ),
-        }
-    }
-
-    /// Retain a native profile before a connection can load it or suspend startup.
-    pub(super) fn retain_profile(
-        &self,
-        profile: crate::profile::ResourceProfile,
-    ) -> Arc<AcpProfile> {
-        let profile = Arc::new(AcpProfile {
-            path: profile.path().to_owned(),
-            profile: Mutex::new(Some(profile)),
-            collected: std::sync::atomic::AtomicBool::new(false),
-        });
-        self.retain(AcpResource::Profile(profile.clone()));
-        profile
-    }
-
-    /// Retain callback/server authority until its native resources and profile have collected.
-    pub(super) fn retain_lease(
-        &self,
-        lease: Option<Arc<dyn forge_provider_api::ResourceLease>>,
-    ) -> Arc<AcpLease> {
-        let collected = lease.is_none();
-        let lease = Arc::new(AcpLease {
-            lease: Mutex::new(lease),
-            collected: std::sync::atomic::AtomicBool::new(collected),
-        });
-        self.retain(AcpResource::Lease(lease.clone()));
-        lease
-    }
-
-    /// Get whether every resource registered to this operation completed collection.
-    pub(super) fn is_collected(&self) -> bool {
-        self.resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .all(AcpResource::is_collected)
-    }
-
-    /// Stop native launch admission before collecting this operation's pending resources.
-    pub(super) fn close_admission(&self) {
-        self.admission.store(false, Ordering::Release);
-    }
-
-    /// Require both this operation and the provider shutdown owner to admit native launch.
-    fn is_admitting(&self) -> bool {
-        self.admission.load(Ordering::Acquire)
-            && self
-                .parent_admission
-                .as_ref()
-                .is_none_or(|parent| parent.load(Ordering::Acquire))
-    }
-
-    /// Register ownership before startup can suspend or fail.
-    fn retain(&self, resources: AcpResource) {
-        if let Some(parent) = &self.parent {
-            parent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(resources.clone());
-        }
-        self.resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(resources);
-    }
-
-    /// Retry process/readers first, then profiles and callback leases only after native collection.
-    pub(super) async fn shutdown(&self) -> Result<(), forge_provider_api::ProviderError> {
-        self.close_admission();
-        let resources = self
-            .resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let mut errors = Vec::new();
-        for resource in &resources {
-            if let AcpResource::Native(native) = resource
-                && let Err(error) = native.shutdown().await
-            {
-                errors.push(crate::error::acp(
-                    error,
-                    forge_provider_api::ProviderOperation::Shutdown,
-                ));
-            }
-        }
-        let native_collected = resources.iter().all(|resource| match resource {
-            AcpResource::Native(_) => resource.is_collected(),
-            AcpResource::Profile(_) | AcpResource::Lease(_) => true,
-        });
-        if native_collected {
-            for resource in &resources {
-                if let AcpResource::Profile(profile) = resource
-                    && let Err(error) = profile
-                        .close(forge_provider_api::ProviderOperation::Shutdown)
-                        .await
-                {
-                    errors.push(error);
-                }
-            }
-        }
-        let prerequisites_collected = resources.iter().all(|resource| match resource {
-            AcpResource::Native(_) | AcpResource::Profile(_) => resource.is_collected(),
-            AcpResource::Lease(_) => true,
-        });
-        if prerequisites_collected {
-            for resource in &resources {
-                if let AcpResource::Lease(lease) = resource {
-                    lease.release().await;
-                }
-            }
-        }
-        let mut errors = errors.into_iter();
-        let Some(primary) = errors.next() else {
-            return Ok(());
-        };
-        let secondary = errors.collect::<Vec<_>>();
-        if secondary.is_empty() {
-            Err(primary)
-        } else {
-            Err(forge_provider_api::ProviderError::Combined {
-                primary: Box::new(primary),
-                secondary,
-            })
-        }
-    }
-}
-
-/// Keep native startup, profile, and callback ownership in one retained cleanup graph.
-#[derive(Clone)]
-enum AcpResource {
-    Native(Arc<AcpTransportResources>),
-    Profile(Arc<AcpProfile>),
-    Lease(Arc<AcpLease>),
-}
-
-impl AcpResource {
-    /// Get positive collection evidence without awaiting a resource currently being collected.
-    fn is_collected(&self) -> bool {
-        match self {
-            Self::Native(native) => native.collected.load(Ordering::Acquire),
-            Self::Profile(profile) => profile.collected.load(Ordering::Acquire),
-            Self::Lease(lease) => lease.collected.load(Ordering::Acquire),
-        }
-    }
-}
-
-/// Retain one profile across native load/configuration failures and cleanup retries.
-pub(super) struct AcpProfile {
-    path: std::path::PathBuf,
-    profile: Mutex<Option<crate::profile::ResourceProfile>>,
-    collected: std::sync::atomic::AtomicBool,
-}
-
-impl AcpProfile {
-    /// Get the unchanged native profile path while its retained owner controls collection.
-    pub(super) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Close the profile once and retain a failed close for the next cleanup attempt.
-    pub(super) async fn close(
-        &self,
-        operation: forge_provider_api::ProviderOperation,
-    ) -> Result<(), forge_provider_api::ProviderError> {
-        let mut profile = self.profile.lock().await;
-        if let Some(profile) = profile.as_mut() {
-            profile
-                .close()
-                .map_err(|error| match error.into_provider_error(operation) {
-                    forge_provider_api::ProviderError::Failure(failure) => {
-                        forge_provider_api::ProviderFailure::new(operation, failure.kind())
-                            .at_phase(
-                                forge_provider_api::ProviderPhase::Collection,
-                                forge_provider_api::FailureDisposition::Invalidated,
-                            )
-                            .into()
-                    }
-                    error => error,
-                })?;
-        }
-        profile.take();
-        self.collected.store(true, Ordering::Release);
-        Ok(())
-    }
-}
-
-/// Retain host callback authority until all native users have been collected.
-pub(super) struct AcpLease {
-    lease: Mutex<Option<Arc<dyn forge_provider_api::ResourceLease>>>,
-    collected: std::sync::atomic::AtomicBool,
-}
-
-impl AcpLease {
-    /// Release callback/server ownership after native collection, idempotently across retries.
-    pub(super) async fn release(&self) {
-        self.lease.lock().await.take();
-        self.collected.store(true, Ordering::Release);
-    }
-}
-
 /// Own native process and reader handles independently of successful protocol initialization.
 struct AcpTransportResources {
     state: Mutex<TransportState>,
@@ -361,9 +126,22 @@ struct TransportState {
     process_collected: bool,
 }
 
+#[async_trait]
+impl crate::resource_cleanup::NativeResource for AcpTransportResources {
+    async fn shutdown(&self) -> Result<(), forge_provider_api::ProviderError> {
+        self.collect().await.map_err(|error| {
+            crate::error::acp(error, forge_provider_api::ProviderOperation::Shutdown)
+        })
+    }
+
+    fn is_collected(&self) -> bool {
+        self.collected.load(Ordering::Acquire)
+    }
+}
+
 impl AcpTransportResources {
     /// Collect independent native phases while retaining handles for cancellation and retry.
-    async fn shutdown(&self) -> Result<(), AcpConnectionError> {
+    async fn collect(&self) -> Result<(), AcpConnectionError> {
         let mut state = self.state.lock().await;
         let process_failure = if state.process_collected {
             None
@@ -511,7 +289,7 @@ impl AcpConnection {
         launch: AcpLaunch<'_>,
         handler: Arc<dyn AcpHandler>,
     ) -> Result<Self, AcpConnectionError> {
-        let cleanup = AcpCleanup::default();
+        let cleanup = crate::resource_cleanup::ResourceCleanup::default();
         Self::launch_retained(launch, handler, &cleanup).await
     }
 
@@ -519,7 +297,7 @@ impl AcpConnection {
     pub(super) async fn launch_retained(
         launch: AcpLaunch<'_>,
         handler: Arc<dyn AcpHandler>,
-        cleanup: &AcpCleanup,
+        cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Self, AcpConnectionError> {
         if !cleanup.is_admitting() {
             return Err(AcpConnectionError::Configuration(
@@ -548,11 +326,11 @@ impl AcpConnection {
             first_failure: Mutex::new(None),
             collected: std::sync::atomic::AtomicBool::new(false),
         });
-        cleanup.retain(AcpResource::Native(resources.clone()));
+        cleanup.retain_native(resources.clone());
         let mut retained = resources.state.lock().await;
         if retained.process_collected || !cleanup.is_admitting() {
             drop(retained);
-            let _ = resources.shutdown().await;
+            let _ = resources.collect().await;
             return Err(AcpConnectionError::Configuration(
                 "ACP startup was collected",
             ));
@@ -592,7 +370,7 @@ impl AcpConnection {
         let connection = match ready.await {
             Ok(connection) => connection,
             Err(source) => {
-                let _ = resources.shutdown().await;
+                let _ = resources.collect().await;
                 return Err(AcpConnectionError::Startup {
                     message: "ACP driver exited before connection startup",
                     source: Box::new(source),
@@ -744,6 +522,6 @@ impl AcpConnection {
 
     /// Collect the process tree and stop the native driver.
     pub async fn shutdown(&self) -> Result<(), AcpConnectionError> {
-        self.resources.shutdown().await
+        self.resources.collect().await
     }
 }

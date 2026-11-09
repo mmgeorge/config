@@ -112,7 +112,11 @@ pub fn create(
             launch.command,
             runtime_root,
         )?),
-        "claude" | "antigravity" => Arc::new(crate::acp::provider::AcpProvider::new(
+        "claude" => Arc::new(crate::claude::ClaudeProvider::new(
+            launch.command,
+            runtime_root,
+        )?),
+        "antigravity" => Arc::new(crate::acp::provider::AcpProvider::new(
             launch.kind,
             launch.command,
             runtime_root,
@@ -188,10 +192,10 @@ const REGISTRATIONS: &[RegistryEntry] = &[
     RegistryEntry {
         id: "claude",
         label: "Claude Code",
-        detail: "Claude Code through ACP",
+        detail: "Claude Code stream-json CLI",
         selectable: true,
         aliases: &[],
-        command: &["claude-agent-acp"],
+        command: &["claude"],
         background_generation: Some(BackgroundGenerationDefaults {
             model: "haiku",
             reasoning_effort: "low",
@@ -382,73 +386,72 @@ fn capability(id: &str) -> ProviderCapability {
             catalog,
             ..Default::default()
         },
-        "claude" | "antigravity" => {
-            let claude = id == "claude";
-            ProviderCapability {
-                integration: ProviderIntegration {
-                    background_generation: claude,
-                    tracked_submission: true,
-                    native_agent_suppression: claude,
-                    resource_target: Some(
-                        if claude {
-                            "claudecode"
-                        } else {
-                            "antigravity-cli"
-                        }
-                        .into(),
-                    ),
-                    limitations: if claude {
-                        vec![]
-                    } else {
-                        vec![
-                            FeatureLimitation {
-                                id: CapabilityId::FileDiff,
-                                support: Support::Limited {
-                                    restrictions: vec![CapabilityRestriction::UnstructuredDiffs],
-                                },
-                            },
-                            FeatureLimitation {
-                                id: CapabilityId::PermissionCallbacks,
-                                support: Support::Limited {
-                                    restrictions: vec![
-                                        CapabilityRestriction::EnterpriseTerminalPolicy,
-                                    ],
-                                },
-                            },
-                            FeatureLimitation {
-                                id: CapabilityId::SkillCatalog,
-                                support: Support::Limited {
-                                    restrictions: vec![CapabilityRestriction::InheritedSkills],
-                                },
-                            },
-                            FeatureLimitation {
-                                id: CapabilityId::SkillMutation,
-                                support: Support::Unsupported,
-                            },
-                            FeatureLimitation {
-                                id: CapabilityId::McpMutation,
-                                support: Support::Unsupported,
-                            },
-                        ]
-                    },
-                    ..Default::default()
-                },
-                native_fork: claude,
-                native_compact: claude,
-                native_steer: claude,
-                model_selection: true,
-                effort_selection: claude,
-                permission_control: true,
-                catalog,
-                approval_mode_list: approvals,
-                compaction: CompactionCapability {
-                    lifecycle: claude,
-                    summary: claude,
-                    ..Default::default()
-                },
+        "claude" => ProviderCapability {
+            integration: ProviderIntegration {
+                background_generation: true,
+                tracked_submission: true,
+                native_agent_suppression: true,
+                mcp_runtime_status: true,
+                resource_target: Some("claudecode".into()),
                 ..Default::default()
-            }
-        }
+            },
+            native_fork: true,
+            native_compact: true,
+            compaction: CompactionCapability {
+                lifecycle: true,
+                background: false,
+                summary: true,
+                metrics: true,
+            },
+            native_steer: true,
+            native_conversation_rewind: true,
+            model_selection: true,
+            effort_selection: true,
+            permission_control: true,
+            approval_mode_list: approvals,
+            catalog,
+            ..Default::default()
+        },
+        "antigravity" => ProviderCapability {
+            integration: ProviderIntegration {
+                tracked_submission: true,
+                resource_target: Some("antigravity-cli".into()),
+                limitations: vec![
+                    FeatureLimitation {
+                        id: CapabilityId::FileDiff,
+                        support: Support::Limited {
+                            restrictions: vec![CapabilityRestriction::UnstructuredDiffs],
+                        },
+                    },
+                    FeatureLimitation {
+                        id: CapabilityId::PermissionCallbacks,
+                        support: Support::Limited {
+                            restrictions: vec![CapabilityRestriction::EnterpriseTerminalPolicy],
+                        },
+                    },
+                    FeatureLimitation {
+                        id: CapabilityId::SkillCatalog,
+                        support: Support::Limited {
+                            restrictions: vec![CapabilityRestriction::InheritedSkills],
+                        },
+                    },
+                    FeatureLimitation {
+                        id: CapabilityId::SkillMutation,
+                        support: Support::Unsupported,
+                    },
+                    FeatureLimitation {
+                        id: CapabilityId::McpMutation,
+                        support: Support::Unsupported,
+                    },
+                ],
+                ..Default::default()
+            },
+            model_selection: true,
+            permission_control: true,
+            catalog,
+            approval_mode_list: approvals,
+            ..Default::default()
+        },
         "mock" => ProviderCapability {
             integration: ProviderIntegration {
                 background_generation: true,

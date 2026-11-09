@@ -30,8 +30,8 @@ struct AcpBinding {
     conversation: Arc<AcpConversation>,
     state: Arc<AcpSessionState>,
     sink: ProviderEventSink,
-    cleanup: super::connection::AcpCleanup,
-    profiles: Mutex<Vec<Arc<super::connection::AcpProfile>>>,
+    cleanup: crate::resource_cleanup::ResourceCleanup,
+    profiles: Mutex<Vec<Arc<crate::resource_cleanup::RetainedProfile>>>,
     selection: Mutex<forge_provider_api::session::ResourceSelection>,
     native_model: Mutex<forge_provider_api::ModelSelection>,
     initial_model: forge_provider_api::ModelSelection,
@@ -62,35 +62,6 @@ struct AcpBinding {
 }
 
 impl AcpBinding {
-    /// Add accepted steering coverage only to its original retained prompt.
-    fn cover_input(
-        &self,
-        scope: &forge_provider_api::InvocationScope,
-        input: forge_provider_api::CoveredInput,
-    ) -> Result<(), ProviderError> {
-        let mut inputs = self
-            .covered_inputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let covered = inputs
-            .get_mut(scope)
-            .ok_or_else(|| failure(ProviderOperation::TurnSteer, ProviderFailureKind::Protocol))?;
-        if let Some(retained) = covered
-            .iter()
-            .find(|retained| retained.submission_id() == input.submission_id())
-        {
-            if retained != &input {
-                return Err(failure(
-                    ProviderOperation::TurnSteer,
-                    ProviderFailureKind::Protocol,
-                ));
-            }
-        } else {
-            covered.push(input);
-        }
-        Ok(())
-    }
-
     /// Check whether native input preparation or a prompt worker is still running.
     fn has_active_prompt(&self) -> bool {
         self.active
@@ -332,7 +303,7 @@ impl AcpOperations {
 struct HistoryReservation {
     operation_id: OperationId,
     owner: ThreadId,
-    cleanup: super::connection::AcpCleanup,
+    cleanup: crate::resource_cleanup::ResourceCleanup,
 }
 
 /// Own one original native prompt and its callback collection under the shared runner.
@@ -411,7 +382,7 @@ struct ActiveExecution {
 pub struct AcpProvider {
     kind: AcpKind,
     runtime: Arc<AcpRuntime>,
-    cleanup: super::connection::AcpCleanup,
+    cleanup: crate::resource_cleanup::ResourceCleanup,
     runtime_root: PathBuf,
     bindings: Arc<std::sync::Mutex<HashMap<BindingId, Arc<AcpBinding>>>>,
     owners: Arc<Mutex<HashMap<ThreadId, BindingId>>>,
@@ -433,7 +404,6 @@ impl AcpProvider {
         runtime_root: PathBuf,
     ) -> Result<Self, ProviderError> {
         let kind = match id.as_str() {
-            "claude" => AcpKind::Claude,
             "antigravity" => AcpKind::Antigravity,
             _ => {
                 return Err(failure(
@@ -459,7 +429,7 @@ impl AcpProvider {
         Self {
             kind: runtime.kind(),
             runtime: Arc::new(runtime),
-            cleanup: super::connection::AcpCleanup::default(),
+            cleanup: crate::resource_cleanup::ResourceCleanup::default(),
             runtime_root,
             bindings: Arc::new(std::sync::Mutex::new(HashMap::new())),
             owners: Arc::new(Mutex::new(HashMap::new())),
@@ -737,7 +707,7 @@ impl AcpProvider {
         &self,
         context: OperationContext,
         mut request: SessionRequest,
-        cleanup: super::connection::AcpCleanup,
+        cleanup: crate::resource_cleanup::ResourceCleanup,
     ) -> Result<forge_provider_api::OpenedSession, ProviderError> {
         context.check_admission(ProviderOperation::ThreadOpen)?;
         if !self.admission.load(Ordering::Acquire) {
@@ -764,9 +734,6 @@ impl AcpProvider {
             .runtime
             .resolve()
             .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime))?;
-        if self.kind == AcpKind::Claude {
-            runtime.validate_native_claude(&context).await?;
-        }
         context.check_admission(ProviderOperation::ThreadOpen)?;
         let _history_admission = self.history_admission.lock().await;
         context.check_admission(ProviderOperation::ThreadOpen)?;
@@ -876,15 +843,6 @@ impl AcpProvider {
                 control_endpoint: request.tool_endpoint.clone(),
                 mcp_servers,
                 resources: mcp_definitions(&selection),
-                profile: profile.path().to_owned(),
-                skills: request
-                    .configuration
-                    .resources
-                    .skills
-                    .iter()
-                    .filter(|skill| skill.enabled)
-                    .map(|skill| skill.name.clone())
-                    .collect(),
                 system_instructions: request.system_instructions.clone(),
             },
             &cleanup,
@@ -1073,14 +1031,7 @@ impl AcpProvider {
                 &configuration.resources.skills,
             )?);
             session.profiles.lock().await.push(profile.clone());
-            let skills = configuration
-                .resources
-                .skills
-                .iter()
-                .filter(|skill| skill.enabled)
-                .map(|skill| skill.name.clone())
-                .collect::<Vec<_>>();
-            Some((profile, servers, skills))
+            Some((profile, servers))
         } else {
             None
         };
@@ -1107,12 +1058,8 @@ impl AcpProvider {
             session.invalidate(error.clone()).await;
             return Err(error);
         }
-        if let Some((profile, servers, skills)) = prepared_resources {
-            if let Err(error) = session
-                .conversation
-                .configure_resources(servers, &skills, profile.path())
-                .await
-            {
+        if let Some((profile, servers)) = prepared_resources {
+            if let Err(error) = session.conversation.configure_resources(servers).await {
                 let error = operation_failure(
                     ProviderOperation::ThreadConfigure,
                     &error,
@@ -1164,246 +1111,28 @@ impl AcpProvider {
     async fn fork_session(
         &self,
         context: OperationContext,
-        request: forge_provider_api::session::SessionForkRequest,
+        _request: forge_provider_api::session::SessionForkRequest,
     ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
         context.check_admission(ProviderOperation::ThreadFork)?;
-        if self.kind != AcpKind::Claude {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeFork,
-            )
-            .into());
-        }
-        let binding = match &request.source {
-            forge_provider_api::ForkSource::Binding(binding) => binding.clone(),
-            forge_provider_api::ForkSource::Checkpoint { .. } => {
-                return Err(forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::CheckpointFork,
-                )
-                .into());
-            }
-        };
-        let session = self.binding(&binding, ProviderOperation::ThreadFork)?;
-        session
-            .state
-            .ensure_admission(ProviderOperation::ThreadFork)?;
-        if !session.capabilities().await.capability.iter().any(|entry| {
-            entry.id == forge_provider_api::capability::CapabilityId::NativeFork
-                && entry.support == forge_provider_api::capability::Support::Supported
-        }) {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeFork,
-            )
-            .into());
-        }
-        let source_owner = &session.owner;
-        if &request.target.thread_id == source_owner {
-            return Err(failure(
-                ProviderOperation::ThreadFork,
-                ProviderFailureKind::WrongInvocation,
-            ));
-        }
-        validate_configuration(
-            &request.target.configuration.model,
-            &request.target.configuration.access,
-        )?;
-        let mcp = super::resources::mcp_launches(
-            ProviderOperation::ThreadFork,
-            &request.target.configuration.resources.mcp,
-        )?;
-        if session.has_active_prompt() {
-            return Err(failure(
-                ProviderOperation::ThreadFork,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
-        let _operation = session.operation.lock().await;
-        session.sink.check()?;
-        context.check_admission(ProviderOperation::ThreadFork)?;
-        session
-            .state
-            .ensure_admission(ProviderOperation::ThreadFork)?;
-        if session.has_active_prompt() || session.state.has_active_work().await {
-            return Err(failure(
-                ProviderOperation::ThreadFork,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
-        let source_model = session.native_model.lock().await.clone();
-        let target_model =
-            resolve_native_model(&session, &request.target.configuration.model, &source_model)?;
-        let models =
-            session.conversation.models().await.map_err(|_| {
-                failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol)
-            })?;
-        if let Some(model) = target_model.model.as_deref()
-            && !models.iter().any(|candidate| candidate.id == model)
-        {
-            return Err(failure(
-                ProviderOperation::ThreadFork,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let selected_model = target_model.model.as_deref().or_else(|| {
-            models
-                .iter()
-                .find(|model| model.is_default)
-                .map(|model| model.id.as_str())
-        });
-        let effort = match &target_model.reasoning {
-            forge_provider_api::generation::ReasoningSelection::Default => None,
-            forge_provider_api::generation::ReasoningSelection::Level(level) => {
-                if !selected_model
-                    .and_then(|id| models.iter().find(|model| model.id == id))
-                    .is_some_and(|model| model.reasoning.contains(level))
-                {
-                    return Err(forge_provider_api::capability::UnsupportedCapability(
-                        forge_provider_api::capability::ProviderFeature::EffortSelection,
-                    )
-                    .into());
-                }
-                Some(level.as_str())
-            }
-            forge_provider_api::generation::ReasoningSelection::Lowest => Some(
-                selected_model
-                    .and_then(|id| models.iter().find(|model| model.id == id))
-                    .and_then(|model| model.reasoning.first())
-                    .ok_or({
-                        forge_provider_api::capability::UnsupportedCapability(
-                            forge_provider_api::capability::ProviderFeature::EffortSelection,
-                        )
-                    })?
-                    .as_str(),
-            ),
-        };
-        session
-            .conversation
-            .validate_fork_instructions(&request.target.system_instructions)?;
-        let skills = request
-            .target
-            .configuration
-            .resources
-            .skills
-            .iter()
-            .filter(|skill| skill.enabled)
-            .map(|skill| skill.name.clone())
-            .collect::<Vec<_>>();
-        let profile = session.cleanup.retain_profile(super::profile::create(
-            self.kind,
-            &self.runtime_root,
-            &request.target.configuration.resources.skills,
-        )?);
-        let id = session
-            .conversation
-            .fork(
-                context.id(),
-                super::conversation::ForkConfiguration {
-                    workspace: &request.target.workspace,
-                    mcp_servers: mcp,
-                    skills: &skills,
-                    profile: profile.path(),
-                    model: target_model.model.as_deref(),
-                    effort,
-                    system_instructions: &request.target.system_instructions,
-                },
-            )
-            .await
-            .map_err(|error| {
-                operation_failure(
-                    ProviderOperation::ThreadFork,
-                    &error,
-                    forge_provider_api::ProviderPhase::Observation,
-                    forge_provider_api::FailureDisposition::Uncertain,
-                )
-            })?;
-        let id = id
-            .try_into()
-            .map_err(|_| failure(ProviderOperation::ThreadFork, ProviderFailureKind::Protocol))?;
-        Ok(forge_provider_api::ProviderForkResult::unprofiled(id))
+        Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::NativeFork,
+        )
+        .into())
     }
 
     /// Require positive native compaction completion within the requested operation.
     async fn compact_session(
         &self,
         context: OperationContext,
-        binding: &BindingId,
+        _binding: &BindingId,
         request: forge_provider_api::CompactionRequest,
     ) -> Result<forge_provider_api::CompactionResult, ProviderError> {
         context.check_admission(ProviderOperation::ThreadCompact)?;
         request.validate_context(&context)?;
-        if self.kind != AcpKind::Claude {
-            return Err(failure(
-                ProviderOperation::ThreadCompact,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let session = self.binding(binding, ProviderOperation::ThreadCompact)?;
-        session
-            .state
-            .ensure_admission(ProviderOperation::ThreadCompact)?;
-        if session.has_active_prompt() {
-            return Err(failure(
-                ProviderOperation::ThreadCompact,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
-        let _operation = session.operation.lock().await;
-        session.sink.check()?;
-        context.check_admission(ProviderOperation::ThreadCompact)?;
-        session
-            .state
-            .ensure_admission(ProviderOperation::ThreadCompact)?;
-        if session.has_active_prompt() {
-            return Err(failure(
-                ProviderOperation::ThreadCompact,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
-        if request.scope.thread_id() != &session.owner {
-            return Err(failure(
-                ProviderOperation::ThreadCompact,
-                ProviderFailureKind::WrongInvocation,
-            ));
-        }
-        let sink = session.sink.bind_scope(request.scope.clone())?;
-        session
-            .state
-            .begin_compaction(session.conversation.id(), sink)
-            .await?;
-        let result = session.conversation.request("session/prompt", serde_json::json!({
-            "sessionId":session.conversation.id(), "prompt":[{"type":"text","text":"/compact"}]
-        })).await;
-        session.state.finish_compaction().await;
-        let response = result?;
-        super::validate_prompt_response(response.clone()).map_err(|_| {
-            failure(
-                ProviderOperation::ThreadCompact,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        if response["stopReason"] == "cancelled" {
-            return Err(ProviderError::Cancelled);
-        }
-        let compaction = match settled_compaction(session.state.latest_compaction().await) {
-            Some(compaction) => compaction,
-            None => {
-                let cause = ProviderError::Failure(
-                    ProviderFailure::new(
-                        ProviderOperation::ThreadCompact,
-                        ProviderFailureKind::Protocol,
-                    )
-                    .at_phase(
-                        forge_provider_api::ProviderPhase::Observation,
-                        forge_provider_api::FailureDisposition::Invalidated,
-                    ),
-                );
-                session.invalidate(cause.clone()).await;
-                return Err(cause);
-            }
-        };
-        Ok(forge_provider_api::CompactionResult {
-            compaction,
-            watermark: session.sink.watermark(),
-        })
+        Err(failure(
+            ProviderOperation::ThreadCompact,
+            ProviderFailureKind::Rejected,
+        ))
     }
 
     /// Deliver only negotiated steering into the exact invocation or report its disposition.
@@ -1437,72 +1166,10 @@ impl AcpProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
-        if self.kind != AcpKind::Claude {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeSteer,
-            )
-            .into());
-        }
-        let capabilities = session.capabilities().await;
-        if capabilities.support(forge_provider_api::capability::CapabilityId::NativeSteer)
-            != Some(&forge_provider_api::capability::Support::Supported)
-        {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeSteer,
-            )
-            .into());
-        }
-        let input = prompt_input(&request.input);
-        let prompt = super::attachments::input(
-            input,
-            &request.attachments,
-            session.conversation.supports_images(),
-        )?;
-        let receipt = request.delivery.receipt().cloned();
-        let submission_id = request.delivery.submission_id().cloned();
-        let covered_input = request
-            .delivery
-            .receipt()
-            .map(|receipt| {
-                receipt.attempt_id().map(|attempt| {
-                    forge_provider_api::CoveredInput::new(receipt.id().clone(), attempt)
-                })
-            })
-            .transpose()?;
-        session.sink.check()?;
-        let response = match session
-            .conversation
-            .steer(
-                serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
-                receipt,
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return Err(error),
-        };
-        if response == super::submission::SteeringAcceptance::UnobservableExecution {
-            session.invalidate(ProviderError::DeliveryUncertain).await;
-            let _ = session.conversation.shutdown().await;
-            session.sink.fail(events::EventDeliveryError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-            ));
-            return Err(ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-            ));
-        }
-        if let Some(input) = covered_input
-            && let Err(error) = session.cover_input(&request.scope, input)
-        {
-            session.invalidate(error.clone()).await;
-            return Err(error);
-        }
-        Ok(match submission_id {
-            Some(submission_id) => {
-                forge_provider_api::session::SteeringAcceptance::Journaled { submission_id }
-            }
-            None => forge_provider_api::session::SteeringAcceptance::Context,
-        })
+        Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::NativeSteer,
+        )
+        .into())
     }
 
     /// Close every producer before joining retained native operations and pending opens.
@@ -1741,7 +1408,7 @@ impl AcpProvider {
     async fn list_models(
         &self,
         request: forge_provider_api::catalog::QueryContext,
-        cleanup: super::connection::AcpCleanup,
+        cleanup: crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
         let binding = match request {
             forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
@@ -1863,7 +1530,7 @@ impl AcpProvider {
     async fn workspace_models(
         &self,
         workspace: &str,
-        cleanup: &super::connection::AcpCleanup,
+        cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
         let runtime = self.runtime.status();
         if !runtime.available {
@@ -1904,11 +1571,7 @@ impl AcpProvider {
                 .await
                 .map_err(|_| protocol())?;
             super::conversation::validate_initialization(&requirement, &initialized)?;
-            let mut parameter = serde_json::json!({"cwd":workspace,"mcpServers":[]});
-            if self.kind == AcpKind::Claude {
-                parameter["_meta"] = serde_json::json!({"claudeCode":{"options":{
-                    "persistSession":false,"strictMcpConfig":true}}});
-            }
+            let parameter = serde_json::json!({"cwd":workspace,"mcpServers":[]});
             let session = connection
                 .request("session/new", parameter)
                 .await
@@ -3265,22 +2928,6 @@ fn with_operation(operation: ProviderOperation, error: ProviderError) -> Provide
     }
 }
 
-/// Return the compaction Claude reported as completed or failed after `/compact`.
-///
-/// A failed compaction leaves the conversation unchanged, so the binding stays usable. When
-/// Claude reports neither outcome, the conversation state is unknown and the binding is invalidated.
-fn settled_compaction(
-    latest: Option<forge_provider_api::Compaction>,
-) -> Option<forge_provider_api::Compaction> {
-    latest.filter(|compaction| {
-        matches!(
-            compaction.state,
-            forge_provider_api::CompactionState::Completed
-                | forge_provider_api::CompactionState::Failed
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3300,7 +2947,7 @@ mod tests {
     /// Create a transport-free adapter for durable recovery-evidence decisions.
     fn provider() -> AcpProvider {
         AcpProvider::new(
-            forge_provider_api::ProviderId::new("claude").unwrap(),
+            forge_provider_api::ProviderId::new("antigravity").unwrap(),
             vec!["must-not-launch".into()],
             PathBuf::from("unused-acp-fixture"),
         )

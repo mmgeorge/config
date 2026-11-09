@@ -2157,7 +2157,7 @@ end
 
 function M.resolve_runtime_model()
   -- This warms the model cache on attach; `provider_catalog.models` stores the catalog and
-  -- redraws the winbar. Providers such as Claude Code list models only from an open binding,
+  -- redraws the winbar. ACP providers such as Antigravity list models only from an open binding,
   -- so an unavailable catalog here is expected; pickers fetch again on demand and report their
   -- own failures.
   require("forge.views.harness.provider_catalog").models(true, function() end)

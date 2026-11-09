@@ -115,7 +115,17 @@ impl RollbackEffect {
         let failure = match &mut self.rewind {
             Some(rewind) => rewind.run().await.err().map(|error| {
                 let cause = format!("{error:#}");
-                if journal.is_some() {
+                // An unsupported rewind target changes nothing, so repeating it cannot succeed.
+                if journal.is_none()
+                    && matches!(
+                        error.downcast_ref::<forge_provider_api::ProviderError>(),
+                        Some(forge_provider_api::ProviderError::Unsupported(_))
+                    )
+                {
+                    RollbackFailure::Unsupported {
+                        reason: "The provider cannot rewind its conversation to this point; nothing changed".into(),
+                    }
+                } else if journal.is_some() {
                     RollbackFailure::RestoreIncomplete { cause }
                 } else {
                     RollbackFailure::RewindFailed { cause }

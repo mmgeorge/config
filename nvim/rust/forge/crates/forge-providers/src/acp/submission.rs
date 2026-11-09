@@ -11,14 +11,6 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcpSubmission {
     Prompt,
-    Steering,
-}
-
-/// Distinguish steering accepted for the active turn from a new unobservable turn.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SteeringAcceptance {
-    Injected,
-    UnobservableExecution,
 }
 
 impl AcpSubmission {
@@ -26,40 +18,17 @@ impl AcpSubmission {
     fn operation(self) -> ProviderOperation {
         match self {
             Self::Prompt => ProviderOperation::TurnStart,
-            Self::Steering => ProviderOperation::TurnSteer,
         }
     }
 
     fn method(self) -> &'static str {
         match self {
             Self::Prompt => "session/prompt",
-            Self::Steering => "_session/steering",
         }
     }
 }
 
 impl AcpConnection {
-    /// Decode a steering response after its accepted delivery receipt is committed.
-    pub async fn submit_steering(
-        &self,
-        parameter: Value,
-        receipt: Option<Arc<dyn InputReceipt>>,
-    ) -> Result<SteeringAcceptance, ProviderError> {
-        let response = self
-            .submit(AcpSubmission::Steering, parameter, receipt, None, None)
-            .await?;
-        match response["outcome"].as_str() {
-            Some("injected") => Ok(SteeringAcceptance::Injected),
-            Some("startedNewTurn") => Ok(SteeringAcceptance::UnobservableExecution),
-            _ => Err(ProviderFailure::new(
-                ProviderOperation::TurnSteer,
-                ProviderFailureKind::Protocol,
-            )
-            .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
-            .into()),
-        }
-    }
-
     /// Commit ACP's provider-owned delivery evidence around one native send.
     pub async fn submit(
         &self,
