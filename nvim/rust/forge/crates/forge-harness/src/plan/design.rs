@@ -715,10 +715,9 @@ impl DeclarationDesign {
                     artifact.authored(),
                     "{path} is read-only; Harness generates it from execution state"
                 );
-                ensure!(
-                    edited.insert(path.to_owned()),
-                    "file appears more than once in patch: {path}"
-                );
+                // An artifact has no baseline or move bookkeeping, so its operations compose in
+                // patch order: Delete then Add replaces it, and repeated Update chunks stack.
+                edited.insert(path.to_owned());
                 ensure!(
                     !lines[position].starts_with("*** Move to: "),
                     "{path} cannot be moved"
@@ -728,7 +727,14 @@ impl DeclarationDesign {
                 position = end;
                 match kind {
                     "delete" => {
-                        bail!("{path} cannot be deleted; use *** Revert File to reset it")
+                        ensure!(body.is_empty(), "Delete File must have no patch body");
+                        // Empty text stays a draft; plan_submit reports any section it requires.
+                        design_artifact::store_authored(
+                            artifact,
+                            String::new(),
+                            &mut title,
+                            &mut candidate,
+                        )?;
                     }
                     "revert" => {
                         ensure!(body.is_empty(), "Revert File must have no patch body");
@@ -738,9 +744,8 @@ impl DeclarationDesign {
                         let patched = if kind == "add" {
                             added_text(body)?
                         } else {
-                            let original = design_artifact::authored_text(
-                                artifact, &title, &candidate, workspace,
-                            )?;
+                            let original =
+                                design_artifact::authored_text(artifact, &title, &candidate)?;
                             patch_file(path, &original, body)?
                         };
                         design_artifact::store_authored(
@@ -748,7 +753,6 @@ impl DeclarationDesign {
                             patched,
                             &mut title,
                             &mut candidate,
-                            workspace,
                         )?;
                     }
                 }
@@ -1312,6 +1316,68 @@ mod tests {
         );
         assert!(edited.parsed.is_none());
         assert!(edited.parsed().is_err());
+    }
+
+    #[test]
+    fn artifact_operations_compose_in_patch_order() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        let overview = |design: &DeclarationDesign| {
+            design
+                .artifact_text
+                .get("plan:overview.md")
+                .cloned()
+                .unwrap()
+        };
+
+        let replaced = patched(
+            &design,
+            workspace.path(),
+            "*** Begin Patch\n*** Delete File: plan:overview.md\n*** Add File: plan:overview.md\n+# Rounds\n+\n+## Objective\n+Play.\n*** End Patch",
+        );
+        assert_eq!(overview(&replaced), "# Rounds\n\n## Objective\nPlay.\n");
+
+        let stacked = patched(
+            &replaced,
+            workspace.path(),
+            "*** Begin Patch\n*** Update File: plan:overview.md\n@@\n-Play.\n+Play twice.\n*** Update File: plan:overview.md\n@@\n-Play twice.\n+Play three times.\n*** End Patch",
+        );
+        assert_eq!(
+            overview(&stacked),
+            "# Rounds\n\n## Objective\nPlay three times.\n"
+        );
+
+        let cleared = patched(
+            &stacked,
+            workspace.path(),
+            "*** Begin Patch\n*** Delete File: plan:overview.md\n*** End Patch",
+        );
+        assert_eq!(overview(&cleared), "");
+
+        let reverted = patched(
+            &cleared,
+            workspace.path(),
+            "*** Begin Patch\n*** Revert File: plan:overview.md\n*** End Patch",
+        );
+        assert!(!reverted.artifact_text.contains_key("plan:overview.md"));
+    }
+
+    #[test]
+    fn a_project_file_still_appears_once_per_patch() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        let error = design
+            .patch(
+                workspace.path(),
+                &BTreeMap::new(),
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  Run twice.\n*** Update File: Game.rs\n@@\n fn walk();\n+Change\n+  Walk twice.\n*** End Patch",
+                "Rounds",
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("file appears more than once in patch: Game.rs"),
+            "{error:#}"
+        );
     }
 
     #[test]

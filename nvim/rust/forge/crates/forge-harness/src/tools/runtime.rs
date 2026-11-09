@@ -819,14 +819,14 @@ mod test {
             .await
             .unwrap();
         assert!(
-            checks.message.contains("- [ ] unit: Unit · requires build"),
-            "{}",
+            !checks.message.contains("unit"),
+            "an unselected plan lists no checks: {}",
             checks.message
         );
         runtime
             .invoke(edit(
                 2,
-                "*** Begin Patch\n*** Update File: plan:checks.md\n@@\n-- [ ] unit: Unit · requires build\n+- [x] unit\n*** End Patch",
+                "*** Begin Patch\n*** Add File: plan:checks.md\n+unit\n*** End Patch",
             ))
             .await
             .unwrap();
@@ -852,8 +852,6 @@ mod test {
         for expected in [
             "error[invalid_plan_artifact]: `## Goals`: unknown section",
             "error[invalid_plan_content]: `## Background`: the section is required",
-            "plan:checks.md:",
-            "error[invalid_plan_check]: `unit`: the check requires `build`; mark it too",
             "Fix them and retry with expected_version 4.",
         ] {
             assert!(
@@ -861,6 +859,10 @@ mod test {
                 "missing {expected:?} in {failure}"
             );
         }
+        assert!(
+            !failure.contains("plan:checks.md"),
+            "an unlisted prerequisite is added, not reported: {failure}"
+        );
 
         let status = runtime
             .invoke(call("plan_status", json!({"plan_id":"plan"})))

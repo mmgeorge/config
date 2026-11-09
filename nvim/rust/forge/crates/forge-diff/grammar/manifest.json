@@ -165,11 +165,11 @@
       "files": [
         {
           "path": "README.md",
-          "sha256": "20aab536b847e80ea9793b88b591b9ce615ba18320777c47fce70574f292fbc2"
+          "sha256": "72160a3f6111c8adf61b1b16c2c8965796471a2aa2889bf41b6510c51eb78ba8"
         },
         {
           "path": "grammar.js",
-          "sha256": "9775c3a04b0a8b11e33e56f6c6ae6944325f940a45171eb1748c898b5bfe857a"
+          "sha256": "4e16ec7b4714dd132ad55e26ff8896ae8a037d96e23008324646ce09d10ac318"
         },
         {
           "path": "tree-sitter.json",
@@ -177,15 +177,15 @@
         },
         {
           "path": "src/grammar.json",
-          "sha256": "107f884764aa3751a7cfe5d026affb15cc765f6912d9afe7dd9a1b5eab06471c"
+          "sha256": "32b9b35c5be2545bb973cc4283bda3069e4313f72df2e5d2ab10397043b76000"
         },
         {
           "path": "src/node-types.json",
-          "sha256": "d6d2f8e46ff20512640d792fa0ba1e8f378354ba16ebf95b4937cd7b1ea7ace4"
+          "sha256": "ecb6f394a67aded7f08085897cda21f9280e5e70f138620c6deb8bbe7bb7fdd2"
         },
         {
           "path": "src/parser.c",
-          "sha256": "01b0f7ade346277a76feb20b5b1a92d6147ba26c2989bd2074bbd85b9520c298"
+          "sha256": "a68d0f8b65192149c974d94ca9101ab7cbbcbe23435163990b52f417e76e0ad9"
         },
         {
           "path": "src/tree_sitter/alloc.h",

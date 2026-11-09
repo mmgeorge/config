@@ -46,7 +46,7 @@ module.exports = grammar({
       ...[
         [1, ['or']],
         [2, ['and']],
-        [3, ['=', '≠', '≤', '≥', '<', '>', 'in', '∈', '∉']],
+        [3, ['=', '≠', '≤', '≥', '<', '>', 'in', '∈', '∉', 'is', seq('is', 'not')]],
         [4, ['∪', '∩']],
         [5, ['+', '-']],
         [6, ['×', '÷', '*', '/', '%', 'mod']],
@@ -57,7 +57,7 @@ module.exports = grammar({
       ))),
     ),
     identifier: $ => /[\p{L}_][\p{L}\p{N}_']*/,
-    builtin: $ => choice('none', 'true', 'false', 'null'),
+    builtin: $ => choice('none', 'some', 'true', 'false', 'null'),
     number: $ => /[0-9]+(\.[0-9]+)?/,
     string: $ => token(choice(/"([^"\\\n]|\\.)*"/, /'([^'\\\n]|\\.)*'/)),
     comment: $ => token(seq('#', /[^\n]*/)),

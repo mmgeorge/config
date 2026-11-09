@@ -719,7 +719,8 @@ navigation target, even when a function of that name exists. They do not require
 implementation functions, and a name that resolves to nothing is not an error.
 Every declaration a plan introduces, including enum variants and struct fields, needs a
 documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
-Assign with `←` or `<-`, compute remainders with `%` or `mod`, and loop with
+Assign with `←` or `<-`, compare with `=`, `≠`, `is`, or `is not` (as in `target is none`),
+compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
 Each Algorithm and Change heading in PlanReview folds its block, and the caret before the heading
 shows its state: `▾` open, `▸` closed. Every block starts open. Folding changes only the display.

@@ -76,7 +76,7 @@ pub(super) async fn execute(
             "{path} has no baseline; read it without baseline"
         );
         let text = if artifact.authored() {
-            crate::plan::design_artifact_text(artifact, &document.title, design, &workspace)?
+            crate::plan::design_artifact_text(artifact, &document.title, design)?
         } else {
             let state = super::status::execution_state(runtime)
                 .await?

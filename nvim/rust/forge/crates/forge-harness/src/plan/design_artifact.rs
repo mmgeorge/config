@@ -7,7 +7,6 @@
 //! text, and the next read renders the result in the same grammar the agent edits.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -146,42 +145,26 @@ impl ArtifactReport<'_> {
     }
 }
 
-/// Return an authored artifact's current text: the agent's stored text, or the document's
+/// Get an authored artifact's current text: the agent's stored text, or the document's
 /// rendering when the agent has not written it.
-///
-/// Only the checks artifact reads the workspace, because it lists the saved check configuration.
 pub(crate) fn authored_text(
     artifact: PlanArtifact,
     title: &str,
     design: &DeclarationDesign,
-    workspace: &Path,
 ) -> Result<String> {
     if let Some(text) = design.artifact_text.get(artifact.path()) {
         return Ok(text.clone());
     }
-    let config = if artifact == PlanArtifact::Checks {
-        Some(crate::checks::ConfigSnapshot::load(workspace)?.config)
-    } else {
-        None
-    };
-    render(artifact, title, &design.document, config.as_ref())
+    render(artifact, title, &design.document)
 }
 
 /// Render an authored artifact from the document in the grammar the agent edits.
-fn render(
-    artifact: PlanArtifact,
-    title: &str,
-    document: &DesignDocument,
-    config: Option<&crate::checks::CheckConfig>,
-) -> Result<String> {
+fn render(artifact: PlanArtifact, title: &str, document: &DesignDocument) -> Result<String> {
     Ok(match artifact {
         PlanArtifact::Overview => overview_text(title, document),
         PlanArtifact::Flows => document.flows.clone(),
         PlanArtifact::Tests => tests_text(&document.tests),
-        PlanArtifact::Checks => checks_text(
-            document,
-            config.context("plan:checks.md requires a saved check configuration")?,
-        ),
+        PlanArtifact::Checks => checks_text(document),
         PlanArtifact::Findings | PlanArtifact::Evidence | PlanArtifact::Verification => {
             bail!("{} is generated from execution state", artifact.path())
         }
@@ -197,7 +180,6 @@ pub(crate) fn store_authored(
     text: String,
     title: &mut String,
     design: &mut DeclarationDesign,
-    workspace: &Path,
 ) -> Result<()> {
     if artifact == PlanArtifact::Overview
         && let Some(heading) = text
@@ -208,14 +190,7 @@ pub(crate) fn store_authored(
     {
         *title = heading.to_owned();
     }
-    let rendered = match artifact {
-        PlanArtifact::Checks => crate::checks::ConfigSnapshot::load(workspace)
-            .ok()
-            .map(|snapshot| render(artifact, title, &design.document, Some(&snapshot.config)))
-            .transpose()?,
-        _ => Some(render(artifact, title, &design.document, None)?),
-    };
-    if rendered.as_ref() == Some(&text) {
+    if render(artifact, title, &design.document)? == text {
         design.artifact_text.remove(artifact.path());
     } else {
         design
@@ -288,7 +263,7 @@ pub(crate) fn parse_authored(
     let text = |artifact: PlanArtifact| -> Result<String> {
         match design.artifact_text.get(artifact.path()) {
             Some(text) => Ok(text.clone()),
-            None => render(artifact, title, &design.document, Some(config)),
+            None => render(artifact, title, &design.document),
         }
     };
     let mut diagnostic = Vec::new();
@@ -405,10 +380,6 @@ pub(crate) fn model_artifacts(
     design: &DeclarationDesign,
     include_verification: bool,
 ) -> Result<BTreeMap<&'static str, String>> {
-    let config = design
-        .check_configuration
-        .as_ref()
-        .map(|snapshot| &snapshot.config);
     let mut artifacts = BTreeMap::new();
     for artifact in PlanArtifact::AUTHORED {
         if artifact == PlanArtifact::Checks && !include_verification {
@@ -416,8 +387,7 @@ pub(crate) fn model_artifacts(
         }
         let text = match design.artifact_text.get(artifact.path()) {
             Some(text) => text.clone(),
-            None if artifact == PlanArtifact::Checks && config.is_none() => continue,
-            None => render(artifact, title, &design.document, config)?,
+            None => render(artifact, title, &design.document)?,
         };
         let text = if artifact == PlanArtifact::Overview && !include_verification {
             without_section(&text, MANUAL_CHECKS)
@@ -1015,131 +985,90 @@ fn parse_tests(text: &str, report: &mut ArtifactReport<'_>) -> Vec<DesignTestFil
     files.into_iter().map(|(_, file, _)| file).collect()
 }
 
-/// Render every enabled configured check with the plan's selection as a checkbox.
-fn checks_text(document: &DesignDocument, config: &crate::checks::CheckConfig) -> String {
-    let lines = config
-        .definitions
-        .iter()
-        .filter(|definition| definition.enabled)
-        .map(|definition| {
-            let mark = if document.checks.contains(&definition.id) {
-                "x"
-            } else {
-                " "
-            };
-            let mut notes = Vec::new();
-            if definition.auto {
-                notes.push("automatic".to_owned());
-            }
-            if !definition.depends_on.is_empty() {
-                notes.push(format!("requires {}", definition.depends_on.join(", ")));
-            }
-            if document.disabled_checks.contains(&definition.id) {
-                notes.push("disabled for this plan".to_owned());
-            }
-            let notes = if notes.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", notes.join(" · "))
-            };
-            format!("- [{mark}] {}: {}{notes}", definition.id, definition.name)
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    }
+/// Render the checks the plan adds, one ID per line.
+fn checks_text(document: &DesignDocument) -> String {
+    document.checks.iter().map(|id| format!("{id}\n")).collect()
 }
 
-/// Parse `- [ ] id` and `- [x] id` lines into the selected check IDs.
+/// Parse one check ID per line into the checks the plan adds to the automatic ones.
 ///
-/// Text after the ID's `:` is Harness's description and is ignored. With a configuration, each
-/// marked ID must name an enabled check whose prerequisites are also marked.
+/// A line's presence selects its check. A leading `- ` is accepted. With a configuration, each ID
+/// must name an enabled check, and Harness adds every unlisted prerequisite after the listed IDs,
+/// so the agent never lists prerequisites itself. Listing an automatic check is harmless.
 fn parse_checks(
     text: &str,
     config: Option<&crate::checks::CheckConfig>,
     report: &mut ArtifactReport<'_>,
 ) -> Vec<String> {
-    let mut marked: Vec<(usize, String)> = Vec::new();
-    let mut listed = BTreeSet::new();
+    let mut listed: Vec<(usize, String)> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
-        if line.trim().is_empty() {
+        let id = line.trim();
+        let id = id.strip_prefix("- ").map_or(id, str::trim);
+        if id.is_empty() {
             continue;
         }
-        let entry = line
-            .strip_prefix("- [x] ")
-            .or_else(|| line.strip_prefix("- [X] "))
-            .map(|rest| (true, rest))
-            .or_else(|| line.strip_prefix("- [ ] ").map(|rest| (false, rest)));
-        let Some((checked, rest)) = entry else {
+        if id.contains(char::is_whitespace) || id.starts_with('[') {
             report.syntax(
                 number,
-                line.trim(),
-                "check lines are `- [x] id` or `- [ ] id`".into(),
+                id,
+                "list one check ID per line, such as `unit`".into(),
             );
             continue;
-        };
-        let id = rest.split_once(':').map_or(rest, |(id, _)| id).trim();
-        if id.is_empty() {
-            report.syntax(number, line.trim(), "the line names no check ID".into());
-            continue;
         }
-        if !listed.insert(id.to_owned()) {
+        if listed.iter().any(|(_, listed)| listed == id) {
             report.syntax(number, id, "the check is listed twice".into());
             continue;
         }
-        if checked {
-            marked.push((number, id.to_owned()));
+        listed.push((number, id.to_owned()));
+    }
+    let mut selected = listed.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
+    let Some(config) = config else {
+        return selected;
+    };
+    let definition = |id: &str| {
+        config
+            .definitions
+            .iter()
+            .find(|definition| definition.id == id)
+    };
+    for (number, id) in &listed {
+        match definition(id) {
+            None => report.check(
+                *number,
+                id,
+                format!(
+                    "no configured check has this ID; configured checks are {}",
+                    config
+                        .definitions
+                        .iter()
+                        .filter(|definition| definition.enabled)
+                        .map(|definition| definition.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            Some(definition) if !definition.enabled => report.check(
+                *number,
+                id,
+                "the check is disabled in the check configuration".into(),
+            ),
+            Some(_) => {}
         }
     }
-    if let Some(config) = config {
-        let selected = marked
-            .iter()
-            .map(|(_, id)| id.as_str())
-            .collect::<BTreeSet<_>>();
-        for (number, id) in &marked {
-            let Some(definition) = config
-                .definitions
-                .iter()
-                .find(|definition| &definition.id == id)
-            else {
-                report.check(
-                    *number,
-                    id,
-                    format!(
-                        "no configured check has this ID; configured checks are {}",
-                        config
-                            .definitions
-                            .iter()
-                            .filter(|definition| definition.enabled)
-                            .map(|definition| definition.id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-                continue;
-            };
-            if !definition.enabled {
-                report.check(
-                    *number,
-                    id,
-                    "the check is disabled in the check configuration".into(),
-                );
-            }
+    // Follow prerequisites transitively; an index walk visits each appended ID once.
+    let mut position = 0;
+    while position < selected.len() {
+        if let Some(definition) = definition(&selected[position]) {
             for prerequisite in &definition.depends_on {
-                if !selected.contains(prerequisite.as_str()) {
-                    report.check(
-                        *number,
-                        id,
-                        format!("the check requires `{prerequisite}`; mark it too"),
-                    );
+                if !selected.contains(prerequisite) {
+                    selected.push(prerequisite.clone());
                 }
             }
         }
+        position += 1;
     }
-    marked.into_iter().map(|(_, id)| id).collect()
+    selected
 }
 
 #[cfg(test)]
@@ -1341,20 +1270,27 @@ mod test {
         };
         let mut diagnostic = Vec::new();
         let selected = parse_checks(
-            "- [ ] build: Build\n- [x] unit: Unit\n- [x] unit-tests\nnot a check\n",
+            "unit\n- unit-tests\n\nnot a check\n- [x] build\n",
             Some(&config),
             &mut report(&mut diagnostic),
         );
-        assert_eq!(selected, vec!["unit".to_owned(), "unit-tests".to_owned()]);
+        assert_eq!(
+            selected,
+            vec![
+                "unit".to_owned(),
+                "unit-tests".to_owned(),
+                "build".to_owned()
+            ],
+            "the unlisted prerequisite follows the listed checks"
+        );
         assert_eq!(
             lines(&diagnostic),
             vec![
                 (4, "invalid_plan_artifact"),
+                (5, "invalid_plan_artifact"),
                 (2, "invalid_plan_check"),
-                (3, "invalid_plan_check"),
             ]
         );
-        assert!(diagnostic[1].reason.contains("requires `build`"));
         assert!(
             diagnostic[2]
                 .reason

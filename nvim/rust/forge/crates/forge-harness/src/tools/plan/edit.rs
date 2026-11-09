@@ -26,9 +26,11 @@ pub(super) fn definition() -> ControlToolDefinition {
                 lifecycle whose transitions come from several triggers. plan:tests.md has one \
                 `## path/to/file` per file and items such as - new `exact_test_name` [target: runner]: \
                 scenario and expected result, where the change is new, modified, removed, or reused and the \
-                target is optional. plan:checks.md lists saved checks as `- [ ] id` lines; mark `[x]` on each \
-                check to run in addition to automatic ones, and mark its prerequisites too. Add File on an \
-                artifact replaces its whole text.\n\
+                target is optional. plan:checks.md lists one check ID per line, each a saved check from \
+                check_definition_list to run in addition to the automatic ones; a line's presence alone \
+                selects its check, and Harness adds prerequisites itself. Add File on an \
+                artifact replaces its whole text, and Delete File clears it. Operations on one artifact \
+                apply in patch order; a project file appears at most once per patch.\n\
                 Verify: plan_edit accepts only a patch of plan:verification.md. Replace each \
                 `N. pending []` row with `N. passed|failed|blocked [IDs] note`, citing IDs from \
                 plan:evidence.md, and list defects under `## Findings` as `path:line:column: message [IDs]`. \
@@ -37,9 +39,9 @@ pub(super) fn definition() -> ControlToolDefinition {
                 signatures and comments, never executable bodies. Each callable \
                 carries at most one behavior block: a nonempty Algorithm for a new callable, including a \
                 renamed or replacing one, or a one-to-two-sentence Change for an existing callable, even when \
-                its signature stays the same; never both. Load the academic-pseudocode skill before writing an \
-                Algorithm. Algorithm statements are one per line: assignments with ←, calls such as \
-                process(item), if/otherwise, for each item in items, while, and return; explanations belong \
+                its signature stays the same; never both. Algorithm statements are one per line: assignments \
+                with ←, calls such as process(item), comparisons such as `target is none`, if/otherwise, \
+                for each item in items, while, and return; explanations belong \
                 only in # comments, and statements inside a control block are indented under it. Place \
                 the behavior block directly below the signature under a standalone Algorithm or Change \
                 heading; plan_read shows its content indented, and content written flush with its heading \

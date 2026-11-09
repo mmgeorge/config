@@ -908,6 +908,23 @@
                     {
                       "type": "STRING",
                       "value": "∉"
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "is"
+                    },
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "STRING",
+                          "value": "is"
+                        },
+                        {
+                          "type": "STRING",
+                          "value": "not"
+                        }
+                      ]
                     }
                   ]
                 },
@@ -1082,6 +1099,10 @@
         {
           "type": "STRING",
           "value": "none"
+        },
+        {
+          "type": "STRING",
+          "value": "some"
         },
         {
           "type": "STRING",

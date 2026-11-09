@@ -497,6 +497,18 @@ mod tests {
     }
 
     #[test]
+    fn is_and_is_not_compare_like_equality() {
+        assert_eq!(
+            messages("if target is none\n  return\nif target is not none\n  attack(target)"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            messages("alive ← enemy.health is some\nis ← 3"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn for_loops_accept_python_style_headers() {
         assert_eq!(
             messages(
