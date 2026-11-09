@@ -482,6 +482,35 @@ fn append_index(
     output.push(0);
 }
 
+/// Returns the selected paths that still have content or an index entry for `git add` to match.
+/// Whole-file staging captures no precondition, so another writer may stage a deletion between
+/// preparation and execution. A path absent from both the worktree and the index already has its
+/// deletion staged, and Git rejects it as an unmatched pathspec rather than treating it as a no-op.
+pub(super) fn stageable_paths(
+    repository: &RepositoryState,
+    path: &[RepositoryPath],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<RepositoryPath>> {
+    let root = repository
+        .identity
+        .worktree_root
+        .as_ref()
+        .context("missing worktree root")?;
+    let mut missing = Vec::new();
+    for target in path {
+        check()?;
+        if read_worktree_stamp(root, target)? == WorktreeStamp::Missing {
+            missing.push(target.clone());
+        }
+    }
+    let indexed = bulk_index(repository, &missing, check)?;
+    Ok(path
+        .iter()
+        .filter(|target| !missing.contains(target) || indexed.contains_key(*target))
+        .cloned()
+        .collect())
+}
+
 fn bulk_index(
     repository: &RepositoryState,
     path: &[RepositoryPath],

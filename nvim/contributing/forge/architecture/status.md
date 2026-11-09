@@ -32,7 +32,7 @@ Staging an already-staged selection, or unstaging an already-unstaged selection,
 
 Each action has its own precondition:
 
-- **Whole-file staging** writes the worktree content current at execution, and requires no unchanged index entry.
+- **Whole-file staging** writes the worktree content current at execution, and requires no unchanged index entry. At execution it drops any path absent from both the worktree and the index, because that path's deletion is already staged and Git rejects it as an unmatched pathspec.
 - **Hunk staging** checks displayed worktree metadata at execution and again before the write, verifies the exact index source, and rejects a changed source without applying the patch.
 - **Discard** fingerprints content and validates the selected source. Its confirmation keeps the captured target and rejects changed ownership.
 

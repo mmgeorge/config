@@ -173,6 +173,39 @@ async fn literal_pathspec_does_not_stage_neighbors() {
 }
 
 #[tokio::test]
+async fn whole_file_stage_completes_when_deletion_was_staged_after_preparation() {
+    let (directory, _, repository, service) = fixture().await;
+    std::fs::write(directory.path().join("neighbor.txt"), "neighbor\n").unwrap();
+    std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
+    let intent = service
+        .prepare(
+            Arc::clone(&repository),
+            GitWriteAction::Stage {
+                path: vec![path("sample.txt"), path("neighbor.txt")],
+            },
+        )
+        .await
+        .unwrap();
+    git(
+        directory.path(),
+        &["rm", "--cached", "--quiet", "sample.txt"],
+    );
+    let outcome = service.submit(intent).unwrap().finish().await.unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{outcome:?}"
+    );
+    service.acknowledge(outcome.operation).unwrap();
+    assert_eq!(
+        git(directory.path(), &["diff", "--cached", "--name-status"]),
+        b"A\tneighbor.txt\nD\tsample.txt\n"
+    );
+}
+
+#[tokio::test]
 async fn untracked_discard_deletes_only_captured_file() {
     let (directory, _, repository, service) = fixture().await;
     std::fs::write(directory.path().join("untracked.txt"), "discard\n").unwrap();

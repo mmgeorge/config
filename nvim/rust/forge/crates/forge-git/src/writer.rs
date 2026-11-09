@@ -1312,6 +1312,19 @@ fn bounded_diagnostic(text: &str) -> String {
     format!("{}{notice}{}", &text[..end], &text[start..])
 }
 
+/// Reports a path group whose targets already hold the requested state, so no process ran.
+fn completed_without_command() -> std::process::Output {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
 fn run_path_chunk(
     intent: &WriteExecution<'_>,
     action: BulkAction,
@@ -1333,18 +1346,19 @@ fn run_path_chunk(
                 )?;
                 std::fs::remove_file(destination).context("delete captured untracked file")?;
             }
-            #[cfg(unix)]
-            use std::os::unix::process::ExitStatusExt;
-            #[cfg(windows)]
-            use std::os::windows::process::ExitStatusExt;
-            return Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            });
+            return Ok(completed_without_command());
         }
         BulkAction::Git(action) => action,
     };
+    let selected: Vec<_> = path.iter().cloned().collect();
+    let selected = if action == PathCommand::Stage {
+        precondition::stageable_paths(&intent.repository, &selected, check)?
+    } else {
+        selected
+    };
+    if selected.is_empty() {
+        return Ok(completed_without_command());
+    }
     let mut command = git_command(&intent.repository)?;
     match action {
         PathCommand::Stage => {
@@ -1368,7 +1382,7 @@ fn run_path_chunk(
     }
     command.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     let mut input = Vec::new();
-    for path in path.iter() {
+    for path in &selected {
         input.extend_from_slice(path.raw());
         input.push(0);
     }
