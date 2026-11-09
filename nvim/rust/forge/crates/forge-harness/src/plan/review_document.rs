@@ -1127,20 +1127,6 @@ impl ReadOnlyPlanReview {
             column as u32
         };
         let Some(symbol) = index.selected(&selected_anchor, saved_column) else {
-            if let super::PlanReviewTarget::Call {
-                path,
-                owner,
-                name,
-                kind,
-                ..
-            } = &anchor.target
-                && let Some(reason) =
-                    index
-                        .unresolved
-                        .get(&(path.clone(), owner.clone(), name.clone(), *kind))
-            {
-                return Ok(serde_json::json!({"message":reason}));
-            }
             return Ok(
                 serde_json::json!({"message":"The selected symbol has no resolved plan identity."}),
             );
@@ -1276,29 +1262,12 @@ impl ReadOnlyPlanReview {
             text.context("reference file is missing")?,
             calls.map(Vec::as_slice).unwrap_or_default(),
         )?;
-        let selected_row = if matches!(
-            reference.kind.as_str(),
-            "call" | "property" | "callback" | "value" | "construct"
-        ) {
-            presentation.call_row.iter().find_map(|(row, targets)| {
-                targets
-                    .iter()
-                    .any(|target| {
-                        target.owner == reference.owner
-                            && target.name == reference.name
-                            && target.kind.label() == reference.kind
-                    })
-                    .then_some(*row)
-            })
-        } else {
-            None
-        }
-        .or_else(|| {
-            presentation.declaration.source.iter().position(|position| {
-                position.is_some_and(|position| position.line == reference.line)
-            })
-        })
-        .context("reference has no declaration row")?;
+        let selected_row = presentation
+            .declaration
+            .source
+            .iter()
+            .position(|position| position.is_some_and(|position| position.line == reference.line))
+            .context("reference has no declaration row")?;
         self.reveal_target(&reference.path, &reference.side, selected_row, locate)
     }
 
@@ -1577,30 +1546,6 @@ impl ReadOnlyPlanReview {
             kind,
         } = &anchor.target
         {
-            let design = self
-                .source
-                .document
-                .design
-                .as_ref()
-                .context("declaration design is unavailable")?;
-            let calls = if side == "baseline" {
-                &design.baseline_calls
-            } else {
-                &design.parsed()?.proposed_calls
-            };
-            if calls.get(path).into_iter().flatten().any(|function| {
-                function.owner == *owner
-                    && function
-                        .call
-                        .iter()
-                        .flatten()
-                        .any(|call| call.name == *name && call.kind == *kind && call.unresolved)
-            }) {
-                return Ok(crate::declaration::DeclarationResolution::Unverified {
-                    reason: "This target includes an opaque local binding in the captured source."
-                        .into(),
-                });
-            }
             let baseline = side == "baseline";
             let mut reference = self
                 .reference
@@ -1701,7 +1646,7 @@ impl ReadOnlyPlanReview {
         row: &str,
         column: usize,
     ) -> Result<Option<super::WorkspaceDefinition>> {
-        use forge_diff::syntax::{DeclarationCalls, DeclarationOverview, DeclarationPosition};
+        use forge_diff::syntax::{DeclarationOverview, DeclarationPosition};
         let Some(design) = &self.source.document.design else {
             return Ok(None);
         };
@@ -1731,67 +1676,6 @@ impl ReadOnlyPlanReview {
             return Ok(None);
         }
         let position = match &anchor.target {
-            super::PlanReviewTarget::Call {
-                owner, name, kind, ..
-            } => {
-                let calls = if side == "baseline" {
-                    &design.baseline_calls
-                } else {
-                    &design.parsed()?.proposed_calls
-                };
-                let Some(function) = calls
-                    .get(path)
-                    .into_iter()
-                    .flatten()
-                    .find(|function| function.owner == *owner)
-                else {
-                    return Ok(None);
-                };
-                let captured = function
-                    .call
-                    .iter()
-                    .flatten()
-                    .filter(|call| call.name == *name && call.kind == *kind)
-                    .filter_map(|call| call.source.as_ref())
-                    .collect::<Vec<_>>();
-                let Some(first) = captured.first() else {
-                    return Ok(None);
-                };
-                // One displayed target may represent several occurrences. Distinct receivers must not be guessed.
-                if captured
-                    .iter()
-                    .any(|candidate| candidate.expression != first.expression)
-                {
-                    return Ok(None);
-                }
-                let extracted = DeclarationCalls::extract(source_path, &source, false)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                let originals = extracted
-                    .iter()
-                    .find(|function| function.owner == *owner)
-                    .into_iter()
-                    .flat_map(|function| &function.call)
-                    .filter(|call| {
-                        call.line == first.line
-                            && call.column == first.column
-                            && (first.expression.is_empty() || call.expression == first.expression)
-                            || first.expression.is_empty() && call.name == *name
-                    })
-                    .collect::<Vec<_>>();
-                let Some(original) = originals.first() else {
-                    return Ok(None);
-                };
-                if originals
-                    .iter()
-                    .any(|candidate| candidate.expression != original.expression)
-                {
-                    return Ok(None);
-                }
-                Some(DeclarationPosition {
-                    line: original.line,
-                    column: original.column,
-                })
-            }
             super::PlanReviewTarget::Declaration {
                 line,
                 column: saved_column,
@@ -1912,13 +1796,13 @@ impl ReadOnlyPlanReview {
                         },
                     );
                 }
-                super::calls::AlgorithmTarget::Reference(reference) => {
+                super::calls::AlgorithmTarget::Reference { name, kind } => {
                     selected.target = super::PlanReviewTarget::Call {
                         path: path.clone(),
                         side: side.clone(),
                         owner: owner.clone(),
-                        name: reference.name,
-                        kind: reference.kind,
+                        name,
+                        kind,
                     };
                 }
             }

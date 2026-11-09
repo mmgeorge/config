@@ -2218,25 +2218,6 @@ impl TimelineRenderer<'_> {
                             for helper in &file.internal {
                                 lines.push(format!("- Internal addition: `{helper}`"));
                             }
-                            for difference in &file.references {
-                                lines.push(format!(
-                                    "- `{}` — {}{}",
-                                    difference.owner,
-                                    difference.category,
-                                    if difference.expected.is_none() {
-                                        " (unspecified in plan)"
-                                    } else {
-                                        ""
-                                    }
-                                ));
-                                if let Some(expected) = &difference.expected {
-                                    lines.push(format!("  Planned: {}", expected.join(", ")));
-                                }
-                                lines.push(format!(
-                                    "  Observed: {}",
-                                    difference.observed.join(", ")
-                                ));
-                            }
                             self.markdown(
                                 &format!("{file_id}:details"),
                                 &lines.join("\n"),

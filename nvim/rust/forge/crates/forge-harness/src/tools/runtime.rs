@@ -1090,11 +1090,10 @@ mod test {
         );
     }
 
-    /// References keep the heading the agent wrote until submission classifies them against the
-    /// final design: a function listed under Accesses stays there in `plan_read` and becomes a
-    /// callback in the submitted structure.
+    /// A source file holds only behavior blocks: `plan_read` shows no reference sections, and a
+    /// written reference section is rejected at submission while an Algorithm-only file submits.
     #[tokio::test]
-    async fn submission_classifies_references_without_moving_authored_text() {
+    async fn source_files_hold_only_behavior_blocks() {
         let mut context = planning_context();
         let workspace = context.workspace_root.clone().unwrap();
         context.plan_document.as_mut().unwrap().design =
@@ -1126,23 +1125,29 @@ mod test {
             ))
             .await
             .unwrap();
-        let shown = runtime
-            .invoke(call(
-                "plan_read",
-                json!({"plan_id":"plan","path":"Rounds.rs"}),
-            ))
-            .await
-            .unwrap();
-        assert!(
-            shown.message.contains("11: Accesses\n12:   score"),
-            "{}",
-            shown.message
-        );
-
-        let accepted = runtime
+        let rejected = runtime
             .invoke(call(
                 "plan_submit",
                 json!({"plan_id":"plan","expected_version":3}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{rejected:#}").contains("Accesses sections are not written in plans"),
+            "{rejected:#}"
+        );
+
+        runtime
+            .invoke(edit(
+                3,
+                "*** Begin Patch\n*** Update File: Rounds.rs\n@@\n     apply(score, round)\n-Accesses\n-  score\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        let accepted = runtime
+            .invoke(call(
+                "plan_submit",
+                json!({"plan_id":"plan","expected_version":4}),
             ))
             .await
             .unwrap();
@@ -1152,29 +1157,10 @@ mod test {
             accepted.message
         );
         let design = runtime.plan_document().unwrap().design.clone().unwrap();
-        let play = design.parsed().unwrap().proposed_calls["Rounds.rs"]
-            .iter()
-            .find(|body| body.owner == "play")
-            .unwrap()
-            .clone();
-        let score = play
-            .call
-            .iter()
-            .flatten()
-            .find(|call| call.name == "score")
-            .unwrap();
-        assert_eq!(score.kind, crate::plan::CallKind::Callback);
-        let shown = runtime
-            .invoke(call(
-                "plan_read",
-                json!({"plan_id":"plan","path":"Rounds.rs"}),
-            ))
-            .await
-            .unwrap();
         assert!(
-            shown.message.contains("11: Accesses\n12:   score"),
-            "{}",
-            shown.message
+            design.parsed().unwrap().proposed_calls["Rounds.rs"]
+                .iter()
+                .all(|body| body.behavior.is_some())
         );
     }
 

@@ -95,20 +95,8 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                     text,
                     calls.get(path).map(Vec::as_slice).unwrap_or_default(),
                     false,
-                    false,
                 )?;
-                if let PlanReviewTarget::Call { owner, name, .. } = &subject.target {
-                    presentation
-                        .call_row
-                        .iter()
-                        .find(|(_, targets)| {
-                            targets
-                                .iter()
-                                .any(|target| target.owner == *owner && target.name == *name)
-                        })
-                        .map(|(row, _)| *row as u32 + 1)
-                        .context("reviewed call is absent from its saved snapshot")?
-                } else if let PlanReviewTarget::Behavior { owner, offset, .. } = &subject.target {
+                if let PlanReviewTarget::Behavior { owner, offset, .. } = &subject.target {
                     presentation
                         .behavior_row
                         .iter()

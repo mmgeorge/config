@@ -67,16 +67,10 @@ pub enum DeclarationDiagnosticKind {
     Reference,
     /// Algorithm text the pseudocode grammar or block structure rejects.
     AlgorithmSyntax,
-    /// A repository field used by an Algorithm without a matching Accesses entry.
-    AlgorithmAccess,
-    /// A Constructs entry without a matching explicit construction in the Algorithm.
-    AlgorithmConstruction,
     /// A callable whose behavior section kind does not match whether it is new.
     BehaviorBlock,
     /// A proposed file line whose function sections do not parse, stored as written by plan_edit.
     DeclarationStructure,
-    /// An Algorithm reference with no unique declaring type or reference list entry.
-    AlgorithmReference,
     /// A plan documentation comment that breaks a planning comment rule.
     DeclarationComment,
     /// A declaration the plan introduces without a documentation comment.
@@ -97,11 +91,8 @@ impl DeclarationDiagnosticKind {
         match self {
             Self::Reference => "invalid_declaration_reference",
             Self::AlgorithmSyntax => "invalid_algorithm_syntax",
-            Self::AlgorithmAccess => "missing_algorithm_access",
-            Self::AlgorithmConstruction => "invalid_algorithm_construction",
             Self::BehaviorBlock => "invalid_behavior_block",
             Self::DeclarationStructure => "invalid_declaration_structure",
-            Self::AlgorithmReference => "invalid_algorithm_reference",
             Self::DeclarationComment => "invalid_declaration_comment",
             Self::MissingDocumentation => "missing_declaration_documentation",
             Self::ArtifactSyntax => "invalid_plan_artifact",
@@ -120,20 +111,11 @@ impl DeclarationDiagnosticKind {
             Self::AlgorithmSyntax => {
                 "Rewrite the reported Algorithm text as assignments, calls, and control flow; keep explanations in # comments."
             }
-            Self::AlgorithmAccess => {
-                "Add the reported field to the callable's Accesses section, or remove the field use from the Algorithm."
-            }
-            Self::AlgorithmConstruction => {
-                "Construct the reported target in the Algorithm with Type(field = value), Type(value) for a tuple type, or Type() for a marker, or remove it from Constructs."
-            }
             Self::BehaviorBlock => {
                 "Use an Algorithm block for a new callable and a Change block for an existing callable."
             }
-            Self::AlgorithmReference => {
-                "Qualify the reference with its declaring type so exactly one reference section entry matches it."
-            }
             Self::DeclarationStructure => {
-                "Patch the reported line: place sections directly below a signature, give each callable one Algorithm or Change, and list bare qualified names under Calls, Constructs, and Accesses."
+                "Patch the reported line: place the behavior block directly below its signature and give each callable at most one Algorithm or Change."
             }
             Self::DeclarationComment => {
                 "Rewrite the reported comment, then submit the current version again."
@@ -338,32 +320,6 @@ impl DeclarationResolver {
                     && symbol.position.column == destination.column
             })
             .map(|symbol| symbol.role)
-    }
-    /// Whether a resolved target is declared by this repository rather than a dependency, the
-    /// standard library, or an unchecked prelude. Planning bookkeeping applies only to the former.
-    pub(crate) fn repository_declaration(&self, resolution: &DeclarationResolution) -> bool {
-        matches!(resolution, DeclarationResolution::Resolved { destination }
-            if destination.proposed || Path::new(&destination.path).starts_with(&self.workspace))
-    }
-
-    /// Inspect the field layout of one resolved struct or enum variant.
-    pub(crate) fn field_shape(
-        &self,
-        resolution: &DeclarationResolution,
-    ) -> Option<forge_diff::syntax::FieldShape> {
-        let DeclarationResolution::Resolved { destination } = resolution else {
-            return None;
-        };
-        self.file
-            .get(Path::new(&destination.path))?
-            .index
-            .symbol
-            .iter()
-            .find(|symbol| {
-                symbol.position.line == destination.line
-                    && symbol.position.column == destination.column
-            })
-            .and_then(|symbol| symbol.field_shape)
     }
 
     /// Resolve declarations exclusively from saved plan files without consulting workspace sources.
@@ -687,7 +643,6 @@ impl DeclarationResolver {
 
     /// Validate imports and signature references only in proposed changed files.
     pub(crate) fn validate(&mut self, design: &DeclarationDesign) -> Result<DeclarationValidation> {
-        let parsed = design.parsed()?;
         let changed = design.changed_paths().into_iter().collect::<HashSet<_>>();
         let files = self
             .file
@@ -794,60 +749,6 @@ impl DeclarationResolver {
                     &import.source.clone().unwrap_or_else(|| path.join("::")),
                     result,
                 );
-            }
-            let path = file
-                .path
-                .strip_prefix(&self.workspace)
-                .unwrap_or(&file.path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Some(functions) = parsed.proposed_calls.get(&path) {
-                for function in functions {
-                    for reference in function
-                        .call
-                        .iter()
-                        .flatten()
-                        .filter(|reference| reference.kind == crate::plan::CallKind::Construct)
-                    {
-                        let position = reference
-                            .source
-                            .as_ref()
-                            .map(|source| DeclarationPosition {
-                                line: source.line,
-                                column: source.column,
-                            })
-                            .or_else(|| {
-                                file.index
-                                    .symbol
-                                    .iter()
-                                    .find(|symbol| {
-                                        symbol
-                                            .scope
-                                            .iter()
-                                            .chain(std::iter::once(&symbol.name))
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                            .join("::")
-                                            == function.owner
-                                    })
-                                    .map(|symbol| symbol.position)
-                            })
-                            .unwrap_or(DeclarationPosition { line: 1, column: 0 });
-                        let result = if reference.unresolved {
-                            unverified("Construction target includes an opaque local binding")
-                        } else {
-                            self.construct(&path, &function.owner, &reference.name)
-                        };
-                        record(
-                            &mut report,
-                            &self.workspace,
-                            &file.path,
-                            position,
-                            &reference.name,
-                            result,
-                        );
-                    }
-                }
             }
         }
         let mut seen = HashSet::new();
@@ -1182,7 +1083,7 @@ impl DeclarationResolver {
             Some(forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Variant) | None => target,
             Some(forge_diff::syntax::DeclarationRole::Callable) if self.factory(&target) => target,
             Some(_) => DeclarationResolution::Invalid {
-                reason: "Constructs requires a type, variant, or factory returning an owned named type. Put other invocations in Calls and value or property uses in Accesses.".into(),
+                reason: "A construction names a type, variant, or factory returning an owned named type.".into(),
             },
         }
     }

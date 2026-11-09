@@ -13,8 +13,8 @@ pub(super) fn definition() -> ControlToolDefinition {
         description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. \
                 Forge validates the expected phase and revision, commits the transition, and returns the next \
                 instructions. Implement and Resolve finish without conformance checks. Verify collects required \
-                declaration and public API differences together. Extra internal helpers and \
-                Calls/Constructs/Accesses never gate completion. End the turn after success. Verification \
+                declaration and public API differences together. Extra internal helpers never \
+                gate completion. End the turn after success. Verification \
                 findings enter Resolve, where code defects can be fixed and intentional contract changes can be \
                 submitted together. Verify submits the report saved in plan:verification.md: write each \
                 manual action's outcome, evidence, and summary there with plan_edit before calling this \

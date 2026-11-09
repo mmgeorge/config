@@ -23,8 +23,8 @@ pub(super) fn definition() -> ControlToolDefinition {
                 Plan, tools remain available after submission. Continue on further work or user input, then \
                 submit the latest version again. Any later accepted edit invalidates the pending submission until \
                 resubmitted. During execution, revisions are allowed only in Resolve. Submit one consolidated \
-                contract change with a concrete reason. Internal helpers and Calls/Constructs/Accesses \
-                differences do not require a revision. The execution tool call waits for the review decision. \
+                contract change with a concrete reason. Internal helper differences do not require a \
+                revision. The execution tool call waits for the review decision. \
                 Continue the same turn using its returned revision and feedback.",
         input_schema: strict_object_input_schema(
             vec![

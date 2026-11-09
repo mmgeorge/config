@@ -99,7 +99,8 @@ body-only edits when the signature remains unchanged. A collapsed body shows its
 change count, such as `pub fn update() { … 2 changes }`. Unfold the declaration to
 read its source diff. PlanReview starts in Public visibility and supports Semantic
 presentation only, so it binds `ov` without `ox`. Its unfolded declarations contain
-the saved Change, Algorithm, Calls, Constructs, and Accesses sections.
+the saved Change or Algorithm. Plans store no Calls, Constructs, or Accesses, so
+unchanged functions show only their signatures.
 
 Public visibility preserves unclassified source changes under an explicit fallback
 label. Unsupported syntax or unavailable historical source cannot silently remove
@@ -703,40 +704,34 @@ Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
 New functions and methods contain an `Algorithm` block in academic pseudocode.
 Algorithm blocks highlight control keywords, assignment and comparison operators, literals,
-and identifiers. Only calls that name a `Calls` or `Constructs` entry use call coloring;
-abstract operations such as `delta(time)` read as plain identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
+and identifiers. Plans contain no reference sections, so Algorithm calls, including
+abstract operations such as `delta(time)`, read as plain identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
 Write operations as calls such as `spawn_square(...)`. Prose statements, prose expressions,
 and adjacent operands without an operator are rejected at submission. Use comma-separated
 tuples and lists, and keep each complete statement on one line.
-Algorithm and Change headings use the same style as Calls, Constructs, and Accesses.
 Wrapped rows preserve source indentation after the diff gutter. Constructors retain type highlighting.
 Press `.` on an Algorithm parameter name to jump to that parameter in the function signature.
-Press it on a call or member name to jump to its declaration. Receiver types take priority,
-then Calls, Constructs, and Accesses resolve shortened names. Ambiguous matches report the
-candidate names without moving the cursor. Jump-back returns to the original Algorithm token.
-Unlisted unqualified lowercase calls represent abstract operations and have no declaration
-navigation target. They do not require implementation functions or new `Calls` entries.
+Press it on a qualified name, a capitalized type or constructor, or a member of a typed
+parameter to jump to its declaration. Ambiguous matches report the candidate names without
+moving the cursor. Jump-back returns to the original Algorithm token.
+Unqualified lowercase calls represent abstract operations and have no declaration
+navigation target, even when a function of that name exists. They do not require
+implementation functions, and a name that resolves to nothing is not an error.
 Every declaration a plan introduces, including enum variants and struct fields, needs a
 documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
 Assign with `←` or `<-`, compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
-Each behavior and reference heading in PlanReview folds its section, and the caret before the heading
-shows its state: `▾` open, `▸` closed. Constructs and Accesses start closed; Algorithm, Change, and
-Calls start open. Folding changes only the display.
-PlanReview shows each type's Accesses entries on one row, such as
-`RunSession { phase, score }`. Go to definition on a member jumps to that member, and
-on the type name jumps to the type when the type itself is listed.
+Each Algorithm and Change heading in PlanReview folds its block, and the caret before the heading
+shows its state: `▾` open, `▸` closed. Every block starts open. Folding changes only the display.
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
-struct or variant, or `CombatEntity()` for a marker. Each `Constructs` entry for a repository type
-must match an invocation in the Algorithm with its qualified name, using named arguments unless
-the type is a tuple. Keep construction separate from the operation that queues or inserts it.
-Repository fields read or written in the Algorithm need `Accesses` entries. Members of dependency,
-standard-library, and prelude types, such as Bevy's `Transform::translation`, need no entries.
+struct or variant, or `CombatEntity()` for a marker. Keep construction separate from the
+operation that queues or inserts it. Name the fields and types a function uses inside its
+Algorithm or Change; plans have no Calls, Constructs, or Accesses sections to fill in.
 Submission checks statement syntax and indentation, including branch and loop structure, and
 reports every violation in one response, each with the callable, the Algorithm line, and the
 rejected text. Drafts can remain incomplete while edited.
 Modified functions use `Change` for behavioral deltas in one or two succinct
-sentences. Expand a function to read its behavior and reference sections.
+sentences. Expand a function to read its behavior block.
 Collapsed signatures omit the `[changed]` suffix.
 Old and new function versions expand independently. Collapsing an old function
 keeps added declarations outside its body visible.
@@ -777,11 +772,6 @@ pauses, and restarts until changed or the task ends. Requesting changes leaves i
 unchanged, as does accepting inline feedback. Turn it off before resubmission when
 another review is required.
 Save pending annotations before a definition jump that changes the projection.
-`Constructs` lists directly instantiated types in green and factory calls with function highlighting.
-Factories are identified by their owned named return type. `Calls` lists other invocations and
-callbacks, while `Accesses` lists fields and named values. Type mentions in
-signatures do not imply construction. References use the same definition navigation.
-Type references retained under `Accesses` also use green type highlighting.
 Test names use function highlighting and omit the leading `tests::` in the file
 list. Navigation and test selection retain the full qualified name.
 Names absent from the plan fall back to exact workspace symbol lookup through

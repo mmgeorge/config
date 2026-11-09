@@ -527,10 +527,10 @@ impl PlanExecutionRecord {
         let verify;
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the accepted design and its tests. The accepted plan is frozen during Implement. Make justified deviations when needed, such as internal helpers, and explain them in your completion summary. Do not edit or submit the plan, update declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance checks in the Checking phase. When the code is written, call plan_phase_done. Differences in declarations, calls, or accesses do not block finishing Implement."
+                "Implement the accepted design and its tests. The accepted plan is frozen during Implement. Make justified deviations when needed, such as internal helpers, and explain them in your completion summary. Do not edit or submit the plan, update declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance checks in the Checking phase. When the code is written, call plan_phase_done. Differences in declarations or in what a callable uses do not block finishing Implement."
             }
             PlanPhase::Resolve => {
-                "Resolve the collected verification findings by fixing the code in the workspace. If an intentional change affects the accepted contract, propose one combined plan revision with a concrete reason, and continue with the returned revision once it is accepted. Internal helpers and differences in Calls, Constructs, or Accesses do not need a revision. Finish with plan_phase_done so Harness runs the declaration and automated checks again. Do not run those checks yourself."
+                "Resolve the collected verification findings by fixing the code in the workspace. If an intentional change affects the accepted contract, propose one combined plan revision with a concrete reason, and continue with the returned revision once it is accepted. Internal helpers and differences in what a callable uses do not need a revision. Finish with plan_phase_done so Harness runs the declaration and automated checks again. Do not run those checks yourself."
             }
             PlanPhase::Checking => {
                 "Harness runs the declaration and accepted checks locally. No model turn runs in this phase."

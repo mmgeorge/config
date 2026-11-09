@@ -457,20 +457,6 @@ pub(super) fn append_semantic_style(
     }
 }
 
-/// Color the type that opens a grouped `Type { member, ... }` reference row.
-pub(super) fn append_group_type_style(metadata: &mut BlockMetadata, text: &str) {
-    let start = text.len() - text.trim_start().len();
-    if let Some(end) = text.find(" { ")
-        && text[start..end]
-            .rsplit([':', '.'])
-            .next()
-            .and_then(|name| name.chars().next())
-            .is_some_and(char::is_uppercase)
-    {
-        append_range(metadata, start, end, "@type");
-    }
-}
-
 /// Color one target on a rendered row. A reference entry occupies `span`, coloring qualifying
 /// segments as types or modules and its final segment by the reference kind; other targets
 /// style the whole row and ignore `span`.

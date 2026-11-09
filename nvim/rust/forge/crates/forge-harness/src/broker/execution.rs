@@ -801,11 +801,7 @@ impl HarnessBroker {
                     for path in newly_captured {
                         if let Some(source) = checkpoint.read(&self.store.objects, &path)? {
                             let source = String::from_utf8(source)?;
-                            let (file, calls) = design.capture_baseline(
-                                Path::new(&self.session.workspace),
-                                &path,
-                                &source,
-                            )?;
+                            let (file, calls) = design.capture_baseline(&path, &source)?;
                             design.baseline.insert(path.clone(), file);
                             if calls.is_empty() {
                                 design.baseline_calls.remove(&path);

@@ -41,7 +41,7 @@ pub(crate) struct DesignFileInventory<'a> {
     changed_paths: Vec<String>,
 }
 
-type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (String, Vec<super::FunctionBody>)>>;
+type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, String>>;
 static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
 
 /// Owns baseline declarations and the agent's proposed file contents.
@@ -151,7 +151,7 @@ impl DeclarationDesign {
     }
 
     /// Collect every rule the planning model must satisfy in authored declarations: comment
-    /// wording, documentation, and incoming use. The design keeps the agent's layout, so every
+    /// wording and documentation. The design keeps the agent's layout, so every
     /// position names a line the agent can read and patch.
     pub(super) fn authored_diagnostics(
         &self,
@@ -160,7 +160,6 @@ impl DeclarationDesign {
         let index = super::references::PlanReferenceIndex::design(self, workspace)?;
         let mut authored = super::comment_lint::diagnostics(self)?;
         authored.extend(super::documentation::diagnostics(self, &index)?);
-        authored.extend(super::usage::diagnostics(self, &index, workspace)?);
         Ok(authored)
     }
 
@@ -212,16 +211,8 @@ impl DeclarationDesign {
             );
         }
         design.check_configuration = Some(configuration);
-        // Classify references once against the final design. Classification never revisits a
-        // reference it already made a construction or callback, so classifying a draft would
-        // keep kinds that the final design no longer supports.
-        let mut resolver =
-            crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
-        for (path, functions) in &mut design.parsed_mut()?.proposed_calls {
-            super::calls::classify(path, functions, &mut resolver);
-        }
         // Authored-rule diagnostics wait for the resolver so one rejection reports them with
-        // every reference failure instead of one rule family per submission.
+        // every declaration failure instead of one rule family per submission.
         let mut authored = design.authored_diagnostics(workspace)?;
         authored.extend(artifacts.diagnostic);
         let paths = design
@@ -248,7 +239,7 @@ impl DeclarationDesign {
         design.validate()?;
         let mut resolver =
             crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
-        authored.extend(super::calls::validate_behaviors(&design, &mut resolver)?);
+        authored.extend(super::calls::validate_behaviors(&design)?);
         let report = resolver.validate(&design)?;
         crate::declaration::DeclarationValidationError::ensure_empty(
             report.diagnostic.iter().cloned().chain(authored).collect(),
@@ -327,18 +318,16 @@ impl DeclarationDesign {
         validate_path(path)?;
         let source = workspace_source(workspace, path)?
             .with_context(|| format!("declaration file does not exist: {path}"))?;
-        self.capture_baseline(workspace, path, &source)
+        self.capture_baseline(path, &source)
     }
 
-    /// Extract one file's baseline declarations and function metadata from its source text.
+    /// Extract one file's baseline declarations from its source text.
     ///
-    /// Baseline references point at code that exists before the plan, so they are classified
-    /// against the baseline snapshot rather than the current proposal. Planning-time capture and
-    /// Resolve-phase recapture from an execution checkpoint both use this, so their baselines
-    /// agree.
+    /// Planning-time capture and Resolve-phase recapture from an execution checkpoint both use
+    /// this, so their baselines agree. A baseline holds no behavior blocks, so its function
+    /// list is empty.
     pub(crate) fn capture_baseline(
         &self,
-        workspace: &Path,
         path: &str,
         source: &str,
     ) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
@@ -350,79 +339,27 @@ impl DeclarationDesign {
             .map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?
             .get(&key)
             .cloned();
-        let overview = if let Some(overview) = cached {
-            overview
+        let text = if let Some(text) = cached {
+            text
         } else {
-            let (text, calls) = DeclarationOverview::extract_with_calls(path, source)
+            let text = DeclarationOverview::extract(path, source)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("extract {path}"))?;
             let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let calls = super::calls::from_extracted(calls);
-            let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?
-                .into_iter()
-                .map(|function| function.owner)
-                .collect::<BTreeSet<_>>();
-            let calls = calls
-                .into_iter()
-                .filter(|function| saved_owners.contains(&function.owner))
-                .collect::<Vec<_>>();
-            let overview = (text, calls);
             let mut cache = cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
-            let bytes = cache
-                .values()
-                .map(|(text, calls)| {
-                    text.len()
-                        + calls
-                            .iter()
-                            .map(|function| {
-                                function.owner.len()
-                                    + function
-                                        .call
-                                        .iter()
-                                        .flatten()
-                                        .map(|call| call.name.len() + 16)
-                                        .sum::<usize>()
-                            })
-                            .sum::<usize>()
-                })
-                .sum::<usize>();
+            let bytes = cache.values().map(String::len).sum::<usize>();
             if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 {
                 cache.clear();
             }
-            cache.insert(key, overview.clone());
-            overview
+            cache.insert(key, text.clone());
+            text
         };
-        let (text, mut calls) = overview;
-        if calls
-            .iter()
-            .flat_map(|function| function.call.iter().flatten())
-            .any(|reference| {
-                matches!(
-                    reference.kind,
-                    super::CallKind::Value | super::CallKind::Property | super::CallKind::Call
-                )
-            })
-        {
-            let mut captured = self.clone();
-            captured.baseline.insert(
-                path.into(),
-                DeclarationFile {
-                    text: text.clone(),
-                    source_digest: source_digest.clone(),
-                    editable_text: String::new(),
-                },
-            );
-            let mut resolver =
-                crate::declaration::DeclarationResolver::planned(workspace, &captured, true)?;
-            super::calls::classify(path, &mut calls, &mut resolver);
-        }
         Ok((
-            DeclarationFile::new(path, text, source_digest, &calls)?,
-            calls,
+            DeclarationFile::new(path, text, source_digest, &[])?,
+            Vec::new(),
         ))
     }
 
@@ -594,17 +531,7 @@ impl DeclarationDesign {
         };
         let mut diagnostic = Vec::new();
         for (path, text) in &self.proposed_source {
-            let original = self
-                .moved
-                .iter()
-                .find(|(_, to)| *to == path)
-                .map_or(path, |(from, _)| from);
-            let previous = self
-                .baseline_calls
-                .get(original)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            match super::calls::parse(path, text, previous) {
+            match super::calls::parse(path, text) {
                 Ok((declarations, calls)) => {
                     parsed.proposed.insert(path.clone(), declarations);
                     if !calls.is_empty() {
@@ -1005,7 +932,7 @@ fn validate_configuration_text(path: &str, text: &str) -> Result<()> {
 /// Check that captured or parsed function metadata belongs to exactly the callables of `text`.
 fn validate_calls(path: &str, text: &str, calls: &[super::FunctionBody]) -> Result<()> {
     let combined = super::calls::combined(path, text, calls)?;
-    let (_, parsed) = super::calls::parse(path, &combined, calls)?;
+    let (_, parsed) = super::calls::parse(path, &combined)?;
     ensure!(
         parsed.len() == calls.len(),
         "call metadata has an absent or ambiguous callable: {path}"
@@ -1295,17 +1222,6 @@ mod tests {
         )
     }
 
-    /// Get the captured source position of each call from `owner` to `helper` in a parsed file.
-    fn helper_sources(parsed: &ParsedDeclarations, path: &str, owner: &str) -> Vec<bool> {
-        parsed.proposed_calls[path]
-            .iter()
-            .filter(|body| body.owner == owner)
-            .flat_map(|body| body.call.iter().flatten())
-            .filter(|call| call.name == "helper")
-            .map(|call| call.source.is_some())
-            .collect()
-    }
-
     #[test]
     fn unedited_capture_submits_the_baseline_unchanged() {
         let workspace = workspace();
@@ -1318,74 +1234,55 @@ mod tests {
         let (parsed, diagnostic) = design.derive_parsed().unwrap();
         assert!(diagnostic.is_empty());
         assert_eq!(parsed.proposed["Game.rs"], design.baseline["Game.rs"].text);
-        assert_eq!(
-            parsed.proposed_calls["Game.rs"],
-            design.baseline_calls["Game.rs"]
-        );
+        assert!(!parsed.proposed_calls.contains_key("Game.rs"));
+        assert!(!design.baseline_calls.contains_key("Game.rs"));
     }
 
     #[test]
-    fn restored_reference_keeps_its_captured_source() {
+    fn parsed_files_store_only_written_behaviors() {
         let workspace = workspace();
         let design = captured(workspace.path());
-        let text = design.proposed_source["Game.rs"].clone();
-        let lines = text.lines().collect::<Vec<_>>();
-        let run = lines.iter().position(|line| *line == "fn run();").unwrap();
-        let calls = lines[run + 1];
-        let helper = lines[run + 2];
-        assert_eq!((calls, helper.trim()), ("Calls", "helper"));
-
-        let removed = patched(
+        assert!(
+            !design.proposed_source["Game.rs"].contains("Calls"),
+            "{}",
+            design.proposed_source["Game.rs"]
+        );
+        assert!(!design.baseline_calls.contains_key("Game.rs"));
+        let changed = patched(
             &design,
             workspace.path(),
-            &format!(
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n {calls}\n-{helper}\n*** End Patch"
-            ),
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  Run the helper twice.\n*** End Patch",
         );
-        let (parsed, _) = removed.derive_parsed().unwrap();
-        assert!(helper_sources(&parsed, "Game.rs", "run").is_empty());
-
-        let restored = patched(
-            &removed,
-            workspace.path(),
-            &format!(
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n {calls}\n+{helper}\n*** End Patch"
-            ),
-        );
-        assert_eq!(restored.proposed_source["Game.rs"], text);
-        let (parsed, _) = restored.derive_parsed().unwrap();
-        assert_eq!(helper_sources(&parsed, "Game.rs", "run"), [true]);
-    }
-
-    #[test]
-    fn moved_file_keeps_evidence_from_its_original_path() {
-        let workspace = workspace();
-        let design = captured(workspace.path());
-        let moved = patched(
-            &design,
-            workspace.path(),
-            "*** Begin Patch\n*** Update File: Game.rs\n*** Move to: Arena.rs\n@@\n-/// Run the helper.\n+/// Run the helper in the arena.\n*** End Patch",
-        );
-        assert_eq!(moved.moved["Game.rs"], "Arena.rs");
-        let (parsed, diagnostic) = moved.derive_parsed().unwrap();
+        let (parsed, diagnostic) = changed.derive_parsed().unwrap();
         assert!(diagnostic.is_empty());
-        assert_eq!(helper_sources(&parsed, "Arena.rs", "run"), [true]);
-        assert_eq!(helper_sources(&parsed, "Arena.rs", "walk"), [true]);
+        let [run] = &parsed.proposed_calls["Game.rs"][..] else {
+            panic!("{:?}", parsed.proposed_calls["Game.rs"]);
+        };
+        assert_eq!(run.owner, "run");
+        assert!(matches!(
+            run.behavior,
+            Some(super::super::FunctionBehavior::Change(_))
+        ));
     }
 
     #[test]
-    fn renamed_callable_loses_only_its_own_evidence() {
+    fn written_reference_sections_are_rejected() {
         let workspace = workspace();
         let design = captured(workspace.path());
-        let renamed = patched(
+        let written = patched(
             &design,
             workspace.path(),
-            "*** Begin Patch\n*** Update File: Game.rs\n@@\n-fn run();\n+fn start();\n*** End Patch",
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Calls\n+  helper\n*** End Patch",
         );
-        let (parsed, diagnostic) = renamed.derive_parsed().unwrap();
-        assert!(diagnostic.is_empty());
-        assert_eq!(helper_sources(&parsed, "Game.rs", "start"), [false]);
-        assert_eq!(helper_sources(&parsed, "Game.rs", "walk"), [true]);
+        let (_, diagnostic) = written.derive_parsed().unwrap();
+        assert_eq!(diagnostic.len(), 1, "{diagnostic:?}");
+        assert!(
+            diagnostic[0]
+                .reason
+                .contains("Calls sections are not written in plans"),
+            "{}",
+            diagnostic[0].reason
+        );
     }
 
     #[test]
@@ -1442,7 +1339,7 @@ mod tests {
         let mut design = patched(
             &DeclarationDesign::open(workspace.path()).unwrap(),
             workspace.path(),
-            "*** Begin Patch\n*** Add File: Rounds.rs\n+/// Score one round.\n+fn score(round: u32) -> u32;\n+Algorithm\n+  return round\n+\n+/// Play every round.\n+fn play(rounds: u32);\n+Algorithm\n+  for each round in rounds\n+    score(round)\n+Calls\n+  score\n*** End Patch",
+            "*** Begin Patch\n*** Add File: Rounds.rs\n+/// Score one round.\n+fn score(round: u32) -> u32;\n+Algorithm\n+  return round\n+\n+/// Play every round.\n+fn play(rounds: u32);\n+Algorithm\n+  for each round in rounds\n+    score(round)\n*** End Patch",
         );
         let (parsed, diagnostic) = design.derive_parsed().unwrap();
         assert!(diagnostic.is_empty());
@@ -1483,9 +1380,5 @@ mod tests {
             .unwrap()
         );
         assert!(text.contains("fn tally(round: u32)"), "{text}");
-        assert!(
-            text.contains("tally(round)") && !text.contains("score"),
-            "{text}"
-        );
     }
 }

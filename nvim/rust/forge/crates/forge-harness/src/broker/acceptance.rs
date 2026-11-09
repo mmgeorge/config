@@ -1415,23 +1415,13 @@ mod tests {
             .plan_file
             .read_working_document(&broker.session.id, &plan.id)?;
         let saved = saved.design.as_ref().unwrap();
-        let (expected, expected_calls) =
-            saved.capture_baseline(workspace.path(), "src/extra.rs", checkpointed)?;
-        assert_eq!(saved.baseline["src/extra.rs"], expected);
-        assert_eq!(saved.baseline_calls["src/extra.rs"], expected_calls);
-        let run = expected_calls
-            .iter()
-            .find(|body| body.owner == "run")
-            .context("run has captured calls")?;
+        let (expected, expected_calls) = saved.capture_baseline("src/extra.rs", checkpointed)?;
         assert_eq!(
-            run.call
-                .iter()
-                .flatten()
-                .filter(|call| call.name == "helper" && call.source.is_some())
-                .count(),
-            1,
+            saved.baseline["src/extra.rs"], expected,
             "the recaptured baseline describes the checkpointed source"
         );
+        assert!(expected_calls.is_empty());
+        assert!(!saved.baseline_calls.contains_key("src/extra.rs"));
         assert_ne!(
             saved.proposed_source["src/extra.rs"], expected.editable_text,
             "the proposal keeps the text the draft carried"

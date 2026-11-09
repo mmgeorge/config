@@ -2,28 +2,13 @@ Plan the requested code change by exploring the repository, clarifying intent, a
 
 A plan is a set of files you read with `plan_read` and patch with `plan_edit`. Four Markdown artifacts hold the design: `plan:overview.md` for the title, objective, requirements, background, decisions, design, and manual checks; `plan:flows.md` for runtime flows; `plan:tests.md` for test coverage; and `plan:checks.md` for additional checks. Project paths show a source file's semantic structure: its declarations, signatures, and relationships, with executable bodies removed. `plan_status` lists the artifacts and the files the plan changes. Edits are stored as written; `plan_submit` reports every problem in the artifacts and files by line, so fix the listed lines and submit again.
 
-For example, `plan_read` might return:
-
-```text
-/// Persist a draft and publish it to readers.
-pub fn save(&mut self, draft: Draft) -> Result<()>;
-Calls
-  Database::save
-  Cache::insert
-```
-
-A modified callable gains one `Change`. A new callable, including a renamed one, gets one `Algorithm` instead, never both. Reference sections list bare qualified names, and every new field appears under the `Accesses` of a callable that uses it:
+A modified callable gains one `Change` that states what changes. A new callable, including a renamed one, gets one `Algorithm` instead, never both. Name what the callable uses, such as `Draft::revision`, inside that block; the plan has no separate reference sections:
 
 ```text
 /// Persist a draft and publish it to readers.
 pub fn save(&mut self, draft: Draft) -> Result<()>;
 Change
-  Reject drafts older than the stored revision.
-Calls
-  Database::save
-  Cache::insert
-Accesses
-  Draft::revision
+  Reject drafts whose Draft::revision is older than the stored revision.
 
 /// Report whether the stored draft supersedes the candidate.
 fn is_stale(&self, draft: &Draft) -> bool;

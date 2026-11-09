@@ -1,11 +1,8 @@
 //! Seeds a disposable mock Harness session with real captured language fixtures.
 
 use anyhow::{Context, Result};
-use forge_diff::syntax::{DeclarationCallKind, DeclarationOverview};
-use forge_harness::plan::{
-    CallKind, CallPosition, CallSite, DeclarationDesign, DeclarationFile, FunctionBody,
-    PlanFileStore,
-};
+use forge_diff::syntax::DeclarationOverview;
+use forge_harness::plan::{DeclarationDesign, DeclarationFile, FunctionBody, PlanFileStore};
 use forge_harness::storage::SqliteStore;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -46,34 +43,14 @@ fn main() -> Result<()> {
         let source = std::fs::read_to_string(workspace.join(path))?;
         let (text, callables) = DeclarationOverview::extract_with_calls(path, &source)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let bodies = callables
+        // Captured baselines record no references, so only the proposal carries behaviors.
+        let changed = callables
             .into_iter()
             .map(|function| FunctionBody {
                 owner: function.owner,
-                behavior: None,
-                evidence: None,
-                call: Some(
-                    function
-                        .call
-                        .into_iter()
-                        .map(|call| CallSite {
-                            name: call.name,
-                            unresolved: call.unresolved,
-                            kind: match call.kind {
-                                DeclarationCallKind::Call => CallKind::Call,
-                                DeclarationCallKind::Callback => CallKind::Callback,
-                                DeclarationCallKind::Property => CallKind::Property,
-                                DeclarationCallKind::Value => CallKind::Value,
-                                DeclarationCallKind::Construct => CallKind::Construct,
-                            },
-                            source: Some(CallPosition {
-                                line: call.line,
-                                column: call.column,
-                                expression: call.expression,
-                            }),
-                        })
-                        .collect(),
-                ),
+                behavior: Some(forge_harness::plan::FunctionBehavior::Change(
+                    "Preserve behavior while reviewing definition navigation.".into(),
+                )),
             })
             .collect::<Vec<_>>();
         baseline.insert(
@@ -84,13 +61,7 @@ fn main() -> Result<()> {
             ),
         );
         proposed.insert((*path).into(), text);
-        design.baseline_calls.insert((*path).into(), bodies.clone());
-        let mut changed = bodies;
-        for body in &mut changed {
-            body.behavior = Some(forge_harness::plan::FunctionBehavior::Change(
-                "Preserve behavior while reviewing definition navigation.".into(),
-            ));
-        }
+        design.baseline_calls.insert((*path).into(), Vec::new());
         proposed_calls.insert((*path).into(), changed);
     }
     if arguments[4] == "behavior" {
@@ -102,19 +73,6 @@ fn main() -> Result<()> {
             behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
                 "result ← value\nrecord(ProbeResult.value)\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\ndecrease_cooldowns(cooldown_remaining, weapon.cooldown, elapsed_seconds, minimum_remaining = 0, preserve_order = stored_firing_order)\n# Preserve firing order while decreasing cooldowns\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
             )),
-            evidence: None,
-            call: Some(vec![
-                CallSite { name: "movement_direction".into(), kind: CallKind::Call, source: None, unresolved: false },
-                CallSite { name: "PlayerAbilities::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
-                CallSite { name: "Other::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
-                CallSite { name: "PlayerAbilities::cooldown".into(), kind: CallKind::Property, source: None, unresolved: false },
-                CallSite { name: "ProbeResult::value".into(), kind: CallKind::Property, source: None, unresolved: false },
-                CallSite {
-                name: "ProbeResult".into(),
-                unresolved: false,
-                kind: CallKind::Construct,
-                source: None,
-            }]),
         });
     }
     if arguments[4] == "tests" {
@@ -130,11 +88,9 @@ fn main() -> Result<()> {
             .unwrap()
             .push(FunctionBody {
                 owner: "added_tests::added_case".into(),
-                evidence: None,
                 behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
                     "return".into(),
                 )),
-                call: Some(Vec::new()),
             });
         proposed.insert(
             "tests/new.rs".into(),

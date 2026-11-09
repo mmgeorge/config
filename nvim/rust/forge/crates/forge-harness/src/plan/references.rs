@@ -56,9 +56,7 @@ pub(crate) struct PlanReferenceIndex {
     baseline_digest: BTreeMap<String, String>,
     pub occurrence: Vec<PlanReference>,
     pub definition: BTreeMap<(String, u32, u32), (String, usize)>,
-    pub call: BTreeMap<(String, String, String, super::CallKind), String>,
     pub structured: BTreeMap<String, String>,
-    pub unresolved: BTreeMap<(String, String, String, super::CallKind), String>,
     algorithm: BTreeMap<AlgorithmLocation, ResolvedAlgorithmReference>,
 }
 
@@ -335,111 +333,6 @@ impl PlanReferenceIndex {
                 .iter()
                 .map(|function| (function.owner.as_str(), function))
                 .collect::<BTreeMap<_, _>>();
-            for function in calls.get(path).into_iter().flatten() {
-                let position = callable.get(function.owner.as_str());
-                let Some(position) = position else { continue };
-                let mut target = BTreeMap::<(&str, super::CallKind), bool>::new();
-                for reference in function.call.iter().flatten() {
-                    *target.entry((&reference.name, reference.kind)).or_default() |=
-                        reference.unresolved;
-                }
-                for ((name, kind), unresolved) in target {
-                    if unresolved {
-                        output.unresolved.insert(
-                            (path.clone(), function.owner.clone(), name.into(), kind),
-                            "This target includes an opaque local binding in the captured source."
-                                .into(),
-                        );
-                        continue;
-                    }
-                    let separator = if path.ends_with(".rs") { "::" } else { "." };
-                    let parts = name.split(separator).map(str::to_owned).collect::<Vec<_>>();
-                    for prefix in 1..parts.len() {
-                        let target = if path.ends_with(".lua") {
-                            lua_target(
-                                path,
-                                &parts[..prefix].join(separator),
-                                &index,
-                                &lua_function,
-                            )
-                        } else {
-                            identity(
-                                resolver.type_target(
-                                    path,
-                                    &function
-                                        .owner
-                                        .split(separator)
-                                        .map(str::to_owned)
-                                        .collect::<Vec<_>>(),
-                                    &parts[..prefix],
-                                ),
-                            )
-                        };
-                        if let Some(symbol) = target {
-                            output.push(
-                                ReferenceSite {
-                                    path,
-                                    side,
-                                    owner: &function.owner,
-                                    line: position.line,
-                                    column: position.column,
-                                },
-                                &parts[..prefix].join(separator),
-                                "body_qualifier",
-                                symbol,
-                                None,
-                            );
-                        }
-                    }
-                    let symbol = if path.ends_with(".lua") {
-                        lua_target(path, name, &index, &lua_function)
-                    } else {
-                        let resolution = match kind {
-                            super::CallKind::Call | super::CallKind::Callback => {
-                                resolver.callable(path, &function.owner, name)
-                            }
-                            super::CallKind::Value => resolver.value(path, &function.owner, name),
-                            super::CallKind::Construct => {
-                                resolver.construct(path, &function.owner, name)
-                            }
-                            super::CallKind::Property => {
-                                resolver.property(path, &function.owner, name)
-                            }
-                        };
-                        match &resolution {
-                            DeclarationResolution::Invalid { reason }
-                            | DeclarationResolution::Ambiguous { reason }
-                            | DeclarationResolution::Unverified { reason } => {
-                                output.unresolved.insert(
-                                    (path.clone(), function.owner.clone(), name.into(), kind),
-                                    reason.clone(),
-                                );
-                            }
-                            _ => (),
-                        }
-                        identity(resolution)
-                    };
-                    if let Some(symbol) = symbol {
-                        output.call.insert(
-                            (path.clone(), function.owner.clone(), name.into(), kind),
-                            symbol.clone(),
-                        );
-                        output.push(
-                            ReferenceSite {
-                                path,
-                                side,
-                                owner: &function.owner,
-                                line: position.line,
-                                column: position.column,
-                            },
-                            name,
-                            kind.label(),
-                            symbol,
-                            None,
-                        );
-                    }
-                }
-            }
             for body in calls.get(path).into_iter().flatten() {
                 let Some(super::FunctionBehavior::Algorithm(source)) = &body.behavior else {
                     continue;
@@ -459,22 +352,18 @@ impl PlanReferenceIndex {
                     };
                     let length = reference.segment.len();
                     let width = lines[reference.line - 1].len();
-                    let Ok(Some(super::calls::AlgorithmTarget::Reference(target))) =
-                        super::calls::resolve_algorithm_reference(path, function, body, reference)
+                    let Some(super::calls::AlgorithmTarget::Reference { name, kind }) =
+                        super::calls::resolve_algorithm_reference(path, function, reference)
                     else {
                         continue;
                     };
-                    let resolution = match target.kind {
+                    let resolution = match kind {
                         super::CallKind::Call | super::CallKind::Callback => {
-                            resolver.callable(path, &body.owner, &target.name)
+                            resolver.callable(path, &body.owner, &name)
                         }
-                        super::CallKind::Construct => {
-                            resolver.construct(path, &body.owner, &target.name)
-                        }
-                        super::CallKind::Property => {
-                            resolver.property(path, &body.owner, &target.name)
-                        }
-                        super::CallKind::Value => resolver.value(path, &body.owner, &target.name),
+                        super::CallKind::Construct => resolver.construct(path, &body.owner, &name),
+                        super::CallKind::Property => resolver.property(path, &body.owner, &name),
+                        super::CallKind::Value => resolver.value(path, &body.owner, &name),
                     };
                     if let Some(symbol) = identity(resolution) {
                         output.algorithm.insert(
@@ -966,85 +855,6 @@ impl PlanReferenceIndex {
                 }
             }
         }
-        let qualifier = self
-            .occurrence
-            .iter()
-            .filter(|reference| reference.kind == "body_qualifier")
-            .map(|reference| {
-                (
-                    (
-                        reference.path.as_str(),
-                        reference.owner.as_str(),
-                        reference.name.as_str(),
-                    ),
-                    reference.symbol.as_str(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (path, functions) in &mut parsed.proposed_calls {
-            for function in functions {
-                for call in function.call.iter_mut().flatten() {
-                    if call.unresolved {
-                        continue;
-                    }
-                    let selected = self
-                        .call
-                        .get(&(
-                            path.clone(),
-                            function.owner.clone(),
-                            call.name.clone(),
-                            call.kind,
-                        ))
-                        .is_some_and(|target| target == identity);
-                    let separator = if path.ends_with(".rs") { "::" } else { "." };
-                    let normalized = call
-                        .name
-                        .replace(':', if separator == "." { "." } else { ":" });
-                    let parts = normalized.split(separator).collect::<Vec<_>>();
-                    let mut replacement = parts
-                        .iter()
-                        .map(|part| (*part).to_owned())
-                        .collect::<Vec<_>>();
-                    for (position, part) in parts.iter().enumerate() {
-                        if *part != symbol.name {
-                            continue;
-                        }
-                        let matches = if position + 1 == parts.len() {
-                            selected
-                        } else {
-                            qualifier
-                                .get(&(
-                                    path.as_str(),
-                                    function.owner.as_str(),
-                                    parts[..=position].join(separator).as_str(),
-                                ))
-                                .copied()
-                                == Some(identity)
-                        };
-                        if matches {
-                            replacement[position] = name.into();
-                        }
-                    }
-                    let mut offset = 0;
-                    let mut edits = Vec::new();
-                    for (replacement, original) in replacement.iter().zip(&parts) {
-                        if replacement != original {
-                            edits.push(super::source_edit::SourceReplacement {
-                                range: offset..offset + original.len(),
-                                expected: original,
-                                replacement,
-                            });
-                        }
-                        offset += original.len() + separator.len();
-                    }
-                    if !edits.is_empty() {
-                        call.name = super::source_edit::SourceRevision::new(&call.name)
-                            .prepare(edits)?
-                            .apply();
-                    }
-                }
-            }
-        }
         for (path, text) in &mut parsed.proposed {
             let Some(positions) = edits.remove(path) else {
                 continue;
@@ -1092,7 +902,7 @@ impl PlanReferenceIndex {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let combined = super::calls::combined(path, text, functions)?;
-            let (_, reparsed) = super::calls::parse(path, &combined, functions)?;
+            let (_, reparsed) = super::calls::parse(path, &combined)?;
             ensure!(
                 reparsed.len() == functions.len(),
                 "rename changed callable ownership"
@@ -1121,19 +931,12 @@ impl PlanReferenceIndex {
         Ok(output)
     }
 
-    /// Identify a symbol at a saved declaration position or a Calls entry.
+    /// Identify a symbol at a saved declaration position.
+    ///
+    /// Plans record no references, so a call target selected in an Algorithm has no indexed
+    /// symbol; the caller resolves its name through the declaration resolver instead.
     pub(crate) fn selected(&self, anchor: &PlanNavigationAnchor, column: u32) -> Option<&str> {
         match &anchor.target {
-            PlanReviewTarget::Call {
-                path,
-                owner,
-                name,
-                kind,
-                ..
-            } => self
-                .call
-                .get(&(path.clone(), owner.clone(), name.clone(), *kind))
-                .map(String::as_str),
             PlanReviewTarget::Declaration { path, line, .. } => self
                 .occurrence
                 .iter()

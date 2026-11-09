@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
-use forge_diff::syntax::{DeclarationCalls, DeclarationContract, DeclarationOverview};
+use forge_diff::syntax::{DeclarationContract, DeclarationOverview};
 use serde::{Deserialize, Serialize};
 
 use super::{DeclarationDesign, PlanExecutionRecord};
@@ -15,18 +15,16 @@ pub struct ImplementationReportRef {
     pub object_id: String,
     pub files: usize,
     pub helpers: usize,
-    pub relationships: usize,
     pub incomplete: bool,
 }
 
 impl ImplementationReportRef {
     pub fn summary(&self) -> String {
         format!(
-            "Implementation differences{} · {} files · {} internal additions · {} relationship changes",
+            "Implementation differences{} · {} files · {} internal additions",
             if self.incomplete { " (incomplete)" } else { "" },
             self.files,
-            self.helpers,
-            self.relationships
+            self.helpers
         )
     }
 }
@@ -41,22 +39,12 @@ pub struct ImplementationReport {
     pub unavailable: Vec<String>,
 }
 
-/// Declaration and reference differences owned by one changed or planned file.
+/// Declaration differences owned by one changed or planned file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImplementationFile {
     pub path: String,
     pub internal: Vec<String>,
     pub contract: Vec<String>,
-    pub references: Vec<ReferenceDifference>,
-}
-
-/// Planned and observed occurrences for a single callable category.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReferenceDifference {
-    pub owner: String,
-    pub category: String,
-    pub expected: Option<Vec<String>>,
-    pub observed: Vec<String>,
 }
 
 impl ImplementationReport {
@@ -102,7 +90,6 @@ impl ImplementationReport {
                     path,
                     internal: Vec::new(),
                     contract: vec!["Changed artifact outside declaration analysis".into()],
-                    references: Vec::new(),
                 });
                 continue;
             }
@@ -131,7 +118,6 @@ impl ImplementationReport {
                 path: path.clone(),
                 internal: Vec::new(),
                 contract: Vec::new(),
-                references: Vec::new(),
             };
             let Some(source) = source else {
                 if !expected.is_empty() {
@@ -196,80 +182,12 @@ impl ImplementationReport {
                         file.internal.push(identity.clone());
                     }
                 }
-                match DeclarationCalls::extract(&path, &source, false) {
-                    Ok(observed) => {
-                        let mut observed = super::calls::from_extracted(observed);
-                        let mut actual_design = original.clone();
-                        actual_design
-                            .parsed_mut()?
-                            .proposed
-                            .insert(path.clone(), overview.clone());
-                        let mut resolver = crate::declaration::DeclarationResolver::planned(
-                            workspace,
-                            &actual_design,
-                            false,
-                        )?;
-                        super::calls::classify(&path, &mut observed, &mut resolver);
-                        let planned = parsed
-                            .proposed_calls
-                            .get(&path)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
-                        let owners = planned
-                            .iter()
-                            .chain(&observed)
-                            .map(|body| body.owner.as_str())
-                            .collect::<BTreeSet<_>>();
-                        for owner in owners {
-                            let expected_body = planned.iter().find(|body| body.owner == owner);
-                            let actual_body = observed.iter().find(|body| body.owner == owner);
-                            for (label, category) in [
-                                ("Calls", super::calls::ReferenceCategory::Calls),
-                                ("Constructs", super::calls::ReferenceCategory::Constructs),
-                                ("Accesses", super::calls::ReferenceCategory::Accesses),
-                            ] {
-                                let category_known = expected_body
-                                    .and_then(|body| body.evidence)
-                                    .is_some_and(|evidence| evidence.contains(category));
-                                let targets = |body: Option<&super::FunctionBody>| {
-                                    body.into_iter()
-                                        .flat_map(|body| body.call.iter().flatten())
-                                        .filter(|call| call.kind.category() == category)
-                                        .map(|call| {
-                                            if call.unresolved {
-                                                format!("{} (unresolved)", call.name)
-                                            } else {
-                                                call.name.clone()
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                };
-                                let expected = category_known.then(|| targets(expected_body));
-                                let observed = targets(actual_body);
-                                if expected.as_ref() != Some(&observed)
-                                    && (expected.is_some() || !observed.is_empty())
-                                {
-                                    file.references.push(ReferenceDifference {
-                                        owner: owner.into(),
-                                        category: label.into(),
-                                        expected,
-                                        observed,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => report
-                        .unavailable
-                        .push(format!("{path}: relationships unavailable: {error:?}")),
-                }
                 Ok(())
             })();
             if let Err(error) = result {
                 report.unavailable.push(format!("{path}: {error:#}"));
             }
-            if !file.internal.is_empty() || !file.contract.is_empty() || !file.references.is_empty()
-            {
+            if !file.internal.is_empty() || !file.contract.is_empty() {
                 report.file.push(file);
             }
         }
@@ -282,7 +200,6 @@ impl ImplementationReport {
             object_id: objects.put(&serde_json::to_vec(self)?)?,
             files: self.file.len(),
             helpers: self.file.iter().map(|file| file.internal.len()).sum(),
-            relationships: self.file.iter().map(|file| file.references.len()).sum(),
             incomplete: incomplete || !self.unavailable.is_empty(),
         })
     }
