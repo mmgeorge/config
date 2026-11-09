@@ -7,6 +7,30 @@ local layout_ranges = {}
 local layout_handlers = false
 local cursor_attached = {}
 local render_epoch = {}
+---@type table<integer, {epoch: integer, window: integer, tick: integer, rendered?: boolean, done?: fun(rendered: boolean)}>
+local render_pending = {}
+local render_observer_installed = false
+
+---@param buf integer
+---@param epoch integer
+---@param rendered boolean
+local function finish_render(buf, epoch, rendered)
+  local pending = render_pending[buf]
+  if not pending or pending.epoch ~= epoch or pending.rendered ~= nil then return end
+  pending.rendered = rendered
+  local done = pending.done
+  pending.done = nil
+  if done then done(rendered) end
+end
+
+---Run the latest publication's navigation only after its Markdown geometry settles.
+---@param buf integer
+---@param done fun(rendered: boolean)
+function M.after_render(buf, done)
+  local pending = render_pending[buf]
+  if pending and pending.rendered == nil then pending.done = done
+  else done(not pending or pending.rendered == true) end
+end
 
 --- Registers markdown Tree-sitter parser support for the Harness filetype.
 ---@return boolean registered True if registration succeeded.
@@ -157,6 +181,21 @@ local function install_linear_sibling_count()
   end
 end
 
+-- A table's replacement height and column widths must not depend on which of its rows
+-- happened to intersect the viewport before tail positioning.
+local function install_complete_table_rows()
+  local View = require("render-markdown.request.view")
+  local overlaps = View.overlaps
+  function View:overlaps(node)
+    local ranges = layout_ranges[self.buf]
+    local kind = node:type()
+    if ranges and (kind == "pipe_table_header" or kind == "pipe_table_row") then
+      return row_in_range(node:start(), ranges)
+    end
+    return overlaps(self, node)
+  end
+end
+
 --- Removes render-markdown extmarks that fall outside designated markdown ranges.
 ---@param buf integer Target buffer number.
 ---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
@@ -174,6 +213,9 @@ end
 ---@param buf integer Target buffer number.
 function M.clear(buf)
   render_epoch[buf] = (render_epoch[buf] or 0) + 1
+  local pending = render_pending[buf]
+  if pending then finish_render(buf, pending.epoch, false) end
+  render_pending[buf] = nil
   layout_ranges[buf] = nil
   local math_handler = package.loaded["markdown_math.display_handler"]
   if math_handler then math_handler.invalidate(buf) end
@@ -212,9 +254,27 @@ function M.render(buf, win, range_list)
   end)
   local epoch = (render_epoch[buf] or 0) + 1
   render_epoch[buf] = epoch
+  local previous = render_pending[buf]
+  render_pending[buf] = { epoch = epoch, window = win, tick = vim.api.nvim_buf_get_changedtick(buf),
+    done = previous and previous.done }
+  if not render_observer_installed then
+    local state = require("render-markdown.state")
+    local on_render = state.on.render
+    state.on.render = function(context)
+      on_render(context)
+      local pending = render_pending[context.buf]
+      if not pending or pending.rendered ~= nil or pending.window ~= context.win then return end
+      finish_render(context.buf, pending.epoch,
+        vim.api.nvim_buf_get_changedtick(context.buf) == pending.tick)
+    end
+    render_observer_installed = true
+  end
   local function after_parse()
     if render_epoch[buf] ~= epoch or not vim.api.nvim_buf_is_valid(buf)
-      or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then return end
+      or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+      finish_render(buf, epoch, false)
+      return
+    end
     local highlight_ok, highlight_error = pcall(perf.trace, "harness", "ui.markdown.highlight", { buf = buf }, function()
       vim.treesitter.start(buf, "markdown")
     end)
@@ -223,6 +283,7 @@ function M.render(buf, win, range_list)
         failed = true
         vim.notify("Harness markdown highlighting failed: " .. tostring(highlight_error), vim.log.levels.WARN, { title = "ForgeHarness" })
       end
+      finish_render(buf, epoch, false)
       return
     end
     local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
@@ -281,6 +342,7 @@ function M.render(buf, win, range_list)
     if not layout_handlers then
       install_final_replacement_anchor()
       install_linear_sibling_count()
+      install_complete_table_rows()
       local state = require("render-markdown.state")
       -- A handler the editor configured wins; otherwise `markdown_math` converts math when the
       -- editor provides it, and render-markdown's built-in handler renders it unconverted.
@@ -291,7 +353,12 @@ function M.render(buf, win, range_list)
           or math_handler_by_language[language]
           or require("render-markdown.handler." .. language))
       end
-      vim.api.nvim_create_autocmd("BufWipeout", { callback = function(event) layout_ranges[event.buf] = nil end })
+      vim.api.nvim_create_autocmd("BufWipeout", { callback = function(event)
+        layout_ranges[event.buf] = nil
+        local pending = render_pending[event.buf]
+        if pending then finish_render(event.buf, pending.epoch, false) end
+        render_pending[event.buf] = nil
+      end })
       layout_handlers = true
     end
     local render_ok, render_error = pcall(perf.trace, "harness", "ui.markdown.render", { buf = buf }, function()
@@ -319,6 +386,7 @@ function M.render(buf, win, range_list)
       failed = true
       vim.notify("Harness markdown rendering failed: " .. tostring(render_error), vim.log.levels.WARN, { title = "ForgeHarness" })
     end
+    if not render_ok then finish_render(buf, epoch, false) end
   end
   parser:parse(true, function(parse_error)
     if parse_error then
@@ -326,6 +394,7 @@ function M.render(buf, win, range_list)
         failed = true
         vim.notify("Harness markdown parsing failed: " .. tostring(parse_error), vim.log.levels.WARN, { title = "ForgeHarness" })
       end
+      finish_render(buf, epoch, false)
       return
     end
     after_parse()

@@ -62,7 +62,7 @@ Centralize related state changes so their ordering and interactions are easy to 
 
 ## Annotations
 
-Declare the return type of every named function, method, and arrow function assigned to a variable or property, so a changed body cannot silently change the contract:
+Declare explicit return types on named functions, methods, and arrow functions that lack a contextual function type, so a changed body cannot silently change the contract:
 
 ```ts
 function displayName(user: User): string {
@@ -72,7 +72,7 @@ function displayName(user: User): string {
 const isActive = (session: Session): boolean => session.state.type === "active";
 ```
 
-Never annotate an inline closure passed as an argument. The receiving signature already types its parameters and return value, and an annotation can only drift from it.
+Never annotate parameters or return types on contextually typed closures, including callbacks passed as arguments and functions inside typed object literals. Put the types on the receiving interface or function signature instead. This rule takes precedence over the explicit-return-type requirement.
 
 Bad:
 
@@ -84,6 +84,18 @@ Good:
 
 ```ts
 const match = sessions.find((session) => session.id === id);
+```
+
+For an object property, declare the contract once:
+
+```ts
+interface ExtentProvider {
+  getFullExtent(): Promise<Extent | null>;
+}
+
+const provider: ExtentProvider = {
+  getFullExtent: async () => fullExtent,
+};
 ```
 
 ## Documentation

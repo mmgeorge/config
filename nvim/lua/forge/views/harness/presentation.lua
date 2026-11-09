@@ -576,7 +576,11 @@ function M.open(options, callback)
         render_markdown(switched_timeline)
         owner.observe_sections()
         if options.on_update then options.on_update() end
-        response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied)
+        local revision = owner.transcript.revision
+        markdown.after_render(options.transcript_buffer, guard(function(rendered)
+          if owner.transcript.revision ~= revision then return end
+          response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied or not rendered)
+        end))
         if result.syntax_pending then owner.highlight() end
         if owner.pending then owner.sync() end
         dispatch_next()

@@ -20,8 +20,10 @@ The writer captures every attached window's cursor and viewport immediately befo
 
 The replica's `before_commit` and `after_commit` callbacks run at that same boundary. Harness uses them to save outgoing timeline views and align status spacing, without overriding cursor restoration.
 
-Harness applies presentation-level navigation after successful transcript and
-status publication. New live-exchange revisions follow the tail while the owning
+Harness applies presentation-level navigation after successful transcript, status,
+and asynchronous Markdown decoration publication. Navigation checks the current
+revision, timeline, and focus after rendering; it retains no viewport across that wait.
+New live-exchange revisions follow the tail while the owning
 composer is focused, or while a floating popup entered from the composer, such as a
 permission review, holds focus. When focus is outside the transcript, a newly completed
 exchange aligns to the bottom if its prompt through tail fits, or places its

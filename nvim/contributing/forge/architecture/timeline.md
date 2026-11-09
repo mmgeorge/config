@@ -69,13 +69,17 @@ Composer height follows wrapped rows within the configured bounds, and `smoothsc
 The status split has a fixed viewport at row one. Its owner resets vertical and horizontal scroll offsets after layout and scroll events without moving focus or the transcript. Status sizing remains content-driven, bounded by available window space, and the separate status-details view retains normal scrolling for overflow.
 
 `HarnessResponseReveal` observes the latest top-level exchange's committed node lifecycle.
-After transcript, status, and local status layout publication, a new transcript
+After transcript, status, local status layout, and Markdown decoration publication, a new transcript
 revision in a live exchange follows the tail when the owning composer window is
 focused, including tool activity before any response text. A permission review or
 other floating popup whose previous window is the composer counts as composer focus,
 because the user who was following the stream did not move to the transcript; a
 popup entered from the transcript leaves the reader's position alone. Focus is checked at
-publication, and unchanged revisions do not replay navigation. Focused transcripts
+publication, and unchanged revisions do not replay navigation. The Markdown adapter
+settles navigation from the renderer's completion callback, after wrapped tables
+have installed their replacement rows. A newer transcript revision or timeline
+invalidates an older callback; no cursor or viewport snapshot crosses that wait.
+Focused transcripts
 retain the shared cursor and selection preservation contract.
 A PlanReview acceptance or revision request is an explicit submission, so on success
 it returns focus to the composer and positions the transcript at its tail, exactly as a
@@ -87,7 +91,7 @@ Math rendering is an optional integration. `forge.integrations.markdown_math` lo
 
 Harness Markdown handlers clip decorations to the current message ranges before `render-markdown` caches them, because incremental parser trees can otherwise restore deleted list bullets onto a separator. `render-markdown` numbers each list item by walking all of its preceding siblings, which makes one render quadratic in the list length and never terminates on a sibling chain that revisits a node; either blocked the editor thread while the transcript re-rendered. `render/harness/markdown.lua` therefore replaces `Node:sibling_count` with a walk that memoizes positions for the current parse and stops at a revisited node.
 
-Transcript windows soft-wrap raw Markdown rather than hard-wrapping it in Rust. `views/harness/layout.lua` owns the shared `transcript_wrapping` options, whose `breakindentopt` `list:-1` indents each continuation by the width of the buffer's `formatlistpat` match, so a wrapped bullet or numbered item hangs under its text at every nesting level. `forge.decorations` applies the same match when it extends full-width backgrounds across continuation rows. `render-markdown` replaces each wrapped table row with virtual lines anchored above the next visible row, and a table that ends the buffer has no such row; the window cannot scroll to lines anchored past the final line, so a window following the response end loses the table's body rows and bottom border. `render/harness/markdown.lua` therefore re-anchors those groups below the last visible row. Column widths come from every row present at each render, so a streaming table rebalances its columns as rows arrive.
+Transcript windows soft-wrap raw Markdown rather than hard-wrapping it in Rust. `views/harness/layout.lua` owns the shared `transcript_wrapping` options, whose `breakindentopt` `list:-1` indents each continuation by the width of the buffer's `formatlistpat` match, so a wrapped bullet or numbered item hangs under its text at every nesting level. `forge.decorations` applies the same match when it extends full-width backgrounds across continuation rows. `render-markdown` replaces each wrapped table row with virtual lines anchored above the next visible row, and a table that ends the buffer has no such row; the window cannot scroll to lines anchored past the final line, so a window following the response end loses the table's body rows and bottom border. `render/harness/markdown.lua` therefore re-anchors those groups below the last visible row. Within a selected Markdown message, a rendered table includes all its rows rather than only rows intersecting the previous viewport. This keeps column widths and replacement height independent of tail positioning; newly streamed rows can still change both.
 
 A tab label stores no session name. `views/harness/tabline.lua` resolves each tab at render time to the Harness view whose transcript window lies in that tab and shows that view's transcript buffer, then prints that view's session name, truncated to 30 characters. `/sessions` can move a view's windows to another tab, a background view can receive a rename, and a session can be deleted. A copied label went stale after each of these events, so the derived label changes at the next redraw instead. `controller.refresh_winbar`, session deletion, and history clearing call `tabline.refresh`. A tab without a Harness transcript falls back to its buffer name. The user's tabline returns once no tab displays a Harness view.
 

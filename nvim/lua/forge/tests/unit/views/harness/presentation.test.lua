@@ -1300,6 +1300,26 @@ T["transcript_follow"] = function()
   vim.api.nvim_win_close(popup, true)
   vim.api.nvim_set_current_win(composer_window)
 
+  local markdown = require("forge.render.harness.markdown")
+  local rendered
+  local after_render = dofile("nvim/lua/forge/tests/support/stub.lua")(markdown, "after_render",
+    function(_, done) rendered = done end)
+  MiniTest.finally(function() markdown.after_render = after_render end)
+  refresh()
+  vim.api.nvim_set_current_win(window)
+  vim.api.nvim_win_set_cursor(window, { 12, 4 })
+  rendered(true)
+  expect_position(window, { 12, 4 }, "Markdown completion ignored publication-time reading focus")
+  vim.api.nvim_set_current_win(composer_window)
+  refresh()
+  local obsolete_render = rendered
+  refresh()
+  obsolete_render(true)
+  expect_position(window, { 12, 4 }, "obsolete Markdown completion navigated a newer transcript")
+  rendered(true)
+  expect_revealed("current Markdown completion did not follow live progress")
+  markdown.after_render = after_render
+
   begin_response("short", { "First response line", "Last response line" })
   expect_position(window, { 12, 4 }, "streaming response moved history")
   finish_response()

@@ -238,4 +238,102 @@ T["harness_markdown_layout"] = function()
   end
 end
 
+T["live_tail_with_wrapped_table"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.api.nvim_ui_attach(121, 62, { rgb = true })
+  child.lua([[
+    local config_path = ...
+    vim.opt.runtimepath:prepend(config_path)
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/nvim-treesitter")
+    require("render-markdown").setup({})
+    vim.o.showtabline, vim.o.laststatus = 0, 0
+    local layout = require("forge.views.harness.layout")
+    local transcript, window, composer, composer_window = layout.open("table-tail")
+    vim.g.tail_transcript, vim.g.tail_window, vim.g.tail_composer = transcript, window, composer_window
+    layout.attach_scroll_boundary(transcript, window)
+    vim.wo[window].winbar = "Harness"
+    local lines = {}
+    for row = 1, 80 do lines[#lines + 1] = "Earlier response " .. row end
+    lines[#lines + 1] = "| Area | Contract |"
+    lines[#lines + 1] = "| --- | --- |"
+    for row = 1, 20 do
+      lines[#lines + 1] = "| Area " .. row .. " | " .. string.rep("Preserve the current invariant. ", 10) .. "|"
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "The response remains available while the next turn runs."
+    lines[#lines + 1] = ""
+    local client = require("forge.client")
+    client.host_is_accepting = function() return true end
+    local revision = 0
+    HarnessTailFixture = require("forge.views.harness.presentation").open({
+      session_id = "table-tail", transcript_buffer = transcript, transcript_window = window,
+      composer_buffer = composer, composer_window = composer_window, read_only = true,
+      is_alive = function() return true end, notice = function(message) error(message) end,
+      request = function(params, receive)
+        if params.operation ~= "open" and params.operation ~= "sync" then receive({}) return end
+        revision = revision + 1
+        local snapshot = { document = params.document, revision = revision, block = {
+          { id = "history", text = lines, metadata = {
+            target = {}, decoration = {}, editable_region = {}, markdown = true,
+            layout = { indent = 2 },
+          } },
+          { id = "prompt", text = { "Continue the investigation." }, metadata = {
+            target = {}, decoration = {}, editable_region = {},
+            node = { id = "prompt", kind = "message", lifecycle = "settled", display = "full",
+              default_display = "full", generation = 1, more = false, content_revision = 1,
+              loaded_rows = 1, loaded_bytes = 27, order = 0 },
+            layout = { indent = 2, marker = { text = ">", capture = "ForgeHarnessPrompt" } },
+          } },
+          { id = "exchange", text = { "Thinking " .. revision .. "s" }, metadata = {
+            target = {}, decoration = {}, editable_region = {},
+            node = { id = "exchange", kind = "exchange", lifecycle = "live", display = "full",
+              default_display = "full", generation = 1, more = false, content_revision = revision,
+              loaded_rows = 1, loaded_bytes = 12, order = 0 },
+          } },
+        } }
+        local status = { document = params.document .. ":status", revision = revision, block = {
+          { id = "working", text = { "Working " .. revision .. "s" }, metadata = {
+            target = {}, decoration = {}, editable_region = {},
+            status = { row = 0, animated = false, hint = "working" },
+          } },
+        } }
+        vim.schedule(function()
+          receive({ [params.operation == "open" and "transcript" or "snapshot"] = snapshot, status = status })
+        end)
+      end,
+    }, function(owner, failure) assert(owner, failure) end)
+  ]], { config_path })
+  wait_until(function()
+    return child.lua([[
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(vim.g.tail_transcript,
+        vim.api.nvim_get_namespaces()["render-markdown.nvim"], 0, -1, { details = true })) do
+        if mark[4].virt_lines then return true end
+      end
+      return false
+    ]])
+  end, "wrapped table did not render")
+  for _ = 1, 3 do
+    child.lua([[
+      HarnessTailFixture.sync()
+    ]])
+    wait_until(function() return child.lua("return not HarnessTailFixture.syncing and not HarnessTailFixture.refresh_timer") end,
+      "live transcript update did not settle")
+    local geometry = child.lua([[
+      vim.cmd("redraw")
+      local window = vim.g.tail_window
+      local last = vim.api.nvim_buf_line_count(vim.g.tail_transcript)
+      return { tail = vim.fn.screenpos(window, last, 1).row,
+        bottom = vim.api.nvim_win_get_position(window)[1] + vim.api.nvim_win_get_height(window),
+        focused = vim.api.nvim_get_current_win(), composer = vim.g.tail_composer,
+        view = vim.api.nvim_win_call(window, vim.fn.winsaveview) }
+    ]])
+    MiniTest.expect.equality(geometry.focused, geometry.composer)
+    assert(geometry.view.topfill > 0, vim.inspect(geometry))
+    assert(geometry.tail == geometry.bottom, vim.inspect(geometry))
+  end
+end
+
 return T

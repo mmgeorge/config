@@ -432,8 +432,10 @@
     },
     "mcp": {
       "*": "ask",
+      "chrome-devtools/*": "allow",
       "docs/*": "allow",
       "github/*": "allow",
+      "play-mcp/*": "allow",
       "sem/*": "allow",
       "terminal-mcp/*": "allow"
     },
