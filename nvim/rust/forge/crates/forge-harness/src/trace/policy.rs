@@ -90,6 +90,8 @@ fn diagnostic_field(key: &str) -> bool {
             | "generation"
             | "revision"
             | "phase"
+            | "disposition"
+            | "terminal_inventory_error"
             | "elapsed_ms"
             | "duration_ms"
             | "received_at_ms"

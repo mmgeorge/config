@@ -295,7 +295,7 @@ impl StatusService {
     ) -> Result<BodyDelivery> {
         let mut diagnostic = Vec::new();
         if let (Some(language), Some(analysis)) = (
-            crate::source::language(&file.record.path),
+            crate::source::diff_language(&file.record.path, file.projection.analysis()),
             file.projection.analysis(),
         ) {
             let parse = |source, cached: Option<SyntaxHandle>| async move {

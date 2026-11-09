@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// Identify a malformed terminal inventory without retaining native values or command text.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalInventoryError {
+    /// The response has no terminal array.
+    MissingInventory,
+    /// A live terminal has no string identity.
+    MissingIdentity,
+    /// A live terminal identity is empty or whitespace.
+    InvalidIdentity,
+    /// A terminal requested for display has no command label.
+    MissingCommand,
+}
+
+impl std::fmt::Display for TerminalInventoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingInventory => "background terminal inventory is missing",
+            Self::MissingIdentity => "background terminal identity is missing",
+            Self::InvalidIdentity => "background terminal identity is invalid",
+            Self::MissingCommand => "background terminal command is missing",
+        })
+    }
+}
+
+impl std::error::Error for TerminalInventoryError {}
+
 /// Provider-owned shells whose lifetime is independent of a Harness exchange.
 ///
 /// A provider without terminal inventory reports `UnsupportedCapability` instead of an

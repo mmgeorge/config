@@ -163,7 +163,9 @@ impl SelectedSource {
                 Err(error) => return Err(error),
             }
         }
-        if let Some(language) = crate::source::language(&self.observed.change.path) {
+        if let Some(language) =
+            crate::source::diff_language(&self.observed.change.path, self.analysis.as_ref())
+        {
             let analysis = self
                 .analysis
                 .as_ref()

@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use forge_buffer::{
     block::TextPosition,
@@ -13,7 +13,7 @@ use forge_git::{
 };
 
 use forge_git::test_support::{
-    head_commit, init_repository, set_config, set_identity, stage, stage_and_commit,
+    head_commit, init_repository, lfs_pointer, set_config, set_identity, stage, stage_and_commit,
 };
 
 use crate::protocol::{StatusFile, StatusStatistics};
@@ -82,6 +82,186 @@ async fn fixture() -> (
     let writer = Arc::new(GitWriteService::new(Arc::clone(&store)));
     let service = StatusService::new(store, Arc::clone(&diff), syntax, Arc::clone(&writer));
     (directory, service, diff, writer)
+}
+
+/// Render a hydrated LFS worktree as plain text without authorizing mutations.
+#[tokio::test]
+async fn text_lfs_diff_is_plain_and_read_only() {
+    let (directory, service, _, _) = fixture().await;
+    let root = directory.path();
+    let (old, _) = lfs_pointer(&root.join(".git/lfs"), b"export const value = 1;\n");
+    std::fs::write(root.join(".gitattributes"), "*.ts filter=lfs -text\n").unwrap();
+    std::fs::write(root.join("sample.spec.ts"), &old).unwrap();
+    stage_and_commit(root, &[".gitattributes", "sample.spec.ts"], "LFS source");
+    set_config(root, "filter \"lfs\"", "process", "");
+    set_config(root, "filter \"lfs\"", "clean", "");
+    set_config(root, "filter \"lfs\"", "required", "true");
+    {
+        let content = "export const value = 2;\n";
+        std::fs::write(root.join("sample.spec.ts"), content).unwrap();
+        let snapshot = service
+            .open(DocumentId("lfs-text".into()), root.to_owned())
+            .await
+            .unwrap();
+        set_config(
+            root,
+            "filter \"lfs\"",
+            "process",
+            "forge-test-filter-must-not-run",
+        );
+        let index = std::fs::read(root.join(".git/index")).unwrap();
+        let collapsed_error = service
+            .act(input(&snapshot, "sample.spec.ts", 1, "stage"), None)
+            .await
+            .err()
+            .expect("collapsed LFS files must remain read-only");
+        assert!(
+            collapsed_error.to_string().contains("LFS"),
+            "{collapsed_error:#}"
+        );
+        let delivery = service
+            .demand(input(&snapshot, "sample.spec.ts", 2, "demand"))
+            .await
+            .unwrap();
+        assert_eq!(delivery.state, BodyState::Ready);
+        let text = rows(delivery.snapshot.as_ref().unwrap()).join("\n");
+        assert!(
+            text.contains("export const value = 1;") && text.contains("export const value = 2;"),
+            "{text}"
+        );
+        assert!(!text.contains("oid sha256:"));
+        let owner = service.get(&snapshot.document).unwrap();
+        {
+            let document = owner.lock().await;
+            let file = document
+                .file
+                .values()
+                .find(|file| file.record.path.display_label() == "sample.spec.ts")
+                .unwrap();
+            assert!(file.old_syntax.is_none() && file.new_syntax.is_none());
+            assert_eq!(
+                file.projection
+                    .analysis()
+                    .unwrap()
+                    .source()
+                    .old
+                    .identity()
+                    .representation,
+                forge_diff::source::Representation::DisplayOnly
+            );
+        }
+        let loaded = delivery.snapshot.as_ref().unwrap();
+        let (block, row) = loaded
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .position(|row| *row == "export const value = 2;")
+                    .map(|row| (block, row))
+            })
+            .unwrap();
+        let mut hunk = input(&snapshot, "sample.spec.ts", 3, "stage");
+        hunk.location = body_location(file(&snapshot, "sample.spec.ts", None), loaded, block, row);
+        let hunk_error = service
+            .act(hunk, None)
+            .await
+            .err()
+            .expect("LFS hunks must remain read-only");
+        assert!(hunk_error.to_string().contains("LFS"), "{hunk_error:#}");
+        for (sequence, action) in [(4, "stage"), (5, "discard")] {
+            let error = service
+                .act(input(&snapshot, "sample.spec.ts", sequence, action), None)
+                .await
+                .err()
+                .expect("LFS actions must be read-only");
+            assert!(error.to_string().contains("LFS"), "{error:#}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("sample.spec.ts")).unwrap(),
+            content
+        );
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        service
+            .change_diff_views(
+                input(&snapshot, "sample.spec.ts", 6, "toggle_presentation"),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let current = service.snapshot(&snapshot.document).await.unwrap();
+        let displayed = body(&service, &current, file(&current, "sample.spec.ts", None)).await;
+        assert!(rows(&displayed).contains(&"export const value = 2;"));
+        let document = owner.lock().await;
+        let source = document
+            .file
+            .values()
+            .find(|file| file.record.path.display_label() == "sample.spec.ts")
+            .unwrap();
+        assert!(source.old_syntax.is_none() && source.new_syntax.is_none());
+        drop(document);
+        service.close(&snapshot.document);
+    }
+}
+
+/// Bypass cached pointer comparisons for staged LFS content and reject collapsed unstaging.
+#[tokio::test]
+async fn staged_lfs_diff_uses_payloads_instead_of_cached_pointers() {
+    let (directory, service, _, _) = fixture().await;
+    let root = directory.path();
+    let (old, _) = lfs_pointer(&root.join(".git/lfs"), b"old text\n");
+    let (new, _) = lfs_pointer(&root.join(".git/lfs"), b"new text\n");
+    std::fs::write(root.join(".gitattributes"), "*.ts filter=lfs -text\n").unwrap();
+    std::fs::write(root.join("source.ts"), old).unwrap();
+    stage_and_commit(root, &[".gitattributes", "source.ts"], "LFS baseline");
+    std::fs::write(root.join("source.ts"), new).unwrap();
+    stage(root, &["source.ts"]);
+    std::fs::write(root.join("source.ts"), "new text\n").unwrap();
+    set_config(
+        root,
+        "filter \"lfs\"",
+        "process",
+        "forge-test-filter-must-not-run",
+    );
+    set_config(root, "filter \"lfs\"", "required", "true");
+    let snapshot = service
+        .open(DocumentId("staged-lfs".into()), root.to_owned())
+        .await
+        .unwrap();
+    let selected = file(&snapshot, "source.ts", Some(StatusSection::Staged));
+    let index = std::fs::read(root.join(".git/index")).unwrap();
+    let error = service
+        .act(
+            captured(
+                &snapshot,
+                StatusLocation::File { id: selected.id },
+                1,
+                "unstage",
+            ),
+            None,
+        )
+        .await
+        .err()
+        .expect("LFS unstaging must remain read-only");
+    assert!(error.to_string().contains("LFS"), "{error:#}");
+    let delivery = service
+        .demand(captured(
+            &snapshot,
+            StatusLocation::File { id: selected.id },
+            2,
+            "demand",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delivery.state, BodyState::Ready);
+    let text = rows(delivery.snapshot.as_ref().unwrap());
+    assert!(
+        text.contains(&"old text") && text.contains(&"new text"),
+        "{text:?}"
+    );
+    assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
 }
 
 #[tokio::test]
@@ -364,6 +544,115 @@ async fn changed_file_refresh_retires_old_body_before_reloading() {
         .snapshot
         .unwrap();
     assert!(rows(&loaded).contains(&"newer content"));
+}
+
+/// Retry both cached-analysis validation and fresh content reads after repository invalidation.
+#[test]
+fn invalidated_body_demand_remains_retryable_after_unchanged_refresh() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for cached_analysis in [true, false] {
+            let (directory, service, _, _) = fixture().await;
+            let snapshot = service
+                .open(DocumentId("retry-body".into()), directory.path().to_owned())
+                .await
+                .unwrap();
+            let owner = service.get(&snapshot.document).unwrap();
+            let repository = Arc::clone(&owner.lock().await.repository);
+            if !cached_analysis {
+                repository.invalidate().unwrap();
+            }
+
+            // Hold the only blocking worker until demand has captured its repository generation.
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            waiting.await.unwrap();
+            let mut pending = Box::pin(service.demand(input(&snapshot, "sample.txt", 1, "demand")));
+            std::future::poll_fn(|context| {
+                assert!(pending.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            repository.invalidate().unwrap();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+
+            let deferred = pending.await.unwrap();
+            assert_eq!(deferred.state, BodyState::Deferred);
+            assert!(deferred.more);
+            assert!(deferred.snapshot.is_none() && deferred.patch.is_none());
+            assert!(service.refresh(&snapshot.document).await.unwrap().is_none());
+            let loaded = service
+                .demand(input(&snapshot, "sample.txt", 2, "demand"))
+                .await
+                .unwrap();
+            assert_eq!(loaded.state, BodyState::Ready);
+            assert!(!loaded.more);
+            assert_eq!(
+                rows(&loaded.snapshot.unwrap()),
+                vec!["@@ +1 -1", "old", "new"]
+            );
+        }
+    });
+}
+
+/// Keep genuine object-read failures terminal instead of repeatedly demanding the same broken source.
+#[tokio::test]
+async fn corrupt_body_source_remains_a_visible_terminal_failure() {
+    let (directory, service, _, _) = fixture().await;
+    let snapshot = service
+        .open(
+            DocumentId("failed-body".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let owner = service.get(&snapshot.document).unwrap();
+    let (repository, object) = {
+        let document = owner.lock().await;
+        let record = &document.file.values().next().unwrap().record;
+        let forge_git::snapshot::PathState::Tracked { index, .. } = &record.state else {
+            panic!("fixture source must be tracked");
+        };
+        (Arc::clone(&document.repository), index.object.to_string())
+    };
+    let object_path = directory
+        .path()
+        .join(".git/objects")
+        .join(&object[..2])
+        .join(&object[2..]);
+    let original = std::fs::read(&object_path).unwrap();
+    std::fs::remove_file(&object_path).unwrap();
+    std::fs::write(&object_path, b"invalid object").unwrap();
+    repository.invalidate().unwrap();
+
+    let failed = service
+        .demand(input(&snapshot, "sample.txt", 1, "demand"))
+        .await
+        .unwrap();
+    let BodyState::Failed(diagnostic) = &failed.state else {
+        panic!("corrupt content must remain a failure: {:?}", failed.state);
+    };
+    assert!(!failed.more);
+    assert_eq!(
+        rows(failed.snapshot.as_ref().unwrap()),
+        vec![diagnostic.as_str()]
+    );
+    std::fs::write(&object_path, original).unwrap();
+    let retained = service
+        .demand(input(&snapshot, "sample.txt", 2, "demand"))
+        .await
+        .unwrap();
+    assert_eq!(retained.state, failed.state);
+    assert!(!retained.more);
 }
 
 #[tokio::test]

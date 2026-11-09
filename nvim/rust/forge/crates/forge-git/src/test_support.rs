@@ -105,6 +105,33 @@ pub fn set_identity(root: &Path) {
     set_config(root, "user", "email", FIXTURE_EMAIL);
 }
 
+/// Store a local LFS payload and produce its canonical pointer without invoking filters.
+pub fn lfs_pointer(storage: &Path, content: &[u8]) -> (String, std::path::PathBuf) {
+    let identity = forge_diff::source::SourceIdentity::from_bytes(
+        content,
+        forge_diff::source::Representation::DisplayOnly,
+    );
+    let object = identity
+        .content_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let directory = storage
+        .join("objects")
+        .join(&object[..2])
+        .join(&object[2..4]);
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(&object);
+    std::fs::write(&path, content).unwrap();
+    (
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{object}\nsize {}\n",
+            content.len()
+        ),
+        path,
+    )
+}
+
 fn open_index(repository: &gix::Repository) -> gix::index::File {
     let index_path = repository.index_path();
     if index_path.exists() {

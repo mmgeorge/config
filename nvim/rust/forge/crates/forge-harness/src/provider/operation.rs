@@ -386,7 +386,8 @@ pub(super) async fn observe_owned<T>(
         "operation_id": observation.id.as_str(), "operation": operation,
         "scope": observation.target, "binding_id": observation.binding,
         "success": result.is_ok(),
-        "reason": result.as_ref().err().map(|error| super::lifecycle_error::diagnostic(operation, error).kind()),
+        "kind": result.as_ref().err().map(|error| super::lifecycle_error::diagnostic(operation, error).kind()),
+        "terminal_inventory_error": failure.and_then(ProviderFailure::terminal_inventory_error),
         "phase": failure.map(ProviderFailure::phase),
         "disposition": failure.map(ProviderFailure::disposition),
     }));

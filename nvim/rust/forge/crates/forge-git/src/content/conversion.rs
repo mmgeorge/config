@@ -59,6 +59,29 @@ pub(super) struct ConversionSession {
 }
 
 impl ConversionSession {
+    /// Resolve and retain the LFS attribute decision for verification after a display read.
+    pub(super) fn is_lfs(
+        &mut self,
+        local: &gix::Repository,
+        repository: &RepositoryIdentity,
+        path: &RepositoryPath,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let selection = resolve_attributes(
+            local,
+            repository,
+            path,
+            &mut self.cache,
+            self.info.as_deref(),
+            check,
+        )?;
+        self.used
+            .push((path.clone(), attribute_digest(&selection.attribute)?));
+        Ok(
+            matches!(&selection.attribute[FILTER_ATTRIBUTE], State::Value(name) if name.as_ref().as_bstr() == b"lfs".as_bstr()),
+        )
+    }
+
     pub(super) fn new(
         local: &mut gix::Repository,
         repository: &RepositoryIdentity,

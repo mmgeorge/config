@@ -7,6 +7,97 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Keep goal completion and final prose distinct from native settlement, then admit another input.
+#[tokio::test]
+async fn goal_completion_settles_final_response_and_accepts_next_input() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let provider = controller.provider_handle();
+    provider
+        .mock_response_control()
+        .context("mock controls missing")?
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::ToolCall {
+                            name: "goal_complete".into(),
+                            arguments: json!({"summary":"Goal finished"}),
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "Implemented the goal".into(),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("rpc", "goal", 2),
+            &sink,
+        )
+        .await?;
+    let store = SqliteStore::open(&controller.data_root)?;
+    for ordinal in 1..=2 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(exchange) = store.latest_exchange(&session_id)?
+                    && exchange.ordinal == ordinal
+                    && exchange.completed_at_ms().is_some()
+                    && controller.coordinator.execution.available_permits() == 1
+                {
+                    assert_eq!(exchange.state(), crate::exchange::ExchangeState::Complete);
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("completed goal stranded the session")??;
+        assert!(controller.task_controller.current()?.is_none());
+        if ordinal == 1 {
+            service
+                .dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: 3,
+                        method: "session.prompt.submit".into(),
+                        params: json!({"operation_id":"after-goal","text":"Continue after completion"}),
+                    },
+                    &sink,
+                )
+                .await?;
+        }
+    }
+    controller.finish_exchange_owner().await?;
+    reader.abort();
+    let result = reader.await;
+    assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+    Ok(())
+}
+
 /// Exercise the real mock-provider file boundary, immutable submission, and dirty-draft guard.
 #[tokio::test]
 async fn directory_planning_submits_real_files_and_preserves_review_snapshot() -> Result<()> {

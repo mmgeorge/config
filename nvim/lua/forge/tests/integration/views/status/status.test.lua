@@ -1192,6 +1192,50 @@ T["diff_controls"] = function()
   render.close(replica)
 end
 
+T["tab_retries_deferred_body"] = function()
+  local fixture = dofile("nvim/lua/forge/tests/support/status_fixture.lua")
+  local status = require("forge.status")
+  local notices = notify.capture()
+  local state, complete
+  local demand_count = 0
+  MiniTest.finally(function() if state then pcall(status.close, state) end end)
+  status._set_runner_for_test(function(_, params, callback)
+    if params.operation == "open" then callback(fixture.snapshot(params.document))
+    elseif params.operation == "demand" then
+      demand_count = demand_count + 1
+      if demand_count == 1 then
+        callback({ document = params.input.document, file = 1, generation = 1,
+          state = { state = "deferred" }, more = true })
+      else
+        assert(demand_count == 2, "completed body was fetched again")
+        complete = function()
+          callback(fixture.body(params.input.document, { "@@ -1 +1 @@", "old", "new" }))
+        end
+      end
+    elseif params.operation == "refresh" or params.operation == "close_view" then callback(nil)
+    elseif params.operation == "close" then callback({ closed = true })
+    else error("unexpected Status request: " .. vim.inspect(params)) end
+  end)
+  state = status.open({ workspace = vim.fn.getcwd() })
+  wait_until(function() return state.ready and not state.request_active end, "Status did not open")
+  local _, row = state.replica.sequence:position("file:1")
+  vim.api.nvim_win_set_cursor(0, { row + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  keymap.invoke("<Tab>")
+  wait_until(function() return complete ~= nil end, "Tab did not retry the deferred body")
+  assert(state.replica.file[1].body == nil, "deferred read published an incomplete body")
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(0), cursor)
+  complete()
+  wait_until(function()
+    return state.done[1] and not state.pending and not state.request_active
+  end, "retried body did not settle")
+  MiniTest.expect.equality(demand_count, 2)
+  assert(state.replica.file[1].body, "retry did not publish the body")
+  assert(not require("forge.nodes").closed(state.replica, "file:1"), "retry lost the Tab expansion")
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(0), cursor)
+  notices:assert_none()
+end
+
 T["status"] = function()
   local root = vim.fs.normalize(vim.fn.getcwd())
   local phase_file = vim.fn.tempname() .. ".status-host-phase.log"

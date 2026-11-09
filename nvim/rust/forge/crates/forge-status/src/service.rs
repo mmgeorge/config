@@ -670,6 +670,7 @@ impl StatusService {
         }
     }
 
+    /// Load a file body, deferring invalidated reads to the next demand without caching a failure.
     pub async fn demand(&self, mut input: StatusInput) -> Result<BodyDelivery> {
         let mut syntax_diagnostic = None;
         let owner = self.get(&input.document)?;
@@ -767,6 +768,9 @@ impl StatusService {
                     file.new_syntax = new_syntax;
                     file.context_requested = true;
                     syntax_diagnostic = diagnostic;
+                }
+                Err(error) if forge_git::repository::transient_observation_failure(&error) => {
+                    file.projection = crate::document::SourceProjection::Deferred;
                 }
                 Err(error) => {
                     file.projection = if error
@@ -885,6 +889,28 @@ impl StatusService {
         );
         let selected = selected_files(&document, &input, selection.as_ref(), &target)?;
         let mut selected: Vec<_> = selected.into_iter().collect();
+        if input.action == "discard" {
+            let repository = Arc::clone(&document.repository);
+            let sources = selected
+                .iter()
+                .map(|(id, _)| {
+                    let file = &document.file[id];
+                    (
+                        file.record.path.clone(),
+                        file.projection.analysis().cloned(),
+                    )
+                })
+                .collect();
+            drop(document);
+            crate::source::ensure_writable(&self.store, &repository, sources).await?;
+            document = owner.lock().await;
+            document._admission.check()?;
+            ensure!(
+                document.revision == input.revision
+                    && document.input.get(&input.view) == Some(&input.sequence),
+                "discard input changed while checking LFS attributes"
+            );
+        }
         selected.sort_by(|(left, _), (right, _)| {
             document.file[left]
                 .record
@@ -1343,7 +1369,10 @@ impl StatusService {
             patch: None,
             snapshot: file.body.as_ref().map(|body| body.snapshot()),
             state: file.projection.state().clone(),
-            more: matches!(file.projection.state(), BodyState::Partial),
+            more: matches!(
+                file.projection.state(),
+                BodyState::Deferred | BodyState::Partial
+            ),
             syntax_diagnostic: None,
         })
     }
@@ -1431,7 +1460,7 @@ impl StatusService {
             .await?
         };
         let (old_syntax, new_syntax, diagnostic) =
-            if let Some(language) = crate::source::language(&record.path) {
+            if let Some(language) = crate::source::diff_language(&record.path, Some(&analysis)) {
                 let ((old_syntax, old_diagnostic), (new_syntax, new_diagnostic)) = tokio::join!(
                     optional_syntax(
                         &self.syntax,
@@ -1503,7 +1532,10 @@ fn body_delivery(
         snapshot,
         patch: if first { None } else { patch },
         state: file.projection.state().clone(),
-        more: matches!(file.projection.state(), BodyState::Partial),
+        more: matches!(
+            file.projection.state(),
+            BodyState::Deferred | BodyState::Partial
+        ),
         syntax_diagnostic: None,
     })
 }

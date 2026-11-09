@@ -18,6 +18,7 @@ use crate::{
 
 mod batch;
 pub(crate) mod conversion;
+mod lfs;
 pub(crate) use batch::ContentBatch;
 pub use conversion::ConversionIdentity;
 
@@ -71,6 +72,17 @@ pub enum ContentSource {
         conversion: WorktreeConversion,
     },
     Supplied(SourceVersion),
+}
+
+impl ContentSource {
+    /// Account for retained source inputs before admitting a native read.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Object(_) => 0,
+            Self::IndexStage { path, .. } | Self::Worktree { path, .. } => path.retained_bytes(),
+            Self::Supplied(source) => source.retained_bytes(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -173,14 +185,9 @@ impl RepositoryState {
         request: ContentRequest,
         retain_identity: bool,
     ) -> Result<RepositoryRead<ContentAcquisition>> {
-        let retained = match &request.source {
-            ContentSource::Object(_) => 0,
-            ContentSource::IndexStage { path, .. } | ContentSource::Worktree { path, .. } => {
-                path.retained_bytes()
-            }
-            ContentSource::Supplied(source) => source.retained_bytes(),
-        };
-        let input_bytes = retained
+        let input_bytes = request
+            .source
+            .retained_bytes()
             .checked_add(size_of::<ContentRequest>())
             .context("content request accounting overflow")?;
         let worker = Arc::clone(self);

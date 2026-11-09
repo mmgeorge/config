@@ -66,6 +66,7 @@ struct Fixture {
     client: CopilotClient,
     peer: test_peer::SdkPeer,
     callbacks: Arc<Callbacks>,
+    tasks: Arc<std::sync::Mutex<Vec<Value>>>,
     _events: forge_provider_api::events::ProviderEventStream,
 }
 
@@ -83,9 +84,11 @@ impl Fixture {
         defer_create: bool,
     ) -> Self {
         let mut pending_create = None;
-        let mut tasks = Vec::<Value>::new();
+        let tasks = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let native_tasks = tasks.clone();
         let mut pending = None;
         let (native, peer) = test_peer::client(move |request| {
+            let mut tasks = native_tasks.lock().unwrap();
             let method = request["method"].as_str().unwrap();
             let result = match method {
                 "mcp.discover" => json!({"servers":[{
@@ -162,7 +165,7 @@ impl Fixture {
                         ),
                     ];
                 }
-                "session.tasks.list" => json!({"tasks":tasks}),
+                "session.tasks.list" => json!({"tasks":*tasks}),
                 "session.tasks.cancel" => {
                     tasks.retain(|task| task["id"] != request["params"]["id"]);
                     json!({"cancelled":true})
@@ -198,6 +201,7 @@ impl Fixture {
             client,
             peer,
             callbacks,
+            tasks,
             _events: events,
         }
     }
@@ -207,6 +211,76 @@ impl Fixture {
         self.shell.close().await.unwrap();
         self.client.stop().await.unwrap();
         self.peer.collected().await
+    }
+}
+
+/// Collect a native shell even when its task row no longer carries presentation metadata.
+#[tokio::test]
+async fn cleanup_does_not_require_command_metadata() {
+    let fixture = Fixture::new(PermissionResponse::Allow, false, false).await;
+    fixture
+        .shell
+        .execute(
+            "outer-call",
+            command_tool(),
+            json!({"command":"fixture command","description":"fixture","mode":"async"}),
+        )
+        .await
+        .unwrap();
+    let task_id = {
+        let mut tasks = fixture.tasks.lock().unwrap();
+        tasks[0].as_object_mut().unwrap().remove("command");
+        tasks[0]["id"].clone()
+    };
+    let requests = fixture.finish().await;
+    let cancellation = requests
+        .iter()
+        .position(|request| {
+            request["method"] == "session.tasks.cancel" && request["params"]["id"] == task_id
+        })
+        .unwrap();
+    let detach = requests
+        .iter()
+        .position(|request| request["method"] == "session.detach")
+        .unwrap();
+    assert!(cancellation < detach);
+    assert!(
+        requests[cancellation + 1..detach]
+            .iter()
+            .any(|request| request["method"] == "session.tasks.list"),
+        "collection must reobserve task absence before detaching"
+    );
+}
+
+/// Retain failed collection until a live task has a cancellable identity.
+#[tokio::test]
+async fn cleanup_reports_missing_identity_and_can_retry() {
+    for (identity, expected) in [
+        (None, "terminal identity is missing"),
+        (Some(" \t"), "terminal identity is invalid"),
+    ] {
+        let fixture = Fixture::new(PermissionResponse::Allow, false, false).await;
+        fixture
+            .shell
+            .execute(
+                "outer-call",
+                command_tool(),
+                json!({"command":"fixture command","description":"fixture","mode":"async"}),
+            )
+            .await
+            .unwrap();
+        let task_id = fixture.tasks.lock().unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("id")
+            .unwrap();
+        if let Some(identity) = identity {
+            fixture.tasks.lock().unwrap()[0]["id"] = json!(identity);
+        }
+        let error = fixture.shell.close().await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        fixture.tasks.lock().unwrap()[0]["id"] = task_id;
+        fixture.finish().await;
     }
 }
 

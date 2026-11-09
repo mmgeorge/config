@@ -16,6 +16,10 @@ winbar and picker teardown cannot remove the Status mount.
 
 Expanding a file sends its handle through `StatusInput`. Rust acquires the source lazily and returns `BodyDelivery`, with a first body snapshot followed by patches under the body's own document identity. Initial demand waits for Tree-sitter analysis, so syntax arrives with the first chunk, and a parse failure returns the plain diff with a diagnostic.
 
+LFS-marked files use locally resolved text payloads rather than canonical pointers. Status bypasses cached pointer comparisons, skips syntax parsing and semantic declaration grouping, and keeps those diffs read-only. Stage, unstage, and discard reject LFS selections before publishing predicted edits, including collapsed files and selections spanning ordinary and LFS files. Missing or invalid payloads remain visible diagnostics; loading a diff never downloads content.
+
+Repository invalidation during content acquisition or cached-analysis validation leaves the body deferred, not failed. Its delivery requests another demand without publishing an error body, so Lua retains the pending expansion and retries while the file remains requested. An unchanged-source refresh preserves that retryable state. Non-transient read failures and unsupported sources remain terminal diagnostics rather than automatic retry loops.
+
 Display grouping merges adjacent hunks whose scopes are equal or nested and whose padded windows are at most six lines apart. Each group keeps the union of its raw hunk identities, so actions on bridge context stage exactly those edits. Omitted ranges render an `...` row with no source coordinate or mutation target.
 
 ## Refresh

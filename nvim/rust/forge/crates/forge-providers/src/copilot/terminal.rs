@@ -1,5 +1,6 @@
 use super::event_stream;
 use anyhow::Context;
+use forge_provider_api::ProviderError;
 use std::sync::Arc;
 
 /// Identify the independently owned native inventories contributing to one binding.
@@ -299,14 +300,26 @@ impl CopilotTerminalMonitor {
                             .list()
                             .await
                             .context("list Copilot background terminals")?;
-                        crate::terminal::parse_snapshot(&serde_json::to_value(result)?, true)
+                        Ok(
+                            crate::terminal::parse_snapshot(&serde_json::to_value(result)?, true)
+                                .map_err(|error| {
+                                ProviderError::from(
+                                    forge_provider_api::ProviderFailure::terminal_inventory(
+                                        forge_provider_api::ProviderOperation::TerminalList,
+                                        error,
+                                    ),
+                                )
+                            })?,
+                        )
                     }
                     .await
-                    .map_err(|_: anyhow::Error| {
-                        native_failure(
-                            forge_provider_api::ProviderOperation::TerminalList,
-                            forge_provider_api::ProviderFailureKind::Runtime,
-                        )
+                    .map_err(|error: anyhow::Error| {
+                        error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                            native_failure(
+                                forge_provider_api::ProviderOperation::TerminalList,
+                                forge_provider_api::ProviderFailureKind::Runtime,
+                            )
+                        })
                     });
                     first = false;
                     let result = match result {

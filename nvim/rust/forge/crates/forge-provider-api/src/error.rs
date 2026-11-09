@@ -137,7 +137,8 @@ pub enum FailureDisposition {
 }
 
 /// Own a safe normalized cause, actual requested operation, lifecycle phase, and effect disposition.
-/// This value excludes native payloads and diagnostics. Reattributing an operation must preserve
+/// This value excludes native payloads and retains only normalized diagnostic fields.
+/// Reattributing an operation must preserve
 /// the cause, phase, and effects; independent cleanup causes retain their own operation tags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ProviderFailure {
@@ -145,6 +146,8 @@ pub struct ProviderFailure {
     kind: ProviderFailureKind,
     phase: ProviderPhase,
     disposition: FailureDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_inventory_error: Option<crate::terminal::TerminalInventoryError>,
 }
 
 impl ProviderFailure {
@@ -157,6 +160,18 @@ impl ProviderFailure {
             kind,
             phase: ProviderPhase::Admission,
             disposition: FailureDisposition::Unchanged,
+            terminal_inventory_error: None,
+        }
+    }
+
+    /// Classify malformed terminal evidence while retaining only its normalized field failure.
+    pub const fn terminal_inventory(
+        operation: ProviderOperation,
+        error: crate::terminal::TerminalInventoryError,
+    ) -> Self {
+        Self {
+            terminal_inventory_error: Some(error),
+            ..Self::new(operation, ProviderFailureKind::Protocol)
         }
     }
 
@@ -190,6 +205,11 @@ impl ProviderFailure {
     pub const fn kind(self) -> ProviderFailureKind {
         self.kind
     }
+
+    /// Get the normalized terminal field failure, without any native field value.
+    pub const fn terminal_inventory_error(self) -> Option<crate::terminal::TerminalInventoryError> {
+        self.terminal_inventory_error
+    }
 }
 
 impl std::fmt::Display for ProviderFailure {
@@ -209,11 +229,21 @@ impl std::fmt::Display for ProviderFailure {
             formatter,
             "provider {:?} failed: {:?}",
             self.operation, self.kind
-        )
+        )?;
+        if let Some(error) = self.terminal_inventory_error {
+            write!(formatter, ": {error}")?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for ProviderFailure {}
+impl std::error::Error for ProviderFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.terminal_inventory_error
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl From<ProviderFailure> for ProviderError {
     fn from(failure: ProviderFailure) -> Self {
@@ -336,6 +366,9 @@ impl std::fmt::Display for ObservationCleanup {
             "provider observation failed: {}",
             self.observation
         )?;
+        if let Some(origin) = &self.origin {
+            write!(formatter, "; origin: {origin}")?;
+        }
         for (phase, errors) in [
             ("fencing", &self.fencing),
             ("cancellation", &self.cancellation),
@@ -553,5 +586,43 @@ impl From<crate::session::RecoveryTokenError> for ProviderError {
 impl From<TurnCancelled> for ProviderError {
     fn from(_error: TurnCancelled) -> Self {
         Self::Cancelled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preserve the original failure alongside independently failed collection in UI diagnostics.
+    #[test]
+    fn cleanup_display_preserves_origin_and_inventory_failure() {
+        let origin =
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Runtime)
+                .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain);
+        let collection = ProviderFailure::terminal_inventory(
+            ProviderOperation::ThreadClose,
+            crate::terminal::TerminalInventoryError::MissingIdentity,
+        )
+        .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated);
+        let retained: ProviderFailure =
+            serde_json::from_value(serde_json::to_value(collection).unwrap()).unwrap();
+        let report = ObservationCleanup::new(
+            crate::lifecycle::ObservationFailure::LifecycleUnavailable,
+            None,
+            None,
+            Some(CleanupFailure::Failed(Box::new(retained.into()))),
+        )
+        .with_origin(origin.into());
+        let message = report.to_string();
+        assert!(
+            message.contains("origin: provider TurnStart failed: Runtime"),
+            "{message}"
+        );
+        assert!(
+            message.contains("collection: provider ThreadClose failed: Protocol: background terminal identity is missing"),
+            "{message}"
+        );
+        assert!(!report.collected());
+        assert_eq!(report.origin().unwrap().to_string(), origin.to_string());
     }
 }

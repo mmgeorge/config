@@ -465,13 +465,13 @@ impl ShellSession {
                 let mut task_failures = Vec::new();
                 match native_tasks(&shell).await {
                     Ok(tasks) => {
-                        for terminal in tasks {
+                        for id in tasks {
                             if shell
                                 .session
                                 .rpc()
                                 .tasks()
                                 .cancel(github_copilot_sdk::rpc::TasksCancelRequest {
-                                    id: terminal.id.as_str().to_owned(),
+                                    id: id.as_str().to_owned(),
                                 })
                                 .await
                                 .is_err()
@@ -1040,10 +1040,10 @@ impl ShellSession {
             })?,
             true,
         )
-        .map_err(|_| {
-            failure(
+        .map_err(|error| {
+            forge_provider_api::ProviderFailure::terminal_inventory(
                 ProviderOperation::TerminalList,
-                ProviderFailureKind::Protocol,
+                error,
             )
         })?;
         let handles = self.handles.lock().await;
@@ -1246,39 +1246,36 @@ async fn open(
 }
 
 /// Read authoritative live native tasks for collection without relying on a presentation cache.
-async fn native_tasks(shell: &PausedShell) -> Result<Vec<BackgroundTerminal>, ProviderError> {
+async fn native_tasks(shell: &PausedShell) -> Result<Vec<TerminalId>, ProviderError> {
     let tasks = shell.session.rpc().tasks().list().await.map_err(|_| {
         failure(
             ProviderOperation::ThreadClose,
             ProviderFailureKind::Transport,
         )
     })?;
-    let tasks = serde_json::to_value(tasks).map_err(|_| {
-        failure(
+    crate::terminal::copilot_task_identities(&tasks.tasks).map_err(|error| {
+        forge_provider_api::ProviderFailure::terminal_inventory(
             ProviderOperation::ThreadClose,
-            ProviderFailureKind::Protocol,
+            error,
         )
-    })?;
-    crate::terminal::parse_snapshot(&tasks, true)
-        .map(|snapshot| snapshot.terminal)
-        .map_err(|_| {
-            failure(
-                ProviderOperation::ThreadClose,
-                ProviderFailureKind::Protocol,
-            )
-        })
+        .at_phase(
+            forge_provider_api::ProviderPhase::Collection,
+            forge_provider_api::FailureDisposition::Invalidated,
+        )
+        .into()
+    })
 }
 
 /// Collect every currently visible task and require a fresh absence proof after cancellation.
 async fn collect_native_tasks(shell: &PausedShell) -> Result<(), ProviderError> {
     let mut failures = Vec::new();
-    for terminal in native_tasks(shell).await? {
+    for id in native_tasks(shell).await? {
         if shell
             .session
             .rpc()
             .tasks()
             .cancel(github_copilot_sdk::rpc::TasksCancelRequest {
-                id: terminal.id.as_str().to_owned(),
+                id: id.as_str().to_owned(),
             })
             .await
             .is_err()

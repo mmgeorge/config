@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use forge_diff::{
     body::BodyKind,
     source::{Representation, SourcePair, SourceVersion},
@@ -72,6 +72,7 @@ fn selection(record: &PathRecord, section: StatusSection) -> Result<SourceSelect
     Ok(SourceSelection { old, new, kind })
 }
 
+/// Compare expanded LFS display content or reuse verified canonical analysis for ordinary files.
 pub(crate) async fn analysis(
     store: &RepositoryStore,
     repository: &Arc<RepositoryState>,
@@ -80,6 +81,21 @@ pub(crate) async fn analysis(
     prepared: Option<&forge_git::snapshot::PreparedAnalysis>,
     diff: &Arc<forge_diff::engine::DiffEngine>,
 ) -> Result<(forge_diff::cache::AnalysisHandle, BodyKind)> {
+    let selected = selection(record, section)?;
+    if let Some(source) = repository
+        .lfs_diff_sources(store, record.path.clone(), [selected.old, selected.new])
+        .await?
+        .value
+    {
+        let analysis = diff
+            .compare(forge_diff::engine::DiffRequest {
+                source,
+                priority: forge_diff::workers::WorkPriority::Visible,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("LFS diff unavailable: {error:?}"))?;
+        return Ok((analysis, selected.kind));
+    }
     if let Some(prepared) = prepared
         && let Some(analysis) = prepared.load(repository, store).await?
     {
@@ -157,4 +173,54 @@ pub(crate) async fn acquire(
 
 pub(crate) fn language(path: &forge_git::RepositoryPath) -> Option<SyntaxLanguage> {
     SyntaxLanguage::for_path(&path.display_label())
+}
+
+/// Select syntax only for complete editable sources, never expanded LFS display content.
+pub(crate) fn diff_language(
+    path: &forge_git::RepositoryPath,
+    analysis: Option<&forge_diff::cache::AnalysisHandle>,
+) -> Option<SyntaxLanguage> {
+    let source = analysis?.source();
+    if source.old.identity().representation == Representation::DisplayOnly
+        || source.new.identity().representation == Representation::DisplayOnly
+    {
+        return None;
+    }
+    language(path)
+}
+
+/// Reject LFS mutations before publication, including collapsed files and stale display analyses.
+pub(crate) async fn ensure_writable(
+    store: &RepositoryStore,
+    repository: &Arc<RepositoryState>,
+    selected: Vec<(
+        forge_git::RepositoryPath,
+        Option<forge_diff::cache::AnalysisHandle>,
+    )>,
+) -> Result<()> {
+    for (path, analysis) in &selected {
+        if let Some(analysis) = analysis {
+            let source = analysis.source();
+            ensure!(
+                source.old.identity().representation != Representation::DisplayOnly
+                    && source.new.identity().representation != Representation::DisplayOnly,
+                "LFS diffs are read-only: {}",
+                path.display_label()
+            );
+        }
+    }
+    let paths = repository
+        .lfs_paths(store, selected.into_iter().map(|(path, _)| path).collect())
+        .await?
+        .value;
+    ensure!(
+        paths.is_empty(),
+        "LFS diffs are read-only: {}",
+        paths
+            .iter()
+            .map(|path| path.display_label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
 }

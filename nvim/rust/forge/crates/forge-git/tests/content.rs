@@ -13,6 +13,180 @@ use forge_git::{
 };
 use support::{commit_index, init_repository, resolve_revision, set_config, stage, stage_conflict};
 
+/// Resolve both pointer sides and pointer-only worktrees while leaving canonical Git reads intact.
+#[tokio::test]
+async fn local_lfs_diff_uses_shared_and_configured_storage_without_filters() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    init_repository(root);
+    fs::write(root.join(".gitattributes"), "*.ts filter=lfs -text\n").unwrap();
+    let (old, _) = support::lfs_pointer(&root.join(".git/lfs"), b"const value = 1;\n");
+    let (new, _) = support::lfs_pointer(&root.join(".git/lfs"), b"const value = 2;\n");
+    fs::write(root.join("source.ts"), &old).unwrap();
+    stage(root, &[".gitattributes", "source.ts"]);
+    let commit = commit_index(root, "LFS source");
+    let old_object = resolve_revision(root, "HEAD:source.ts");
+    let linked = root.join("linked");
+    support::add_detached_worktree(root, &linked, commit);
+    set_config(
+        root,
+        "filter \"lfs\"",
+        "process",
+        "forge-test-filter-must-not-run",
+    );
+    set_config(root, "filter \"lfs\"", "required", "true");
+    fs::write(linked.join("source.ts"), &new).unwrap();
+    stage(&linked, &["source.ts"]);
+    let store = RepositoryStore::default();
+    let repository = store.open(linked.clone()).await.unwrap().unwrap();
+    for configured in [false, true] {
+        if configured {
+            fs::rename(root.join(".git/lfs"), root.join(".git/custom-lfs")).unwrap();
+            set_config(root, "lfs", "storage", "custom-lfs");
+        }
+        for current in [
+            ContentSource::IndexStage {
+                path: path("source.ts"),
+                stage: IndexStage::Normal,
+            },
+            ContentSource::Worktree {
+                path: path("source.ts"),
+                conversion: forge_git::content::WorktreeConversion::GitCanonical,
+            },
+        ] {
+            let source = repository
+                .lfs_diff_sources(
+                    &store,
+                    path("source.ts"),
+                    [Some(ContentSource::Object(old_object)), Some(current)],
+                )
+                .await
+                .unwrap()
+                .value
+                .unwrap();
+            assert_eq!(source.old.text(), "const value = 1;\n");
+            assert_eq!(source.new.text(), "const value = 2;\n");
+            assert_eq!(
+                source.old.identity().representation,
+                Representation::DisplayOnly
+            );
+            assert_eq!(
+                source.new.identity().representation,
+                Representation::DisplayOnly
+            );
+        }
+    }
+    let canonical = ready(
+        repository
+            .content(&store, request(ContentSource::Object(old_object)))
+            .await
+            .unwrap()
+            .value,
+    );
+    assert_eq!(canonical.source.text(), old);
+    assert_eq!(
+        canonical.source.identity().representation,
+        Representation::GitCanonical
+    );
+    let canonical_worktree = repository
+        .content(
+            &store,
+            request(ContentSource::Worktree {
+                path: path("source.ts"),
+                conversion: forge_git::content::WorktreeConversion::GitCanonical,
+            }),
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(matches!(
+        canonical_worktree,
+        ContentResult::Unavailable(ContentUnavailable::ExternalFilter)
+    ));
+    assert!(
+        repository
+            .lfs_diff_sources(&store, path("normal.txt"), [None, None])
+            .await
+            .unwrap()
+            .value
+            .is_none()
+    );
+}
+
+/// Report missing, corrupt, binary, and malformed LFS inputs rather than rendering pointer text.
+#[tokio::test]
+async fn local_lfs_diff_reports_unavailable_and_invalid_payloads() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let local = init_repository(root);
+    fs::write(root.join(".gitattributes"), "*.ts filter=lfs -text\n").unwrap();
+    set_config(
+        root,
+        "filter \"lfs\"",
+        "process",
+        "forge-test-filter-must-not-run",
+    );
+    let store = RepositoryStore::default();
+    let repository = store.open(root.to_owned()).await.unwrap().unwrap();
+    for (scenario, diagnostic) in [
+        ("missing", "LFS content not downloaded"),
+        ("hash", "SHA-256 mismatch"),
+        ("size", "size mismatch"),
+        ("binary", "binary NUL"),
+        ("encoding", "not valid UTF-8"),
+        ("pointer", "invalid LFS SHA-256"),
+        ("extension", "unsupported LFS extensions"),
+    ] {
+        let payload = match scenario {
+            "binary" => b"a\0b".as_slice(),
+            "encoding" => b"a\xffb".as_slice(),
+            _ => b"old".as_slice(),
+        };
+        let (mut pointer, object_path) = support::lfs_pointer(&root.join(".git/lfs"), payload);
+        match scenario {
+            "missing" => fs::remove_file(object_path).unwrap(),
+            "hash" => fs::write(object_path, b"bad").unwrap(),
+            "size" => fs::write(object_path, b"too long").unwrap(),
+            "pointer" => {
+                pointer =
+                    "version https://git-lfs.github.com/spec/v1\noid sha256:../../escape\nsize 3\n"
+                        .into()
+            }
+            "extension" => {
+                pointer = pointer.replacen("\noid ", "\next-0-custom sha256:unused\noid ", 1)
+            }
+            _ => {}
+        }
+        let object = local.write_blob(pointer.as_bytes()).unwrap().detach();
+        let error = repository
+            .lfs_diff_sources(
+                &store,
+                path("source.ts"),
+                [Some(ContentSource::Object(object)), None],
+            )
+            .await
+            .err()
+            .expect("invalid LFS content must fail");
+        assert!(
+            format!("{error:#}").contains(diagnostic),
+            "{scenario}: {error:#}"
+        );
+    }
+    let (empty, _) = support::lfs_pointer(&root.join(".git/lfs"), b"");
+    let object = local.write_blob(empty.as_bytes()).unwrap().detach();
+    let source = repository
+        .lfs_diff_sources(
+            &store,
+            path("source.ts"),
+            [None, Some(ContentSource::Object(object))],
+        )
+        .await
+        .unwrap()
+        .value
+        .unwrap();
+    assert!(source.old.text().is_empty() && source.new.text().is_empty());
+}
+
 #[tokio::test]
 async fn staged_unstaged_and_head_sources_remain_distinct() {
     let fixture = tempfile::tempdir().unwrap();

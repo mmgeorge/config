@@ -695,6 +695,18 @@ impl StatusService {
         } else {
             version.select(&input.location, &mut selected)?;
         }
+        crate::source::ensure_writable(
+            &self.store,
+            &repository,
+            selected
+                .keys()
+                .map(|id| {
+                    let source = &version.file[id];
+                    (source.observed.change.path.clone(), source.analysis.clone())
+                })
+                .collect(),
+        )
+        .await?;
         for (id, selected) in &selected {
             if selected.requires_comparison(version.visibility) {
                 version
@@ -1307,7 +1319,7 @@ impl StatusService {
                 continue;
             }
             let (Some(language), Some(analysis)) = (
-                crate::source::language(&file.record.path),
+                crate::source::diff_language(&file.record.path, file.projection.analysis()),
                 file.projection.analysis().cloned(),
             ) else {
                 continue;

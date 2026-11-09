@@ -44,6 +44,12 @@ size. Follow `next_cursor` with the same arguments to read older records; the
 reader excludes later appends. The response byte budget does not split log pages
 or large entries. The first request reads only its batch, not the entire retained log.
 
+Provider cleanup errors show the retained original cause separately from cleanup
+failures when available. Terminal protocol errors identify missing or invalid
+inventory fields without exposing command text. A failed cleanup still blocks
+provider restart until collection succeeds; these diagnostics do not authorize
+replaying an uncertain prompt.
+
 ## Git review
 
 | Command | Arguments | Behavior |
@@ -65,6 +71,12 @@ Git actions continue to use native file identities and repository paths.
 
 Unfolding an unloaded file keeps its heading visible until the first diff chunk has
 syntax colors and hunk context. A syntax failure reports the error and still shows the diff.
+
+Text LFS files show read-only line diffs without syntax highlighting or semantic
+declaration grouping. Forge resolves pointers from local LFS storage and supports
+UTF-8 content without NUL bytes; it does not download missing objects. Missing or
+corrupt objects and unsupported content produce diagnostics. Stage, unstage, and
+discard reject selections containing LFS files.
 
 Completed stage and unstage actions invalidate the native Git index cache before
 settlement. Files retain their settled section even when the replacement index has

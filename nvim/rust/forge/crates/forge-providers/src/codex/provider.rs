@@ -4463,10 +4463,10 @@ async fn read_binding_terminals(
                     ProviderOperation::TerminalList,
                 )
                 .await?;
-            let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|_| {
-                failure(
+            let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|error| {
+                forge_provider_api::ProviderFailure::terminal_inventory(
                     ProviderOperation::TerminalList,
-                    ProviderFailureKind::Protocol,
+                    error,
                 )
             })?;
             for mut row in parsed.terminal {

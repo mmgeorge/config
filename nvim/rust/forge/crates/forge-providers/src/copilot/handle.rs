@@ -299,6 +299,24 @@ impl CopilotSession {
     pub async fn terminal_snapshot(
         &self,
     ) -> Result<forge_provider_api::terminal::TerminalInventory, ProviderError> {
+        let tasks = self.native_terminal_tasks().await?;
+        let encoded = serde_json::to_value(tasks).map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::TerminalList,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            )
+        })?;
+        let inventory = crate::terminal::parse_snapshot(&encoded, true).map_err(|error| {
+            forge_provider_api::ProviderFailure::terminal_inventory(
+                forge_provider_api::ProviderOperation::TerminalList,
+                error,
+            )
+        })?;
+        Ok(inventory)
+    }
+
+    /// Refresh native liveness before reading task rows for display or cancellation.
+    async fn native_terminal_tasks(&self) -> Result<TaskList, ProviderError> {
         self.ensure_healthy()?;
         self.inner.rpc().tasks().refresh().await.map_err(|_| {
             native_failure(
@@ -306,31 +324,26 @@ impl CopilotSession {
                 forge_provider_api::ProviderFailureKind::Transport,
             )
         })?;
-        let tasks = self.inner.rpc().tasks().list().await.map_err(|_| {
+        self.inner.rpc().tasks().list().await.map_err(|_| {
             native_failure(
                 forge_provider_api::ProviderOperation::TerminalList,
                 forge_provider_api::ProviderFailureKind::Transport,
             )
-        })?;
-        let encoded = serde_json::to_value(tasks).map_err(|_| {
-            native_failure(
-                forge_provider_api::ProviderOperation::TerminalList,
-                forge_provider_api::ProviderFailureKind::Protocol,
-            )
-        })?;
-        let inventory = crate::terminal::parse_snapshot(&encoded, true).map_err(|_| {
-            native_failure(
-                forge_provider_api::ProviderOperation::TerminalList,
-                forge_provider_api::ProviderFailureKind::Protocol,
-            )
-        })?;
-        Ok(inventory)
+        })
     }
 
     /// Stop every detached shell before closing the entire binding.
     pub async fn terminate_all(&self) -> Result<(), ProviderError> {
-        for terminal in self.terminal_snapshot().await?.terminal {
-            self.terminate_terminal(terminal.id.as_str()).await?;
+        let tasks = self.native_terminal_tasks().await?;
+        let identities =
+            crate::terminal::copilot_task_identities(&tasks.tasks).map_err(|error| {
+                forge_provider_api::ProviderFailure::terminal_inventory(
+                    forge_provider_api::ProviderOperation::TerminalTerminate,
+                    error,
+                )
+            })?;
+        for id in identities {
+            self.terminate_terminal(id.as_str()).await?;
         }
         Ok(())
     }
@@ -586,15 +599,16 @@ impl CopilotSession {
     }
     pub async fn terminate_terminal(&self, id: &str) -> Result<(), ProviderError> {
         let result: Result<()> = async {
-            self.inner.rpc().tasks().refresh().await?;
-            let inventory = self.inner.rpc().tasks().list().await?;
-            let inventory =
-                crate::terminal::parse_snapshot(&serde_json::to_value(inventory)?, true)?;
+            let inventory = self.native_terminal_tasks().await?;
+            let identities =
+                crate::terminal::copilot_task_identities(&inventory.tasks).map_err(|error| {
+                    ProviderError::from(forge_provider_api::ProviderFailure::terminal_inventory(
+                        forge_provider_api::ProviderOperation::TerminalTerminate,
+                        error,
+                    ))
+                })?;
             anyhow::ensure!(
-                inventory
-                    .terminal
-                    .iter()
-                    .any(|terminal| terminal.id.as_str() == id),
+                identities.iter().any(|terminal| terminal.as_str() == id),
                 "Background terminal is no longer running"
             );
             super::operation::dispatch_for(
