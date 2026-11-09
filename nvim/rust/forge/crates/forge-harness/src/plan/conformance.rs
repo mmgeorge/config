@@ -42,8 +42,10 @@ pub(crate) fn contract(
 ) -> Result<DeclarationContract> {
     let mut contract =
         DeclarationContract::parse(path, overview).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let mut design = super::DeclarationDesign::default();
-    design.proposed.insert(path.into(), overview.into());
+    let design = super::DeclarationDesign::scratch(std::collections::BTreeMap::from([(
+        path.to_owned(),
+        overview.to_owned(),
+    )]))?;
     let exposed = crate::declaration::exposure::symbols(workspace, &design)?;
     let positions = exposed
         .into_iter()

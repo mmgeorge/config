@@ -47,6 +47,7 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
         .design
         .as_ref()
         .context("review feedback requires a declaration design")?;
+    let parsed = design.parsed()?;
     let mut files = BTreeMap::<String, FeedbackFile>::new();
     let mut general = BTreeSet::new();
     for (index, comment) in annotation.iter().enumerate() {
@@ -57,7 +58,7 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                 } => (path, side == "baseline", *line),
                 PlanReviewTarget::Call { path, side, .. }
                 | PlanReviewTarget::Behavior { path, side, .. } => (path, side == "baseline", 0),
-                PlanReviewTarget::File { path } => (path, !design.proposed.contains_key(path), 0),
+                PlanReviewTarget::File { path } => (path, !parsed.proposed.contains_key(path), 0),
                 _ => {
                     general.insert(index);
                     continue;
@@ -81,12 +82,12 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
             let text = if baseline {
                 design.baseline.get(path).map(|file| &file.text)
             } else {
-                design.proposed.get(path)
+                parsed.proposed.get(path)
             };
             let calls = if baseline {
                 &design.baseline_calls
             } else {
-                &design.proposed_calls
+                &parsed.proposed_calls
             };
             let line = if let Some(text) = text {
                 let presentation = super::calls::insert(
@@ -157,14 +158,14 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
             })
             .transpose()?
             .unwrap_or_default();
-        let after = design
+        let after = parsed
             .proposed
             .get(&file.proposed)
             .map(|text| {
                 super::calls::combined(
                     &file.proposed,
                     text,
-                    design
+                    parsed
                         .proposed_calls
                         .get(&file.proposed)
                         .map(Vec::as_slice)

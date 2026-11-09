@@ -388,12 +388,18 @@ impl DeclarationResolver {
                 .map(|(path, file)| (path.clone(), file.text.clone()))
                 .collect()
         } else {
-            design.proposed.clone()
+            design.parsed()?.proposed.clone()
         };
         let workspace_files: HashSet<String> = design
             .baseline
             .keys()
-            .chain(design.proposed.keys())
+            .chain(design.proposed_source.keys())
+            .chain(
+                design
+                    .parsed
+                    .iter()
+                    .flat_map(|parsed| parsed.proposed.keys()),
+            )
             .cloned()
             .collect();
         let changed = design.changed_paths().into_iter().collect();
@@ -680,7 +686,8 @@ impl DeclarationResolver {
     }
 
     /// Validate imports and signature references only in proposed changed files.
-    pub(crate) fn validate(&mut self, design: &DeclarationDesign) -> DeclarationValidation {
+    pub(crate) fn validate(&mut self, design: &DeclarationDesign) -> Result<DeclarationValidation> {
+        let parsed = design.parsed()?;
         let changed = design.changed_paths().into_iter().collect::<HashSet<_>>();
         let files = self
             .file
@@ -696,7 +703,7 @@ impl DeclarationResolver {
             .cloned()
             .collect::<Vec<_>>();
         let mut report = DeclarationValidation {
-            fingerprint: fingerprint(design),
+            fingerprint: fingerprint(design)?,
             ..Default::default()
         };
         for warning in &self.warning {
@@ -794,7 +801,7 @@ impl DeclarationResolver {
                 .unwrap_or(&file.path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if let Some(functions) = design.proposed_calls.get(&path) {
+            if let Some(functions) = parsed.proposed_calls.get(&path) {
                 for function in functions {
                     for reference in function
                         .call
@@ -853,7 +860,7 @@ impl DeclarationResolver {
                 diagnostic.reason.clone(),
             ))
         });
-        report
+        Ok(report)
     }
 
     /// Resolve the exact signature token selected in saved declaration coordinates.
@@ -1745,11 +1752,14 @@ impl DeclarationResolver {
     }
 }
 
-pub(crate) fn fingerprint(design: &DeclarationDesign) -> String {
-    crate::plan::digest(
-        &serde_json::to_vec(&(&design.proposed, &design.proposed_calls, &design.cargo_lock))
-            .expect("string maps serialize"),
-    )
+/// Identify the submitted declarations and dependency locks a validation report describes.
+pub(crate) fn fingerprint(design: &DeclarationDesign) -> Result<String> {
+    let parsed = design.parsed()?;
+    Ok(crate::plan::digest(&serde_json::to_vec(&(
+        &parsed.proposed,
+        &parsed.proposed_calls,
+        &design.cargo_lock,
+    ))?))
 }
 
 fn normalize(path: &Path) -> PathBuf {

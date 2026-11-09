@@ -19,7 +19,7 @@ pub(super) fn diagnostics(
         let Some(marker) = documentation_marker(path) else {
             continue;
         };
-        let Some(text) = design.proposed.get(path) else {
+        let Some(text) = design.parsed()?.proposed.get(path) else {
             continue;
         };
         let lines = text.lines().collect::<Vec<_>>();
@@ -113,8 +113,7 @@ mod tests {
             "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
         .expect("manifest");
-        let mut design = DeclarationDesign::default();
-        design.proposed.insert(
+        let design = DeclarationDesign::scratch(std::collections::BTreeMap::from([(
             "src/main.rs".into(),
             "// Closed gameplay state.
 enum RunPhase {
@@ -132,7 +131,8 @@ struct Player {
 }
 "
             .into(),
-        );
+        )]))
+        .expect("design");
         let index = PlanReferenceIndex::design(&design, workspace.path()).expect("index");
         let mut reported = diagnostics(&design, &index)
             .expect("documentation")

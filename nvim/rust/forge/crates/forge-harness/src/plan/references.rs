@@ -107,19 +107,18 @@ impl PlanReferenceIndex {
         baseline: bool,
         mut resolver: DeclarationResolver,
     ) -> Result<Self> {
-        let files: BTreeMap<String, String> = if baseline {
-            design
-                .baseline
-                .iter()
-                .map(|(path, file)| (path.clone(), file.text.clone()))
-                .collect()
+        let (files, calls): (BTreeMap<String, String>, _) = if baseline {
+            (
+                design
+                    .baseline
+                    .iter()
+                    .map(|(path, file)| (path.clone(), file.text.clone()))
+                    .collect(),
+                &design.baseline_calls,
+            )
         } else {
-            design.proposed.clone()
-        };
-        let calls = if baseline {
-            &design.baseline_calls
-        } else {
-            &design.proposed_calls
+            let parsed = design.parsed()?;
+            (parsed.proposed.clone(), &parsed.proposed_calls)
         };
         let side = if baseline { "baseline" } else { "proposed" };
         let mut output = Self::default();
@@ -710,7 +709,7 @@ impl PlanReferenceIndex {
         let text = if baseline {
             &design.baseline[path].text
         } else {
-            &design.proposed[path]
+            &design.parsed()?.proposed[path]
         };
         let callable = DeclarationCalls::extract(path, text, true)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
@@ -748,6 +747,7 @@ impl PlanReferenceIndex {
             .design
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("rename requires a declaration plan"))?;
+        let parsed = design.parsed()?;
         let candidates = self
             .definition
             .iter()
@@ -767,7 +767,7 @@ impl PlanReferenceIndex {
             .cloned()
             .or_else(|| {
                 path.ends_with(".lua")
-                    .then(|| lua_symbol(path, &design.proposed[path], *line, *column))
+                    .then(|| lua_symbol(path, &parsed.proposed[path], *line, *column))
                     .flatten()
             })
             .ok_or_else(|| {
@@ -861,6 +861,8 @@ impl PlanReferenceIndex {
 
         let mut output = document.clone();
         let mut design = original_design.clone();
+        let original_parsed = original_design.parsed()?;
+        let mut parsed = original_parsed.clone();
         let mut algorithm_edits = BTreeMap::<(String, String), BTreeSet<(u32, u32)>>::new();
         for (location, reference) in &self.algorithm {
             if reference.symbol == identity {
@@ -871,7 +873,7 @@ impl PlanReferenceIndex {
             }
         }
         for ((path, owner), positions) in algorithm_edits {
-            let body = design
+            let body = parsed
                 .proposed_calls
                 .get_mut(&path)
                 .into_iter()
@@ -886,7 +888,7 @@ impl PlanReferenceIndex {
                 .map_err(|error| anyhow::anyhow!("Algorithm rename token changed: {error:#}"))?
                 .apply();
         }
-        let index = DeclarationIndex::extract(&definition_path, &design.proposed[&definition_path])
+        let index = DeclarationIndex::extract(&definition_path, &parsed.proposed[&definition_path])
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         ensure!(
             !index.symbol.iter().any(|candidate| candidate.name == name
@@ -908,7 +910,7 @@ impl PlanReferenceIndex {
             ensure!(
                 !DeclarationCalls::extract(
                     &definition_path,
-                    &design.proposed[&definition_path],
+                    &parsed.proposed[&definition_path],
                     true
                 )
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?
@@ -929,7 +931,7 @@ impl PlanReferenceIndex {
                     "call" | "property" | "callback" | "value" | "construct" | "body_qualifier"
                 )
         }) {
-            let text = &design.proposed[&reference.path];
+            let text = &parsed.proposed[&reference.path];
             let row = text
                 .lines()
                 .nth(reference.line as usize - 1)
@@ -979,7 +981,7 @@ impl PlanReferenceIndex {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        for (path, functions) in &mut design.proposed_calls {
+        for (path, functions) in &mut parsed.proposed_calls {
             for function in functions {
                 for call in function.call.iter_mut().flatten() {
                     if call.unresolved {
@@ -1043,7 +1045,7 @@ impl PlanReferenceIndex {
                 }
             }
         }
-        for (path, text) in &mut design.proposed {
+        for (path, text) in &mut parsed.proposed {
             let Some(positions) = edits.remove(path) else {
                 continue;
             };
@@ -1055,13 +1057,13 @@ impl PlanReferenceIndex {
             edits.is_empty(),
             "rename source changed outside the proposal"
         );
-        for (path, functions) in &mut design.proposed_calls {
-            if design.proposed.get(path) == original_design.proposed.get(path) {
+        for (path, functions) in &mut parsed.proposed_calls {
+            if parsed.proposed.get(path) == original_parsed.proposed.get(path) {
                 continue;
             }
-            let before = DeclarationCalls::extract(path, &original_design.proposed[path], true)
+            let before = DeclarationCalls::extract(path, &original_parsed.proposed[path], true)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let after = DeclarationCalls::extract(path, &design.proposed[path], true)
+            let after = DeclarationCalls::extract(path, &parsed.proposed[path], true)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             ensure!(
                 before.len() == after.len(),
@@ -1075,27 +1077,41 @@ impl PlanReferenceIndex {
                 function.owner.clone_from(&after[position].owner);
             }
         }
-        design.validation = None;
-        for (path, text) in &design.proposed {
-            let previous = original_design;
-            if previous.proposed.get(path) == Some(text)
-                && previous.proposed_calls.get(path) == design.proposed_calls.get(path)
+        let mut renamed_paths = Vec::new();
+        for (path, text) in &parsed.proposed {
+            if original_parsed.proposed.get(path) == Some(text)
+                && original_parsed.proposed_calls.get(path) == parsed.proposed_calls.get(path)
             {
                 continue;
             }
             forge_diff::syntax::DeclarationOverview::parse(path, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let functions = design
+            let functions = parsed
                 .proposed_calls
                 .get(path)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let combined = super::calls::combined(path, text, functions)?;
-            let (_, parsed) = super::calls::parse(path, &combined, functions)?;
+            let (_, reparsed) = super::calls::parse(path, &combined, functions)?;
             ensure!(
-                parsed.len() == functions.len(),
+                reparsed.len() == functions.len(),
                 "rename changed callable ownership"
             );
+            renamed_paths.push(path.clone());
+        }
+        // Rename positions are in parsed coordinates, so each renamed file's proposed source is
+        // regenerated from its renamed structure rather than edited in place.
+        parsed.validation = None;
+        design.parsed = Some(parsed);
+        for path in renamed_paths {
+            let parsed = design.parsed()?;
+            let declarations = parsed.proposed[&path].clone();
+            let calls = parsed
+                .proposed_calls
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            design.parsed_insert(&path, declarations, calls)?;
         }
         output.design = Some(design);
         output.version = output

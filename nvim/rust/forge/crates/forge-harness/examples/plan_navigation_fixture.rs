@@ -8,6 +8,7 @@ use forge_harness::plan::{
 };
 use forge_harness::storage::SqliteStore;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -36,6 +37,11 @@ fn main() -> Result<()> {
         .context("mock plan is not a declaration plan")?
         .document
         .clone();
+    // Build both sides completely before storing them, because each stored proposal records the
+    // baseline it was derived from.
+    let mut baseline = BTreeMap::<String, (String, String)>::new();
+    let mut proposed = BTreeMap::<String, String>::new();
+    let mut proposed_calls = BTreeMap::<String, Vec<FunctionBody>>::new();
     for path in paths {
         let source = std::fs::read_to_string(workspace.join(path))?;
         let (text, callables) = DeclarationOverview::extract_with_calls(path, &source)
@@ -70,28 +76,28 @@ fn main() -> Result<()> {
                 ),
             })
             .collect::<Vec<_>>();
-        design.baseline.insert(
+        baseline.insert(
             (*path).into(),
-            DeclarationFile {
-                text: text.clone(),
-                source_digest: format!("{:x}", Sha256::digest(source.as_bytes())),
-            },
+            (
+                text.clone(),
+                format!("{:x}", Sha256::digest(source.as_bytes())),
+            ),
         );
-        design.proposed.insert((*path).into(), text);
+        proposed.insert((*path).into(), text);
         design.baseline_calls.insert((*path).into(), bodies.clone());
-        let mut proposed = bodies;
-        for body in &mut proposed {
+        let mut changed = bodies;
+        for body in &mut changed {
             body.behavior = Some(forge_harness::plan::FunctionBehavior::Change(
                 "Preserve behavior while reviewing definition navigation.".into(),
             ));
         }
-        design.proposed_calls.insert((*path).into(), proposed);
+        proposed_calls.insert((*path).into(), changed);
     }
     if arguments[4] == "behavior" {
-        design.proposed.get_mut("src/change.rs").unwrap().push_str(
+        proposed.get_mut("src/change.rs").unwrap().push_str(
             "\n/// Holds the optional probe result.\npub struct ProbeResult {\n  /// Value observed by the probe.\n  pub value: Option<u32>\n}\n/// Preserves the optional value.\npub fn planned_probe(\n  value: Option<u32>,\n  abilities: &mut PlayerAbilities\n) -> ProbeResult;\n",
         );
-        design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
+        proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
             owner: "planned_probe".into(),
             behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
                 "result ← value\nrecord(ProbeResult.value)\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\ndecrease_cooldowns(cooldown_remaining, weapon.cooldown, elapsed_seconds, minimum_remaining = 0, preserve_order = stored_firing_order)\n# Preserve firing order while decreasing cooldowns\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
@@ -112,16 +118,14 @@ fn main() -> Result<()> {
         });
     }
     if arguments[4] == "tests" {
-        design.proposed.get_mut("src/change.rs").unwrap().push_str("\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn new_case();\n  #[test]\n  fn changed_case();\n  #[test]\n  fn reused_case();\n}\n");
-        design
-            .baseline
+        proposed.get_mut("src/change.rs").unwrap().push_str("\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn new_case();\n  #[test]\n  fn changed_case();\n  #[test]\n  fn reused_case();\n}\n");
+        baseline
             .get_mut("src/change.rs")
             .unwrap()
-            .text
+            .0
             .push_str("\n#[cfg(test)]\nmod history {\n  #[test]\n  fn removed_case();\n}\n");
-        design.proposed.get_mut("src/change.rs").unwrap().push_str("\n/// Exercises the new test-only helpers.\n#[cfg(test)]\nmod added_tests {\n  #[test]\n  fn added_case();\n}\n");
-        design
-            .proposed_calls
+        proposed.get_mut("src/change.rs").unwrap().push_str("\n/// Exercises the new test-only helpers.\n#[cfg(test)]\nmod added_tests {\n  #[test]\n  fn added_case();\n}\n");
+        proposed_calls
             .get_mut("src/change.rs")
             .unwrap()
             .push(FunctionBody {
@@ -132,7 +136,7 @@ fn main() -> Result<()> {
                 )),
                 call: Some(Vec::new()),
             });
-        design.proposed.insert(
+        proposed.insert(
             "tests/new.rs".into(),
             "// Planned integration test file.\n".into(),
         );
@@ -156,6 +160,19 @@ fn main() -> Result<()> {
                   "branches":[{"condition":"old combat entities exist","steps":[{"action":"remove old entities","effects":[{"target":"*literal* cleanup","change":"perform"}]}]}]}
              ]}
         ]))?;
+    }
+    for (path, (text, source_digest)) in baseline {
+        let calls = design
+            .baseline_calls
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
+        let file = DeclarationFile::new(&path, text, source_digest, &calls)?;
+        design.baseline.insert(path, file);
+    }
+    for (path, declarations) in proposed {
+        let calls = proposed_calls.remove(&path).unwrap_or_default();
+        design.parsed_insert(&path, declarations, calls)?;
     }
     document.design = Some(design);
     document.version += 1;

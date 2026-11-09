@@ -207,7 +207,7 @@ fn changed_files(design: &crate::plan::DeclarationDesign) -> Vec<String> {
         }
         let row = match (
             design.baseline.contains_key(&path),
-            design.proposed.contains_key(&path),
+            design.proposed_source.contains_key(&path),
         ) {
             (true, false) => match design.moved.get(&path) {
                 Some(destination) => format!("R {path} -> {destination}"),

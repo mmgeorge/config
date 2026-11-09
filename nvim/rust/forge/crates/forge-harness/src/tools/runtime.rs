@@ -884,7 +884,7 @@ mod test {
             .unwrap();
         let document = runtime.plan_document().unwrap();
         let design = document.design.as_ref().unwrap();
-        assert!(design.proposed.is_empty() && design.baseline.is_empty());
+        assert!(design.proposed_source.is_empty() && design.baseline.is_empty());
         assert!(!design.artifact_text.contains_key("plan:overview.md"));
         let status = runtime
             .invoke(call("plan_status", json!({"plan_id":"plan"})))
@@ -898,11 +898,13 @@ mod test {
         assert!(status.message.contains("plan:overview.md  empty"));
     }
 
-    /// Source edits keep the agent's text: a flush section body parses, a structure mistake is
-    /// stored and reported by line at submission, a chunk copied at the wrong base indentation
-    /// still applies with its nesting, and a mismatch names its line without changing the plan.
+    /// Source edits keep the agent's text exactly: every effective edit reports the file as
+    /// changed even while its structure does not parse, a rejected submission changes nothing,
+    /// a chunk copied at the wrong base indentation still applies with its nesting, an accepted
+    /// submission parses the text without rewriting it, and a mismatch names its line without
+    /// changing the plan.
     #[tokio::test]
-    async fn source_edits_store_authored_structure_and_submit_reports_it_by_line() {
+    async fn source_edits_store_authored_text_and_submit_parses_it_without_changes() {
         let mut context = planning_context();
         let workspace = context.workspace_root.clone().unwrap();
         context.plan_document.as_mut().unwrap().design =
@@ -929,39 +931,44 @@ mod test {
                 .unwrap()
                 .clone()
         };
+        let authored = "/// Play every round.\npub fn play(rounds: u32);\nAlgorithm\nfor each round in rounds\n    score(round)\n";
 
-        runtime
+        let overview = runtime
             .invoke(edit(
                 1,
+                "*** Begin Patch\n*** Add File: plan:overview.md\n+# Rounds\n+\n+## Objective\n+Play every round.\n+\n+## Background\n+Rounds are scored one at a time.\n+\n+## Design\n+One function plays each round.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            overview.message.contains("version is 2"),
+            "{}",
+            overview.message
+        );
+        runtime
+            .invoke(edit(
+                2,
                 "*** Begin Patch\n*** Add File: Game.rs\n+/// Play every round.\n+pub fn play(rounds: u32);\n+Algorithm\n+for each round in rounds\n+    score(round)\n*** End Patch",
             ))
             .await
             .unwrap();
         let design = read(&runtime);
-        assert!(design.unparsed_proposed.is_empty());
-        assert_eq!(
-            design.proposed_calls["Game.rs"][0]
-                .behavior
-                .as_ref()
-                .unwrap()
-                .text(),
-            "for each round in rounds\n    score(round)"
-        );
+        assert_eq!(design.proposed_source["Game.rs"], authored);
+        assert!(design.parsed.is_none());
 
         let second_block = runtime
             .invoke(edit(
-                2,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n       score(round)\n+Change\n+  Also record the round.\n*** End Patch",
+                3,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n     score(round)\n+Change\n+  Also record the round.\n*** End Patch",
             ))
             .await
             .unwrap();
         assert!(
-            second_block.message.contains("version is 3"),
+            second_block.message.contains("version is 4")
+                && second_block.message.contains("Changed: Game.rs"),
             "{}",
             second_block.message
         );
-        let design = read(&runtime);
-        assert!(design.unparsed_proposed["Game.rs"].contains("Change\n  Also record"));
         let shown = runtime
             .invoke(call(
                 "plan_read",
@@ -971,9 +978,24 @@ mod test {
             .unwrap();
         assert!(shown.message.contains("6: Change"), "{}", shown.message);
 
+        let another_block = runtime
+            .invoke(edit(
+                4,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n   Also record the round.\n+Change\n+  Record it twice.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            another_block.message.contains("version is 5")
+                && another_block.message.contains("Changed: Game.rs"),
+            "an edit of text that does not parse still reports its file: {}",
+            another_block.message
+        );
+
+        let before_rejection = crate::codec::to_vec(runtime.plan_document().unwrap()).unwrap();
         let submit = call(
             "plan_submit",
-            json!({"plan_id":"plan","expected_version":3}),
+            json!({"plan_id":"plan","expected_version":5}),
         );
         let error = runtime.invoke(submit.clone()).await.unwrap_err();
         let failure =
@@ -981,32 +1003,63 @@ mod test {
         for expected in [
             "Game.rs:6:1: error[invalid_declaration_structure]:",
             "already has a behavior block",
-            "Fix them and retry with expected_version 3.",
+            "Fix them and retry with expected_version 5.",
         ] {
             assert!(
                 failure.contains(expected),
                 "missing {expected:?} in {failure}"
             );
         }
-
-        runtime
-            .invoke(edit(
-                3,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n-Change\n-  Also record the round.\n*** End Patch",
-            ))
-            .await
-            .unwrap();
-        assert!(read(&runtime).unparsed_proposed.is_empty());
-
-        runtime
-            .invoke(edit(
-                4,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n for each round in rounds\n     score(round)\n+    finish(round)\n*** End Patch",
-            ))
-            .await
-            .unwrap();
         assert_eq!(
-            read(&runtime).proposed_calls["Game.rs"][0]
+            crate::codec::to_vec(runtime.plan_document().unwrap()).unwrap(),
+            before_rejection,
+            "a rejected submission leaves the plan byte-identical"
+        );
+
+        runtime
+            .invoke(edit(
+                5,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n-Change\n-  Also record the round.\n-Change\n-  Record it twice.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read(&runtime).proposed_source["Game.rs"], authored);
+
+        runtime
+            .invoke(edit(
+                6,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n   for each round in rounds\n       score(round)\n+      finish(round)\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        let draft = read(&runtime);
+        assert!(
+            draft.proposed_source["Game.rs"]
+                .ends_with("for each round in rounds\n    score(round)\n    finish(round)\n"),
+            "{}",
+            draft.proposed_source["Game.rs"]
+        );
+
+        let accepted = runtime
+            .invoke(call(
+                "plan_submit",
+                json!({"plan_id":"plan","expected_version":7}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            accepted.message.contains("submitted for review"),
+            "{}",
+            accepted.message
+        );
+        let submitted = read(&runtime);
+        assert_eq!(
+            submitted.proposed_source, draft.proposed_source,
+            "an accepted submission leaves the proposed source byte-identical"
+        );
+        assert_eq!(submitted.artifact_text, draft.artifact_text);
+        assert_eq!(
+            submitted.parsed().unwrap().proposed_calls["Game.rs"][0]
                 .behavior
                 .as_ref()
                 .unwrap()
@@ -1015,7 +1068,7 @@ mod test {
         );
 
         let mismatch = edit(
-            5,
+            7,
             "*** Begin Patch\n*** Update File: Game.rs\n@@\n-  for each turn in turns\n+  for each turn in rounds\n*** End Patch",
         );
         let error = runtime.invoke(mismatch.clone()).await.unwrap_err();
@@ -1023,14 +1076,106 @@ mod test {
             crate::tools::control_tool_failure_text(&mismatch, &error, runtime.plan_document());
         for expected in [
             "Game.rs: chunk 1 does not match: its first line `  for each turn in turns` is not in the file",
-            "No changes were applied. Fix them and retry with expected_version 5.",
+            "No changes were applied. Fix them and retry with expected_version 7.",
         ] {
             assert!(
                 failure.contains(expected),
                 "missing {expected:?} in {failure}"
             );
         }
-        assert_eq!(runtime.plan_document().unwrap().version, 5);
+        assert_eq!(runtime.plan_document().unwrap().version, 7);
+        assert!(
+            read(&runtime).parsed.is_some(),
+            "a failed edit keeps the submitted structure"
+        );
+    }
+
+    /// References keep the heading the agent wrote until submission classifies them against the
+    /// final design: a function listed under Accesses stays there in `plan_read` and becomes a
+    /// callback in the submitted structure.
+    #[tokio::test]
+    async fn submission_classifies_references_without_moving_authored_text() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        context.plan_document.as_mut().unwrap().design =
+            Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        let mut runtime = ControlToolRuntime::new(context);
+        let call = |name: &str, arguments: serde_json::Value| ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: name.into(),
+            arguments,
+        };
+        let edit = |version: u64, patch: &str| {
+            call(
+                "plan_edit",
+                json!({"plan_id":"plan","expected_version":version,"patch":patch}),
+            )
+        };
+        runtime
+            .invoke(edit(
+                1,
+                "*** Begin Patch\n*** Add File: plan:overview.md\n+# Rounds\n+\n+## Objective\n+Score every round.\n+\n+## Background\n+Rounds are scored by a scorer.\n+\n+## Design\n+Play passes the scorer to each round.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        runtime
+            .invoke(edit(
+                2,
+                "*** Begin Patch\n*** Add File: Rounds.rs\n+/// Score one round.\n+pub fn score(round: u32) -> u32;\n+Algorithm\n+  return round\n+\n+/// Play every round with the scorer.\n+pub fn play(rounds: u32);\n+Algorithm\n+  for each round in rounds\n+    apply(score, round)\n+Accesses\n+  score\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        let shown = runtime
+            .invoke(call(
+                "plan_read",
+                json!({"plan_id":"plan","path":"Rounds.rs"}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            shown.message.contains("11: Accesses\n12:   score"),
+            "{}",
+            shown.message
+        );
+
+        let accepted = runtime
+            .invoke(call(
+                "plan_submit",
+                json!({"plan_id":"plan","expected_version":3}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            accepted.message.contains("submitted for review"),
+            "{}",
+            accepted.message
+        );
+        let design = runtime.plan_document().unwrap().design.clone().unwrap();
+        let play = design.parsed().unwrap().proposed_calls["Rounds.rs"]
+            .iter()
+            .find(|body| body.owner == "play")
+            .unwrap()
+            .clone();
+        let score = play
+            .call
+            .iter()
+            .flatten()
+            .find(|call| call.name == "score")
+            .unwrap();
+        assert_eq!(score.kind, crate::plan::CallKind::Callback);
+        let shown = runtime
+            .invoke(call(
+                "plan_read",
+                json!({"plan_id":"plan","path":"Rounds.rs"}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            shown.message.contains("11: Accesses\n12:   score"),
+            "{}",
+            shown.message
+        );
     }
 
     fn planning_context() -> ControlTurnContext {

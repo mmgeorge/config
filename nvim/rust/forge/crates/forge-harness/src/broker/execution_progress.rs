@@ -62,7 +62,7 @@ impl PlanProgressJob {
                 crate::plan::execution::SemanticProgress::scan(design, &scan_workspace)?
             } else {
                 let mut progress = crate::plan::execution::SemanticProgress::default();
-                for path in design.proposed.keys() {
+                for path in design.proposed_source.keys() {
                     if let Some(source) = crate::plan::workspace_source(&scan_workspace, path)? {
                         progress
                             .source_digest

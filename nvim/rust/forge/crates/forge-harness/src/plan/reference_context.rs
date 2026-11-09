@@ -90,13 +90,19 @@ impl ReferenceContext {
         let mut document = source.document.clone();
         let (blocks, targets) = if let Some(design) = document.design.as_mut() {
             if baseline {
-                design.proposed.clear();
-                design.proposed_calls.clear();
+                design.proposed_source.clear();
+                let parsed = design.parsed_mut()?;
+                parsed.proposed.clear();
+                parsed.proposed_calls.clear();
             } else {
                 design.baseline.clear();
                 design.baseline_calls.clear();
             }
             design.moved.clear();
+            // The projected side stands alone, so its parsed structure must describe exactly the
+            // proposed source left after clearing the other side.
+            let fingerprint = design.source_fingerprint()?;
+            design.parsed_mut()?.source_fingerprint = fingerprint;
             super::design_review::project(
                 &document,
                 &WidthProfile::default(),

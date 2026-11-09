@@ -15,7 +15,7 @@ pub(super) fn diagnostics(design: &DeclarationDesign) -> Result<Vec<DeclarationD
         .map(|(origin, destination)| (destination.as_str(), origin.as_str()))
         .collect::<BTreeMap<_, _>>();
     for path in design.changed_paths() {
-        let Some(proposed) = design.proposed.get(&path) else {
+        let Some(proposed) = design.parsed()?.proposed.get(&path) else {
             continue;
         };
         if !proposed

@@ -19,23 +19,37 @@ impl DeclarationDelta {
         design: &DeclarationDesign,
     ) -> Result<Self> {
         let previous = previous.and_then(|document| document.design.as_ref());
-        let mut baseline = previous
-            .map(|design| design.proposed.clone())
-            .unwrap_or_else(|| {
-                design
-                    .baseline
-                    .iter()
-                    .map(|(path, file)| (path.clone(), file.text.clone()))
-                    .collect()
-            });
+        let previous_parsed = previous.map(DeclarationDesign::parsed).transpose()?;
+        let parsed = design.parsed()?;
+        let mut baseline = match (previous, previous_parsed) {
+            (Some(previous), Some(previous_parsed)) => previous_parsed
+                .proposed
+                .iter()
+                .map(|(path, text)| {
+                    let file = DeclarationFile {
+                        text: text.clone(),
+                        source_digest: String::new(),
+                        editable_text: previous
+                            .proposed_source
+                            .get(path)
+                            .cloned()
+                            .unwrap_or_default(),
+                    };
+                    (path.clone(), file)
+                })
+                .collect::<BTreeMap<_, _>>(),
+            _ => design.baseline.clone(),
+        };
         let mut baseline_paths = std::collections::BTreeSet::new();
-        let mut baseline_calls = previous
-            .map(|design| design.proposed_calls.clone())
+        let mut baseline_calls = previous_parsed
+            .map(|previous| previous.proposed_calls.clone())
             .unwrap_or_else(|| design.baseline_calls.clone());
         if let Some(previous) = previous {
             for (path, file) in &design.baseline {
-                if !previous.baseline.contains_key(path) && !previous.proposed.contains_key(path) {
-                    baseline.insert(path.clone(), file.text.clone());
+                if !previous.baseline.contains_key(path)
+                    && !previous.proposed_source.contains_key(path)
+                {
+                    baseline.insert(path.clone(), file.clone());
                     if let Some(calls) = design.baseline_calls.get(path) {
                         baseline_calls.insert(path.clone(), calls.clone());
                     }
@@ -51,33 +65,27 @@ impl DeclarationDelta {
             let after = design.moved.get(original).unwrap_or(original);
             if before != after
                 && baseline.contains_key(before)
-                && design.proposed.contains_key(after)
-                && !design.proposed.contains_key(before)
+                && design.proposed_source.contains_key(after)
+                && !design.proposed_source.contains_key(before)
             {
                 moved.insert(before.clone(), after.clone());
             }
         }
         let delta = DeclarationDesign {
-            baseline: baseline
-                .into_iter()
-                .map(|(path, text)| {
-                    (
-                        path,
-                        DeclarationFile {
-                            text,
-                            source_digest: String::new(),
-                        },
-                    )
-                })
-                .collect(),
-            proposed: design.proposed.clone(),
+            baseline,
             baseline_calls,
-            proposed_calls: design.proposed_calls.clone(),
             moved,
+            proposed_source: design.proposed_source.clone(),
+            parsed: Some(super::ParsedDeclarations {
+                proposed: parsed.proposed.clone(),
+                proposed_calls: parsed.proposed_calls.clone(),
+                ..Default::default()
+            }),
             ..DeclarationDesign::default()
         };
+        let delta_parsed = delta.parsed()?;
         let mut patch = Vec::new();
-        for file in super::review_file_layout::order(&delta, &Default::default()) {
+        for file in super::review_file_layout::order(&delta, &Default::default())? {
             let before = delta
                 .baseline
                 .get(&file.baseline)
@@ -93,14 +101,14 @@ impl DeclarationDelta {
                     )
                 })
                 .transpose()?;
-            let after = delta
+            let after = delta_parsed
                 .proposed
                 .get(&file.proposed)
                 .map(|text| {
                     super::calls::combined(
                         &file.proposed,
                         text,
-                        delta
+                        delta_parsed
                             .proposed_calls
                             .get(&file.proposed)
                             .map(Vec::as_slice)

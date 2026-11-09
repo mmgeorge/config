@@ -174,7 +174,7 @@ pub(super) fn project(
         .as_ref()
         .context("declaration review has no design")?;
     let narrative_symbols =
-        super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""));
+        super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""))?;
     let narrative_spans = super::review_symbols::spans(design, &narrative_symbols);
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
@@ -443,6 +443,7 @@ fn rows(
         .design
         .as_ref()
         .context("declaration review has no design")?;
+    let parsed = design.parsed()?;
     let mut file_diff = Vec::new();
     let mut hidden = HashSet::new();
     let mut contextual_path = HashSet::new();
@@ -452,7 +453,7 @@ fn rows(
         HashMap::<(String, String), std::sync::Arc<super::calls::CallPresentation>>::new();
     let started = Instant::now();
     let included = revealed.iter().map(|(path, _, _)| path.clone()).collect();
-    let ordered_files = super::review_file_layout::order(design, &included);
+    let ordered_files = super::review_file_layout::order(design, &included)?;
     if let Some(trace) = trace {
         trace.record(
             "plan.review.file_order",
@@ -479,14 +480,14 @@ fn rows(
             })
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let after = design
+        let after = parsed
             .proposed
             .get(&destination)
             .map(|text| {
                 super::calls::present(
                     &destination,
                     text,
-                    design
+                    parsed
                         .proposed_calls
                         .get(&destination)
                         .map(Vec::as_slice)
@@ -716,8 +717,8 @@ fn rows(
                         )
                     } else {
                         (
-                            design.proposed.get(source_path).map(String::as_str),
-                            &design.proposed_calls,
+                            parsed.proposed.get(source_path).map(String::as_str),
+                            &parsed.proposed_calls,
                         )
                     };
                     let callables = algorithm_callables
@@ -1330,6 +1331,7 @@ pub(super) fn test_inventory(
     design: &super::DeclarationDesign,
 ) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
     let files = &design.document.tests;
+    let parsed = design.parsed()?;
     let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
     let mut heading = vec![
         TextChunk {
@@ -1390,7 +1392,7 @@ pub(super) fn test_inventory(
                 .get(original_path)
                 .map(|file| file.text.as_str()),
         )?;
-        let after = declarations(design.proposed.get(&file.file).map(String::as_str))?;
+        let after = declarations(parsed.proposed.get(&file.file).map(String::as_str))?;
         let line_width = before
             .iter()
             .chain(&after)
@@ -1403,11 +1405,11 @@ pub(super) fn test_inventory(
         let start = block.len();
         let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
         let change = if !design.baseline.contains_key(&file.file)
-            && design.proposed.contains_key(&file.file)
+            && parsed.proposed.contains_key(&file.file)
         {
             FileChange::Added
         } else if design.baseline.contains_key(&file.file)
-            && !design.proposed.contains_key(&file.file)
+            && !parsed.proposed.contains_key(&file.file)
         {
             FileChange::Deleted
         } else if file

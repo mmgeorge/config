@@ -46,7 +46,7 @@ mod review_alignment;
 mod review_delivery;
 mod review_diff;
 mod review_file_layout;
-pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
+pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest, ParsedDeclarations};
 mod edit;
 pub(crate) mod edit_trace;
 pub(crate) mod event;
@@ -1448,18 +1448,18 @@ impl PlanFileStore {
         if let Some(design) = &mut document.design {
             design.check_configuration =
                 Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
-            let fingerprint = crate::declaration::fingerprint(design);
-            let report = match design.validation.take() {
+            let fingerprint = crate::declaration::fingerprint(design)?;
+            let report = match design.parsed_mut()?.validation.take() {
                 Some(report) if report.fingerprint == fingerprint => report,
                 _ => crate::declaration::DeclarationResolver::planned(
                     &self.workspace,
                     design,
                     false,
                 )?
-                .validate(design),
+                .validate(design)?,
             };
             report.ensure_valid()?;
-            design.validation = Some(report);
+            design.parsed_mut()?.validation = Some(report);
         }
         let rendered = self.render_review(&document)?;
         Ok(PreparedPlanSubmission {
@@ -1517,6 +1517,7 @@ impl PlanFileStore {
             design.authored_diagnostics(&self.workspace)?,
         )?;
         design
+            .parsed()?
             .validation
             .as_ref()
             .context("execution revision has no validation evidence")?

@@ -1158,10 +1158,12 @@ mod tests {
         design.document.objective = "Preserve ownership".into();
         design.document.background = "A review fixture".into();
         design.document.design = "Keep state in its owner.".into();
-        design.proposed.insert(
+        design.proposed_source.insert(
             "src/owner.rs".into(),
             "/// Own application state.\npub struct Owner;\n".into(),
         );
+        design.parsed =
+            crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
         document.design = Some(design);
         let mut plan = broker
             .plan_file
@@ -1265,8 +1267,17 @@ mod tests {
         _data: tempfile::TempDir,
     }
 
-    async fn resolving_execution() -> Result<ResolvingExecution> {
+    /// Accept the reviewed fixture and enter Resolve, after writing `checkpointed_source` into the
+    /// workspace so the execution checkpoint contains it.
+    async fn resolving_execution(
+        checkpointed_source: &[(&str, &str)],
+    ) -> Result<ResolvingExecution> {
         let (workspace, data, mut broker, plan) = reviewed_execution_fixture()?;
+        for (path, source) in checkpointed_source {
+            let target = workspace.path().join(path);
+            std::fs::create_dir_all(target.parent().context("source path has a parent")?)?;
+            std::fs::write(target, source)?;
+        }
         let digest = plan
             .review_digest
             .clone()
@@ -1354,10 +1365,84 @@ mod tests {
         Ok(broker.store.load_plan(&plan.id)?.unwrap())
     }
 
+    /// A file first captured during Resolve takes its baseline from the execution checkpoint
+    /// through the same capture as planning, so its classified calls and editable text describe
+    /// the checkpointed source rather than the edited workspace.
+    #[tokio::test]
+    async fn resolve_draft_recaptures_new_baselines_from_the_checkpoint() -> Result<()> {
+        let checkpointed =
+            "/// Help once.\nfn helper() {}\n/// Run the helper.\nfn run() {\n    helper();\n}\n";
+        let execution_fixture = resolving_execution(&[("src/extra.rs", checkpointed)]).await?;
+        let ResolvingExecution {
+            broker,
+            plan,
+            exchange,
+            _workspace: workspace,
+            ..
+        } = &mut { execution_fixture };
+        std::fs::write(
+            workspace.path().join("src/extra.rs"),
+            "/// Help once.\nfn helper() {}\n/// Run the helper twice.\nfn run() {\n    helper();\n    helper();\n}\n",
+        )?;
+        let mut document = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)?;
+        document.version += 1;
+        let design = document.design.as_mut().unwrap();
+        // A plan edit that captures a file removes the submitted structure, as this draft does.
+        design.parsed = None;
+        let (edited, edited_calls) = design.source(workspace.path(), "src/extra.rs")?;
+        design
+            .proposed_source
+            .insert("src/extra.rs".into(), edited.editable_text.clone());
+        design.baseline.insert("src/extra.rs".into(), edited);
+        design
+            .baseline_calls
+            .insert("src/extra.rs".into(), edited_calls);
+        let task = broker.task_controller.current()?.unwrap();
+        let execution = broker.current_execution()?.unwrap();
+        broker
+            .handle_execution_control(
+                &execution.id,
+                execution.generation,
+                &task.permit(),
+                ExecutionOperation::Draft(Box::new(document)),
+                exchange,
+            )
+            .await?;
+
+        let saved = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)?;
+        let saved = saved.design.as_ref().unwrap();
+        let (expected, expected_calls) =
+            saved.capture_baseline(workspace.path(), "src/extra.rs", checkpointed)?;
+        assert_eq!(saved.baseline["src/extra.rs"], expected);
+        assert_eq!(saved.baseline_calls["src/extra.rs"], expected_calls);
+        let run = expected_calls
+            .iter()
+            .find(|body| body.owner == "run")
+            .context("run has captured calls")?;
+        assert_eq!(
+            run.call
+                .iter()
+                .flatten()
+                .filter(|call| call.name == "helper" && call.source.is_some())
+                .count(),
+            1,
+            "the recaptured baseline describes the checkpointed source"
+        );
+        assert_ne!(
+            saved.proposed_source["src/extra.rs"], expected.editable_text,
+            "the proposal keeps the text the draft carried"
+        );
+        Ok(())
+    }
+
     /// Review annotations on an execution revision request changes and keep acceptance explicit.
     #[tokio::test]
     async fn inline_execution_review_annotations_request_changes() -> Result<()> {
-        let mut execution_fixture = resolving_execution().await?;
+        let mut execution_fixture = resolving_execution(&[]).await?;
         let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
         let ResolvingExecution { broker, plan, .. } = &mut execution_fixture;
         assert_eq!(submitted.state, PlanState::AwaitingReview);

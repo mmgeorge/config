@@ -343,7 +343,7 @@ impl PlanReviewStore {
                 let saved = if side == "baseline" {
                     Some(&baseline.text)
                 } else {
-                    design.proposed.get(saved_path)
+                    design.parsed()?.proposed.get(saved_path)
                 };
                 if let Some(saved) = saved
                     && let Some(position) = super::workspace_definition::map_position(
@@ -609,7 +609,7 @@ impl EditablePlanReview<'_> {
             .design
             .as_ref()
             .context("plan questions require a declaration design")?;
-        let mut context = serde_json::json!({"proposed":design.proposed});
+        let mut context = serde_json::json!({"proposed":design.parsed()?.proposed});
         context["document"] = super::codec::to_value(&design.document)?;
         let context = super::codec::to_string_pretty(&context)?;
         let mut question = Vec::new();
@@ -694,6 +694,8 @@ impl EditablePlanReview<'_> {
             &document.source.document.design,
             &source.revision.document.design,
         ) {
+            let previous_parsed = previous.parsed()?;
+            let current_parsed = current.parsed()?;
             for ((path, side), handle) in &document.source.declaration_syntax {
                 let (before, after) = if side == "baseline" {
                     (
@@ -701,7 +703,10 @@ impl EditablePlanReview<'_> {
                         current.baseline.get(path).map(|file| &file.text),
                     )
                 } else {
-                    (previous.proposed.get(path), current.proposed.get(path))
+                    (
+                        previous_parsed.proposed.get(path),
+                        current_parsed.proposed.get(path),
+                    )
                 };
                 let (before_calls, after_calls) = if side == "baseline" {
                     (
@@ -710,8 +715,8 @@ impl EditablePlanReview<'_> {
                     )
                 } else {
                     (
-                        previous.proposed_calls.get(path),
-                        current.proposed_calls.get(path),
+                        previous_parsed.proposed_calls.get(path),
+                        current_parsed.proposed_calls.get(path),
                     )
                 };
                 if before.is_some() && before == after && before_calls == after_calls {
@@ -720,9 +725,9 @@ impl EditablePlanReview<'_> {
                         .insert((path.clone(), side.clone()), handle.clone());
                 }
             }
-            if previous.proposed == current.proposed
+            if previous_parsed.proposed == current_parsed.proposed
                 && previous.baseline == current.baseline
-                && previous.proposed_calls == current.proposed_calls
+                && previous_parsed.proposed_calls == current_parsed.proposed_calls
                 && previous.baseline_calls == current.baseline_calls
             {
                 source.resolver = Arc::clone(&document.source.resolver);
@@ -759,8 +764,14 @@ impl EditablePlanReview<'_> {
                     previous.baseline.get(path) == current.baseline.get(path)
                         && previous.baseline_calls.get(path) == current.baseline_calls.get(path)
                 } else {
-                    previous.proposed.get(path) == current.proposed.get(path)
-                        && previous.proposed_calls.get(path) == current.proposed_calls.get(path)
+                    match (&previous.parsed, &current.parsed) {
+                        (Some(previous), Some(current)) => {
+                            previous.proposed.get(path) == current.proposed.get(path)
+                                && previous.proposed_calls.get(path)
+                                    == current.proposed_calls.get(path)
+                        }
+                        _ => false,
+                    }
                 }
             })
             .cloned()
@@ -930,7 +941,7 @@ impl EditablePlanReview<'_> {
         {
             let position = forge_diff::syntax::DeclarationOverview::token_position(
                 path,
-                &design.proposed[path],
+                &design.parsed()?.proposed[path],
                 forge_diff::syntax::DeclarationPosition {
                     line: *line,
                     column: saved.unwrap_or(0),
@@ -977,7 +988,7 @@ impl EditablePlanReview<'_> {
                         } if side == "proposed" => {
                             let position = forge_diff::syntax::DeclarationOverview::token_position(
                                 path,
-                                &design.proposed[path],
+                                &design.parsed()?.proposed[path],
                                 forge_diff::syntax::DeclarationPosition {
                                     line: *line,
                                     column: saved.unwrap_or(0),
@@ -1094,7 +1105,7 @@ impl ReadOnlyPlanReview {
             let text = if side == "baseline" {
                 design.baseline.get(path).map(|file| &file.text)
             } else {
-                design.proposed.get(path)
+                design.parsed()?.proposed.get(path)
             }
             .context("declaration file is unavailable")?;
             let position = forge_diff::syntax::DeclarationOverview::token_position(
@@ -1252,8 +1263,12 @@ impl ReadOnlyPlanReview {
             )
         } else {
             (
-                design.proposed.get(&reference.path).map(String::as_str),
-                design.proposed_calls.get(&reference.path),
+                design
+                    .parsed()?
+                    .proposed
+                    .get(&reference.path)
+                    .map(String::as_str),
+                design.parsed()?.proposed_calls.get(&reference.path),
             )
         };
         let presentation = super::calls::present(
@@ -1381,7 +1396,7 @@ impl ReadOnlyPlanReview {
                 .as_ref()
                 .context("declaration design is unavailable")?;
             let symbols =
-                super::review_symbols::NarrativeSymbols::new(design, &self.source.workspace);
+                super::review_symbols::NarrativeSymbols::new(design, &self.source.workspace)?;
             let matching = symbols.matching(name);
             if action == "jump_entity" || action == "open" || action.starts_with("jump_symbol:") {
                 if matching.len() == 1 {
@@ -1409,7 +1424,7 @@ impl ReadOnlyPlanReview {
                 let excluded = design
                     .baseline
                     .keys()
-                    .chain(design.proposed.keys())
+                    .chain(design.parsed()?.proposed.keys())
                     .map(|path| self.source.workspace.join(path))
                     .collect::<Vec<_>>();
                 return Ok(
@@ -1571,7 +1586,7 @@ impl ReadOnlyPlanReview {
             let calls = if side == "baseline" {
                 &design.baseline_calls
             } else {
-                &design.proposed_calls
+                &design.parsed()?.proposed_calls
             };
             if calls.get(path).into_iter().flatten().any(|function| {
                 function.owner == *owner
@@ -1651,7 +1666,7 @@ impl ReadOnlyPlanReview {
         let text = if side == "baseline" {
             design.baseline.get(path).map(|file| &file.text)
         } else {
-            design.proposed.get(path)
+            design.parsed()?.proposed.get(path)
         }
         .context("declaration snapshot is unavailable")?;
         let position = forge_diff::syntax::DeclarationOverview::token_position(
@@ -1722,7 +1737,7 @@ impl ReadOnlyPlanReview {
                 let calls = if side == "baseline" {
                     &design.baseline_calls
                 } else {
-                    &design.proposed_calls
+                    &design.parsed()?.proposed_calls
                 };
                 let Some(function) = calls
                     .get(path)
@@ -1785,7 +1800,7 @@ impl ReadOnlyPlanReview {
                 let saved = if side == "baseline" {
                     &baseline.text
                 } else {
-                    let Some(saved) = design.proposed.get(path) else {
+                    let Some(saved) = design.parsed()?.proposed.get(path) else {
                         return Ok(None);
                     };
                     saved
@@ -1852,8 +1867,8 @@ impl ReadOnlyPlanReview {
                 )
             } else {
                 (
-                    design.proposed.get(path).map(String::as_str),
-                    &design.proposed_calls,
+                    design.parsed()?.proposed.get(path).map(String::as_str),
+                    &design.parsed()?.proposed_calls,
                 )
             };
             let body = bodies
@@ -1963,7 +1978,7 @@ impl ReadOnlyPlanReview {
                 let captured = if side == "baseline" {
                     design.baseline.contains_key(relative)
                 } else {
-                    design.proposed.contains_key(relative)
+                    design.parsed()?.proposed.contains_key(relative)
                 };
                 if captured {
                     return self.reveal_target(relative, side, 0, |blocks, targets| {
@@ -1992,7 +2007,7 @@ impl ReadOnlyPlanReview {
             let text = if side == "baseline" {
                 design.baseline.get(&relative).map(|file| &file.text)
             } else {
-                design.proposed.get(&relative)
+                design.parsed()?.proposed.get(&relative)
             };
             let Some(text) = text else {
                 anyhow::ensure!(
@@ -2042,7 +2057,7 @@ impl ReadOnlyPlanReview {
             let calls = if side == "baseline" {
                 &design.baseline_calls
             } else {
-                &design.proposed_calls
+                &design.parsed()?.proposed_calls
             };
             let combined = super::calls::present(
                 &relative,
@@ -2467,10 +2482,13 @@ mod tests {
         design.document.design =
             "Use a focused state owner.\nPreserve independent readers.\nKeep writes explicit.\nReport failures."
                 .into();
-        design.proposed.insert(
+        design.proposed_source.insert(
             "state.rs".into(),
             "/// Owns shared state.\npub struct State;\n".into(),
         );
+        design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())
+            .unwrap()
+            .parsed;
         canonical.design = Some(design);
         file.write_working_document("session", "plan", &canonical)
             .unwrap();

@@ -956,6 +956,7 @@ impl PlanDocument {
     pub fn validate_for_submission(&self) -> Result<()> {
         if let Some(design) = &self.design {
             self.validate()?;
+            design.parsed()?;
             design.document.validate_for_submission()?;
             return Ok(());
         }

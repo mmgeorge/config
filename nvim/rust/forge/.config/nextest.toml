@@ -92,6 +92,13 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 filter = "package(forge-harness) & test(/^service::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# Storage concurrency suite: session lease ownership must hold across OS processes, so these tests
+# launch worker copies of the test executable that contend for one SQLite store. A run takes about
+# 0.3 s alone, but six worker startups compete with the full parallel run and can pass two seconds.
+[[profile.default.overrides]]
+filter = "package(forge-harness) & test(/^storage::concurrency_tests::/)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 # Provider owner conformance suite: every scenario runs once for each owner implementation, and
 # the backpressure scenario pushes ordered output past queue capacity while a successor
 # interrupts, because surviving that volume is what it verifies.

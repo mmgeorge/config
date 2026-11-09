@@ -80,7 +80,8 @@ impl ImplementationReport {
         workspace: &Path,
     ) -> Result<(Self, BTreeMap<String, String>)> {
         let report = &mut self;
-        let mut paths = original
+        let parsed = original.parsed()?;
+        let mut paths = parsed
             .proposed
             .keys()
             .chain(original.baseline.keys())
@@ -125,7 +126,7 @@ impl ImplementationReport {
                     .as_deref()
                     .map_or_else(|| "absent".into(), |text| super::digest(text.as_bytes())),
             );
-            let expected = original.proposed.get(&path).cloned().unwrap_or_default();
+            let expected = parsed.proposed.get(&path).cloned().unwrap_or_default();
             let mut file = ImplementationFile {
                 path: path.clone(),
                 internal: Vec::new(),
@@ -148,7 +149,7 @@ impl ImplementationReport {
                 }
                 continue;
             };
-            if original.baseline.contains_key(&path) && !original.proposed.contains_key(&path) {
+            if original.baseline.contains_key(&path) && !parsed.proposed.contains_key(&path) {
                 file.contract.push("Planned deletion still exists".into());
             }
             if forge_diff::syntax::ConfigurationFormat::for_path(&path).is_some() {
@@ -200,6 +201,7 @@ impl ImplementationReport {
                         let mut observed = super::calls::from_extracted(observed);
                         let mut actual_design = original.clone();
                         actual_design
+                            .parsed_mut()?
                             .proposed
                             .insert(path.clone(), overview.clone());
                         let mut resolver = crate::declaration::DeclarationResolver::planned(
@@ -208,7 +210,7 @@ impl ImplementationReport {
                             false,
                         )?;
                         super::calls::classify(&path, &mut observed, &mut resolver);
-                        let planned = original
+                        let planned = parsed
                             .proposed_calls
                             .get(&path)
                             .map(Vec::as_slice)
@@ -345,7 +347,7 @@ mod tests {
         );
         let (report, _) = report()
             .capture(
-                &DeclarationDesign::default(),
+                &DeclarationDesign::scratch(BTreeMap::new()).unwrap(),
                 Some(&initial),
                 Some(&current),
                 &objects,

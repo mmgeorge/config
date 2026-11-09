@@ -352,7 +352,7 @@ impl HarnessService {
                             .document
                             .design
                             .as_ref()
-                            .map_or(0, |design| design.proposed.len()),
+                            .map_or(0, |design| design.proposed_source.len()),
                     );
                 }
                 admission.check()?;
@@ -1731,13 +1731,14 @@ async fn analyze_plan_source(
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
 ) -> Result<()> {
     if let Some(design) = &source.revision.document.design {
+        let parsed = design.parsed()?;
         for path in design.changed_paths() {
             for (side, text) in [
                 (
                     "baseline",
                     design.baseline.get(&path).map(|file| &file.text),
                 ),
-                ("proposed", design.proposed.get(&path)),
+                ("proposed", parsed.proposed.get(&path)),
             ] {
                 let Some(text) = text else { continue };
                 let stage = trace.map(|trace| trace.stage(&format!("syntax.{side}.{path}")));
@@ -1753,7 +1754,7 @@ async fn analyze_plan_source(
                 let calls = if side == "baseline" {
                     &design.baseline_calls
                 } else {
-                    &design.proposed_calls
+                    &parsed.proposed_calls
                 };
                 let presentation = crate::plan::calls::present(
                     &path,

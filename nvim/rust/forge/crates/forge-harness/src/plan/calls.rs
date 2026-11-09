@@ -1049,7 +1049,8 @@ pub(super) fn validate_behaviors(
     resolver: &mut crate::declaration::DeclarationResolver,
 ) -> Result<Vec<crate::declaration::DeclarationDiagnostic>> {
     let mut diagnostics = Vec::new();
-    for (path, text) in &design.proposed {
+    let parsed = design.parsed()?;
+    for (path, text) in &parsed.proposed {
         let original_path = design
             .moved
             .iter()
@@ -1074,7 +1075,7 @@ pub(super) fn validate_behaviors(
                 function: &function,
                 diagnostics: &mut diagnostics,
             };
-            let body = design
+            let body = parsed
                 .proposed_calls
                 .get(path)
                 .into_iter()
@@ -1871,11 +1872,12 @@ total <- delta(time)",
             "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
         .expect("manifest");
-        let mut design = DeclarationDesign::default();
-        design
-            .proposed
-            .insert("src/main.rs".into(), DECLARATIONS.into());
-        design.proposed_calls.insert(
+        let mut design = DeclarationDesign::scratch(std::collections::BTreeMap::from([(
+            "src/main.rs".into(),
+            DECLARATIONS.into(),
+        )]))
+        .expect("design");
+        design.parsed_mut().expect("parsed").proposed_calls.insert(
             "src/main.rs".into(),
             vec![
                 body(

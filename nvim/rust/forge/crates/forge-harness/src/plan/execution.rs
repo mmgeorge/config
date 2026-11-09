@@ -201,15 +201,16 @@ pub struct DeclarationMismatch {
 impl SemanticProgress {
     /// Compare every captured target against fresh implementation projections.
     pub fn scan(design: &DeclarationDesign, workspace: &Path) -> Result<Self> {
+        let parsed = design.parsed()?;
         let mut progress = Self::default();
         for path in design
             .baseline
             .keys()
-            .chain(design.proposed.keys())
+            .chain(parsed.proposed.keys())
             .cloned()
             .collect::<BTreeSet<_>>()
         {
-            let expected = design.proposed.get(&path);
+            let expected = parsed.proposed.get(&path);
             let source = match super::workspace_source(workspace, &path) {
                 Ok(source) => source,
                 Err(error) => {
@@ -804,13 +805,11 @@ mod tests {
     #[test]
     fn semantic_scan_detects_source_configuration_deletions_and_parse_failure() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut design = DeclarationDesign::default();
-        design
-            .proposed
-            .insert("main.rs".into(), "fn run();\n".into());
-        design
-            .proposed
-            .insert("config.json".into(), "{\"enabled\":true}\n".into());
+        let design = DeclarationDesign::scratch(BTreeMap::from([
+            ("main.rs".into(), "fn run();\n".into()),
+            ("config.json".into(), "{\"enabled\":true}\n".into()),
+        ]))
+        .unwrap();
         assert_eq!(
             SemanticProgress::scan(&design, workspace.path())
                 .unwrap()

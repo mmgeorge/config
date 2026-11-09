@@ -248,7 +248,7 @@ impl ExecutionConformanceJob {
         let accepted_paths = design
             .baseline
             .keys()
-            .chain(design.proposed.keys())
+            .chain(design.proposed_source.keys())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let inspected_workspace = workspace.clone();
@@ -800,29 +800,18 @@ impl HarnessBroker {
                         .collect::<Vec<_>>();
                     for path in newly_captured {
                         if let Some(source) = checkpoint.read(&self.store.objects, &path)? {
-                            let source_digest = crate::plan::digest(&source);
                             let source = String::from_utf8(source)?;
-                            let (text, calls) =
-                                forge_diff::syntax::DeclarationOverview::extract_with_calls(
-                                    &path, &source,
-                                )
-                                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                            let text = forge_diff::syntax::DeclarationOverview::format_with_width(
+                            let (file, calls) = design.capture_baseline(
+                                Path::new(&self.session.workspace),
                                 &path,
-                                &text,
-                                design.line_width,
-                            )
-                            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                            design.baseline.insert(
-                                path.clone(),
-                                crate::plan::DeclarationFile {
-                                    text,
-                                    source_digest,
-                                },
-                            );
-                            design
-                                .baseline_calls
-                                .insert(path, crate::plan::calls::from_extracted(calls));
+                                &source,
+                            )?;
+                            design.baseline.insert(path.clone(), file);
+                            if calls.is_empty() {
+                                design.baseline_calls.remove(&path);
+                            } else {
+                                design.baseline_calls.insert(path, calls);
+                            }
                         } else {
                             design.baseline.remove(&path);
                             design.baseline_calls.remove(&path);

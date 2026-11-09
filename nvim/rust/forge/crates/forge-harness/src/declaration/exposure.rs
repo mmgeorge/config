@@ -14,14 +14,19 @@ type Position = (String, u32, u32);
 pub(crate) fn symbols(workspace: &Path, design: &DeclarationDesign) -> Result<BTreeSet<Position>> {
     let mut metadata = design.clone();
     let mut inspected = BTreeSet::new();
-    for path in design.proposed.keys().filter(|path| path.ends_with(".rs")) {
+    for path in design
+        .parsed()?
+        .proposed
+        .keys()
+        .filter(|path| path.ends_with(".rs"))
+    {
         for directory in Path::new(path).ancestors().skip(1) {
             let manifest = directory
                 .join("Cargo.toml")
                 .to_string_lossy()
                 .replace('\\', "/");
             if read(workspace, &manifest, &mut metadata, &mut inspected)? {
-                let value: toml::Value = toml::from_str(&metadata.proposed[&manifest])?;
+                let value: toml::Value = toml::from_str(&metadata.parsed()?.proposed[&manifest])?;
                 let root = value
                     .get("lib")
                     .and_then(|library| library.get("path"))
@@ -219,6 +224,7 @@ pub(crate) fn symbols(workspace: &Path, design: &DeclarationDesign) -> Result<BT
         }
     }
     for (path, text) in design
+        .parsed()?
         .proposed
         .iter()
         .filter(|(path, _)| path.ends_with(".lua"))
@@ -242,14 +248,14 @@ fn read(
     design: &mut DeclarationDesign,
     inspected: &mut BTreeSet<String>,
 ) -> Result<bool> {
-    if design.proposed.contains_key(path) {
+    if design.parsed()?.proposed.contains_key(path) {
         return Ok(true);
     }
     if design.baseline.contains_key(path) || !inspected.insert(path.into()) {
         return Ok(false);
     }
     if let Some(text) = crate::plan::workspace_source(workspace, path)? {
-        design.proposed.insert(path.into(), text);
+        design.parsed_mut()?.proposed.insert(path.into(), text);
         Ok(true)
     } else {
         Ok(false)

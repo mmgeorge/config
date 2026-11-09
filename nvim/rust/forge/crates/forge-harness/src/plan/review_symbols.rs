@@ -21,9 +21,10 @@ pub(super) struct NarrativeSymbols {
 }
 
 impl NarrativeSymbols {
-    pub fn new(design: &DeclarationDesign, workspace: &Path) -> Self {
-        Self {
+    pub fn new(design: &DeclarationDesign, workspace: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
             proposed: design
+                .parsed()?
                 .proposed
                 .iter()
                 .flat_map(|(path, text)| symbols(path, text, workspace))
@@ -33,7 +34,7 @@ impl NarrativeSymbols {
                 .iter()
                 .flat_map(|(path, file)| symbols(path, &file.text, workspace))
                 .collect(),
-        }
+        })
     }
 
     pub fn matching(&self, name: &str) -> Vec<&Symbol> {

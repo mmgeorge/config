@@ -163,11 +163,10 @@ fn changed_paths(before: &PlanDocument, after: &PlanDocument) -> Result<String> 
             .collect::<Vec<_>>();
     let paths = [before_design, after_design]
         .into_iter()
-        .flat_map(|design| design.baseline.keys().chain(design.proposed.keys()))
+        .flat_map(|design| design.baseline.keys().chain(design.proposed_source.keys()))
         .collect::<std::collections::BTreeSet<_>>();
     for path in paths {
-        if before_design.proposed.get(path) != after_design.proposed.get(path)
-            || before_design.proposed_calls.get(path) != after_design.proposed_calls.get(path)
+        if before_design.proposed_source.get(path) != after_design.proposed_source.get(path)
             || before_design.baseline.contains_key(path) != after_design.baseline.contains_key(path)
         {
             changed.push(path.clone());

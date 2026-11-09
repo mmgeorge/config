@@ -215,13 +215,14 @@ impl BrokerObserver {
             .text
             .clone()
         } else {
+            let parsed = design.parsed()?;
             crate::plan::calls::present(
                 &path,
-                design
+                parsed
                     .proposed
                     .get(&path)
                     .context("proposed declaration not found")?,
-                design
+                parsed
                     .proposed_calls
                     .get(&path)
                     .map(Vec::as_slice)

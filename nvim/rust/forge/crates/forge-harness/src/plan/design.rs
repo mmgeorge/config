@@ -12,6 +12,26 @@ use serde::{Deserialize, Serialize};
 pub struct DeclarationFile {
     pub text: String,
     pub source_digest: String,
+    /// Holds the text `plan_read` shows for this baseline: its declarations with the captured
+    /// function sections. A proposed file whose text equals it proposes no change.
+    pub editable_text: String,
+}
+
+impl DeclarationFile {
+    /// Create a baseline file whose editable text shows `calls` beneath their signatures.
+    pub fn new(
+        path: &str,
+        text: String,
+        source_digest: String,
+        calls: &[super::FunctionBody],
+    ) -> Result<Self> {
+        let editable_text = super::calls::combined(path, &text, calls)?;
+        Ok(Self {
+            text,
+            source_digest,
+            editable_text,
+        })
+    }
 }
 
 /// Borrow the original and proposed paths while owning the computed change list.
@@ -21,8 +41,7 @@ pub(crate) struct DesignFileInventory<'a> {
     changed_paths: Vec<String>,
 }
 
-type SourceOverviewCache =
-    std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
+type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (String, Vec<super::FunctionBody>)>>;
 static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
 
 /// Owns baseline declarations and the agent's proposed file contents.
@@ -40,9 +59,6 @@ pub struct DeclarationDesign {
     /// Retains dependency selection independently of subsequent checkout edits.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cargo_lock: BTreeMap<String, String>,
-    /// Generated reference evidence for the exact submitted declaration snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validation: Option<crate::declaration::DeclarationValidation>,
     #[serde(default)]
     pub document: DesignDocument,
     /// Holds the agent's text for each authored `plan:` artifact it has edited, keyed by
@@ -53,20 +69,34 @@ pub struct DeclarationDesign {
     #[serde(default = "default_line_width")]
     pub line_width: usize,
     pub baseline: BTreeMap<String, DeclarationFile>,
-    pub proposed: BTreeMap<String, String>,
     pub moved: BTreeMap<String, String>,
     /// Function metadata captured with each source baseline, retaining reference extraction order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub baseline_calls: BTreeMap<String, Vec<super::FunctionBody>>,
+    /// Holds the text of every proposed project file, keyed by proposed path, as the last plan
+    /// edit or review rename left it. Source files contain declarations and function sections;
+    /// configuration files contain complete contents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub proposed_source: BTreeMap<String, String>,
+    /// Holds the structure that the last submission parsed from `proposed_source`. Drafts have
+    /// none, and every effective plan edit removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsed: Option<ParsedDeclarations>,
+}
+
+/// Holds declarations and function bodies derived from one exact `proposed_source`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ParsedDeclarations {
+    /// Identifies the plan inputs this structure was derived from.
+    pub source_fingerprint: String,
+    /// Declarations of each proposed file without function sections, keyed by proposed path.
+    pub proposed: BTreeMap<String, String>,
     /// Function changes and reference relationships accompanying proposed declarations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub proposed_calls: BTreeMap<String, Vec<super::FunctionBody>>,
-    /// Holds the agent's editable text for each proposed source file whose latest edit does not
-    /// parse as semantic structure, keyed by proposed path. Reads and later patches use this text,
-    /// `proposed` keeps the file's last parsed structure (empty for a new file), and submission
-    /// reports each file's structure problem by line.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub unparsed_proposed: BTreeMap<String, String>,
+    /// Reference evidence generated for exactly this structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::declaration::DeclarationValidation>,
 }
 
 fn default_line_width() -> usize {
@@ -80,16 +110,14 @@ impl Default for DeclarationDesign {
             check_preview_source: String::new(),
             check_configuration: None,
             cargo_lock: BTreeMap::new(),
-            validation: None,
             document: DesignDocument::default(),
             artifact_text: BTreeMap::new(),
             line_width: default_line_width(),
             baseline: BTreeMap::new(),
-            proposed: BTreeMap::new(),
             moved: BTreeMap::new(),
             baseline_calls: BTreeMap::new(),
-            proposed_calls: BTreeMap::new(),
-            unparsed_proposed: BTreeMap::new(),
+            proposed_source: BTreeMap::new(),
+            parsed: None,
         }
     }
 }
@@ -106,7 +134,11 @@ impl ValidatedDesign {
     }
 
     pub(crate) fn into_design(mut self) -> DeclarationDesign {
-        self.design.validation = Some(self.report);
+        self.design
+            .parsed
+            .as_mut()
+            .expect("validated_revision stores the parsed declarations it validated")
+            .validation = Some(self.report);
         self.design
     }
 }
@@ -146,7 +178,8 @@ impl DeclarationDesign {
     ) -> Result<ValidatedDesign> {
         self.validate()?;
         let mut design = self.clone();
-        let structure = design.parse_unparsed();
+        let (parsed, structure) = design.derive_parsed()?;
+        design.parsed = Some(parsed);
         let configuration = crate::checks::ConfigSnapshot::load(workspace)?;
         let artifacts =
             super::design_artifact::parse_authored(title, &design, &configuration.config)?;
@@ -179,12 +212,20 @@ impl DeclarationDesign {
             );
         }
         design.check_configuration = Some(configuration);
+        // Classify references once against the final design. Classification never revisits a
+        // reference it already made a construction or callback, so classifying a draft would
+        // keep kinds that the final design no longer supports.
+        let mut resolver =
+            crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
+        for (path, functions) in &mut design.parsed_mut()?.proposed_calls {
+            super::calls::classify(path, functions, &mut resolver);
+        }
         // Authored-rule diagnostics wait for the resolver so one rejection reports them with
         // every reference failure instead of one rule family per submission.
         let mut authored = design.authored_diagnostics(workspace)?;
         authored.extend(artifacts.diagnostic);
         let paths = design
-            .proposed
+            .proposed_source
             .keys()
             .filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml"))
             .cloned()
@@ -208,7 +249,7 @@ impl DeclarationDesign {
         let mut resolver =
             crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
         authored.extend(super::calls::validate_behaviors(&design, &mut resolver)?);
-        let report = resolver.validate(&design);
+        let report = resolver.validate(&design)?;
         crate::declaration::DeclarationValidationError::ensure_empty(
             report.diagnostic.iter().cloned().chain(authored).collect(),
         )?;
@@ -220,7 +261,7 @@ impl DeclarationDesign {
     /// Identifies only the planned inputs that determine check selection.
     pub(crate) fn check_preview_fingerprint(&self) -> Result<String> {
         let manifests: BTreeMap<_, _> = self
-            .proposed
+            .proposed_source
             .iter()
             .filter(|(path, _)| {
                 path.ends_with("Cargo.toml")
@@ -277,6 +318,7 @@ impl DeclarationDesign {
         Ok(design)
     }
 
+    /// Capture one workspace file's baseline without changing the saved design.
     pub(crate) fn source(
         &self,
         workspace: &Path,
@@ -285,6 +327,21 @@ impl DeclarationDesign {
         validate_path(path)?;
         let source = workspace_source(workspace, path)?
             .with_context(|| format!("declaration file does not exist: {path}"))?;
+        self.capture_baseline(workspace, path, &source)
+    }
+
+    /// Extract one file's baseline declarations and function metadata from its source text.
+    ///
+    /// Baseline references point at code that exists before the plan, so they are classified
+    /// against the baseline snapshot rather than the current proposal. Planning-time capture and
+    /// Resolve-phase recapture from an execution checkpoint both use this, so their baselines
+    /// agree.
+    pub(crate) fn capture_baseline(
+        &self,
+        workspace: &Path,
+        path: &str,
+        source: &str,
+    ) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
         let source_digest = super::digest(source.as_bytes());
         let key = format!("{path}:{}:{source_digest}", self.line_width);
         let cache = SOURCE_OVERVIEW_CACHE.get_or_init(Default::default);
@@ -296,7 +353,7 @@ impl DeclarationDesign {
         let overview = if let Some(overview) = cached {
             overview
         } else {
-            let (text, calls) = DeclarationOverview::extract_with_calls(path, &source)
+            let (text, calls) = DeclarationOverview::extract_with_calls(path, source)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("extract {path}"))?;
             let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
@@ -310,21 +367,15 @@ impl DeclarationDesign {
             let calls = calls
                 .into_iter()
                 .filter(|function| saved_owners.contains(&function.owner))
-                .collect();
-            let overview = (
-                DeclarationFile {
-                    text,
-                    source_digest,
-                },
-                calls,
-            );
+                .collect::<Vec<_>>();
+            let overview = (text, calls);
             let mut cache = cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
             let bytes = cache
                 .values()
-                .map(|(file, calls)| {
-                    file.text.len()
+                .map(|(text, calls)| {
+                    text.len()
                         + calls
                             .iter()
                             .map(|function| {
@@ -345,7 +396,7 @@ impl DeclarationDesign {
             cache.insert(key, overview.clone());
             overview
         };
-        let (file, mut calls) = overview;
+        let (text, mut calls) = overview;
         if calls
             .iter()
             .flat_map(|function| function.call.iter().flatten())
@@ -357,12 +408,22 @@ impl DeclarationDesign {
             })
         {
             let mut captured = self.clone();
-            captured.proposed.insert(path.into(), file.text.clone());
+            captured.baseline.insert(
+                path.into(),
+                DeclarationFile {
+                    text: text.clone(),
+                    source_digest: source_digest.clone(),
+                    editable_text: String::new(),
+                },
+            );
             let mut resolver =
-                crate::declaration::DeclarationResolver::planned(workspace, &captured, false)?;
+                crate::declaration::DeclarationResolver::planned(workspace, &captured, true)?;
             super::calls::classify(path, &mut calls, &mut resolver);
         }
-        Ok((file, calls))
+        Ok((
+            DeclarationFile::new(path, text, source_digest, &calls)?,
+            calls,
+        ))
     }
 
     /// Inspect one uncaptured workspace file without changing the saved design.
@@ -373,11 +434,10 @@ impl DeclarationDesign {
         path: &str,
         baseline: bool,
     ) -> Result<serde_json::Value> {
-        if !self.baseline.contains_key(path) && !self.proposed.contains_key(path) {
-            let (file, calls) = self.source(workspace, path)?;
-            let text = super::calls::combined(path, &file.text, &calls)?;
+        if !self.baseline.contains_key(path) && !self.proposed_source.contains_key(path) {
+            let (file, _) = self.source(workspace, path)?;
             return Ok(
-                serde_json::json!({"path":path,"side":"workspace","text":text,"source_digest":file.source_digest}),
+                serde_json::json!({"path":path,"side":"workspace","text":file.editable_text,"source_digest":file.source_digest}),
             );
         }
         self.read(path, baseline)
@@ -402,58 +462,154 @@ impl DeclarationDesign {
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate baseline {path}"))?;
         }
-        for (path, text) in &self.proposed {
+        for (path, text) in &self.proposed_source {
             validate_path(path)?;
-            DeclarationOverview::parse(path, text)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("validate {path}"))?;
-        }
-        for (files, baseline) in [(&self.baseline_calls, true), (&self.proposed_calls, false)] {
-            for (path, calls) in files {
-                let text = if baseline {
-                    self.baseline.get(path).map(|file| &file.text)
-                } else {
-                    self.proposed.get(path)
-                }
-                .with_context(|| format!("call metadata has no declaration file: {path}"))?;
-                let combined = super::calls::combined(path, text, calls)?;
-                let (_, parsed) = super::calls::parse(path, &combined, calls)?;
-                ensure!(
-                    parsed.len() == calls.len(),
-                    "call metadata has an absent or ambiguous callable: {path}"
-                );
+            if is_configuration(path) {
+                DeclarationOverview::parse(path, text)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .with_context(|| format!("validate {path}"))?;
             }
+        }
+        for (path, calls) in &self.baseline_calls {
+            let text = &self
+                .baseline
+                .get(path)
+                .with_context(|| format!("call metadata has no declaration file: {path}"))?
+                .text;
+            validate_calls(path, text, calls)?;
         }
         for (from, to) in &self.moved {
             ensure!(
                 self.baseline.contains_key(from)
-                    && self.proposed.contains_key(to)
-                    && !self.proposed.contains_key(from),
+                    && self.proposed_source.contains_key(to)
+                    && !self.proposed_source.contains_key(from),
                 "invalid declaration move {from} → {to}"
             );
         }
-        for path in self.unparsed_proposed.keys() {
+        if let Some(parsed) = &self.parsed {
             ensure!(
-                self.proposed.contains_key(path),
-                "unparsed proposal has no proposed declaration file: {path}"
+                parsed.source_fingerprint == self.source_fingerprint()?,
+                "parsed declarations do not match the proposed source"
             );
+            ensure!(
+                parsed.proposed.keys().eq(self.proposed_source.keys()),
+                "parsed declarations do not cover the proposed files"
+            );
+            for (path, text) in &parsed.proposed {
+                DeclarationOverview::parse(path, text)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .with_context(|| format!("validate {path}"))?;
+            }
+            for (path, calls) in &parsed.proposed_calls {
+                let text = parsed
+                    .proposed
+                    .get(path)
+                    .with_context(|| format!("call metadata has no declaration file: {path}"))?;
+                validate_calls(path, text, calls)?;
+            }
         }
         Ok(())
     }
 
-    /// Parse every unparsed proposal, keeping each one that parses and reporting each one that
-    /// does not at its editable line.
-    fn parse_unparsed(&mut self) -> Vec<crate::declaration::DeclarationDiagnostic> {
+    /// Get the structure the last submission parsed from the proposed source.
+    pub(crate) fn parsed(&self) -> Result<&ParsedDeclarations> {
+        self.parsed
+            .as_ref()
+            .context("plan has no submitted declaration structure; submit it first")
+    }
+
+    /// Get mutable access to the submitted structure for edits that keep it current.
+    pub(crate) fn parsed_mut(&mut self) -> Result<&mut ParsedDeclarations> {
+        self.parsed
+            .as_mut()
+            .context("plan has no submitted declaration structure; submit it first")
+    }
+
+    /// Store one file's parsed declarations and regenerate its proposed source from them.
+    ///
+    /// Review edits that change parsed structure directly, such as a symbol rename, use this so
+    /// the proposed source and the parsed structure keep describing each other. Every other
+    /// proposed file must already be parsed. The validation report no longer applies.
+    pub fn parsed_insert(
+        &mut self,
+        path: &str,
+        declarations: String,
+        calls: Vec<super::FunctionBody>,
+    ) -> Result<()> {
+        let text = super::calls::combined(path, &declarations, &calls)?;
+        self.proposed_source.insert(path.into(), text);
+        let mut parsed = self.parsed.take().unwrap_or_default();
+        parsed.proposed.insert(path.into(), declarations);
+        if calls.is_empty() {
+            parsed.proposed_calls.remove(path);
+        } else {
+            parsed.proposed_calls.insert(path.into(), calls);
+        }
+        parsed.validation = None;
+        parsed.source_fingerprint = self.source_fingerprint()?;
+        self.parsed = Some(parsed);
+        Ok(())
+    }
+
+    /// Identify the plan inputs that parsed declarations are derived from.
+    pub(crate) fn source_fingerprint(&self) -> Result<String> {
+        Ok(super::digest(&super::codec::to_vec(&(
+            &self.proposed_source,
+            &self.moved,
+            &self.baseline,
+            &self.baseline_calls,
+        ))?))
+    }
+
+    /// Create a design whose proposed source and parsed declarations are the given texts, for
+    /// callers that need a design only as input to declaration indexing.
+    pub(crate) fn scratch(proposed: BTreeMap<String, String>) -> Result<Self> {
+        let mut design = Self {
+            proposed_source: proposed.clone(),
+            ..Self::default()
+        };
+        design.parsed = Some(ParsedDeclarations {
+            source_fingerprint: design.source_fingerprint()?,
+            proposed,
+            ..ParsedDeclarations::default()
+        });
+        Ok(design)
+    }
+
+    /// Parse every proposed file against its baseline evidence.
+    ///
+    /// Each file is matched against the function metadata captured from its original path, so
+    /// captured source positions survive any sequence of edits that keeps a reference. A file
+    /// whose structure does not parse becomes a diagnostic at its line, and the returned
+    /// structure omits it.
+    fn derive_parsed(
+        &self,
+    ) -> Result<(
+        ParsedDeclarations,
+        Vec<crate::declaration::DeclarationDiagnostic>,
+    )> {
+        let mut parsed = ParsedDeclarations {
+            source_fingerprint: self.source_fingerprint()?,
+            ..ParsedDeclarations::default()
+        };
         let mut diagnostic = Vec::new();
-        for (path, text) in std::mem::take(&mut self.unparsed_proposed) {
+        for (path, text) in &self.proposed_source {
+            let original = self
+                .moved
+                .iter()
+                .find(|(_, to)| *to == path)
+                .map_or(path, |(from, _)| from);
             let previous = self
-                .proposed_calls
-                .get(&path)
+                .baseline_calls
+                .get(original)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            match super::calls::parse(&path, &text, previous) {
+            match super::calls::parse(path, text, previous) {
                 Ok((declarations, calls)) => {
-                    self.store_parsed(&path, declarations, calls);
+                    parsed.proposed.insert(path.clone(), declarations);
+                    if !calls.is_empty() {
+                        parsed.proposed_calls.insert(path.clone(), calls);
+                    }
                 }
                 Err(error) => {
                     let (line, reason) =
@@ -463,44 +619,37 @@ impl DeclarationDesign {
                         };
                     diagnostic.push(crate::declaration::DeclarationDiagnostic {
                         path: path.clone(),
-                        line: line as u32,
+                        line: u32::try_from(line)?,
                         column: 0,
-                        reference: text.lines().nth(line - 1).unwrap_or_default().trim().into(),
+                        reference: text
+                            .lines()
+                            .nth(line.saturating_sub(1))
+                            .unwrap_or_default()
+                            .trim()
+                            .into(),
                         error: true,
                         reason,
                         kind: crate::declaration::DeclarationDiagnosticKind::DeclarationStructure,
                     });
-                    self.unparsed_proposed.insert(path, text);
                 }
             }
         }
-        diagnostic
-    }
-
-    /// Replace one proposed file's parsed structure and drop its unparsed text.
-    fn store_parsed(&mut self, path: &str, declarations: String, calls: Vec<super::FunctionBody>) {
-        self.unparsed_proposed.remove(path);
-        self.proposed.insert(path.into(), declarations);
-        if calls.is_empty() {
-            self.proposed_calls.remove(path);
-        } else {
-            self.proposed_calls.insert(path.into(), calls);
-        }
+        Ok((parsed, diagnostic))
     }
 
     /// Return original paths whose declaration content or location changed.
     pub fn changed_paths(&self) -> Vec<String> {
         self.baseline
             .keys()
-            .chain(self.proposed.keys())
+            .chain(self.proposed_source.keys())
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .filter(|path| {
-                self.unparsed_proposed.contains_key(path)
-                    || self.baseline.get(path).map(|file| file.text.as_str())
-                        != self.proposed.get(path).map(String::as_str)
-                    || self.baseline_calls.get(path) != self.proposed_calls.get(path)
+                self.baseline
+                    .get(path)
+                    .map(|file| file.editable_text.as_str())
+                    != self.proposed_source.get(path).map(String::as_str)
             })
             .collect()
     }
@@ -535,7 +684,7 @@ impl DeclarationDesign {
         let paths = self
             .baseline
             .keys()
-            .chain(self.proposed.keys())
+            .chain(self.proposed_source.keys())
             .collect::<BTreeSet<_>>();
         DesignFileInventory {
             paths,
@@ -543,46 +692,18 @@ impl DeclarationDesign {
         }
     }
 
-    /// Read one captured file's baseline or proposed semantic structure.
+    /// Read one captured file's baseline or proposed text as `plan_read` shows it.
     pub fn read(&self, path: &str, baseline: bool) -> Result<serde_json::Value> {
         validate_path(path)?;
-        if !baseline && let Some(text) = self.unparsed_proposed.get(path) {
-            return Ok(serde_json::json!({"path":path,"side":"proposed","text":text}));
-        }
         let text = if baseline {
-            self.baseline.get(path).map(|file| &file.text)
+            self.baseline.get(path).map(|file| &file.editable_text)
         } else {
-            self.proposed.get(path)
+            self.proposed_source.get(path)
         }
         .with_context(|| format!("declaration file does not exist: {path}"))?;
-        let calls = if baseline {
-            self.baseline_calls.get(path)
-        } else {
-            self.proposed_calls.get(path)
-        };
-        let text =
-            super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
         Ok(
             serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
         )
-    }
-
-    /// Return the proposed text a patch of `path` applies to: its unparsed text when its last
-    /// edit did not parse, otherwise its parsed structure with function sections.
-    fn editable_text(&self, path: &str) -> Result<String> {
-        if let Some(text) = self.unparsed_proposed.get(path) {
-            return Ok(text.clone());
-        }
-        let text = self
-            .proposed
-            .get(path)
-            .with_context(|| format!("cannot update absent declaration file: {path}"))?;
-        let calls = self
-            .proposed_calls
-            .get(path)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        super::calls::combined(path, text, calls)
     }
 
     /// Withdraw every proposal for one project file, including a move, so it reads from the
@@ -596,19 +717,15 @@ impl DeclarationDesign {
             .map(|(from, _)| from.clone())
             .unwrap_or_else(|| path.into());
         ensure!(
-            self.baseline.contains_key(&original) || self.proposed.contains_key(path),
+            self.baseline.contains_key(&original) || self.proposed_source.contains_key(path),
             "{path}: the plan proposes no change to this file"
         );
         if let Some(destination) = self.moved.remove(&original) {
-            self.proposed.remove(&destination);
-            self.proposed_calls.remove(&destination);
-            self.unparsed_proposed.remove(&destination);
+            self.proposed_source.remove(&destination);
         }
         self.baseline.remove(&original);
         self.baseline_calls.remove(&original);
-        self.proposed.remove(&original);
-        self.proposed_calls.remove(&original);
-        self.unparsed_proposed.remove(&original);
+        self.proposed_source.remove(&original);
         Ok(())
     }
 
@@ -632,7 +749,7 @@ impl DeclarationDesign {
         );
         let mut candidate = self.clone();
         let mut title = title.to_owned();
-        candidate.validation = None;
+        candidate.parsed = None;
         let mut position = 1;
         let mut edited = BTreeSet::new();
         let body_end = |position: usize| {
@@ -721,7 +838,9 @@ impl DeclarationDesign {
                 continue;
             }
             validate_path(path)?;
-            if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path) {
+            if !candidate.proposed_source.contains_key(path)
+                && !candidate.baseline.contains_key(path)
+            {
                 if kind == "add" {
                     ensure!(
                         std::fs::symlink_metadata(workspace.join(path))
@@ -736,10 +855,11 @@ impl DeclarationDesign {
                             "{path}: workspace changed since inspection. Read the declaration file again."
                         );
                     }
-                    candidate.proposed.insert(path.into(), file.text.clone());
+                    candidate
+                        .proposed_source
+                        .insert(path.into(), file.editable_text.clone());
                     if !calls.is_empty() {
-                        candidate.baseline_calls.insert(path.into(), calls.clone());
-                        candidate.proposed_calls.insert(path.into(), calls);
+                        candidate.baseline_calls.insert(path.into(), calls);
                     }
                     candidate.baseline.insert(path.into(), file);
                 }
@@ -767,7 +887,7 @@ impl DeclarationDesign {
                 }
                 ensure!(
                     to != path
-                        && !candidate.proposed.contains_key(to)
+                        && !candidate.proposed_source.contains_key(to)
                         && (!candidate.baseline.contains_key(to)
                             || candidate
                                 .moved
@@ -786,56 +906,27 @@ impl DeclarationDesign {
                 "delete" => {
                     ensure!(body.is_empty(), "Delete File must have no patch body");
                     ensure!(
-                        candidate.proposed.remove(path).is_some(),
+                        candidate.proposed_source.remove(path).is_some(),
                         "cannot delete absent declaration file: {path}"
                     );
                     candidate.moved.retain(|_, to| to != path);
-                    candidate.proposed_calls.remove(path);
-                    candidate.unparsed_proposed.remove(path);
                 }
                 "add" => {
                     ensure!(
-                        !candidate.proposed.contains_key(path),
+                        !candidate.proposed_source.contains_key(path),
                         "cannot add existing declaration file: {path}"
                     );
                     let text = added_text(body)?;
-                    match super::calls::parse(path, &text, &[]) {
-                        Ok((declarations, calls)) => {
-                            candidate.store_parsed(path, declarations, calls);
-                        }
-                        Err(_) if defers_structure_errors(path) => {
-                            candidate.proposed.insert(path.into(), String::new());
-                            candidate.unparsed_proposed.insert(path.into(), text);
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    validate_configuration_text(path, &text)?;
+                    candidate.proposed_source.insert(path.into(), text);
                 }
                 _ => {
-                    ensure!(
-                        candidate.proposed.contains_key(path),
-                        "cannot update absent declaration file: {path}"
-                    );
-                    let original = candidate.editable_text(path)?;
+                    let original = candidate.proposed_source.remove(path).with_context(|| {
+                        format!("cannot update absent declaration file: {path}")
+                    })?;
                     let text = patch_file(path, &original, body)?;
-                    let calls = candidate.proposed_calls.remove(path).unwrap_or_default();
-                    let parsed = super::calls::parse(destination, &text, &calls);
-                    let structure = candidate.proposed.remove(path).unwrap_or_default();
-                    candidate.unparsed_proposed.remove(path);
-                    match parsed {
-                        Ok((declarations, calls)) => {
-                            candidate.store_parsed(destination, declarations, calls);
-                        }
-                        Err(_) if defers_structure_errors(destination) => {
-                            // The last parsed structure follows the file, so moves and
-                            // inventories stay consistent until the text parses.
-                            candidate.proposed.insert(destination.into(), structure);
-                            if !calls.is_empty() {
-                                candidate.proposed_calls.insert(destination.into(), calls);
-                            }
-                            candidate.unparsed_proposed.insert(destination.into(), text);
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    validate_configuration_text(destination, &text)?;
+                    candidate.proposed_source.insert(destination.into(), text);
                     if destination != path {
                         let original = candidate
                             .moved
@@ -855,34 +946,15 @@ impl DeclarationDesign {
             }
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
-        if candidate
-            .proposed_calls
-            .values()
-            .flatten()
-            .flat_map(|function| function.call.iter().flatten())
-            .any(|reference| {
-                !reference.unresolved
-                    && matches!(
-                        reference.kind,
-                        super::CallKind::Value | super::CallKind::Property | super::CallKind::Call
-                    )
-            })
-        {
-            let mut resolver =
-                crate::declaration::DeclarationResolver::planned(workspace, &candidate, false)?;
-            for (path, functions) in &mut candidate.proposed_calls {
-                super::calls::classify(path, functions, &mut resolver);
-            }
-        }
         candidate.validate()?;
-        if candidate.proposed == self.proposed
-            && candidate.proposed_calls == self.proposed_calls
-            && candidate.unparsed_proposed == self.unparsed_proposed
+        if candidate.proposed_source == self.proposed_source
             && candidate.baseline == self.baseline
+            && candidate.baseline_calls == self.baseline_calls
             && candidate.document == self.document
+            && candidate.artifact_text == self.artifact_text
             && candidate.moved == self.moved
         {
-            candidate.validation = self.validation.clone();
+            candidate.parsed = self.parsed.clone();
         }
         Ok((candidate, title))
     }
@@ -915,12 +987,30 @@ pub(crate) fn patch_single_file(patch: &str, path: &str, original: &str) -> Resu
     }
 }
 
-/// Report whether an edit of `path` that does not parse is stored for `plan_submit` to report.
+/// Report whether `path` holds configuration, whose complete contents are parsed on every edit.
+fn is_configuration(path: &str) -> bool {
+    forge_diff::syntax::ConfigurationFormat::for_path(path).is_some()
+}
+
+/// Reject configuration text that does not parse, so an invalid value never reaches the plan.
 ///
-/// Source files hold semantic structure whose problems the agent corrects across several
-/// edits. Configuration files keep complete values, so a syntax error still rejects the edit.
-fn defers_structure_errors(path: &str) -> bool {
-    forge_diff::syntax::ConfigurationFormat::for_path(path).is_none()
+/// Source files are stored as written; `plan_submit` reports their structure problems.
+fn validate_configuration_text(path: &str, text: &str) -> Result<()> {
+    if is_configuration(path) {
+        DeclarationOverview::parse(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    }
+    Ok(())
+}
+
+/// Check that captured or parsed function metadata belongs to exactly the callables of `text`.
+fn validate_calls(path: &str, text: &str, calls: &[super::FunctionBody]) -> Result<()> {
+    let combined = super::calls::combined(path, text, calls)?;
+    let (_, parsed) = super::calls::parse(path, &combined, calls)?;
+    ensure!(
+        parsed.len() == calls.len(),
+        "call metadata has an absent or ambiguous callable: {path}"
+    );
+    Ok(())
 }
 
 /// Collect the text of an Add File body, whose every line starts with `+`.
@@ -1174,4 +1264,228 @@ fn context_mismatch(
     }
     message.push_str(". Read the file again and copy context lines exactly.");
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GAME: &str = "/// Help once.\nfn helper() {}\n/// Run the helper.\nfn run() {\n    helper();\n}\n/// Walk with the helper.\nfn walk() {\n    helper();\n}\n";
+
+    fn workspace() -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Game.rs"), GAME).unwrap();
+        workspace
+    }
+
+    fn patched(design: &DeclarationDesign, workspace: &Path, patch: &str) -> DeclarationDesign {
+        design
+            .patch(workspace, &BTreeMap::new(), patch, "Rounds")
+            .unwrap()
+            .0
+    }
+
+    /// Capture `Game.rs` without changing its text.
+    fn captured(workspace: &Path) -> DeclarationDesign {
+        let design = DeclarationDesign::open(workspace).unwrap();
+        patched(
+            &design,
+            workspace,
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n-fn helper();\n+fn helper();\n*** End Patch",
+        )
+    }
+
+    /// Get the captured source position of each call from `owner` to `helper` in a parsed file.
+    fn helper_sources(parsed: &ParsedDeclarations, path: &str, owner: &str) -> Vec<bool> {
+        parsed.proposed_calls[path]
+            .iter()
+            .filter(|body| body.owner == owner)
+            .flat_map(|body| body.call.iter().flatten())
+            .filter(|call| call.name == "helper")
+            .map(|call| call.source.is_some())
+            .collect()
+    }
+
+    #[test]
+    fn unedited_capture_submits_the_baseline_unchanged() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        assert!(design.changed_paths().is_empty());
+        assert_eq!(
+            design.proposed_source["Game.rs"],
+            design.baseline["Game.rs"].editable_text
+        );
+        let (parsed, diagnostic) = design.derive_parsed().unwrap();
+        assert!(diagnostic.is_empty());
+        assert_eq!(parsed.proposed["Game.rs"], design.baseline["Game.rs"].text);
+        assert_eq!(
+            parsed.proposed_calls["Game.rs"],
+            design.baseline_calls["Game.rs"]
+        );
+    }
+
+    #[test]
+    fn restored_reference_keeps_its_captured_source() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        let text = design.proposed_source["Game.rs"].clone();
+        let lines = text.lines().collect::<Vec<_>>();
+        let run = lines.iter().position(|line| *line == "fn run();").unwrap();
+        let calls = lines[run + 1];
+        let helper = lines[run + 2];
+        assert_eq!((calls, helper.trim()), ("Calls", "helper"));
+
+        let removed = patched(
+            &design,
+            workspace.path(),
+            &format!(
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n {calls}\n-{helper}\n*** End Patch"
+            ),
+        );
+        let (parsed, _) = removed.derive_parsed().unwrap();
+        assert!(helper_sources(&parsed, "Game.rs", "run").is_empty());
+
+        let restored = patched(
+            &removed,
+            workspace.path(),
+            &format!(
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n {calls}\n+{helper}\n*** End Patch"
+            ),
+        );
+        assert_eq!(restored.proposed_source["Game.rs"], text);
+        let (parsed, _) = restored.derive_parsed().unwrap();
+        assert_eq!(helper_sources(&parsed, "Game.rs", "run"), [true]);
+    }
+
+    #[test]
+    fn moved_file_keeps_evidence_from_its_original_path() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        let moved = patched(
+            &design,
+            workspace.path(),
+            "*** Begin Patch\n*** Update File: Game.rs\n*** Move to: Arena.rs\n@@\n-/// Run the helper.\n+/// Run the helper in the arena.\n*** End Patch",
+        );
+        assert_eq!(moved.moved["Game.rs"], "Arena.rs");
+        let (parsed, diagnostic) = moved.derive_parsed().unwrap();
+        assert!(diagnostic.is_empty());
+        assert_eq!(helper_sources(&parsed, "Arena.rs", "run"), [true]);
+        assert_eq!(helper_sources(&parsed, "Arena.rs", "walk"), [true]);
+    }
+
+    #[test]
+    fn renamed_callable_loses_only_its_own_evidence() {
+        let workspace = workspace();
+        let design = captured(workspace.path());
+        let renamed = patched(
+            &design,
+            workspace.path(),
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n-fn run();\n+fn start();\n*** End Patch",
+        );
+        let (parsed, diagnostic) = renamed.derive_parsed().unwrap();
+        assert!(diagnostic.is_empty());
+        assert_eq!(helper_sources(&parsed, "Game.rs", "start"), [false]);
+        assert_eq!(helper_sources(&parsed, "Game.rs", "walk"), [true]);
+    }
+
+    #[test]
+    fn plan_edit_removes_submitted_structure_and_a_failed_edit_keeps_it() {
+        let workspace = workspace();
+        let mut design = captured(workspace.path());
+        let (parsed, _) = design.derive_parsed().unwrap();
+        design.parsed = Some(parsed);
+        design.validate().unwrap();
+
+        let failed = design.patch(
+            workspace.path(),
+            &BTreeMap::new(),
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n-fn absent();\n+fn present();\n*** End Patch",
+            "Rounds",
+        );
+        assert!(failed.is_err());
+        assert!(
+            design.parsed().is_ok(),
+            "a failed edit leaves the design as it was"
+        );
+
+        let edited = patched(
+            &design,
+            workspace.path(),
+            "*** Begin Patch\n*** Add File: plan:overview.md\n+# Rounds\n+\n+## Objective\n+Play.\n*** End Patch",
+        );
+        assert!(edited.parsed.is_none());
+        assert!(edited.parsed().is_err());
+    }
+
+    #[test]
+    fn stale_parsed_structure_is_rejected() {
+        let workspace = workspace();
+        let mut design = captured(workspace.path());
+        let (parsed, _) = design.derive_parsed().unwrap();
+        design.parsed = Some(parsed);
+        design.validate().unwrap();
+        design
+            .proposed_source
+            .get_mut("Game.rs")
+            .unwrap()
+            .push_str("/// Added later.\nfn later();\n");
+        let error = design.validate().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("parsed declarations do not match the proposed source"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn review_rename_regenerates_the_renamed_proposed_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut design = patched(
+            &DeclarationDesign::open(workspace.path()).unwrap(),
+            workspace.path(),
+            "*** Begin Patch\n*** Add File: Rounds.rs\n+/// Score one round.\n+fn score(round: u32) -> u32;\n+Algorithm\n+  return round\n+\n+/// Play every round.\n+fn play(rounds: u32);\n+Algorithm\n+  for each round in rounds\n+    score(round)\n+Calls\n+  score\n*** End Patch",
+        );
+        let (parsed, diagnostic) = design.derive_parsed().unwrap();
+        assert!(diagnostic.is_empty());
+        design.parsed = Some(parsed);
+        let mut document = crate::plan::test_fixture("plan", "Rounds");
+        document.design = Some(design.clone());
+        let index =
+            super::super::references::PlanReferenceIndex::planned(&document, workspace.path())
+                .unwrap();
+        let score_line = u32::try_from(
+            design.parsed().unwrap().proposed["Rounds.rs"]
+                .lines()
+                .position(|line| line.starts_with("fn score("))
+                .unwrap()
+                + 1,
+        )
+        .unwrap();
+        let identity = index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "Rounds.rs" && *line == score_line)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap();
+
+        let renamed = index.renamed(&document, &identity, "tally").unwrap();
+        let renamed = renamed.design.unwrap();
+        renamed.validate().unwrap();
+        let parsed = renamed.parsed().unwrap();
+        assert!(parsed.validation.is_none());
+        let text = &renamed.proposed_source["Rounds.rs"];
+        assert_eq!(
+            *text,
+            super::super::calls::combined(
+                "Rounds.rs",
+                &parsed.proposed["Rounds.rs"],
+                &parsed.proposed_calls["Rounds.rs"],
+            )
+            .unwrap()
+        );
+        assert!(text.contains("fn tally(round: u32)"), "{text}");
+        assert!(
+            text.contains("tally(round)") && !text.contains("score"),
+            "{text}"
+        );
+    }
 }

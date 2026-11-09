@@ -42,8 +42,11 @@ struct Edge {
 }
 
 /// Orders changed and explicitly included snapshots by package and declaration dependencies.
-pub(super) fn order(design: &DeclarationDesign, included: &HashSet<String>) -> Vec<ReviewFile> {
-    let mut source = design.proposed.clone();
+pub(super) fn order(
+    design: &DeclarationDesign,
+    included: &HashSet<String>,
+) -> anyhow::Result<Vec<ReviewFile>> {
+    let mut source = design.parsed()?.proposed.clone();
     for (path, file) in &design.baseline {
         if design.moved.contains_key(path) {
             continue;
@@ -176,7 +179,7 @@ pub(super) fn order(design: &DeclarationDesign, included: &HashSet<String>) -> V
             result.push(file.clone());
         }
     }
-    result
+    Ok(result)
 }
 
 fn discover_packages(source: &BTreeMap<String, String>) -> BTreeMap<String, Package> {
