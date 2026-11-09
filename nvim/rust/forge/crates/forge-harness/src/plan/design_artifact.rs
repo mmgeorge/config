@@ -13,7 +13,6 @@ use anyhow::{Context, Result, bail};
 
 use super::design::DeclarationDesign;
 use super::design_document::{DesignDecision, DesignDocument};
-use super::design_flows::{DesignFlow, DesignFlowBranch, DesignFlowEffect, DesignFlowStep};
 use super::design_tests::{DesignTestCase, DesignTestChange, DesignTestFile};
 use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 
@@ -25,7 +24,7 @@ pub(crate) const ARTIFACT_PREFIX: &str = "plan:";
 pub(crate) enum PlanArtifact {
     /// Holds the title and the prose sections of the overview.
     Overview,
-    /// Holds runtime flows in an indented step grammar.
+    /// Holds runtime flows, each a short description and a Mermaid diagram.
     Flows,
     /// Holds the planned test inventory grouped by file.
     Tests,
@@ -177,7 +176,7 @@ fn render(
 ) -> Result<String> {
     Ok(match artifact {
         PlanArtifact::Overview => overview_text(title, document),
-        PlanArtifact::Flows => flows_text(&document.flows),
+        PlanArtifact::Flows => document.flows.clone(),
         PlanArtifact::Tests => tests_text(&document.tests),
         PlanArtifact::Checks => checks_text(
             document,
@@ -738,71 +737,20 @@ fn decision(number: usize, item: &str, report: &mut ArtifactReport<'_>) -> Optio
     }
 }
 
-/// Render flows as `## Title`, a `Trigger:` line, a description, and an indented step list.
-fn flows_text(flows: &[DesignFlow]) -> String {
-    let mut blocks = Vec::new();
-    for flow in flows {
-        let mut lines = vec![
-            format!("## {}", flow.title),
-            format!("Trigger: {}", flow.trigger),
-        ];
-        let description = flow.description.trim_matches('\n');
-        if !description.trim().is_empty() {
-            lines.push(String::new());
-            lines.push(description.into());
-        }
-        lines.push(String::new());
-        enum Pending<'flow> {
-            Step(&'flow DesignFlowStep, usize),
-            Branch(&'flow DesignFlowBranch, usize),
-        }
-        let mut pending = flow
-            .steps
-            .iter()
-            .rev()
-            .map(|step| Pending::Step(step, 0))
-            .collect::<Vec<_>>();
-        while let Some(item) = pending.pop() {
-            match item {
-                Pending::Step(step, indent) => {
-                    lines.push(format!("{}- {}", " ".repeat(indent), step.action));
-                    for effect in &step.effects {
-                        lines.push(format!(
-                            "{}- effect: {} -> {}",
-                            " ".repeat(indent + 2),
-                            effect.target,
-                            effect.change
-                        ));
-                    }
-                    for branch in step.branches.iter().rev() {
-                        pending.push(Pending::Branch(branch, indent + 2));
-                    }
-                }
-                Pending::Branch(branch, indent) => {
-                    lines.push(format!("{}- if {}", " ".repeat(indent), branch.condition));
-                    for step in branch.steps.iter().rev() {
-                        pending.push(Pending::Step(step, indent + 2));
-                    }
-                }
-            }
-        }
-        blocks.push(lines.join("\n"));
-    }
-    if blocks.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", blocks.join("\n\n"))
-    }
-}
-
-/// Parse every `## Title` flow block, building nested steps without recursion.
-fn parse_flows(text: &str, report: &mut ArtifactReport<'_>) -> Vec<DesignFlow> {
+/// Check every `## Title` flow block and return the flow Markdown unchanged.
+fn parse_flows(text: &str, report: &mut ArtifactReport<'_>) -> String {
     let mut blocks: Vec<(usize, &str, Vec<(usize, &str)>)> = Vec::new();
+    let mut fenced = false;
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
-        if let Some(title) = line.strip_prefix("## ") {
+        if !fenced && let Some(title) = line.strip_prefix("## ") {
             blocks.push((number, title.trim(), Vec::new()));
-        } else if let Some((_, _, lines)) = blocks.last_mut() {
+            continue;
+        }
+        if line.starts_with("```") {
+            fenced = !fenced;
+        }
+        if let Some((_, _, lines)) = blocks.last_mut() {
             lines.push((number, line));
         } else if !line.trim().is_empty() {
             report.syntax(
@@ -813,230 +761,94 @@ fn parse_flows(text: &str, report: &mut ArtifactReport<'_>) -> Vec<DesignFlow> {
         }
     }
     let mut titles = HashSet::new();
-    blocks
-        .into_iter()
-        .map(|(number, title, lines)| {
-            let flow = parse_flow(number, title, &lines, report);
-            if !flow.title.is_empty()
-                && !titles.insert(flow.title.split_whitespace().collect::<Vec<_>>().join(" "))
-            {
-                report.content(
-                    number,
-                    &format!("## {title}"),
-                    "another flow has the same title".into(),
-                );
-            }
-            flow
-        })
-        .collect()
+    for (number, title, lines) in blocks {
+        check_flow(number, title, &lines, report);
+        if !title.is_empty()
+            && !titles.insert(title.split_whitespace().collect::<Vec<_>>().join(" "))
+        {
+            report.content(
+                number,
+                &format!("## {title}"),
+                "another flow has the same title".into(),
+            );
+        }
+    }
+    text.to_owned()
 }
 
-/// Parse one flow block into its trigger, description, and step tree.
-fn parse_flow(
+/// Check one flow block: a description, then exactly one ```` ```mermaid ```` block whose first
+/// line names an allowed diagram type.
+fn check_flow(
     heading: usize,
     title: &str,
     lines: &[(usize, &str)],
     report: &mut ArtifactReport<'_>,
-) -> DesignFlow {
+) {
     let reference = format!("## {title}");
     if title.is_empty() {
         report.content(heading, "##", "a flow heading needs a title".into());
     }
-    let mut remaining = lines
-        .iter()
-        .skip_while(|(_, line)| line.trim().is_empty())
-        .peekable();
-    let trigger = match remaining.next_if(|(_, line)| line.starts_with("Trigger:")) {
-        Some((number, line)) => {
-            let trigger = line.trim_start_matches("Trigger:").trim().to_owned();
-            if trigger.is_empty() {
-                report.content(*number, "Trigger:", "the trigger must name an event".into());
-            }
-            trigger
-        }
-        None => {
-            report.syntax(
-                heading,
-                &reference,
-                "the first line under a flow heading must be `Trigger: event`".into(),
-            );
-            String::new()
-        }
+    let mut remaining = lines.iter().peekable();
+    let description =
+        std::iter::from_fn(|| remaining.next_if(|(_, line)| !line.starts_with("```")))
+            .copied()
+            .collect::<Vec<_>>();
+    if prose(&description).trim().is_empty() {
+        report.content(
+            heading,
+            &reference,
+            "the flow needs a one-to-two-line description before its mermaid block".into(),
+        );
+    }
+    let Some((fence, opening)) = remaining.next() else {
+        report.content(
+            heading,
+            &reference,
+            "the flow needs a ```mermaid block after its description".into(),
+        );
+        return;
     };
-    let mut description = Vec::new();
-    while let Some((number, line)) =
-        remaining.next_if(|(_, line)| !line.starts_with("- ") && !line.starts_with(' '))
-    {
-        description.push((*number, *line));
-    }
-    let entries = remaining.collect::<Vec<_>>();
-
-    /// One parsed step before branches are assembled into owned values.
-    struct StepNode {
-        action: String,
-        effects: Vec<DesignFlowEffect>,
-        branches: Vec<usize>,
-    }
-    /// One parsed branch before its steps are assembled into owned values.
-    struct BranchNode {
-        line: usize,
-        condition: String,
-        steps: Vec<usize>,
-    }
-    #[derive(Clone, Copy)]
-    enum Container {
-        Flow,
-        Step(usize),
-        Branch(usize),
-    }
-    let mut steps: Vec<StepNode> = Vec::new();
-    let mut branches: Vec<BranchNode> = Vec::new();
-    let mut roots = Vec::new();
-    let mut stack: Vec<(usize, Container)> = vec![(0, Container::Flow)];
-    for (number, line) in entries {
-        let number = *number;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start_matches(' ').len();
-        let Some(item) = line[indent..]
-            .strip_prefix("- ")
-            .or_else(|| (&line[indent..] == "-").then_some(""))
-        else {
-            report.syntax(
-                number,
-                line.trim(),
-                "steps are `- action` list items; keep each item on one line".into(),
-            );
-            continue;
-        };
-        let item = item.trim();
-        while stack.last().is_some_and(|(child, _)| *child > indent) {
-            stack.pop();
-        }
-        let Some(container) = stack
-            .last()
-            .filter(|(child, _)| *child == indent)
-            .map(|(_, container)| *container)
-        else {
-            report.syntax(
-                number,
-                item,
-                "nested items are indented by exactly two spaces under their parent".into(),
-            );
-            continue;
-        };
-        match container {
-            Container::Flow | Container::Branch(_) => {
-                if item.is_empty() {
-                    report.content(number, "-", "a step needs an action".into());
-                }
-                let id = steps.len();
-                steps.push(StepNode {
-                    action: item.into(),
-                    effects: Vec::new(),
-                    branches: Vec::new(),
-                });
-                match container {
-                    Container::Branch(branch) => branches[branch].steps.push(id),
-                    _ => roots.push(id),
-                }
-                stack.push((indent + 2, Container::Step(id)));
-            }
-            Container::Step(step) => {
-                if let Some(effect) = item.strip_prefix("effect:") {
-                    match effect.split_once("->").or_else(|| effect.split_once('→')) {
-                        Some((target, change))
-                            if !target.trim().is_empty() && !change.trim().is_empty() =>
-                        {
-                            steps[step].effects.push(DesignFlowEffect {
-                                target: target.trim().into(),
-                                change: change.trim().into(),
-                            });
-                        }
-                        _ => report.syntax(
-                            number,
-                            item,
-                            "effects use `- effect: target -> change` with both parts present"
-                                .into(),
-                        ),
-                    }
-                } else if let Some(condition) = item.strip_prefix("if ") {
-                    let id = branches.len();
-                    branches.push(BranchNode {
-                        line: number,
-                        condition: condition.trim().into(),
-                        steps: Vec::new(),
-                    });
-                    steps[step].branches.push(id);
-                    stack.push((indent + 2, Container::Branch(id)));
-                } else {
-                    report.syntax(
-                        number,
-                        item,
-                        "items nested under a step are `- effect: target -> change` or \
-                         `- if condition`; indent a following step at its parent's level"
-                            .into(),
-                    );
-                }
-            }
-        }
-    }
-    for branch in &branches {
-        if branch.steps.is_empty() {
-            report.content(
-                branch.line,
-                &format!("if {}", branch.condition),
-                "a branch needs at least one step indented under it".into(),
-            );
-        }
-    }
-    let description = prose(&description);
-    if description.trim().is_empty() {
-        report.content(
-            heading,
-            &reference,
-            "the flow needs a description paragraph after its trigger".into(),
+    if opening.trim_end() != "```mermaid" {
+        report.syntax(
+            *fence,
+            opening.trim(),
+            "flow diagrams are fenced as ```mermaid".into(),
         );
     }
-    if roots.is_empty() {
-        report.content(
-            heading,
-            &reference,
-            "the flow needs at least one `- action` step".into(),
+    let mut first_line = None;
+    let mut closed = false;
+    for (number, line) in remaining.by_ref() {
+        if line.trim_end() == "```" {
+            closed = true;
+            break;
+        }
+        first_line.get_or_insert((*number, *line));
+    }
+    if !closed {
+        report.syntax(
+            *fence,
+            opening.trim(),
+            "the mermaid block needs a closing ``` line".into(),
         );
     }
-    // Children are always created after their parent, so assembling in reverse creation order
-    // finds every child already built.
-    let mut built: Vec<Option<DesignFlowStep>> = (0..steps.len()).map(|_| None).collect();
-    for id in (0..steps.len()).rev() {
-        let node = &mut steps[id];
-        let mut assembled = Vec::new();
-        for branch in std::mem::take(&mut node.branches) {
-            let branch = &branches[branch];
-            assembled.push(DesignFlowBranch {
-                condition: branch.condition.clone(),
-                steps: branch
-                    .steps
-                    .iter()
-                    .filter_map(|child| built[*child].take())
-                    .collect(),
-            });
-        }
-        built[id] = Some(DesignFlowStep {
-            action: std::mem::take(&mut node.action),
-            effects: std::mem::take(&mut node.effects),
-            branches: assembled,
-        });
+    for (number, line) in remaining.filter(|(_, line)| !line.trim().is_empty()) {
+        report.syntax(
+            *number,
+            line.trim(),
+            "a flow holds one description and one mermaid block; start another flow with `## Title`"
+                .into(),
+        );
     }
-    DesignFlow {
-        title: title.into(),
-        description,
-        trigger,
-        steps: roots
-            .into_iter()
-            .filter_map(|id| built[id].take())
-            .collect(),
+    let (number, line) = first_line.unwrap_or((*fence, ""));
+    if !super::design_flows::diagram_allowed(line) {
+        report.content(
+            number,
+            line.trim(),
+            format!(
+                "the first line of a flow's mermaid block must start with {}",
+                super::design_flows::allowed_keywords()
+            ),
+        );
     }
 }
 
@@ -1345,7 +1157,7 @@ mod test {
                 rationale: "The prototype is small.".into(),
             }],
             design: "Plain prose.\n\n```text\n## Not a section inside a fence\n```".into(),
-            flows: Vec::new(),
+            flows: String::new(),
             manual_checks: vec!["Run the game.".into()],
             tests: Vec::new(),
             checks: Vec::new(),
@@ -1415,60 +1227,42 @@ mod test {
         assert_eq!(lines(&diagnostic), vec![(1, "invalid_plan_artifact")]);
     }
 
-    /// Flows with effects and nested branches survive a render and parse round trip.
+    /// Flow Markdown is kept exactly as written, with no diagnostics for a well-formed flow.
     #[test]
-    fn flows_round_trip_with_effects_and_branches() {
-        let flows = vec![DesignFlow {
-            title: "Run and survive".into(),
-            description: "Advance the loop.".into(),
-            trigger: "The app starts".into(),
-            steps: vec![
-                DesignFlowStep {
-                    action: "player_control fires".into(),
-                    effects: vec![DesignFlowEffect {
-                        target: "Weapon.seconds_until_fire".into(),
-                        change: "reset to cooldown".into(),
-                    }],
-                    branches: vec![DesignFlowBranch {
-                        condition: "no live enemy exists".into(),
-                        steps: vec![DesignFlowStep {
-                            action: "skip firing".into(),
-                            effects: Vec::new(),
-                            branches: Vec::new(),
-                        }],
-                    }],
-                },
-                DesignFlowStep {
-                    action: "hud_update renders".into(),
-                    effects: Vec::new(),
-                    branches: Vec::new(),
-                },
-            ],
-        }];
-        let text = flows_text(&flows);
-        assert!(text.contains("  - effect: Weapon.seconds_until_fire -> reset to cooldown"));
-        assert!(text.contains("    - skip firing"));
+    fn flows_keep_their_authored_markdown() {
+        let text = "## Submit a plan\n\nRuns when the agent calls `plan_submit`.\nA rejection changes nothing.\n\n```mermaid\nsequenceDiagram\n    Agent->>Runtime: plan_submit(version)\n    Runtime-->>Agent: submitted\n```\n";
         let mut diagnostic = Vec::new();
-        assert_eq!(parse_flows(&text, &mut report(&mut diagnostic)), flows);
+        assert_eq!(parse_flows(text, &mut report(&mut diagnostic)), text);
         assert_eq!(diagnostic, Vec::new());
+        assert_eq!(super::super::design_flows::count(text), 1);
     }
 
-    /// Flow parsing reports misplaced nested items, missing triggers, and empty flows.
+    /// Flow parsing reports trailing text, unknown diagram types, misfenced blocks, and missing
+    /// descriptions or diagrams, each at its line.
     #[test]
-    fn flows_report_unindented_children_and_missing_triggers() {
+    fn flows_report_each_malformed_block_at_its_line() {
         let mut diagnostic = Vec::new();
         parse_flows(
-            "## Flow\nTrigger: start\n\nRuns.\n\n- step\n  - not an effect\n\n## Other\n\n- step\n",
+            "## Flow\n\nRuns once.\n\n```mermaid\ngraph TD\n  a --> b\n```\ntrailing\n\n## Other\n\n```text\nflowchart TD\n```\n\n## Bare\n\nOnly prose.\n",
             &mut report(&mut diagnostic),
         );
         assert_eq!(
             lines(&diagnostic),
             vec![
-                (7, "invalid_plan_artifact"),
                 (9, "invalid_plan_artifact"),
-                (9, "invalid_plan_content"),
+                (6, "invalid_plan_content"),
+                (11, "invalid_plan_content"),
+                (13, "invalid_plan_artifact"),
+                (17, "invalid_plan_content"),
             ]
         );
+
+        let mut diagnostic = Vec::new();
+        parse_flows(
+            "## Open\n\nRuns.\n\n```mermaid\nflowchart TD\n",
+            &mut report(&mut diagnostic),
+        );
+        assert_eq!(lines(&diagnostic), vec![(5, "invalid_plan_artifact")]);
     }
 
     /// Test inventories round-trip, and malformed or duplicate items are reported at their line.

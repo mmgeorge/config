@@ -24,6 +24,7 @@ pub(crate) use design_artifact::{
 };
 mod design_document;
 mod design_flows;
+pub(crate) use design_flows::count as flow_count;
 mod design_tests;
 pub use design_tests::DesignTestChange;
 pub(crate) use design_tests::DesignTestSelection;

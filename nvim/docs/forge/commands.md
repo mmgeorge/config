@@ -741,13 +741,12 @@ Collapsed signatures omit the `[changed]` suffix.
 Old and new function versions expand independently. Collapsing an old function
 keeps added declarations outside its body visible.
 
-Flow diagrams render as native buffer rows with branch rails, literal labels, and declaration-kind
-symbol colors. Each flow starts with its trigger. `→` starts execution, `↓` continues it, and
-`┄▶` marks resulting state changes. Conditional branches contain actions, while results
-cannot contain further steps. Independent events appear as separate flows.
-Press `.` on a function, type, or qualified member name to jump to its definition.
-Ambiguous names use the existing symbol picker. Diagram fences remain part of text exports,
-and do not appear in PlanReview.
+Flows appear as the agent wrote them in `plan:flows.md`: one heading per
+independently triggered flow, a one-to-two-line description, and a fenced
+Mermaid diagram. A `sequenceDiagram` shows a flow that crosses ownership
+boundaries, a `flowchart` shows branching inside one owner, and a
+`stateDiagram-v2` shows a lifecycle. PlanReview shows the Mermaid source as
+text and does not link names inside it to declarations.
 
 Inline-code names in plan prose use declaration-kind colors when the proposed
 plan resolves them. Go to definition opens that proposed declaration, including

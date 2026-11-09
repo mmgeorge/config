@@ -6,7 +6,7 @@ use forge_buffer::block::{BufferBlock, Decoration, TargetRange, TextPosition, Te
 use forge_buffer::identity::TargetId;
 use forge_buffer::markdown::MarkdownRenderer;
 use forge_diff::syntax::{DeclarationIndex, DeclarationRole};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub(super) struct Symbol {
@@ -128,7 +128,6 @@ fn symbols(path: &str, text: &str, workspace: &Path) -> Vec<Symbol> {
 
 pub(super) fn spans(
     design: &DeclarationDesign,
-    symbols: &NarrativeSymbols,
 ) -> HashMap<String, Vec<(std::ops::Range<usize>, String)>> {
     let mut spans = HashMap::new();
     for section in design.document.sections() {
@@ -145,48 +144,7 @@ pub(super) fn spans(
                 .push((range.start - offset..range.end - offset, name));
         }
     }
-    let known = symbols
-        .proposed
-        .iter()
-        .chain(&symbols.baseline)
-        .flat_map(|symbol| [symbol.qualified.as_str(), symbol.destination.name.as_str()])
-        .collect::<HashSet<_>>();
-    for (index, row) in super::design_flows::rows(&design.document.flows)
-        .iter()
-        .enumerate()
-    {
-        if row.kind != super::design_flows::FlowRowKind::Diagram {
-            continue;
-        }
-        for (range, name) in diagram_identifiers(&row.text) {
-            if known.contains(name.replace("::", ".").as_str()) || name.contains(['_', ':', '.']) {
-                spans
-                    .entry(format!("plan:metadata:flows:{index}"))
-                    .or_insert_with(Vec::new)
-                    .push((range, name));
-            }
-        }
-    }
     spans
-}
-
-fn diagram_identifiers(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let mut output = Vec::new();
-    let mut start = None;
-    for (offset, character) in text
-        .char_indices()
-        .chain(std::iter::once((text.len(), ' ')))
-    {
-        if character.is_alphanumeric() || matches!(character, '_' | '.' | ':') {
-            start.get_or_insert(offset);
-        } else if let Some(start) = start.take() {
-            let name = text[start..offset].trim_end_matches(['.', ':']);
-            if identifier(name) {
-                output.push((start..start + name.len(), name.into()));
-            }
-        }
-    }
-    output
 }
 
 fn identifier(name: &str) -> bool {

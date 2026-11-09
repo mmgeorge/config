@@ -20,9 +20,10 @@ pub(super) fn definition() -> ControlToolDefinition {
                 and Design are required. List sections use `- item` with two-space continuation lines, \
                 decisions use `- **Decision.** Rationale.`, and Manual checks lists what the agent must \
                 observe in Verify because automated checks cannot establish it. plan:flows.md has one \
-                `## Title` per independently triggered flow, then `Trigger: event`, a description paragraph, \
-                and `- action` steps; nest `- effect: target -> change` and `- if condition` under a step and \
-                the branch's steps under the `if`, two spaces per level. plan:tests.md has one \
+                `## Title` per independently triggered flow, then a one-to-two-line description that names \
+                its trigger, then one ```mermaid block: sequenceDiagram for a flow that crosses ownership \
+                boundaries, flowchart for branching control flow inside one owner, or stateDiagram-v2 for a \
+                lifecycle whose transitions come from several triggers. plan:tests.md has one \
                 `## path/to/file` per file and items such as - new `exact_test_name` [target: runner]: \
                 scenario and expected result, where the change is new, modified, removed, or reused and the \
                 target is optional. plan:checks.md lists saved checks as `- [ ] id` lines; mark `[x]` on each \

@@ -28,7 +28,7 @@ The overview would otherwise be a nested JSON argument, which provider schema co
 | Path | Contents |
 | --- | --- |
 | `plan:overview.md` | `# Title`, then the Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. |
-| `plan:flows.md` | One `## Title` per flow with a `Trigger:` line, a description, and an indented step list with `effect:` and `if` items. |
+| `plan:flows.md` | One `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and one `mermaid` block that opens with `sequenceDiagram`, `flowchart`, or `stateDiagram-v2`. |
 | `plan:tests.md` | One `## path` per file with `- change \`name\` [target: t]: scenario` items. |
 | `plan:checks.md` | Every enabled saved check as a `- [ ] id` line; `[x]` selects a check, and its prerequisites must be marked too. |
 | `plan:findings.md` | Execution findings for Resolve; read-only. |
@@ -75,7 +75,7 @@ The shared Tree-sitter `DeclarationIndex` resolves Rust and TypeScript names wit
 
 ## Flows
 
-Plan metadata stores execution flows separately from prose, typed by `design_flows.rs` as a `trigger` and ordered `steps`. Steps hold actions, terminal effects, and conditional branches. Rendering and validation traverse branches iteratively, without count or depth caps.
+`DesignDocument::flows` stores `plan:flows.md` as the Markdown the agent wrote, so review, section reads, and revision diffs show the same text without a renderer of their own. Submission checks only the shape: `design_artifact::parse_flows` requires each `## Title` block to hold a description and exactly one closed `mermaid` block whose first line names an allowed diagram type, and reports each violation at its line. Harness does not parse Mermaid, so a diagram with a syntax error inside an allowed type passes submission, and PlanReview does not link names inside a diagram to declarations.
 
 ## Acceptance
 

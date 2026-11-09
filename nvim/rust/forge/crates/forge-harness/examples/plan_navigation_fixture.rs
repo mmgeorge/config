@@ -151,15 +151,7 @@ fn main() -> Result<()> {
         ]))?;
     }
     if arguments[4] == "flows" {
-        design.document.flows = serde_json::from_value(serde_json::json!([
-            {"title":"Restart input","description":"Restore the base and combat state.",
-             "trigger":"Fresh R input","steps":[
-                 {"action":"restart_round","effects":[{"target":"base state","change":"restore"}]},
-                 {"action":"reset_combat",
-                  "effects":[{"target":"WaveDirector and Weapon state","change":"reset"},{"target":"starting enemy","change":"create"}],
-                  "branches":[{"condition":"old combat entities exist","steps":[{"action":"remove old entities","effects":[{"target":"*literal* cleanup","change":"perform"}]}]}]}
-             ]}
-        ]))?;
+        design.document.flows = "## Restart input\n\nRuns on a fresh R input and restores the base and combat state.\n\n```mermaid\nflowchart TD\n    input([Fresh R input]) --> restart[restart_round]\n    restart --> reset[reset_combat]\n    reset --> old{old combat entities exist?}\n    old -->|yes| remove[remove old entities]\n```\n".into();
     }
     for (path, (text, source_digest)) in baseline {
         let calls = design

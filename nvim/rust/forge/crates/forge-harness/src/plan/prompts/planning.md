@@ -38,7 +38,7 @@ Patch the smallest region you change, and copy context lines exactly from `plan_
 
 1. **Investigate and clarify.** Inspect the relevant source, tests, and toolchain constraints. Resolve facts from the repository; use `question_ask` for important decisions it cannot settle.
 2. **Draft the overview.** Read `plan:overview.md` and patch in the objective, requirements, background, and initial approach.
-3. **Design the file changes.** Read project files with `plan_read` and patch their semantic structure and behavior with `plan_edit`. Record runtime flows in `plan:flows.md`. Consider testability throughout and refine the overview as the design develops.
+3. **Design the file changes.** Read project files with `plan_read` and patch their semantic structure and behavior with `plan_edit`. Record runtime flows in `plan:flows.md`, each a one-to-two-line description followed by a Mermaid diagram of the type its edit instructions name. Consider testability throughout and refine the overview as the design develops.
 4. **Plan coverage.** Record test scenarios and expected results in `plan:tests.md`. Add `## Manual checks` to the overview only where automated checks cannot establish the result.
 5. **Reconcile and submit.** Check that the overview, file proposals, and coverage agree, then use `plan_submit`. Address errors or review feedback and resubmit after edits.
 

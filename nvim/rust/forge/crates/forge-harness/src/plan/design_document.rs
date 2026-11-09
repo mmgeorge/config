@@ -21,9 +21,10 @@ pub struct DesignDocument {
     pub decisions: Vec<DesignDecision>,
     /// Explains the proposed solution and ownership boundaries.
     pub design: String,
-    /// Traces operations between concrete objects independently of Design prose.
+    /// Holds the runtime flows as the Markdown of `plan:flows.md`: one `## Title` heading per
+    /// flow with a short description and a Mermaid diagram.
     #[serde(default)]
-    pub flows: Vec<super::design_flows::DesignFlow>,
+    pub flows: String,
     /// Lists the manual checks Verify performs after automated checks pass, from
     /// `## Manual checks`.
     pub manual_checks: Vec<String>,
@@ -172,7 +173,7 @@ impl DesignDocument {
                 path: "flows",
                 title: "Flows",
                 section: PlanSection::Flows,
-                text: super::design_flows::text(&self.flows),
+                text: self.flows.trim_end_matches('\n').to_owned(),
             },
             DesignSection {
                 path: "tests",
@@ -210,7 +211,6 @@ impl DesignDocument {
                 .all(|id| !self.disabled_checks.contains(id)),
             "plan check cannot be enabled and disabled"
         );
-        super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
         for action in &self.manual_checks {
             ensure!(

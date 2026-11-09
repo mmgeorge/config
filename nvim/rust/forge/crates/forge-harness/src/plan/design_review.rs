@@ -145,23 +145,18 @@ pub(super) fn project(
     let DesignReviewRows {
         block: source,
         navigation,
-        mut hidden,
+        hidden,
         contextual,
     } = rows(document, syntax, public_only, true, trace, revealed)?;
-    // Parse the complete generated section so code-fence context survives per-row projection.
-    let flow_rows = super::design_flows::rows(
-        &document
-            .design
-            .as_ref()
-            .context("declaration review has no design")?
-            .document
-            .flows,
-    );
-    let flow_text = flow_rows
-        .iter()
-        .map(|row| row.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Render the complete flows section once so each row keeps its Mermaid fence context.
+    let flow_text = document
+        .design
+        .as_ref()
+        .context("declaration review has no design")?
+        .document
+        .flows
+        .trim_end_matches('\n')
+        .to_owned();
     let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
         BlockId("plan:flow-markdown".into()),
         &flow_text,
@@ -175,7 +170,7 @@ pub(super) fn project(
         .context("declaration review has no design")?;
     let narrative_symbols =
         super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""))?;
-    let narrative_spans = super::review_symbols::spans(design, &narrative_symbols);
+    let narrative_spans = super::review_symbols::spans(design);
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     let mut omitted = 0;
@@ -186,35 +181,13 @@ pub(super) fn project(
             .strip_prefix("plan:metadata:flows:")
             .and_then(|index| index.parse::<usize>().ok())
         {
-            match flow_rows[index].kind {
-                super::design_flows::FlowRowKind::Fence => {
-                    hidden.insert(row.id.clone());
-                }
-                super::design_flows::FlowRowKind::Diagram => {
-                    row.metadata
-                        .decoration
-                        .push(forge_buffer::block::Decoration {
-                            range: forge_buffer::block::TextRange {
-                                start: TextPosition { row: 0, column: 0 },
-                                end: TextPosition {
-                                    row: 0,
-                                    column: row.text.row(0).unwrap_or_default().len(),
-                                },
-                            },
-                            capture: "Comment".into(),
-                            priority: 100,
-                        });
-                }
-                super::design_flows::FlowRowKind::Narrative => {
-                    row.metadata.markdown = true;
-                    for decoration in &flow_markdown.block.metadata.decoration {
-                        if decoration.range.start.row == index {
-                            let mut decoration = decoration.clone();
-                            decoration.range.start.row = 0;
-                            decoration.range.end.row = 0;
-                            row.metadata.decoration.push(decoration);
-                        }
-                    }
+            row.metadata.markdown = true;
+            for decoration in &flow_markdown.block.metadata.decoration {
+                if decoration.range.start.row == index {
+                    let mut decoration = decoration.clone();
+                    decoration.range.start.row = 0;
+                    decoration.range.end.row = 0;
+                    row.metadata.decoration.push(decoration);
                 }
             }
         } else if let Some(index) = row

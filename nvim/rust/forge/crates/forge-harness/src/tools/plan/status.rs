@@ -95,7 +95,7 @@ fn status_text(document: &PlanDocument, execution: Option<&Value>) -> Result<Str
     } else {
         "written".to_owned()
     };
-    let flows_state = count(overview.flows.len(), "flow", "flows");
+    let flows_state = count(crate::plan::flow_count(&overview.flows), "flow", "flows");
     let test_count = overview.tests.iter().map(|file| file.cases.len()).sum();
     let tests_state = if test_count == 0 {
         "empty".to_owned()
