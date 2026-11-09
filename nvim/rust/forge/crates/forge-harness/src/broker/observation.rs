@@ -902,11 +902,16 @@ impl BrokerObserver {
         report.push_str("\n### Verification assessments\n\n");
         for evidence in &execution.verification {
             report.push_str(&format!(
-                "- Revision {} · {:?}: {}\n  Tool evidence: {}\n",
+                "- Revision {} · {:?}: {}\n  Observed in: {}\n",
                 evidence.revision,
-                evidence.report.outcome,
+                evidence.report.status,
                 evidence.summary,
-                evidence.report.evidence.join(", ")
+                evidence
+                    .report
+                    .cited()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             if let Some(reason) = &evidence.report.reuse_reason {
                 report.push_str(&format!("  Evidence reuse: {reason}\n"));

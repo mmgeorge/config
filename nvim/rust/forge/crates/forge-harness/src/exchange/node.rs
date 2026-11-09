@@ -109,17 +109,19 @@ pub struct ArtifactChange {
 /// Owns published verification evidence independently of the current execution task.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VerificationResult {
-    pub outcome: crate::plan::execution::VerificationOutcome,
-    pub summary: Option<String>,
+    pub status: crate::plan::execution::VerificationStatus,
+    /// Holds the summary the agent passed to `plan_phase_done`.
+    pub phase_summary: Option<String>,
     #[serde(default)]
     pub findings: Vec<String>,
-    pub verification: Option<crate::plan::execution::VerificationReport>,
+    pub report: Option<crate::plan::execution::VerificationReport>,
     #[serde(default)]
     pub declaration_findings: Vec<String>,
     #[serde(default)]
     pub declaration_changes: Vec<crate::plan::execution::DeclarationMismatch>,
+    /// Maps each cited evidence ID to the tool call that produced it.
     #[serde(default)]
-    pub verification_tools: std::collections::BTreeMap<String, crate::turn::ToolAddress>,
+    pub evidence_sources: std::collections::BTreeMap<String, crate::turn::ToolAddress>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

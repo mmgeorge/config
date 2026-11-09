@@ -88,7 +88,7 @@ impl ObservedTools {
             let result = match self.executor.execute(invocation.clone()).await {
                 Ok(outcome) => match outcome.result {
                     Ok(result) => Ok(result.message),
-                    Err(error) => Ok(crate::tools::control_tool_failure_json(
+                    Err(error) => Ok(crate::tools::control_tool_failure_text(
                         &invocation,
                         &error,
                         outcome.plan_document.as_ref(),
@@ -697,7 +697,7 @@ impl HostInvocation {
                 }
                 result.message.clone()
             }
-            Err(error) => crate::tools::control_tool_failure_json(
+            Err(error) => crate::tools::control_tool_failure_text(
                 &invocation,
                 error,
                 outcome.plan_document.as_ref(),

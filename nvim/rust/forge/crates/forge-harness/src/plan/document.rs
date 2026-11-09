@@ -831,9 +831,8 @@ impl PlanDocument {
     pub fn patch_design(
         &self,
         workspace: &std::path::Path,
-        request: impl Into<super::DesignEditRequest>,
+        request: super::DesignPatchRequest,
     ) -> Result<Self> {
-        let request = request.into().into_patch(self, workspace)?;
         anyhow::ensure!(
             request.plan_id == self.plan_id,
             "design plan id does not match the active plan"
@@ -844,16 +843,18 @@ impl PlanDocument {
             self.version
         );
         let mut candidate = self.clone();
-        candidate.design = Some(
-            self.design
-                .as_ref()
-                .context("obsolete plan format. Create a new declaration design.")?
-                .patch(workspace, &request.source_digests, &request.patch)?,
-        );
-        if let Some(title) = request.title {
-            anyhow::ensure!(!title.trim().is_empty(), "design title must not be empty");
-            candidate.title = title.trim().into();
-        }
+        let (design, title) = self
+            .design
+            .as_ref()
+            .context("obsolete plan format. Create a new declaration design.")?
+            .patch(
+                workspace,
+                &request.source_digests,
+                &request.patch,
+                &self.title,
+            )?;
+        candidate.design = Some(design);
+        candidate.title = title;
         if candidate.design == self.design && candidate.title == self.title {
             return Ok(self.clone());
         }
@@ -966,47 +967,29 @@ impl PlanDocument {
         Ok(super::codec::to_string_pretty(&self.model_value()?)?)
     }
 
-    /// Read the descriptive overview and file inventory without exposing an internal document path.
-    pub fn overview_json(&self) -> Result<String> {
-        Ok(super::codec::to_string_pretty(&self.overview()?)?)
-    }
-
-    /// Borrow the model-facing overview until its caller serializes the response.
-    pub(crate) fn overview(&self) -> Result<PlanOverview<'_>> {
-        let design = self
-            .design
-            .as_ref()
-            .context("plan has no semantic structure")?;
-        Ok(PlanOverview {
-            plan_id: &self.plan_id,
-            version: self.version,
-            title: &self.title,
-            request: &self.prompt,
-            overview: &design.document,
-            files: design.file_inventory(),
-        })
-    }
-
     /// Omit deferred verification instructions from code-writing handoffs.
     pub(crate) fn execution_json(&self, phase: super::PlanPhase) -> Result<String> {
-        let mut value = self.model_value()?;
-        if matches!(
+        let value = self.model_value_with(!matches!(
             phase,
             super::PlanPhase::Implement | super::PlanPhase::Resolve
-        ) && let Some(document) = value
-            .get_mut("document")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            document.remove("verification");
-            document.remove("checks");
-        }
+        ))?;
         Ok(super::codec::to_string_pretty(&value)?)
     }
 
     fn model_value(&self) -> Result<serde_json::Value> {
+        self.model_value_with(true)
+    }
+
+    /// Present the plan as the artifact text the agent edits, so a prompt never shows a parsed
+    /// document older than the agent's latest edit.
+    fn model_value_with(&self, include_verification: bool) -> Result<serde_json::Value> {
         if let Some(design) = &self.design {
             let mut value = serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.file_inventory()});
-            value["document"] = super::codec::to_value(&design.document)?;
+            value["artifacts"] = serde_json::to_value(super::design_artifact::model_artifacts(
+                &self.title,
+                design,
+                include_verification,
+            )?)?;
             return Ok(value);
         }
         let mut value = super::codec::to_value(self)?;
@@ -1016,17 +999,6 @@ impl PlanDocument {
         hide_derived_state(&mut value);
         Ok(value)
     }
-}
-
-/// Borrow the descriptive planning surface without copying it into a JSON tree.
-#[derive(Serialize)]
-pub(crate) struct PlanOverview<'a> {
-    plan_id: &'a str,
-    version: u64,
-    title: &'a str,
-    request: &'a str,
-    overview: &'a super::design_document::DesignDocument,
-    files: super::design::DesignFileInventory<'a>,
 }
 
 fn hide_derived_state(value: &mut serde_json::Value) {

@@ -3,7 +3,7 @@ use crate::provider::ProviderCompletion;
 use crate::tools::error::{ToolContext, ToolResult as Result};
 use crate::tools::{ControlToolInvocation, ControlToolResult, runtime::ControlToolRuntime};
 
-/// Commit a file or overview edit while preserving version and execution ownership.
+/// Commit an artifact or file edit while preserving version and execution ownership.
 pub(super) async fn apply_edit(
     runtime: &mut ControlToolRuntime,
     mut invocation: ControlToolInvocation,
@@ -14,10 +14,18 @@ pub(super) async fn apply_edit(
         !runtime.context.has_active_elicitation,
         "resolve pending Harness questions before editing the design"
     );
-    let edit = output
+    let mut request = output
         .design_patch
         .pop()
         .context("plan edit has no request")?;
+    if runtime
+        .context
+        .execution
+        .as_ref()
+        .is_some_and(|execution| execution.phase == crate::plan::PlanPhase::Verify)
+    {
+        return apply_verification_edit(runtime, request).await;
+    }
     let document = runtime
         .plan_document
         .as_ref()
@@ -27,7 +35,6 @@ pub(super) async fn apply_edit(
         .workspace_root
         .as_deref()
         .context("design patch has no workspace root")?;
-    let mut request = edit.into_patch(document, workspace)?;
     for (path, digest) in &runtime.inspected {
         request
             .source_digests
@@ -56,21 +63,9 @@ pub(super) async fn apply_edit(
                 .insert(path.clone(), file.source_digest.clone());
         }
     }
-    if invocation.name == "plan_file_edit" {
-        invocation.arguments["source_digests"] = serde_json::to_value(&request.source_digests)?;
-    }
-    let delta = crate::plan::revision::DeclarationDelta::between(Some(document), updated_design)?;
-    let mut confirmation = format!("{}{}", delta.document, delta.files);
-    if confirmation.is_empty() {
-        confirmation.push_str("No declaration changes.\n");
-    }
+    invocation.arguments["source_digests"] = serde_json::to_value(&request.source_digests)?;
+    let confirmation = changed_paths(document, &updated)?;
     if let Some(execution) = &runtime.context.execution {
-        if updated.version == document.version {
-            return Ok(ControlToolResult {
-                invocation: None,
-                message: runtime.plan_version_message("Design unchanged"),
-            });
-        }
         let saved = execution
             .send(crate::plan::execution::ExecutionOperation::Draft(Box::new(
                 updated.clone(),
@@ -97,5 +92,90 @@ pub(super) async fn apply_edit(
             "{}\n{confirmation}",
             runtime.plan_version_message("Plan edit accepted")
         ),
+    })
+}
+
+/// Save a Verify report edit; the accepted plan itself stays immutable outside Resolve.
+async fn apply_verification_edit(
+    runtime: &mut ControlToolRuntime,
+    request: crate::plan::DesignPatchRequest,
+) -> Result<ControlToolResult> {
+    use crate::plan::PlanArtifact;
+    let document = runtime
+        .plan_document
+        .as_ref()
+        .context("verification edit has no active plan")?;
+    if request.plan_id != document.plan_id {
+        return Err(crate::tools::ToolError::PlanIdMismatch {
+            requested: request.plan_id,
+            active: document.plan_id.clone(),
+        });
+    }
+    crate::tools::error::ensure!(
+        request.expected_version == document.version,
+        "stale plan version: expected {}, active plan is version {}",
+        request.expected_version,
+        document.version
+    );
+    let state = super::status::execution_state(runtime)
+        .await?
+        .context("verification edit has no active execution")?;
+    let path = PlanArtifact::Verification.path();
+    let original =
+        super::status::execution_artifact_text(PlanArtifact::Verification, document, &state)?;
+    let patched = crate::plan::patch_single_file(&request.patch, path, &original)
+        .map_err(|error| anyhow::anyhow!("{error}; in Verify, plan_edit accepts only {path}"))?;
+    if patched == original {
+        return Ok(ControlToolResult {
+            invocation: None,
+            message: format!("{path} unchanged."),
+        });
+    }
+    runtime
+        .context
+        .execution
+        .as_ref()
+        .context("verification edit has no active execution")?
+        .send(crate::plan::execution::ExecutionOperation::VerificationDraft(patched))
+        .await?;
+    Ok(ControlToolResult {
+        invocation: None,
+        message: format!(
+            "Verification report saved; plan_phase_done reports any problems in it.\nChanged: {path}"
+        ),
+    })
+}
+
+/// Name the artifacts and project files an edit changed, without echoing their content.
+fn changed_paths(before: &PlanDocument, after: &PlanDocument) -> Result<String> {
+    let before_design = before
+        .design
+        .as_ref()
+        .context("source plan has no declaration design")?;
+    let after_design = after
+        .design
+        .as_ref()
+        .context("patched plan has no declaration design")?;
+    let mut changed =
+        crate::plan::changed_artifacts(&before.title, before_design, &after.title, after_design)
+            .into_iter()
+            .map(|artifact| artifact.path().to_owned())
+            .collect::<Vec<_>>();
+    let paths = [before_design, after_design]
+        .into_iter()
+        .flat_map(|design| design.baseline.keys().chain(design.proposed.keys()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in paths {
+        if before_design.proposed.get(path) != after_design.proposed.get(path)
+            || before_design.proposed_calls.get(path) != after_design.proposed_calls.get(path)
+            || before_design.baseline.contains_key(path) != after_design.baseline.contains_key(path)
+        {
+            changed.push(path.clone());
+        }
+    }
+    Ok(if changed.is_empty() {
+        "No content changes.".into()
+    } else {
+        format!("Changed: {}", changed.join(", "))
     })
 }

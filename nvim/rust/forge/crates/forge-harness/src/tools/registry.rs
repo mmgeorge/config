@@ -5,6 +5,19 @@ use serde_json::Value;
 
 pub use forge_provider_api::control::ControlToolDefinition;
 
+/// Show plan_submit only while authoring or in Resolve, and plan_edit also in Verify, where it
+/// writes `plan:verification.md`.
+fn plan_mutation_visible(name: &str, phase: Option<crate::plan::PlanPhase>) -> bool {
+    use crate::plan::PlanPhase;
+    match name {
+        "plan_submit" => phase.is_none_or(|phase| phase == PlanPhase::Resolve),
+        "plan_edit" => {
+            phase.is_none_or(|phase| matches!(phase, PlanPhase::Resolve | PlanPhase::Verify))
+        }
+        _ => true,
+    }
+}
+
 /// Owns the canonical Harness control-tool catalog for every provider adapter.
 #[derive(Clone, Debug, Default)]
 pub struct ControlToolRegistry;
@@ -47,7 +60,8 @@ impl ControlToolRegistry {
         .collect()
     }
 
-    /// Expose plan mutation only while authoring a plan or resolving an execution.
+    /// Expose plan mutation only while authoring a plan, resolving an execution, or writing the
+    /// Verify report.
     pub fn definition_list_for(
         &self,
         phase: Option<crate::plan::PlanPhase>,
@@ -55,11 +69,7 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
-                !is_agent_tool(definition.name)
-                    && (!matches!(
-                        definition.name,
-                        "plan_file_edit" | "plan_overview_edit" | "plan_submit"
-                    ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve))
+                !is_agent_tool(definition.name) && plan_mutation_visible(definition.name, phase)
             })
             .collect()
     }
@@ -119,10 +129,7 @@ impl ControlToolRegistry {
                         .and_then(|context| context.agent.as_ref())
                         .is_some_and(|scope| scope.available());
                 }
-                !matches!(
-                    definition.name,
-                    "plan_file_edit" | "plan_overview_edit" | "plan_submit"
-                ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
+                plan_mutation_visible(definition.name, phase)
             })
             .map(|mut definition| {
                 if definition.name == "agent_spawn"
@@ -161,5 +168,27 @@ impl ControlToolRegistry {
             .iter()
             .map(ControlToolDefinition::mcp_value)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::plan::PlanPhase;
+
+    #[test]
+    fn verify_exposes_plan_edit_without_plan_submit() {
+        let visible = |phase| {
+            let names = ControlToolRegistry
+                .definition_list_for(phase)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>();
+            (names.contains(&"plan_edit"), names.contains(&"plan_submit"))
+        };
+        assert_eq!(visible(None), (true, true));
+        assert_eq!(visible(Some(PlanPhase::Resolve)), (true, true));
+        assert_eq!(visible(Some(PlanPhase::Verify)), (true, false));
+        assert_eq!(visible(Some(PlanPhase::Implement)), (false, false));
     }
 }

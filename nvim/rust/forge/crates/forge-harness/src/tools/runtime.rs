@@ -344,8 +344,8 @@ impl ControlToolRuntime {
                         | "question_reply"
                         | "question_revise"
                         | "question_withdraw"
-                        | "plan_file_read"
-                        | "plan_overview_read"
+                        | "plan_read"
+                        | "plan_status"
                 ) || (super::session::is_tool(&invocation.name)
                     || invocation.name == super::config::NAME)
                     || (super::lsp::is_tool(&invocation.name)
@@ -416,12 +416,12 @@ impl ControlToolRuntime {
             !self.terminal,
             "this provider turn already reached a terminal control action"
         );
-        if matches!(
-            invocation.name.as_str(),
-            "plan_file_edit" | "plan_overview_edit" | "plan_submit"
-        ) && let Some(execution) = &self.context.execution
-        {
-            execution.require_revision_phase()?;
+        if let Some(execution) = &self.context.execution {
+            match invocation.name.as_str() {
+                "plan_edit" => execution.require_edit_phase()?,
+                "plan_submit" => execution.require_revision_phase()?,
+                _ => {}
+            }
         }
         match invocation.name.as_str() {
             name if super::agents::is_tool(name) => {
@@ -702,7 +702,7 @@ mod test {
         let read = ControlToolInvocation {
             call_id: None,
             task_permit: None,
-            name: "plan_file_read".into(),
+            name: "plan_read".into(),
             arguments: json!({"plan_id":"plan","path":"Foo.rs"}),
         };
         let inspected = runtime.invoke(read.clone()).await.unwrap();
@@ -711,7 +711,7 @@ mod test {
         let edit = ControlToolInvocation {
             call_id: None,
             task_permit: None,
-            name: "plan_file_edit".into(),
+            name: "plan_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}),
         };
         std::fs::write(
@@ -733,10 +733,7 @@ mod test {
         let mut output = ProviderCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
         let request = output.design_patch.pop().unwrap();
-        let crate::plan::DesignEditRequest::File(file) = &request else {
-            panic!("expected file edit")
-        };
-        assert!(file.source_digests.contains_key("Foo.rs"));
+        assert!(request.source_digests.contains_key("Foo.rs"));
         let replayed = initial.patch_design(&workspace, request.clone()).unwrap();
         assert_eq!(runtime.plan_document(), Some(&replayed));
         std::fs::write(
@@ -745,6 +742,160 @@ mod test {
         )
         .unwrap();
         assert!(initial.patch_design(&workspace, request).is_err());
+    }
+
+    /// The plan is authored as files: artifact edits store text as written, plan_submit reports
+    /// every artifact problem by line in one rejection, and Revert File withdraws proposals.
+    #[tokio::test]
+    async fn plan_artifacts_patch_status_and_revert_like_files() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        std::fs::write(
+            workspace.join(".forge.json"),
+            json!({"checks":{
+                "build":{"trigger":{"auto":true,"paths":["**"]},
+                    "action":{"command":["build"],"label":"Build","category":"build"}},
+                "unit":{"trigger":{"auto":false,"paths":["**"]},
+                    "action":{"command":["unit"],"label":"Unit","category":"test","after":["build"]}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n").unwrap();
+        context.plan_document.as_mut().unwrap().design =
+            Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        let mut runtime = ControlToolRuntime::new(context);
+        let call = |name: &str, arguments: serde_json::Value| ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: name.into(),
+            arguments,
+        };
+        let edit = |version: u64, patch: &str| {
+            call(
+                "plan_edit",
+                json!({"plan_id":"plan","expected_version":version,"patch":patch}),
+            )
+        };
+
+        let overview = runtime
+            .invoke(call(
+                "plan_read",
+                json!({"plan_id":"plan","path":"plan:overview.md"}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            overview.message.contains("1: # Structured plan"),
+            "{}",
+            overview.message
+        );
+        assert!(overview.message.contains("## Manual checks"));
+
+        let accepted = runtime
+            .invoke(edit(
+                1,
+                "*** Begin Patch\n*** Update File: plan:overview.md\n@@\n-# Structured plan\n+# Shipped game\n@@\n ## Objective\n+Ship the game.\n+## Goals\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            accepted.message.contains("version is 2"),
+            "{}",
+            accepted.message
+        );
+        assert!(accepted.message.contains("Changed: plan:overview.md"));
+        let document = runtime.plan_document().unwrap();
+        let design = document.design.as_ref().unwrap();
+        assert!(design.artifact_text["plan:overview.md"].contains("Ship the game.\n## Goals"));
+        assert!(design.document.objective.is_empty());
+        assert_eq!(document.title, "Shipped game");
+
+        let checks = runtime
+            .invoke(call(
+                "plan_read",
+                json!({"plan_id":"plan","path":"plan:checks.md"}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            checks.message.contains("- [ ] unit: Unit · requires build"),
+            "{}",
+            checks.message
+        );
+        runtime
+            .invoke(edit(
+                2,
+                "*** Begin Patch\n*** Update File: plan:checks.md\n@@\n-- [ ] unit: Unit · requires build\n+- [x] unit\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        runtime
+            .invoke(edit(
+                3,
+                "*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+
+        let submit = call(
+            "plan_submit",
+            json!({"plan_id":"plan","expected_version":4}),
+        );
+        let error = runtime.invoke(submit.clone()).await.unwrap_err();
+        let failure =
+            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document());
+        assert!(
+            failure.starts_with("plan_submit rejected version 4 with "),
+            "{failure}"
+        );
+        for expected in [
+            "error[invalid_plan_artifact]: `## Goals`: unknown section",
+            "error[invalid_plan_content]: `## Background`: the section is required",
+            "plan:checks.md:",
+            "error[invalid_plan_check]: `unit`: the check requires `build`; mark it too",
+            "Fix them and retry with expected_version 4.",
+        ] {
+            assert!(
+                failure.contains(expected),
+                "missing {expected:?} in {failure}"
+            );
+        }
+
+        let status = runtime
+            .invoke(call("plan_status", json!({"plan_id":"plan"})))
+            .await
+            .unwrap();
+        assert!(
+            status.message.contains("planning · version 4"),
+            "{}",
+            status.message
+        );
+        assert!(status.message.contains("plan:overview.md  written"));
+        assert!(status.message.contains("unit selected"));
+        assert!(status.message.contains("M Foo.rs"));
+
+        runtime
+            .invoke(edit(
+                4,
+                "*** Begin Patch\n*** Revert File: Foo.rs\n*** Revert File: plan:overview.md\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        let document = runtime.plan_document().unwrap();
+        let design = document.design.as_ref().unwrap();
+        assert!(design.proposed.is_empty() && design.baseline.is_empty());
+        assert!(!design.artifact_text.contains_key("plan:overview.md"));
+        let status = runtime
+            .invoke(call("plan_status", json!({"plan_id":"plan"})))
+            .await
+            .unwrap();
+        assert!(
+            status.message.contains("Files\n  (none)"),
+            "{}",
+            status.message
+        );
+        assert!(status.message.contains("plan:overview.md  empty"));
     }
 
     fn planning_context() -> ControlTurnContext {

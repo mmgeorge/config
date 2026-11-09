@@ -235,7 +235,7 @@ impl HarnessBroker {
         };
         if run.revision != execution.revision
             || run.state != CheckState::Passed
-            || run.outcome() != crate::plan::execution::VerificationOutcome::Passed
+            || run.status() != crate::plan::execution::VerificationStatus::Passed
             || run.shell != self.session.shell
             || run.executable != self.session.shell.executable().ok()
             || run.environment_digest != check_environment_digest()?
@@ -382,7 +382,7 @@ impl HarnessBroker {
         let state = OwnedTaskChecks {
             source: turn.id.clone(),
             input_id: work.id.clone(),
-            manual: !design.document.verification.is_empty(),
+            manual: !design.document.manual_checks.is_empty(),
             permit,
             task,
             execution,
@@ -590,17 +590,17 @@ impl HarnessBroker {
                     ));
                 }
             }
-            use crate::plan::execution::VerificationOutcome;
-            match run.outcome() {
-                VerificationOutcome::Failed => {
+            use crate::plan::execution::VerificationStatus;
+            match run.status() {
+                VerificationStatus::Failed => {
                     run.state = CheckState::Failed;
                     execution.phase = crate::plan::PlanPhase::Resolve;
                 }
-                VerificationOutcome::Blocked => {
+                VerificationStatus::Blocked => {
                     run.state = CheckState::Blocked;
                     execution.phase = crate::plan::PlanPhase::Resolve;
                 }
-                VerificationOutcome::Passed => {
+                VerificationStatus::Passed => {
                     run.state = CheckState::Passed;
                     execution.findings.clear();
                     if state.manual {

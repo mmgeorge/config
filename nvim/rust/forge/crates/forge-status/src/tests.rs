@@ -67,6 +67,15 @@ async fn fixture() -> (
     std::fs::write(directory.path().join("sample.txt"), "old\n").unwrap();
     stage_and_commit(directory.path(), &["sample.txt"], "initial");
     std::fs::write(directory.path().join("sample.txt"), "new\n").unwrap();
+    // The edit keeps the committed size, so a write within the commit's second leaves stat data
+    // identical at whole-second precision and status can report the file clean. Moving its mtime
+    // a full hour makes the modification visible to stat comparison on every run.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join("sample.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
     let store = Arc::new(RepositoryStore::default());
     let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
     let syntax = SyntaxEngine::new(diff.analysis_pool());

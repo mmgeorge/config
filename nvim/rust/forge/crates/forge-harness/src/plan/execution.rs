@@ -36,8 +36,8 @@ pub enum PlanExecutionState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-/// Records the agent's interpretation of behavioral verification.
-pub enum VerificationOutcome {
+/// States whether a manual check, or the Verify phase as a whole, passed, failed, or could not run.
+pub enum VerificationStatus {
     Passed,
     Failed,
     Blocked,
@@ -45,13 +45,15 @@ pub enum VerificationOutcome {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Links an agent assessment to actual tool evidence and unresolved defects.
+/// Holds a submitted Verify report: one result per manual check, the defects found, and the
+/// overall status Harness derives from them.
 pub struct VerificationReport {
-    pub outcome: VerificationOutcome,
+    pub status: VerificationStatus,
     #[serde(default)]
-    pub checks: Vec<VerificationCheck>,
+    pub manual_checks: Vec<ManualCheckResult>,
+    /// Cites the evidence behind the findings.
     #[serde(default)]
-    pub evidence: Vec<String>,
+    pub observed_in: Vec<String>,
     #[serde(default)]
     pub findings: Vec<String>,
     #[serde(default)]
@@ -60,24 +62,18 @@ pub struct VerificationReport {
     pub reuse_reason: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-/// Identifies the accepted plan's verification group.
-pub enum VerificationCategory {
-    Automated,
-    Manual,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Records one planned check and the tool evidence supporting its result.
-pub struct VerificationCheck {
-    pub category: VerificationCategory,
+/// Records one accepted manual check, what the agent observed, and where it observed it.
+pub struct ManualCheckResult {
+    /// Holds the accepted manual check text from `## Manual checks`.
     pub label: String,
-    pub outcome: VerificationOutcome,
-    pub summary: String,
+    pub status: VerificationStatus,
+    /// Describes what the agent observed while performing the check.
+    pub note: String,
+    /// Cites the tool results and passed checks that show the result.
     #[serde(default)]
-    pub evidence: Vec<String>,
+    pub observed_in: Vec<String>,
 }
 
 enum VerificationAssessment<'report> {
@@ -85,81 +81,85 @@ enum VerificationAssessment<'report> {
     Failed,
     Blocked { reason: &'report str },
 }
+
+/// Derive the short, stable citation that `plan:evidence.md` shows for one evidence ID.
+///
+/// A content hash keeps the alias fixed as later tool calls join the evidence list, so a reading
+/// taken earlier in the turn still names the same result.
+pub(crate) fn evidence_alias(id: &str) -> String {
+    format!("E{}", &super::digest(id.as_bytes())[..8])
+}
+
 impl VerificationReport {
+    /// Iterate every evidence ID the report cites, from its findings and its manual checks.
+    pub(crate) fn cited(&self) -> impl Iterator<Item = &String> {
+        self.observed_in.iter().chain(
+            self.manual_checks
+                .iter()
+                .flat_map(|check| &check.observed_in),
+        )
+    }
+
     fn assessment(&self) -> Result<VerificationAssessment<'_>> {
-        match self.outcome {
-            VerificationOutcome::Passed => {
+        match self.status {
+            VerificationStatus::Passed => {
                 ensure!(
-                    self.checks
+                    self.manual_checks
                         .iter()
-                        .all(|check| check.outcome == VerificationOutcome::Passed),
-                    "a passed assessment cannot contain failed or blocked checks"
+                        .all(|check| check.status == VerificationStatus::Passed),
+                    "a passed report cannot contain failed or blocked checks"
                 );
                 ensure!(
                     self.findings.is_empty(),
-                    "a passed assessment cannot retain unresolved findings"
+                    "a passed report cannot retain unresolved findings"
                 );
                 ensure!(
-                    !self.evidence.is_empty()
-                        || self.checks.iter().any(|check| !check.evidence.is_empty()),
-                    "a passed assessment requires verification evidence"
+                    self.cited().next().is_some(),
+                    "a passed report requires cited evidence"
                 );
                 Ok(VerificationAssessment::Passed)
             }
-            VerificationOutcome::Failed => {
+            VerificationStatus::Failed => {
                 ensure!(
                     self.findings
                         .iter()
                         .any(|finding| !finding.trim().is_empty())
                         || self
-                            .checks
+                            .manual_checks
                             .iter()
-                            .any(|check| check.outcome == VerificationOutcome::Failed),
-                    "failed verification requires concrete findings"
+                            .any(|check| check.status == VerificationStatus::Failed),
+                    "a failed report requires concrete findings"
                 );
                 Ok(VerificationAssessment::Failed)
             }
-            VerificationOutcome::Blocked => {
+            VerificationStatus::Blocked => {
                 let reason = self
                     .reason
                     .as_deref()
                     .filter(|reason| !reason.trim().is_empty())
-                    .context("blocked verification requires a reason")?;
+                    .context("a blocked report requires a reason")?;
                 Ok(VerificationAssessment::Blocked { reason })
             }
         }
     }
-    /// Validate check identities and evidence before a phase transition is committed.
-    pub(crate) fn validate_checks(&self, actions: &[String]) -> Result<()> {
-        // Each rejection names the exact expected labels so a model can correct its
-        // report instead of retrying a contract it cannot see.
-        let expected = || {
-            actions
-                .iter()
-                .enumerate()
-                .map(|(index, action)| format!("{}. {action}", index + 1))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
+
+    /// Require exactly one noted result per accepted manual check, in plan order.
+    pub(crate) fn validate_checks(&self, manual_checks: &[String]) -> Result<()> {
         ensure!(
-            self.checks.len() == actions.len(),
-            "report every accepted manual verification action: expected {} entries labeled exactly, in order: {}; got {}",
-            actions.len(),
-            expected(),
-            self.checks.len()
+            self.manual_checks.len() == manual_checks.len()
+                && self
+                    .manual_checks
+                    .iter()
+                    .zip(manual_checks)
+                    .all(|(result, check)| result.label == *check),
+            "the report must hold one result per accepted manual check, in plan order"
         );
-        for (position, (check, action)) in self.checks.iter().zip(actions).enumerate() {
-            ensure!(
-                check.category == VerificationCategory::Manual && check.label == *action,
-                "verification must contain only accepted manual actions in order: entry {} must have category manual and label exactly {action:?}; expected labels: {}",
-                position + 1,
-                expected()
-            );
-            ensure!(
-                !check.summary.trim().is_empty(),
-                "manual result requires observations"
-            );
-        }
+        ensure!(
+            self.manual_checks
+                .iter()
+                .all(|result| !result.note.trim().is_empty()),
+            "every manual check result requires a note"
+        );
         Ok(())
     }
 }
@@ -171,7 +171,8 @@ pub struct PlanPhaseDone {
     pub phase: PlanPhase,
     pub revision: u32,
     pub summary: String,
-    #[serde(default)]
+    /// Parsed by Harness from the saved `plan:verification.md` text, never from model arguments.
+    #[serde(skip)]
     pub verification: Option<VerificationReport>,
 }
 
@@ -351,6 +352,10 @@ pub struct PlanExecutionRecord {
     pub findings: Vec<String>,
     pub progress: SemanticProgress,
     pub verification: Vec<VerificationEvidence>,
+    /// Holds the text of `plan:verification.md` as the agent wrote it during Verify, until
+    /// `plan_phase_done` parses and submits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_draft: Option<String>,
     #[serde(default)]
     pub check_runs: Vec<crate::checks::CheckRun>,
     pub revision_history: Vec<ExecutionRevision>,
@@ -382,7 +387,7 @@ impl PlanExecutionRecord {
             .filter(|run| {
                 run.revision == self.revision
                     && run.state == crate::checks::CheckState::Passed
-                    && run.outcome() == VerificationOutcome::Passed
+                    && run.status() == VerificationStatus::Passed
             })
             .into_iter()
             .flat_map(|run| run.commands.iter().filter(|command| command.selected))
@@ -396,6 +401,7 @@ impl PlanExecutionRecord {
         now_ms: i64,
     ) -> Result<()> {
         self.validate_phase_request(&request)?;
+        self.verification_draft = None;
         if self.phase != PlanPhase::Verify {
             ensure!(
                 request.verification.is_none(),
@@ -422,10 +428,10 @@ impl PlanExecutionRecord {
                     self.findings = report.findings.clone();
                     self.findings.extend(
                         report
-                            .checks
+                            .manual_checks
                             .iter()
-                            .filter(|check| check.outcome != VerificationOutcome::Passed)
-                            .map(|check| format!("{}: {}", check.label, check.summary)),
+                            .filter(|result| result.status != VerificationStatus::Passed)
+                            .map(|result| format!("{}: {}", result.label, result.note)),
                     );
                     self.findings.extend(progress.findings());
                 }
@@ -494,15 +500,15 @@ impl PlanExecutionRecord {
             })
             .collect::<Vec<_>>();
         let checks = if passed.is_empty() {
-            "Harness ran no automated check commands for this revision, because no configured check runs automatically for these changes, so execution.verification_evidence has no `Harness check` entry. When an action requires a check, find it with check_definition_list, run it with check_run, and cite that check_run result as evidence. Do not edit source or revise the plan.".to_owned()
+            "Harness ran no automated check commands for this revision, because no configured check runs automatically for these changes, so plan:verification.md lists no `Harness check` evidence. When an action requires a check, find it with check_definition_list, run it with check_run, and cite that check_run result as evidence. Do not edit source or revise the plan.".to_owned()
         } else {
             format!(
-                "Harness has already passed the declaration check and these automated checks for this revision: {}. If an action requests one of them, report its recorded result instead of running it again, citing the matching `Harness check` entry from execution.verification_evidence. Run any other check an action requires with check_run. Do not rerun passed checks, edit source, or revise the plan.",
+                "Harness has already passed the declaration check and these automated checks for this revision: {}. If an action requests one of them, report its recorded result instead of running it again, citing the matching `Harness check` evidence from plan:verification.md. Run any other check an action requires with check_run. Do not rerun passed checks, edit source, or revise the plan.",
                 passed.join(", ")
             )
         };
         format!(
-            "Perform only the accepted plan's manual verification actions, in order. {checks} Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
+            "Perform only the accepted plan's manual verification actions, in order. {checks} Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Read plan:verification.md with plan_read for the actions and evidence IDs before submitting results."
         )
     }
 
@@ -534,12 +540,12 @@ impl PlanExecutionRecord {
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
-            " Report verification.checks with one entry per accepted manual action, in plan order. Each entry has category (manual), a label copied verbatim from the accepted verification action, outcome (passed, failed, or blocked), a short result summary, and evidence tool IDs. List checks that could not run as blocked, with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI shows the structured report, so keep the final response brief."
+            " Write the report in plan:verification.md with plan_edit. Replace each `N. pending []` row with `N. passed|failed|blocked [IDs] note`, citing IDs from plan:evidence.md; a blocked note states the concrete cause. List each defect under `## Findings` as `path:line:column: message [IDs]`, or `-: message` when no file applies, without repeating row notes or Harness declaration diagnostics. Harness derives the overall result. Then call plan_phase_done, which reports any problem in the report by line. The UI shows the structured report, so keep the final response brief."
         } else {
             ""
         };
         format!(
-            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the plan with plan_overview_read. Call plan_phase_done with this phase and revision when the phase's work is finished, then end the turn after it succeeds. Harness records the transition and supplies the next phase. Ending a turn does not end the phase. Do not call goal_complete for this execution.",
+            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Inspect the plan with plan_status and read its artifacts and files with plan_read. Call plan_phase_done with this phase and revision when the phase's work is finished, then end the turn after it succeeds. Harness records the transition and supplies the next phase. Ending a turn does not end the phase. Do not call goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -569,6 +575,8 @@ impl PlanExecutionRecord {
 pub enum ExecutionOperation {
     Inspect,
     Phase(PlanPhaseDone),
+    /// Saves the text of `plan:verification.md` without finishing the phase.
+    VerificationDraft(String),
     Draft(Box<PlanDocument>),
     Submit {
         baseline: Box<PlanDocument>,
@@ -617,6 +625,15 @@ impl ExecutionControlSender {
             self.phase.label()
         );
         Ok(())
+    }
+
+    /// Reject plan edits outside Resolve, which revises the plan, and Verify, which writes its
+    /// report artifact.
+    pub fn require_edit_phase(&self) -> Result<()> {
+        if self.phase == PlanPhase::Verify {
+            return Ok(());
+        }
+        self.require_revision_phase()
     }
 
     /// Await a committed broker result before acknowledging the provider's request.
@@ -685,6 +702,7 @@ mod tests {
             findings: Vec::new(),
             progress: SemanticProgress::default(),
             verification: Vec::new(),
+            verification_draft: None,
             check_runs: Vec::new(),
             revision_history: Vec::new(),
             approval_comments: Vec::new(),
@@ -699,28 +717,42 @@ mod tests {
         }
     }
 
-    fn done(phase: PlanPhase, outcome: Option<VerificationOutcome>) -> PlanPhaseDone {
+    fn done(phase: PlanPhase, status: Option<VerificationStatus>) -> PlanPhaseDone {
         PlanPhaseDone {
             phase,
             revision: 1,
             summary: "Verified requirement".into(),
-            verification: outcome.map(|outcome| VerificationReport {
-                outcome,
-                evidence: vec!["check-result".into()],
-                findings: if outcome == VerificationOutcome::Failed {
+            verification: status.map(|status| VerificationReport {
+                status,
+                observed_in: vec!["check-result".into()],
+                findings: if status == VerificationStatus::Failed {
                     vec!["Round reset retains score".into()]
                 } else {
                     Vec::new()
                 },
-                reason: if outcome == VerificationOutcome::Blocked {
+                reason: if status == VerificationStatus::Blocked {
                     Some("Compiler unavailable".into())
                 } else {
                     None
                 },
                 reuse_reason: None,
-                checks: Vec::new(),
+                manual_checks: Vec::new(),
             }),
         }
+    }
+
+    #[test]
+    fn finishing_a_phase_discards_the_verification_draft() {
+        let mut execution = execution();
+        execution.verification_draft = Some("# Verification\n".into());
+        execution
+            .finish_phase(
+                done(PlanPhase::Implement, None),
+                SemanticProgress::default(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(execution.verification_draft, None);
     }
 
     #[test]
@@ -737,7 +769,7 @@ mod tests {
         execution.phase = PlanPhase::Verify;
         execution
             .finish_phase(
-                done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                done(PlanPhase::Verify, Some(VerificationStatus::Passed)),
                 mismatch.clone(),
                 2,
             )
@@ -751,7 +783,7 @@ mod tests {
         execution.phase = PlanPhase::Verify;
         execution
             .finish_phase(
-                done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                done(PlanPhase::Verify, Some(VerificationStatus::Passed)),
                 SemanticProgress::default(),
                 4,
             )
@@ -761,7 +793,7 @@ mod tests {
         assert!(
             execution
                 .finish_phase(
-                    done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                    done(PlanPhase::Verify, Some(VerificationStatus::Passed)),
                     SemanticProgress::default(),
                     5
                 )

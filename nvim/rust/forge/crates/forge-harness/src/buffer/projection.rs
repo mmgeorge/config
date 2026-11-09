@@ -1619,17 +1619,17 @@ impl TimelineRenderer<'_> {
         id: &str,
         result: &crate::exchange::VerificationResult,
     ) -> Result<()> {
-        use crate::plan::execution::VerificationOutcome;
-        let outcome = result.outcome;
+        use crate::plan::execution::VerificationStatus;
+        let status = result.status;
         let identity = id.to_owned();
-        if outcome == VerificationOutcome::Passed
+        if status == VerificationStatus::Passed
             && result
-                .verification
+                .report
                 .as_ref()
-                .is_none_or(|report| report.checks.is_empty())
+                .is_none_or(|report| report.manual_checks.is_empty())
         {
             let summary = result
-                .summary
+                .phase_summary
                 .as_deref()
                 .unwrap_or("")
                 .split_whitespace()
@@ -1648,22 +1648,22 @@ impl TimelineRenderer<'_> {
                 None,
             );
         }
-        let label = match outcome {
-            VerificationOutcome::Failed => "Verification failed",
-            VerificationOutcome::Blocked => "Verification blocked",
-            VerificationOutcome::Passed => "Verification passed",
+        let label = match status {
+            VerificationStatus::Failed => "Verification failed",
+            VerificationStatus::Blocked => "Verification blocked",
+            VerificationStatus::Passed => "Verification passed",
         };
-        let checks = result
-            .verification
+        let manual_checks = result
+            .report
             .as_ref()
-            .map_or(&[][..], |report| report.checks.as_slice());
-        let failed = checks
+            .map_or(&[][..], |report| report.manual_checks.as_slice());
+        let failed = manual_checks
             .iter()
-            .filter(|check| check.outcome == VerificationOutcome::Failed)
+            .filter(|check| check.status == VerificationStatus::Failed)
             .count();
-        let blocked = checks
+        let blocked = manual_checks
             .iter()
-            .filter(|check| check.outcome == VerificationOutcome::Blocked)
+            .filter(|check| check.status == VerificationStatus::Blocked)
             .count();
         let mut totals = Vec::new();
         if failed > 0 {
@@ -1696,67 +1696,51 @@ impl TimelineRenderer<'_> {
         };
         self.literal(&identity, &format!("▸ {label}{suffix}"), None)?;
         let section = self.begin_section(2);
-        for (category, label) in [
-            (
-                crate::plan::execution::VerificationCategory::Automated,
-                "Automated",
-            ),
-            (
-                crate::plan::execution::VerificationCategory::Manual,
-                "Manual",
-            ),
-        ] {
-            let group_checks = checks
-                .iter()
-                .filter(|check| check.category == category)
-                .collect::<Vec<_>>();
-            if group_checks.is_empty() {
-                continue;
-            }
-            let group_id = format!("{identity}:{label}");
+        if !manual_checks.is_empty() {
+            let group_id = format!("{identity}:Manual");
             let counts = [
-                (VerificationOutcome::Passed, "passed"),
-                (VerificationOutcome::Failed, "failed"),
-                (VerificationOutcome::Blocked, "blocked"),
+                (VerificationStatus::Passed, "passed"),
+                (VerificationStatus::Failed, "failed"),
+                (VerificationStatus::Blocked, "blocked"),
             ]
             .into_iter()
-            .filter_map(|(outcome, label)| {
-                let count = group_checks
+            .filter_map(|(status, label)| {
+                let count = manual_checks
                     .iter()
-                    .filter(|check| check.outcome == outcome)
+                    .filter(|check| check.status == status)
                     .count();
                 (count > 0).then(|| format!("{count} {label}"))
             })
             .collect::<Vec<_>>()
             .join(", ");
-            self.literal(&group_id, &format!("▸ {label} · {counts}"), None)?;
+            self.literal(&group_id, &format!("▸ Manual checks · {counts}"), None)?;
             let group = self.begin_section(2);
-            for (index, check) in group_checks.into_iter().enumerate() {
+            for (index, check) in manual_checks.iter().enumerate() {
                 let check_id = format!("{group_id}:{index}");
-                let outcome = match check.outcome {
-                    VerificationOutcome::Passed => "passed",
-                    VerificationOutcome::Failed => "failed",
-                    VerificationOutcome::Blocked => "blocked",
+                let status = match check.status {
+                    VerificationStatus::Passed => "passed",
+                    VerificationStatus::Failed => "failed",
+                    VerificationStatus::Blocked => "blocked",
                 };
                 self.literal(
                     &check_id,
-                    &format!("▸ {} · {outcome}", check.label.replace(['\r', '\n'], " ")),
+                    &format!("▸ {} · {status}", check.label.replace(['\r', '\n'], " ")),
                     None,
                 )?;
                 let check_section = self.begin_section(2);
                 self.markdown(
-                    &format!("{check_id}:summary"),
-                    check.summary.trim_end(),
+                    &format!("{check_id}:note"),
+                    check.note.trim_end(),
                     MarkdownRole::Detail,
                 )?;
-                for (evidence_index, evidence) in check.evidence.iter().enumerate() {
+                for (source_index, evidence_id) in check.observed_in.iter().enumerate() {
                     let action = result
-                        .verification_tools
-                        .get(evidence)
+                        .evidence_sources
+                        .get(evidence_id)
                         .and_then(|source| self.display.source_tool(source))
                         .map(|call_id| TranscriptAction::Tool { call_id });
                     self.literal(
-                        &format!("{check_id}:evidence:{evidence_index}"),
+                        &format!("{check_id}:observed_in:{source_index}"),
                         "Command output",
                         action,
                     )?;
@@ -1830,7 +1814,7 @@ impl TimelineRenderer<'_> {
             self.finish_section(declarations, &declaration_id, true);
         }
         let findings = result
-            .verification
+            .report
             .as_ref()
             .map_or(result.findings.as_slice(), |report| {
                 report.findings.as_slice()
@@ -1852,14 +1836,14 @@ impl TimelineRenderer<'_> {
             }
             self.finish_section(finding_section, &finding_id, true);
         }
-        if checks.is_empty()
+        if manual_checks.is_empty()
             && findings.is_empty()
             && result.declaration_findings.is_empty()
             && let Some(reason) = result
-                .verification
+                .report
                 .as_ref()
                 .and_then(|report| report.reason.as_deref())
-                .or(result.summary.as_deref())
+                .or(result.phase_summary.as_deref())
         {
             self.markdown(&format!("{identity}:reason"), reason, MarkdownRole::Detail)?;
         }

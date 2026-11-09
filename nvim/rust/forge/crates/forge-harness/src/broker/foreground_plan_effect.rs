@@ -7,7 +7,7 @@ use crate::provider::session_execution::{
 /// An ordered semantic mutation, prepared against one admitted plan authority.
 pub(crate) enum PlanMutation {
     Edit(crate::plan::PlanEditRequest),
-    Design(crate::plan::DesignEditRequest),
+    Design(crate::plan::DesignPatchRequest),
 }
 
 /// Own a plan mutation and its receipt while the broker is available to other requests.
@@ -154,7 +154,7 @@ impl PlanSubmissionJob {
             };
         let mut document = original.clone();
         let warnings = if let Some(design) = &mut document.design {
-            let validated = design.validated(&workspace).await?;
+            let validated = design.validated(&workspace, &original.title).await?;
             let warnings = validated.warnings();
             *design = validated.into_design();
             warnings

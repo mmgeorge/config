@@ -119,7 +119,7 @@ pub struct ProviderCompletion {
     #[serde(default)]
     pub plan_edit: Vec<crate::plan::PlanEditRequest>,
     #[serde(default)]
-    pub design_patch: Vec<crate::plan::DesignEditRequest>,
+    pub design_patch: Vec<crate::plan::DesignPatchRequest>,
     pub plan_submit: Option<PlanSubmitRequest>,
     pub plan_read: Option<String>,
     pub plan_question: Option<PlanQuestionSet>,

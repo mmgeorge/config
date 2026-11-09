@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 use super::design_document::DesignDocument;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use forge_diff::syntax::DeclarationOverview;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,6 @@ pub(crate) struct DesignFileInventory<'a> {
     paths: BTreeSet<&'a String>,
     changed_paths: Vec<String>,
 }
-
-const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
 type SourceOverviewCache =
     std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
@@ -47,6 +45,11 @@ pub struct DeclarationDesign {
     pub validation: Option<crate::declaration::DeclarationValidation>,
     #[serde(default)]
     pub document: DesignDocument,
+    /// Holds the agent's text for each authored `plan:` artifact it has edited, keyed by
+    /// artifact path. Submission parses this text into `document`; an artifact without an
+    /// entry renders from `document`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_text: BTreeMap<String, String>,
     #[serde(default = "default_line_width")]
     pub line_width: usize,
     pub baseline: BTreeMap<String, DeclarationFile>,
@@ -73,6 +76,7 @@ impl Default for DeclarationDesign {
             cargo_lock: BTreeMap::new(),
             validation: None,
             document: DesignDocument::default(),
+            artifact_text: BTreeMap::new(),
             line_width: default_line_width(),
             baseline: BTreeMap::new(),
             proposed: BTreeMap::new(),
@@ -102,9 +106,9 @@ impl ValidatedDesign {
 
 impl DeclarationDesign {
     /// Format and validate one submission using only captured declaration evidence.
-    pub(crate) async fn validated(&self, workspace: &Path) -> Result<ValidatedDesign> {
+    pub(crate) async fn validated(&self, workspace: &Path, title: &str) -> Result<ValidatedDesign> {
         self.check_workspace(workspace)?;
-        self.validated_revision(workspace).await
+        self.validated_revision(workspace, title).await
     }
 
     /// Collect every rule the planning model must satisfy in authored declarations: comment
@@ -123,9 +127,25 @@ impl DeclarationDesign {
     }
 
     /// Validate a new target without replacing the immutable pre-execution baseline.
-    pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<ValidatedDesign> {
+    ///
+    /// The authored artifacts are parsed here, the only path from their text into `document`,
+    /// and their diagnostics join the declaration diagnostics in one rejection.
+    pub(crate) async fn validated_revision(
+        &self,
+        workspace: &Path,
+        title: &str,
+    ) -> Result<ValidatedDesign> {
         let mut design = self.formatted()?;
         let configuration = crate::checks::ConfigSnapshot::load(workspace)?;
+        let artifacts =
+            super::design_artifact::parse_authored(title, &design, &configuration.config)?;
+        let artifact_errors = artifacts
+            .diagnostic
+            .iter()
+            .any(|diagnostic| diagnostic.error);
+        if !artifact_errors {
+            design.document = artifacts.document;
+        }
         configuration
             .config
             .validate_selection(&design.document.checks)?;
@@ -143,6 +163,7 @@ impl DeclarationDesign {
         // Authored-rule diagnostics wait for the resolver so one rejection reports them with
         // every reference failure instead of one rule family per submission.
         let mut authored = self.authored_diagnostics(&design, workspace)?;
+        authored.extend(artifacts.diagnostic);
         let paths = design
             .proposed
             .keys()
@@ -330,14 +351,10 @@ impl DeclarationDesign {
     pub fn inspect(
         &self,
         workspace: &Path,
-        path: Option<&str>,
+        path: &str,
         baseline: bool,
     ) -> Result<serde_json::Value> {
-        if let Some(path) = path
-            && path != PLAN_DOCUMENT_PATH
-            && !self.baseline.contains_key(path)
-            && !self.proposed.contains_key(path)
-        {
+        if !self.baseline.contains_key(path) && !self.proposed.contains_key(path) {
             let (file, calls) = self.source(workspace, path)?;
             let text = super::calls::combined(path, &file.text, &calls)?;
             return Ok(
@@ -478,55 +495,84 @@ impl DeclarationDesign {
         }
     }
 
-    /// Read one virtual overview or list paths without sending the complete snapshot.
-    pub fn read(&self, path: Option<&str>, baseline: bool) -> Result<serde_json::Value> {
-        if let Some(path) = path {
-            if path == PLAN_DOCUMENT_PATH {
-                ensure!(!baseline, "plan.json has no source baseline");
-                return Ok(
-                    serde_json::json!({"path":path,"side":"proposed","text":format!("{}\n",super::codec::to_string_pretty(&self.document)?)}),
-                );
-            }
-            validate_path(path)?;
-            let text = if baseline {
-                self.baseline.get(path).map(|file| &file.text)
-            } else {
-                self.proposed.get(path)
-            }
-            .with_context(|| format!("declaration file does not exist: {path}"))?;
-            let calls = if baseline {
-                self.baseline_calls.get(path)
-            } else {
-                self.proposed_calls.get(path)
-            };
-            let text =
-                super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
-            Ok(
-                serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
-            )
+    /// Read one captured file's baseline or proposed semantic structure.
+    pub fn read(&self, path: &str, baseline: bool) -> Result<serde_json::Value> {
+        validate_path(path)?;
+        let text = if baseline {
+            self.baseline.get(path).map(|file| &file.text)
         } else {
-            Ok(
-                serde_json::json!({"paths":self.baseline.keys().chain(self.proposed.keys()).map(String::as_str).chain([PLAN_DOCUMENT_PATH]).collect::<BTreeSet<_>>(),"changed_paths":self.changed_paths()}),
-            )
+            self.proposed.get(path)
         }
+        .with_context(|| format!("declaration file does not exist: {path}"))?;
+        let calls = if baseline {
+            self.baseline_calls.get(path)
+        } else {
+            self.proposed_calls.get(path)
+        };
+        let text =
+            super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
+        Ok(
+            serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
+        )
     }
 
-    /// Apply a familiar multi-file patch atomically to virtual proposed files.
+    /// Withdraw every proposal for one project file, including a move, so it reads from the
+    /// workspace again.
+    fn revert_file(&mut self, path: &str) -> Result<()> {
+        validate_path(path)?;
+        let original = self
+            .moved
+            .iter()
+            .find(|(_, to)| to.as_str() == path)
+            .map(|(from, _)| from.clone())
+            .unwrap_or_else(|| path.into());
+        ensure!(
+            self.baseline.contains_key(&original) || self.proposed.contains_key(path),
+            "{path}: the plan proposes no change to this file"
+        );
+        if let Some(destination) = self.moved.remove(&original) {
+            self.proposed.remove(&destination);
+            self.proposed_calls.remove(&destination);
+        }
+        self.baseline.remove(&original);
+        self.baseline_calls.remove(&original);
+        self.proposed.remove(&original);
+        self.proposed_calls.remove(&original);
+        Ok(())
+    }
+
+    /// Apply a familiar multi-file patch atomically to virtual proposed files and plan artifacts.
+    ///
+    /// Artifact text is stored as written; `plan_submit` reports its problems. The overview
+    /// artifact carries the plan title, so the patch receives the current title and returns the
+    /// title its `# Title` line leaves.
     pub fn patch(
         &self,
         workspace: &Path,
         source_digests: &BTreeMap<String, String>,
         patch: &str,
-    ) -> Result<Self> {
+        title: &str,
+    ) -> Result<(Self, String)> {
+        use super::design_artifact::{self, PlanArtifact};
         let lines = patch.lines().collect::<Vec<_>>();
         ensure!(
             lines.first() == Some(&"*** Begin Patch") && lines.last() == Some(&"*** End Patch"),
             "patch must start with *** Begin Patch and end with *** End Patch"
         );
         let mut candidate = self.clone();
+        let mut title = title.to_owned();
         candidate.validation = None;
         let mut position = 1;
         let mut edited = BTreeSet::new();
+        let body_end = |position: usize| {
+            let mut end = position;
+            while end < lines.len() - 1
+                && (!lines[end].starts_with("*** ") || lines[end] == "*** End of File")
+            {
+                end += 1;
+            }
+            end
+        };
         while position < lines.len() - 1 {
             let operation = lines[position];
             position += 1;
@@ -543,37 +589,88 @@ impl DeclarationDesign {
                         .strip_prefix("*** Delete File: ")
                         .map(|path| ("delete", path))
                 })
-                .context("expected Add File, Update File, or Delete File header")?;
-            if path == PLAN_DOCUMENT_PATH {
+                .or_else(|| {
+                    operation
+                        .strip_prefix("*** Revert File: ")
+                        .map(|path| ("revert", path))
+                })
+                .context("expected Add File, Update File, Delete File, or Revert File header")?;
+            if let Some(artifact) = PlanArtifact::from_path(path)? {
                 ensure!(
-                    kind == "update",
-                    "plan.json already exists and can only be updated"
+                    artifact.authored(),
+                    "{path} is read-only; Harness generates it from execution state"
                 );
-            } else {
-                validate_path(path)?;
-                if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path)
-                {
-                    if kind == "add" {
-                        ensure!(
-                            std::fs::symlink_metadata(workspace.join(path))
-                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-                            "{path}: Add File destination already exists or cannot be inspected"
-                        );
-                    } else {
-                        let (file, calls) = candidate.source(workspace, path)?;
-                        if let Some(expected) = source_digests.get(path) {
-                            ensure!(
-                                *expected == file.source_digest,
-                                "{path}: workspace changed since inspection. Read the declaration file again."
-                            );
-                        }
-                        candidate.proposed.insert(path.into(), file.text.clone());
-                        if !calls.is_empty() {
-                            candidate.baseline_calls.insert(path.into(), calls.clone());
-                            candidate.proposed_calls.insert(path.into(), calls);
-                        }
-                        candidate.baseline.insert(path.into(), file);
+                ensure!(
+                    edited.insert(path.to_owned()),
+                    "file appears more than once in patch: {path}"
+                );
+                ensure!(
+                    !lines[position].starts_with("*** Move to: "),
+                    "{path} cannot be moved"
+                );
+                let end = body_end(position);
+                let body = &lines[position..end];
+                position = end;
+                match kind {
+                    "delete" => {
+                        bail!("{path} cannot be deleted; use *** Revert File to reset it")
                     }
+                    "revert" => {
+                        ensure!(body.is_empty(), "Revert File must have no patch body");
+                        design_artifact::revert_authored(artifact, &mut candidate);
+                    }
+                    _ => {
+                        let patched = if kind == "add" {
+                            added_text(body)?
+                        } else {
+                            let original = design_artifact::authored_text(
+                                artifact, &title, &candidate, workspace,
+                            )?;
+                            patch_file(&original, body)?
+                        };
+                        design_artifact::store_authored(
+                            artifact,
+                            patched,
+                            &mut title,
+                            &mut candidate,
+                            workspace,
+                        )?;
+                    }
+                }
+                continue;
+            }
+            if kind == "revert" {
+                ensure!(
+                    edited.insert(path.to_owned()),
+                    "file appears more than once in patch: {path}"
+                );
+                let end = body_end(position);
+                ensure!(end == position, "Revert File must have no patch body");
+                candidate.revert_file(path)?;
+                continue;
+            }
+            validate_path(path)?;
+            if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path) {
+                if kind == "add" {
+                    ensure!(
+                        std::fs::symlink_metadata(workspace.join(path))
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                        "{path}: Add File destination already exists or cannot be inspected"
+                    );
+                } else {
+                    let (file, calls) = candidate.source(workspace, path)?;
+                    if let Some(expected) = source_digests.get(path) {
+                        ensure!(
+                            *expected == file.source_digest,
+                            "{path}: workspace changed since inspection. Read the declaration file again."
+                        );
+                    }
+                    candidate.proposed.insert(path.into(), file.text.clone());
+                    if !calls.is_empty() {
+                        candidate.baseline_calls.insert(path.into(), calls.clone());
+                        candidate.proposed_calls.insert(path.into(), calls);
+                    }
+                    candidate.baseline.insert(path.into(), file);
                 }
             }
             ensure!(
@@ -586,8 +683,8 @@ impl DeclarationDesign {
             {
                 ensure!(kind == "update", "Move to requires Update File");
                 ensure!(
-                    path != PLAN_DOCUMENT_PATH && to != PLAN_DOCUMENT_PATH,
-                    "plan.json cannot be moved"
+                    PlanArtifact::from_path(to)?.is_none(),
+                    "a project file cannot move into a plan artifact path: {to}"
                 );
                 validate_path(to)?;
                 if !candidate.baseline.contains_key(to) {
@@ -612,20 +709,8 @@ impl DeclarationDesign {
                 position += 1;
             }
             let start = position;
-            while position < lines.len() - 1
-                && (!lines[position].starts_with("*** ") || lines[position] == "*** End of File")
-            {
-                position += 1;
-            }
+            position = body_end(position);
             let body = &lines[start..position];
-            if path == PLAN_DOCUMENT_PATH {
-                let original =
-                    format!("{}\n", super::codec::to_string_pretty(&candidate.document)?);
-                let text = patch_file(&original, body)?;
-                candidate.document =
-                    super::codec::from_str(&text).context("invalid plan.json document")?;
-                continue;
-            }
             match kind {
                 "delete" => {
                     ensure!(body.is_empty(), "Delete File must have no patch body");
@@ -641,15 +726,7 @@ impl DeclarationDesign {
                         !candidate.proposed.contains_key(path),
                         "cannot add existing declaration file: {path}"
                     );
-                    let mut text = String::new();
-                    for line in body {
-                        text.push_str(
-                            line.strip_prefix('+')
-                                .context("Add File lines must start with +")?,
-                        );
-                        text.push('\n');
-                    }
-                    let (text, calls) = super::calls::parse(path, &text, &[])?;
+                    let (text, calls) = super::calls::parse(path, &added_text(body)?, &[])?;
                     candidate.proposed.insert(path.into(), text);
                     if !calls.is_empty() {
                         candidate.proposed_calls.insert(path.into(), calls);
@@ -714,23 +791,63 @@ impl DeclarationDesign {
         candidate.validate()?;
         if candidate.proposed == self.proposed
             && candidate.proposed_calls == self.proposed_calls
+            && candidate.baseline == self.baseline
             && candidate.document == self.document
             && candidate.moved == self.moved
         {
             candidate.validation = self.validation.clone();
         }
-        Ok(candidate)
+        Ok((candidate, title))
     }
 }
 
-/// Carries an optimistic patch against proposed declaration files.
+/// Apply a patch that may touch only `path` to that file's current text.
+///
+/// Verify edits exactly one execution artifact, so this rejects any other file, a move, a delete,
+/// or a revert instead of silently dropping it.
+pub(crate) fn patch_single_file(patch: &str, path: &str, original: &str) -> Result<String> {
+    let lines = patch.lines().collect::<Vec<_>>();
+    ensure!(
+        lines.len() >= 3
+            && lines.first() == Some(&"*** Begin Patch")
+            && lines.last() == Some(&"*** End Patch"),
+        "patch must start with *** Begin Patch and end with *** End Patch"
+    );
+    let body = &lines[2..lines.len() - 1];
+    ensure!(
+        body.iter()
+            .all(|line| !line.starts_with("*** ") || *line == "*** End of File"),
+        "this patch may contain only one Update File or Add File section for {path}"
+    );
+    if lines[1] == format!("*** Update File: {path}") {
+        patch_file(original, body)
+    } else if lines[1] == format!("*** Add File: {path}") {
+        added_text(body)
+    } else {
+        bail!("this patch may edit only {path}, with *** Update File or *** Add File")
+    }
+}
+
+/// Collect the text of an Add File body, whose every line starts with `+`.
+fn added_text(body: &[&str]) -> Result<String> {
+    let mut text = String::new();
+    for line in body {
+        text.push_str(
+            line.strip_prefix('+')
+                .context("Add File lines must start with +")?,
+        );
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Carries an optimistic patch against proposed project files and plan artifacts.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesignPatchRequest {
     pub plan_id: String,
     pub expected_version: u64,
     pub patch: String,
-    pub title: Option<String>,
     /// Checks inspected workspace identities when their baselines are first captured.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub source_digests: BTreeMap<String, String>,

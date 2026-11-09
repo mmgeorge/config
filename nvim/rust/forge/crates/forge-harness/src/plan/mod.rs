@@ -14,12 +14,15 @@ pub(crate) mod conformance;
 mod documentation;
 pub(crate) mod implementation_report;
 mod usage;
-pub(crate) use design::workspace_source;
+pub(crate) use design::{patch_single_file, workspace_source};
 mod design;
+mod design_artifact;
+pub(crate) mod verification_artifact;
+pub(crate) use design_artifact::{
+    PlanArtifact, artifact_diagnostic, authored_text as design_artifact_text, changed_artifacts,
+    preview_authored,
+};
 mod design_document;
-mod design_edit;
-pub(crate) use design_edit::ensure_file_patch;
-pub use design_edit::{DesignEditRequest, PlanOverviewEditRequest};
 mod design_flows;
 mod design_tests;
 pub use design_tests::DesignTestChange;
@@ -1716,15 +1719,13 @@ impl PlanFileStore {
             .to_vec())
         })?;
         measure(trace, "delete.semantic_edit", || {
-            design_tests::remove(
-                &mut document
-                    .design
-                    .as_mut()
-                    .context("test deletion requires a declaration design")?
-                    .document
-                    .tests,
-                selected,
-            )
+            let design = document
+                .design
+                .as_mut()
+                .context("test deletion requires a declaration design")?;
+            design_tests::remove(&mut design.document.tests, selected)?;
+            design_artifact::revert_authored(PlanArtifact::Tests, design);
+            Ok(())
         })?;
         document.version = document
             .version
@@ -1783,8 +1784,10 @@ impl PlanFileStore {
             .context("plan has no configured checks")?
             .config;
         design.document.set_checks(config, changes)?;
+        design_artifact::revert_authored(PlanArtifact::Checks, design);
         if !tests.is_empty() {
             design_tests::remove(&mut design.document.tests, tests)?;
+            design_artifact::revert_authored(PlanArtifact::Tests, design);
         }
         design.check_preview = crate::checks::preview_plan(&self.workspace, design).await?;
         design.check_preview_source = design.check_preview_fingerprint()?;

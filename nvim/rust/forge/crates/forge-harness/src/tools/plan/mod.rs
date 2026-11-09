@@ -1,10 +1,9 @@
 mod catalog;
-mod file_edit;
-mod file_read;
-mod overview_edit;
-mod overview_read;
+mod edit;
 mod phase_done;
+mod read;
 mod state;
+mod status;
 mod submit;
 
 pub(in crate::tools) use catalog::{definitions, execute, is_tool, record};

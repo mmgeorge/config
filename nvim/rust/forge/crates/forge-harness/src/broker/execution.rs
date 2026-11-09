@@ -745,6 +745,20 @@ impl HarnessBroker {
                 response["verification_evidence"] =
                     serde_json::to_value(evidence.into_iter().rev().take(32).collect::<Vec<_>>())?;
                 response["progress"] = serde_json::to_value(&execution.progress)?;
+                response["verification_draft"] =
+                    serde_json::to_value(&execution.verification_draft)?;
+                return Ok(ExecutionControlStage::Complete(response));
+            }
+            ExecutionOperation::VerificationDraft(draft) => {
+                anyhow::ensure!(
+                    execution.phase == crate::plan::PlanPhase::Verify,
+                    "plan:verification.md is editable only in Verify"
+                );
+                execution.verification_draft = Some(draft);
+                self.store.save_plan_execution(&execution)?;
+                let mut response = execution.response();
+                response["verification_draft"] =
+                    serde_json::to_value(&execution.verification_draft)?;
                 return Ok(ExecutionControlStage::Complete(response));
             }
             ExecutionOperation::Draft(mut document) => {
@@ -872,7 +886,7 @@ impl HarnessBroker {
                     .as_ref()
                     .context("execution revision design is missing")?
                     .document
-                    .verification
+                    .manual_checks
                     .clone();
                 let delta = crate::plan::revision::DeclarationDelta::between(
                     Some(&previous),
@@ -903,7 +917,7 @@ impl HarnessBroker {
                 title = "Plan revision awaiting review";
                 execution.generation += 1;
             }
-            ExecutionOperation::Phase(request) => {
+            ExecutionOperation::Phase(mut request) => {
                 execution.validate_phase_request(&request)?;
                 anyhow::ensure!(
                     self.agent_coordinator.active_count() == 0,
@@ -927,8 +941,22 @@ impl HarnessBroker {
                 let design = document
                     .design
                     .context("execution requires a semantic design")?;
-                if let Some(report) = &request.verification {
-                    report.validate_checks(&design.document.verification)?;
+                if execution.phase == crate::plan::PlanPhase::Verify {
+                    let draft = execution.verification_draft.as_ref().context(
+                        "Verify requires a report: fill in plan:verification.md with plan_edit before calling plan_phase_done",
+                    )?;
+                    let tools = self.verification_evidence(execution_id, interaction)?;
+                    let report = crate::plan::verification_artifact::parse(
+                        draft,
+                        &design.document.manual_checks,
+                        &tools
+                            .iter()
+                            .map(|tool| tool.id.as_str())
+                            .collect::<Vec<_>>(),
+                        Path::new(&self.session.workspace),
+                    )?;
+                    report.validate_checks(&design.document.manual_checks)?;
+                    request.verification = Some(report);
                 }
                 let verifying = execution.phase == crate::plan::PlanPhase::Verify;
                 let resolving = execution.phase == crate::plan::PlanPhase::Resolve;
@@ -949,45 +977,27 @@ impl HarnessBroker {
                         "{path}: workspace changed during validation. Retry phase completion."
                     );
                 }
-                let mut verification_tools = std::collections::BTreeMap::new();
+                let mut evidence_sources = std::collections::BTreeMap::new();
                 if let Some(report) = &request.verification {
                     let tools = self.verification_evidence(execution_id, interaction)?;
-                    for reference in report
-                        .evidence
-                        .iter()
-                        .chain(report.checks.iter().flat_map(|check| &check.evidence))
-                    {
+                    for reference in report.cited() {
                         anyhow::ensure!(
                             tools.iter().any(|tool| tool.id == *reference),
-                            "verification evidence {reference} is not a completed tool result or passed Harness check in this execution. Call plan_overview_read with plan_id and use exact IDs from execution.verification_evidence."
+                            "verification evidence {reference} is not a completed tool result or passed Harness check in this execution. Read plan:verification.md with plan_read and cite an ID from its Evidence section."
                         );
                         let tool = tools
                             .iter()
                             .find(|tool| tool.id == *reference)
                             .context("validated verification evidence disappeared")?;
                         if let Some(address) = &tool.address {
-                            verification_tools.insert(reference.clone(), address.clone());
+                            evidence_sources.insert(reference.clone(), address.clone());
                         }
                     }
-                    let reused = execution.verification.iter().any(|evidence| {
-                        evidence
+                    let reused = execution.verification.iter().any(|earlier| {
+                        earlier
                             .report
-                            .evidence
-                            .iter()
-                            .chain(
-                                evidence
-                                    .report
-                                    .checks
-                                    .iter()
-                                    .flat_map(|check| &check.evidence),
-                            )
-                            .any(|reference| {
-                                report
-                                    .evidence
-                                    .iter()
-                                    .chain(report.checks.iter().flat_map(|check| &check.evidence))
-                                    .any(|observed| observed == reference)
-                            })
+                            .cited()
+                            .any(|reference| report.cited().any(|cited| cited == reference))
                     });
                     anyhow::ensure!(
                         !reused
@@ -1016,13 +1026,14 @@ impl HarnessBroker {
                     execution.findings = vec!["Automated check evidence no longer covers the current workspace, configuration, or execution contract. Resolve the changed inputs and run Check again before completing verification.".into()];
                     execution.findings.extend(progress.findings());
                     execution.progress = progress;
+                    execution.verification_draft = None;
                     execution.generation += 1;
                 } else {
                     let conforms = progress.conforms();
                     execution.finish_phase(request, progress, now_ms)?;
                     if resolving && checks_current && conforms {
                         execution.findings.clear();
-                        if design.document.verification.is_empty() {
+                        if design.document.manual_checks.is_empty() {
                             execution.state = PlanExecutionState::Complete;
                             execution.completed_at_ms = Some(now_ms);
                         } else {
@@ -1031,24 +1042,24 @@ impl HarnessBroker {
                     }
                 }
                 if verifying {
-                    use crate::plan::execution::VerificationOutcome;
+                    use crate::plan::execution::VerificationStatus;
                     let outcome = match (execution.state, execution.phase) {
-                        (PlanExecutionState::Blocked, _) => VerificationOutcome::Blocked,
-                        (_, crate::plan::PlanPhase::Resolve) => VerificationOutcome::Failed,
-                        _ => VerificationOutcome::Passed,
+                        (PlanExecutionState::Blocked, _) => VerificationStatus::Blocked,
+                        (_, crate::plan::PlanPhase::Resolve) => VerificationStatus::Failed,
+                        _ => VerificationStatus::Passed,
                     };
                     interaction
                         .node_list
                         .push(ExchangeNode::VerificationResult {
                             id: format!("{}:verification:{}", interaction.id, execution.generation),
                             result: Box::new(crate::exchange::VerificationResult {
-                                outcome,
-                                summary: Some(summary),
+                                status: outcome,
+                                phase_summary: Some(summary),
                                 findings: execution.findings.clone(),
-                                verification,
+                                report: verification,
                                 declaration_findings,
                                 declaration_changes,
-                                verification_tools,
+                                evidence_sources,
                             }),
                         });
                 }

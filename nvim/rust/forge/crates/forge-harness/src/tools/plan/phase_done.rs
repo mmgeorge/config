@@ -16,10 +16,10 @@ pub(super) fn definition() -> ControlToolDefinition {
                 declaration and public API differences together. Extra internal helpers and \
                 Calls/Constructs/Accesses never gate completion. End the turn after success. Verification \
                 findings enter Resolve, where code defects can be fixed and intentional contract changes can be \
-                submitted together. Verify requires an agent assessment and exact completed tool-call IDs in \
-                verification.evidence. After running checks, call plan_overview_read with plan_id to obtain \
-                execution.verification_evidence IDs and output previews. Passed cannot bypass semantic \
-                conformance. Failed enters Resolve. Blocked preserves Verify.",
+                submitted together. Verify submits the report saved in plan:verification.md: write each \
+                manual action's outcome, evidence, and summary there with plan_edit before calling this \
+                tool. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves \
+                Verify.",
         input_schema: strict_object_input_schema(
             vec![
                 (
@@ -28,38 +28,6 @@ pub(super) fn definition() -> ControlToolDefinition {
                 ),
                 ("revision", json!({"type":"integer","minimum":1})),
                 ("summary", string_schema()),
-                (
-                    "verification",
-                    strict_object_input_schema(
-                        vec![
-                            (
-                                "outcome",
-                                json!({"type":"string","enum":["passed","failed","blocked"]}),
-                            ),
-                            (
-                                "checks",
-                                json!({"type":"array","description":"One result per accepted manual action, in plan order. Copy each label verbatim from the accepted verification action. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
-                            ("category", json!({"type":"string","enum":["manual"]})),
-                            ("label", string_schema()),
-                            ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
-                            ("summary", string_schema()),
-                            ("evidence", json!({"type":"array","items":{"type":"string"}}))
-                        ], &["category","label","outcome","summary","evidence"])}),
-                            ),
-                            (
-                                "evidence",
-                                json!({"type":"array","description":"Exact completed tool-call IDs from plan_overview_read execution.verification_evidence", "items":{"type":"string"}}),
-                            ),
-                            (
-                                "findings",
-                                json!({"type":"array","items":{"type":"string"}}),
-                            ),
-                            ("reason", string_schema()),
-                            ("reuse_reason", string_schema()),
-                        ],
-                        &["outcome", "checks"],
-                    ),
-                ),
             ],
             &["phase", "revision", "summary"],
         ),
@@ -84,10 +52,47 @@ pub(super) async fn execute(
         .send(crate::plan::execution::ExecutionOperation::Phase(request))
         .await?;
     runtime.terminal = true;
-    let message = serde_json::to_string(&response)?;
+    let message = execution_response_text("Phase finished.", &response);
     runtime.completion = Some((identity, message.clone()));
     Ok(crate::tools::ControlToolResult {
         invocation: None,
         message,
     })
+}
+
+/// Render an execution control response as plain text: the resulting state, any findings,
+/// review feedback, and the next instruction.
+pub(super) fn execution_response_text(opening: &str, response: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    let label = |value: &serde_json::Value| value.as_str().unwrap_or("unknown").to_owned();
+    let mut text = format!(
+        "{opening} Execution is {} in {} at revision {}.\n",
+        label(&response["status"]),
+        label(&response["phase"]),
+        response["revision"]
+    );
+    if let Some(state) = response["plan_state"].as_str() {
+        let _ = writeln!(text, "The plan is {state}.");
+    }
+    for (heading, key) in [
+        ("Findings", "findings"),
+        ("Reviewer changes", "manual_changes"),
+        ("Approval comments", "approval_comments"),
+    ] {
+        let items = response[key].as_array().cloned().unwrap_or_default();
+        if items.is_empty() {
+            continue;
+        }
+        let _ = writeln!(text, "\n{heading}:");
+        for item in items {
+            let item = item
+                .as_str()
+                .map_or_else(|| item.to_string(), str::to_owned);
+            let _ = writeln!(text, "- {}", item.replace('\n', "\n  "));
+        }
+    }
+    if let Some(instructions) = response["instructions"].as_str() {
+        let _ = write!(text, "\n{instructions}\n");
+    }
+    text
 }

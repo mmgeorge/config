@@ -79,6 +79,14 @@ pub enum DeclarationDiagnosticKind {
     DeclarationComment,
     /// A declaration the plan introduces without a documentation comment.
     MissingDocumentation,
+    /// A plan artifact line that does not follow its artifact's grammar.
+    ArtifactSyntax,
+    /// Plan artifact content that is missing, empty, or duplicated.
+    ArtifactContent,
+    /// A `plan:checks.md` selection naming an unknown or disabled check, or omitting a prerequisite.
+    PlanCheck,
+    /// A Verify report line in `plan:verification.md` that cannot be submitted.
+    VerificationReport,
 }
 
 impl DeclarationDiagnosticKind {
@@ -93,6 +101,10 @@ impl DeclarationDiagnosticKind {
             Self::AlgorithmReference => "invalid_algorithm_reference",
             Self::DeclarationComment => "invalid_declaration_comment",
             Self::MissingDocumentation => "missing_declaration_documentation",
+            Self::ArtifactSyntax => "invalid_plan_artifact",
+            Self::ArtifactContent => "invalid_plan_content",
+            Self::PlanCheck => "invalid_plan_check",
+            Self::VerificationReport => "invalid_verification_report",
         }
     }
 
@@ -122,6 +134,16 @@ impl DeclarationDiagnosticKind {
             }
             Self::MissingDocumentation => {
                 "Add a documentation comment directly above each reported declaration, including enum variants and fields."
+            }
+            Self::ArtifactSyntax => {
+                "Rewrite the reported line in its artifact's grammar, which the plan_edit description lists."
+            }
+            Self::ArtifactContent => "Fill in, complete, or deduplicate the reported entry.",
+            Self::PlanCheck => {
+                "Mark only check IDs that plan:checks.md lists as configured, and also mark every prerequisite of a marked check."
+            }
+            Self::VerificationReport => {
+                "Correct the reported line in plan:verification.md with plan_edit, then call plan_phase_done again."
             }
         }
     }

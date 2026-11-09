@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ControlToolViolation {
@@ -36,37 +37,12 @@ impl fmt::Display for ControlToolArgumentError {
 
 impl std::error::Error for ControlToolArgumentError {}
 
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Names the stage that rejected a control call, which selects the failure's opening line.
+#[derive(Clone, Copy, Debug)]
 enum ControlToolFailurePhase {
     ArgumentValidation,
     SemanticExecution,
     SubmissionValidation,
-}
-
-#[derive(Debug, Serialize)]
-struct ControlToolFailure<'a> {
-    ok: bool,
-    tool: &'a str,
-    phase: ControlToolFailurePhase,
-    code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plan_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    active_version: Option<u64>,
-    violation: Vec<ControlToolViolation>,
-    /// Correction hint for each violation code, stated once instead of on every violation.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    code_hint: std::collections::BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry: Option<ControlToolRetry>,
-}
-
-#[derive(Debug, Serialize)]
-struct ControlToolRetry {
-    action: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_version: Option<u64>,
 }
 
 pub(crate) fn schema_violation_list(
@@ -181,10 +157,15 @@ fn schema_violation(error: &ValidationError<'_>, schema: &Value) -> ControlToolV
             unexpected_property_message(unexpected),
             allowed_property_shape(error, schema),
         ),
+        // Report the object's complete required set, so a model that misses one field does not
+        // read the error as a choice between alternative field sets.
         ValidationErrorKind::Required { property } => (
             "missing_field",
             format!("Required field `{property}` is missing."),
-            Some(json!({ "required": [property] })),
+            Some(
+                keyword_shape(error, schema, "required")
+                    .unwrap_or_else(|| json!({ "required": [property] })),
+            ),
         ),
         ValidationErrorKind::Type { .. } => (
             "type_mismatch",
@@ -307,23 +288,26 @@ fn unexpected_property_message(unexpected: &[String]) -> String {
     }
 }
 
-pub(crate) fn control_tool_failure_json(
+/// Render a failed control call as compiler-style text: one `location: error[code]: message`
+/// line per problem, each shared correction once, and the retry instruction.
+///
+/// Only the model reads this text, so it carries no envelope fields the model already knows,
+/// such as the tool name it called or the plan ID it supplied.
+pub(crate) fn control_tool_failure_text(
     invocation: &ControlToolInvocation,
     error: &(dyn Error + 'static),
     document: Option<&PlanDocument>,
 ) -> String {
-    let (phase, code, mut violation) = if let Some(argument_error) =
+    let (phase, mut violation) = if let Some(argument_error) =
         find_error::<ControlToolArgumentError>(error)
     {
         (
             ControlToolFailurePhase::ArgumentValidation,
-            "invalid_arguments".to_owned(),
             argument_error.violation.clone(),
         )
     } else if let Some(mutation_error) = find_error::<PlanMutationError>(error) {
         (
             failure_phase(invocation),
-            "invalid_plan_edit".to_owned(),
             vec![ControlToolViolation {
                 path: mutation_error.path.clone(),
                 code: mutation_error.code.clone(),
@@ -335,7 +319,6 @@ pub(crate) fn control_tool_failure_json(
     } else if let Some(validation_error) = find_error::<PlanValidationError>(error) {
         (
             failure_phase(invocation),
-            "canonical_validation_failed".to_owned(),
             validation_error
                 .violation
                 .iter()
@@ -347,7 +330,6 @@ pub(crate) fn control_tool_failure_json(
     {
         (
             failure_phase(invocation),
-            "declaration_validation_failed".to_owned(),
             validation_error
                 .diagnostic
                 .iter()
@@ -359,7 +341,11 @@ pub(crate) fn control_tool_failure_json(
                         diagnostic.column + 1
                     ),
                     code: diagnostic.kind.code().into(),
-                    message: format!("{}: {}", diagnostic.reference, diagnostic.reason),
+                    message: if diagnostic.reference.is_empty() {
+                        diagnostic.reason.clone()
+                    } else {
+                        format!("`{}`: {}", diagnostic.reference, diagnostic.reason)
+                    },
                     expected_shape: None,
                     hint: Some(diagnostic.kind.hint().into()),
                 })
@@ -368,7 +354,6 @@ pub(crate) fn control_tool_failure_json(
     } else if let Some(question_error) = find_error::<crate::exchange::QuestionEventError>(error) {
         (
             failure_phase(invocation),
-            question_error.code().into(),
             vec![ControlToolViolation {
                 path: "<question>".into(),
                 code: question_error.code().into(),
@@ -380,7 +365,6 @@ pub(crate) fn control_tool_failure_json(
     } else if let Some(wait_error) = find_error::<crate::question::QuestionWaitError>(error) {
         (
             failure_phase(invocation),
-            wait_error.code().into(),
             vec![ControlToolViolation {
                 path: "<question_wait>".into(),
                 code: wait_error.code().into(),
@@ -392,22 +376,20 @@ pub(crate) fn control_tool_failure_json(
     } else if let Some((requested, active)) = plan_id_mismatch(error) {
         (
             failure_phase(invocation),
-            "plan_id_mismatch".into(),
             vec![ControlToolViolation {
                 path: "plan_id".into(),
                 code: "plan_id_mismatch".into(),
                 message: format!("requested plan {requested} does not match active plan {active}"),
-                expected_shape: Some(json!({"const": active})),
-                hint: Some("Read the current plan overview and use its plan_id.".into()),
+                expected_shape: None,
+                hint: Some(format!("Use plan_id {active}, which plan_status reports.")),
             }],
         )
     } else {
         let message = error_message(error);
         (
             failure_phase(invocation),
-            semantic_code(&message).to_owned(),
             vec![ControlToolViolation {
-                path: "<request>".to_owned(),
+                path: "request".to_owned(),
                 code: semantic_violation_code(&message).to_owned(),
                 message,
                 expected_shape: None,
@@ -415,44 +397,62 @@ pub(crate) fn control_tool_failure_json(
             }],
         )
     };
-    let plan_id = document
-        .map(|plan| plan.plan_id.as_str())
-        .or_else(|| invocation.arguments.get("plan_id").and_then(Value::as_str));
     let active_version = document.map(|plan| plan.version);
-    let retry = matches!(
-        invocation.name.as_str(),
-        "plan_file_edit" | "plan_overview_edit" | "harness_plan_edit" | "plan_submit"
-    )
-    .then_some(ControlToolRetry {
-        action: "correct_and_retry",
-        expected_version: active_version,
-    });
     let code_hint = hoist_code_hints(&mut violation);
-    let failure = ControlToolFailure {
-        code_hint,
-        ok: false,
-        tool: invocation.name.as_str(),
-        phase,
-        code,
-        plan_id,
-        active_version,
-        violation,
-        retry,
+    let tool = invocation.name.as_str();
+    let errors = match violation.len() {
+        1 => "1 error".to_owned(),
+        count => format!("{count} errors"),
     };
-    serde_json::to_string(&failure).unwrap_or_else(|serialization_error| {
-        json!({
-            "ok": false,
-            "tool": invocation.name,
-            "phase": "semantic_execution",
-            "code": "failure_serialization_failed",
-            "violation": [{
-                "path": "<response>",
-                "code": "serialization_failed",
-                "message": serialization_error.to_string()
-            }]
-        })
-        .to_string()
-    })
+    let mut text = match (phase, active_version) {
+        (ControlToolFailurePhase::ArgumentValidation, _) => {
+            format!("{tool} rejected its arguments with {errors}:\n")
+        }
+        (ControlToolFailurePhase::SubmissionValidation, Some(version)) => {
+            format!("{tool} rejected version {version} with {errors}:\n")
+        }
+        _ => format!("{tool} failed with {errors}:\n"),
+    };
+    for item in &violation {
+        let _ = writeln!(
+            text,
+            "{}: error[{}]: {}",
+            item.path, item.code, item.message
+        );
+        if let Some(hint) = &item.hint {
+            let _ = writeln!(text, "  hint: {hint}");
+        }
+        if let Some(shape) = &item.expected_shape {
+            let _ = writeln!(text, "  expected: {shape}");
+        }
+    }
+    if !code_hint.is_empty() {
+        text.push('\n');
+        for (code, hint) in &code_hint {
+            let _ = writeln!(text, "{code}: {hint}");
+        }
+    }
+    let retry = match tool {
+        "plan_edit" | "harness_plan_edit" | "plan_submit" => active_version
+            .map(|version| format!("Fix them and retry with expected_version {version}.")),
+        "plan_phase_done"
+            if code_hint.contains_key(
+                crate::declaration::DeclarationDiagnosticKind::VerificationReport.code(),
+            ) =>
+        {
+            Some(
+                "Fix plan:verification.md with plan_edit, then call plan_phase_done again."
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    };
+    if let Some(retry) = retry {
+        text.push('\n');
+        text.push_str(&retry);
+        text.push('\n');
+    }
+    text
 }
 
 /// Move hints shared by every violation of a code to one entry per code, so a rejection with many

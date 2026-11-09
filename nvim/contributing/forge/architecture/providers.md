@@ -68,7 +68,7 @@ Copilot reads `assistant.message_start` metadata before deltas and reconciles th
 
 Copilot correlates each accepted message ID with a root-envelope `user.message`, its native turn, and the event ancestry leading to completion. Root inputs can carry `parentAgentTaskId`; that field does not identify a child subscription. Events with an `agentId` cannot supply root input coverage. Ephemeral streaming and idle events refer to durable ancestry without becoming the parent of subsequent durable events.
 
-Codex keeps the phase from `item/started` for matching deltas and snapshots. ACP assigns message identities within its execution. Adapters never assign tools or checks to commentary, because `Exchange` captures each activity's owner at admission.
+Codex keeps the phase from `item/started` for matching deltas and snapshots. ACP assigns message identities within its execution. Consecutive chunks of the same kind join one message only while their optional native `messageId` matches, so two adjacent Claude API messages stay separate items; agents that omit `messageId` join on kind alone. ACP carries no phase, so `AcpSession` leaves prose unclassified until the first `tool_call` or `tool_call_update` for a tool-call ID it has not seen before. That event marks all pending prose as commentary, and normal turn completion marks the last unclassified message as the response. Updates to tools that are already known do not classify anything, because Claude can report a terminal status for an earlier, abandoned tool after it has written the final answer. Adapters never assign tools or checks to commentary, because `Exchange` captures each activity's owner at admission.
 
 ## Tools
 

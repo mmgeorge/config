@@ -2894,11 +2894,12 @@ async fn accept_prompt(
 /// declaration design.
 ///
 /// Harness renders the canonical design as a JSON block in the planning instructions or, on a
-/// continuation, in the turn input. The overview edit names that document's version so every
-/// revision changes content; the mock then adds one declaration file and submits the version
-/// those edits produce. Turns without plan tools or a readable design keep the plain response.
+/// continuation, in the turn input. The overview replacement names that document's version so
+/// every revision changes content; the mock then adds one declaration file and submits the
+/// version those edits produce. Turns without plan tools or a readable design keep the plain
+/// response.
 fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> {
-    let has_plan_tools = ["plan_overview_edit", "plan_file_edit", "plan_submit"]
+    let has_plan_tools = ["plan_edit", "plan_submit"]
         .iter()
         .all(|name| request.tools.iter().any(|tool| tool.name == *name));
     if request.execution != ExecutionMode::Planning || !has_plan_tools {
@@ -2916,27 +2917,40 @@ fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> 
         return Vec::new();
     };
     let objective = declaration.request.trim();
+    let objective = if objective.is_empty() {
+        "Implement the requested change."
+    } else {
+        objective
+    };
+    let overview = format!(
+        "# Implement the requested change\n\n## Objective\n{objective}\n\n## Requirements\n\
+         - Preserve the requested behavior at its owning boundary.\n\n## Background\n\
+         The mock provider drafted this overview from declaration version {}.\n\n## Design\n\
+         Apply the requested behavior at its owning boundary.\n\n## Verification\n\
+         - Confirm the requested interface behaves as designed.\n",
+        declaration.version
+    );
+    let overview_patch = format!(
+        "*** Begin Patch\n*** Add File: plan:overview.md\n{}\n*** End Patch",
+        overview
+            .lines()
+            .map(|line| format!("+{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     let mut steps = vec![TestPromptStep::ToolCall {
-        name: "plan_overview_edit".into(),
+        name: "plan_edit".into(),
         arguments: serde_json::json!({
             "plan_id": declaration.plan_id,
             "expected_version": declaration.version,
-            "title": "Implement the requested change",
-            "objective": if objective.is_empty() { "Implement the requested change." } else { objective },
-            "background": format!(
-                "The mock provider drafted this overview from declaration version {}.",
-                declaration.version
-            ),
-            "requirements": ["Preserve the requested behavior at its owning boundary."],
-            "design": "Apply the requested behavior at its owning boundary.",
-            "verification": ["Confirm the requested interface behaves as designed."],
+            "patch": overview_patch,
         }),
     }];
     let mut submitted_version = declaration.version + 1;
     // A revision already declares the mock file, and adding it again would reject the edit.
     if !declaration.declares_mock_file {
         steps.push(TestPromptStep::ToolCall {
-            name: "plan_file_edit".into(),
+            name: "plan_edit".into(),
             arguments: serde_json::json!({
                 "plan_id": declaration.plan_id,
                 "expected_version": submitted_version,

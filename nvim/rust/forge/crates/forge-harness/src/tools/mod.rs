@@ -25,7 +25,7 @@ pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority, TaskAutho
 pub use error::{ToolError, ToolResult};
 pub(crate) use executor::ControlToolExecutor;
 pub(crate) use failure::{
-    ControlToolArgumentError, control_tool_failure_json, schema_violation_list,
+    ControlToolArgumentError, control_tool_failure_text, schema_violation_list,
 };
 pub use invocation::{ControlToolInvocation, apply_invocation};
 pub(crate) use invocation::{json_pointer_to_path, validate_arguments};

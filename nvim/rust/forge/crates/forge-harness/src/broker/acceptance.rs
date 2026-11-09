@@ -905,7 +905,7 @@ impl BrokerObserver {
                 .as_ref()
                 .context("accepted execution design is missing")?
                 .document
-                .verification
+                .manual_checks
                 .clone();
             execution
                 .record
@@ -1064,7 +1064,7 @@ impl BrokerObserver {
                 .as_ref()
                 .context("accepted execution design is missing")?
                 .document
-                .verification
+                .manual_checks
                 .clone(),
             planning_provider_session_id: session.provider_session_id.clone(),
             execution_provider_session_id: session.provider_session_id.clone(),
@@ -1072,6 +1072,7 @@ impl BrokerObserver {
             findings: Vec::new(),
             progress: Default::default(),
             verification: Vec::new(),
+            verification_draft: None,
             check_runs: Vec::new(),
             revision_history: Vec::new(),
             approval_comments: comment.into_iter().collect(),

@@ -2056,8 +2056,8 @@ pub(super) fn validate_execution_update(
                         .verification
                         .last()
                         .is_some_and(|evidence| evidence.revision == next.revision
-                            && evidence.report.outcome
-                                == crate::plan::execution::VerificationOutcome::Passed),
+                            && evidence.report.status
+                                == crate::plan::execution::VerificationStatus::Passed),
             "completion requires passing evidence for accepted manual actions"
         );
     }

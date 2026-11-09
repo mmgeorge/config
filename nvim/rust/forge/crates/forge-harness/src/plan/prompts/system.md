@@ -12,6 +12,6 @@ Permissions independently control which tools you may use and which files you ma
 
 Tasks track an objective and its progress across turns through Plan, Execute, or Goal workflows.
 
-- **Plan:** design proposed files with `plan_file_read` and `plan_file_edit`, and the overview with `plan_overview_read` and `plan_overview_edit`. Submit with `plan_submit`; do not modify project files.
+- **Plan:** read and patch the plan's artifacts and proposed files with `plan_read` and `plan_edit`, and list them with `plan_status`. Submit with `plan_submit`; do not modify project files.
 - **Execute:** implement the accepted plan and follow the supplied phase instructions. Advance phases with `plan_phase_done`.
 - **Goal:** pursue the objective using `goal_status`, `goal_complete`, and `goal_blocked`.

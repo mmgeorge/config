@@ -95,6 +95,8 @@ struct AcpToolItem {
 struct AcpMessage {
     address: TurnAddress,
     item_id: ItemId,
+    /// The agent's optional ACP `messageId`, which marks where one native message ends.
+    native_message_id: Option<String>,
     role: Option<AcpMessageRole>,
     text: String,
     closed: bool,
@@ -617,6 +619,7 @@ impl AcpSessionState {
         &self,
         session_id: &str,
         role: Option<AcpMessageRole>,
+        native_message_id: Option<&str>,
         text: &str,
     ) -> Result<()> {
         if text.is_empty() {
@@ -630,10 +633,13 @@ impl AcpSessionState {
         let event = {
             let mut messages = self.message.lock().await;
             let messages = messages.entry(turn.clone()).or_default();
-            let (item_id, event) = if let Some(message) = messages
-                .last_mut()
-                .filter(|message| !message.closed && message.role == role)
-            {
+            // Chunks extend the open message only while they keep its role and native message ID.
+            // Agents that omit `messageId` match on role alone, as ACP v1 allows.
+            let (item_id, event) = if let Some(message) = messages.last_mut().filter(|message| {
+                !message.closed
+                    && message.role == role
+                    && message.native_message_id.as_deref() == native_message_id
+            }) {
                 message.text.push_str(text);
                 (
                     message.item_id.clone(),
@@ -646,6 +652,7 @@ impl AcpSessionState {
                 messages.push(AcpMessage {
                     address: turn.clone(),
                     item_id: item_id.clone(),
+                    native_message_id: native_message_id.map(str::to_owned),
                     role,
                     text: text.into(),
                     closed: false,
@@ -1372,6 +1379,7 @@ impl AcpSessionState {
                 self.message_chunk(
                     session_id,
                     thought.then_some(AcpMessageRole::Reasoning),
+                    update["messageId"].as_str().filter(|id| !id.is_empty()),
                     text,
                 )
                 .await?;
@@ -1398,9 +1406,9 @@ impl AcpSessionState {
                     }
                 }
                 let mut tool_map = self.tool.lock().await;
-                let snapshot = tool_map
-                    .entry((session_id.to_owned(), id.to_owned()))
-                    .or_insert_with(|| json!({}));
+                let tool_key = (session_id.to_owned(), id.to_owned());
+                let invocation_started = !tool_map.contains_key(&tool_key);
+                let snapshot = tool_map.entry(tool_key).or_insert_with(|| json!({}));
                 let finished = self
                     .finished_tool
                     .lock()
@@ -1424,8 +1432,13 @@ impl AcpSessionState {
                 let snapshot = snapshot.clone();
                 drop(tool_map);
                 let update = &snapshot;
-                self.classify_messages(&turn, AcpMessageRole::Commentary)
-                    .await?;
+                // Only a newly started invocation shows the agent kept working after its prose.
+                // Claude can report a terminal status for an earlier, abandoned tool after the
+                // final answer, and that update must leave the answer for turn completion.
+                if invocation_started {
+                    self.classify_messages(&turn, AcpMessageRole::Commentary)
+                        .await?;
+                }
                 let native_key = (session_id.to_owned(), id.to_owned());
                 let status = update["status"].as_str().unwrap_or("in_progress");
                 let status = match status {

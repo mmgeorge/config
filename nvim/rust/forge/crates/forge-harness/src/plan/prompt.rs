@@ -43,7 +43,7 @@ impl PlanPrompt {
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with plan_file_edit and plan_overview_edit, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with plan_edit, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -74,7 +74,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested changes with plan_file_edit and plan_overview_edit. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
+            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested changes with plan_edit. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -127,7 +127,7 @@ Review comments:
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
-            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with plan_file_edit and plan_overview_edit, and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
+            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with plan_edit, and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
 }

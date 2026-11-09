@@ -402,7 +402,7 @@ pub(super) fn validate_passing_gate(record: &crate::plan::PlanExecutionRecord) -
             .last()
             .is_some_and(|run| run.revision == record.revision
                 && run.state == crate::checks::CheckState::Passed
-                && run.outcome() == crate::plan::execution::VerificationOutcome::Passed),
+                && run.status() == crate::plan::execution::VerificationStatus::Passed),
         "execution requires passing automated evidence for the accepted revision"
     );
     Ok(())

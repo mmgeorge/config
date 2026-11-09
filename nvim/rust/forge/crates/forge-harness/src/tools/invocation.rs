@@ -62,11 +62,7 @@ impl ControlToolInvocation {
         let scoped = self.name.starts_with("plan_")
             || matches!(
                 self.name.as_str(),
-                "plan_file_edit"
-                    | "question_ask"
-                    | "question_reply"
-                    | "question_revise"
-                    | "question_withdraw"
+                "question_ask" | "question_reply" | "question_revise" | "question_withdraw"
             );
         let kind = match mode {
             crate::provider::PromptMode::Plan | crate::provider::PromptMode::PlanDiscussion

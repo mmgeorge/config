@@ -6,7 +6,7 @@ use super::PlanSection;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Owns the reviewed intent and implementation guidance in virtual `plan.json`.
+/// Owns the reviewed intent and implementation guidance that the `plan:` artifacts project.
 pub struct DesignDocument {
     /// States the requested outcome and scope.
     pub objective: String,
@@ -24,8 +24,9 @@ pub struct DesignDocument {
     /// Traces operations between concrete objects independently of Design prose.
     #[serde(default)]
     pub flows: Vec<super::design_flows::DesignFlow>,
-    /// Lists manual actions and expected results after automated checks pass.
-    pub verification: Vec<String>,
+    /// Lists the manual checks Verify performs after automated checks pass, from
+    /// `## Manual checks`.
+    pub manual_checks: Vec<String>,
     /// Inventories changed and reused tests by file, independently of source language.
     pub tests: Vec<super::design_tests::DesignTestFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -184,7 +185,7 @@ impl DesignDocument {
                 title: "Verification",
                 section: PlanSection::ManualVerification,
                 text: self
-                    .verification
+                    .manual_checks
                     .iter()
                     .map(|item| format!("- {item}"))
                     .collect::<Vec<_>>()
@@ -211,7 +212,7 @@ impl DesignDocument {
         );
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
-        for action in &self.verification {
+        for action in &self.manual_checks {
             ensure!(
                 !action.trim().is_empty(),
                 "manual verification actions cannot be empty"
@@ -243,13 +244,13 @@ impl DesignDocument {
     pub(crate) fn validate_for_submission(&self) -> Result<()> {
         self.validate()?;
         for (name, text) in [
-            ("objective", &self.objective),
-            ("background", &self.background),
-            ("design", &self.design),
+            ("Objective", &self.objective),
+            ("Background", &self.background),
+            ("Design", &self.design),
         ] {
             ensure!(
                 !text.trim().is_empty(),
-                "plan.json {name} is required before submission"
+                "plan:overview.md `## {name}` is required before submission"
             );
         }
         Ok(())

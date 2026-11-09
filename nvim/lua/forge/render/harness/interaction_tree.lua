@@ -644,17 +644,17 @@ end
 ---@param options table Render options.
 local function append_verification_result(result, interaction, node, options)
   local phase = node.result
-  if phase.outcome ~= "passed" and phase.outcome ~= "failed" and phase.outcome ~= "blocked" then return end
-  local summary = type(phase.summary) == "string" and phase.summary or ""
+  if phase.status ~= "passed" and phase.status ~= "failed" and phase.status ~= "blocked" then return end
+  local summary = type(phase.phase_summary) == "string" and phase.phase_summary or ""
   local findings = vim.tbl_filter(function(finding) return finding:match("%S") ~= nil end, phase.findings or {})
   local key = node.id
   local first = #result.lines + 1
-  if phase.outcome == "passed" then
+  if phase.status == "passed" then
     local suffix = summary:match("%S") and " · " .. summary:gsub("%s+", " ") or ""
     append_wrapped(result, "Verification passed" .. suffix, "◇ ", "  ", "Normal", options.content_width)
   else
     local expanded = result.expanded[key] == true
-    local label = phase.outcome == "failed" and "Verification failed" or "Verification blocked"
+    local label = phase.status == "failed" and "Verification failed" or "Verification blocked"
     local reason = findings[1] and findings[1]:gsub("%s+", " ") or "No findings recorded"
     local suffix = #findings > 1 and (" (+%d more)"):format(#findings - 1) or ""
     append_wrapped(result, label .. " · " .. reason .. suffix, expanded and "▾ " or "▸ ", "  ", "Normal", options.content_width)

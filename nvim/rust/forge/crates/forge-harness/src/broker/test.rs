@@ -1316,37 +1316,40 @@ async fn plan_fixture_tool(
     let Some(plan_id) = document.get("plan_id").and_then(Value::as_str) else {
         return Ok(());
     };
-    let overview = crate::provider::test_support::call_tool(
+    let read = crate::provider::test_support::call_tool(
         request,
-        "plan_overview_read",
-        json!({"plan_id":plan_id}),
+        "plan_read",
+        json!({"plan_id":plan_id,"path":"plan:overview.md"}),
     )
     .await?;
-    let version = overview
-        .get("version")
-        .and_then(Value::as_u64)
+    let read = read.as_str().unwrap_or_default();
+    let version = shared_version(read)
         .or_else(|| document.get("version").and_then(Value::as_u64))
         .unwrap_or(1);
-    let current = overview.get("overview").cloned().unwrap_or(Value::Null);
-    let required = |name: &str, fallback: &str| {
-        current
-            .get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(fallback)
-            .to_owned()
-    };
-    let objective = required("objective", "Implement the requested migration.");
-    let background = required("background", "Preserve the existing caller contract.");
-    let design = required(
-        "design",
-        "Keep ownership explicit and preserve compatibility.",
-    );
-    if !request
-        .tools
-        .iter()
-        .any(|tool| tool.name == "plan_overview_edit")
-    {
+    // Fill only the sections submission requires, so overview text a revision already reviewed
+    // keeps its exact content.
+    let current = read
+        .lines()
+        .skip(2)
+        .map(|line| line.split_once(": ").map_or("", |(_, text)| text))
+        .collect::<Vec<_>>();
+    let mut filled = Vec::new();
+    for (index, line) in current.iter().enumerate() {
+        filled.push((*line).to_owned());
+        let fallback = match *line {
+            "## Objective" => "Implement the requested migration.",
+            "## Background" => "Preserve the existing caller contract.",
+            "## Design" => "Keep ownership explicit and preserve compatibility.",
+            _ => continue,
+        };
+        if current
+            .get(index + 1)
+            .is_none_or(|next| next.trim().is_empty() || next.starts_with("## "))
+        {
+            filled.push(fallback.to_owned());
+        }
+    }
+    if !request.tools.iter().any(|tool| tool.name == "plan_edit") {
         return Err(forge_provider_api::ProviderError::Failure(
             forge_provider_api::ProviderFailure::new(
                 forge_provider_api::ProviderOperation::TurnStart,
@@ -1354,35 +1357,32 @@ async fn plan_fixture_tool(
             ),
         ));
     }
-    request
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: plan:overview.md\n{}\n*** End Patch",
+        filled
+            .iter()
+            .map(|line| format!("+{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let edited = request
         .provider_tools
         .call(
             &request.scope,
             forge_provider_api::control::ToolCall {
                 id: forge_provider_api::control::ToolCallId::new("fixture-call-1")
                     .expect("fixture call identity is nonempty"),
-                name: "plan_overview_edit".into(),
+                name: "plan_edit".into(),
                 arguments: json!({
                     "plan_id":plan_id,
                     "expected_version":version,
-                    "objective":objective,
-                    "background":background,
-                    "design":design
+                    "patch":patch
                 }),
             },
         )
         .await?;
     if submit {
-        let updated = crate::provider::test_support::call_tool(
-            request,
-            "plan_overview_read",
-            json!({"plan_id":plan_id}),
-        )
-        .await?;
-        let version = updated
-            .get("version")
-            .and_then(Value::as_u64)
-            .unwrap_or(version);
+        let version = shared_version(&edited).unwrap_or(version);
         if !request.tools.iter().any(|tool| tool.name == "plan_submit") {
             return Err(forge_provider_api::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
@@ -1405,6 +1405,18 @@ async fn plan_fixture_tool(
             .await?;
     }
     Ok(())
+}
+
+/// Read the shared plan version from a plan_read header or a plan_edit confirmation.
+fn shared_version(text: &str) -> Option<u64> {
+    let (_, rest) = text
+        .split_once("· version ")
+        .or_else(|| text.split_once("version is "))?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 fn plan_fixture_provider(broker: &HarnessBroker, behavior: PlanFixtureBehavior) -> Arc<Provider> {

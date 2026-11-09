@@ -1,28 +1,31 @@
-use crate::plan::PlanDocument;
+use crate::plan::{PlanArtifact, PlanDocument};
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::{ToolContext, ToolResult as Result};
 use crate::tools::schema::strict_object_input_schema;
 use crate::tools::schema::string_schema;
 use serde_json::json;
 
-pub(super) const NAME: &str = "plan_file_read";
+pub(super) const NAME: &str = "plan_read";
 
-/// Describe the plan_file_read tool and its accepted inputs.
+/// Describe the plan_read tool and its accepted inputs.
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Read a file's proposed semantic structure or complete configuration text without changing the \
-                plan. Supply plan_id and a project-relative path. Unedited files are read from the workspace \
-                without being added to the plan. Set baseline to read the saved original of an edited file. \
-                Optional start_line/end_line select an inclusive range. Returns numbered text, the shared \
-                version, and a source digest for unedited files. Use plan_overview_read for the plan overview and \
-                file inventory.",
+        description: "Read a plan artifact or a project file's proposed semantic structure without changing \
+                the plan. Supply plan_id and a path. Plan artifacts are plan:overview.md, plan:flows.md, \
+                plan:tests.md, and plan:checks.md, plus plan:findings.md, plan:evidence.md, and \
+                plan:verification.md during execution; plan:verification.md holds the Verify report and \
+                plan:evidence.md the results it may cite. Other paths are project-relative files; unedited files are read from the \
+                workspace without being added to the plan. Set baseline to read the saved original of an \
+                edited project file. Optional start_line/end_line select an inclusive range. Returns \
+                numbered text and the shared version, plus a source digest for unedited files. Use \
+                plan_status for the plan's artifacts and changed files.",
         input_schema: strict_object_input_schema(
             vec![
                 ("plan_id", string_schema()),
                 (
                     "path",
-                    json!({"type":"string","description":"Project-relative .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, XML, or .gitignore path."}),
+                    json!({"type":"string","description":"A plan: artifact path, or a project-relative .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, XML, or .gitignore path."}),
                 ),
                 ("baseline", json!({"type":"boolean"})),
                 ("start_line", json!({"type":"integer","minimum":1})),
@@ -33,7 +36,7 @@ pub(super) fn definition() -> ControlToolDefinition {
     }
 }
 
-/// Execute plan_file_read within the current turn authority.
+/// Execute plan_read within the current turn authority.
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
@@ -42,7 +45,7 @@ pub(super) async fn execute(
     runtime.require_readable_plan()?;
     let document = runtime
         .plan_document
-        .as_ref()
+        .clone()
         .context("plan read has no active canonical document")?;
     let requested = output
         .plan_read
@@ -54,7 +57,6 @@ pub(super) async fn execute(
             active: document.plan_id.clone(),
         });
     }
-
     let design = document
         .design
         .as_ref()
@@ -62,18 +64,46 @@ pub(super) async fn execute(
     let workspace = runtime
         .context
         .workspace_root
-        .as_deref()
+        .clone()
         .context("file read has no workspace root")?;
     let path = invocation.arguments["path"]
         .as_str()
-        .context("file read requires a path")?;
-    let file = design.inspect(
-        workspace,
-        Some(path),
-        invocation.arguments["baseline"].as_bool().unwrap_or(false),
-    )?;
-    let message = read_design(document, &file, &invocation.arguments)?;
-    if let Some(digest) = file["source_digest"].as_str() {
+        .context("plan read requires a path")?;
+    let baseline = invocation.arguments["baseline"].as_bool().unwrap_or(false);
+    if let Some(artifact) = PlanArtifact::from_path(path)? {
+        crate::tools::error::ensure!(
+            !baseline,
+            "{path} has no baseline; read it without baseline"
+        );
+        let text = if artifact.authored() {
+            crate::plan::design_artifact_text(artifact, &document.title, design, &workspace)?
+        } else {
+            let state = super::status::execution_state(runtime)
+                .await?
+                .with_context(|| format!("{path} exists only while an accepted plan executes"))?;
+            super::status::execution_artifact_text(artifact, &document, &state)?
+        };
+        let message = numbered(
+            &document,
+            path,
+            "artifact",
+            &text,
+            None,
+            &invocation.arguments,
+        )?;
+        return Ok(crate::tools::ControlToolResult {
+            invocation: Some(invocation),
+            message,
+        });
+    }
+    let file = design.inspect(&workspace, path, baseline)?;
+    let text = file["text"]
+        .as_str()
+        .context("declaration read has no text")?;
+    let side = file["side"].as_str().unwrap_or("proposed");
+    let digest = file["source_digest"].as_str();
+    let message = numbered(&document, path, side, text, digest, &invocation.arguments)?;
+    if let Some(digest) = digest {
         runtime.inspected.insert(path.into(), digest.into());
     }
     Ok(crate::tools::ControlToolResult {
@@ -82,32 +112,22 @@ pub(super) async fn execute(
     })
 }
 
-/// Presents an exact declaration range without JSON escaping or implementation bodies.
-fn read_design(
+/// Presents an exact line range without JSON escaping or implementation bodies.
+fn numbered(
     document: &PlanDocument,
-    file: &serde_json::Value,
+    path: &str,
+    side: &str,
+    text: &str,
+    digest: Option<&str>,
     arguments: &serde_json::Value,
 ) -> Result<String> {
     use std::fmt::Write;
-    let path = arguments.get("path").and_then(serde_json::Value::as_str);
     let start = arguments
         .get("start_line")
         .and_then(serde_json::Value::as_u64);
     let end = arguments
         .get("end_line")
         .and_then(serde_json::Value::as_u64);
-    crate::tools::error::ensure!(
-        path.is_some() || (start.is_none() && end.is_none()),
-        "line ranges require a file path"
-    );
-    let Some(path) = path else {
-        return Ok(serde_json::to_string(
-            &serde_json::json!({"plan_id":document.plan_id,"version":document.version,"file":file}),
-        )?);
-    };
-    let text = file["text"]
-        .as_str()
-        .context("declaration read has no text")?;
     let total = text.lines().count();
     let start = start.unwrap_or(1);
     let end = end.unwrap_or(total as u64);
@@ -120,12 +140,11 @@ fn read_design(
         "start_line is outside the file ({total} lines)"
     );
     let end = end.min(total as u64);
-    let side = file["side"].as_str().unwrap_or("proposed");
     let mut message = format!(
         "Plan {} · version {}\n{path} ({side}) · lines {start}-{end} of {total}\n",
         document.plan_id, document.version
     );
-    if let Some(digest) = file["source_digest"].as_str() {
+    if let Some(digest) = digest {
         writeln!(
             message,
             "Source digest: {digest} (uncaptured workspace file)"
@@ -147,10 +166,6 @@ pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
     output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
-    crate::tools::error::ensure!(
-        invocation.arguments["path"].as_str() != Some("plan.json"),
-        "use plan_overview_read to read the plan overview"
-    );
     output.plan_read = invocation
         .arguments
         .get("plan_id")

@@ -62,7 +62,6 @@ pub(super) async fn execute(
         submission.expected_version == document.version,
         "submitted version does not match active version"
     );
-    document.validate_for_submission()?;
     if let Some(design) = &document.design {
         let workspace = runtime
             .context
@@ -70,12 +69,20 @@ pub(super) async fn execute(
             .as_deref()
             .context("design submission has no workspace root")?;
         let design = if runtime.context.execution.is_some() {
-            design.validated_revision(workspace).await?
+            design
+                .validated_revision(workspace, &document.title)
+                .await?
         } else {
-            design.validated(workspace).await?
+            design.validated(workspace, &document.title).await?
         };
+        let warnings = design
+            .warnings()
+            .into_iter()
+            .map(|warning| format!("{}: warning: {}", warning.path, warning.message))
+            .collect::<Vec<_>>();
         let mut submitted = document.clone();
         submitted.design = Some(design.into_design());
+        submitted.validate_for_submission()?;
         if let Some(execution) = &runtime.context.execution {
             let reason = invocation
                 .arguments
@@ -104,7 +111,8 @@ pub(super) async fn execute(
             runtime.context.execution.as_mut().unwrap().generation = generation;
             runtime.context.plan_state = Some(plan_state);
             runtime.plan_document = Some(document);
-            let message = serde_json::to_string(&response)?;
+            let message =
+                super::phase_done::execution_response_text("Revision reviewed.", &response);
             return Ok(crate::tools::ControlToolResult {
                 invocation: None,
                 message,
@@ -112,11 +120,20 @@ pub(super) async fn execute(
         }
         runtime.plan_document = Some(submitted);
         runtime.context.plan_state = Some(PlanState::AwaitingReview);
+        let mut message = runtime.plan_version_message("Declaration design submitted for review");
+        if !warnings.is_empty() {
+            message.push_str(&format!(
+                "\n{} unverified reference warning(s); they do not block review:\n{}",
+                warnings.len(),
+                warnings.join("\n")
+            ));
+        }
         return Ok(crate::tools::ControlToolResult {
             invocation: Some(invocation),
-            message: runtime.plan_version_message("Declaration design submitted for review"),
+            message,
         });
     }
+    document.validate_for_submission()?;
     let workspace_root = runtime
         .context
         .workspace_root

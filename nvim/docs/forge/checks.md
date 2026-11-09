@@ -100,12 +100,14 @@ the same action used to delete planned tests. Confirming disables those checks
 for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
-Agents select existing checks through the `checks` field of `plan_overview_edit`,
-alongside tests and manual verification. The list replaces the plan's additional
-check selection without changing repository settings or executing commands.
-Prerequisites are included automatically; `[]` clears additions while automatic
-checks still apply. Omitting `checks` preserves the selection. The tool is
-available during plan authoring and Resolve.
+Agents select existing checks by editing the `- [ ] id` lines of the
+`plan:checks.md` artifact with `plan_edit`. The artifact lists every enabled
+saved check, and marking `[x]` adds that check to the plan without changing
+repository settings or executing commands. `plan_submit` reports a marked ID
+that names no configured check, a disabled check, or a check whose prerequisite
+is unmarked, each at its line. Unmarking every box clears additions while
+automatic checks still apply. Editing is available during plan authoring and
+Resolve.
 `check_run` accepts `check` as a name or a list of names. Supply `inputs` as an
 object matching each check's declared input contract, or omit it to use defaults
 and automatic context bindings. `all: true` requests full context and cannot be

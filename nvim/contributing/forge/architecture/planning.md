@@ -6,21 +6,42 @@ This chapter follows a plan from authoring through acceptance and execution. [Pl
 
 ## Prompts
 
-Three files define what the model is told. `plan/prompts/planning.md` introduces semantic structure and the authoring workflow; the planning tools describe file patch syntax and overview fields. `plan/prompts/system.md` introduces the Harness environment. `provider/prompt.rs` adds the current permission and interaction purpose for each request.
+Three files define what the model is told. `plan/prompts/planning.md` introduces semantic structure, the plan artifacts, and the authoring workflow; `plan_edit` describes the patch syntax and each artifact's grammar. `plan/prompts/system.md` introduces the Harness environment. `provider/prompt.rs` adds the current permission and interaction purpose for each request.
 
 ## Plan documents
 
-`DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and edits the plan through separate file and overview tools:
+`DeclarationDesign` persists baseline text, original source digests, proposed text, explicit moves, and the `DesignDocument` overview in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and treats the whole plan as files it reads and patches:
 
 | Tool | Behavior |
 | --- | --- |
-| `plan_file_read` | Returns a source file's semantic structure or a complete configuration file as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
-| `plan_file_edit` | Applies Add, Update, Delete, Move, and context chunks atomically. The first edit of a path captures its baseline and digest. Invalid syntax, paths, versions, or context change nothing. |
-| `plan_overview_read` | Returns the descriptive overview, shared version, file inventory, and any current execution evidence. |
-| `plan_overview_edit` | Updates supplied overview fields atomically. Omitted fields remain unchanged, arrays replace their previous values, and `usage: null` removes the example. The optional `checks` list replaces additional check selections and includes prerequisites. File proposals are preserved. |
-| `plan_submit` | Validates the complete document and freezes an immutable revision. |
+| `plan_status` | Lists the plan identity, phase, shared version, artifacts, and changed project files in one shape for planning and execution. Validation errors belong to `plan_submit`. |
+| `plan_read` | Returns an artifact, a source file's semantic structure, or a complete configuration file as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
+| `plan_edit` | Applies Add, Update, Delete, Revert, Move, and context chunks atomically to artifacts and project files. The first edit of a path captures its baseline and digest. Artifact text is stored as written. Revert File withdraws a file's proposal, including a move, or returns an artifact to its last submitted text. Invalid patch syntax, paths, versions, or context change nothing. |
+| `plan_submit` | Parses every artifact, validates the complete document, and freezes an immutable revision. A rejection lists every artifact and declaration problem by line. |
 
-Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. File edits and overview edits share one version. Every effective edit increments it; a no-op leaves it unchanged. The model does not edit internal `plan.json` storage through the file tools.
+Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. Artifact and file edits share one version. Every effective edit increments it, and a no-op leaves it unchanged. A successful edit returns the version and the changed paths rather than a diff, because the agent already holds the text it wrote.
+
+### Artifacts
+
+The overview would otherwise be a nested JSON argument, which provider schema compaction can strip of its guidance and which models often get wrong on the first attempt. The plan is therefore a set of Markdown artifacts under the reserved `plan:` prefix, which no workspace path can occupy.
+
+| Path | Contents |
+| --- | --- |
+| `plan:overview.md` | `# Title`, then the Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. |
+| `plan:flows.md` | One `## Title` per flow with a `Trigger:` line, a description, and an indented step list with `effect:` and `if` items. |
+| `plan:tests.md` | One `## path` per file with `- change \`name\` [target: t]: scenario` items. |
+| `plan:checks.md` | Every enabled saved check as a `- [ ] id` line; `[x]` selects a check, and its prerequisites must be marked too. |
+| `plan:findings.md` | Execution findings for Resolve; read-only. |
+| `plan:evidence.md` | Completed tool results and passed checks the Verify report may cite, each with a short alias; read-only. |
+| `plan:verification.md` | The Verify report: one result row per manual check, the defect findings, and a reuse reason. Editable only in Verify. |
+
+`DeclarationDesign::artifact_text` stores each edited authored artifact exactly as the agent wrote it, so every diagnostic names a line the agent can find. Submission is the only path from that text to `DesignDocument`: `design_artifact::parse_authored` parses all four artifacts and collects every problem as a `DeclarationDiagnostic` with an artifact kind, and `validated_revision` merges them with the declaration diagnostics into one rejection. A clean parse covers every rule `DesignDocument::validate_for_submission` enforces, so the parsed document always satisfies it. Parsers continue past a bad line rather than stopping at the first, and flow parsing builds nested steps iteratively, without count or depth caps.
+
+An artifact without stored text renders from `DesignDocument`. That keeps Harness-side writers consistent with the text model: the review check toggle and test removal change the document and drop the artifact's stored text, and the next read renders the result in the grammar the agent edits. Every overview edit copies its `# Title` line into the plan title, so the title in the UI follows the draft. Provider prompts present the artifact text rather than the parsed document, so a prompt never shows a document older than the agent's latest edit.
+
+Evidence in `plan:evidence.md` carries a short alias derived from a hash of its full ID, so the alias stays fixed as later tool results join the list. The Verify report is an artifact rather than a `plan_phase_done` argument, because the argument was a nested array of objects whose labels had to repeat each accepted action verbatim. In Verify, `plan_edit` accepts only a patch of `plan:verification.md` and stores the text on `PlanExecutionRecord::verification_draft`. Each manual check gets an `N. passed|failed|blocked [IDs] note` row, and each defect a `path:line:column: message [IDs]` finding, so Resolve receives locations. `plan_phase_done` takes only the phase, revision, and summary. `verification_artifact::parse` reports every problem by line: pending or unknown statuses, unknown citations, findings whose file or line does not exist, and missing rows. It then builds the `VerificationReport`, labels each check from its accepted action, and derives the overall result: findings or a failed row fail it, a blocked row blocks it, and otherwise it passes. Every phase transition discards the draft, so a later Verify phase starts from the template.
+
+Failed control calls return compiler-style text rather than JSON, because only the model reads them. `control_tool_failure_text` prints one `location: error[code]: message` line per problem, each shared correction once, and the retry instruction. The successful results of `plan_submit` and `plan_phase_done` are text too, and a successful submission lists unverified-reference warnings in the same format.
 
 Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON, JSONC, TOML, YAML, and XML files. Language adapters extract declarations with complete signatures, fields, visibility, generics, imports, and documentation, and omit executable bodies. Configuration keeps complete values. Harness owns layout, so agents supply content and nesting. `declaration_line_width` is a preference, never a validation limit.
 
@@ -64,7 +85,7 @@ When acceptance includes inline comments, Harness sends changes-requested feedba
 
 ## Implementation and conformance
 
-Accepted execution begins in Implement, then enters the Harness-owned Check phase. Check findings enter Resolve, and passing checks enter Verify only when the plan contains manual verification actions; otherwise they complete execution. Implement attempts the accepted behavior and tests, and plan mutation tools are absent in Implement and Verify. Successful phase completion ends the model turn, so Harness owns the next transition.
+Accepted execution begins in Implement, then enters the Harness-owned Check phase. Check findings enter Resolve, and passing checks enter Verify only when the plan contains manual verification actions; otherwise they complete execution. Implement attempts the accepted behavior and tests, and plan mutation tools are absent in Implement. Verify exposes `plan_edit` only for its report artifact, and withholds `plan_submit`. Successful phase completion ends the model turn, so Harness owns the next transition.
 
 Execution admission persists the workspace baseline before starting its first provider turn. Baseline capture and executor setup are required operations rather than a Prepare phase. A missing baseline fails admission instead of allowing implementation to proceed without task-relative change attribution.
 

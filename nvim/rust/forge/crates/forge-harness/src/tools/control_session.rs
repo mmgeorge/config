@@ -263,7 +263,7 @@ impl ControlEndpoint for ControlSession {
         let result = match outcome.result {
             Ok(result) => result,
             Err(error) => {
-                let failure = super::control_tool_failure_json(
+                let failure = super::control_tool_failure_text(
                     &invocation,
                     &error,
                     outcome.plan_document.as_ref(),

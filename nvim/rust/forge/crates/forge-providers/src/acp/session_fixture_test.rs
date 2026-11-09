@@ -111,6 +111,146 @@ async fn native_message_and_tool_updates_publish_normalized_addresses_and_outcom
             if changes.file.iter().any(|change| change.path == "src/main.rs"))));
 }
 
+/// Collect the classification each assistant message received, keyed by its completed text.
+fn message_classifications(
+    events: &[forge_provider_api::ProviderEvent],
+) -> Vec<(String, Vec<forge_provider_api::MessageClassification>)> {
+    let mut message_list: Vec<(
+        forge_provider_api::ItemId,
+        String,
+        Vec<forge_provider_api::MessageClassification>,
+    )> = Vec::new();
+    for event in events {
+        let forge_provider_api::ProviderEvent::Item { item_id, event, .. } = event else {
+            continue;
+        };
+        match event {
+            forge_provider_api::ItemEvent::Started(
+                forge_provider_api::ItemStart::AgentMessage(start),
+            ) => message_list.push((item_id.clone(), start.text.clone(), Vec::new())),
+            forge_provider_api::ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Classified(classification),
+            } => {
+                if let Some((_, _, classification_list)) = message_list
+                    .iter_mut()
+                    .find(|(message_id, ..)| message_id == item_id)
+                {
+                    classification_list.push(*classification);
+                }
+            }
+            forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::AgentMessage(completion),
+            ) => {
+                if let Some((_, text, _)) = message_list
+                    .iter_mut()
+                    .find(|(message_id, ..)| message_id == item_id)
+                {
+                    text.clone_from(&completion.text);
+                }
+            }
+            _ => {}
+        }
+    }
+    message_list
+        .into_iter()
+        .map(|(_, text, classification_list)| (text, classification_list))
+        .collect()
+}
+
+#[tokio::test]
+async fn late_update_for_an_earlier_tool_keeps_the_final_answer_a_response() {
+    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    let session_update = |update: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            state
+                .notification(
+                    "session/update",
+                    json!({"sessionId":"root","update":update}),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    session_update(
+        json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"progress"}}),
+    )
+    .await;
+    session_update(json!({"sessionUpdate":"tool_call","toolCallId":"abandoned","kind":"search","title":"grep"})).await;
+    session_update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"final answer"}})).await;
+    session_update(
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"abandoned","status":"failed"}),
+    )
+    .await;
+    state
+        .finish(forge_provider_api::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+        })
+        .await
+        .unwrap();
+
+    let commentary = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Commentary,
+    );
+    let response = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Response,
+    );
+    assert_eq!(
+        message_classifications(&drain(&mut stream)),
+        vec![
+            ("progress".to_owned(), vec![commentary]),
+            ("final answer".to_owned(), vec![response]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn native_message_ids_split_adjacent_prose_into_separate_messages() {
+    let (state, _, mut stream) = activate(AcpKind::Claude).await;
+    for (native_message_id, text) in [
+        (Some("msg-1"), "first "),
+        (Some("msg-1"), "message"),
+        (Some("msg-2"), "second message"),
+        (None, " without"),
+        (None, " an id"),
+    ] {
+        let mut update = json!({
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
+        });
+        if let Some(native_message_id) = native_message_id {
+            update["messageId"] = json!(native_message_id);
+        }
+        state
+            .notification(
+                "session/update",
+                json!({"sessionId":"root","update":update}),
+            )
+            .await
+            .unwrap();
+    }
+    state
+        .finish(forge_provider_api::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+        })
+        .await
+        .unwrap();
+
+    let commentary = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Commentary,
+    );
+    let response = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Response,
+    );
+    assert_eq!(
+        message_classifications(&drain(&mut stream)),
+        vec![
+            ("first message".to_owned(), vec![commentary]),
+            ("second message".to_owned(), vec![commentary]),
+            (" without an id".to_owned(), vec![response]),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn native_permission_callback_receives_a_normalized_target_and_once_choice() {
     let (state, permission, _stream) = activate(AcpKind::Claude).await;

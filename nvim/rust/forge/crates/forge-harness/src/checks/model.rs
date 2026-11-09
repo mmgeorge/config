@@ -1,4 +1,4 @@
-use crate::plan::execution::{SemanticProgress, VerificationOutcome};
+use crate::plan::execution::{SemanticProgress, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -121,14 +121,14 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
     }
 
     /// Select the gate result from recorded failures rather than model interpretation.
-    pub fn outcome(&self) -> VerificationOutcome {
+    pub fn status(&self) -> VerificationStatus {
         if self.commands.iter().any(|check| {
             matches!(
                 check.state,
                 CheckState::ConfigurationError | CheckState::Blocked | CheckState::ExecutionError
             )
         }) {
-            return VerificationOutcome::Blocked;
+            return VerificationStatus::Blocked;
         }
         if !self.progress.missing.is_empty()
             || !self.progress.different.is_empty()
@@ -137,16 +137,16 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
                 .iter()
                 .any(|check| check.state == CheckState::Failed)
         {
-            VerificationOutcome::Failed
+            VerificationStatus::Failed
         } else if self.progress.unverified.is_empty()
             && self
                 .commands
                 .iter()
                 .all(|check| matches!(check.state, CheckState::Passed | CheckState::Skipped))
         {
-            VerificationOutcome::Passed
+            VerificationStatus::Passed
         } else {
-            VerificationOutcome::Blocked
+            VerificationStatus::Blocked
         }
     }
 }
