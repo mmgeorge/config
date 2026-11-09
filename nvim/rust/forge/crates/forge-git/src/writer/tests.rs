@@ -413,7 +413,7 @@ fn scoped_patch_target(old: &str, new: &str, replacement: &str, reverse: bool) -
 
 #[tokio::test]
 async fn scoped_patch_rejects_foreign_baselines_and_unselected_raw_regions() {
-    let (_, _, repository, service) = fixture().await;
+    let (_directory, _, repository, service) = fixture().await;
     let old = "one\ntwo\nthree\nfour\nfive\n";
     let new = "ONE\ntwo\nthree\nfour\nFIVE\n";
     let mut target = scoped_patch_target(old, new, "one\ntwo\nthree\nfour\nFIVE\n", false);

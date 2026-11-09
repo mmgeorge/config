@@ -267,41 +267,41 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     host.stop().await;
 }
 
+/// A compiled commit-editor fixture whose directory lives as long as the test that uses it.
 struct CommitEditorExecutable {
-    _directory: tempfile::TempDir,
-    path: std::path::PathBuf,
+    directory: tempfile::TempDir,
 }
 
-fn commit_editor_executable() -> &'static std::path::Path {
-    static EXECUTABLE: std::sync::OnceLock<CommitEditorExecutable> = std::sync::OnceLock::new();
-    &EXECUTABLE
-        .get_or_init(|| {
-            let directory = tempfile::tempdir().unwrap();
-            let source = directory.path().join("commit_editor.rs");
-            let output = directory.path().join(if cfg!(windows) {
-                "commit-editor.exe"
-            } else {
-                "commit-editor"
-            });
-            std::fs::write(&source, include_str!("fixtures/commit_editor.rs")).unwrap();
-            let compiled = std::process::Command::new("rustup")
-                .args(["run", "1.94.0", "rustc", "--edition=2024"])
-                .arg(source)
-                .arg("-o")
-                .arg(&output)
-                .output()
-                .unwrap();
-            assert!(
-                compiled.status.success(),
-                "{}",
-                String::from_utf8_lossy(&compiled.stderr)
-            );
-            CommitEditorExecutable {
-                path: output,
-                _directory: directory,
-            }
+impl CommitEditorExecutable {
+    /// Create the editor by compiling the fixture source into a test-owned directory.
+    fn compile() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("commit_editor.rs");
+        std::fs::write(&source, include_str!("fixtures/commit_editor.rs")).unwrap();
+        let editor = Self { directory };
+        let compiled = std::process::Command::new("rustup")
+            .args(["run", "1.94.0", "rustc", "--edition=2024"])
+            .arg(source)
+            .arg("-o")
+            .arg(editor.path())
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        editor
+    }
+
+    /// Get the compiled editor's path.
+    fn path(&self) -> std::path::PathBuf {
+        self.directory.path().join(if cfg!(windows) {
+            "commit-editor.exe"
+        } else {
+            "commit-editor"
         })
-        .path
+    }
 }
 
 /// Git evaluates GIT_EDITOR through its shell, including on Git for Windows.
@@ -321,7 +321,8 @@ async fn commit_editor_options_and_progress_receipts_use_the_copied_host_fixture
     std::fs::write(root.join("commit.txt"), "commit through editor\n").unwrap();
     git(root, &["add", "commit.txt"]);
 
-    let editor = git_editor_command(commit_editor_executable());
+    let editor_executable = CommitEditorExecutable::compile();
+    let editor = git_editor_command(&editor_executable.path());
     let nvim_server = "fixture-nvim-server";
     let mut host = Host::start().await;
     let prepared = host

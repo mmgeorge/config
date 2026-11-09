@@ -17,28 +17,10 @@ function M.start(state, prompt, completed)
   local text = source and table.concat(source, "\n") or prompt.text
   if not text:find("%S") then completed(nil, "Prompt requires nonempty text") return end
   local attachments = prompt.attachments or (context and attachment.capture(context.buffer).attachments) or {}
-  local cleared_tick
+  local restore = function() return false end
   if context and context.is_current() and vim.api.nvim_buf_is_valid(context.buffer)
     and (prompt.changedtick == nil or prompt.changedtick == vim.api.nvim_buf_get_changedtick(context.buffer)) then
-    vim.api.nvim_buf_set_lines(context.buffer, 0, -1, false, { "" })
-    attachment.restore(context.buffer, {})
-    cleared_tick = vim.api.nvim_buf_get_changedtick(context.buffer)
-  end
-  -- Restoration must never overwrite later composer work. An untouched composer qualifies, and so
-  -- does one that is empty again: queueing a follow-up types into the composer and then clears it.
-  local function composer_free()
-    if vim.api.nvim_buf_get_changedtick(context.buffer) == cleared_tick then return true end
-    local lines = vim.api.nvim_buf_get_lines(context.buffer, 0, -1, false)
-    return #lines == 1 and lines[1] == "" and #attachment.capture(context.buffer).attachments == 0
-  end
-  local function restore()
-    if context and source and cleared_tick and context.is_current() and vim.api.nvim_buf_is_valid(context.buffer)
-      and composer_free() then
-      vim.api.nvim_buf_set_lines(context.buffer, 0, -1, false, source)
-      attachment.restore(context.buffer, attachments)
-      return true
-    end
-    return false
+    restore = require("forge.views.harness.composer_draft").take(context.buffer, assert(source), attachments, context.is_current)
   end
   input_state.submit(state, text, attachments, "auto", nil, function(failure)
     if failure then restore() end

@@ -471,6 +471,44 @@ T["effort_selection"] = function()
   vim.api.nvim_buf_delete(composer, { force = true })
 end
 
+-- A task command empties the composer on submission rather than on the host's reply, which can
+-- arrive only after a provider turn starts, and a rejection restores the draft unless newer
+-- composer work replaced it.
+T["task_command_clears_composer_before_reply"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  require("forge.views.harness.prompt_history").record = function() end
+  controller.render, controller.refresh_winbar = function() end, function() end
+  state.session = { id = "task-composer", model = "test" }
+  state.host_error, state.execution_notice = nil, nil
+  state.queue, state.pending_steer, state.capability = {}, {}, {}
+  state.composer_buf = buffer.scratch()
+  local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local requests = mock_client.record()
+
+  buffer.set(state.composer_buf, { "/goal Finish the port" })
+  controller.submit()
+  local accepted = requests[#requests]
+  eq(accepted.spec.method, "session.command.apply")
+  eq(buffer.text(state.composer_buf), "")
+  accepted.callback({ state = "accepted" })
+  eq(buffer.text(state.composer_buf), "")
+
+  buffer.set(state.composer_buf, { "/plan Port the renderer" })
+  controller.submit()
+  local rejected = requests[#requests]
+  eq(buffer.text(state.composer_buf), "")
+  rejected.callback(nil, "task is already active", { code = "conflict" })
+  eq(buffer.text(state.composer_buf), "/plan Port the renderer")
+  eq(#failures, 1)
+
+  controller.submit()
+  local superseded = requests[#requests]
+  buffer.set(state.composer_buf, { "newer draft" })
+  superseded.callback(nil, "task is already active", { code = "conflict" })
+  eq(buffer.text(state.composer_buf), "newer draft")
+end
+
 T["mode_restart"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")

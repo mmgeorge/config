@@ -2172,13 +2172,18 @@ function M.task_transition(action, submitted_text, completed, method)
   end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then M.report_uninitialized(state, "Harness task") return end
+  local restore_draft
+  local buffer = state.composer_buf
+  if submitted_text and composer_text(buffer) == submitted_text then
+    dismiss_composer_completion(buffer)
+    restore_draft = require("forge.views.harness.composer_draft").take(buffer,
+      vim.api.nvim_buf_get_lines(buffer, 0, -1, false), attachment.capture(buffer).attachments,
+      function() return harness_state() == state and state.composer_buf == buffer end)
+  end
   task_control.transition(state, action, M.render, function(failure)
+    if failure and restore_draft then restore_draft() end
     if completed then completed(not failure) end
     if harness_state() == state then M.render() end
-  end, function()
-    if submitted_text and harness_state() == state and composer_text(state.composer_buf) == submitted_text then
-      set_composer_text(state.composer_buf, "")
-    end
   end, method)
 end
 

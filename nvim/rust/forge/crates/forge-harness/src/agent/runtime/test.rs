@@ -72,7 +72,10 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
         tool_timeout: Default::default(),
         trace: trace.clone(),
         submission_store: SubmissionStore::open(directory.path(), trace)?,
-        permission: crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+        permission: crate::provider::approval::PermissionCoordinator::load(
+            directory.path().join("permissions.json"),
+            directory.path(),
+        )?,
         request: ProviderRequest {
             dispatch: Default::default(),
             execution_owner: Some(owner.clone()),

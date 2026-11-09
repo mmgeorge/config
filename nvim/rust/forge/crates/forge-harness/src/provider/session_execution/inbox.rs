@@ -707,7 +707,6 @@ mod tests {
 
     /// Retain real admitted native work independently of its foreground result waiter.
     struct AdmittedWork {
-        _directory: tempfile::TempDir,
         _session: crate::provider::test_support::ProviderTestSession,
         registry: super::super::SessionExecutionRegistry,
         _engine: Arc<super::super::SessionExecution>,
@@ -717,6 +716,8 @@ mod tests {
         result: tokio::task::JoinHandle<
             std::result::Result<crate::provider::ProviderCompletion, ProviderError>,
         >,
+        // Declared last: fields drop in order, and Windows cannot delete files still open.
+        _directory: tempfile::TempDir,
     }
 
     impl AdmittedWork {

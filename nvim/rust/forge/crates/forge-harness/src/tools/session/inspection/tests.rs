@@ -22,10 +22,11 @@ fn exchange(session: &HarnessSession, id: &str, text: &str) -> Exchange {
 }
 
 struct Fixture {
-    root: tempfile::TempDir,
-    workspace: tempfile::TempDir,
     scope: Arc<HarnessInspectionScope>,
     _lease: InspectionLease,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    root: tempfile::TempDir,
+    workspace: tempfile::TempDir,
 }
 
 impl Fixture {

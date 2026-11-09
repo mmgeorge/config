@@ -502,7 +502,7 @@ async fn bridge(
 ) -> Result<ProviderBridge, anyhow::Error> {
     Ok(ProviderBridge::new(
         forge_providers::registry::RegisteredProvider::new(native.descriptor(), native, None),
-        PermissionCoordinator::transient(root)?,
+        PermissionCoordinator::load(root.join("permissions.json"), root)?,
         Arc::new(crate::trace::TraceStore::open(root)?),
         root.to_owned(),
     ))

@@ -367,10 +367,11 @@ fn wire_peer_handler(mode: String) -> super::in_memory_peer::PeerHandler {
 }
 
 struct WireFixture {
-    _directory: tempfile::TempDir,
     connection: AcpConnection,
     command: Vec<String>,
     peer: super::in_memory_peer::InMemoryPeer,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    _directory: tempfile::TempDir,
 }
 
 impl WireFixture {

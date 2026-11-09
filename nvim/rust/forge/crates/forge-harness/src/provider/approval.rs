@@ -18,7 +18,7 @@ use crate::session::{ApprovalMode, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
 use forge_provider_api::SanitizedMessage;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -438,11 +438,13 @@ impl PermissionCoordinator {
         Arc::clone(&self.store)
     }
 
-    pub fn transient(workspace: impl AsRef<Path>) -> Result<Arc<Self>> {
-        let directory = std::env::temp_dir()
-            .join("forge-harness")
-            .join(Uuid::new_v4().to_string());
-        let store = PermissionStore::load(directory.join("permissions.json"), workspace.as_ref())?;
+    /// Create a coordinator over the permission document at `document_path`, writing the default
+    /// rules when the file is absent. The caller owns the document's directory and its cleanup.
+    pub fn load(
+        document_path: impl Into<PathBuf>,
+        workspace: impl AsRef<Path>,
+    ) -> Result<Arc<Self>> {
+        let store = PermissionStore::load(document_path, workspace.as_ref())?;
         Ok(Arc::new(Self::new(Arc::new(RwLock::new(store)))))
     }
 
@@ -1952,7 +1954,8 @@ mod test {
         std::fs::create_dir_all(external.join("nested"))?;
         forge_git::test_support::init_repository(&external);
         let settings_root = root.path().join("settings");
-        let coordinator = PermissionCoordinator::transient(&workspace)?;
+        let coordinator =
+            PermissionCoordinator::load(root.path().join("permissions.json"), &workspace)?;
         coordinator.store().write().unwrap().set_rule_list(&[(
             CATEGORY_EDIT.into(),
             ".".into(),

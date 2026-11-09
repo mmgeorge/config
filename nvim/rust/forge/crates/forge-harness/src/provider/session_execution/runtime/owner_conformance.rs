@@ -62,7 +62,6 @@ impl SteeringCall {
 
 /// Retain real adapter and host owners while tests independently control native evidence.
 struct Fixture {
-    directory: tempfile::TempDir,
     native: Arc<EventFixtureProvider>,
     session: ProviderTestSession,
     registry: SessionExecutionRegistry,
@@ -70,6 +69,8 @@ struct Fixture {
     calls: mpsc::UnboundedReceiver<NativeCall>,
     steering: mpsc::UnboundedReceiver<SteeringCall>,
     dispatch_count: Arc<AtomicUsize>,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    directory: tempfile::TempDir,
 }
 impl Fixture {
     /// Create the production bridge and retained runner with explicit native controls.

@@ -21,7 +21,6 @@ enum CollectionBoundary {
 
 /// Hold one real owner at a selected boundary while native collection remains delayed.
 struct SlowCollectionFixture {
-    root: tempfile::TempDir,
     provider: crate::provider::test_support::ProviderTestSession,
     controller: Arc<SessionController>,
     engine: Arc<crate::provider::session_execution::SessionExecution>,
@@ -31,6 +30,8 @@ struct SlowCollectionFixture {
     events: Arc<std::sync::Mutex<Vec<(tokio::time::Instant, serde_json::Value)>>>,
     events_changed: Arc<tokio::sync::Notify>,
     collection_count: Arc<std::sync::atomic::AtomicUsize>,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    root: tempfile::TempDir,
 }
 
 /// Start a prompt held before acceptance or after native start, with delayed first collection.

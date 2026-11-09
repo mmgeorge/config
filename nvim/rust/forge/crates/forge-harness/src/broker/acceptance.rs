@@ -1257,11 +1257,12 @@ mod tests {
 
     /// An execution in its Resolve phase with one accepted revision and a settled source exchange.
     struct ResolvingExecution {
-        _workspace: tempfile::TempDir,
-        _data: tempfile::TempDir,
         broker: HarnessBroker,
         plan: PlanRecord,
         exchange: Exchange,
+        // Declared last: fields drop in order, and Windows cannot delete files still open.
+        _workspace: tempfile::TempDir,
+        _data: tempfile::TempDir,
     }
 
     async fn resolving_execution() -> Result<ResolvingExecution> {

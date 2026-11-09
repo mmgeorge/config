@@ -4468,7 +4468,10 @@ mod tests {
                         .expect("registry supplies a nonselectable fixture identity"),
                     command: Vec::new(),
                 },
-                crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+                crate::provider::approval::PermissionCoordinator::load(
+                    directory.path().join("permissions.json"),
+                    directory.path(),
+                )?,
                 trace.clone(),
                 directory.path().into(),
             )?;

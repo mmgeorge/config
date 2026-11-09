@@ -2,9 +2,10 @@
 nextest-version = { required = "0.9.98" }
 experimental = ["setup-scripts"]
 
-# Build the seeded Git template once per run for broker fixtures; see `git_template.nu`.
-[scripts.setup.git-template]
-command = "nu .config/git_template.nu"
+# Give each run its own temporary-directory root and build the seeded Git template that broker
+# fixtures copy; see `fixture_root.nu`.
+[scripts.setup.fixture-root]
+command = "nu .config/fixture_root.nu"
 
 # Every Forge test must be deterministic and nearly instant. A test still running after two
 # seconds is terminated and reported as a failure, so a hang or a real-clock wait fails fast
@@ -20,9 +21,10 @@ fail-fast = false
 # two-second limit on a 24-thread machine, so parallelism is capped rather than the limit raised.
 test-threads = 8
 
+# Every package's tests create temporary directories, so every test gets the per-run root.
 [[profile.default.scripts]]
-filter = "package(forge-harness)"
-setup = "git-template"
+filter = "all()"
+setup = "fixture-root"
 
 # Exceptions get ten seconds: five times the slowest serial duration measured in them, which still
 # terminates a hang quickly. Their tests take up to two seconds alone, so machine load alone

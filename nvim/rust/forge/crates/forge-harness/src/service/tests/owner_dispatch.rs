@@ -35,7 +35,6 @@ enum HoldPoint {
 
 /// Drive a real session whose first send pauses after `Sending` is recorded and before `confirm()`.
 struct HeldDispatch {
-    _root: tempfile::TempDir,
     controller: Arc<SessionController>,
     provider: crate::provider::test_support::ProviderTestSession,
     sink: MessageSender,
@@ -46,6 +45,8 @@ struct HeldDispatch {
     interrupted_during_send: Arc<AtomicBool>,
     commands_started_at_hold: usize,
     hold: HoldPoint,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    _root: tempfile::TempDir,
 }
 
 impl HeldDispatch {

@@ -56,9 +56,8 @@ end
 ---@param action table
 ---@param refresh fun()
 ---@param settled fun(failure: string?, background: boolean?)
----@param admitted? fun()
 ---@param method? string
-function M.transition(state, action, refresh, settled, admitted, method)
+function M.transition(state, action, refresh, settled, method)
   if state.host_error then settled(state.host_error) return end
   local session_id, generation = state.session.id, client.host_get_generation()
   action = vim.deepcopy(action)
@@ -74,8 +73,6 @@ function M.transition(state, action, refresh, settled, admitted, method)
       diagnostic.set(state, "execution_notice", failure, { owner = action.operation_id,
         category = detail and detail.code or "command", severity = "error" })
       notifications.error(failure, "Harness task")
-    elseif admitted then
-      admitted()
     end
     settled(failure)
     refresh()

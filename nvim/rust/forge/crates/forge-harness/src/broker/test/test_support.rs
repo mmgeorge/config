@@ -194,7 +194,7 @@ pub(in crate::broker) fn repository() -> tempfile::TempDir {
 
 /// Create a committed Git repository with deterministic fixture identity and line endings, for
 /// tests that exercise checkpoints, rollback, or workspace changes. Under nextest the
-/// `git-template` setup script builds this repository once per run and exports its path, so each
+/// `fixture-root` setup script builds this repository once per run and exports its path, so each
 /// test copies it instead of launching Git. Other runners build it directly.
 pub(in crate::broker) fn git_repository() -> tempfile::TempDir {
     let temporary = tempfile::tempdir().unwrap();

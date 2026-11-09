@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 /// Keep real owner admission and held generic provider work under deterministic test control.
 pub(super) struct OwnerTransitionFixture {
-    /// Keeps the workspace directory alive for the fixture's lifetime.
-    _root: tempfile::TempDir,
     pub(super) service: HarnessService,
     pub(super) controller: Arc<SessionController>,
     pub(super) session: String,
@@ -19,6 +17,8 @@ pub(super) struct OwnerTransitionFixture {
     _engine: Arc<crate::provider::session_execution::SessionExecution>,
     pub(super) sink: MessageSender,
     pub(super) reader: tokio::task::JoinHandle<Result<()>>,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    _root: tempfile::TempDir,
 }
 
 /// Start one held root invocation without using retired restart or cancellation flags.
