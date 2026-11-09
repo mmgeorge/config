@@ -397,7 +397,7 @@ impl BrokerObserver {
                         crate::plan::render_review_feedback(&reviewed.document, &annotation)?;
                     let instruction = PlanPrompt::with_manual_changes(
                         PlanPrompt::revision(
-                            &reviewed.document.model_json()?,
+                            &reviewed.document,
                             &feedback,
                             review.comment.as_deref(),
                         ),

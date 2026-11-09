@@ -10,14 +10,14 @@ Three files define what the model is told. `plan/prompts/planning.md` introduces
 
 ## Plan documents
 
-`DeclarationDesign` persists baseline text, original source digests, proposed text, explicit moves, and the `DesignDocument` overview in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and treats the whole plan as files it reads and patches:
+`DeclarationDesign` persists baseline text, original source digests, proposed text, explicit moves, and the `DesignDocument` overview in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives one line naming the plan ID and version, because the plan tools read the live plan and a snapshot in the prompt goes stale at the first edit. It treats the whole plan as files it reads and patches:
 
 | Tool | Behavior |
 | --- | --- |
 | `plan_status` | Lists the plan identity, phase, shared version, artifacts, and changed project files in one shape for planning and execution. Validation errors belong to `plan_submit`. |
 | `plan_read` | Returns an artifact, a source file's semantic structure, or a complete configuration file as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
-| `plan_edit` | Applies Add, Update, Delete, Revert, Move, and context chunks atomically to artifacts and project files. The first edit of a path captures its baseline and digest. Artifact text is stored as written. Revert File withdraws a file's proposal, including a move, or returns an artifact to its last submitted text. Invalid patch syntax, paths, versions, or context change nothing. |
-| `plan_submit` | Parses every artifact, validates the complete document, and freezes an immutable revision. A rejection lists every artifact and declaration problem by line. |
+| `plan_edit` | Applies Add, Update, Delete, Revert, Move, and context chunks atomically to artifacts and project files. The first edit of a path captures its baseline and digest. Artifact text is stored as written, and so is a source file whose function sections do not parse. Revert File withdraws a file's proposal, including a move, or returns an artifact to its last submitted text. Invalid patch syntax, paths, versions, or context change nothing, and the failure says so. |
+| `plan_submit` | Parses every artifact and unparsed source file, validates the complete document, and freezes an immutable revision without reformatting it. A rejection lists every artifact and declaration problem by line. |
 
 Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. Artifact and file edits share one version. Every effective edit increments it, and a no-op leaves it unchanged. A successful edit returns the version and the changed paths rather than a diff, because the agent already holds the text it wrote.
 
@@ -43,7 +43,7 @@ Evidence in `plan:evidence.md` carries a short alias derived from a hash of its 
 
 Failed control calls return compiler-style text rather than JSON, because only the model reads them. `control_tool_failure_text` prints one `location: error[code]: message` line per problem, each shared correction once, and the retry instruction. The successful results of `plan_submit` and `plan_phase_done` are text too, and a successful submission lists unverified-reference warnings in the same format.
 
-Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON, JSONC, TOML, YAML, and XML files. Language adapters extract declarations with complete signatures, fields, visibility, generics, imports, and documentation, and omit executable bodies. Configuration keeps complete values. Harness owns layout, so agents supply content and nesting. `declaration_line_width` is a preference, never a validation limit.
+Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON, JSONC, TOML, YAML, and XML files. Language adapters extract declarations with complete signatures, fields, visibility, generics, imports, and documentation, and omit executable bodies. Configuration keeps complete values. Harness stores proposed text as the agent wrote it and lays declarations out only when presenting them, through `calls::present` in reviews and diffs, so agents supply content and nesting without a required base indentation. `declaration_line_width` is a presentation preference, never a validation limit.
 
 ## Function behavior and references
 
@@ -69,7 +69,7 @@ Adapters add a control call to durable replay only after its provider request su
 
 ## Reference validation
 
-`plan_submit` validates references before accepting a version, so the provider can repair a rejected design in the same turn, and the broker repeats validation on the formatted snapshot. `DeclarationDesign.validation` stores diagnostics and the snapshot fingerprint, and any patch invalidates them. Proven invalid or ambiguous references reject submission, and unverifiable references only warn.
+`plan_submit` validates references before accepting a version, so the provider can repair a rejected design in the same turn, and the broker repeats validation on the same stored snapshot. `DeclarationDesign.validation` stores diagnostics and the snapshot fingerprint, and any patch invalidates them. Proven invalid or ambiguous references reject submission, and unverifiable references only warn.
 
 The shared Tree-sitter `DeclarationIndex` resolves Rust and TypeScript names within the saved plan, with proposed declarations replacing their baseline files and deleted lines using a separate baseline graph. External APIs, dependency versions, and uncaptured modules stay unchecked, and capture, saving, and submission never make LSP or dependency requests.
 

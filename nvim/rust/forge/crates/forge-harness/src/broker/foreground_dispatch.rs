@@ -1274,7 +1274,7 @@ impl HarnessBroker {
             };
         }
         if matches!(staged.mode, PromptMode::Plan | PromptMode::PlanDiscussion)
-            && !input.text().contains("Active declaration design:")
+            && !PlanPrompt::has_active_plan(&input.text())
         {
             let plan_id = self
                 .current_plan_id()?
@@ -1282,7 +1282,7 @@ impl HarnessBroker {
             let document = self
                 .plan_file
                 .read_working_document(&self.session.id, &plan_id)?;
-            let prefix = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
+            let prefix = PlanPrompt::with_active_plan(String::new(), &document);
             input = match input {
                 ProviderInput::Text { text, attachments } => {
                     ProviderInput::from_text(format!("{prefix}{text}"))
@@ -1716,7 +1716,7 @@ impl HarnessBroker {
                 let document = self
                     .plan_file
                     .read_working_document(&self.session.id, &plan.id)?;
-                PlanPrompt::with_active_document(text.clone(), &document.model_json()?)
+                PlanPrompt::with_active_plan(text.clone(), &document)
             }
             _ => text.clone(),
         };

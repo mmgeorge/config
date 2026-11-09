@@ -898,6 +898,141 @@ mod test {
         assert!(status.message.contains("plan:overview.md  empty"));
     }
 
+    /// Source edits keep the agent's text: a flush section body parses, a structure mistake is
+    /// stored and reported by line at submission, a chunk copied at the wrong base indentation
+    /// still applies with its nesting, and a mismatch names its line without changing the plan.
+    #[tokio::test]
+    async fn source_edits_store_authored_structure_and_submit_reports_it_by_line() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        context.plan_document.as_mut().unwrap().design =
+            Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        let mut runtime = ControlToolRuntime::new(context);
+        let call = |name: &str, arguments: serde_json::Value| ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: name.into(),
+            arguments,
+        };
+        let edit = |version: u64, patch: &str| {
+            call(
+                "plan_edit",
+                json!({"plan_id":"plan","expected_version":version,"patch":patch}),
+            )
+        };
+        let read = |runtime: &ControlToolRuntime| {
+            runtime
+                .plan_document()
+                .unwrap()
+                .design
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+
+        runtime
+            .invoke(edit(
+                1,
+                "*** Begin Patch\n*** Add File: Game.rs\n+/// Play every round.\n+pub fn play(rounds: u32);\n+Algorithm\n+for each round in rounds\n+    score(round)\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        let design = read(&runtime);
+        assert!(design.unparsed_proposed.is_empty());
+        assert_eq!(
+            design.proposed_calls["Game.rs"][0]
+                .behavior
+                .as_ref()
+                .unwrap()
+                .text(),
+            "for each round in rounds\n    score(round)"
+        );
+
+        let second_block = runtime
+            .invoke(edit(
+                2,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n       score(round)\n+Change\n+  Also record the round.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            second_block.message.contains("version is 3"),
+            "{}",
+            second_block.message
+        );
+        let design = read(&runtime);
+        assert!(design.unparsed_proposed["Game.rs"].contains("Change\n  Also record"));
+        let shown = runtime
+            .invoke(call(
+                "plan_read",
+                json!({"plan_id":"plan","path":"Game.rs"}),
+            ))
+            .await
+            .unwrap();
+        assert!(shown.message.contains("6: Change"), "{}", shown.message);
+
+        let submit = call(
+            "plan_submit",
+            json!({"plan_id":"plan","expected_version":3}),
+        );
+        let error = runtime.invoke(submit.clone()).await.unwrap_err();
+        let failure =
+            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document());
+        for expected in [
+            "Game.rs:6:1: error[invalid_declaration_structure]:",
+            "already has a behavior block",
+            "Fix them and retry with expected_version 3.",
+        ] {
+            assert!(
+                failure.contains(expected),
+                "missing {expected:?} in {failure}"
+            );
+        }
+
+        runtime
+            .invoke(edit(
+                3,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n-Change\n-  Also record the round.\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert!(read(&runtime).unparsed_proposed.is_empty());
+
+        runtime
+            .invoke(edit(
+                4,
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n for each round in rounds\n     score(round)\n+    finish(round)\n*** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&runtime).proposed_calls["Game.rs"][0]
+                .behavior
+                .as_ref()
+                .unwrap()
+                .text(),
+            "for each round in rounds\n    score(round)\n    finish(round)"
+        );
+
+        let mismatch = edit(
+            5,
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n-  for each turn in turns\n+  for each turn in rounds\n*** End Patch",
+        );
+        let error = runtime.invoke(mismatch.clone()).await.unwrap_err();
+        let failure =
+            crate::tools::control_tool_failure_text(&mismatch, &error, runtime.plan_document());
+        for expected in [
+            "Game.rs: chunk 1 does not match: its first line `  for each turn in turns` is not in the file",
+            "No changes were applied. Fix them and retry with expected_version 5.",
+        ] {
+            assert!(
+                failure.contains(expected),
+                "missing {expected:?} in {failure}"
+            );
+        }
+        assert_eq!(runtime.plan_document().unwrap().version, 5);
+    }
+
     fn planning_context() -> ControlTurnContext {
         let workspace = tempfile::tempdir().unwrap().keep();
         crate::checks::configure_fixture(&workspace);

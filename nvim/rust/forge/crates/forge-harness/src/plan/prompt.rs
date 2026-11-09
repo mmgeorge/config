@@ -66,34 +66,40 @@ Original request:
 
     /// Build a semantic revision request from reviewed plan state.
     pub fn revision(
-        document_json: &str,
+        document: &super::PlanDocument,
         review_feedback: &str,
         overall_comment: Option<&str>,
     ) -> String {
         let comment = overall_comment
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
+        let plan = active_plan_line(document);
         format!(
             r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested changes with plan_edit. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
+{plan}
+
 Overall review comment:
 {comment}
-
-Current declaration design:
-```json
-{document_json}
-```
 
 Review comments:
 {review_feedback}"#
         )
     }
 
-    /// Prepend the complete canonical plan so every provider can discover and edit it.
-    pub fn with_active_document(prompt: String, document_json: &str) -> String {
-        format!("Active declaration design:\n```json\n{document_json}\n```\n\n{prompt}")
+    /// Prepend the active plan's identity so every provider can address its plan tools.
+    ///
+    /// The tools read the live plan, so the prompt carries only the ID and version they require
+    /// rather than a snapshot that the first edit makes stale.
+    pub fn with_active_plan(prompt: String, document: &super::PlanDocument) -> String {
+        format!("{}\n\n{prompt}", active_plan_line(document))
+    }
+
+    /// Report whether a prompt already carries the active plan's identity.
+    pub(crate) fn has_active_plan(prompt: &str) -> bool {
+        prompt.contains(ACTIVE_PLAN_PREFIX)
     }
 
     /// Restore execution identity and phase without replaying completed work after interruption.
@@ -130,6 +136,15 @@ Review comments:
             "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with plan_edit, and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
+}
+
+const ACTIVE_PLAN_PREFIX: &str = "Active plan `";
+
+fn active_plan_line(document: &super::PlanDocument) -> String {
+    format!(
+        "{ACTIVE_PLAN_PREFIX}{}` is at version {}. Read it with `plan_status` and `plan_read`, and pass this plan ID and the current version to `plan_edit` and `plan_submit`.",
+        document.plan_id, document.version
+    )
 }
 
 fn mutable_elicitation_prompt(

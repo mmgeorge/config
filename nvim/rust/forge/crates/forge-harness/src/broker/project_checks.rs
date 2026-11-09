@@ -100,13 +100,13 @@ impl HarnessBroker {
             .current()?
             .context("pending plan task is missing")?;
         let now_ms = self.clock.now_ms();
-        let instruction = PlanPrompt::with_active_document(
+        let instruction = PlanPrompt::with_active_plan(
             format!(
                 "Project checks have been saved and validated at revision {}. Check setup is complete. Now begin the original planning request.\n\n{}",
                 snapshot.digest,
                 PlanPrompt::draft(&plan.request)
             ),
-            &document.model_json()?,
+            &document,
         );
         self.task_controller.apply(
             &mut self.store,

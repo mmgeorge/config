@@ -10,12 +10,29 @@ pub fn save(&mut self, draft: Draft) -> Result<()>;
 Calls
   Database::save
   Cache::insert
-Accesses
-  Store::database
-  Store::cache
 ```
 
-You can then change the signature or add a `Change` section describing new behavior. This allows us to build a semantic representation of the plan's changes.
+A modified callable gains one `Change`. A new callable, including a renamed one, gets one `Algorithm` instead, never both. Reference sections list bare qualified names, and every new field appears under the `Accesses` of a callable that uses it:
+
+```text
+/// Persist a draft and publish it to readers.
+pub fn save(&mut self, draft: Draft) -> Result<()>;
+Change
+  Reject drafts older than the stored revision.
+Calls
+  Database::save
+  Cache::insert
+Accesses
+  Draft::revision
+
+/// Report whether the stored draft supersedes the candidate.
+fn is_stale(&self, draft: &Draft) -> bool;
+Algorithm
+  stored ← self.database.revision(draft.id)
+  return stored > draft.revision
+```
+
+Patch the smallest region you change, and copy context lines exactly from `plan_read`. A failed edit changes nothing, so reread the region before retrying.
 
 ## Workflow
 

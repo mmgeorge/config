@@ -33,21 +33,31 @@ pub(super) fn definition() -> ControlToolDefinition {
                 plan:evidence.md, and list defects under `## Findings` as `path:line:column: message [IDs]`. \
                 plan_phase_done reports any problem in the report by line.\n\
                 Project files: paths are project-relative. Source files contain semantic structure: \
-                signatures, comments, and Calls/Constructs/Accesses; never executable bodies. New callables \
-                require a nonempty Algorithm; load the academic-pseudocode skill before writing one. \
-                Algorithm statements are one per line: assignments with ←, calls such as process(item), \
-                if/otherwise, for each item in items, while, and return; explanations belong only in # \
-                comments. Modified callables use a one-to-two-sentence Change, even when the signature stays \
-                the same. Place behavior and reference sections directly below the signature. Use a \
-                standalone heading and indented content, for example:\n\
+                signatures, comments, and Calls/Constructs/Accesses; never executable bodies. Each callable \
+                carries at most one behavior block: a nonempty Algorithm for a new callable, including a \
+                renamed or replacing one, or a one-to-two-sentence Change for an existing callable, even when \
+                its signature stays the same; never both. Load the academic-pseudocode skill before writing an \
+                Algorithm. Algorithm statements are one per line: assignments with ←, calls such as \
+                process(item), if/otherwise, for each item in items, while, and return; explanations belong \
+                only in # comments, and statements inside a control block are indented under it. Place \
+                behavior and reference sections directly below the signature, each under a standalone \
+                heading; plan_read shows their content indented, and content written flush with its heading \
+                ends at the next blank line. For example:\n\
                 pub fn existing();\nChange\n  Preserve the existing result while recording the update.\n\
                 pub fn added();\nAlgorithm\n  return none\n\
-                Document every new declaration, including enum variants and fields, with a doc comment \
-                (/// in Rust), without starting comments with Returns. Keep unchanged references; omitted \
-                reference sections mean unknown, and empty sections mean none. New internal declarations \
-                need a recorded use. Configuration files retain complete contents. The first edit saves the \
-                original structure for comparison; later edits change the proposal. Add requires an absent \
-                project path. Returns the shared version and the changed paths; no-ops keep the version.",
+                Calls, Constructs, and Accesses list bare qualified names such as App::add_systems, never \
+                expressions, receivers, or arguments. Document every new declaration, including enum \
+                variants and fields, with a doc comment (/// in Rust), without starting comments with \
+                Returns. Keep unchanged references; omitted reference sections mean unknown, and empty \
+                sections mean none. Every new internal declaration needs a recorded use: list each new field \
+                or constant under the Accesses of a callable that reads or writes it. Source file edits are \
+                stored as written even when their structure is incomplete, and plan_submit reports each \
+                structure problem by line. Configuration files retain complete contents. The first edit saves \
+                the original structure for comparison; later edits change the proposal. Add requires an \
+                absent project path. Patch the smallest region you change, copying context lines exactly \
+                from plan_read; a chunk whose lines all sit at one different indentation still applies, \
+                shifted to match. A failed edit changes nothing. Returns the shared version and the changed \
+                paths; no-ops keep the version.",
         input_schema: strict_object_input_schema(
             vec![
                 ("plan_id", string_schema()),

@@ -223,10 +223,7 @@ impl BrokerObserver {
                 let document = self
                     .plan_file
                     .read_working_document(&self.session_id, &plan.artifact.id)?;
-                PlanPrompt::with_active_document(
-                    PlanPrompt::draft(&plan.artifact.request),
-                    &document.model_json()?,
-                )
+                PlanPrompt::with_active_plan(PlanPrompt::draft(&plan.artifact.request), &document)
             }
             WorkflowSnapshot::Execute { execution } => {
                 let mut resumed = execution.clone();
@@ -361,9 +358,9 @@ impl BrokerObserver {
                         let document = self
                             .plan_file
                             .read_working_document(&self.session_id, &plan.artifact.id)?;
-                        PlanPrompt::with_active_document(
+                        PlanPrompt::with_active_plan(
                             PlanPrompt::draft(&plan.artifact.request),
-                            &document.model_json()?,
+                            &document,
                         )
                     };
                     task.request_entry(instruction, now_ms)?;

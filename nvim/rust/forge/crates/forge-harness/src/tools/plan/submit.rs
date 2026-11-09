@@ -11,7 +11,8 @@ pub(super) const NAME: &str = "plan_submit";
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Format and submit the exact canonical declaration design for user review. Automatically validate \
+        description: "Submit the exact canonical declaration design for user review. Parse every artifact and \
+                proposed file, reporting each structure problem by line, and automatically validate \
                 Rust and TypeScript imports and signature references against the proposed declarations and \
                 available sources. Proven invalid references return actionable errors and remain editable. \
                 Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success \
@@ -75,11 +76,7 @@ pub(super) async fn execute(
         } else {
             design.validated(workspace, &document.title).await?
         };
-        let warnings = design
-            .warnings()
-            .into_iter()
-            .map(|warning| format!("{}: warning: {}", warning.path, warning.message))
-            .collect::<Vec<_>>();
+        let warnings = grouped_warnings(design.warnings());
         let mut submitted = document.clone();
         submitted.design = Some(design.into_design());
         submitted.validate_for_submission()?;
@@ -123,8 +120,7 @@ pub(super) async fn execute(
         let mut message = runtime.plan_version_message("Declaration design submitted for review");
         if !warnings.is_empty() {
             message.push_str(&format!(
-                "\n{} unverified reference warning(s); they do not block review:\n{}",
-                warnings.len(),
+                "\nUnverified reference warnings do not block review:\n{}",
                 warnings.join("\n")
             ));
         }
@@ -147,6 +143,37 @@ pub(super) async fn execute(
         invocation: Some(invocation),
         message: runtime.plan_version_message("Plan passed canonical submission validation"),
     })
+}
+
+/// Print one line per file and warning message, so a file with many unchecked dependency
+/// references reports a count instead of one identical line per reference.
+fn grouped_warnings(warnings: Vec<crate::plan::PlanViolation>) -> Vec<String> {
+    let mut group = Vec::<(String, String, Vec<String>)>::new();
+    for warning in warnings {
+        let (file, position) = warning
+            .path
+            .split_once(':')
+            .map_or((warning.path.as_str(), ""), |(file, position)| {
+                (file, position)
+            });
+        match group
+            .iter_mut()
+            .find(|(path, message, _)| path == file && *message == warning.message)
+        {
+            Some((_, _, positions)) => positions.push(position.into()),
+            None => group.push((file.into(), warning.message, vec![position.into()])),
+        }
+    }
+    group
+        .into_iter()
+        .map(|(file, message, positions)| match positions.as_slice() {
+            [position] => format!("{file}:{position}: warning: {message}"),
+            _ => format!(
+                "{file}: warning: {message} ({} references)",
+                positions.len()
+            ),
+        })
+        .collect()
 }
 
 /// Decode the tool's replayable completion fields.

@@ -93,6 +93,9 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
                 );
             }
         }
+        if tool["kind"] == "search" {
+            paths.extend(searched_directory(native_tool, input));
+        }
         anyhow::ensure!(
             paths.is_empty()
                 || matches!(
@@ -128,6 +131,45 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
         reason: None,
         target_list,
     })
+}
+
+/// Return the directory a Claude Code search reads beyond any explicit `path`.
+///
+/// `Glob` and `Grep` search the session's working directory when they omit `path`, and Claude
+/// Code reports no location for them, so without this the request reaches Harness as a read of
+/// an unknown file and always asks. A `Glob` pattern can also leave its base directory through
+/// `..` or an absolute prefix, so the read target is the pattern's literal prefix joined onto the
+/// base rather than the base alone. Workspace resolution then checks that directory against the
+/// read scope like any other read.
+fn searched_directory(native_tool: Option<&str>, input: &Value) -> Option<String> {
+    let base = input["path"]
+        .as_str()
+        .filter(|path| !path.trim().is_empty());
+    match native_tool? {
+        "Glob" => {
+            let pattern = input["pattern"].as_str().unwrap_or_default();
+            let prefix = pattern
+                .split(['/', '\\'])
+                .take_while(|component| !component.contains(['*', '?', '[', '{']))
+                .collect::<Vec<_>>()
+                .join("/");
+            if std::path::Path::new(&prefix).is_absolute() || pattern.starts_with(['/', '\\']) {
+                return Some(if prefix.is_empty() {
+                    "/".into()
+                } else {
+                    prefix
+                });
+            }
+            let base = base.unwrap_or(".");
+            Some(if prefix.is_empty() {
+                base.to_owned()
+            } else {
+                format!("{}/{prefix}", base.trim_end_matches(['/', '\\']))
+            })
+        }
+        "Grep" if base.is_none() => Some(".".into()),
+        _ => None,
+    }
 }
 
 /// Name of the MCP server through which Harness exposes its own control tools.
@@ -208,6 +250,51 @@ mod tests {
         );
         Ok(())
     }
+    /// A Claude Code search without `path` reads the working directory, and a Glob pattern's
+    /// literal prefix extends the read target, so escaping patterns stay visible to the scope.
+    #[test]
+    fn claude_searches_read_their_searched_directory() {
+        let reads = |raw_input: Value, tool_name: &str| {
+            permission_request(
+                ProviderKind::Claude,
+                &json!({
+                    "kind":"search","locations":[],"rawInput":raw_input,
+                    "_meta":{"claudeCode":{"toolName":tool_name}}
+                }),
+            )
+            .unwrap()
+            .target_list
+        };
+        let read = |path: &str| PermissionTarget::Read { path: path.into() };
+        assert_eq!(
+            reads(json!({"pattern":"nvim/crates/tests/**/*.rs"}), "Glob"),
+            [read("./nvim/crates/tests")]
+        );
+        assert_eq!(reads(json!({"pattern":"**/*.rs"}), "Glob"), [read(".")]);
+        let escaping = reads(json!({"path":"src","pattern":"../../**"}), "Glob");
+        assert!(escaping.contains(&read("src")));
+        assert!(escaping.contains(&read("src/../..")));
+        assert_eq!(
+            reads(json!({"pattern":"/etc/*.conf"}), "Glob"),
+            [read("/etc")]
+        );
+        assert_eq!(reads(json!({"pattern":"fn main"}), "Grep"), [read(".")]);
+        assert_eq!(
+            reads(json!({"path":"src","pattern":"fn main"}), "Grep"),
+            [read("src")]
+        );
+        assert!(matches!(
+            permission_request(
+                ProviderKind::Claude,
+                &json!({"kind":"search","rawInput":{"query":"x"}}),
+            )
+            .unwrap()
+            .target_list
+            .as_slice(),
+            [PermissionTarget::UnknownFile { .. }]
+        ));
+    }
+
     /// An opaque path-bearing native operation cannot gain write authority through a read decision.
     #[test]
     fn path_permissions_require_positive_native_read_or_write_semantics() {

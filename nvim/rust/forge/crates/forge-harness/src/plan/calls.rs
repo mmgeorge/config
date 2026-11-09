@@ -1036,7 +1036,8 @@ pub(crate) fn visibility(
 
 enum BodySection {
     Behavior(FunctionBehavior),
-    References(ReferenceCategory, Vec<(String, CallKind)>),
+    /// Reference entries with the zero-based editable row each was written on.
+    References(ReferenceCategory, Vec<(String, CallKind, usize)>),
 }
 
 /// Check every behavior section at submission and return all violations together, so one
@@ -1315,7 +1316,77 @@ fn covers_access(recorded: &str, required: &str) -> bool {
 #[derive(Default)]
 struct FunctionSection {
     behavior: Option<FunctionBehavior>,
-    reference: BTreeMap<ReferenceCategory, Vec<(String, CallKind)>>,
+    reference: BTreeMap<ReferenceCategory, Vec<(String, CallKind, usize)>>,
+}
+
+/// A semantic-structure problem at one line of a proposed file's editable text.
+///
+/// `plan_edit` stores text that fails with this error as written, and `plan_submit` reports the
+/// line, so a structure mistake never discards the rest of an edit.
+#[derive(Debug)]
+pub(crate) struct DeclarationStructureError {
+    /// One-based line in the editable text that the agent patches.
+    pub line: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for DeclarationStructureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "line {}: {}", self.line, self.message)
+    }
+}
+
+impl std::error::Error for DeclarationStructureError {}
+
+/// Build a structure error for the zero-based row `index`.
+fn structure_error(index: usize, message: impl Into<String>) -> anyhow::Error {
+    DeclarationStructureError {
+        line: index + 1,
+        message: message.into(),
+    }
+    .into()
+}
+
+fn is_section_heading(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "Algorithm" | "Change" | "Calls" | "Constructs" | "Accesses"
+    )
+}
+
+/// Return the exclusive end row of the section whose heading is row `heading`.
+///
+/// Presentation indents every body, but the agent may write one flush with its heading, so the
+/// extent cannot depend on indentation alone. A body indented past its heading ends at the first
+/// nonblank row that is not; behavior bodies may contain blank rows, and reference lists end at
+/// one. A flush body ends at the first blank row or section heading. Trailing blank rows belong
+/// to the surrounding declarations.
+fn section_end(lines: &[&str], heading: usize, blank_rows_continue: bool) -> usize {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let heading_indent = indent_of(lines[heading]);
+    let indented = lines[heading + 1..]
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| indent_of(line) > heading_indent);
+    let mut index = heading + 1;
+    while index < lines.len() {
+        let line = lines[index];
+        let ends = if line.trim().is_empty() {
+            !(indented && blank_rows_continue)
+        } else if indented {
+            indent_of(line) <= heading_indent
+        } else {
+            is_section_heading(line)
+        };
+        if ends {
+            break;
+        }
+        index += 1;
+    }
+    while index > heading + 1 && lines[index - 1].trim().is_empty() {
+        index -= 1;
+    }
+    index
 }
 
 fn protected_declaration_lines(
@@ -1334,20 +1405,9 @@ fn protected_declaration_lines(
     let mut sections = Vec::new();
     let mut index = 0;
     while index < lines.len() {
-        let line = lines[index];
-        if matches!(
-            line.trim(),
-            "Algorithm" | "Change" | "Calls" | "Constructs" | "Accesses"
-        ) {
+        if is_section_heading(lines[index]) {
             let start = index;
-            let indent = line.len() - line.trim_start().len();
-            index += 1;
-            while index < lines.len()
-                && (lines[index].trim().is_empty()
-                    || lines[index].len() - lines[index].trim_start().len() > indent)
-            {
-                index += 1;
-            }
+            index = section_end(lines, index, true);
             sections.push(start..index);
         } else {
             index += 1;
@@ -1409,44 +1469,37 @@ pub(crate) fn parse(
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
-        if matches!(
-            line.trim(),
-            "Algorithm" | "Change" | "Calls" | "Constructs" | "Accesses"
-        ) && !protected.contains(&index)
-        {
+        if is_section_heading(line) && !protected.contains(&index) {
             let kind = match line.trim() {
                 "Accesses" => ReferenceCategory::Accesses,
                 "Constructs" => ReferenceCategory::Constructs,
                 _ => ReferenceCategory::Calls,
             };
-            let indent = line.len() - line.trim_start().len();
-            let preceding = original_line
-                .last()
-                .copied()
-                .context("Function uses must follow a callable declaration")?;
-            index += 1;
-            if matches!(line.trim(), "Algorithm" | "Change") {
-                let start = index;
-                while index < lines.len() {
-                    let value = lines[index];
-                    if !value.trim().is_empty() && value.len() - value.trim_start().len() <= indent
-                    {
-                        break;
-                    }
-                    index += 1;
-                }
-                let mut end = index;
-                while end > start && lines[end - 1].trim().is_empty() {
-                    end -= 1;
-                }
-                index = end;
+            let heading = index;
+            if original_line.is_empty() {
+                return Err(structure_error(
+                    heading,
+                    format!("{} must follow a callable declaration", line.trim()),
+                ));
+            }
+            let behavior_section = matches!(line.trim(), "Algorithm" | "Change");
+            let end = section_end(&lines, heading, behavior_section);
+            let start = heading + 1;
+            index = end;
+            if behavior_section {
                 let summary_indent = lines[start..end]
                     .iter()
                     .filter(|value| !value.trim().is_empty())
                     .map(|value| value.len() - value.trim_start().len())
                     .min()
-                    .with_context(|| {
-                        format!("{} requires indented, nonempty content", line.trim())
+                    .ok_or_else(|| {
+                        structure_error(
+                            heading,
+                            format!(
+                                "{} requires nonempty content on the lines directly below it",
+                                line.trim()
+                            ),
+                        )
                     })?;
                 let content = lines[start..end]
                     .iter()
@@ -1466,24 +1519,17 @@ pub(crate) fn parse(
                 };
                 block.push((
                     original_line.len(),
-                    preceding,
+                    heading,
                     BodySection::Behavior(behavior),
                 ));
                 continue;
             }
-            let mut names = Vec::new();
-            while index < lines.len() {
-                let value = lines[index];
-                if value.trim().is_empty() || value.len() - value.trim_start().len() <= indent {
-                    break;
-                }
-                let name = value.trim();
-                names.push((name.to_owned(), kind.default_kind()));
-                index += 1;
-            }
+            let names = (start..end)
+                .map(|row| (lines[row].trim().to_owned(), kind.default_kind(), row))
+                .collect();
             block.push((
                 original_line.len(),
-                preceding,
+                heading,
                 BodySection::References(kind, names),
             ));
         } else {
@@ -1511,27 +1557,41 @@ pub(crate) fn parse(
         .iter()
         .map(|calls| (calls.owner.as_str(), calls))
         .collect::<BTreeMap<_, _>>();
-    for (line, _, section) in block {
-        let function = by_line
-            .get(&line)
-            .context("Function body sections must immediately follow a callable signature")?;
+    for (line, heading, section) in block {
+        let function = by_line.get(&line).ok_or_else(|| {
+            structure_error(
+                heading,
+                format!(
+                    "{} must directly follow a callable signature",
+                    lines[heading].trim()
+                ),
+            )
+        })?;
         let entry = sections.entry(line).or_default();
         match section {
             BodySection::Behavior(behavior) => {
-                ensure!(
-                    entry.behavior.is_none(),
-                    "only one Algorithm or Change block is allowed for {}",
-                    function.owner
-                );
+                if entry.behavior.is_some() {
+                    return Err(structure_error(
+                        heading,
+                        format!(
+                            "{} already has a behavior block; a callable has one Algorithm (new) or one Change (existing), never both",
+                            function.owner
+                        ),
+                    ));
+                }
                 entry.behavior = Some(behavior);
             }
             BodySection::References(kind, names) => {
-                ensure!(
-                    !entry.reference.contains_key(&kind),
-                    "duplicate {:?} block for {}",
-                    kind,
-                    function.owner
-                );
+                if entry.reference.contains_key(&kind) {
+                    return Err(structure_error(
+                        heading,
+                        format!(
+                            "{} already has a {} section",
+                            function.owner,
+                            lines[heading].trim()
+                        ),
+                    ));
+                }
                 entry.reference.insert(kind, names);
             }
         }
@@ -1584,7 +1644,7 @@ pub(crate) fn parse(
         }
         let call = names
             .into_iter()
-            .map(|(name, kind)| -> Result<CallSite> {
+            .map(|(name, kind, row)| -> Result<CallSite> {
                 let unresolved = function
                     .binding
                     .keys()
@@ -1592,10 +1652,10 @@ pub(crate) fn parse(
                 let captured = remaining
                     .get_mut(&(name.clone(), kind.category()))
                     .and_then(std::collections::VecDeque::pop_front);
-                ensure!(
-                    captured.as_ref().is_some_and(|call| call.source.is_some())
-                        || (!name.is_empty()
-                            && name.chars().all(|character| character.is_alphanumeric()
+                if !(captured.as_ref().is_some_and(|call| call.source.is_some())
+                    || (!name.is_empty()
+                        && name.chars().all(|character| {
+                            character.is_alphanumeric()
                                 || if matches!(
                                     DeclarationOverview::filetype(path),
                                     "typescript" | "tsx"
@@ -1604,9 +1664,16 @@ pub(crate) fn parse(
                                 } else {
                                     "_:.<>#"
                                 }
-                                .contains(character))),
-                    "Function uses contain only a qualified target name, without arguments: {name}"
-                );
+                                .contains(character)
+                        })))
+                {
+                    return Err(structure_error(
+                        row,
+                        format!(
+                            "`{name}`: reference entries are bare qualified names such as App::add_systems, without receivers, calls, or arguments"
+                        ),
+                    ));
+                }
                 let mut call = captured.unwrap_or(CallSite {
                     kind,
                     name,

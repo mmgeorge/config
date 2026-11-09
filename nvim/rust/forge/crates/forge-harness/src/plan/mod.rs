@@ -1438,12 +1438,11 @@ impl PlanFileStore {
             "validated document identity changed before submission"
         );
         if let Some(design) = &document.design {
-            let formatted = design.formatted()?;
-            formatted.check_workspace(&self.workspace)?;
+            design.validate()?;
+            design.check_workspace(&self.workspace)?;
             crate::declaration::DeclarationValidationError::ensure_empty(
-                design.authored_diagnostics(&formatted, &self.workspace)?,
+                design.authored_diagnostics(&self.workspace)?,
             )?;
-            document.design = Some(formatted);
         }
         document.validate_for_submission()?;
         if let Some(design) = &mut document.design {
@@ -1503,7 +1502,7 @@ impl PlanFileStore {
         plan_id: &str,
         revision: u32,
         current: &PlanDocument,
-        mut document: PlanDocument,
+        document: PlanDocument,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         anyhow::ensure!(
             current.version == document.version && document.plan_id == plan_id,
@@ -1512,17 +1511,16 @@ impl PlanFileStore {
         let design = document
             .design
             .as_ref()
-            .context("execution revision requires semantic design")?
-            .formatted()?;
+            .context("execution revision requires semantic design")?;
+        design.validate()?;
         crate::declaration::DeclarationValidationError::ensure_empty(
-            design.authored_diagnostics(&design, &self.workspace)?,
+            design.authored_diagnostics(&self.workspace)?,
         )?;
         design
             .validation
             .as_ref()
             .context("execution revision has no validation evidence")?
             .ensure_valid()?;
-        document.design = Some(design);
         document.validate_for_submission()?;
         self.persist_revision(session_id, plan_id, revision, document, Some(current), None)
     }

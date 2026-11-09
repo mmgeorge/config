@@ -61,6 +61,12 @@ pub struct DeclarationDesign {
     /// Function changes and reference relationships accompanying proposed declarations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub proposed_calls: BTreeMap<String, Vec<super::FunctionBody>>,
+    /// Holds the agent's editable text for each proposed source file whose latest edit does not
+    /// parse as semantic structure, keyed by proposed path. Reads and later patches use this text,
+    /// `proposed` keeps the file's last parsed structure (empty for a new file), and submission
+    /// reports each file's structure problem by line.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unparsed_proposed: BTreeMap<String, String>,
 }
 
 fn default_line_width() -> usize {
@@ -83,6 +89,7 @@ impl Default for DeclarationDesign {
             moved: BTreeMap::new(),
             baseline_calls: BTreeMap::new(),
             proposed_calls: BTreeMap::new(),
+            unparsed_proposed: BTreeMap::new(),
         }
     }
 }
@@ -105,40 +112,52 @@ impl ValidatedDesign {
 }
 
 impl DeclarationDesign {
-    /// Format and validate one submission using only captured declaration evidence.
+    /// Validate one submission using only captured declaration evidence.
     pub(crate) async fn validated(&self, workspace: &Path, title: &str) -> Result<ValidatedDesign> {
         self.check_workspace(workspace)?;
         self.validated_revision(workspace, title).await
     }
 
     /// Collect every rule the planning model must satisfy in authored declarations: comment
-    /// wording on this design, then documentation and incoming use on its formatted form,
-    /// whose positions match the shared reference index.
+    /// wording, documentation, and incoming use. The design keeps the agent's layout, so every
+    /// position names a line the agent can read and patch.
     pub(super) fn authored_diagnostics(
         &self,
-        formatted: &Self,
         workspace: &Path,
     ) -> Result<Vec<crate::declaration::DeclarationDiagnostic>> {
-        let index = super::references::PlanReferenceIndex::design(formatted, workspace)?;
+        let index = super::references::PlanReferenceIndex::design(self, workspace)?;
         let mut authored = super::comment_lint::diagnostics(self)?;
-        authored.extend(super::documentation::diagnostics(formatted, &index)?);
-        authored.extend(super::usage::diagnostics(formatted, &index, workspace)?);
+        authored.extend(super::documentation::diagnostics(self, &index)?);
+        authored.extend(super::usage::diagnostics(self, &index, workspace)?);
         Ok(authored)
     }
 
     /// Validate a new target without replacing the immutable pre-execution baseline.
     ///
     /// The authored artifacts are parsed here, the only path from their text into `document`,
-    /// and their diagnostics join the declaration diagnostics in one rejection.
+    /// and their diagnostics join the declaration diagnostics in one rejection. Declarations
+    /// keep the agent's layout; only presentation formats them. A proposed file whose structure
+    /// does not parse reports its line together with the artifact problems, because reference
+    /// rules need the complete structure.
     pub(crate) async fn validated_revision(
         &self,
         workspace: &Path,
         title: &str,
     ) -> Result<ValidatedDesign> {
-        let mut design = self.formatted()?;
+        self.validate()?;
+        let mut design = self.clone();
+        let structure = design.parse_unparsed();
         let configuration = crate::checks::ConfigSnapshot::load(workspace)?;
         let artifacts =
             super::design_artifact::parse_authored(title, &design, &configuration.config)?;
+        if !structure.is_empty() {
+            crate::declaration::DeclarationValidationError::ensure_empty(
+                structure
+                    .into_iter()
+                    .chain(artifacts.diagnostic.iter().cloned())
+                    .collect(),
+            )?;
+        }
         let artifact_errors = artifacts
             .diagnostic
             .iter()
@@ -162,7 +181,7 @@ impl DeclarationDesign {
         design.check_configuration = Some(configuration);
         // Authored-rule diagnostics wait for the resolver so one rejection reports them with
         // every reference failure instead of one rule family per submission.
-        let mut authored = self.authored_diagnostics(&design, workspace)?;
+        let mut authored = design.authored_diagnostics(workspace)?;
         authored.extend(artifacts.diagnostic);
         let paths = design
             .proposed
@@ -413,32 +432,60 @@ impl DeclarationDesign {
                 "invalid declaration move {from} → {to}"
             );
         }
+        for path in self.unparsed_proposed.keys() {
+            ensure!(
+                self.proposed.contains_key(path),
+                "unparsed proposal has no proposed declaration file: {path}"
+            );
+        }
         Ok(())
     }
 
-    /// Format both declaration snapshots atomically before freezing their review identity.
-    pub fn formatted(&self) -> Result<Self> {
-        self.validate()?;
-        let mut candidate = self.clone();
-        for (path, file) in &mut candidate.baseline {
-            file.text = DeclarationOverview::format_with_width(path, &file.text, self.line_width)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("format baseline {path}"))?;
+    /// Parse every unparsed proposal, keeping each one that parses and reporting each one that
+    /// does not at its editable line.
+    fn parse_unparsed(&mut self) -> Vec<crate::declaration::DeclarationDiagnostic> {
+        let mut diagnostic = Vec::new();
+        for (path, text) in std::mem::take(&mut self.unparsed_proposed) {
+            let previous = self
+                .proposed_calls
+                .get(&path)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            match super::calls::parse(&path, &text, previous) {
+                Ok((declarations, calls)) => {
+                    self.store_parsed(&path, declarations, calls);
+                }
+                Err(error) => {
+                    let (line, reason) =
+                        match error.downcast_ref::<super::calls::DeclarationStructureError>() {
+                            Some(structure) => (structure.line, structure.message.clone()),
+                            None => (1, format!("{error:#}")),
+                        };
+                    diagnostic.push(crate::declaration::DeclarationDiagnostic {
+                        path: path.clone(),
+                        line: line as u32,
+                        column: 0,
+                        reference: text.lines().nth(line - 1).unwrap_or_default().trim().into(),
+                        error: true,
+                        reason,
+                        kind: crate::declaration::DeclarationDiagnosticKind::DeclarationStructure,
+                    });
+                    self.unparsed_proposed.insert(path, text);
+                }
+            }
         }
-        for (path, text) in &mut candidate.proposed {
-            *text = DeclarationOverview::format_with_width(path, text, self.line_width)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("format proposed {path}"))?;
+        diagnostic
+    }
+
+    /// Replace one proposed file's parsed structure and drop its unparsed text.
+    fn store_parsed(&mut self, path: &str, declarations: String, calls: Vec<super::FunctionBody>) {
+        self.unparsed_proposed.remove(path);
+        self.proposed.insert(path.into(), declarations);
+        if calls.is_empty() {
+            self.proposed_calls.remove(path);
+        } else {
+            self.proposed_calls.insert(path.into(), calls);
         }
-        candidate.validate()?;
-        if candidate
-            .validation
-            .as_ref()
-            .is_some_and(|report| report.fingerprint != crate::declaration::fingerprint(&candidate))
-        {
-            candidate.validation = None;
-        }
-        Ok(candidate)
     }
 
     /// Return original paths whose declaration content or location changed.
@@ -450,8 +497,9 @@ impl DeclarationDesign {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .filter(|path| {
-                self.baseline.get(path).map(|file| file.text.as_str())
-                    != self.proposed.get(path).map(String::as_str)
+                self.unparsed_proposed.contains_key(path)
+                    || self.baseline.get(path).map(|file| file.text.as_str())
+                        != self.proposed.get(path).map(String::as_str)
                     || self.baseline_calls.get(path) != self.proposed_calls.get(path)
             })
             .collect()
@@ -498,6 +546,9 @@ impl DeclarationDesign {
     /// Read one captured file's baseline or proposed semantic structure.
     pub fn read(&self, path: &str, baseline: bool) -> Result<serde_json::Value> {
         validate_path(path)?;
+        if !baseline && let Some(text) = self.unparsed_proposed.get(path) {
+            return Ok(serde_json::json!({"path":path,"side":"proposed","text":text}));
+        }
         let text = if baseline {
             self.baseline.get(path).map(|file| &file.text)
         } else {
@@ -514,6 +565,24 @@ impl DeclarationDesign {
         Ok(
             serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
         )
+    }
+
+    /// Return the proposed text a patch of `path` applies to: its unparsed text when its last
+    /// edit did not parse, otherwise its parsed structure with function sections.
+    fn editable_text(&self, path: &str) -> Result<String> {
+        if let Some(text) = self.unparsed_proposed.get(path) {
+            return Ok(text.clone());
+        }
+        let text = self
+            .proposed
+            .get(path)
+            .with_context(|| format!("cannot update absent declaration file: {path}"))?;
+        let calls = self
+            .proposed_calls
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        super::calls::combined(path, text, calls)
     }
 
     /// Withdraw every proposal for one project file, including a move, so it reads from the
@@ -533,11 +602,13 @@ impl DeclarationDesign {
         if let Some(destination) = self.moved.remove(&original) {
             self.proposed.remove(&destination);
             self.proposed_calls.remove(&destination);
+            self.unparsed_proposed.remove(&destination);
         }
         self.baseline.remove(&original);
         self.baseline_calls.remove(&original);
         self.proposed.remove(&original);
         self.proposed_calls.remove(&original);
+        self.unparsed_proposed.remove(&original);
         Ok(())
     }
 
@@ -626,7 +697,7 @@ impl DeclarationDesign {
                             let original = design_artifact::authored_text(
                                 artifact, &title, &candidate, workspace,
                             )?;
-                            patch_file(&original, body)?
+                            patch_file(path, &original, body)?
                         };
                         design_artifact::store_authored(
                             artifact,
@@ -720,35 +791,50 @@ impl DeclarationDesign {
                     );
                     candidate.moved.retain(|_, to| to != path);
                     candidate.proposed_calls.remove(path);
+                    candidate.unparsed_proposed.remove(path);
                 }
                 "add" => {
                     ensure!(
                         !candidate.proposed.contains_key(path),
                         "cannot add existing declaration file: {path}"
                     );
-                    let (text, calls) = super::calls::parse(path, &added_text(body)?, &[])?;
-                    candidate.proposed.insert(path.into(), text);
-                    if !calls.is_empty() {
-                        candidate.proposed_calls.insert(path.into(), calls);
+                    let text = added_text(body)?;
+                    match super::calls::parse(path, &text, &[]) {
+                        Ok((declarations, calls)) => {
+                            candidate.store_parsed(path, declarations, calls);
+                        }
+                        Err(_) if defers_structure_errors(path) => {
+                            candidate.proposed.insert(path.into(), String::new());
+                            candidate.unparsed_proposed.insert(path.into(), text);
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 _ => {
-                    let original = candidate.proposed.get(path).with_context(|| {
-                        format!("cannot update absent declaration file: {path}")
-                    })?;
-                    let calls = candidate
-                        .proposed_calls
-                        .get(path)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    let original = super::calls::combined(path, original, calls)?;
-                    let text = patch_file(&original, body)?;
-                    let (text, calls) = super::calls::parse(destination, &text, calls)?;
-                    candidate.proposed.remove(path);
-                    candidate.proposed_calls.remove(path);
-                    candidate.proposed.insert(destination.into(), text);
-                    if !calls.is_empty() {
-                        candidate.proposed_calls.insert(destination.into(), calls);
+                    ensure!(
+                        candidate.proposed.contains_key(path),
+                        "cannot update absent declaration file: {path}"
+                    );
+                    let original = candidate.editable_text(path)?;
+                    let text = patch_file(path, &original, body)?;
+                    let calls = candidate.proposed_calls.remove(path).unwrap_or_default();
+                    let parsed = super::calls::parse(destination, &text, &calls);
+                    let structure = candidate.proposed.remove(path).unwrap_or_default();
+                    candidate.unparsed_proposed.remove(path);
+                    match parsed {
+                        Ok((declarations, calls)) => {
+                            candidate.store_parsed(destination, declarations, calls);
+                        }
+                        Err(_) if defers_structure_errors(destination) => {
+                            // The last parsed structure follows the file, so moves and
+                            // inventories stay consistent until the text parses.
+                            candidate.proposed.insert(destination.into(), structure);
+                            if !calls.is_empty() {
+                                candidate.proposed_calls.insert(destination.into(), calls);
+                            }
+                            candidate.unparsed_proposed.insert(destination.into(), text);
+                        }
+                        Err(error) => return Err(error),
                     }
                     if destination != path {
                         let original = candidate
@@ -791,6 +877,7 @@ impl DeclarationDesign {
         candidate.validate()?;
         if candidate.proposed == self.proposed
             && candidate.proposed_calls == self.proposed_calls
+            && candidate.unparsed_proposed == self.unparsed_proposed
             && candidate.baseline == self.baseline
             && candidate.document == self.document
             && candidate.moved == self.moved
@@ -820,12 +907,20 @@ pub(crate) fn patch_single_file(patch: &str, path: &str, original: &str) -> Resu
         "this patch may contain only one Update File or Add File section for {path}"
     );
     if lines[1] == format!("*** Update File: {path}") {
-        patch_file(original, body)
+        patch_file(path, original, body)
     } else if lines[1] == format!("*** Add File: {path}") {
         added_text(body)
     } else {
         bail!("this patch may edit only {path}, with *** Update File or *** Add File")
     }
+}
+
+/// Report whether an edit of `path` that does not parse is stored for `plan_submit` to report.
+///
+/// Source files hold semantic structure whose problems the agent corrects across several
+/// edits. Configuration files keep complete values, so a syntax error still rejects the edit.
+fn defers_structure_errors(path: &str) -> bool {
+    forge_diff::syntax::ConfigurationFormat::for_path(path).is_none()
 }
 
 /// Collect the text of an Add File body, whose every line starts with `+`.
@@ -902,11 +997,21 @@ pub(super) fn validate_relative_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
+/// Apply context chunks to `original`, the text `plan_read` shows for `path`.
+///
+/// A chunk applies where its removed and context lines match exactly. Failing that, it applies
+/// at the one place where every nonblank line matches after shifting the whole chunk by the same
+/// number of spaces, and its added lines shift with it. A uniform shift keeps relative nesting,
+/// such as an Algorithm statement inside its loop, so a chunk copied at the wrong base indent
+/// still lands with the structure its author wrote. A mismatch names the first chunk line the
+/// file lacks.
+fn patch_file(path: &str, original: &str, patch: &[&str]) -> Result<String> {
     let mut text = original.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut position = 0;
     let mut search_start = 0;
+    let mut chunk = 0;
     while position < patch.len() {
+        chunk += 1;
         let header = patch[position];
         ensure!(
             header == "@@" || header.starts_with("@@ "),
@@ -947,15 +1052,38 @@ fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
         if at_end {
             position += 1;
         }
-        let index = if before.is_empty() {
-            text.len()
+        let candidates = search_start..=text.len().saturating_sub(before.len());
+        let fits_end = |index: usize| !at_end || index + before.len() == text.len();
+        let (index, after) = if before.is_empty() {
+            (text.len(), after)
+        } else if let Some(index) = candidates.clone().find(|index| {
+            text.get(*index..*index + before.len()) == Some(before.as_slice()) && fits_end(*index)
+        }) {
+            (index, after)
         } else {
-            (search_start..=text.len().saturating_sub(before.len()))
-                .find(|index| {
-                    text.get(*index..*index + before.len()) == Some(before.as_slice())
-                        && (!at_end || *index + before.len() == text.len())
+            let shifted = candidates
+                .filter(|index| index + before.len() <= text.len() && fits_end(*index))
+                .filter_map(|index| {
+                    indentation_shift(&before, &text[index..index + before.len()])
+                        .map(|shift| (index, shift))
                 })
-                .context("patch context does not match the proposed declaration file")?
+                .collect::<Vec<_>>();
+            let [(index, shift)] = shifted.as_slice() else {
+                bail!(context_mismatch(path, chunk, &text, search_start, &before));
+            };
+            let after = after
+                .iter()
+                .map(|line| {
+                    shift_indentation(line, *shift).with_context(|| {
+                        format!(
+                            "{path}: chunk {chunk} matches {} columns {}, but added line `{line}` has too little indentation to move with it",
+                            shift.unsigned_abs(),
+                            if *shift > 0 { "deeper" } else { "shallower" }
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (*index, after)
         };
         search_start = index + after.len();
         text.splice(index..index + before.len(), after);
@@ -965,4 +1093,85 @@ fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
     } else {
         format!("{}\n", text.join("\n"))
     })
+}
+
+fn leading_spaces(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// Move `line` by `shift` columns of spaces, leaving blank lines blank.
+fn shift_indentation(line: &str, shift: isize) -> Option<String> {
+    if line.trim().is_empty() {
+        return Some(line.to_owned());
+    }
+    if shift >= 0 {
+        return Some(format!("{}{line}", " ".repeat(shift.unsigned_abs())));
+    }
+    let removed = shift.unsigned_abs();
+    (leading_spaces(line) >= removed).then(|| line[removed..].to_owned())
+}
+
+/// Return the nonzero space shift that makes every chunk line equal its target, if one exists.
+fn indentation_shift(chunk: &[String], target: &[String]) -> Option<isize> {
+    let (first, anchor) = chunk
+        .iter()
+        .zip(target)
+        .find(|(line, _)| !line.trim().is_empty())?;
+    let shift = leading_spaces(anchor) as isize - leading_spaces(first) as isize;
+    (shift != 0
+        && chunk.iter().zip(target).all(|(line, target)| {
+            if line.trim().is_empty() {
+                target.trim().is_empty()
+            } else {
+                shift_indentation(line, shift).as_deref() == Some(target.as_str())
+            }
+        }))
+    .then_some(shift)
+}
+
+/// Describe why a chunk matched nowhere: the first chunk line that does not continue the lines
+/// before it, and where the file holds that text at another indentation.
+fn context_mismatch(
+    path: &str,
+    chunk: usize,
+    text: &[String],
+    search_start: usize,
+    before: &[String],
+) -> String {
+    let matches_prefix = |length: usize| {
+        (search_start..=text.len().saturating_sub(length))
+            .any(|index| text.get(index..index + length) == Some(&before[..length]))
+    };
+    let missing = (1..=before.len())
+        .find(|length| !matches_prefix(*length))
+        .unwrap_or(before.len())
+        - 1;
+    let line = &before[missing];
+    let mut message = if missing == 0 {
+        format!(
+            "{path}: chunk {chunk} does not match: its first line `{line}` is not in the file{}",
+            if search_start > 0 {
+                " after the previous chunk"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!(
+            "{path}: chunk {chunk} does not match: its line {} `{line}` does not follow the line before it in the file",
+            missing + 1
+        )
+    };
+    if let Some(row) = text.iter().position(|candidate| {
+        candidate != line && candidate.trim() == line.trim() && !line.trim().is_empty()
+    }) {
+        message.push_str(&format!(
+            "; file line {} holds that text with {} leading spaces instead of {}",
+            row + 1,
+            leading_spaces(&text[row]),
+            leading_spaces(line)
+        ));
+    }
+    message.push_str(". Read the file again and copy context lines exactly.");
+    message
 }

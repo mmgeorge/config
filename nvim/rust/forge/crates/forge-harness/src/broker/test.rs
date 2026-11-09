@@ -1287,6 +1287,8 @@ enum PlanFixtureBehavior {
     Questions { structured: bool },
 }
 
+/// Read the active plan's ID and version from the identity line Harness prepends to planning
+/// prompts.
 fn plan_document_in_request(request: &forge_provider_api::PromptRequest) -> Option<Value> {
     let mut text = String::new();
     text.push_str(&request.instructions);
@@ -1300,10 +1302,15 @@ fn plan_document_in_request(request: &forge_provider_api::PromptRequest) -> Opti
             text.push_str(input);
         }
     }
-    let marker = "Active declaration design:\n```json\n";
+    let marker = "Active plan `";
     let start = text.find(marker)? + marker.len();
-    let end = text[start..].find("\n```")? + start;
-    serde_json::from_str(&text[start..end]).ok()
+    let (plan_id, rest) = text[start..].split_once("` is at version ")?;
+    let version = rest
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(json!({"plan_id": plan_id, "version": version}))
 }
 
 async fn plan_fixture_tool(

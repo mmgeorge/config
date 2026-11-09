@@ -38,7 +38,7 @@ impl PlanFileStore {
             document.overview = request.clone();
         }
         let instruction = if checks_ready {
-            PlanPrompt::with_active_document(PlanPrompt::draft(&request), &document.model_json()?)
+            PlanPrompt::with_active_plan(PlanPrompt::draft(&request), &document)
         } else {
             PlanPrompt::checks_setup(&request)
         };

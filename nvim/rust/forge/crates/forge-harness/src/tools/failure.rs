@@ -433,7 +433,12 @@ pub(crate) fn control_tool_failure_text(
         }
     }
     let retry = match tool {
-        "plan_edit" | "harness_plan_edit" | "plan_submit" => active_version
+        // A patch is atomic, so saying so keeps the agent from patching text that a failed chunk
+        // never wrote.
+        "plan_edit" | "harness_plan_edit" => active_version.map(|version| {
+            format!("No changes were applied. Fix them and retry with expected_version {version}.")
+        }),
+        "plan_submit" => active_version
             .map(|version| format!("Fix them and retry with expected_version {version}.")),
         "plan_phase_done"
             if code_hint.contains_key(

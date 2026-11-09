@@ -73,6 +73,8 @@ pub enum DeclarationDiagnosticKind {
     AlgorithmConstruction,
     /// A callable whose behavior section kind does not match whether it is new.
     BehaviorBlock,
+    /// A proposed file line whose function sections do not parse, stored as written by plan_edit.
+    DeclarationStructure,
     /// An Algorithm reference with no unique declaring type or reference list entry.
     AlgorithmReference,
     /// A plan documentation comment that breaks a planning comment rule.
@@ -98,6 +100,7 @@ impl DeclarationDiagnosticKind {
             Self::AlgorithmAccess => "missing_algorithm_access",
             Self::AlgorithmConstruction => "invalid_algorithm_construction",
             Self::BehaviorBlock => "invalid_behavior_block",
+            Self::DeclarationStructure => "invalid_declaration_structure",
             Self::AlgorithmReference => "invalid_algorithm_reference",
             Self::DeclarationComment => "invalid_declaration_comment",
             Self::MissingDocumentation => "missing_declaration_documentation",
@@ -128,6 +131,9 @@ impl DeclarationDiagnosticKind {
             }
             Self::AlgorithmReference => {
                 "Qualify the reference with its declaring type so exactly one reference section entry matches it."
+            }
+            Self::DeclarationStructure => {
+                "Patch the reported line: place sections directly below a signature, give each callable one Algorithm or Change, and list bare qualified names under Calls, Constructs, and Accesses."
             }
             Self::DeclarationComment => {
                 "Rewrite the reported comment, then submit the current version again."
