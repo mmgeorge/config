@@ -893,4 +893,31 @@ T["submit_steering"] = function()
   assert(#transitions == transition_count and #host.requests == before and buffer.line(state.composer_buf, 1) == "Keep my unsent draft")
 end
 
+T["undo_requires_native_conversation_rewind"] = function()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local warnings = {}
+  require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+  require("forge.infra.notifications").error = function(message) error(message) end
+  state.session = { id = "undo-capability", model = "test" }
+  local methods = {}
+  client.request = function(request_specification, callback)
+    methods[#methods + 1] = request_specification.method
+    if request_specification.method == "session.exchange.recovery" then callback(vim.NIL, nil) end
+  end
+  -- A provider without native rewind gets a notice and no rollback request.
+  state.capability = { native_conversation_rewind = false }
+  controller.open_undo_picker()
+  eq(methods, { "session.exchange.recovery" })
+  eq(#warnings, 1)
+  assert(warnings[1]:find("unsupported", 1, true), warnings[1])
+  -- A rewinding provider proceeds to the interaction list.
+  methods, warnings = {}, {}
+  state.capability = { native_conversation_rewind = true }
+  controller.open_undo_picker()
+  eq(methods, { "session.exchange.recovery", "session.exchange.list" })
+  eq(warnings, {})
+end
+
 return T

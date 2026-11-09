@@ -1211,6 +1211,87 @@ impl CodexProvider {
     }
 
     /// Retract the exact output-free cancelled input only while its native turn remains the newest boundary.
+    /// Revert native history to end at the requested turn checkpoint.
+    ///
+    /// Codex checkpoints name the completed turn itself, so the turn after the checkpoint is the
+    /// first one `thread/revert` excludes. An absent successor means history already ends at the
+    /// checkpoint, which keeps a repeated request a successful no-op.
+    async fn rewind_binding(
+        &self,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        const OPERATION: ProviderOperation = ProviderOperation::ThreadRewind;
+        let session = self.binding(binding).await?;
+        let _admission = session.admission.lock().await;
+        session.check_input_admission(OPERATION)?;
+        collect_settled_execution(&session).await?;
+        if session.active.lock().await.is_some() {
+            return Err(failure(OPERATION, ProviderFailureKind::ExecutionActive));
+        }
+        let thread_id = session.history_id().as_str().to_owned();
+        let rpc = session.rpc.lock().await;
+        let turn_ids = |history: &Value| {
+            history
+                .pointer("/thread/turns")
+                .and_then(Value::as_array)
+                .map(|turns| {
+                    turns
+                        .iter()
+                        .filter_map(|turn| turn.get("id").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+        };
+        let history = rpc
+            .request(
+                "thread/read",
+                json!({"threadId":thread_id,"includeTurns":true}),
+                OPERATION,
+            )
+            .await?;
+        let Some(turns) = turn_ids(&history) else {
+            return Err(failure(OPERATION, ProviderFailureKind::Protocol));
+        };
+        let retained = match &request.after {
+            Some(checkpoint) => match turns.iter().position(|id| id == checkpoint.as_str()) {
+                Some(index) => index + 1,
+                None => return Err(failure(OPERATION, ProviderFailureKind::Rejected)),
+            },
+            None => 0,
+        };
+        let Some(first_removed) = turns.get(retained) else {
+            return Ok(());
+        };
+        super::operations::mark_changed();
+        super::operations::check()?;
+        *session.rollback.lock().await = None;
+        rpc.request(
+            "thread/revert",
+            json!({"threadId":thread_id,"beforeTurnId":first_removed}),
+            OPERATION,
+        )
+        .await?;
+        let history = rpc
+            .request(
+                "thread/read",
+                json!({"threadId":thread_id,"includeTurns":true}),
+                OPERATION,
+            )
+            .await?;
+        if turn_ids(&history).as_deref() != Some(&turns[..retained]) {
+            return Err(
+                ProviderFailure::new(OPERATION, ProviderFailureKind::Protocol)
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    )
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     async fn retract_input(
         &self,
         binding: &BindingId,
@@ -2311,6 +2392,7 @@ impl CodexProvider {
                 ProviderOperation::TurnStart
                 | ProviderOperation::TurnSteer
                 | ProviderOperation::ThreadFork
+                | ProviderOperation::ThreadRewind
                 | ProviderOperation::TerminalTerminate => (
                     forge_provider_api::ProviderPhase::Dispatch,
                     forge_provider_api::FailureDisposition::Uncertain,
@@ -3023,6 +3105,46 @@ impl Provider for CodexProvider {
                         provider.reconcile_input(request).await.map_err(|error| {
                             operation_error(error, ProviderOperation::InputReconcile)
                         })
+                    })
+                    .await
+                },
+                move |reason| cleanup_provider.operation_interruption(native, target, reason),
+            )
+            .await
+    }
+
+    async fn thread_rewind(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        let native =
+            super::operations::NativeContext::new(context.clone(), ProviderOperation::ThreadRewind);
+        let payload = (binding.clone(), request.clone());
+        let target = CleanupTarget::Binding {
+            binding: binding.clone(),
+            invocation: None,
+        };
+        let binding = binding.clone();
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let worker_native = native.clone();
+        self.records
+            .rewind
+            .observe(
+                context,
+                ProviderOperation::ThreadRewind,
+                payload,
+                async move {
+                    super::operations::scope(worker_native, async move {
+                        super::operations::check()?;
+                        provider
+                            .rewind_binding(&binding, request)
+                            .await
+                            .map_err(|error| {
+                                operation_error(error, ProviderOperation::ThreadRewind)
+                            })
                     })
                     .await
                 },
@@ -6058,9 +6180,12 @@ fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderE
         (ProviderOperation::TurnInterrupt, _) => (Phase::Interruption, Disposition::Uncertain),
         (ProviderOperation::ThreadConfigure, _) => (Phase::Preparation, Disposition::Invalidated),
         (ProviderOperation::ThreadCompact, _) => (Phase::Observation, Disposition::Invalidated),
-        (ProviderOperation::InputRetract | ProviderOperation::ThreadFork, _) => {
-            (Phase::Observation, Disposition::Uncertain)
-        }
+        (
+            ProviderOperation::InputRetract
+            | ProviderOperation::ThreadFork
+            | ProviderOperation::ThreadRewind,
+            _,
+        ) => (Phase::Observation, Disposition::Uncertain),
         (
             ProviderOperation::ThreadOpen
             | ProviderOperation::Inspect

@@ -1217,6 +1217,11 @@ local function open_exchange_undo_picker(recovery)
     notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
     return
   end
+  -- Every rollback rewinds the provider conversation natively; Harness never replays history.
+  if not (state.capability and state.capability.native_conversation_rewind == true) then
+    notifications.warn("Conversation rollback is unsupported: the current provider cannot rewind its conversation", "Harness undo")
+    return
+  end
   local session_id, generation = state.session and state.session.id, client.host_get_generation()
   if not session_id then return end
   client.request({ session_id = session_id, method = "session.exchange.list", params = {} }, function(interaction_list, request_error)

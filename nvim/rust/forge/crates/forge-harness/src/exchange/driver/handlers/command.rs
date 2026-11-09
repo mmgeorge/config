@@ -132,7 +132,6 @@ impl ExchangeDriver {
                         "source":"rollback","event":event.name(),"update_step":step,
                     }),
                 );
-                let was_initializing = run.initializing();
                 let (progress, catalog) = {
                     let mut broker = broker.lock().await;
                     let progress = run.update(
@@ -173,19 +172,10 @@ impl ExchangeDriver {
                 }
                 match progress {
                     Ok(RollbackProgress::Waiting { events, input }) => {
-                        if run.initializing() {
-                            self.execution_stop_begin(services);
-                        }
                         publish_control(events, input.as_deref(), env.context(step), &id);
                         *command = Some(ActiveCommand::Rollback(run));
                     }
                     Ok(RollbackProgress::Finished { outcome, events }) => {
-                        if was_initializing
-                            && outcome.is_ok()
-                            && matches!(self.execution_state, ExecutionState::Stopping)
-                        {
-                            self.execution_reopen(services);
-                        }
                         if matches!(
                             &outcome,
                             Err(crate::exchange::rollback::RollbackFailure::RecoveryRequired)

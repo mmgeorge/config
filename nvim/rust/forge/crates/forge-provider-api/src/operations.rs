@@ -188,6 +188,18 @@ pub enum InputRetractOutcome {
     Unknown,
 }
 
+/// Discard every settled native turn after one provider-issued checkpoint.
+///
+/// `after` names the checkpoint a completed turn reported, the same identity native fork uses.
+/// `None` discards the whole conversation. The request is idempotent: when nothing follows the
+/// checkpoint, the adapter succeeds without mutation, so the host may repeat an uncertain rewind
+/// with the same request. Rewind never restores files or other tool effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThreadRewindRequest {
+    /// Retain history through this checkpoint and remove every later turn.
+    pub after: Option<CheckpointId>,
+}
+
 /// Classify unavailable retraction without parsing adapter diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputRetractUnavailable {

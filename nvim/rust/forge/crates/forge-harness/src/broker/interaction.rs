@@ -678,6 +678,9 @@ impl HarnessBroker {
             )?;
         }
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
+        if let Some(checkpoint) = &output.provider_checkpoint_id {
+            interaction.provider_checkpoint_id = Some(checkpoint.clone());
+        }
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
         }

@@ -89,6 +89,9 @@ pub struct ProviderCapability {
     pub compaction: CompactionCapability,
     pub native_steer: bool,
     pub native_turn_rollback: bool,
+    #[serde(default)]
+    /// Discards settled conversation history after a recorded turn checkpoint.
+    pub native_conversation_rewind: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,

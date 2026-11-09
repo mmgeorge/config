@@ -863,6 +863,40 @@ impl Provider for MockProvider {
             .await
     }
 
+    async fn thread_rewind(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        let payload = (binding.clone(), request.clone());
+        let operation = MockOperation::new(context.clone());
+        let native_operation = operation.clone();
+        let native = self.clone();
+        let native_binding = binding.clone();
+        self.operations
+            .thread_rewind
+            .observe(
+                context,
+                ProviderOperation::ThreadRewind,
+                payload,
+                async move {
+                    let completed = native_operation.clone();
+                    let result = native
+                        .thread_rewind_native(native_operation, &native_binding, request)
+                        .await;
+                    completed.complete();
+                    result
+                },
+                move |reason| {
+                    let (observation, _) =
+                        operation.interrupt(reason, ProviderOperation::ThreadRewind);
+                    Interruption::new(observation, async { Ok(()) })
+                },
+            )
+            .await
+    }
+
     async fn input_retract(
         &self,
         context: OperationContext,
@@ -1209,6 +1243,7 @@ impl MockProvider {
             active: Mutex::new(None),
             cancelled_submission: Mutex::new(None),
             history_boundary: Mutex::new(None),
+            control: self.control.clone(),
         });
         let mut bindings = self.bindings.lock().await;
         let mut owners = self.owners.lock().await;
@@ -1752,6 +1787,61 @@ impl MockProvider {
         Ok(SubmissionEvidence::Unknown)
     }
 
+    /// Truncate the owner's retained checkpoints after the requested one.
+    async fn thread_rewind_native(
+        &self,
+        operation: MockOperation,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        let session = self
+            .binding(binding, ProviderOperation::ThreadRewind)
+            .await?;
+        let _admission = session.admission.lock().await;
+        ensure_open(&session, ProviderOperation::ThreadRewind)?;
+        if session.active.lock().await.is_some() {
+            return Err(failure(
+                ProviderOperation::ThreadRewind,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let retained = {
+            let histories = self.control.histories.lock().unwrap();
+            let history = histories
+                .get(&session.owner)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let retained = match &request.after {
+                Some(checkpoint) => history
+                    .iter()
+                    .position(|retained| retained == checkpoint)
+                    .map(|index| index + 1)
+                    .ok_or_else(|| {
+                        failure(
+                            ProviderOperation::ThreadRewind,
+                            ProviderFailureKind::Rejected,
+                        )
+                    })?,
+                None => 0,
+            };
+            (retained < history.len()).then_some(retained)
+        };
+        if let Some(retained) = retained {
+            operation.dispatch(ProviderOperation::ThreadRewind)?;
+            if let Some(history) = self
+                .control
+                .histories
+                .lock()
+                .unwrap()
+                .get_mut(&session.owner)
+            {
+                history.truncate(retained);
+            }
+            session.history_boundary.lock().await.take();
+        }
+        Ok(())
+    }
+
     async fn input_retract_native(
         &self,
         operation: MockOperation,
@@ -2004,6 +2094,7 @@ struct MockOperations {
     turn_steer: Store<(BindingId, SteeringRequestIdentity), SteeringAcceptance>,
     input_reconcile: Store<InputReconcileRequest, SubmissionEvidence>,
     input_retract: Store<(BindingId, InputRetractRequest), InputRetractOutcome>,
+    thread_rewind: Store<(BindingId, forge_provider_api::ThreadRewindRequest), ()>,
     shutdown: Store<(), ()>,
     model_list: Store<QueryContext, Vec<ProviderModel>>,
     skill_list: Store<QueryContext, Vec<catalog::SkillDefinition>>,
@@ -2027,6 +2118,7 @@ impl MockOperations {
             turn_steer: Store::registered(identities.clone()),
             input_reconcile: Store::registered(identities.clone()),
             input_retract: Store::registered(identities.clone()),
+            thread_rewind: Store::registered(identities.clone()),
             shutdown: Store::registered(identities.clone()),
             model_list: Store::registered(identities.clone()),
             skill_list: Store::registered(identities.clone()),
@@ -2068,6 +2160,9 @@ impl MockOperations {
             failures.push(error);
         }
         if let Err(error) = self.input_retract.join_all_except(excluded).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.thread_rewind.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.model_list.join_all_except(excluded).await {
@@ -2122,6 +2217,7 @@ struct MockSession {
     active: Mutex<Option<MockInvocation>>,
     cancelled_submission: Mutex<Option<SubmissionId>>,
     history_boundary: Mutex<Option<CheckpointId>>,
+    control: Arc<MockControl>,
 }
 
 #[derive(Clone, Copy)]
@@ -2226,6 +2322,8 @@ struct MockControl {
     holds: std::sync::Mutex<VecDeque<Arc<ResponseHold>>>,
     scripts: std::sync::Mutex<HashMap<ThreadId, VecDeque<testing::TestPromptScript>>>,
     binding_model_catalog: std::sync::atomic::AtomicBool,
+    /// Retain each owner's completed turn checkpoints across bindings, as durable native history.
+    histories: std::sync::Mutex<HashMap<ThreadId, Vec<CheckpointId>>>,
 }
 
 impl MockControl {
@@ -2317,6 +2415,17 @@ impl ProviderTestControl for MockControl {
                     .store(true, std::sync::atomic::Ordering::Release);
                 Ok(TestControlResult::Configured)
             }
+            TestControlCommand::History => Ok(TestControlResult::History {
+                checkpoints: self
+                    .histories
+                    .lock()
+                    .unwrap()
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .map(|checkpoint| checkpoint.as_str().to_owned())
+                    .collect(),
+            }),
         }
     }
 
@@ -3232,6 +3341,13 @@ async fn retain_terminal(
             .expect("covered journal input is nonempty")
     });
     *session.history_boundary.lock().await = checkpoint.clone();
+    if let Some(checkpoint) = &checkpoint {
+        let mut histories = session.control.histories.lock().unwrap();
+        let history = histories.entry(session.owner.clone()).or_default();
+        if history.last() != Some(checkpoint) {
+            history.push(checkpoint.clone());
+        }
+    }
     let outcome = match outcome {
         TurnOutcome::Failed { error, retry } => TurnOutcome::Failed {
             error: ProviderFailure::new(error.operation(), failure_kind.unwrap_or(error.kind()))

@@ -170,7 +170,6 @@ impl ExchangeDriver {
             tasks:
                 RunningTasks {
                     stops: running_stops,
-                    rollbacks: rollback_cleanup,
                     ..
                 },
             ..
@@ -182,7 +181,7 @@ impl ExchangeDriver {
                     let result = if self.commands.storage_unavailable() {
                         Err(crate::exchange::rollback::RollbackFailure::RecoveryRequired)
                     } else {
-                        recovery.apply(&mut broker, services)
+                        recovery.apply(&mut broker)
                     };
                     *services
                         .provider
@@ -195,13 +194,7 @@ impl ExchangeDriver {
                     services.catalog_publish(catalog).await;
                 }
                 match result {
-                    Ok(crate::exchange::rollback_run::RollbackRecoveryProgress::Waiting) => {
-                        rollback_cleanup.spawn(async move { (id, recovery.collect().await) });
-                        return WakeEnd::RestartStep;
-                    }
-                    Ok(crate::exchange::rollback_run::RollbackRecoveryProgress::Finished(
-                        events,
-                    )) => publish_control(events, None, env.context(step), &id),
+                    Ok(events) => publish_control(events, None, env.context(step), &id),
                     Err(error) => {
                         trace.record(session_id, "exchange.rollback.recovery_failed", serde_json::json!({
                                 "command_id":id.as_str(),"error_code":error.code(),"update_step":step,

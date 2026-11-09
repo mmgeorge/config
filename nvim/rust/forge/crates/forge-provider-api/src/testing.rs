@@ -75,6 +75,8 @@ pub enum TestControlCommand {
     /// Reject workspace model discovery so models are listed only from an open binding, as
     /// ACP agents negotiate their catalogs per session.
     RequireBindingModelCatalog,
+    /// Read the turn checkpoints the selected owner's native history retains, oldest first.
+    History,
 }
 
 /// Select native fixture content without treating reasoning as an assistant prose role.
@@ -165,6 +167,7 @@ pub enum TestControlResult {
     OwnerCancelled,
     Scripted,
     Configured,
+    History { checkpoints: Vec<String> },
 }
 
 /// Control deterministic normalized test flows without exposing provider protocol details.

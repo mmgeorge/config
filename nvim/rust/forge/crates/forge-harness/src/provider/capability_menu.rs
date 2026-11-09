@@ -139,6 +139,12 @@ fn provider_row_text(id: CapabilityId) -> ProviderRowText {
             Provider,
             "Cancellation still stops work without history retraction",
         ),
+        CapabilityId::NativeConversationRewind => provider_row(
+            "Provider",
+            "Roll back conversation",
+            Provider,
+            "Undo reports conversation rollback as unsupported without native rewind",
+        ),
         CapabilityId::CompactionLifecycle => provider_row(
             "Provider",
             "Compaction timeline events",

@@ -91,6 +91,21 @@ pub trait Provider: Send + Sync + 'static {
         Err(UnsupportedCapability(ProviderFeature::NativeCompact).into())
     }
 
+    /// Discard settled native history after the requested checkpoint on an idle binding.
+    /// Reject active execution and an unknown checkpoint before mutation. Verify the resulting
+    /// history ends at the checkpoint; after a possible mutation that cannot be verified, report an
+    /// uncertain failure so the host repeats the same idempotent request instead of assuming success.
+    async fn thread_rewind(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadRewind)?;
+        let _ = (binding, request);
+        Err(UnsupportedCapability(ProviderFeature::NativeConversationRewind).into())
+    }
+
     /// Revoke admission and callback authority before transport waits, then collect the entire binding.
     /// Collect foreground workers, callbacks, readers, profiles, and owned terminals while retaining
     /// durable history. Success also deletes temporary history. Preserve the first failure and all

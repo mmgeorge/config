@@ -1308,9 +1308,6 @@ impl HarnessBroker {
                 },
             };
         }
-        if self.session.provider_session_id.is_none() {
-            input = self.rollback_context(&staged.exchange.id, input)?;
-        }
         let mut request = self.provider_request(input, staged.mode)?;
         if let Some(configuration) = staged.task_configuration.as_ref() {
             configuration.apply(&self.session, &mut request);

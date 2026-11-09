@@ -403,7 +403,9 @@ After selecting an interaction, choose **Conversation only** to keep current fil
 or **Conversation and files** to restore its checkpoint too. Conversation-only
 rollback works without a file checkpoint. Confirming conversation rollback collects
 active execution before changing history and leaves the task paused. An unfinished
-restore requires recovery first.
+restore requires recovery first. Rollback rewinds the provider's own conversation, so it
+requires a provider that supports native rewind (Codex and Copilot). With Claude or
+Antigravity, `/undo` reports that conversation rollback is unsupported and changes nothing.
 
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending

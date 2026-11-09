@@ -397,7 +397,7 @@ async fn intentional_retirement_rejects_accepted_input_without_terminal_proof() 
             .submission(call.request.submission_id.as_str())?;
         assert!(
             engine
-                .close_with_reason(OwnerCloseReason::Cancelled)
+                .close_with_reason(OwnerCloseReason::Shutdown)
                 .await
                 .is_err()
         );

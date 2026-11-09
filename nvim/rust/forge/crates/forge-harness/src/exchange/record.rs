@@ -104,6 +104,10 @@ pub struct Exchange {
     pub attributed_diff_text: Option<String>,
     pub checkpoint_diff_text: Option<String>,
     pub attributed_matches_checkpoint: bool,
+    /// Native history checkpoint reported by this exchange's last completed provider turn.
+    /// Conversation rollback rewinds the provider to the last retained exchange's checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_checkpoint_id: Option<String>,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
     pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
@@ -172,6 +176,10 @@ struct ExchangeRecord {
     pub attributed_diff_text: Option<String>,
     pub checkpoint_diff_text: Option<String>,
     pub attributed_matches_checkpoint: bool,
+    /// Native history checkpoint reported by this exchange's last completed provider turn.
+    /// Conversation rollback rewinds the provider to the last retained exchange's checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_checkpoint_id: Option<String>,
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
     pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
@@ -374,6 +382,7 @@ impl Exchange {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
@@ -427,6 +436,7 @@ impl Exchange {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
@@ -1624,6 +1634,7 @@ mod test {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,

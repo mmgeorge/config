@@ -8300,6 +8300,7 @@ impl HarnessBroker {
         capability.native_compact = supports(CapabilityId::NativeCompact);
         capability.native_steer = supports(CapabilityId::NativeSteer);
         capability.native_turn_rollback = supports(CapabilityId::NativeTurnRollback);
+        capability.native_conversation_rewind = supports(CapabilityId::NativeConversationRewind);
         capability.model_selection = supports(CapabilityId::ModelSelection);
         capability.effort_selection = supports(CapabilityId::EffortSelection);
         capability.fast_mode = supports(CapabilityId::FastMode);
@@ -9248,6 +9249,7 @@ impl HarnessBroker {
                 attributed_diff_text: None,
                 checkpoint_diff_text: None,
                 attributed_matches_checkpoint: false,
+                provider_checkpoint_id: None,
                 approval_resolution: Vec::new(),
                 host_file_changes: Vec::new(),
                 check_setup: None,
@@ -9821,6 +9823,7 @@ impl HarnessBroker {
                         == crate::exchange::HistoryDisposition::Current,
                 "restore preview is stale: exchange history changed"
             );
+            self.native_rewind(&exchanges, position)?;
             self.store
                 .require_settled_exchange_tree(&self.session.id, &preview.exchange_ids)?;
         }
@@ -9914,6 +9917,18 @@ impl HarnessBroker {
         let Some(first) = exchange_ids.first() else {
             return Ok(Vec::new());
         };
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        let position = exchanges
+            .iter()
+            .position(|exchange| &exchange.id == first)
+            .context("rollback interaction disappeared")?;
+        let native = self.native_rewind(&exchanges, position)?;
+        if let Some(native) = &native {
+            self.provider
+                .thread_rewind(native.request.clone(), native.after.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!("provider conversation rewind failed: {error}"))?;
+        }
         let mut session = self.session.clone();
         if let Some(task) = self.task_controller.current()? {
             self.task_controller.change(
@@ -9924,24 +9939,7 @@ impl HarnessBroker {
             )?;
             session.active_task = None;
         }
-        let replacement = crate::provider::build(
-            self.provider_launch.clone(),
-            self.permission_coordinator.clone(),
-            self.trace.clone(),
-            self.data_root.clone(),
-        )?;
-        let execution_cleanup = self.execution_registry.close().await;
-        let native_cleanup = self.provider.shutdown().await;
-        execution_cleanup?;
-        native_cleanup?;
-        self.provider = replacement;
-        session.provider_session_id = None;
-        session.provider_checkpoint_id = None;
-        session.provider_fork_state = ProviderForkState::Ready;
-        session.context_usage = None;
-        session.last_compaction_turn = None;
-        session.acquire_lease(&self.client_id)?;
-        session.updated_at_ms = self.clock.now_ms();
+        self.apply_rewound_conversation(&mut session, native.as_ref())?;
         self.store.record_rollback(&session, exchange_ids)?;
         self.session = session;
         self.context_usage_fresh = false;
@@ -9965,55 +9963,6 @@ impl HarnessBroker {
             events.push(self.event("document_changed", patch.notification())?);
         }
         Ok(events)
-    }
-
-    fn rollback_context(
-        &self,
-        current_exchange: &str,
-        input: ProviderInput,
-    ) -> Result<ProviderInput> {
-        let exchanges = self.store.list_exchange(&self.session.id)?;
-        if !exchanges
-            .iter()
-            .any(|exchange| exchange.disposition() != crate::exchange::HistoryDisposition::Current)
-        {
-            return Ok(input);
-        }
-        let retained = exchanges
-            .iter()
-            .filter(|exchange| {
-                exchange.id != current_exchange
-                    && exchange.disposition() == crate::exchange::HistoryDisposition::Current
-            })
-            .collect::<Vec<_>>();
-        let history = serde_json::to_string(&retained)?;
-        let context = format!(
-            "The conversation was rolled back. Use only this retained conversation history as prior context. The current workspace files are authoritative.\n{history}\n\nCurrent request:\n"
-        );
-        Ok(match input {
-            ProviderInput::Text { text, attachments } => ProviderInput::Text {
-                text: format!("{context}{text}"),
-                attachments,
-            },
-            ProviderInput::Skill {
-                name,
-                arguments,
-                attachments,
-            } => ProviderInput::Skill {
-                name,
-                arguments: format!("{context}{arguments}"),
-                attachments,
-            },
-            ProviderInput::QuestionReply {
-                reply,
-                context: previous,
-                attachments,
-            } => ProviderInput::QuestionReply {
-                reply,
-                context: format!("{context}{previous}"),
-                attachments,
-            },
-        })
     }
 
     async fn restore_recovery(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -10055,6 +10004,15 @@ impl HarnessBroker {
                     exchange.iter().all(|exchange| exchange.is_finished()),
                     "cancel or finish active work before restore recovery"
                 );
+                if let Some(position) = journal.preview.exchange_ids.first().and_then(|first| {
+                    exchange.iter().position(|candidate| {
+                        &candidate.id == first
+                            && candidate.disposition()
+                                == crate::exchange::HistoryDisposition::Current
+                    })
+                }) {
+                    self.native_rewind(&exchange, position)?;
+                }
                 self.store.require_settled_exchange_tree(
                     &self.session.id,
                     &exchange

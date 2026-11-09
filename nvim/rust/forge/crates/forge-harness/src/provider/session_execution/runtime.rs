@@ -1000,7 +1000,6 @@ enum ExecutionTask {
 /// Identify deliberate resource retirement without claiming native execution success.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerCloseReason {
-    Cancelled,
     Shutdown,
 }
 

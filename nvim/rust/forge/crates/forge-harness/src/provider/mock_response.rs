@@ -33,6 +33,8 @@ pub(crate) enum MockResponseCommand {
     Script { script: TestPromptScript },
     /// Reject workspace model discovery, as ACP agents list models only from an open binding.
     RequireBindingModelCatalog,
+    /// Read the turn checkpoints the session's native history retains, oldest first.
+    History,
     /// Fire the session's pending timed approvals through their deadline path immediately.
     /// The session service owns the permission coordinator, so it handles this operation.
     ExpireApproval,
@@ -84,6 +86,7 @@ impl MockResponseControl {
                 id: TestHoldId::new(id)?,
             },
             MockResponseCommand::Script { script } => TestControlCommand::Script { script },
+            MockResponseCommand::History => TestControlCommand::History,
             MockResponseCommand::RequireBindingModelCatalog => {
                 TestControlCommand::RequireBindingModelCatalog
             }
@@ -113,6 +116,7 @@ impl MockResponseControl {
             TestControlResult::OwnerCancelled => Ok(json!({"cancelled": true})),
             TestControlResult::Scripted => Ok(json!({"scripted": true})),
             TestControlResult::Configured => Ok(json!({"configured": true})),
+            TestControlResult::History { checkpoints } => Ok(json!({"checkpoints": checkpoints})),
         }
     }
 }

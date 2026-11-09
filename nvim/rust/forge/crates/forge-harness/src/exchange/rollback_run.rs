@@ -26,7 +26,6 @@ pub(super) struct RollbackRun {
     transition: Option<ExchangeStop>,
     control: Option<OwnedSemaphorePermit>,
     retirement: Option<OwnedRwLockWriteGuard<()>>,
-    pending_finish: Option<(RollbackOutcome, Vec<SessionEvent>)>,
 }
 
 impl RollbackRun {
@@ -42,10 +41,6 @@ impl RollbackRun {
             unreachable!("rollback stage retains its typed intent")
         };
         intent.requires_collection()
-    }
-    /// Get whether a committed rollback still awaits its replacement provider's readiness.
-    pub(super) fn initializing(&self) -> bool {
-        self.pending_finish.is_some()
     }
     /// Install collection before file mutation, or acquire control for read-only preparation.
     pub(super) fn start(command: QueuedCommand, services: &OwnerServices) -> Self {
@@ -85,7 +80,6 @@ impl RollbackRun {
             transition,
             control: None,
             retirement: None,
-            pending_finish: None,
         }
     }
 
@@ -114,15 +108,7 @@ impl RollbackRun {
                 _ = tokio::time::sleep_until(*deadline) => RollbackEvent::Deadline,
             },
             RollbackStage::Commit(_) => RollbackEvent::Commit,
-            RollbackStage::Initializing { task, deadline } => tokio::select! {
-                biased;
-                result = task => RollbackEvent::Initialized(result.unwrap_or(Err(super::provider_lifecycle::ProviderLifecycleFailure::ObservationUnavailable))),
-                _ = tokio::time::sleep_until(*deadline) => RollbackEvent::Deadline,
-            },
-            RollbackStage::InitializationReady(_) => RollbackEvent::CommitInitialization,
-            RollbackStage::InitializationFailed(_) | RollbackStage::Consumed => {
-                std::future::pending().await
-            }
+            RollbackStage::Consumed => std::future::pending().await,
         }
     }
 
@@ -151,19 +137,13 @@ impl RollbackRun {
                         Err(_) => RollbackStage::Consumed,
                     };
                 }
-                RollbackEvent::Initialized(result) => {
-                    self.stage = RollbackStage::InitializationReady(result);
-                }
                 RollbackEvent::Transition(event) => {
                     self.transition
                         .as_mut()
                         .expect("rollback transition retains yielded facts")
                         .retain_uncommitted(event);
                 }
-                RollbackEvent::Prepare
-                | RollbackEvent::Commit
-                | RollbackEvent::CommitInitialization
-                | RollbackEvent::Deadline => {}
+                RollbackEvent::Prepare | RollbackEvent::Commit | RollbackEvent::Deadline => {}
             }
             return Err(OperationFailure::StorageUncommitted);
         }
@@ -266,21 +246,6 @@ impl RollbackRun {
                     unreachable!("rollback commit consumes one completed effect")
                 };
                 match broker.commit_rollback_effect(*result) {
-                    Ok((outcome @ RollbackOutcome::Restored, events)) => {
-                        let provider = broker.provider_handle();
-                        *services
-                            .provider
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = provider.clone();
-                        self.retirement.take();
-                        self.pending_finish = Some((outcome, events));
-                        self.stage = RollbackStage::Initializing {
-                            task: tokio::spawn(services.provider_lifecycle.prepare(provider)),
-                            deadline: tokio::time::Instant::now()
-                                + std::time::Duration::from_secs(60),
-                        };
-                        Ok(RollbackProgress::waiting())
-                    }
                     Ok((outcome, events)) => Ok(RollbackProgress::Finished {
                         outcome: Ok(outcome),
                         events,
@@ -289,35 +254,6 @@ impl RollbackRun {
                         outcome: Err(failure),
                         events: Vec::new(),
                     }),
-                }
-            }
-            RollbackEvent::Initialized(result) => {
-                self.stage = RollbackStage::InitializationReady(result);
-                Ok(RollbackProgress::waiting())
-            }
-            RollbackEvent::CommitInitialization => {
-                let RollbackStage::InitializationReady(result) =
-                    std::mem::replace(&mut self.stage, RollbackStage::Consumed)
-                else {
-                    unreachable!("initialization commit retains its exact native result")
-                };
-                let (outcome, events) = self
-                    .pending_finish
-                    .take()
-                    .expect("replacement initialization retains the committed rollback outcome");
-                match result.and_then(|initialized| initialized.commit(broker)) {
-                    Ok(()) => Ok(RollbackProgress::Finished {
-                        outcome: Ok(outcome),
-                        events,
-                    }),
-                    Err(error) => {
-                        self.stage = RollbackStage::InitializationFailed(error);
-                        self.pending_finish = Some((outcome, events.clone()));
-                        Ok(RollbackProgress::Finished {
-                            outcome: Err(RollbackFailure::RecoveryRequired),
-                            events,
-                        })
-                    }
                 }
             }
             RollbackEvent::Deadline => Err(OperationFailure::JobDeadline),
@@ -333,7 +269,6 @@ impl RollbackRun {
                 transition: self.transition,
                 control: self.control,
                 retirement: self.retirement,
-                pending_finish: self.pending_finish,
             },
         )
     }
@@ -345,7 +280,6 @@ pub(super) struct RollbackRecovery {
     transition: Option<ExchangeStop>,
     control: Option<OwnedSemaphorePermit>,
     retirement: Option<OwnedRwLockWriteGuard<()>>,
-    pending_finish: Option<(RollbackOutcome, Vec<SessionEvent>)>,
 }
 
 impl RollbackRecovery {
@@ -369,11 +303,6 @@ impl RollbackRecovery {
             self.retirement = task.await.ok().and_then(Result::ok);
             self.stage = RollbackStage::Consumed;
         }
-        if let RollbackStage::Initializing { task, .. } = &mut self.stage {
-            self.stage = RollbackStage::InitializationReady(task.await.unwrap_or(Err(
-                super::provider_lifecycle::ProviderLifecycleFailure::ObservationUnavailable,
-            )));
-        }
         self
     }
 
@@ -381,50 +310,19 @@ impl RollbackRecovery {
     pub(super) fn apply(
         &mut self,
         broker: &mut crate::broker::HarnessBroker,
-        services: &OwnerServices,
-    ) -> Result<RollbackRecoveryProgress, RollbackFailure> {
+    ) -> Result<Vec<SessionEvent>, RollbackFailure> {
         let stage = std::mem::replace(&mut self.stage, RollbackStage::Consumed);
         match stage {
             RollbackStage::Commit(result) => {
-                let (outcome, events) = broker.commit_rollback_effect(*result)?;
-                if matches!(outcome, RollbackOutcome::Restored) {
-                    let provider = broker.provider_handle();
-                    *services
-                        .provider
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = provider.clone();
-                    self.retirement.take();
-                    self.pending_finish = Some((outcome, events));
-                    self.stage = RollbackStage::Initializing {
-                        task: tokio::spawn(services.provider_lifecycle.prepare(provider)),
-                        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-                    };
-                    return Ok(RollbackRecoveryProgress::Waiting);
-                }
-                Ok(RollbackRecoveryProgress::Finished(events))
-            }
-            RollbackStage::InitializationReady(result) => {
-                let events = self
-                    .pending_finish
-                    .take()
-                    .map_or_else(Vec::new, |(_, events)| events);
-                if let Err(error) = result.and_then(|initialized| initialized.commit(broker)) {
-                    self.stage = RollbackStage::InitializationFailed(error);
-                    return Err(RollbackFailure::RecoveryRequired);
-                }
-                Ok(RollbackRecoveryProgress::Finished(events))
-            }
-            RollbackStage::InitializationFailed(error) => {
-                self.stage = RollbackStage::InitializationFailed(error);
-                Err(RollbackFailure::RecoveryRequired)
+                let (_, events) = broker.commit_rollback_effect(*result)?;
+                Ok(events)
             }
             RollbackStage::Acquiring(_)
             | RollbackStage::Retiring(_)
             | RollbackStage::Working { .. }
             | RollbackStage::Collecting
             | RollbackStage::Prepare
-            | RollbackStage::Initializing { .. }
-            | RollbackStage::Consumed => Ok(RollbackRecoveryProgress::Finished(Vec::new())),
+            | RollbackStage::Consumed => Ok(Vec::new()),
         }
     }
 
@@ -437,12 +335,6 @@ impl RollbackRecovery {
     }
 }
 
-/// Keep late replacement initialization owned before releasing the collection fence.
-pub(super) enum RollbackRecoveryProgress {
-    Waiting,
-    Finished(Vec<SessionEvent>),
-}
-
 enum RollbackStage {
     Acquiring(JoinHandle<Result<OwnedSemaphorePermit, CommandFailure>>),
     Retiring(JoinHandle<Result<OwnedRwLockWriteGuard<()>, CommandFailure>>),
@@ -453,22 +345,6 @@ enum RollbackStage {
         deadline: tokio::time::Instant,
     },
     Commit(Box<crate::broker::RollbackEffectResult>),
-    Initializing {
-        task: JoinHandle<
-            Result<
-                super::provider_lifecycle::ProviderInitialization,
-                super::provider_lifecycle::ProviderLifecycleFailure,
-            >,
-        >,
-        deadline: tokio::time::Instant,
-    },
-    InitializationReady(
-        Result<
-            super::provider_lifecycle::ProviderInitialization,
-            super::provider_lifecycle::ProviderLifecycleFailure,
-        >,
-    ),
-    InitializationFailed(super::provider_lifecycle::ProviderLifecycleFailure),
     Consumed,
 }
 
@@ -480,13 +356,6 @@ pub(super) enum RollbackEvent {
     Prepare,
     Worked(Result<Box<crate::broker::RollbackEffectResult>, RollbackFailure>),
     Commit,
-    Initialized(
-        Result<
-            super::provider_lifecycle::ProviderInitialization,
-            super::provider_lifecycle::ProviderLifecycleFailure,
-        >,
-    ),
-    CommitInitialization,
     Deadline,
 }
 
@@ -500,8 +369,6 @@ impl RollbackEvent {
             Self::Prepare => "rollback_effect_preparation",
             Self::Worked(_) => "rollback_effect_collected",
             Self::Commit => "rollback_effect_commit",
-            Self::Initialized(_) => "rollback_provider_initialized",
-            Self::CommitInitialization => "rollback_provider_commit",
             Self::Deadline => "rollback_effect_deadline",
         }
     }

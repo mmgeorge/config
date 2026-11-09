@@ -1,6 +1,7 @@
 use super::super::{HarnessBroker, SessionController, prepare_new_session, prompt};
 use super::bootstrap::initialize;
 use super::owner_fixture::owner_transition_fixture;
+use crate::session::SessionStore;
 use anyhow::{Context, Result};
 use forge_protocol::message::Request;
 use serde_json::json;
@@ -192,4 +193,192 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
         .context("shared runtime shutdown failed")?;
     fixture.reader.abort();
     Ok(())
+}
+
+/// Wait until every submitted input settled into a finished exchange and the owner is idle.
+async fn settle_exchanges(
+    controller: &SessionController,
+    session_id: &str,
+    count: usize,
+) -> Result<()> {
+    loop {
+        let exchanges =
+            crate::storage::SqliteStore::open(&controller.data_root)?.list_exchange(session_id)?;
+        if exchanges.len() == count
+            && exchanges.iter().all(|exchange| exchange.is_finished())
+            && controller.coordinator.execution.available_permits() == 1
+            && controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty()
+        {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Submit one user input at the queue's current control revision, as the editor does, so input
+/// submitted after a control operation such as undo resumes the suspended queue.
+async fn submit_input(
+    service: &super::super::HarnessService,
+    controller: &SessionController,
+    session_id: &str,
+    request_id: u64,
+    input_id: &str,
+    text: &str,
+    sink: &forge_protocol::outbound::MessageSender,
+) -> Result<()> {
+    let control_revision = controller
+        .coordinator
+        .submissions
+        .snapshot()?
+        .control_revision;
+    service
+        .dispatch(
+            Some(session_id.to_owned()),
+            Request {
+                id: request_id,
+                method: "session.input.apply".into(),
+                params: json!({"id":input_id,"control_revision":control_revision,
+                    "action":{"kind":"submit","message":{
+                    "id":input_id,"text":text,"intent":"auto","attachments":[]}}}),
+            },
+            sink,
+        )
+        .await
+}
+
+/// Conversation undo rewinds the provider's own history and keeps the provider session, so the
+/// next prompt carries no replayed transcript.
+#[tokio::test]
+async fn conversation_undo_rewinds_native_history_and_keeps_provider_session() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = super::bootstrap::service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let responses = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let received = responses.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            received
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(frame.bytes())?);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.start_provider(&sink).await;
+    controller.attach_input(&sink).await?;
+    let scenario = async {
+        submit_input(&service, &controller, &session_id, 10, "kept-input", "Keep this exchange", &sink).await?;
+        settle_exchanges(&controller, &session_id, 1).await?;
+        submit_input(&service, &controller, &session_id, 11, "removed-input", "Roll back this exchange", &sink)
+            .await?;
+        settle_exchanges(&controller, &session_id, 2).await?;
+        let store = crate::storage::SqliteStore::open(&controller.data_root)?;
+        let exchanges = store.list_exchange(&session_id)?;
+        let native = script
+            .dispatch(&session_id, MockResponseCommand::History)
+            .await?;
+        let checkpoints = native["checkpoints"]
+            .as_array()
+            .context("history checkpoints missing")?
+            .clone();
+        assert_eq!(checkpoints.len(), 2, "{native}");
+        assert_eq!(
+            exchanges[0].provider_checkpoint_id.as_deref(),
+            checkpoints[0].as_str()
+        );
+        let provider_session = store.load_session(&session_id)?.unwrap().provider_session_id;
+        assert!(provider_session.is_some());
+
+        let removed = exchanges[1].id.clone();
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 20,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":"rewind-undo","action":"undo","rollback":{
+                        "scope":"conversation","exchange_id":removed,"latest_exchange_id":removed}}),
+                },
+                &sink,
+            )
+            .await?;
+        let response = loop {
+            let response = responses
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|message| message["id"] == 20)
+                .cloned();
+            if let Some(response) = response {
+                break response;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(response["error"].is_null(), "{response}");
+
+        let native = script
+            .dispatch(&session_id, MockResponseCommand::History)
+            .await?;
+        assert_eq!(native["checkpoints"], json!([checkpoints[0]]));
+        let store = crate::storage::SqliteStore::open(&controller.data_root)?;
+        let session = store.load_session(&session_id)?.unwrap();
+        assert_eq!(session.provider_session_id, provider_session);
+        assert_eq!(
+            session.provider_checkpoint_id.as_deref(),
+            checkpoints[0].as_str()
+        );
+        assert_eq!(
+            store.list_exchange(&session_id)?[1].disposition(),
+            crate::exchange::HistoryDisposition::RolledBack
+        );
+
+        let hold = script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
+            .await?;
+        let hold_id = hold["id"].as_str().context("hold id missing")?.to_owned();
+        submit_input(&service, &controller, &session_id, 30, "after-undo", "Continue after undo", &sink).await?;
+        let pending = script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            )
+            .await?;
+        let prompt = pending["prompt"].as_str().context("held prompt missing")?;
+        assert!(prompt.contains("Continue after undo"), "{prompt}");
+        assert!(
+            !prompt.contains("Roll back this exchange") && !prompt.contains("Keep this exchange"),
+            "the next prompt must not replay retained history: {prompt}"
+        );
+        script
+            .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+            .await?;
+        settle_exchanges(&controller, &session_id, 3).await
+    }
+    .await;
+    service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
+    scenario
 }

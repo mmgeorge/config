@@ -5,12 +5,12 @@ use crate::exchange::rollback::{
     PreparedRollbackToken, RollbackCommand, RollbackFailure, RollbackOutcome,
 };
 
-/// Own immutable restore inputs and native teardown across asynchronous work.
+/// Own immutable restore inputs and the native conversation rewind across asynchronous work.
 pub(crate) struct RollbackEffect {
     objects: crate::storage::objects::ObjectStore,
     repositories: Arc<forge_git::store::RepositoryStore>,
     work: RollbackWork,
-    teardown: Option<foreground_undo::UndoTeardown>,
+    rewind: Option<foreground_undo::ConversationRewind>,
 }
 struct RollbackPreparation {
     workspace: std::path::PathBuf,
@@ -32,26 +32,18 @@ enum RollbackWork {
 pub(crate) struct RollbackEffectResult {
     prepared: Option<RestorePreview>,
     journal: Option<RestoreJournal>,
-    teardown: Option<foreground_undo::UndoTeardown>,
+    rewind: Option<foreground_undo::ConversationRewind>,
     authority: Option<crate::exchange::rollback::RestoreRevision>,
     failure: Option<RollbackFailure>,
 }
 impl RollbackEffect {
-    /// Collect native resources and execute serialized repository work without broker ownership.
+    /// Restore files, then rewind the provider conversation, without broker ownership.
+    ///
+    /// Files restore first under their journal. A rewind failure after restoration leaves that
+    /// journal incomplete, so restore recovery repeats both steps; the rewind is idempotent.
     pub(crate) async fn run(
         mut self,
     ) -> std::result::Result<RollbackEffectResult, RollbackFailure> {
-        if let Some(teardown) = &mut self.teardown
-            && teardown.run().await.is_err()
-        {
-            return Ok(RollbackEffectResult {
-                prepared: None,
-                journal: None,
-                teardown: self.teardown,
-                authority: None,
-                failure: Some(RollbackFailure::RecoveryRequired),
-            });
-        }
         let authority = match &self.work {
             RollbackWork::Reverse(journal) => Some(
                 crate::exchange::rollback::RestoreRevision::capture(journal)?,
@@ -108,22 +100,36 @@ impl RollbackEffect {
             Ok::<_, RollbackFailure>((prepared, journal))
         }
         .await;
-        match work {
-            Ok((prepared, journal)) => Ok(RollbackEffectResult {
-                prepared,
-                journal,
-                teardown: self.teardown,
-                authority,
-                failure: None,
+        let (prepared, journal) = match work {
+            Ok(settled) => settled,
+            Err(failure) => {
+                return Ok(RollbackEffectResult {
+                    prepared: None,
+                    journal: None,
+                    rewind: self.rewind,
+                    authority,
+                    failure: Some(failure),
+                });
+            }
+        };
+        let failure = match &mut self.rewind {
+            Some(rewind) => rewind.run().await.err().map(|error| {
+                let cause = format!("{error:#}");
+                if journal.is_some() {
+                    RollbackFailure::RestoreIncomplete { cause }
+                } else {
+                    RollbackFailure::RewindFailed { cause }
+                }
             }),
-            Err(failure) => Ok(RollbackEffectResult {
-                prepared: None,
-                journal: None,
-                teardown: self.teardown,
-                authority,
-                failure: Some(failure),
-            }),
-        }
+            None => None,
+        };
+        Ok(RollbackEffectResult {
+            prepared,
+            journal,
+            rewind: self.rewind,
+            authority,
+            failure,
+        })
     }
 }
 impl HarnessBroker {
@@ -133,7 +139,7 @@ impl HarnessBroker {
         command: RollbackCommand,
     ) -> std::result::Result<RollbackEffect, RollbackFailure> {
         let command = self.capture_rollback(&command)?;
-        let mut teardown = None;
+        let mut rewind = None;
         let work = match command {
             RollbackCommand::Prepare(selection) => {
                 self.require_restore_recovered()
@@ -202,15 +208,22 @@ impl HarnessBroker {
                 }))
             }
             RollbackCommand::Apply(PreparedRollbackToken::Conversation { selection }) => {
-                teardown = Some(self.prepare_rollback_teardown(&json!({"rollback":{"scope":"conversation","exchange_id":selection.exchange_id,"latest_exchange_id":selection.latest_exchange_id}}), false)
-                    .map_err(|_| RollbackFailure::RecoveryRequired)?);
+                rewind = Some(
+                    self.prepare_conversation_rewind(
+                        &json!({"rollback":{"scope":"conversation","exchange_id":selection.exchange_id,"latest_exchange_id":selection.latest_exchange_id}}),
+                        false,
+                    )
+                    .map_err(|error| RollbackFailure::Unsupported {
+                        reason: format!("{error:#}"),
+                    })?,
+                );
                 RollbackWork::Conversation
             }
             RollbackCommand::Apply(PreparedRollbackToken::Workspace { preview_id, .. }) => {
                 let preview =
                     RestorePreview::load(&self.store.objects, &self.session.id, &preview_id)
                         .map_err(|_| RollbackFailure::AuthorityUnavailable)?;
-                teardown = self.rollback_preview_teardown(&preview)?;
+                rewind = self.rollback_preview_rewind(&preview)?;
                 RollbackWork::Restore {
                     preview,
                     resume: false,
@@ -223,7 +236,7 @@ impl HarnessBroker {
                 if journal.state == crate::checkpoint::RestoreState::Complete {
                     return Err(RollbackFailure::StaleAuthority);
                 }
-                teardown = self.rollback_preview_teardown(&journal.preview)?;
+                rewind = self.rollback_preview_rewind(&journal.preview)?;
                 RollbackWork::Restore {
                     preview: journal.preview,
                     resume: true,
@@ -240,7 +253,7 @@ impl HarnessBroker {
             objects: self.store.objects.clone(),
             repositories: self.repositories.clone(),
             work,
-            teardown,
+            rewind,
         })
     }
 
@@ -268,8 +281,8 @@ impl HarnessBroker {
                 Vec::new(),
             ));
         }
-        let events = if let Some(teardown) = result.teardown {
-            self.commit_undo_teardown(teardown)
+        let events = if let Some(rewind) = result.rewind {
+            self.commit_conversation_rewind(rewind)
                 .map_err(|_| RollbackFailure::RecoveryRequired)?
         } else {
             Vec::new()
@@ -283,11 +296,11 @@ impl HarnessBroker {
         Ok((RollbackOutcome::Restored, events))
     }
 
-    /// Capture native teardown only while history still needs its restore commit.
-    fn rollback_preview_teardown(
+    /// Capture the native rewind only while history still needs its restore commit.
+    fn rollback_preview_rewind(
         &mut self,
         preview: &RestorePreview,
-    ) -> std::result::Result<Option<foreground_undo::UndoTeardown>, RollbackFailure> {
+    ) -> std::result::Result<Option<foreground_undo::ConversationRewind>, RollbackFailure> {
         if !crate::workspace::same(&preview.workspace, &self.session.workspace) {
             return Err(RollbackFailure::StaleAuthority);
         }
@@ -330,7 +343,13 @@ impl HarnessBroker {
             .ok_or(RollbackFailure::StaleAuthority)?
             .id
             .clone();
-        self.prepare_rollback_teardown(&json!({"rollback":{"scope":"conversation","exchange_id":first,"latest_exchange_id":latest}}), true)
-            .map(Some).map_err(|_| RollbackFailure::RecoveryRequired)
+        self.prepare_conversation_rewind(
+            &json!({"rollback":{"scope":"conversation","exchange_id":first,"latest_exchange_id":latest}}),
+            true,
+        )
+        .map(Some)
+        .map_err(|error| RollbackFailure::Unsupported {
+            reason: format!("{error:#}"),
+        })
     }
 }

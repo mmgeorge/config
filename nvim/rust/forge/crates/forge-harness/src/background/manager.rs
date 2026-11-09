@@ -354,7 +354,7 @@ impl BackgroundManager {
                                     ..
                                 },
                             ) => {
-                                let reason = match reason { crate::provider::session_execution::OwnerCloseReason::Cancelled => "cancelled", crate::provider::session_execution::OwnerCloseReason::Shutdown => "shutdown" };
+                                let reason = match reason { crate::provider::session_execution::OwnerCloseReason::Shutdown => "shutdown" };
                                 broker.trace.record(
                                     &session_id,
                                     "background.observation_collected",

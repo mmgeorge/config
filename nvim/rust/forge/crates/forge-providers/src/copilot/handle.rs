@@ -823,6 +823,101 @@ impl CopilotSession {
             })
         })
     }
+    /// Truncate native history so it ends at the requested turn checkpoint.
+    ///
+    /// Copilot checkpoints name a turn's terminal event. The first primary `user.message` after
+    /// it begins the discarded suffix; when none exists, history already ends there and a repeated
+    /// rewind succeeds without mutation.
+    pub async fn rewind_after(&self, after: Option<&str>) -> Result<(), ProviderError> {
+        const OPERATION: forge_provider_api::ProviderOperation =
+            forge_provider_api::ProviderOperation::ThreadRewind;
+        let Some(event_id) = self.first_input_after(after).await? else {
+            return Ok(());
+        };
+        super::operation::dispatch_for(OPERATION)?;
+        let result = self
+            .inner
+            .rpc()
+            .history()
+            .truncate(HistoryTruncateRequest { event_id })
+            .await;
+        if result.is_err() || self.first_input_after(after).await?.is_some() {
+            return Err(forge_provider_api::ProviderFailure::new(
+                OPERATION,
+                forge_provider_api::ProviderFailureKind::Transport,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Find the first primary input after a checkpoint, rejecting a checkpoint absent from history.
+    async fn first_input_after(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Option<String>, ProviderError> {
+        const OPERATION: forge_provider_api::ProviderOperation =
+            forge_provider_api::ProviderOperation::ThreadRewind;
+        let transport = || {
+            native_failure(
+                OPERATION,
+                forge_provider_api::ProviderFailureKind::Transport,
+            )
+        };
+        let mut cursor = None;
+        let mut past_checkpoint = after.is_none();
+        let mut seen = HashSet::new();
+        loop {
+            let history = self
+                .inner
+                .rpc()
+                .event_log()
+                .read(EventLogReadRequest {
+                    agent_ids: None,
+                    direction: Some(EventsReadDirection::Forward),
+                    include_ephemeral: Some(false),
+                    cursor: cursor.clone(),
+                    agent_scope: Some(EventsAgentScope::Primary),
+                    types: None,
+                    max: Some(100),
+                    wait_ms: Some(0),
+                })
+                .await
+                .map_err(|_| transport())?;
+            if history.cursor_status != EventsCursorStatus::Ok {
+                return Err(transport());
+            }
+            for event in history.events {
+                if !past_checkpoint {
+                    past_checkpoint = Some(event.id.as_str()) == after;
+                    continue;
+                }
+                if event.agent_id.is_none() && event.event_type == "user.message" {
+                    return Ok(Some(event.id));
+                }
+            }
+            if !history.has_more {
+                break;
+            }
+            if !seen.insert(history.cursor.clone()) {
+                return Err(transport());
+            }
+            cursor = Some(history.cursor);
+        }
+        if past_checkpoint {
+            Ok(None)
+        } else {
+            Err(native_failure(
+                OPERATION,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
+        }
+    }
+
     pub async fn compact(&self, id: String) -> Result<Compaction, ProviderError> {
         let result: Result<Compaction> = async {
             super::operation::dispatch_for(forge_provider_api::ProviderOperation::ThreadCompact)?;

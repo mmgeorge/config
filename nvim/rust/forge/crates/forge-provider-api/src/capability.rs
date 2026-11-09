@@ -59,6 +59,8 @@ pub enum CapabilityId {
     NativeSteer,
     /// Checked cancelled-input history retraction.
     NativeTurnRollback,
+    /// Settled conversation history rewind to a recorded turn checkpoint.
+    NativeConversationRewind,
     /// Native compaction lifecycle observations.
     CompactionLifecycle,
     /// Compaction observations outside active input execution.
@@ -169,6 +171,11 @@ impl CapabilityManifest {
             (
                 CapabilityId::NativeTurnRollback,
                 flags.native_turn_rollback,
+                Immediate,
+            ),
+            (
+                CapabilityId::NativeConversationRewind,
+                flags.native_conversation_rewind,
                 Immediate,
             ),
             (
@@ -362,6 +369,8 @@ pub enum ProviderFeature {
     NativeSteer,
     /// Checked exact cancelled-input history retraction.
     NativeTurnRollback,
+    /// Settled conversation history rewind to a recorded turn checkpoint.
+    NativeConversationRewind,
     /// Admitted image attachment input.
     ImageInput,
 }

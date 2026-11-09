@@ -449,7 +449,7 @@ Apply a prepared rollback.
 
 ### Contract
 
-Accepts `scope`, defaulting to `workspace`. Workspace mode requires the captured `preview_id`, revalidates workspace identity, Git HEAD, current file content, and exchange history, then applies the restore and finalizes conversation rollback. Returns `{ "restored": true }`. Conversation mode requires `exchange_id` and captured `latest_exchange_id`, changes conversation history without restoring files, and returns `{ "restored": true, "scope": "conversation" }`. Both require settled exchange trees and no active children. A partial filesystem restore retains a journal and requires recovery before new workspace work. Stale previews, conflicts, unavailable checkpoints, and I/O failures remain errors.
+Accepts `scope`, defaulting to `workspace`. Workspace mode requires the captured `preview_id`, revalidates workspace identity, Git HEAD, current file content, and exchange history, then applies the restore and finalizes conversation rollback. Returns `{ "restored": true }`. Conversation mode requires `exchange_id` and captured `latest_exchange_id`, changes conversation history without restoring files, and returns `{ "restored": true, "scope": "conversation" }`. Both modes rewind the provider conversation natively; a provider without `native_conversation_rewind`, or a retained exchange with provider turns but no recorded checkpoint, rejects the rollback before any change. Both require settled exchange trees and no active children. A partial filesystem restore retains a journal and requires recovery before new workspace work. Stale previews, conflicts, unavailable checkpoints, and I/O failures remain errors.
 
 ## `session.exchange.rollback.prepare`
 

@@ -127,6 +127,7 @@ pub(crate) fn operation_timeout(operation: ProviderOperation) -> Option<Duration
         | ProviderOperation::ThreadCompact
         | ProviderOperation::InputReconcile
         | ProviderOperation::InputRetract
+        | ProviderOperation::ThreadRewind
         | ProviderOperation::TerminalTerminate => Some(Duration::from_secs(120)),
     }
 }
@@ -358,6 +359,7 @@ pub(super) async fn observe_owned<T>(
                 | ProviderOperation::TurnSteer
                 | ProviderOperation::InputReconcile
                 | ProviderOperation::InputRetract
+                | ProviderOperation::ThreadRewind
                 | ProviderOperation::ThreadFork
                 | ProviderOperation::ThreadCompact
                 | ProviderOperation::TurnInterrupt

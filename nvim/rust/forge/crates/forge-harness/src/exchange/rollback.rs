@@ -156,6 +156,12 @@ pub(crate) enum RollbackFailure {
     /// failed apply leaves only the journal state behind.
     #[error("restoration did not complete ({cause}); inspect retained recovery status")]
     RestoreIncomplete { cause: String },
+    /// The provider cannot rewind this conversation, so nothing changed.
+    #[error("{reason}")]
+    Unsupported { reason: String },
+    /// Native rewind failed before host history changed; repeating the rollback is safe.
+    #[error("{cause}; undo again to retry")]
+    RewindFailed { cause: String },
 }
 impl RollbackFailure {
     /// Get a stable transport failure code.
@@ -166,6 +172,8 @@ impl RollbackFailure {
             Self::AuthorityUnavailable => "rollback_authority_unavailable",
             Self::PreparationFailed => "rollback_preparation_failed",
             Self::RecoveryRequired | Self::RestoreIncomplete { .. } => "restore_recovery_required",
+            Self::Unsupported { .. } => "rollback_unsupported",
+            Self::RewindFailed { .. } => "rollback_rewind_failed",
         }
     }
 }

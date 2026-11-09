@@ -70,6 +70,10 @@ struct Operations {
         (BindingId, InputRetractRequest),
         InputRetractOutcome,
     >,
+    rewind: forge_provider_api::retained_operation::Store<
+        (BindingId, forge_provider_api::ThreadRewindRequest),
+        (),
+    >,
     shutdown: forge_provider_api::retained_operation::Store<(), ()>,
     models: forge_provider_api::retained_operation::Store<
         QueryContext,
@@ -112,6 +116,7 @@ impl Operations {
                 identities.clone(),
             ),
             retract: forge_provider_api::retained_operation::Store::registered(identities.clone()),
+            rewind: forge_provider_api::retained_operation::Store::registered(identities.clone()),
             shutdown: forge_provider_api::retained_operation::Store::registered(identities.clone()),
             models: forge_provider_api::retained_operation::Store::registered(identities.clone()),
             skills: forge_provider_api::retained_operation::Store::registered(identities.clone()),
@@ -160,6 +165,9 @@ impl Operations {
             failures.push(error);
         }
         if let Err(error) = self.retract.join_all_except(excluded).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.rewind.join_all_except(excluded).await {
             failures.push(error);
         }
         if let Err(error) = self.models.join_all_except(excluded).await {
@@ -2063,6 +2071,27 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         .await
     }
 
+    async fn thread_rewind(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        let resource = InterruptedResource::Binding(binding.clone());
+        let payload = (binding.clone(), request.clone());
+        let provider = self.clone();
+        let binding = binding.clone();
+        self.observe(
+            &self.operations.rewind,
+            context,
+            ProviderOperation::ThreadRewind,
+            payload,
+            resource,
+            async move { provider.rewind_conversation(&binding, request).await },
+        )
+        .await
+    }
+
     async fn shutdown(&self, context: OperationContext) -> Result<(), ProviderError> {
         let resource = InterruptedResource::RetainNative;
         let payload = ();
@@ -2241,6 +2270,7 @@ impl CopilotProvider {
                         | ProviderOperation::TurnSteer
                         | ProviderOperation::InputReconcile
                         | ProviderOperation::InputRetract
+                        | ProviderOperation::ThreadRewind
                         | ProviderOperation::Inspect
                         | ProviderOperation::ModelList
                         | ProviderOperation::SkillList
@@ -4012,6 +4042,37 @@ impl CopilotProvider {
             .await
             .insert(operation_id, result.clone());
         result
+    }
+
+    /// Rewind an idle binding's conversation to a recorded turn checkpoint.
+    async fn rewind_conversation(
+        &self,
+        binding: &BindingId,
+        request: forge_provider_api::ThreadRewindRequest,
+    ) -> Result<(), ProviderError> {
+        let state = self
+            .binding(binding, ProviderOperation::ThreadRewind)
+            .await?;
+        let _admission = state.admission.lock().await;
+        if self.closed.load(Ordering::Acquire) || state.closing.load(Ordering::Acquire) {
+            return Err(failure(
+                ProviderOperation::ThreadRewind,
+                ProviderFailureKind::BindingClosed,
+            ));
+        }
+        if state.unsafe_history.load(Ordering::Acquire) {
+            return Err(failure(
+                ProviderOperation::ThreadRewind,
+                ProviderFailureKind::BindingInvalidated,
+            ));
+        }
+        state
+            .require_native_idle(ProviderOperation::ThreadRewind)
+            .await?;
+        let session = state.session.read().await.clone();
+        session
+            .rewind_after(request.after.as_ref().map(|checkpoint| checkpoint.as_str()))
+            .await
     }
 
     async fn retract_input(

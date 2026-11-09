@@ -12,6 +12,8 @@ pub enum ProviderOperation {
     ThreadFork,
     /// Compact settled native history.
     ThreadCompact,
+    /// Discard settled native history after a retained checkpoint.
+    ThreadRewind,
     /// Revoke and collect an entire binding.
     ThreadClose,
     /// Interrupt and settle one exact invocation.

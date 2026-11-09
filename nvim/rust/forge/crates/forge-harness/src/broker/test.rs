@@ -691,6 +691,7 @@ pub(super) fn completed_interaction(
         attributed_diff_text: None,
         checkpoint_diff_text: None,
         attributed_matches_checkpoint: false,
+        provider_checkpoint_id: None,
         approval_resolution: Vec::new(),
         host_file_changes: Vec::new(),
         check_setup: None,
@@ -1134,87 +1135,44 @@ fn cleanup_retry_provider(
     (workflow_fixture_bridge(broker, native), signals)
 }
 
+/// Without native rewind, conversation rollback reports unsupported and changes nothing.
 #[tokio::test]
-async fn conversation_rollback_preserves_files_and_restarts_with_retained_context() -> Result<()> {
+async fn conversation_rollback_is_unsupported_without_native_rewind() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let mut first = completed_interaction("retained", &broker.session.id, Vec::new());
-    first.prompt = "KEEP_THIS_CONTEXT".into();
+    broker.capability.native_conversation_rewind = false;
+    let first = completed_interaction("retained", &broker.session.id, Vec::new());
     let mut second = completed_interaction("removed", &broker.session.id, Vec::new());
     second.ordinal = 2;
-    second.prompt = "DROP_THIS_CONTEXT".into();
-    assert!(second.checkpoint_before.is_none());
     broker.store.save_exchange(&first)?;
     broker.store.save_exchange(&second)?;
-    broker.session.provider_session_id = Some("old-provider-history".into());
+    broker.session.provider_session_id = Some("retained-provider-history".into());
     broker.save_session()?;
-    assert!(!broker.reconcile_timeline()?.is_empty());
     std::fs::write(
         repository.path().join("seed.txt"),
         "Keep these file changes\n",
     )?;
-    std::fs::write(
-        repository.path().join("new-file.txt"),
-        "Keep this new file\n",
-    )?;
-    let mut params =
-        json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"stale"});
-    assert!(broker.apply_rollback(params.clone()).await.is_err());
+    let params =
+        json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"removed"});
+    let error = broker
+        .apply_rollback(params)
+        .await
+        .expect_err("rollback without native rewind must be rejected");
+    assert!(format!("{error:#}").contains("unsupported"), "{error:#}");
     assert_eq!(
         broker.store.list_exchange(&broker.session.id)?[1].disposition(),
         crate::exchange::HistoryDisposition::Current
     );
-    params["latest_exchange_id"] = json!("removed");
-    let (result, events) = broker.apply_rollback(params).await?;
-    assert_eq!(result["scope"], "conversation");
-    let rolled_back = events
-        .iter()
-        .position(|event| event.event == "interaction_rolled_back")
-        .expect("rollback event");
-    let document = events
-        .iter()
-        .position(|event| event.event == "document_changed")
-        .expect("rollback must publish the patch that removes rolled-back exchanges");
-    assert!(rolled_back < document);
-    assert!(
-        broker.reconcile_timeline()?.is_empty(),
-        "the published patch must leave the presentation current"
+    let session = broker.store.load_session(&broker.session.id)?.unwrap();
+    assert_eq!(
+        session.provider_session_id,
+        Some("retained-provider-history".into())
     );
     assert_eq!(
         std::fs::read_to_string(repository.path().join("seed.txt"))?,
         "Keep these file changes\n"
     );
-    assert_eq!(
-        std::fs::read_to_string(repository.path().join("new-file.txt"))?,
-        "Keep this new file\n"
-    );
-    assert!(
-        crate::checkpoint::RestoreJournal::progress(&broker.store.objects, &broker.session.id)?
-            .is_none()
-    );
-    assert!(
-        broker
-            .store
-            .load_session(&broker.session.id)?
-            .unwrap()
-            .provider_session_id
-            .is_none()
-    );
-    assert!(
-        !broker
-            .snapshot()?
-            .timeline
-            .iter()
-            .any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == "removed"))
-    );
-    let input =
-        broker.rollback_context("new-request", ProviderInput::from_text("CURRENT_REQUEST"))?;
-    let ProviderInput::Text { text, .. } = input else {
-        unreachable!()
-    };
-    assert!(text.contains("KEEP_THIS_CONTEXT") && text.contains("CURRENT_REQUEST"));
-    assert!(!text.contains("DROP_THIS_CONTEXT"));
     Ok(())
 }
 

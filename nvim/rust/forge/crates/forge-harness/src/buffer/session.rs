@@ -2773,6 +2773,7 @@ mod tests {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,

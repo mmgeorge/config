@@ -1780,6 +1780,49 @@ impl ProviderBridge {
         .await
     }
 
+    /// Rewind the owner's native conversation so it ends at `after`, opening or resuming its binding.
+    ///
+    /// Each call is a fresh operation: the native rewind is idempotent, so a repeated rollback after
+    /// an uncertain failure sends the same request rather than replaying a retained outcome.
+    pub async fn thread_rewind(
+        &self,
+        request: ProviderRequest,
+        after: Option<String>,
+    ) -> Result<(), ProviderError> {
+        let _admission = self.admission.read().await;
+        self.ensure_admission(ProviderOperation::ThreadRewind)?;
+        let rejected = || {
+            failure(
+                ProviderOperation::ThreadRewind,
+                ProviderFailureKind::Rejected,
+            )
+        };
+        let after = after
+            .map(forge_provider_api::CheckpointId::new)
+            .transpose()
+            .map_err(|_| rejected())?;
+        let owner = request.owner().map_err(|_| rejected())?;
+        let binding = self.binding_under_admission(&request).await?;
+        let control = OperationControl::fresh(ProviderOperation::ThreadRewind)?;
+        let context = control.context();
+        super::operation::observe(
+            self.trace.clone(),
+            &self.core_events,
+            ProviderOperation::ThreadRewind,
+            &context,
+            forge_provider_api::EventScope::Binding {
+                thread_id: forge_provider_api::ThreadId::from(owner),
+            },
+            Some(binding.id.clone()),
+            self.native.thread_rewind(
+                context.clone(),
+                &binding.id,
+                forge_provider_api::ThreadRewindRequest { after },
+            ),
+        )
+        .await
+    }
+
     /// Compact the retained target without resolving a different binding on retry.
     pub async fn thread_compact(
         &self,
