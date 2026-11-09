@@ -797,6 +797,7 @@ impl SessionTaskController {
         permit: &TaskPermit,
         exchange: &crate::exchange::Exchange,
         canonical_progress: bool,
+        draft_dirty: bool,
         now_ms: i64,
     ) -> Result<Option<(crate::plan::PlanRecord, bool)>> {
         if !latest_turn_completed_normally(exchange) {
@@ -830,6 +831,11 @@ impl SessionTaskController {
                     anyhow::bail!("planning progress requires an active plan");
                 };
                 ensure!(!plan.paused, "planning task is paused");
+                if draft_dirty && plan.artifact.state == crate::plan::PlanState::AwaitingReview {
+                    crate::plan::state_machine::PlanStateMachine::apply(
+                        &mut plan.artifact, crate::plan::state_machine::PlanEvent::ChangesRequested, now_ms,
+                    )?;
+                }
                 if canonical_progress {
                     plan.artifact.generation.canonical_revision = plan
                         .artifact
@@ -862,7 +868,7 @@ impl SessionTaskController {
                         work: super::TaskWork::Provider { instruction: if artifact.state == crate::plan::PlanState::ConfiguringChecks {
                             crate::plan::PlanPrompt::checks_setup(&artifact.request)
                         } else { format!(
-                            "Continue the active planning task. The previous turn ended without submitting the plan or asking a question. Edit the proposed declaration files if needed, then call plan_submit. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.\n\nPlanning continuation: turn {} of {}.",
+                            "Continue the active planning task in its existing directory. The previous turn ended without submitting the plan or asking a question. Use ordinary file tools for docs/ and files/, then call plan_submit with the plan ID and no expected version. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.\n\nPlanning continuation: turn {} of {}.",
                             artifact.generation.budget.turn_count + 1,
                             artifact.generation.budget.max_turn_count,
                         ) } },

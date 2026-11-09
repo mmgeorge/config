@@ -43,7 +43,7 @@ impl PlanPrompt {
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with plan_edit, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers to the existing planning directory with ordinary file tools, settle remaining decisions according to the user's question preferences, then call plan_submit with the plan ID and no expected version.
 
 {PLANNING_CONTRACT}
 
@@ -75,7 +75,7 @@ Original request:
             .unwrap_or("None");
         let plan = active_plan_line(document);
         format!(
-            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested changes with plan_edit. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
+            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment by editing the existing planning directory with ordinary file tools. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the plan ID and no expected version.
 
 {PLANNING_CONTRACT}
 
@@ -89,10 +89,9 @@ Review comments:
         )
     }
 
-    /// Prepend the active plan's identity so every provider can address its plan tools.
+    /// Prepend the active identity without embedding a mutable draft or edit version.
     ///
-    /// The tools read the live plan, so the prompt carries only the ID and version they require
-    /// rather than a snapshot that the first edit makes stale.
+    /// The interaction contract supplies current filesystem locations on every planning turn.
     pub fn with_active_plan(prompt: String, document: &super::PlanDocument) -> String {
         format!("{}\n\n{prompt}", active_plan_line(document))
     }
@@ -133,7 +132,7 @@ Review comments:
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
-            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with plan_edit, and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
+            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing planning directory with ordinary file tools, then call plan_submit with its plan ID and no expected version. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
 }
@@ -142,8 +141,8 @@ const ACTIVE_PLAN_PREFIX: &str = "Active plan `";
 
 fn active_plan_line(document: &super::PlanDocument) -> String {
     format!(
-        "{ACTIVE_PLAN_PREFIX}{}` is at version {}. Read it with `plan_status` and `plan_read`, and pass this plan ID and the current version to `plan_edit` and `plan_submit`.",
-        document.plan_id, document.version
+        "{ACTIVE_PLAN_PREFIX}{}`. Edit the supplied planning directory with ordinary file tools; plan_status reports its location. Submit this plan ID with plan_submit without an expected version.",
+        document.plan_id
     )
 }
 

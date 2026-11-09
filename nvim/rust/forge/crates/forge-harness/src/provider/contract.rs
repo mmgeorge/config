@@ -214,7 +214,11 @@ impl ProviderCompletion {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanSubmitRequest {
     pub plan_id: String,
+    #[serde(default)]
     pub expected_version: u64,
+    /// Identify host-captured planning inputs, never a caller-selected filesystem location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) authoring_snapshot: Option<String>,
 }
 
 /// Describes a provider fork after the Harness child identity is allocated.

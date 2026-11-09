@@ -33,17 +33,38 @@ pub(super) fn diagnostics(
             })
             .collect::<BTreeSet<_>>();
         for symbol in &declaration.symbol {
+            let owner = symbol
+                .scope
+                .iter()
+                .chain(std::iter::once(&symbol.name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("::");
+            let introduced = if symbol.role == DeclarationRole::Callable {
+                design
+                    .parsed()?
+                    .proposed_calls
+                    .get(path)
+                    .into_iter()
+                    .flatten()
+                    .any(|body| {
+                        body.owner == owner
+                            && matches!(body.behavior, Some(super::FunctionBehavior::Algorithm(_)))
+                    })
+            } else {
+                index.introduced.contains(&(
+                    path.clone(),
+                    symbol.position.line,
+                    symbol.position.column,
+                ))
+            };
             if symbol.parameter
                 || symbol.external_entry
                 || matches!(
                     symbol.role,
                     DeclarationRole::Binding | DeclarationRole::Module
                 )
-                || !index.introduced.contains(&(
-                    path.clone(),
-                    symbol.position.line,
-                    symbol.position.column,
-                ))
+                || !introduced
             {
                 continue;
             }
@@ -52,13 +73,6 @@ pub(super) fn diagnostics(
             {
                 continue;
             }
-            let owner = symbol
-                .scope
-                .iter()
-                .chain(std::iter::once(&symbol.name))
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("::");
             diagnostic.push(DeclarationDiagnostic {
                 path: path.clone(),
                 line: symbol.position.line,

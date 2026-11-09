@@ -85,6 +85,15 @@ impl<'a> CodexSecurity<'a> {
 
     /// Override the turn policy using fields accepted by the app-server API.
     pub fn apply_turn(&self, params: &mut Value, workspace: &str) {
+        // Codex's project-root grant follows runtime roots, not only writableRoots.
+        // Replace its sticky roots on every turn, including return to ordinary work.
+        params["runtimeWorkspaceRoots"] = json!(
+            self.access
+                .effective_write_roots
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| vec![workspace.to_owned()])
+        );
         params["approvalPolicy"] = json!(self.approval_policy());
         params["approvalsReviewer"] = json!("user");
         params["sandboxPolicy"] = if self.access.sandbox
@@ -103,6 +112,28 @@ impl<'a> CodexSecurity<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep a restricted invocation's project-root grant out of the repository.
+    #[test]
+    fn scoped_turn_replaces_and_then_restores_runtime_workspace_roots() {
+        let access = AccessPolicy {
+            effective_write_roots: Some(std::sync::Arc::new(vec!["/state/authoring".into()])),
+            ..Default::default()
+        };
+        let mut turn = json!({});
+        CodexSecurity::new(&access)
+            .unwrap()
+            .apply_turn(&mut turn, "/repository");
+        assert_eq!(turn["runtimeWorkspaceRoots"], json!(["/state/authoring"]));
+        assert_eq!(
+            turn["sandboxPolicy"]["writableRoots"],
+            json!(["/state/authoring"])
+        );
+        CodexSecurity::new(&AccessPolicy::default())
+            .unwrap()
+            .apply_turn(&mut turn, "/repository");
+        assert_eq!(turn["runtimeWorkspaceRoots"], json!(["/repository"]));
+    }
 
     #[test]
     fn disabling_sandbox_does_not_disable_approvals() {

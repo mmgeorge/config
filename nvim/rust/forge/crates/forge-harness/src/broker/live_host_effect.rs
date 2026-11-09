@@ -221,7 +221,7 @@ impl HarnessBroker {
                     LiveHostRejection::MultipleMutations
                 );
                 let mutation = if let Some(edit) = completion.plan_edit.first() {
-                    foreground_plan_effect::PlanMutation::Edit(edit.clone())
+                    foreground_plan_effect::PlanMutation::Edit(Box::new(edit.clone()))
                 } else {
                     foreground_plan_effect::PlanMutation::Design(completion.design_patch[0].clone())
                 };

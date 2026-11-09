@@ -37,6 +37,24 @@ impl DirectoryPolicy {
         let mut evaluation = compiled.evaluate(request)?;
         let mut denied = evaluation.decision == PermissionDecision::Deny;
         for (target, original) in request.target_list.iter().zip(original_target_list) {
+            if let Some(roots) = &access.effective_write_roots {
+                let denied_write = match target {
+                    PermissionTarget::Write { path } => !roots
+                        .iter()
+                        .any(|root| path_starts_with(Path::new(path), Path::new(root))),
+                    PermissionTarget::UnknownFile {
+                        operation: DirectoryOperation::Write,
+                    } => true,
+                    _ => false,
+                };
+                if denied_write {
+                    denied = true;
+                    evaluation
+                        .pending_target_list
+                        .retain(|pending| pending != target);
+                    continue;
+                }
+            }
             let (path, full, directories) = match target {
                 PermissionTarget::Read { path } => (
                     path,
@@ -69,11 +87,18 @@ impl DirectoryPolicy {
                 target_list: vec![original],
                 ..request.clone()
             })?;
-            let covered =
-                full || path_starts_with(
+            let covered = matches!(target, PermissionTarget::Write { .. })
+                && access.effective_write_roots.as_ref().is_some_and(|roots| {
+                    roots
+                        .iter()
+                        .any(|root| path_starts_with(Path::new(path), Path::new(root)))
+                })
+                || full
+                || path_starts_with(
                     Path::new(path),
                     &resolve_path(&self.workspace, &self.workspace)?,
-                ) || directories
+                )
+                || directories
                     .iter()
                     .any(|directory| path_starts_with(Path::new(path), Path::new(directory)));
             let specific_allow = explicit.decision == PermissionDecision::Allow
@@ -114,6 +139,9 @@ impl DirectoryPolicy {
     }
 
     pub(crate) fn grant(&self, target: &PermissionTarget) -> Result<Option<DirectoryGrant>> {
+        if self.access.effective_write_roots.is_some() {
+            return Ok(None);
+        }
         let (path, operation) = match target {
             PermissionTarget::Read { path } => (path, DirectoryOperation::Read),
             PermissionTarget::Write { path } => (path, DirectoryOperation::Write),
@@ -240,6 +268,60 @@ pub struct DirectoryGrant {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Restrict temporary planning writes even when saved user access is Full.
+    #[test]
+    fn invocation_roots_deny_workspace_and_host_writes_without_persisted_grants() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = dunce::canonicalize(root.path())?;
+        let workspace = root.join("repository");
+        let draft = root.join("draft");
+        let host = root.join("host");
+        for directory in [&workspace, &draft, &host] {
+            std::fs::create_dir(directory)?;
+        }
+        let policy = DirectoryPolicy {
+            access: AccessPolicy {
+                write_access: WriteScope::Full,
+                effective_write_roots: Some(std::sync::Arc::new(vec![draft.display().to_string()])),
+                ..Default::default()
+            },
+            workspace: workspace.clone(),
+            session_id: "session".into(),
+            settings_root: None,
+        };
+        let compiled = CompiledPermissionDocument::compile(
+            parse_permission_document(
+                r#"{"permission":{"read":{"*":"allow"},"edit":{"*":"allow"}}}"#,
+            )?,
+            &workspace,
+        );
+        for (path, expected) in [
+            (draft.join("files/new.rs"), PermissionDecision::Allow),
+            (workspace.join("source.rs"), PermissionDecision::Deny),
+            (host.join("ledger.json"), PermissionDecision::Deny),
+        ] {
+            let mut request = PermissionRequest {
+                id: "write".into(),
+                provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+                reason: None,
+                target_list: vec![PermissionTarget::Write {
+                    path: path.display().to_string(),
+                }],
+            };
+            assert_eq!(policy.evaluate(&compiled, &mut request)?.decision, expected);
+        }
+        let persisted = serde_json::to_value(&policy.access)?;
+        assert!(persisted.get("effective_write_roots").is_none());
+        assert!(
+            policy
+                .grant(&PermissionTarget::Write {
+                    path: draft.join("files/new.rs").display().to_string()
+                })?
+                .is_none()
+        );
+        Ok(())
+    }
     use crate::permissions::document::parse_permission_document;
 
     #[test]

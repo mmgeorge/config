@@ -103,6 +103,8 @@ pub enum TestPromptStep {
         name: String,
         arguments: serde_json::Value,
     },
+    /// Exercise ordinary authorized file editing rather than a host plan patch.
+    FileWrite { path: String, text: String },
     /// Publish one complete native checklist replacement for the scripted turn.
     Checklist {
         update: crate::ProviderChecklistUpdate,

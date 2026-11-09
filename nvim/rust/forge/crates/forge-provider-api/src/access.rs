@@ -58,6 +58,9 @@ pub struct AccessPolicy {
     pub writable_directory: Vec<String>,
     #[serde(default)]
     pub isolation_mode: Option<String>,
+    /// Restrict one invocation to exact writable roots without persisting workflow authority.
+    #[serde(skip)]
+    pub effective_write_roots: Option<std::sync::Arc<Vec<String>>>,
 }
 
 impl Default for AccessPolicy {
@@ -69,6 +72,7 @@ impl Default for AccessPolicy {
             readable_directory: Vec::new(),
             writable_directory: Vec::new(),
             isolation_mode: None,
+            effective_write_roots: None,
         }
     }
 }
@@ -168,6 +172,9 @@ impl AccessPolicy {
     pub fn writable_roots(&self, workspace: &str) -> Vec<String> {
         if self.write_access == WriteScope::Off {
             return Vec::new();
+        }
+        if let Some(roots) = &self.effective_write_roots {
+            return roots.as_ref().clone();
         }
         if self.write_access == WriteScope::Workspace {
             let mut roots = vec![workspace.to_owned()];

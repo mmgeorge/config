@@ -5,6 +5,17 @@ use serde_json::Value;
 
 pub use forge_provider_api::control::ControlToolDefinition;
 
+/// Exclude trusted replay metadata from provider-visible schemas.
+fn advertised_definition(mut definition: ControlToolDefinition) -> ControlToolDefinition {
+    if definition.name == "plan_submit" {
+        definition.input_schema["properties"]
+            .as_object_mut()
+            .expect("plan submit properties are an object")
+            .remove("authoring_snapshot");
+    }
+    definition
+}
+
 /// Show plan_submit only while authoring or in Resolve, and plan_edit also in Verify, where it
 /// writes `plan:verification.md`.
 fn plan_mutation_visible(name: &str, phase: Option<crate::plan::PlanPhase>) -> bool {
@@ -39,6 +50,7 @@ impl ControlToolRegistry {
                     || definition.name.starts_with("repository_")
                     || lsp::is_tool(definition.name)
             })
+            .map(advertised_definition)
             .collect()
     }
 
@@ -71,6 +83,7 @@ impl ControlToolRegistry {
             .filter(|definition| {
                 !is_agent_tool(definition.name) && plan_mutation_visible(definition.name, phase)
             })
+            .map(advertised_definition)
             .collect()
     }
 
@@ -88,6 +101,14 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
+                if definition.name == "plan_capture_file" {
+                    return root && context.is_some_and(|context| context.plan_authoring.is_some());
+                }
+                if context.is_some_and(|context| context.plan_authoring.is_some())
+                    && matches!(definition.name, "plan_read" | "plan_edit")
+                {
+                    return false;
+                }
                 if context.is_some_and(|context| {
                     context.mode == crate::provider::PromptMode::PlanQuestion
                 }) && !(definition.name.starts_with("repository_")
@@ -132,6 +153,31 @@ impl ControlToolRegistry {
                 plan_mutation_visible(definition.name, phase)
             })
             .map(|mut definition| {
+                if definition.name == "plan_submit" {
+                    definition.input_schema["properties"].as_object_mut().expect("plan submit properties are an object")
+                        .remove("authoring_snapshot");
+                    if context.is_some_and(|context| context.execution.is_some()) {
+                        definition.input_schema["required"] = serde_json::json!(["plan_id", "expected_version"]);
+                    }
+                }
+                if definition.name == "plan_submit"
+                    && context.is_some_and(|context| context.plan_authoring.is_some())
+                {
+                    definition.input_schema["required"] = serde_json::json!(["plan_id"]);
+                    definition.input_schema["properties"]
+                        .as_object_mut()
+                        .expect("plan submit properties are an object")
+                        .remove("expected_version");
+                    definition.input_schema["properties"].as_object_mut().expect("plan submit properties are an object").remove("reason");
+                    definition.input_schema["properties"]
+                        .as_object_mut()
+                        .expect("plan submit properties are an object")
+                        .remove("authoring_snapshot");
+                    definition.description = "Submit the active planning directory for review. Supply plan_id without an expected version. Harness snapshots docs/ and files/, reports parsing and reference diagnostics by file and line, and preserves the editable draft on failure. Later ordinary edits require resubmission. Wait for Harness execution instructions; submission alone never authorizes implementation.";
+                }
+                if definition.name == "plan_status" && context.is_some_and(|context| context.plan_authoring.is_some()) {
+                    definition.description = "Show the active plan ID, its planning directory, proposal inventory, and whether authored files differ from the saved submission. Supply plan_id. Read and edit docs/ and files/ with ordinary file tools, not virtual plan tools.";
+                }
                 if definition.name == "agent_spawn"
                     && let Some(schema) = context
                         .and_then(|context| context.agent.as_ref())
@@ -159,14 +205,16 @@ impl ControlToolRegistry {
                 }
                 owner.is_root() && (!is_agent_tool(definition.name) || agent_tools)
             })
+            .map(advertised_definition)
             .collect()
     }
 
     /// Convert the canonical definitions into the MCP tool-list shape.
     pub fn mcp_tool_list(&self) -> Vec<Value> {
         self.definition_list()
-            .iter()
-            .map(ControlToolDefinition::mcp_value)
+            .into_iter()
+            .map(advertised_definition)
+            .map(|definition| definition.mcp_value())
             .collect()
     }
 }

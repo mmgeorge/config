@@ -9,7 +9,8 @@ pub(super) const NAME: &str = "plan_edit";
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Edit plan artifacts and proposed project files without writing project files. Supply \
+        description: "During execution, edit plan artifacts and proposed project files without writing project files. \
+                During planning, use ordinary file tools in the supplied directory instead. Supply \
                 plan_id, expected_version, and an atomic patch using *** Begin Patch, Add File, Update File, \
                 Delete File, Revert File, Move to, @@, and *** End Patch. Read a path with plan_read first and \
                 omit displayed line numbers from patches. Revert File withdraws every proposal for a project \
@@ -37,9 +38,9 @@ pub(super) fn definition() -> ControlToolDefinition {
                 plan_phase_done reports any problem in the report by line.\n\
                 Project files: paths are project-relative. Source files contain semantic structure: \
                 signatures and comments, never executable bodies. Each callable \
-                carries at most one behavior block: a nonempty Algorithm for a new callable, including a \
-                renamed or replacing one, or a one-to-two-sentence Change for an existing callable, even when \
-                its signature stays the same; never both. Algorithm statements are one per line: assignments \
+                carries at most one behavior block: a nonempty Algorithm classifies new behavior, a \
+                one-to-two-sentence Change classifies modified behavior, and no block claims unchanged \
+                behavior. Harness validates supplied blocks, not their historical classification. Algorithm statements are one per line: assignments \
                 with ←, calls such as process(item), comparisons such as `target is none`, if/otherwise, \
                 for each item in items, while, and return; explanations belong \
                 only in # comments, and statements inside a control block are indented under it. Place \

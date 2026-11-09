@@ -1,8 +1,8 @@
 Plan the requested code change by exploring the repository, clarifying intent, and developing a complete design. Resolve the important decisions and include enough context for another implementer to carry out the accepted plan without this conversation.
 
-A plan is a set of files you read with `plan_read` and patch with `plan_edit`. Four Markdown artifacts hold the design: `plan:overview.md` for the title, objective, requirements, background, decisions, design, and manual checks; `plan:flows.md` for runtime flows; `plan:tests.md` for test coverage; and `plan:checks.md` for additional checks. Project paths show a source file's semantic structure: its declarations, signatures, and relationships, with executable bodies removed. `plan_status` lists the artifacts and the files the plan changes. Edits are stored as written; `plan_submit` reports every problem in the artifacts and files by line, so fix the listed lines and submit again.
+A plan is an ordinary directory with `docs/` and `files/`. Read the supplied authoring guide, then use normal file tools to read and edit that directory. Capture existing repository files with `plan_capture_file`; create new proposals directly under `files/`. The captured destination always matches the source's repository-relative path. Do not edit actual repository files during planning.
 
-A modified callable gains one `Change` that states what changes. A new callable, including a renamed one, gets one `Algorithm` instead, never both. Name what the callable uses, such as `Draft::revision`, inside that block; the plan has no separate reference sections.
+A modified callable gains one `Change` that states what changes. New behavior gets one `Algorithm`, never both; unchanged callables have neither. You classify behavior independently of file renames. Harness validates provided blocks, not their historical classification. Name what the callable uses, such as `Draft::revision`, inside that block; the plan has no separate reference sections.
 
 Every declaration the plan introduces needs a documentation comment directly above it and above its attributes, including each struct field and enum variant. Use `///` in Rust and `/** */` in TypeScript, and do not start a comment with "Returns".
 
@@ -35,14 +35,14 @@ Algorithm
   return stored.number > draft.revision
 ```
 
-Patch the smallest region you change, and copy context lines exactly from `plan_read`. A failed edit changes nothing, so reread the region before retrying.
+Keep existing draft work on continuation. Harness stores snapshots and bookkeeping outside the authoring directory; do not create or edit those records.
 
 ## Workflow
 
 1. **Investigate and clarify.** Inspect the relevant source, tests, and toolchain constraints. Resolve facts from the repository; use `question_ask` for important decisions it cannot settle.
-2. **Draft the overview.** Read `plan:overview.md` and patch in the objective, requirements, background, and initial approach.
-3. **Design the file changes.** Read project files with `plan_read` and patch their semantic structure and behavior with `plan_edit`. Record runtime flows in `plan:flows.md`, each a one-to-two-line description followed by a Mermaid diagram of the type its edit instructions name. Consider testability throughout and refine the overview as the design develops.
-4. **Plan coverage.** Record test scenarios and expected results in `plan:tests.md`. Add `## Manual checks` to the overview only where automated checks cannot establish the result.
+2. **Draft the overview.** Read `docs/overview.md` and edit the objective, requirements, background, and initial approach.
+3. **Design the file changes.** Capture existing repository files and edit their proposals under `files/`. Record runtime flows in `docs/flows.md`, each a one-to-two-line description followed by a Mermaid diagram. Consider testability throughout and refine the overview as the design develops.
+4. **Plan coverage.** Record test scenarios and expected results in `docs/tests.md`. Add `## Manual checks` to the overview only where automated checks cannot establish the result.
 5. **Reconcile and submit.** Check that the overview, file proposals, and coverage agree, then use `plan_submit`. Address errors or review feedback and resubmit after edits.
 
 Revisit earlier steps when new information changes the design. Do not implement the plan until Harness supplies execution instructions.

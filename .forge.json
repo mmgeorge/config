@@ -509,6 +509,35 @@
         "input": true
       }
     },
+    "rust-lint-no-deps": {
+      "trigger": {},
+      "action": {
+        "command": [
+          "cargo",
+          "clippy",
+          "--profile",
+          "dev",
+          "--locked",
+          "--package",
+          "{package}",
+          "--lib",
+          "--no-deps",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "inputs": {
+          "package": {
+            "type": "string",
+            "description": "Cargo package whose library is linted without dependency diagnostics",
+            "required": true
+          }
+        },
+        "directory": "nvim/rust/forge",
+        "label": "Lint Rust library (no dependencies)",
+        "category": "lint"
+      }
+    },
     "rust-test": {
       "trigger": {
         "auto": true,
@@ -585,12 +614,12 @@
       "action": {
         "command": [
           "cargo",
-          "test",
-          "--profile",
+          "nextest",
+          "run",
+          "--cargo-profile",
           "dev",
           "--locked",
-          "--workspace",
-          "--tests"
+          "--workspace"
         ],
         "directory": "nvim/rust/forge",
         "label": "Run Rust workspace tests",

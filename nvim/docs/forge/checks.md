@@ -100,14 +100,14 @@ the same action used to delete planned tests. Confirming disables those checks
 for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
-Agents select existing checks by listing their IDs, one per line, in the
-`plan:checks.md` artifact with `plan_edit`. A listed ID adds that check to the
+During planning, agents select existing checks by listing their IDs, one per line,
+in the planning directory's `docs/checks.md` with ordinary file tools. A listed ID adds that check to the
 plan without changing repository settings or executing commands, and Harness
 adds each listed check's prerequisites itself. Automatic checks run whether or
 not they are listed. `plan_submit` reports a listed ID that names no configured
 check or a disabled check, each at its line. An empty artifact clears additions
 while automatic checks still apply. Editing is available during plan authoring and
-Resolve.
+Resolve; Resolve retains `plan:checks.md` and `plan_edit`.
 `check_run` accepts `check` as a name or a list of names. Supply `inputs` as an
 object matching each check's declared input contract, or omit it to use defaults
 and automatic context bindings. `all: true` requests full context and cannot be

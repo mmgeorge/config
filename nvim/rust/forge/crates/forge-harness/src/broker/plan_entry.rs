@@ -379,6 +379,15 @@ impl BrokerObserver {
                 let mut document = self
                     .plan_file
                     .read_working_document(&self.session_id, &plan_id)?;
+                if self
+                    .plan_file
+                    .authoring_directory(&self.session_id, &plan_id)
+                    .try_exists()?
+                {
+                    document = self
+                        .plan_file
+                        .authoring_import(&self.session_id, &document)?;
+                }
                 document.plan_id = Uuid::new_v4().to_string();
                 document.version = 1;
                 let objective = format!(
@@ -386,15 +395,6 @@ impl BrokerObserver {
                     source.title, source.request
                 );
                 document.prompt = objective.clone();
-                if let Some(design) = document.design.as_mut() {
-                    let session = store
-                        .load_session(&self.session_id)?
-                        .context("session is missing")?;
-                    let fresh =
-                        crate::plan::DeclarationDesign::open(Path::new(&session.workspace))?;
-                    design.baseline = fresh.baseline;
-                    design.baseline_calls = fresh.baseline_calls;
-                }
                 self.plan_file
                     .prepare_entry(&self.session_id, objective, Some(document), now_ms)?
             }

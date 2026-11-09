@@ -34,7 +34,8 @@ def main [] {
   mkdir $template
   ^git -C $template init -q
   # Matches `git_repository()` in `crates/forge-harness/src/broker/test/test_support.rs`.
-  "[core]\n\tautocrlf = false\n[user]\n\temail = harness@example.invalid\n\tname = Harness Test\n"
+  # A user-level fsmonitor setting creates a socket that cannot be copied into fixtures.
+  "[core]\n\tautocrlf = false\n\tfsmonitor = false\n[user]\n\temail = harness@example.invalid\n\tname = Harness Test\n"
   | save --append ($template | path join ".git" "config")
   "seed\n" | save ($template | path join "seed.txt")
   ^git -C $template add .

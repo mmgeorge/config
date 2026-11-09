@@ -7,6 +7,77 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Exercise the real mock-provider file boundary, immutable submission, and dirty-draft guard.
+#[tokio::test]
+async fn directory_planning_submits_real_files_and_preserves_review_snapshot() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"allow-draft-files","text":"/yolo"}),
+            },
+            &sink,
+        )
+        .await?;
+    service.dispatch(Some(session_id.clone()), Request {
+        id: 3, method: "session.prompt.submit".into(),
+        params: json!({"operation_id":"directory-plan","text":"/plan Add an isolated callable"}),
+    }, &sink).await?;
+    let plan = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = controller.task_controller.current()?;
+            if let Some(task) = current
+                && let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow
+                && plan.artifact.state == crate::plan::PlanState::AwaitingReview
+                && controller.coordinator.execution.available_permits() == 1
+            {
+                break Ok::<_, anyhow::Error>(plan.artifact.clone());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("filesystem planning never reached review")??;
+    let files = crate::plan::PlanFileStore::new(&controller.data_root, root.path())?;
+    let directory = files.authoring_directory(&session_id, &plan.id);
+    assert_eq!(std::fs::read_dir(&directory)?.count(), 2);
+    let proposal = directory.join("files/src/change.rs");
+    assert!(std::fs::read_to_string(&proposal)?.contains("pub fn requested_change();"));
+    let accepted_candidate =
+        files.read_submitted_document(&session_id, &plan.id, plan.model_revision)?;
+    files.authoring_require_current(&session_id, &accepted_candidate)?;
+    std::fs::write(&proposal, "/// Revise the proposal.\npub fn changed();\n")?;
+    assert!(
+        files
+            .authoring_require_current(&session_id, &accepted_candidate)
+            .is_err()
+    );
+    assert_eq!(
+        files.read_submitted_document(&session_id, &plan.id, plan.model_revision)?,
+        accepted_candidate
+    );
+    controller.finish_exchange_owner().await?;
+    reader.abort();
+    let result = reader.await;
+    assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+    Ok(())
+}
+
 fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
     let operation = format!("{transport}-{command}-{id}");
     let text = if command == "goal" {

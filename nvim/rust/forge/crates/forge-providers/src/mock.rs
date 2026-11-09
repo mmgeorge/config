@@ -2906,6 +2906,9 @@ async fn run_prompt_inner(
                     return Err(error);
                 }
             }
+            TestPromptStep::FileWrite { path, text } => {
+                run_file_write(&session, request, &sink, &turn, path, text).await?;
+            }
         }
     }
     let terminal = script.terminal.clone();
@@ -3008,6 +3011,13 @@ async fn accept_prompt(
 /// version those edits produce. Turns without plan tools or a readable design keep the plain
 /// response.
 fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> {
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool.name == "plan_capture_file")
+    {
+        return directory_planning_steps(request, prompt);
+    }
     let has_plan_tools = ["plan_edit", "plan_submit"]
         .iter()
         .all(|name| request.tools.iter().any(|tool| tool.name == *name));
@@ -3076,6 +3086,125 @@ fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> 
         }),
     });
     steps
+}
+
+/// Draft through normal files using the directory and plan identity supplied by the host.
+fn directory_planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> {
+    let Some(directory) = request
+        .configuration
+        .access
+        .effective_write_roots
+        .as_ref()
+        .and_then(|roots| roots.first())
+    else {
+        return Vec::new();
+    };
+    let Some(plan_id) = [prompt, request.instructions.as_str()]
+        .into_iter()
+        .find_map(|text| {
+            text.split_once("Active plan `")
+                .and_then(|(_, rest)| rest.split_once('`'))
+                .map(|(id, _)| id)
+        })
+    else {
+        return Vec::new();
+    };
+    let overview = format!(
+        "# Implement the requested change\n\n## Objective\nImplement the requested behavior.\n\n## Background\nThe mock provider prepared this design for submission {}.\n\n## Design\nApply the behavior at its owning boundary.\n\n## Manual checks\n- Confirm the requested interface behaves as designed.\n",
+        request.submission_id.as_str(),
+    );
+    vec![
+        TestPromptStep::FileWrite {
+            path: std::path::Path::new(directory).join("docs/overview.md").to_string_lossy().into_owned(),
+            text: overview,
+        },
+        TestPromptStep::FileWrite {
+            path: std::path::Path::new(directory).join(format!("files/{MOCK_DECLARATION_PATH}")).to_string_lossy().into_owned(),
+            text: "/// Apply the requested behavior.\npub fn requested_change();\nAlgorithm\n  return none\n".into(),
+        },
+        TestPromptStep::ToolCall {
+            name: "plan_submit".into(),
+            arguments: serde_json::json!({"plan_id": plan_id}),
+        },
+    ]
+}
+
+/// Authorize and report a native file edit through the same provider boundary as real editors.
+async fn run_file_write(
+    session: &MockSession,
+    request: &PromptRequest,
+    sink: &AdapterActivityWriter,
+    turn: &TurnAddress,
+    path: String,
+    text: String,
+) -> Result<(), ProviderError> {
+    ensure_open(session, ProviderOperation::TurnStart)?;
+    request.permissions.before_tool(&request.scope).await?;
+    let permission = PermissionRequest {
+        id: uuid::Uuid::new_v4().to_string(),
+        provider: ProviderId::new("mock").expect("static provider identity is valid"),
+        reason: None,
+        target_list: vec![PermissionTarget::Write { path: path.clone() }],
+    };
+    if !matches!(
+        request
+            .permissions
+            .authorize(&request.scope, permission)
+            .await,
+        PermissionResponse::Allow
+    ) {
+        return Err(failure(
+            ProviderOperation::TurnStart,
+            ProviderFailureKind::Authorization,
+        ));
+    }
+    let item_id =
+        ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated identity is nonempty");
+    let descriptor = ToolDescriptor {
+        semantics: Default::default(),
+        name: "write_file".into(),
+        title: format!("Write {path}"),
+        arguments: InspectableArguments::new(serde_json::json!({"path": path})),
+    };
+    sink.send_wait(AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: item_id.clone(),
+        event: ItemEvent::Started(ItemStart::FileChange(descriptor)),
+    })
+    .await?;
+    let destination = std::path::Path::new(&path);
+    let kind = if destination.exists() {
+        ProviderChangeKind::Update
+    } else {
+        ProviderChangeKind::Add
+    };
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
+    }
+    std::fs::write(destination, text)
+        .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
+    sink.send_wait(AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id,
+        event: ItemEvent::Completed(ItemCompletion::FileChange(ToolCompletion {
+            outcome: ToolOutcome::Succeeded,
+            descriptor: None,
+            output: None,
+            changes: ProviderChangeSet {
+                file: vec![ProviderFileChange {
+                    path,
+                    move_path: None,
+                    kind,
+                    diff: String::new(),
+                }],
+            },
+        })),
+    })
+    .await?;
+    Ok(())
 }
 
 /// Workspace-relative declaration file that the mock planner adds.

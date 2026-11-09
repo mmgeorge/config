@@ -21,11 +21,14 @@ Inside Harness, run the configured checks instead of these commands:
 | Read-only formatting | `rust-format`, or `rust-format-workspace` for shared configuration |
 | Apply formatting | `rust-format-fix`, then restart from the type check |
 | Lint | `rust-lint` |
+| Lint one library without dependency diagnostics | `rust-lint-no-deps` with an explicit `package` |
 | Build | `rust-build` |
 
 No check declares a dependency on the build. Lua tests that launch the Forge host assume a current executable, so run `rust-build` after Rust changes and before `lua-test`. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
+
+`rust-lint-no-deps` keeps warnings fatal in the selected library while omitting diagnostics from dependencies. Use it to distinguish modified-library findings from a recorded baseline failure in another crate; it does not replace or weaken `rust-lint`.
 
 ## Build the executable
 

@@ -122,6 +122,18 @@ impl PlanReferenceIndex {
         let mut output = Self::default();
         let mut lua_function = BTreeMap::<(String, String), (u32, u32)>::new();
         let mut lua_index = BTreeMap::new();
+        let mut removed_symbol = BTreeSet::new();
+        if !baseline {
+            for (path, file) in &design.baseline {
+                if !design.proposed_source.contains_key(path)
+                    && forge_diff::syntax::ConfigurationFormat::for_path(path).is_none()
+                {
+                    let previous = DeclarationIndex::extract(path, &file.text)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    removed_symbol.extend(previous.symbol.iter().map(symbol_key));
+                }
+            }
+        }
         for (path, text) in files.iter().filter(|(path, _)| path.ends_with(".lua")) {
             let index = std::sync::Arc::new(
                 DeclarationIndex::extract(path, text)
@@ -171,11 +183,14 @@ impl PlanReferenceIndex {
                     .map(|file| DeclarationIndex::extract(origin, &file.text))
                     .transpose()
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                let existing = previous
+                let mut existing = previous
                     .iter()
                     .flat_map(|index| &index.symbol)
                     .map(symbol_key)
                     .collect::<BTreeSet<_>>();
+                if !design.baseline.contains_key(path) {
+                    existing.extend(removed_symbol.iter().cloned());
+                }
                 if let Some(file) = design.baseline.get(origin) {
                     output
                         .baseline_digest

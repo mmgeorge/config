@@ -92,6 +92,7 @@ impl ObservedTools {
                         &invocation,
                         &error,
                         outcome.plan_document.as_ref(),
+                        None,
                     )),
                 },
                 Err(_) => Err(rejected()),
@@ -701,6 +702,11 @@ impl HostInvocation {
                 &invocation,
                 error,
                 outcome.plan_document.as_ref(),
+                self.template
+                    .plan_authoring
+                    .as_ref()
+                    .map(|authoring| authoring.directory())
+                    .as_deref(),
             ),
         };
         let batch = self.completion.publish_batch(completion)?;

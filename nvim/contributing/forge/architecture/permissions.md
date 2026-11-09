@@ -10,6 +10,8 @@ These scopes authorize the operations a provider reports. They do not sandbox ev
 
 `HarnessSession` keeps two independent settings. `AccessPolicy` holds the read scope (Workspace or Full), the write scope (Off, Workspace, or Full), and extra directory lists. `ApprovalMode` is Ask, Deny, or Allow. New interactive sessions use full reads, workspace writes, and Ask. Resumption restores the stored selections, Background generation disables writes, and forks copy the source's access.
 
+Filesystem planning adds an invocation-only `effective_write_roots` restriction for its authoring directory, without changing saved user access preferences. Directory evaluation rejects reported writes outside that root even under Full or Allow, and write-off still rejects capture and ordinary file writes. Baselines and host snapshots remain outside the writable root; read access does not make them editable.
+
 `PermissionChange` resolves the permission commands through the task transition coordinator. `/yolo` selects full reads and writes, Allow, and sandbox off together, and repeating it switches back to Ask and re-enables the sandbox where the provider supports it.
 
 ## Evaluation order

@@ -112,7 +112,7 @@ impl DeclarationDiagnosticKind {
                 "Rewrite the reported Algorithm text as assignments, calls, and control flow; keep explanations in # comments."
             }
             Self::BehaviorBlock => {
-                "Use an Algorithm block for a new callable and a Change block for an existing callable."
+                "Use at most one behavior block: Algorithm for new behavior, Change for modified behavior, and neither for unchanged behavior. Supplied Algorithms must be nonempty and syntactically valid."
             }
             Self::DeclarationStructure => {
                 "Patch the reported line: place the behavior block directly below its signature and give each callable at most one Algorithm or Change."

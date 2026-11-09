@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 /// Disposable-state contract shared by databases, journals, plans, and captured files.
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 17;
 
 /// Pin one executable's state version until its final storage user releases it.
 #[derive(Clone)]
@@ -165,6 +165,11 @@ mod tests {
         let old = root.path().join("state/v1");
         fs::create_dir_all(old.join("objects"))?;
         fs::write(old.join("objects/retained"), "captured file")?;
+        fs::create_dir_all(old.join("plan-workspaces/session/plan/files"))?;
+        fs::write(
+            old.join("plan-workspaces/session/plan/files/retained.rs"),
+            "pub fn retained();",
+        )?;
         let old_owner = version_lock(root.path(), 1)?;
         old_owner.lock_shared()?;
         let mut store = SqliteStore::open(root.path())?;
@@ -258,6 +263,10 @@ mod tests {
         assert!(!locked.current_cleared);
         assert_eq!(locked.retained.len(), 2);
         assert!(old.join("objects/retained").is_file());
+        assert!(
+            old.join("plan-workspaces/session/plan/files/retained.rs")
+                .is_file()
+        );
         assert_persistent_settings()?;
         drop(store);
 
@@ -266,6 +275,10 @@ mod tests {
         assert_eq!(partial.removed, vec![directory(root.path())]);
         assert_eq!(partial.retained.len(), 1);
         assert!(old.join("objects/retained").is_file());
+        assert!(
+            old.join("plan-workspaces/session/plan/files/retained.rs")
+                .is_file()
+        );
         assert_eq!(pins.load("mock")?, vec!["chosen-model"]);
         assert_persistent_settings()?;
         drop(old_owner);

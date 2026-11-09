@@ -41,7 +41,12 @@ pub(super) async fn apply_edit(
             .entry(path.clone())
             .or_insert_with(|| digest.clone());
     }
-    let updated = document.patch_design(workspace, request.clone())?;
+    let mut updated = document.patch_design(workspace, request.clone())?;
+    if runtime.context.execution.is_some()
+        && let Some(design) = &mut updated.design
+    {
+        design.authoring_fingerprint = None;
+    }
     if updated.version == document.version {
         return Ok(ControlToolResult {
             invocation: None,

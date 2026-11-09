@@ -516,8 +516,15 @@ async fn direct_input_during_dispatch_waits_for_the_send() -> Result<()> {
         fixture.settle().await;
         fixture.release(HeldSendEnd::Confirm);
         submitted.await??;
-        fixture.settle().await;
-        let sent: Vec<String> = std::iter::from_fn(|| fixture.dispatches.try_recv().ok()).collect();
+        let mut sent = Vec::new();
+        while let Some(text) = fixture.dispatches.recv().await {
+            let second_dispatched = text.ends_with("Second prompt");
+            sent.push(text);
+            if second_dispatched {
+                break;
+            }
+        }
+        sent.extend(std::iter::from_fn(|| fixture.dispatches.try_recv().ok()));
         for prompt in ["First prompt", "Second prompt"] {
             assert_eq!(
                 sent.iter().filter(|text| text.ends_with(prompt)).count(),

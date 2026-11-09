@@ -94,6 +94,14 @@ impl HarnessBroker {
                 &document,
             )?;
         }
+        if !self
+            .plan_file
+            .authoring_directory(&self.session.id, &plan_id)
+            .exists()
+        {
+            self.plan_file
+                .authoring_create(&self.session.id, &document)?;
+        }
         PlanStateMachine::apply(&mut plan, PlanEvent::ChecksConfigured, self.clock.now_ms())?;
         let task = self
             .task_controller

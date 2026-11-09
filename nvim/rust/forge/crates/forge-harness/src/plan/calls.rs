@@ -557,22 +557,6 @@ pub(super) fn validate_behaviors(
     let mut diagnostics = Vec::new();
     let parsed = design.parsed()?;
     for (path, text) in &parsed.proposed {
-        let original_path = design
-            .moved
-            .iter()
-            .find(|(_, destination)| *destination == path)
-            .map_or(path, |(original, _)| original);
-        let original = design
-            .baseline
-            .get(original_path)
-            .map(|file| DeclarationCalls::extract(original_path, &file.text, true))
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?
-            .unwrap_or_default();
-        let original_owner = original
-            .iter()
-            .map(|function| function.owner.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
         let proposed = DeclarationCalls::extract(path, text, true)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         for function in proposed {
@@ -588,28 +572,20 @@ pub(super) fn validate_behaviors(
                 .flatten()
                 .find(|body| body.owner == function.owner);
             let behavior = body.and_then(|body| body.behavior.as_ref());
-            if original_owner.contains(function.owner.as_str()) {
-                if matches!(behavior, Some(FunctionBehavior::Algorithm(_))) {
-                    callable.push(
-                        DeclarationDiagnosticKind::BehaviorBlock,
-                        &function.owner,
-                        format!(
-                            "existing callable {} uses Change, not Algorithm",
-                            function.owner
-                        ),
-                    );
-                }
-                continue;
-            }
-            let Some(FunctionBehavior::Algorithm(algorithm)) = behavior else {
+            if let Some(FunctionBehavior::Change(change)) = behavior
+                && change.trim().is_empty()
+            {
                 callable.push(
                     DeclarationDiagnosticKind::BehaviorBlock,
                     &function.owner,
                     format!(
-                        "new callable {} requires a nonempty Algorithm block",
+                        "Change for {} must describe its intended behavior",
                         function.owner
                     ),
                 );
+                continue;
+            }
+            let Some(FunctionBehavior::Algorithm(algorithm)) = behavior else {
                 continue;
             };
             if algorithm.trim().is_empty() {
@@ -978,6 +954,77 @@ fn report_score(session: &RunSession);
                 );
             }
         }
+    }
+
+    /// Validate provided Algorithms without inferring classification from baseline file identity.
+    #[test]
+    fn behavior_classification_belongs_to_the_authored_block() {
+        let mut design = DeclarationDesign::scratch(std::collections::BTreeMap::from([(
+            "renamed.rs".into(),
+            "pub fn existing();\npub fn modified();\npub fn unchanged();\n".into(),
+        )]))
+        .unwrap();
+        design.baseline.insert(
+            "original.rs".into(),
+            crate::plan::DeclarationFile::new(
+                "original.rs",
+                "pub fn existing();\n".into(),
+                "original-source".into(),
+                &[],
+            )
+            .unwrap(),
+        );
+        design.parsed_mut().unwrap().proposed_calls.insert(
+            "renamed.rs".into(),
+            vec![
+                body("existing", "return none"),
+                FunctionBody {
+                    owner: "modified".into(),
+                    behavior: Some(FunctionBehavior::Change(
+                        "Preserve the caller contract.".into(),
+                    )),
+                },
+            ],
+        );
+        assert!(validate_behaviors(&design).unwrap().is_empty());
+        design
+            .parsed_mut()
+            .unwrap()
+            .proposed_calls
+            .get_mut("renamed.rs")
+            .unwrap()[1]
+            .behavior = Some(FunctionBehavior::Change(String::new()));
+        assert!(
+            validate_behaviors(&design)
+                .unwrap()
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.kind == DeclarationDiagnosticKind::BehaviorBlock
+                        && diagnostic.reference == "modified"
+                )
+        );
+        design
+            .parsed_mut()
+            .unwrap()
+            .proposed_calls
+            .get_mut("renamed.rs")
+            .unwrap()[1]
+            .behavior = Some(FunctionBehavior::Change(
+            "Preserve the caller contract.".into(),
+        ));
+        design
+            .parsed_mut()
+            .unwrap()
+            .proposed_calls
+            .get_mut("renamed.rs")
+            .unwrap()[0] = body("existing", "prose is not a statement");
+        let diagnostics = validate_behaviors(&design).unwrap();
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind == DeclarationDiagnosticKind::AlgorithmSyntax)
+        );
     }
 
     #[test]

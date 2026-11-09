@@ -1660,11 +1660,18 @@ impl HarnessBroker {
         let Some(current) = self.task_controller.current()? else {
             return Ok(Vec::new());
         };
+        let document = self
+            .plan_file
+            .read_working_document(&self.session.id, &context.plan_id)?;
+        let (draft_changed, draft_dirty) = self
+            .plan_file
+            .authoring_progress(&self.session.id, &document)?;
         let observed = match self.task_controller.observe_plan_response(
             &mut self.store,
             &current.permit(),
             interaction,
-            progressed,
+            progressed || draft_changed,
+            draft_dirty,
             self.clock.now_ms(),
         ) {
             Ok(observed) => observed,

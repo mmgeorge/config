@@ -5,7 +5,7 @@ use super::super::{
 use super::test_support::{
     PreparationProbe, checkpoint_fixture, git_repository, planning_question_broker, repository,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,9 +148,25 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         let session_id = broker.session.id.clone();
         let cancellation = broker.turn_cancellation();
         cancellation.arm();
+        let (settled, mut completion) = tokio::sync::watch::channel(false);
         let observe = async {
-            preparation.started.notified().await;
             let mut published = false;
+            let preparing = preparation.started.notified();
+            tokio::pin!(preparing);
+            // Admission may flush its publication before native preparation begins.
+            loop {
+                tokio::select! {
+                    () = &mut preparing => break,
+                    changed = completion.changed() => {
+                        changed?;
+                        anyhow::ensure!(!*completion.borrow(), "turn settled before preparation was admitted");
+                    }
+                    update = stream.recv() => {
+                        let update = update?.context("publication closed before preparation")?;
+                        published |= matches!(update, SessionUpdate::ExecutionState { .. });
+                    }
+                }
+            }
             while let Ok(event) = stream.try_recv() {
                 published |= matches!(event, SessionUpdate::ExecutionState { .. });
             }
@@ -161,22 +177,40 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             assert_eq!(exchange[0].state(), ExchangeState::Running);
             assert_eq!(exchange[0].prompt, "Visible before provider preparation");
             assert!(!tool_ran.load(Ordering::SeqCst));
+            drop(store);
             if outcome == "cancel" {
                 cancellation.request();
             } else {
                 preparation.release.notify_one();
             }
+            // Publication flushes require a consumer through the end of settlement.
+            while !*completion.borrow() {
+                tokio::select! {
+                    changed = completion.changed() => { changed?; },
+                    update = stream.recv() => {
+                        if update?.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
             Ok::<_, anyhow::Error>(())
         };
         let (result, observed) = async {
             tokio::join!(
-                broker.run_interaction(
-                    "Visible before provider preparation".into(),
-                    PromptMode::Chat,
-                    Some(ExchangeAdmission::chat(
-                        "Visible before provider preparation".into()
-                    )),
-                ),
+                async {
+                    let result = broker
+                        .run_interaction(
+                            "Visible before provider preparation".into(),
+                            PromptMode::Chat,
+                            Some(ExchangeAdmission::chat(
+                                "Visible before provider preparation".into(),
+                            )),
+                        )
+                        .await;
+                    settled.send_replace(true);
+                    result
+                },
                 observe
             )
         }

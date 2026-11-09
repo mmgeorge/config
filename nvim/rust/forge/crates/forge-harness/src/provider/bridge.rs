@@ -986,6 +986,7 @@ impl ProviderBridge {
                 ProviderFailureKind::Rejected,
             ))
         })?;
+        context.file_permissions = Some(permissions.clone());
         let endpoint = Arc::new(ControlSession::new(tools.clone()));
         endpoint.begin(context.clone(), sink).await;
         let server = ControlServer::start(endpoint.clone())

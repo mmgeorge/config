@@ -24,14 +24,13 @@ pub enum PromptMode {
 impl PromptMode {
     /// Project the workflow onto the provider-neutral execution posture.
     ///
-    /// Plan drafting, discussion, and review questions are read-only design work, so they ask
-    /// for the provider's native planning posture when one exists.
+    /// Draft authoring needs ordinary file tools; only review questions request native read-only planning.
     pub fn execution(self) -> forge_provider_api::ExecutionMode {
         match self {
-            Self::Plan | Self::PlanDiscussion | Self::PlanQuestion => {
-                forge_provider_api::ExecutionMode::Planning
-            }
+            Self::PlanQuestion => forge_provider_api::ExecutionMode::Planning,
             Self::Background
+            | Self::Plan
+            | Self::PlanDiscussion
             | Self::Chat
             | Self::ExecutePlan
             | Self::GoalContinuation

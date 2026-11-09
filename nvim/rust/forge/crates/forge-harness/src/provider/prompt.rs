@@ -36,10 +36,10 @@ impl ProviderRequest {
                 "Answer the current request. This interaction does not start, clear, or complete a Harness task."
             }
             PromptMode::Plan => {
-                "Create or revise the supplied Plan task. Edit virtual proposals only, then submit them for review."
+                "Create or revise the supplied Plan task. Edit only its planning directory with ordinary file tools, then submit it for review."
             }
             PromptMode::PlanDiscussion => {
-                "Discuss the active plan. Edit virtual proposals only when the user requests a revision, and do not implement the plan."
+                "Discuss the active plan. Edit its planning directory only when the user requests a revision, and do not implement the plan."
             }
             PromptMode::PlanQuestion => {
                 "Answer the plan review question in this forked session with a concise final response, which Harness saves on the original question. Do not edit, submit, implement, or ask follow-up questions."
@@ -63,6 +63,12 @@ impl ProviderRequest {
         } else {
             ""
         };
+        let authoring = self
+            .control_context
+            .as_ref()
+            .and_then(|context| context.plan_authoring.as_ref())
+            .map(|scope| format!("\n{}", scope.prompt()))
+            .unwrap_or_default();
         let shell = self
             .control_context
             .as_ref()
@@ -87,7 +93,7 @@ impl ProviderRequest {
             String::new()
         };
         format!(
-            "{}Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live check_editing, automatic_checks, and check_timing settings, because the user can change them during the conversation. When check_editing is true, use the harness-checks skill to configure checks and submit changes with check_definition_edit, which follows the selected tool approval mode. When it is false, only the user can enable it with /checks edit on. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks; only Verify may run a check that a manual action requires with check_run. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{harness}",
+            "{}Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}{authoring}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live check_editing, automatic_checks, and check_timing settings, because the user can change them during the conversation. When check_editing is true, use the harness-checks skill to configure checks and submit changes with check_definition_edit, which follows the selected tool approval mode. When it is false, only the user can enable it with /checks edit on. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks; only Verify may run a check that a manual action requires with check_run. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{harness}",
             self.lsp_guidance(),
             self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")

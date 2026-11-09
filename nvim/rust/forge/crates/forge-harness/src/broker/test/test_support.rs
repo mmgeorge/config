@@ -209,6 +209,7 @@ pub(in crate::broker) fn git_repository() -> tempfile::TempDir {
     config.push_str(
         "[core]
 	autocrlf = false
+	fsmonitor = false
 [user]
 	email = harness@example.invalid
 	name = Harness Test

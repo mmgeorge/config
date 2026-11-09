@@ -30,12 +30,13 @@ pub(super) fn definition() -> ControlToolDefinition {
             vec![
                 ("plan_id", string_schema()),
                 ("reason", string_schema()),
+                ("authoring_snapshot", string_schema()),
                 (
                     "expected_version",
                     json!({ "type": "integer", "minimum": 1 }),
                 ),
             ],
-            &["plan_id", "expected_version"],
+            &["plan_id"],
         ),
     }
 }
@@ -43,10 +44,60 @@ pub(super) fn definition() -> ControlToolDefinition {
 /// Execute plan_submit within the current turn authority.
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
-    invocation: crate::tools::ControlToolInvocation,
+    mut invocation: crate::tools::ControlToolInvocation,
     output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     runtime.require_editable_plan()?;
+    crate::tools::error::ensure!(
+        invocation.arguments.get("authoring_snapshot").is_none(),
+        "authoring snapshot identities are owned by Harness, not tool arguments"
+    );
+    if let Some(authoring) = runtime.context.plan_authoring.clone() {
+        crate::tools::error::ensure!(
+            invocation.arguments.get("expected_version").is_none()
+                && invocation.arguments.get("reason").is_none(),
+            "planning submission takes only the plan ID; omit expected_version and reason"
+        );
+        let requested = invocation.arguments["plan_id"]
+            .as_str()
+            .context("submission requires a plan ID")?;
+        let (original, mut document) = authoring.snapshot()?;
+        runtime.plan_document = Some(document.clone());
+        crate::tools::error::ensure!(
+            document.plan_id == requested,
+            "submitted plan id does not match the active plan"
+        );
+        let workspace = runtime
+            .context
+            .workspace_root
+            .as_deref()
+            .context("submission requires a workspace")?;
+        let validated = document
+            .design
+            .as_ref()
+            .context("submission requires semantic structure")?
+            .validated(workspace, &document.title)
+            .await?;
+        let warnings = grouped_warnings(validated.warnings());
+        document.design = Some(validated.into_design());
+        document.validate_for_submission()?;
+        let snapshot = authoring.snapshot_save(&document)?;
+        invocation.arguments["expected_version"] = json!(original.version);
+        invocation.arguments["authoring_snapshot"] = json!(snapshot);
+        runtime.plan_document = Some(document);
+        runtime.context.plan_state = Some(PlanState::AwaitingReview);
+        return Ok(crate::tools::ControlToolResult {
+            invocation: Some(invocation),
+            message: format!(
+                "Planning directory submitted for review.{}",
+                if warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", warnings.join("\n"))
+                }
+            ),
+        });
+    }
     let submission = output
         .plan_submit
         .as_ref()

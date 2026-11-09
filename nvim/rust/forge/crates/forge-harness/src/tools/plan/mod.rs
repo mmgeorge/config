@@ -1,3 +1,4 @@
+mod capture;
 mod catalog;
 mod edit;
 mod phase_done;

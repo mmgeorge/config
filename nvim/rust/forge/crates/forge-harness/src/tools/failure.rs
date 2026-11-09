@@ -297,6 +297,7 @@ pub(crate) fn control_tool_failure_text(
     invocation: &ControlToolInvocation,
     error: &(dyn Error + 'static),
     document: Option<&PlanDocument>,
+    authoring_directory: Option<&std::path::Path>,
 ) -> String {
     let (phase, mut violation) = if let Some(argument_error) =
         find_error::<ControlToolArgumentError>(error)
@@ -397,7 +398,39 @@ pub(crate) fn control_tool_failure_text(
             }],
         )
     };
-    let active_version = document.map(|plan| plan.version);
+    let filesystem_planning = invocation.name == "plan_submit" && authoring_directory.is_some();
+    if filesystem_planning {
+        for item in &mut violation {
+            if let Some(fields) = item
+                .expected_shape
+                .as_mut()
+                .and_then(|shape| shape.get_mut("allowed_fields"))
+                .and_then(Value::as_array_mut)
+            {
+                fields.retain(|field| {
+                    !matches!(
+                        field.as_str(),
+                        Some("expected_version" | "authoring_snapshot" | "reason")
+                    )
+                });
+            }
+            if let Some(artifact) = item.path.strip_prefix("plan:") {
+                item.path = format!("docs/{artifact}");
+            } else if let Some(design) = document.and_then(|plan| plan.design.as_ref())
+                && design
+                    .proposed_source
+                    .keys()
+                    .any(|path| item.path == *path || item.path.starts_with(&format!("{path}:")))
+            {
+                item.path = format!("files/{}", item.path);
+            }
+        }
+    }
+    let active_version = if filesystem_planning {
+        None
+    } else {
+        document.map(|plan| plan.version)
+    };
     let code_hint = hoist_code_hints(&mut violation);
     let tool = invocation.name.as_str();
     let errors = match violation.len() {
@@ -438,6 +471,7 @@ pub(crate) fn control_tool_failure_text(
         "plan_edit" | "harness_plan_edit" => active_version.map(|version| {
             format!("No changes were applied. Fix them and retry with expected_version {version}.")
         }),
+        "plan_submit" if filesystem_planning => Some("Fix the reported files in the planning directory, then call plan_submit with the plan ID. No expected version is required.".into()),
         "plan_submit" => active_version
             .map(|version| format!("Fix them and retry with expected_version {version}.")),
         "plan_phase_done"

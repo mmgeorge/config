@@ -22,6 +22,7 @@ pub(crate) struct ControlReply {
 }
 
 struct ActiveControl {
+    authoring_directory: Option<std::path::PathBuf>,
     executor: Arc<ControlToolExecutor>,
     sink: HarnessEventSink,
     tools: std::collections::HashSet<String>,
@@ -108,6 +109,10 @@ impl ControlSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let active = Arc::new(ActiveControl {
+            authoring_directory: context
+                .plan_authoring
+                .as_ref()
+                .map(|authoring| authoring.directory()),
             executor: Arc::new(ControlToolExecutor::new(context)),
             sink,
             tools: self
@@ -267,6 +272,7 @@ impl ControlEndpoint for ControlSession {
                     &invocation,
                     &error,
                     outcome.plan_document.as_ref(),
+                    active.authoring_directory.as_deref(),
                 );
                 sink.send_host(HostEvent::Failure {
                     failure: forge_provider_api::ProviderFailure::new(

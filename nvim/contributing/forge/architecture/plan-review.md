@@ -10,6 +10,8 @@ PlanReview opens with one compact block snapshot. Modified files contribute chan
 
 Declaration comparisons first match unique Tree-sitter callable owners, then run the histogram matcher on the gaps between them. This follows Git's [patience](https://github.com/git/git/blob/c51408889c3b372814bc20b9431c3b74d0d268eb/xdiff/xpatience.c) approach, with callable identities as anchors. Removed-row navigation opens the previous proposal, or the source baseline on the first submission, and never the current worktree.
 
+The plan's `working_path` still identifies the host-owned rendered review, not the agent's authoring directory. The native controller requests schema inspection through its captured document owner; `review_document::action` serializes that reviewed document into a read-only buffer rather than loading the current draft. Later edits under `plan-workspaces` therefore change neither the displayed declarations nor the inspected schema.
+
 ## Navigation
 
 The PlanReview winbar shows review state, visibility, and only the `? help`
@@ -26,6 +28,8 @@ Inline-code identifiers in prose resolve against the complete proposed declarati
 ## Review edits
 
 Reviewers can rename declarations and delete tests in place. Renames preview every affected span. `session.plan.test.delete` removes only the selected inventory entries, and `session.plan.check.update` changes the plan's check selection through the same versioned path. Each edit validates the captured view and source version and returns an updated projection, so the review never reloads. Confirmed deletions show immediately and restore on failure.
+
+For directory-authored plans, reviewer edits update authored files through the same recoverable artifact transaction. The editable directory and rendered review remain separate: ordinary agent edits never rewrite an existing submitted review, and a dirty directory requires resubmission before acceptance. Intervening draft edits reject a reviewer write rather than being overwritten.
 
 The plan keeps an ordered `manual_changes` history, which acceptance, revision feedback, and resumed execution show to the agent. Each edit advances the review digest, while submitted snapshots stay unchanged. Accepting or requesting changes freezes one snapshot of the edited draft and records one revision.
 

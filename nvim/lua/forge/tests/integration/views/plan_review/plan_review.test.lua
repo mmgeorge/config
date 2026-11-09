@@ -6,8 +6,78 @@ local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
 local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
 local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
 local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+local host = dofile("nvim/lua/forge/tests/support/host.lua")
+local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+T["directory_planning"] = function()
+  local started = host.start({ config = true })
+  local workspace = temp.directory("planning-workspace")
+  vim.fn.writefile({ '{"checks":{}}' }, workspace .. "/.forge.json")
+  vim.api.nvim_set_current_dir(workspace)
+  require("forge").setup({ harness = { provider = "mock" }, diff_logging = false, harness_logging = false })
+  local state = require("forge.session").harness
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  require("forge.views.harness").open()
+  wait_until(function() return state.session ~= nil end, "planning host did not open", {
+    timeout_ms = 4000, errors = errors,
+    context = function() return tostring(started.client._client and started.client._client.stderr) end,
+  })
+
+  local function request(method, params)
+    local result, failure, done
+    started.client.request({ method = method, params = params, session_id = state.session.id },
+      function(value, problem) result, failure, done = value, problem, true end)
+    wait_until(function() return done end, method .. " did not settle")
+    assert(not failure, tostring(failure))
+    return result
+  end
+  request("session.prompt.submit", { operation_id = "planning-access", text = "/yolo" })
+  request("session.prompt.submit", { operation_id = "planning-draft", text = "/plan Add an isolated callable" })
+  local plan
+  wait_until(function()
+    local task = state.session.active_task
+    plan = task and task.plan and task.plan.artifact or nil
+    return plan and plan.state == "awaiting_review"
+  end, "physical draft did not reach review", { errors = errors,
+    context = function() return vim.inspect(state.session.active_task) end })
+
+  local directory_list = vim.fn.glob(vim.fs.joinpath(started.data, "**", "plan-workspaces", state.session.id, plan.id), true, true)
+  MiniTest.expect.equality(#directory_list, 1)
+  local directory = directory_list[1]
+  local entry_list = vim.fn.readdir(directory)
+  table.sort(entry_list)
+  MiniTest.expect.equality(entry_list, { "docs", "files" })
+  local proposal = vim.fs.joinpath(directory, "files", "src", "change.rs")
+  assert(table.concat(vim.fn.readfile(proposal), "\n"):find("requested_change", 1, true))
+  assert(not plan.working_path:find(directory, 1, true), "review storage aliases the editable draft")
+  assert(vim.fn.filereadable(workspace .. "/src/change.rs") == 0, "planning wrote repository implementation")
+
+  require("forge.views.plan_review.native_controller").open(plan)
+  wait_until(function()
+    local review = state.plan_review
+    return review and buffer.text(review.buf):find("requested_change", 1, true)
+  end, "submitted declarations did not render", { errors = errors })
+  local review = state.plan_review
+  assert(not vim.bo[review.buf].modifiable, "reviewed declarations became an editable proposal")
+  local function schema()
+    local result, failure, done
+    review.owner.action("schema", function(value, problem) result, failure, done = value, problem, true end)
+    wait_until(function() return done end, "review schema did not settle")
+    assert(not failure, tostring(failure))
+    assert(result.schema, "review action omitted its captured schema")
+    return result.schema.block
+  end
+  local submitted_schema = schema()
+  assert(vim.json.encode(submitted_schema):find("requested_change", 1, true), "schema omitted the submitted declarations")
+  local submitted_lines = buffer.lines(review.buf)
+  vim.fn.writefile({ "/// Revise the proposal.", "pub fn changed();" }, proposal)
+  MiniTest.expect.equality(schema(), submitted_schema)
+  MiniTest.expect.equality(buffer.lines(review.buf), submitted_lines)
+  errors:assert_none()
+  assert(host.stop(), "planning host did not stop")
+end
 
 T["plan_optimistic_edit"] = function()
   local preview = require("forge.views.plan_review.test_preview")

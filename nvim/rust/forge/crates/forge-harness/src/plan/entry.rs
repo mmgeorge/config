@@ -15,6 +15,7 @@ impl PlanFileStore {
     ) -> Result<PreparedPlan> {
         anyhow::ensure!(!request.trim().is_empty(), "task objective is required");
         let checks_ready = crate::checks::ConfigSnapshot::load(&self.workspace).is_ok();
+        let seeded = document.is_some();
         let mut document = document.unwrap_or_else(|| PlanDocument {
             schema_version: PLAN_SCHEMA_VERSION,
             version: 1,
@@ -37,6 +38,34 @@ impl PlanFileStore {
             document.title = request.lines().next().unwrap_or_default().into();
             document.overview = request.clone();
         }
+        // Capture fresh evidence for an explicitly forked or replanned document.
+        if seeded && let Some(design) = &mut document.design {
+            let previous_source = design.source_fingerprint()?;
+            let paths = design
+                .baseline
+                .keys()
+                .chain(design.proposed_source.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut baseline = std::collections::BTreeMap::new();
+            for path in paths {
+                if let Some(source) = workspace_source(&self.workspace, &path)? {
+                    let (file, _) = design.capture_baseline(&path, &source)?;
+                    baseline.insert(path, file);
+                }
+            }
+            design.baseline = baseline;
+            design.baseline_calls.clear();
+            design.moved.clear();
+            design.cargo_lock.clear();
+            design.check_configuration = None;
+            design.check_preview.clear();
+            design.check_preview_source.clear();
+            design.authoring_fingerprint = None;
+            if design.source_fingerprint()? != previous_source {
+                design.parsed = None;
+            }
+        }
         let instruction = if checks_ready {
             PlanPrompt::with_active_plan(PlanPrompt::draft(&request), &document)
         } else {
@@ -44,6 +73,16 @@ impl PlanFileStore {
         };
         let working_path =
             self.create_working_document(session_id, &document.plan_id, &document)?;
+        self.authoring_create(session_id, &document)?;
+        let instruction = if checks_ready {
+            format!(
+                "Planning directory: {}\n\n{instruction}",
+                self.authoring_directory(session_id, &document.plan_id)
+                    .display()
+            )
+        } else {
+            instruction
+        };
         Ok(PreparedPlan {
             record: PlanRecord {
                 id: document.plan_id,

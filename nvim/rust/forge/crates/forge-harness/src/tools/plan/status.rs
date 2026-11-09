@@ -42,6 +42,12 @@ pub(super) async fn execute(
             active: document.plan_id.clone(),
         });
     }
+    if let Some(authoring) = &runtime.context.plan_authoring {
+        return Ok(crate::tools::ControlToolResult {
+            invocation: Some(invocation),
+            message: authoring.status()?,
+        });
+    }
     let execution = execution_state(runtime).await?;
     Ok(crate::tools::ControlToolResult {
         invocation: Some(invocation),

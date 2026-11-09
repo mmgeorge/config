@@ -79,6 +79,9 @@ impl BrokerObserver {
         if document.version != plan.document_version || current_digest != digest {
             return Err(TaskCommandFailure::PlanChanged);
         }
+        self.plan_file
+            .authoring_require_current(&self.session_id, &document)
+            .map_err(|_| TaskCommandFailure::PlanChanged)?;
         let changed: Result<_> = async {
             match &edit.request().change {
                 PlanEditChange::RenameEntity {
@@ -753,6 +756,8 @@ impl BrokerObserver {
             );
         }
         let reviewed = self.capture_plan_review(&plan.id, &digest)?;
+        self.plan_file
+            .authoring_require_current(&self.session_id, &reviewed.document)?;
         if let Some(expected) = selection.saved_source_digest.as_deref() {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,

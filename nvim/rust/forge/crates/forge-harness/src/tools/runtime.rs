@@ -28,6 +28,9 @@ pub struct ControlTurnContext {
     pub(crate) task_generation: Option<u64>,
     pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
     pub(crate) permission_required: bool,
+    /// Authorize capture's source read and proposal write through the original invocation.
+    pub(crate) file_permissions:
+        Option<Arc<dyn forge_provider_api::permissions::ProviderPermissions>>,
     pub(crate) task_start: Option<crate::exchange::TaskStart>,
     pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
@@ -38,6 +41,8 @@ pub struct ControlTurnContext {
     pub check_shell: crate::session::CheckShell,
     pub plan_state: Option<PlanState>,
     pub plan_document: Option<PlanDocument>,
+    /// Limit filesystem authoring controls to the active planning directory.
+    pub(crate) plan_authoring: Option<crate::plan::PlanAuthoringScope>,
     pub resolved_question_digest_set: HashSet<String>,
     pub has_active_elicitation: bool,
     pub has_active_execution: bool,
@@ -134,6 +139,8 @@ impl ControlTurnContext {
         context.question_events = None;
         context.checks = None;
         context.execution = None;
+        context.plan_authoring = None;
+        context.file_permissions = None;
         Ok(context)
     }
 
@@ -262,6 +269,7 @@ impl ControlTurnContext {
             task_generation: None,
             permission_snapshot: None,
             permission_required: false,
+            file_permissions: None,
             task_start: None,
             submission_cancelled: None,
             checkpoint: None,
@@ -272,6 +280,7 @@ impl ControlTurnContext {
             check_shell: Default::default(),
             plan_state: None,
             plan_document: None,
+            plan_authoring: None,
             resolved_question_digest_set: HashSet::new(),
             has_active_elicitation: false,
             has_active_execution: false,
@@ -317,6 +326,12 @@ impl ControlToolRuntime {
     /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
         self.ensure_submission_active()?;
+        if self.context.plan_authoring.is_some() {
+            crate::tools::error::ensure!(
+                !matches!(invocation.name.as_str(), "plan_read" | "plan_edit"),
+                "planning uses ordinary file tools in its planning directory; capture existing files with plan_capture_file"
+            );
+        }
         if self.context.observed_file_changes.is_some()
             && !(super::lsp::is_tool(&invocation.name)
                 || super::repository::is_tool(&invocation.name))
@@ -381,6 +396,12 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         output: ProviderCompletion,
     ) -> Result<ControlToolResult> {
+        if self.context.plan_authoring.is_some() {
+            crate::tools::error::ensure!(
+                !matches!(invocation.name.as_str(), "plan_read" | "plan_edit"),
+                "planning uses ordinary file tools, not virtual plan reads or patches"
+            );
+        }
         self.ensure_submission_active()?;
         self.context.task_permit = self.context.current_task_permit()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
@@ -524,6 +545,167 @@ impl ControlToolRuntime {
 mod test {
     use super::*;
     use crate::provider::ScopeOwner;
+
+    enum CapturePermission {
+        Allow,
+        DenyRead,
+    }
+
+    #[async_trait::async_trait]
+    impl forge_provider_api::permissions::ProviderPermissions for CapturePermission {
+        /// Apply source-read authorization at the established permission callback boundary.
+        async fn authorize(
+            &self,
+            _scope: &forge_provider_api::InvocationScope,
+            request: forge_provider_api::permissions::PermissionRequest,
+        ) -> forge_provider_api::permissions::PermissionResponse {
+            use forge_provider_api::permissions::{PermissionResponse, PermissionTarget};
+            if matches!(self, Self::DenyRead)
+                && request
+                    .target_list
+                    .iter()
+                    .any(|target| matches!(target, PermissionTarget::Read { .. }))
+            {
+                PermissionResponse::Deny {
+                    reason: Some("Source reads are denied".into()),
+                }
+            } else {
+                PermissionResponse::Allow
+            }
+        }
+
+        /// Admit the fixture's already-ready checkpoint boundary.
+        async fn before_tool(
+            &self,
+            _scope: &forge_provider_api::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Exercise capture authorization, its fixed destination, and the filesystem-only planning catalog.
+    #[tokio::test]
+    async fn filesystem_capture_preserves_resource_authority_and_fixed_destination()
+    -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        crate::checks::configure_fixture(temporary.path());
+        std::fs::write(temporary.path().join("source.rs"), "pub fn existing() {}\n")?;
+        let files = Arc::new(crate::plan::PlanFileStore::new(
+            temporary.path().join("storage"),
+            temporary.path(),
+        )?);
+        let prepared = files.prepare_entry("session", "Revise a callable.".into(), None, 1)?;
+        let plan_id = prepared.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        let mut context = ControlTurnContext::inactive(PromptMode::Plan);
+        context.plan_state = Some(PlanState::Generating);
+        context.plan_document = Some(files.read_working_document("session", &plan_id)?);
+        context.workspace_root = Some(temporary.path().into());
+        context.plan_authoring = Some(crate::plan::PlanAuthoringScope::new(
+            files.clone(),
+            "session".into(),
+            plan_id.clone(),
+            crate::session::WriteScope::Workspace,
+        ));
+        context.question_invocation = Some(crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "capture",
+        ));
+        context.file_permissions = Some(Arc::new(CapturePermission::DenyRead));
+        let catalog =
+            super::super::ControlToolRegistry.definition_list_for_context(Some(&context), true);
+        assert!(catalog.iter().any(|tool| tool.name == "plan_capture_file"));
+        assert!(
+            !catalog
+                .iter()
+                .any(|tool| matches!(tool.name, "plan_read" | "plan_edit"))
+        );
+        let submit = catalog
+            .iter()
+            .find(|tool| tool.name == "plan_submit")
+            .unwrap();
+        assert!(
+            submit.input_schema["properties"]
+                .get("expected_version")
+                .is_none()
+        );
+        assert!(
+            submit.input_schema["properties"]
+                .get("authoring_snapshot")
+                .is_none()
+        );
+        assert!(submit.input_schema["properties"].get("reason").is_none());
+        let failed_submit = ControlToolInvocation {
+            call_id: None,
+            name: "plan_submit".into(),
+            arguments: serde_json::json!({"plan_id": plan_id}),
+            task_permit: None,
+        };
+        let failure = crate::tools::control_tool_failure_text(
+            &failed_submit,
+            &crate::tools::ToolError::Rejected("A required artifact is missing".into()),
+            context.plan_document.as_ref(),
+            Some(&directory),
+        );
+        assert!(!failure.contains("expected_version"));
+        assert!(failure.contains("planning directory"));
+        let invocation = |arguments| ControlToolInvocation {
+            call_id: None,
+            name: "plan_capture_file".into(),
+            arguments,
+            task_permit: None,
+        };
+        let mut runtime = ControlToolRuntime::new(context);
+        assert!(
+            runtime
+                .invoke(invocation(serde_json::json!({"path":"source.rs"})))
+                .await
+                .is_err()
+        );
+        assert!(!directory.join("files/source.rs").exists());
+        runtime.context.file_permissions = Some(Arc::new(CapturePermission::Allow));
+        assert!(
+            runtime
+                .invoke(invocation(
+                    serde_json::json!({"path":"source.rs","destination":"elsewhere.rs"})
+                ))
+                .await
+                .is_err()
+        );
+        let result = runtime
+            .invoke(invocation(serde_json::json!({"path":"source.rs"})))
+            .await?;
+        assert!(
+            result
+                .message
+                .contains(&directory.join("files/source.rs").display().to_string())
+        );
+        assert!(
+            std::fs::read_to_string(directory.join("files/source.rs"))?
+                .contains("pub fn existing();")
+        );
+        std::fs::write(directory.join("files/source.rs"), "pub fn edited();\n")?;
+        runtime
+            .invoke(invocation(serde_json::json!({"path":"source.rs"})))
+            .await?;
+        assert_eq!(
+            std::fs::read_to_string(directory.join("files/source.rs"))?,
+            "pub fn edited();\n"
+        );
+        runtime.context.plan_authoring = Some(crate::plan::PlanAuthoringScope::new(
+            files,
+            "session".into(),
+            plan_id,
+            crate::session::WriteScope::Off,
+        ));
+        assert!(
+            runtime
+                .invoke(invocation(serde_json::json!({"path":"source.rs"})))
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 
     /// Explicit retry permission still cannot replay a completed native or host effect.
     #[test]
@@ -844,7 +1026,7 @@ mod test {
         );
         let error = runtime.invoke(submit.clone()).await.unwrap_err();
         let failure =
-            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document());
+            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document(), None);
         assert!(
             failure.starts_with("plan_submit rejected version 4 with "),
             "{failure}"
@@ -1001,7 +1183,7 @@ mod test {
         );
         let error = runtime.invoke(submit.clone()).await.unwrap_err();
         let failure =
-            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document());
+            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document(), None);
         for expected in [
             "Game.rs:6:1: error[invalid_declaration_structure]:",
             "already has a behavior block",
@@ -1074,8 +1256,12 @@ mod test {
             "*** Begin Patch\n*** Update File: Game.rs\n@@\n-  for each turn in turns\n+  for each turn in rounds\n*** End Patch",
         );
         let error = runtime.invoke(mismatch.clone()).await.unwrap_err();
-        let failure =
-            crate::tools::control_tool_failure_text(&mismatch, &error, runtime.plan_document());
+        let failure = crate::tools::control_tool_failure_text(
+            &mismatch,
+            &error,
+            runtime.plan_document(),
+            None,
+        );
         for expected in [
             "Game.rs: chunk 1 does not match: its first line `  for each turn in turns` is not in the file",
             "No changes were applied. Fix them and retry with expected_version 7.",
@@ -1188,6 +1374,7 @@ mod test {
             check_shell: Default::default(),
             plan_state: Some(PlanState::Generating),
             plan_document: Some(crate::plan::test_fixture("plan", "Initial")),
+            plan_authoring: None,
             resolved_question_digest_set: HashSet::new(),
             has_active_elicitation: false,
             has_active_execution: false,
@@ -1198,6 +1385,7 @@ mod test {
             task_generation: None,
             permission_snapshot: None,
             permission_required: false,
+            file_permissions: None,
             repository: None,
             harness: None,
             lsp: None,

@@ -18,6 +18,9 @@ use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 /// Reserves the artifact namespace so it can never collide with a workspace path.
 pub(crate) const ARTIFACT_PREFIX: &str = "plan:";
 
+type ArtifactSection<'text> = (usize, Vec<(usize, &'text str)>);
+type ArtifactFlowBlock<'text> = (usize, &'text str, Vec<(usize, &'text str)>);
+
 /// Names one Harness-owned plan artifact addressed through the plan file tools.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PlanArtifact {
@@ -489,7 +492,7 @@ fn parse_overview(
 ) -> Option<String> {
     let mut title = None;
     let mut body = OverviewBody::Preamble;
-    let mut sections: BTreeMap<&'static str, (usize, Vec<(usize, &str)>)> = BTreeMap::new();
+    let mut sections: BTreeMap<&'static str, ArtifactSection<'_>> = BTreeMap::new();
     let mut fenced = false;
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
@@ -709,7 +712,7 @@ fn decision(number: usize, item: &str, report: &mut ArtifactReport<'_>) -> Optio
 
 /// Check every `## Title` flow block and return the flow Markdown unchanged.
 fn parse_flows(text: &str, report: &mut ArtifactReport<'_>) -> String {
-    let mut blocks: Vec<(usize, &str, Vec<(usize, &str)>)> = Vec::new();
+    let mut blocks: Vec<ArtifactFlowBlock<'_>> = Vec::new();
     let mut fenced = false;
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;

@@ -8,6 +8,8 @@ use self::edit_trace::{PlanEditTrace, measure};
 use crate::session::{ApprovalMode, continuation::ContinuationBudget};
 
 mod artifact_recovery;
+mod authoring;
+pub(crate) use authoring::PlanAuthoringScope;
 mod audit;
 mod comment_lint;
 pub(crate) mod conformance;
@@ -1136,6 +1138,7 @@ impl PlanFileStore {
     pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let lease = crate::storage::state::StateLease::open(&root)?;
+        let root = dunce::canonicalize(root)?;
         Ok(Self {
             _lease: lease,
             root,
@@ -1434,7 +1437,13 @@ impl PlanFileStore {
             "plan version changed before validated submission"
         );
         anyhow::ensure!(
-            document.plan_id == plan_id && document.version == expected_version,
+            document.plan_id == plan_id
+                && (document.version == expected_version
+                    || (document
+                        .design
+                        .as_ref()
+                        .is_some_and(|design| design.authoring_fingerprint.is_some())
+                        && expected_version.checked_add(1) == Some(document.version))),
             "validated document identity changed before submission"
         );
         if let Some(design) = &document.design {
@@ -1446,8 +1455,16 @@ impl PlanFileStore {
         }
         document.validate_for_submission()?;
         if let Some(design) = &mut document.design {
-            design.check_configuration =
-                Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
+            let configuration = crate::checks::ConfigSnapshot::load(&self.workspace)?;
+            anyhow::ensure!(
+                design.authoring_fingerprint.is_none()
+                    || design
+                        .check_configuration
+                        .as_ref()
+                        .is_none_or(|captured| captured == &configuration),
+                "configured checks changed during planning submission; submit the current draft again"
+            );
+            design.check_configuration = Some(configuration);
             let fingerprint = crate::declaration::fingerprint(design)?;
             let report = match design.parsed_mut()?.validation.take() {
                 Some(report) if report.fingerprint == fingerprint => report,
@@ -1485,6 +1502,7 @@ impl PlanFileStore {
             document,
             rendered,
         } = prepared;
+        self.authoring_require_current(&session_id, &document)?;
         self.persist_rendered_revision(
             &session_id,
             &plan_id,
@@ -1648,9 +1666,19 @@ impl PlanFileStore {
     fn persist_review_draft_locked(
         &self,
         session_id: &str,
-        revision: PlanReviewRevision,
+        mut revision: PlanReviewRevision,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        if revision
+            .document
+            .design
+            .as_ref()
+            .is_some_and(|design| design.authoring_fingerprint.is_some())
+        {
+            let (mut document, rendered, _) = revision.into_parts();
+            self.authoring_review_prepare(session_id, &mut document)?;
+            revision = PlanReviewRevision::new(&document.plan_id.clone(), document, rendered)?;
+        }
         self.require_reconciled_artifacts(session_id, &revision.document.plan_id)?;
         if crate::storage::state::database(&self.root).exists()
             && let Some(prior) = crate::storage::SqliteStore::read_only(&self.root)?
@@ -1662,6 +1690,16 @@ impl PlanFileStore {
             return Ok(revision.into_parts());
         }
         let plan_directory = self.plan_dir(session_id, &revision.document.plan_id);
+        for image in self.authoring_review_images(session_id, &revision.document)? {
+            let (path, _, target) = image.into_parts();
+            write_bytes_atomically(
+                &authoring::checked_destination(
+                    &self.authoring_directory(session_id, &revision.document.plan_id),
+                    &path,
+                )?,
+                &target,
+            )?;
+        }
         let document = &revision.document;
         let rendered = &revision.rendered;
         measure(trace, "persist.working_directory", || {
@@ -1892,6 +1930,11 @@ impl PlanFileStore {
             fs::remove_dir_all(&directory)
                 .with_context(|| format!("delete plan directory {}", directory.display()))?;
         }
+        let directory = self.authoring_directory(session_id, plan_id);
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .with_context(|| format!("delete planning directory {}", directory.display()))?;
+        }
         Ok(())
     }
 
@@ -1910,6 +1953,14 @@ impl PlanFileStore {
         if directory.exists() {
             fs::remove_dir_all(&directory).with_context(|| {
                 format!("delete session plan directory {}", directory.display())
+            })?;
+        }
+        let directory = crate::storage::state::directory(&self.root)
+            .join("plan-workspaces")
+            .join(session_id);
+        if directory.exists() {
+            fs::remove_dir_all(&directory).with_context(|| {
+                format!("delete session planning directory {}", directory.display())
             })?;
         }
         Ok(())
@@ -1934,6 +1985,12 @@ impl PlanFileStore {
         let mut working = self.read_working_document(source_session_id, source_plan_id)?;
         working.plan_id = target_plan_id.to_owned();
         self.create_working_document(target_session_id, target_plan_id, &working)?;
+        self.authoring_copy(
+            source_session_id,
+            source_plan_id,
+            target_session_id,
+            &working,
+        )?;
         let source_revision = source.join("revisions");
         if source_revision.exists() {
             for entry in fs::read_dir(&source_revision)? {

@@ -518,7 +518,7 @@ def "main check" [
   let outcome_list = run_fixture_list $test_list ($jobs | default (default_jobs))
   let report = $outcome_list | sort-by test | each {|outcome|
     {
-      file: $outcome.test
+      file: (split_fixture_entry $outcome.test).path
       state: (if $outcome.state == "passed" { "passed" } else { "failed" })
       duration_ms: ($outcome.elapsed / 1ms | into int)
       command: ($outcome.command | str join " ")

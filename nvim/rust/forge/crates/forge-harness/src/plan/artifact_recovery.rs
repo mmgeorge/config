@@ -20,6 +20,7 @@ struct ArtifactImage {
 /// Restrict replay to recognized working and submitted artifact paths.
 #[derive(Serialize, Deserialize)]
 enum ArtifactPath {
+    Authoring { path: String },
     Working { extension: String },
     Submitted { revision: u32, extension: String },
 }
@@ -27,14 +28,33 @@ enum ArtifactPath {
 impl ArtifactPath {
     /// Resolve only known artifact names under the selected plan directory.
     fn resolve(&self, directory: &Path) -> Result<PathBuf> {
+        if let Self::Authoring { path } = self {
+            let plan = directory
+                .file_name()
+                .context("plan directory has no identity")?;
+            let session = directory
+                .parent()
+                .and_then(Path::file_name)
+                .context("plan directory has no session")?;
+            let state = directory
+                .ancestors()
+                .nth(3)
+                .context("plan directory has no state root")?;
+            return super::authoring::checked_destination(
+                &state.join("plan-workspaces").join(session).join(plan),
+                path,
+            );
+        }
         let extension = match self {
             Self::Working { extension } | Self::Submitted { extension, .. } => extension,
+            Self::Authoring { .. } => unreachable!("authoring paths were resolved above"),
         };
         anyhow::ensure!(
             ["json", "md", "index.json"].contains(&extension.as_str()),
             "invalid artifact journal file"
         );
         Ok(match self {
+            Self::Authoring { .. } => unreachable!("authoring paths were resolved above"),
             Self::Working { extension } => directory.join(format!("working.{extension}")),
             Self::Submitted {
                 revision,
@@ -118,6 +138,7 @@ impl PlanFileStore {
             .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
         self.reconcile_artifact_locked(prior)?;
         let checksum = digest(&crate::plan::codec::to_vec(&reviewed.document)?);
+        self.authoring_require_current(&prior.session_id, &reviewed.document)?;
         let captured = self.capture_review_source(&prior.session_id, &prior.id, None, &checksum)?;
         anyhow::ensure!(
             captured.document == reviewed.document
@@ -179,6 +200,7 @@ impl PlanFileStore {
             .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
         self.reconcile_artifact_locked(prior)?;
         let checksum = digest(&crate::plan::codec::to_vec(&reviewed.document)?);
+        self.authoring_require_current(&prior.session_id, &reviewed.document)?;
         let current = self.capture_review_source(&prior.session_id, &prior.id, None, &checksum)?;
         anyhow::ensure!(
             current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
@@ -210,6 +232,14 @@ impl PlanFileStore {
             ),
         ];
         let mut files = Vec::new();
+        for image in self.authoring_review_images(&prior.session_id, document)? {
+            let (path, prior, target) = image.into_parts();
+            files.push(ArtifactImage {
+                path: ArtifactPath::Authoring { path },
+                prior: Some(prior),
+                target,
+            });
+        }
         for (extension, target) in contents {
             let mut paths = vec![ArtifactPath::Working {
                 extension: extension.into(),
@@ -337,7 +367,9 @@ impl PlanFileStore {
                     ArtifactPath::Working { extension } if extension == "json" => {
                         Some(&file.target)
                     }
-                    ArtifactPath::Working { .. } | ArtifactPath::Submitted { .. } => None,
+                    ArtifactPath::Working { .. }
+                    | ArtifactPath::Submitted { .. }
+                    | ArtifactPath::Authoring { .. } => None,
                 })
                 .context("artifact journal has no target document")?;
             let document: PlanDocument = crate::plan::codec::from_slice(working)?;

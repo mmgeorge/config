@@ -47,6 +47,9 @@ static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sy
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    /// Bind a submitted planning directory to its immutable raw input snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoring_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Proposed check commands, distinct from executed verification evidence.
     pub check_preview: Vec<crate::checks::CheckPreview>,
@@ -106,6 +109,7 @@ fn default_line_width() -> usize {
 impl Default for DeclarationDesign {
     fn default() -> Self {
         Self {
+            authoring_fingerprint: None,
             check_preview: Vec::new(),
             check_preview_source: String::new(),
             check_configuration: None,
@@ -399,13 +403,8 @@ impl DeclarationDesign {
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate baseline {path}"))?;
         }
-        for (path, text) in &self.proposed_source {
+        for path in self.proposed_source.keys() {
             validate_path(path)?;
-            if is_configuration(path) {
-                DeclarationOverview::parse(path, text)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))
-                    .with_context(|| format!("validate {path}"))?;
-            }
         }
         for (path, calls) in &self.baseline_calls {
             let text = &self
@@ -583,13 +582,17 @@ impl DeclarationDesign {
 
     /// Reject submission against changed workspace sources or newly occupied destinations.
     pub fn check_workspace(&self, workspace: &Path) -> Result<()> {
-        for path in self.changed_paths() {
-            let target = workspace.join(&path);
-            let source = match std::fs::read(&target) {
-                Ok(source) => Some(source),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
+        let paths = if self.authoring_fingerprint.is_some() {
+            self.baseline
+                .keys()
+                .chain(self.proposed_source.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.changed_paths().into_iter().collect()
+        };
+        for path in paths {
+            let source = workspace_source(workspace, &path)?.map(String::into_bytes);
             match self.baseline.get(&path) {
                 Some(before) => ensure!(
                     source
@@ -969,7 +972,7 @@ pub struct DesignPatchRequest {
     pub source_digests: BTreeMap<String, String>,
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(super) fn validate_path(path: &str) -> Result<()> {
     validate_relative_path(path)?;
     ensure!(
         DeclarationOverview::supports(path),

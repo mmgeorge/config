@@ -830,6 +830,7 @@ mod receipt_tests {
                 plan_submit: Some(crate::provider::PlanSubmitRequest {
                     plan_id: "plan".into(),
                     expected_version: 1,
+                    authoring_snapshot: None,
                 }),
                 ..Default::default()
             },

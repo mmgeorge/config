@@ -6,7 +6,7 @@ use crate::provider::session_execution::{
 
 /// An ordered semantic mutation, prepared against one admitted plan authority.
 pub(crate) enum PlanMutation {
-    Edit(crate::plan::PlanEditRequest),
+    Edit(Box<crate::plan::PlanEditRequest>),
     Design(crate::plan::DesignPatchRequest),
 }
 
@@ -152,9 +152,12 @@ impl PlanSubmissionJob {
                 }
                 ResultEffectAdmission::Apply(guard) => guard,
             };
-        let mut document = original.clone();
+        let mut document = match &request.authoring_snapshot {
+            Some(snapshot) => store.authoring_snapshot_read(&session_id, &plan.id, snapshot)?,
+            None => original.clone(),
+        };
         let warnings = if let Some(design) = &mut document.design {
-            let validated = design.validated(&workspace, &original.title).await?;
+            let validated = design.validated(&workspace, &document.title).await?;
             let warnings = validated.warnings();
             *design = validated.into_design();
             warnings
@@ -300,7 +303,7 @@ impl PlanMutationQueue {
             edits
                 .into_iter()
                 .zip(std::mem::take(&mut staged.output.plan_edit))
-                .map(|(id, request)| (id, PlanMutation::Edit(request))),
+                .map(|(id, request)| (id, PlanMutation::Edit(Box::new(request)))),
         );
         pending.extend(
             designs
@@ -401,7 +404,7 @@ impl PlanMutationJob {
                     guard.cancel_definite()?;
                     anyhow::bail!("edited plan id does not match active plan");
                 }
-                match crate::plan::apply_plan_edit(&original, request) {
+                match crate::plan::apply_plan_edit(&original, *request) {
                     Ok(result) => result.document,
                     Err(error) => {
                         guard.cancel_definite()?;

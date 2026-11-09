@@ -48,6 +48,8 @@ Provider errors expose typed operations and categories, never native response co
 
 ## Sessions
 
+Planning authoring uses ordinary native execution posture so file tools remain available; read-only review questions still request a native planning posture. Harness supplies invocation-only effective write roots independently of saved access preferences. Codex replaces its sticky `runtimeWorkspaceRoots` on every turn as well as `writableRoots`, so returning from a restricted authoring turn restores the ordinary project-root context.
+
 Native initialization validates the selected runtime before opening or resuming its conversation. The current minimums are Codex 0.164.0, Copilot CLI 1.0.103, Claude Code 2.1.317, and Antigravity ACP 1.4.5. The Copilot SDK dependency is pinned separately to 1.0.26; its version does not prove that a configured CLI override is supported. Codex reads its initialization user agent, Copilot queries the connected runtime status, Claude Code runs `claude --version` once per provider, and ACP reads the adapter version from the initialization handshake. Missing, malformed, and below-minimum versions produce typed initialization errors. A replacement runtime must validate again.
 
 Conversations open or resume their provider session asynchronously, without creating an exchange or sending model input. The controller releases its broker lock during network work and rejects stale results after configuration changes. The broker persists the root conversation ID when it accepts a provider turn-start boundary, so interrupting the first turn still keeps the conversation.

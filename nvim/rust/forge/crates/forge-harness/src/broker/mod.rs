@@ -2895,6 +2895,7 @@ impl HarnessBroker {
             task_generation: callback_snapshot.map(|(generation, _)| generation),
             permission_snapshot,
             permission_required: true,
+            file_permissions: None,
             submission_cancelled: Some(self.turn_cancellation.submission_flag()),
             checkpoint: self
                 .exchange_runtime
@@ -2910,6 +2911,23 @@ impl HarnessBroker {
                     .is_some_and(|plan| plan.state == crate::plan::PlanState::AwaitingInput),
             plan_state: plan.as_ref().map(|plan| plan.state),
             plan_document: document,
+            plan_authoring: if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
+                && !self.question_discussion
+                && plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.state != crate::plan::PlanState::ConfiguringChecks)
+            {
+                plan.as_ref().map(|plan| {
+                    crate::plan::PlanAuthoringScope::new(
+                        self.plan_file.clone(),
+                        self.session.id.clone(),
+                        plan.id.clone(),
+                        self.session.access.write_access,
+                    )
+                })
+            } else {
+                None
+            },
             resolved_question_digest_set: plan
                 .as_ref()
                 .map(|plan| {
@@ -5804,6 +5822,7 @@ impl HarnessBroker {
                     &current.permit(),
                     &exchange,
                     after != setup_digest,
+                    false,
                     self.clock.now_ms(),
                 )?;
             }
@@ -10543,6 +10562,25 @@ impl HarnessBroker {
             request.access.writable_directory.clear();
         }
         request.control_context = self.control_turn_context(request.mode);
+        if let Some(authoring) = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.plan_authoring.as_ref())
+        {
+            request.access.effective_write_roots = Some(Arc::new(vec![
+                authoring.directory().to_string_lossy().into_owned(),
+            ]));
+            request
+                .access
+                .readable_directory
+                .push(authoring.directory().to_string_lossy().into_owned());
+            request.access.readable_directory.push(
+                authoring
+                    .readable_directory()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         if let Some(selection) = &self.question_model {
             let model = selection
                 .model
