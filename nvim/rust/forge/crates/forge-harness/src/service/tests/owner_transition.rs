@@ -413,8 +413,14 @@ async fn forked_child_input_waits_for_native_fork() -> Result<()> {
         )
         .await;
 
-    assert!(gate.wait().await.is_err(), "the held source fails the native fork");
+    assert!(
+        gate.wait().await.is_err(),
+        "the held source fails the native fork"
+    );
     let error = submitted.expect_err("input must not run before the fork is ready");
-    assert!(format!("{error:#}").contains("ExecutionActive"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("ExecutionActive"),
+        "{error:#}"
+    );
     Ok(())
 }

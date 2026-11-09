@@ -1958,7 +1958,7 @@ async fn route_request(
         false
     };
     // Provider-bound child work waits for its native fork, or it would open fresh history.
-    if false && (method.requires_provider_fork() || new_queued_submission) {
+    if method.requires_provider_fork() || new_queued_submission {
         registry
             .await_provider_fork(&session_id, &controller)
             .await?;
