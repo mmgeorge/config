@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) struct PreparedPlan {
     pub record: PlanRecord,
-    pub instruction: String,
+    pub instruction: forge_provider_api::forge::TurnInput,
 }
 
 impl PlanFileStore {

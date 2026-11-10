@@ -4648,7 +4648,15 @@ mod tests {
             )?;
             let (reply, response) = oneshot::channel();
             driver.command(Command::SteerCurrent {
-                input: crate::provider::SteeringInput::AgentResult("stale child message".into()),
+                input: crate::provider::SteeringInput::AgentResult(
+                    forge_provider_api::forge::AgentResult {
+                        agent: "/stale".into(),
+                        task_id: "stale child message".into(),
+                        status: "completed".into(),
+                        response: None,
+                        error: None,
+                    },
+                ),
                 submission: None,
                 authority: Some(authority),
                 reply,

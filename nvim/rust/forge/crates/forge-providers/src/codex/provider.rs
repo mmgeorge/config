@@ -573,7 +573,12 @@ impl CodexProvider {
         if session.isolated
             && (!request.tools.is_empty()
                 || request.tool_endpoint.is_some()
-                || !matches!(request.input, PromptInput::Text(_))
+                || !matches!(
+                    request.input.kind(),
+                    forge_provider_api::forge::TurnKind::UserMessage {
+                        input: PromptInput::Text(_)
+                    }
+                )
                 || !request.recovered_inputs.is_empty())
         {
             return Err(failure(
@@ -618,22 +623,16 @@ impl CodexProvider {
             .await
             .bind(Some(request.scope.clone()));
         session.rollback.lock().await.take();
-        let mut prompt = input_text(&request.input);
-        let recovered_text = request
+        // Codex carries `<permissions>`, `<instructions>`, and `<task>` in one developer message;
+        // the turn's data elements start the user input, followed by the user's own words.
+        let blocks = request.blocks(forge_provider_api::forge::ContextChannel::DeveloperMessage);
+        let current = joined([blocks.user.clone(), user_text(&request.input)]);
+        let recovered = request
             .recovered_inputs
             .iter()
-            .map(|recovered| {
-                let note = forge_provider_api::turn_context::note(&recovered.instructions);
-                [note, input_text(&recovered.input)]
-                    .into_iter()
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(|recovered| (recovered.input.clone(), user_text(&recovered.input)))
             .collect::<Vec<_>>();
-        if !recovered_text.is_empty() {
-            prompt = forge_provider_api::input::recovered_text(&prompt, &recovered_text);
-        }
+        let prompt = forge_provider_api::input::recovered_text(&current, &recovered);
         let mut attachments = request
             .recovered_inputs
             .iter()
@@ -642,7 +641,7 @@ impl CodexProvider {
         attachments.extend(request.attachments.iter().cloned());
         let mut native_input = super::attachments::input(prompt, &attachments);
         for recovered in &request.recovered_inputs {
-            if let PromptInput::Skill { name, .. } = &recovered.input {
+            if let Some(PromptInput::Skill { name, .. }) = recovered.input.user_input() {
                 let rpc = session.rpc.lock().await;
                 let path = session
                     .resources
@@ -653,7 +652,7 @@ impl CodexProvider {
                 native_input.push(json!({"type":"skill","name":name,"path":path}));
             }
         }
-        if let PromptInput::Skill { name, .. } = &request.input {
+        if let Some(PromptInput::Skill { name, .. }) = request.input.user_input() {
             let rpc = session.rpc.lock().await;
             let path = session
                 .resources
@@ -675,9 +674,9 @@ impl CodexProvider {
         let effort =
             apply_model_selection(&rpc, &mut params, &model, ProviderOperation::TurnStart).await?;
         drop(rpc);
-        // Changed Harness context sections and this input's note become one `<forge>` developer
-        // message. Harness tracks which sections the conversation already accepted.
-        let developer = Some(request.context_block())
+        // Harness tracks which standing sections the conversation already accepted, so the
+        // developer message is empty when nothing changed and the input has no instructions.
+        let developer = Some(blocks.lead)
             .filter(|block| !block.is_empty())
             .into_iter()
             .collect::<Vec<_>>();
@@ -719,7 +718,7 @@ impl CodexProvider {
             .await?;
         drop(rpc);
         if !injected {
-            // Without developer injection, the same block starts the user input instead.
+            // Without developer injection, the instruction block starts the user input instead.
             if let Some(input) = params["input"].as_array_mut() {
                 input.insert(0, json!({"type":"text","text":developer.concat()}));
             }
@@ -1499,7 +1498,12 @@ impl CodexProvider {
                 return Err(record_receipt_failure(receipt.clone(), error).await);
             }
         }
-        let prompt = input_text(&request.input);
+        // A steered input carries its own elements, such as a question response, and no
+        // standing context; they precede the user's words in the same user message.
+        let prompt = joined([
+            forge_provider_api::forge::input_block(&request.input),
+            user_text(&request.input),
+        ]);
         let expected_turn_id = session
             .active
             .lock()
@@ -5909,10 +5913,21 @@ fn input_text(input: &PromptInput) -> String {
         PromptInput::Skill { name, arguments } => {
             format!("Use skill {name} with arguments: {arguments}")
         }
-        PromptInput::QuestionReply(reply) => {
-            forge_provider_api::turn_context::question_reply(reply)
-        }
     }
+}
+
+/// Render the user's own words of one turn input, or nothing for a Harness-started turn.
+fn user_text(input: &forge_provider_api::forge::TurnInput) -> String {
+    input.user_input().map(input_text).unwrap_or_default()
+}
+
+/// Join non-empty prompt parts with one line break, keeping a block directly before its text.
+fn joined(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Reject model controls absent from the native protocol before acquiring resources.
@@ -7121,10 +7136,14 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             attempt_id: forge_provider_api::DeliveryAttemptId::new("attempt").unwrap(),
             submission_id: forge_provider_api::SubmissionId::try_from("submission".to_owned())
                 .expect("fixture identity is valid"),
-            input: PromptInput::Text("original request".into()),
+            // A kind with instructions makes the turn inject one developer message first.
+            input: forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::PlanDiscussion {
+                    input: PromptInput::Text("original request".into()),
+                },
+            ),
             recovered_inputs: Vec::new(),
             context: Default::default(),
-            instructions: "instructions".into(),
             attachments: Vec::new(),
             receipt: Arc::new(FixtureReceipt(
                 forge_provider_api::SubmissionId::try_from("submission".to_owned())

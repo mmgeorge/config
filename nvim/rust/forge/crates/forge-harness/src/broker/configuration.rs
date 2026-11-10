@@ -1850,19 +1850,20 @@ impl HarnessBroker {
                     _ => None,
                 })
                 .context("interrupted clarification has no recorded question input")?;
+            // Both are the user's words: the recorded clarification and the resumed reply.
             let follow_up = format!("{}\n\n{text}", clarification.text);
-            let elicitation_json = serde_json::to_string_pretty(elicitation)?;
-            let prompt = if let Some(plan) = &pending_plan {
-                PlanPrompt::clarification(&plan.request, &elicitation_json, &follow_up)
+            let user = forge_provider_api::PromptInput::Text(follow_up.clone());
+            let prompt = if pending_plan.is_some() {
+                PlanPrompt::clarification(elicitation, user)
             } else {
-                PlanPrompt::question_follow_up(&elicitation_json, &follow_up)
+                PlanPrompt::question_follow_up(elicitation, user)
             };
             let mode = self.task_prompt_mode()?;
             let staged = self.stage_selected_foreground_interaction(
-                &prompt,
+                &follow_up,
                 mode,
                 None,
-                ProviderInput::from_text(prompt.clone()),
+                ProviderInput::new(prompt),
                 Some(selected),
             )?;
             let clarification = Some(match pending_plan {

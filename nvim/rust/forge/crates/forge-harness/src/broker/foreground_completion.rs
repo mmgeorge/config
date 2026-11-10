@@ -71,9 +71,14 @@ impl HarnessBroker {
                 )?);
                 *interaction = candidate;
                 (
-                    format!(
-                        "Harness resolved the pending questions and recorded their response sources. Do not call question_answer or question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
-                    ),
+                    match crate::plan::resolved_questions(&elicitation) {
+                        Some(answers) => forge_provider_api::forge::TurnInput::new(
+                            forge_provider_api::forge::TurnKind::WorkflowAnswers { answers },
+                        ),
+                        None => crate::plan::task_step(
+                            forge_provider_api::forge::TaskStep::AnswersResolved,
+                        ),
+                    },
                     self.task_prompt_mode()?,
                 )
             }
@@ -95,15 +100,13 @@ impl HarnessBroker {
                                 && item.kind == PlanLifecycleKind::QuestionWithdrawn
                         })
                         .context("withdrawn planning question has no lifecycle record")?;
-                    let feedback = format!(
-                        "Pending planning questions withdrawn: {}",
-                        withdrawal
-                            .answer
-                            .as_deref()
-                            .unwrap_or("no material decision remains")
-                    );
                     (
-                        PlanPrompt::feedback(&plan.request, &feedback),
+                        PlanPrompt::withdrawn(
+                            withdrawal
+                                .answer
+                                .as_deref()
+                                .unwrap_or("no material decision remains"),
+                        ),
                         PromptMode::Plan,
                     )
                 } else {
@@ -185,7 +188,10 @@ impl HarnessBroker {
                     events.push(event);
                     *interaction = candidate;
                     (
-                        PlanPrompt::feedback(&plan.request, &feedback),
+                        match crate::plan::resolved_questions(&elicitation) {
+                            Some(answers) => PlanPrompt::feedback(answers),
+                            None => PlanPrompt::withdrawn("no questions were recorded"),
+                        },
                         PromptMode::Plan,
                     )
                 }
@@ -201,11 +207,8 @@ impl HarnessBroker {
                     .context("planning continuation lost its task")?,
             );
         }
-        let request = self.refresh_owned_continuation_request(
-            previous,
-            ProviderInput::from_text(prompt),
-            mode,
-        )?;
+        let request =
+            self.refresh_owned_continuation_request(previous, ProviderInput::new(prompt), mode)?;
         Ok(Some((request, events)))
     }
 
@@ -439,11 +442,10 @@ impl HarnessBroker {
                 )));
             }
             if resume_input || child_continuation {
-                let messages = results
+                let reports = results
                     .iter()
-                    .map(|task| self.agent_result_message(task))
-                    .collect::<Result<Vec<_>>>()?
-                    .join("\n\n");
+                    .map(|task| self.agent_result(task))
+                    .collect::<Result<Vec<_>>>()?;
                 if child_continuation {
                     anyhow::ensure!(
                         transaction.continuation_count < self.goal_max_turns,
@@ -452,23 +454,19 @@ impl HarnessBroker {
                     transaction.continuation_count += 1;
                 }
                 let command = transaction.steering.deferred.pop_front();
+                // A deferred user message carries the reports beside its text; otherwise the
+                // reports continue the parent's request on their own.
                 let (input, submission) = if let Some(command) = &command {
-                    let mut text = command.text.clone();
-                    if !messages.is_empty() {
-                        text.push_str("\n\n");
-                        text.push_str(&messages);
-                    }
-                    (
-                        ProviderInput::from_text(text)
-                            .with_attachments(command.attachments.clone()),
-                        command.submission.clone(),
-                    )
+                    let mut input = ProviderInput::from_text(command.text.clone())
+                        .with_attachments(command.attachments.clone());
+                    input.push_child_results(reports);
+                    (input, command.submission.clone())
                 } else {
                     (
-                        ProviderInput::from_text(format!(
-                            "{} Synthesize the results and complete the original request when its required work is settled.\n\n{messages}",
-                            crate::agent::report::CHILD_CONTINUATION_PREAMBLE
-                        )),
+                        ProviderInput::new(
+                            forge_provider_api::forge::TurnInput::child_continuation(reports)
+                                .context("child continuation has no settled results")?,
+                        ),
                         None,
                     )
                 };

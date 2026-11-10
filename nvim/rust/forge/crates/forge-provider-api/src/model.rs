@@ -194,10 +194,10 @@ pub struct ProviderIntegration {
     pub resource_target: Option<String>,
     pub isolation_modes: Vec<IsolationMode>,
     pub limitations: Vec<crate::capability::FeatureLimitation>,
-    /// Message role that carries each turn's `<forge>` context block, which the open-time
+    /// Message role that carries each turn's `<forge>` instruction elements, which the open-time
     /// instructions describe to the model.
     #[serde(default)]
-    pub context_channel: crate::turn_context::ContextChannel,
+    pub context_channel: crate::forge::ContextChannel,
 }
 
 impl ProviderCapability {

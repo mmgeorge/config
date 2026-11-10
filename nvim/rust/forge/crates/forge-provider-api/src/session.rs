@@ -267,11 +267,16 @@ pub struct RecoveredInput {
     /// Original logical input and delivery attempt accepted with this grouped prompt.
     pub covered_input: crate::CoveredInput,
     /// Earlier host input backed by positive proof that its prior attempt was not consumed.
-    pub input: crate::input::PromptInput,
+    pub input: crate::forge::TurnInput,
     /// Files admitted with that exact earlier input.
     pub attachments: Vec<crate::input::FileAttachment>,
-    /// Host-prepared workflow instructions retained with that input.
-    pub instructions: String,
+}
+
+impl RecoveredInput {
+    /// Render the block that precedes this input, numbered from 1 in delivery order.
+    pub fn block(&self, index: usize) -> String {
+        crate::forge::earlier_input_block(index, &self.input)
+    }
 }
 
 /// Own complete resolved session defaults independently of per-invocation overrides.
@@ -505,22 +510,17 @@ pub struct PromptRequest {
     pub submission_id: SubmissionId,
     /// Identify this immutable delivery attempt independently of logical input.
     pub attempt_id: crate::DeliveryAttemptId,
-    /// Carry prepared user input.
-    pub input: crate::input::PromptInput,
+    /// Carry this input's typed Harness content and the user's own words.
+    pub input: crate::forge::TurnInput,
     /// Confirm tracked transport handoff independently of eventual native acceptance.
     /// Validate binding, scope, submission, and attempt before admission; confirm only after
     /// immutable configuration and cancellation/collection ownership are installed.
     pub dispatch: crate::submission::DispatchReporter,
     /// Carry previously saved input proven not to have reached the provider.
     pub recovered_inputs: Vec<RecoveredInput>,
-    /// Carry Harness context sections that changed since this conversation last received them.
-    /// Deliver them with [`Self::instructions`] as one
-    /// [`crate::turn_context::TurnContext::block`] before the input: as a developer message where
-    /// the provider declares that channel, otherwise at the start of the user message.
-    pub context: crate::turn_context::TurnContext,
-    /// Carry the Harness note that belongs to this input only, such as plan-discussion rules or a
-    /// question reply's workflow context. It is not tracked and renders as the block's `<note>`.
-    pub instructions: String,
+    /// Carry the standing sections that changed since this conversation last received them.
+    /// [`Self::blocks`] renders them with the input's elements for the provider's channel.
+    pub context: crate::forge::TurnContext,
     /// Carry files admitted and resolved by the host input owner.
     pub attachments: Vec<crate::input::FileAttachment>,
     /// Commit native delivery transitions through the host-owned journal.
@@ -567,11 +567,14 @@ impl PromptRequest {
         self.into()
     }
 
-    /// Render this turn's changed context sections and note as one `<forge>` block.
-    ///
-    /// The result is empty when the turn delivers neither.
-    pub fn context_block(&self) -> String {
-        self.context.block(&self.instructions)
+    /// Render this turn's standing sections and input elements for `channel`.
+    pub fn blocks(&self, channel: crate::forge::ContextChannel) -> crate::forge::Blocks {
+        crate::forge::render(&self.context, &self.input, channel)
+    }
+
+    /// Render everything for a provider that places all Harness content in the user message.
+    pub fn user_message_block(&self) -> String {
+        self.blocks(crate::forge::ContextChannel::UserMessage).lead
     }
 }
 
@@ -592,7 +595,6 @@ impl PartialEq for PromptRequest {
             && self.dispatch == other.dispatch
             && self.recovered_inputs == other.recovered_inputs
             && self.context == other.context
-            && self.instructions == other.instructions
             && self.attachments == other.attachments
             && std::sync::Arc::ptr_eq(&self.receipt, &other.receipt)
             && std::sync::Arc::ptr_eq(&self.permissions, &other.permissions)
@@ -625,8 +627,9 @@ pub struct SteeringRequest {
     pub scope: InvocationScope,
     /// Distinguish durable user input from a host-generated contextual notification.
     pub delivery: SteeringDelivery,
-    /// Carry normalized text or a selected skill.
-    pub input: crate::input::PromptInput,
+    /// Carry the steered input: the user's words, or a typed Harness input such as a question
+    /// response, rendered with [`crate::forge::input_block`] and no standing context.
+    pub input: crate::forge::TurnInput,
     /// Preserve files admitted with this independently journaled input.
     pub attachments: Vec<crate::input::FileAttachment>,
 }

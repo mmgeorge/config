@@ -216,10 +216,11 @@ fn prompt_request(
         resource_lease: None,
         submission_id: receipt.id.clone(),
         attempt_id: receipt.attempt_id().unwrap(),
-        input: forge_provider_api::input::PromptInput::Text("hello".into()),
+        input: forge_provider_api::forge::TurnInput::user(
+            forge_provider_api::input::PromptInput::Text("hello".into()),
+        ),
         recovered_inputs: Vec::new(),
         context: Default::default(),
-        instructions: "fixture instructions".into(),
         attachments: Vec::new(),
         receipt,
         permissions: Arc::new(FixedPermissions(permission)),
@@ -229,10 +230,10 @@ fn prompt_request(
     }
 }
 
-/// Start the user message with one `<forge>` block holding changed context and the input's note.
+/// Start the user message with one `<forge>` block and keep the user's words unwrapped after it.
 #[test]
 fn prompt_texts_place_the_forge_block_before_the_input() {
-    use forge_provider_api::turn_context::{ContextPart, ContextSection, TurnContext};
+    use forge_provider_api::forge::{GoalTask, Task, TurnContext, TurnInput, TurnKind};
     let binding = forge_provider_api::BindingId::new("context-binding").unwrap();
     let mut request = prompt_request(
         &binding,
@@ -240,26 +241,26 @@ fn prompt_texts_place_the_forge_block_before_the_input() {
         receipt("context-submission"),
         forge_provider_api::permissions::PermissionResponse::Allow,
     );
-    request.instructions.clear();
     assert_eq!(
         super::provider::prompt_texts(&request),
         ["hello"],
-        "an unchanged context without a note adds no text"
+        "an unchanged context adds no text to a user message"
     );
-    request.instructions = "fixture note".into();
     request.context = TurnContext {
         record: "k3f9".into(),
-        parts: vec![
-            ContextPart::new(ContextSection::Task, "Plan task.").with_attribute("kind", "plan"),
-        ],
+        permissions: None,
+        task: Some(Task::Goal(GoalTask {
+            objective: "Ship.".into(),
+        })),
     };
-    assert_eq!(
-        super::provider::prompt_texts(&request),
-        [
-            "<forge>\n<note>\nfixture note\n</note>\n<task kind=\"plan\">\nPlan task.\n</task>\n</forge>",
-            "hello"
-        ]
-    );
+    request.input = TurnInput::new(TurnKind::PlanDiscussion {
+        input: forge_provider_api::input::PromptInput::Text("why?".into()),
+    });
+    let texts = super::provider::prompt_texts(&request);
+    assert_eq!(texts.len(), 2);
+    assert!(texts[0].starts_with("<forge>\n<instructions>\nContinue discussing the active plan"));
+    assert!(texts[0].ends_with("</task>\n</forge>"));
+    assert_eq!(texts[1], "why?");
 }
 
 fn steering_request(
@@ -268,7 +269,9 @@ fn steering_request(
 ) -> forge_provider_api::session::SteeringRequest {
     forge_provider_api::session::SteeringRequest {
         scope,
-        input: forge_provider_api::input::PromptInput::Text(text.into()),
+        input: forge_provider_api::forge::TurnInput::user(
+            forge_provider_api::input::PromptInput::Text(text.into()),
+        ),
         attachments: Vec::new(),
         delivery: forge_provider_api::session::SteeringDelivery::Context,
     }
@@ -819,7 +822,9 @@ async fn unanswered_interrupt_ends_the_turn() {
         receipt("second"),
         forge_provider_api::permissions::PermissionResponse::Allow,
     );
-    request.input = forge_provider_api::input::PromptInput::Text("again".into());
+    request.input = forge_provider_api::forge::TurnInput::user(
+        forge_provider_api::input::PromptInput::Text("again".into()),
+    );
     assert!(
         provider
             .turn_start(operation_context(), &binding, request)

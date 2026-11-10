@@ -1905,7 +1905,7 @@ mod tests {
         );
         assert_eq!(
             sent[0].input,
-            forge_provider_api::PromptInput::Text("new instruction replaces earlier scope".into())
+            forge_provider_api::forge::TurnInput::from("new instruction replaces earlier scope")
         );
         assert!(
             store

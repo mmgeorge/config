@@ -1670,7 +1670,7 @@ pub(super) struct PreparedContinuation {
     request: super::command::WorkflowContinuationRequest,
     prior: Option<crate::task::TaskPermit>,
     change: crate::broker::plan_entry::PreparedTaskChange,
-    instruction: String,
+    instruction: forge_provider_api::forge::TurnInput,
 }
 
 /// Retain execution authority and prepared effects until their atomic owner commit.
@@ -1828,7 +1828,10 @@ fn prepare_workflow_continuation(
                 )
                 .map_err(OperationFailure::Domain)?;
                 plan.generation.reset_no_progress();
-                instruction = crate::plan::PlanPrompt::feedback(&plan.request, &feedback);
+                instruction = match crate::plan::resolved_questions(&elicitation) {
+                    Some(answers) => crate::plan::PlanPrompt::feedback(answers),
+                    None => crate::plan::PlanPrompt::withdrawn("no questions were recorded"),
+                };
                 effects.plan.push(plan.clone());
                 effects.lifecycle.push(crate::plan::PlanLifecycleRecord {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -1909,6 +1912,7 @@ fn prepare_workflow_continuation(
                     .take_elicitation()
                     .expect("validated exchange retains elicitation");
                 let feedback = elicitation.feedback();
+                let resolved = crate::plan::resolved_questions(&elicitation);
                 if exchange.check_setup.is_some()
                     && elicitation.answer.iter().any(|answer| {
                         answer.source == crate::session::ResolutionSource::User
@@ -1943,9 +1947,14 @@ fn prepare_workflow_continuation(
                     )
                     .map_err(OperationFailure::Domain)?;
                 effects.exchange.push(exchange);
-                instruction = format!(
-                    "Harness resolved the pending questions and recorded their response sources. Continue the original request using these responses.\n\n{feedback}"
-                );
+                instruction = match resolved {
+                    Some(answers) => forge_provider_api::forge::TurnInput::new(
+                        forge_provider_api::forge::TurnKind::WorkflowAnswers { answers },
+                    ),
+                    None => {
+                        crate::plan::task_step(forge_provider_api::forge::TaskStep::AnswersResolved)
+                    }
+                };
                 change = continuation_task_change(
                     current,
                     source.completed_turn(),
@@ -1984,16 +1993,23 @@ fn prepare_workflow_continuation(
                         .as_ref()
                         .and_then(|turn| turn.continuation.as_ref())
                         .and_then(|input| input.work.instruction())
-                        .unwrap_or("")
-                        .into(),
+                        .cloned()
+                        .ok_or_else(|| rejected(TaskCommandFailure::Changed))?,
                     _ => return Err(rejected(TaskCommandFailure::Changed)),
                 };
                 change = prepared.change;
                 effects = prepared.effects;
             } else {
-                instruction = request.message.clone().unwrap_or_else(|| {
-                    "Continue the previous request from its completed state.".into()
-                });
+                // A user message continues as the user's own input; otherwise Harness asks for
+                // the previous request to continue.
+                instruction = match &request.message {
+                    Some(message) => forge_provider_api::forge::TurnInput::user(
+                        crate::provider::parse_user_input(message),
+                    ),
+                    None => {
+                        crate::plan::task_step(forge_provider_api::forge::TaskStep::ContinueRequest)
+                    }
+                };
                 change = continuation_task_change(
                     current,
                     source.completed_turn(),
@@ -2018,7 +2034,7 @@ fn prepare_workflow_continuation(
 fn continuation_task_change(
     current: Option<&crate::task::Task>,
     completed: &crate::task::TaskTurnId,
-    instruction: &str,
+    instruction: &forge_provider_api::forge::TurnInput,
     now_ms: i64,
 ) -> Result<crate::task::TaskChange, OperationFailure> {
     let Some(current) = current else {
@@ -2046,7 +2062,7 @@ fn continuation_task_change(
             reason: "The selected workflow was continued".into(),
             delivery: crate::task::TaskInputDelivery::Pending,
             work: crate::task::TaskWork::Provider {
-                instruction: instruction.into(),
+                instruction: instruction.clone(),
             },
         }),
     });

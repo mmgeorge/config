@@ -908,7 +908,9 @@ impl HarnessBroker {
                         self.store.save_exchange(interaction)?;
                         let request = self.refresh_owned_continuation_request(
                             &transaction.request,
-                            ProviderInput::from_text(prompt),
+                            ProviderInput::kind(forge_provider_api::forge::TurnKind::CheckRepair {
+                                repair: prompt,
+                            }),
                             PromptMode::Chat,
                         )?;
                         let applied = self.prepare_live_interaction(
@@ -1924,9 +1926,14 @@ impl HarnessBroker {
             if task.kind() == crate::task::TaskKind::Execute {
                 self.reserve_execution_continuation(turn)?;
             } else {
-                self.task_controller.reserve_continuation(&mut self.store, &task.permit(), turn,
-                    "Continue the current task at its preserved phase using the recorded user answers. Do not repeat resolved questions.".into(),
-                    "Continue after required questions are resolved".into(), self.clock.now_ms())?;
+                self.task_controller.reserve_continuation(
+                    &mut self.store,
+                    &task.permit(),
+                    turn,
+                    crate::plan::task_step(forge_provider_api::forge::TaskStep::AnswersResolved),
+                    "Continue after required questions are resolved".into(),
+                    self.clock.now_ms(),
+                )?;
             }
         }
         if paused {

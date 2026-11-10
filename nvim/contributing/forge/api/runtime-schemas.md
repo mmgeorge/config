@@ -1559,8 +1559,9 @@ pub struct PlanRecord {
     pub accepted_revision: Option<u32>,
     pub user_revision: u32,
     #[serde(default)]
-    /// Retains ordered user edits across reviewed revisions and final decisions.
-    pub manual_changes: Vec<String>,
+    /// Retains ordered edits the user applied with the review tools, which the next review
+    /// decision reports to the model.
+    pub manual_changes: Vec<forge_provider_api::forge::PlanEdit>,
     pub review_digest: Option<String>,
     pub accepted_digest: Option<String>,
     #[serde(default)]

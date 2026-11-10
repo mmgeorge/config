@@ -89,11 +89,10 @@ pub struct PromptRequestIdentity {
     resource_lease: Option<AuthorityIdentity<dyn ResourceLease>>,
     submission_id: SubmissionId,
     attempt_id: DeliveryAttemptId,
-    input: PromptInput,
+    input: crate::forge::TurnInput,
     dispatch: submission::DispatchIdentity,
     recovered_inputs: Vec<RecoveredInput>,
-    context: crate::turn_context::TurnContext,
-    instructions: String,
+    context: crate::forge::TurnContext,
     attachments: Vec<FileAttachment>,
     receipt: AuthorityIdentity<dyn submission::InputReceipt>,
     permissions: AuthorityIdentity<dyn permissions::ProviderPermissions>,
@@ -119,7 +118,6 @@ impl From<&PromptRequest> for PromptRequestIdentity {
             dispatch,
             recovered_inputs,
             context,
-            instructions,
             attachments,
             receipt,
             permissions,
@@ -142,7 +140,6 @@ impl From<&PromptRequest> for PromptRequestIdentity {
             dispatch: dispatch.identity(),
             recovered_inputs: recovered_inputs.clone(),
             context: context.clone(),
-            instructions: instructions.clone(),
             attachments: attachments.clone(),
             receipt: AuthorityIdentity::new(receipt),
             permissions: AuthorityIdentity::new(permissions),
@@ -169,7 +166,7 @@ enum SteeringDeliveryIdentity {
 pub struct SteeringRequestIdentity {
     scope: InvocationScope,
     delivery: SteeringDeliveryIdentity,
-    input: PromptInput,
+    input: crate::forge::TurnInput,
     attachments: Vec<FileAttachment>,
 }
 impl From<&SteeringRequest> for SteeringRequestIdentity {

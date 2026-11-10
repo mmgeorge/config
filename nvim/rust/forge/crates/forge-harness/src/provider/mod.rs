@@ -1,7 +1,7 @@
 pub mod approval;
 mod approval_view;
 mod catalog;
-pub(crate) use catalog::select_model_settings;
+pub(crate) use catalog::{parse_user_input, select_model_settings};
 pub use compaction::{
     Compaction, CompactionCapability, CompactionContext, CompactionCost, CompactionResult,
     CompactionState, CompactionUsage,

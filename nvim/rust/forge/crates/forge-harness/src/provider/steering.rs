@@ -22,16 +22,23 @@ pub enum SteeringInput {
         submission: Arc<super::submission::Submission>,
     },
     /// Adds an attributed child result while its transcript remains under the child.
-    AgentResult(String),
+    AgentResult(forge_provider_api::forge::AgentResult),
 }
 
 impl SteeringInput {
-    /// Returns the provider-visible message without its presentation origin.
+    /// Returns the user's or task entry's text; a child result has no text of its own.
     pub fn text(&self) -> &str {
         match self {
-            Self::User { text, .. } | Self::TaskEntry { text, .. } | Self::AgentResult(text) => {
-                text
-            }
+            Self::User { text, .. } | Self::TaskEntry { text, .. } => text,
+            Self::AgentResult(_) => "",
+        }
+    }
+
+    /// Returns the child result this input reports, if any.
+    pub(crate) fn agent_result(&self) -> Option<&forge_provider_api::forge::AgentResult> {
+        match self {
+            Self::AgentResult(result) => Some(result),
+            Self::User { .. } | Self::TaskEntry { .. } => None,
         }
     }
 
@@ -141,6 +148,7 @@ pub struct SteerCommand {
     event_sink: Option<HarnessEventSink>,
     publish_input: bool,
     task_start: Option<crate::exchange::TaskStart>,
+    agent_result: Option<forge_provider_api::forge::AgentResult>,
 }
 
 /// Defines the active-turn operation carried over the shared provider process.
@@ -245,6 +253,10 @@ impl SteeringLane {
             .unwrap_or_default();
         let submission = input.as_ref().and_then(SteeringInput::submission);
         let task_start = input.as_ref().and_then(SteeringInput::task_start).cloned();
+        let agent_result = input
+            .as_ref()
+            .and_then(SteeringInput::agent_result)
+            .cloned();
         sender
             .sender
             .try_send(SteerCommand {
@@ -257,6 +269,7 @@ impl SteeringLane {
                 event_sink: None,
                 publish_input,
                 task_start,
+                agent_result,
             })
             .map_err(|_| not_admitted())?;
         if let Some(submission) = submission {
@@ -322,8 +335,8 @@ impl SteerCommand {
     }
 
     pub(crate) fn input(&self) -> SteeringInput {
-        if !self.publish_input {
-            return SteeringInput::AgentResult(self.text.clone());
+        if let Some(result) = &self.agent_result {
+            return SteeringInput::AgentResult(result.clone());
         }
         match (&self.task_start, &self.submission) {
             (Some(start), Some(submission)) => SteeringInput::TaskEntry {
@@ -536,7 +549,13 @@ mod test {
         assert!(
             captured
                 .steer(crate::provider::SteeringInput::AgentResult(
-                    "old target".into()
+                    forge_provider_api::forge::AgentResult {
+                        agent: "/old".into(),
+                        task_id: "old target".into(),
+                        status: "completed".into(),
+                        response: None,
+                        error: None,
+                    }
                 ))
                 .await
                 .is_err()

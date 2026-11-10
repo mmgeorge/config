@@ -851,7 +851,6 @@ impl ProviderBridge {
         let prepared_attachments =
             prepare_attachments(request.input.attachments().to_vec()).await?;
         let input = neutralized_input(request.input.normalized());
-        let instructions = request.input_instructions();
         let included_inputs = submission.included_inputs()?;
         if included_inputs.len() != request.recovered_input.len() {
             return Err(ProviderError::Observation(
@@ -864,7 +863,6 @@ impl ProviderBridge {
                 covered_input,
                 input: neutralized_input(recovered.normalized()),
                 attachments: prepare_attachments(recovered.attachments().to_vec()).await?,
-                instructions: recovered.additional_instructions().to_owned(),
             });
         }
         let binding = self.binding_under_admission(&request).await?;
@@ -955,7 +953,7 @@ impl ProviderBridge {
             .context_delivery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending(request.context_sections());
+            .pending(request.standing_sections());
         let permissions = Arc::new(
             crate::permissions::provider::ProviderPermissionContext::new(self.permissions.clone()),
         );
@@ -1076,10 +1074,13 @@ impl ProviderBridge {
                 attempt_id,
                 submission_id,
                 dispatch,
-                input: crate::exchange::TaskStart::render_input(context.task_start.as_ref(), input),
+                input: {
+                    let mut input = input;
+                    crate::exchange::TaskStart::announce(context.task_start.as_ref(), &mut input);
+                    input
+                },
                 recovered_inputs,
                 context: turn_context,
-                instructions,
                 attachments: prepared_attachments,
                 receipt: native_receipt,
                 permissions,
@@ -1211,24 +1212,31 @@ impl ProviderBridge {
                     attachments,
                 )
             }
-            None if matches!(input, super::SteeringInput::AgentResult(_)) => (
-                forge_provider_api::SteeringDelivery::Context,
-                forge_provider_api::PromptInput::Text(input.text().to_owned()),
-                Vec::new(),
-            ),
-            None => {
-                return Err(failure(
-                    ProviderOperation::TurnSteer,
-                    ProviderFailureKind::Rejected,
-                ));
-            }
+            None => match input.agent_result() {
+                Some(result) => (
+                    forge_provider_api::SteeringDelivery::Context,
+                    forge_provider_api::forge::TurnInput::child_continuation(vec![result.clone()])
+                        .expect("one child result is not empty"),
+                    Vec::new(),
+                ),
+                None => {
+                    return Err(failure(
+                        ProviderOperation::TurnSteer,
+                        ProviderFailureKind::Rejected,
+                    ));
+                }
+            },
         };
         Ok((
             native.binding.id.clone(),
             forge_provider_api::SteeringRequest {
                 scope,
                 delivery,
-                input: crate::exchange::TaskStart::render_input(input.task_start(), normalized),
+                input: {
+                    let mut normalized = neutralized_input(normalized);
+                    crate::exchange::TaskStart::announce(input.task_start(), &mut normalized);
+                    normalized
+                },
                 attachments,
             },
         ))
@@ -2938,22 +2946,24 @@ fn binding_metadata(event: &ProviderEvent, owner: &ThreadOwner) -> Option<Bindin
     }
 }
 
-/// Disarm `<forge>` markers in input text before it reaches a provider.
+/// Disarm `<forge>` markers in the user's own words before they reach a provider.
 ///
 /// The open-time instructions tell the model that every `<forge>` block in a user message comes
-/// from Harness, so input text must not be able to open or close one. Question replies are
-/// neutralized where they are rendered.
-fn neutralized_input(input: forge_provider_api::PromptInput) -> forge_provider_api::PromptInput {
+/// from Harness, so user text must not be able to open or close one. Text inside `<forge>`
+/// elements is escaped where those elements are rendered.
+fn neutralized_input(
+    mut input: forge_provider_api::forge::TurnInput,
+) -> forge_provider_api::forge::TurnInput {
     use forge_provider_api::PromptInput;
-    use forge_provider_api::turn_context::neutralize;
-    match input {
+    use forge_provider_api::forge::neutralize;
+    input.map_user_input(|user| match user {
         PromptInput::Text(text) => PromptInput::Text(neutralize(&text).into_owned()),
         PromptInput::Skill { name, arguments } => PromptInput::Skill {
             name,
             arguments: neutralize(&arguments).into_owned(),
         },
-        reply @ PromptInput::QuestionReply(_) => reply,
-    }
+    });
+    input
 }
 
 /// Resolve admitted attachments on the blocking pool before any native dispatch.

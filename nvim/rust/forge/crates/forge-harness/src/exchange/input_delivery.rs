@@ -565,11 +565,8 @@ impl InputDeliveryRun {
                     .kind;
                 let input = match &self.message.purpose {
                     crate::input::InputPurpose::Question { reply, .. } => {
-                        crate::provider::ProviderInput::QuestionReply {
-                            context: String::new(),
-                            reply: reply.clone(),
-                            attachments: attachments.clone(),
-                        }
+                        crate::provider::ProviderInput::question_reply(reply.clone())
+                            .with_attachments(attachments.clone())
                     }
                     crate::input::InputPurpose::Clarification { .. }
                     | crate::input::InputPurpose::User
@@ -577,7 +574,7 @@ impl InputDeliveryRun {
                     | crate::input::InputPurpose::WorkflowContinuation { .. }
                     | crate::input::InputPurpose::TaskEntry { .. }
                     | crate::input::InputPurpose::TaskContinuation { .. } => {
-                        crate::provider::ProviderInput::from_text(self.message.text.clone())
+                        crate::provider::ProviderInput::from_message(&self.message)
                             .with_attachments(attachments.clone())
                     }
                 };

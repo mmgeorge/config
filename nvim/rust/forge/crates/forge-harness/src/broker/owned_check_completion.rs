@@ -15,7 +15,7 @@ pub(crate) enum OwnedCheckProgress {
     Pending,
     Revalidate,
     Repair {
-        prompt: String,
+        prompt: forge_provider_api::forge::CheckRepair,
         change_owner: String,
     },
     Ready(CheckCompletionOutcome),

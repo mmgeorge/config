@@ -13,15 +13,10 @@ use std::collections::{HashMap, HashSet};
 type Result<T> = std::result::Result<T, ProviderError>;
 
 /// Records a native suffix repair without changing the user's submitted input.
+///
+/// The next prompt reports it as [`forge_provider_api::forge::Notice::HistoryRepaired`].
 #[derive(Clone)]
 pub struct HistoryRepair;
-
-impl HistoryRepair {
-    /// Explain why prior side effects must be inspected before repeating work.
-    pub fn caution(&self) -> &'static str {
-        "Recovery notice: an interrupted native tool-call suffix was removed from provider history. Its actions may already have completed or partially changed the workspace. Inspect the workspace before repeating writes; do not replay the interrupted request automatically."
-    }
-}
 
 /// Remove only a proven incomplete trailing tool-call suffix, then verify repair.
 pub async fn repair(session: &super::handle::CopilotSession) -> Result<Option<HistoryRepair>> {

@@ -174,15 +174,7 @@ impl BoundarySteeringProvider {
                 async move {
                     start.observed(0).await?;
 
-                    let text = match &request.input {
-                        forge_provider_api::PromptInput::Text(text) => text.clone(),
-                        forge_provider_api::PromptInput::Skill { name, arguments } => {
-                            format!("/{name} {arguments}")
-                        }
-                        forge_provider_api::PromptInput::QuestionReply(reply) => {
-                            reply.question.clone()
-                        }
-                    };
+                    let text = crate::provider::test_support::input_text(&request.input);
                     input.lock().unwrap().push(text.clone());
                     let continuation = text == "boundary correction";
                     let address = crate::provider::TurnAddress {
@@ -262,7 +254,7 @@ impl BoundarySteeringProvider {
             let continuation_started = continuation_started.clone();
             let continuation_accept = continuation_accept.clone();
             async move {
-                if matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "boundary correction") {
+                if matches!(request.input.user_input(), Some(forge_provider_api::PromptInput::Text(text)) if text == "boundary correction") {
                     continuation_started.add_permits(1);
                     crate::provider::test_support::wait_gate(&continuation_accept).await?;
                 }

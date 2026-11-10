@@ -1,15 +1,25 @@
 use serde::{Deserialize, Serialize};
 
-/// The text or explicit skill selected by the caller, before native skill resolution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The user's own text or explicit skill selection, before native skill resolution.
+///
+/// Harness-authored content never appears here; it travels as typed
+/// [`crate::forge::TurnInput`] elements beside this input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PromptInput {
     Text(String),
-    Skill {
-        name: String,
-        arguments: String,
-    },
-    /// Carry a host-validated question response for provider-specific rendering.
-    QuestionReply(QuestionReply),
+    Skill { name: String, arguments: String },
+}
+
+impl PromptInput {
+    /// Describe the input as the user wrote it, for transcripts and labels.
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Skill { name, arguments } if arguments.is_empty() => format!("${name}"),
+            Self::Skill { name, arguments } => format!("${name} {arguments}"),
+        }
+    }
 }
 
 /// Identify one validated response to a host-owned structured question.
@@ -60,21 +70,28 @@ pub enum QuestionReplyResponse {
     },
 }
 
-/// Render admitted but definitely undelivered input ahead of the newest instruction.
+/// Render admitted but definitely undelivered inputs ahead of the newest input.
 ///
-/// Each input follows a Harness note that labels it, so the labels stay distinguishable from the
-/// user's text.
-pub fn recovered_text(current: &str, previous: &[String]) -> String {
-    use crate::turn_context::{newest_note, recovered_note};
-    if previous.is_empty() {
-        return current.to_owned();
-    }
-    let mut text = String::new();
-    for (index, input) in previous.iter().enumerate() {
-        text.push_str(&format!("{}\n{input}\n\n", recovered_note(index + 1)));
-    }
-    text.push_str(&format!("{}\n{current}", newest_note()));
-    text
+/// Each earlier input is rendered as its [`crate::forge::earlier_input_block`] followed by its
+/// text, so the marker and the earlier input's own elements precede the user's words.
+pub fn recovered_text(current: &str, previous: &[(crate::forge::TurnInput, String)]) -> String {
+    let mut parts = previous
+        .iter()
+        .enumerate()
+        .map(|(index, (input, text))| {
+            [
+                crate::forge::earlier_input_block(index + 1, input),
+                text.clone(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .collect::<Vec<_>>();
+    parts.push(current.to_owned());
+    parts.retain(|part| !part.is_empty());
+    parts.join("\n\n")
 }
 
 /// Carry prepared user text and explicitly selected files into a native provider adapter.

@@ -80,7 +80,9 @@ impl HeldDispatch {
                             forge_provider_api::turn::TurnOutcome::Interrupted,
                         ));
                     }
-                    if let forge_provider_api::input::PromptInput::Text(text) = &request.input {
+                    if let Some(forge_provider_api::input::PromptInput::Text(text)) =
+                        request.input.user_input()
+                    {
                         let _ = dispatched.send(text.clone());
                     }
                     // Each turn replies under its own message identity, as a provider does.

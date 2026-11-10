@@ -24,7 +24,7 @@ pub(crate) enum TaskChange {
     Preserve,
     Pause,
     Resume,
-    ResumeWithEntry(String),
+    ResumeWithEntry(forge_provider_api::forge::TurnInput),
     ResumeWithChecks(super::TaskTurnId),
     Clear,
 }
@@ -363,12 +363,12 @@ impl SessionTaskController {
         store: &mut SqliteStore,
         permit: &TaskPermit,
         completed_turn: super::TaskTurnId,
-        instruction: String,
+        instruction: forge_provider_api::forge::TurnInput,
         reason: String,
         now_ms: i64,
     ) -> Result<bool> {
         ensure!(
-            !instruction.trim().is_empty(),
+            !instruction.label().trim().is_empty(),
             "continuation instruction is required"
         );
         self.mutate(store, permit, now_ms, |task| {
@@ -741,15 +741,15 @@ impl SessionTaskController {
                 }
                 let continuation = match (&task.workflow, decision) {
                     (
-                        WorkflowSnapshot::Goal { goal },
+                        WorkflowSnapshot::Goal { .. },
                         crate::goal::ContinuationDecision::Continue
                         | crate::goal::ContinuationDecision::RetryNoProgress,
                     ) => Some(super::TaskContinuation {
                         id: super::TaskInputId::fresh(),
+                        // The goal's objective travels in the `<task>` section.
                         work: super::TaskWork::Provider {
-                            instruction: format!(
-                                "Continue working toward this goal: {}",
-                                goal.objective
+                            instruction: crate::plan::task_step(
+                                forge_provider_api::forge::TaskStep::GoalContinue,
                             ),
                         },
                         reason: "The active task requires another turn".into(),
@@ -819,65 +819,96 @@ impl SessionTaskController {
                 let task = active.as_mut().context("session has no active task")?;
                 permit.validate(Some(task))?;
                 task.edit(|task| {
-                ensure!(
-                    task.entry_accepted(),
-                    "plan entry has not been acknowledged"
-                );
-                if task.observed_turn.as_ref().is_some_and(|observed| observed >= &completed_turn)
-                {
-                    return Ok(None);
-                }
-                let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
-                    anyhow::bail!("planning progress requires an active plan");
-                };
-                ensure!(!plan.paused, "planning task is paused");
-                if draft_dirty && plan.artifact.state == crate::plan::PlanState::AwaitingReview {
-                    crate::plan::state_machine::PlanStateMachine::apply(
-                        &mut plan.artifact, crate::plan::state_machine::PlanEvent::ChangesRequested, now_ms,
-                    )?;
-                }
-                if canonical_progress {
-                    plan.artifact.generation.canonical_revision = plan
-                        .artifact
-                        .generation
-                        .canonical_revision
-                        .saturating_add(1);
-                }
-                let budget_allows = plan.artifact.generation.observe(canonical_progress);
-                let generating = matches!(plan.artifact.state,
-                    crate::plan::PlanState::ConfiguringChecks | crate::plan::PlanState::Generating | crate::plan::PlanState::Revising);
-                if generating && !budget_allows {
-                    if plan.artifact.state == crate::plan::PlanState::ConfiguringChecks {
-                        plan.paused = true;
-                    } else { crate::plan::state_machine::PlanStateMachine::apply(
-                        &mut plan.artifact,
-                        crate::plan::state_machine::PlanEvent::TransitionFailed,
-                        now_ms,
-                    )?; }
-                }
-                let continuing = generating && budget_allows;
-                let artifact = plan.artifact.clone();
-                let reserved = task.turn.as_ref().filter(|turn| turn.id == completed_turn)
-                    .and_then(|turn| turn.continuation.clone())
-                    .filter(|input| input.delivery == super::TaskInputDelivery::Pending);
-                task.observed_turn = Some(completed_turn.clone());
-                task.turn = Some(super::TaskTurn {
-                    id: completed_turn,
-                    continuation: if continuing { reserved.or_else(|| Some(super::TaskContinuation {
-                        id: super::TaskInputId::fresh(),
-                        work: super::TaskWork::Provider { instruction: if artifact.state == crate::plan::PlanState::ConfiguringChecks {
-                            crate::plan::PlanPrompt::checks_setup(&artifact.request)
-                        } else { format!(
-                            "Continue the active planning task in its existing directory. The previous turn ended without submitting the plan or asking a question. Use ordinary file tools for docs/ and files/, then call plan_submit with the plan ID and no expected version. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.\n\nPlanning continuation: turn {} of {}.",
-                            artifact.generation.budget.turn_count + 1,
-                            artifact.generation.budget.max_turn_count,
-                        ) } },
-                        reason: "The planning turn ended without submitting a plan".into(),
-                        delivery: super::TaskInputDelivery::Pending,
-                    })) } else { None },
-                });
-                if generating && !budget_allows { task.renew(now_ms); } else { task.updated_at_ms = now_ms; }
-                Ok(Some((artifact, continuing)))
+                    ensure!(
+                        task.entry_accepted(),
+                        "plan entry has not been acknowledged"
+                    );
+                    if task
+                        .observed_turn
+                        .as_ref()
+                        .is_some_and(|observed| observed >= &completed_turn)
+                    {
+                        return Ok(None);
+                    }
+                    let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                        anyhow::bail!("planning progress requires an active plan");
+                    };
+                    ensure!(!plan.paused, "planning task is paused");
+                    if draft_dirty && plan.artifact.state == crate::plan::PlanState::AwaitingReview
+                    {
+                        crate::plan::state_machine::PlanStateMachine::apply(
+                            &mut plan.artifact,
+                            crate::plan::state_machine::PlanEvent::ChangesRequested,
+                            now_ms,
+                        )?;
+                    }
+                    if canonical_progress {
+                        plan.artifact.generation.canonical_revision = plan
+                            .artifact
+                            .generation
+                            .canonical_revision
+                            .saturating_add(1);
+                    }
+                    let budget_allows = plan.artifact.generation.observe(canonical_progress);
+                    let generating = matches!(
+                        plan.artifact.state,
+                        crate::plan::PlanState::ConfiguringChecks
+                            | crate::plan::PlanState::Generating
+                            | crate::plan::PlanState::Revising
+                    );
+                    if generating && !budget_allows {
+                        if plan.artifact.state == crate::plan::PlanState::ConfiguringChecks {
+                            plan.paused = true;
+                        } else {
+                            crate::plan::state_machine::PlanStateMachine::apply(
+                                &mut plan.artifact,
+                                crate::plan::state_machine::PlanEvent::TransitionFailed,
+                                now_ms,
+                            )?;
+                        }
+                    }
+                    let continuing = generating && budget_allows;
+                    let artifact = plan.artifact.clone();
+                    let reserved = task
+                        .turn
+                        .as_ref()
+                        .filter(|turn| turn.id == completed_turn)
+                        .and_then(|turn| turn.continuation.clone())
+                        .filter(|input| input.delivery == super::TaskInputDelivery::Pending);
+                    task.observed_turn = Some(completed_turn.clone());
+                    task.turn = Some(super::TaskTurn {
+                        id: completed_turn,
+                        continuation: if continuing {
+                            reserved.or_else(|| {
+                                Some(super::TaskContinuation {
+                                    id: super::TaskInputId::fresh(),
+                                    work: super::TaskWork::Provider {
+                                        instruction: if artifact.state
+                                            == crate::plan::PlanState::ConfiguringChecks
+                                        {
+                                            crate::plan::PlanPrompt::checks_setup(&artifact.request)
+                                        } else {
+                                            crate::plan::PlanPrompt::continuation(
+                                                artifact.generation.budget.turn_count + 1,
+                                                artifact.generation.budget.max_turn_count,
+                                            )
+                                        },
+                                    },
+                                    reason: "The planning turn ended without submitting a plan"
+                                        .into(),
+                                    delivery: super::TaskInputDelivery::Pending,
+                                })
+                            })
+                        } else {
+                            None
+                        },
+                    });
+                    if generating && !budget_allows {
+                        task.renew(now_ms);
+                    } else {
+                        task.updated_at_ms = now_ms;
+                    }
+                    Ok(Some((artifact, continuing)))
                 })
             },
         )
@@ -1599,7 +1630,7 @@ impl SessionTaskController {
         context: OwnerTaskCommit<'_>,
         request: &crate::exchange::command::WorkflowContinuationRequest,
         prepared: crate::broker::plan_entry::PreparedTaskChange,
-        instruction: String,
+        instruction: forge_provider_api::forge::TurnInput,
     ) -> std::result::Result<
         crate::exchange::command::TaskCommandCheckpoint,
         crate::exchange::command::TaskCommandFailure,
@@ -1683,14 +1714,16 @@ impl SessionTaskController {
                     )
                 }
             };
+            // The typed input is what the provider receives; the text is its display label.
             let message = crate::input::InputMessage::admitted(crate::input::InputDraft {
                 id: input.as_str().into(),
-                text: instruction,
+                text: instruction.label(),
                 purpose,
                 attachments: Vec::new(),
                 config: None,
                 intent: crate::input::InputIntent::Auto,
-            });
+            })
+            .with_turn(instruction.clone());
             effects.owner_task_commit =
                 Some(crate::exchange::journal::TaskCommandCommit::WorkflowInput {
                     command: id.clone(),

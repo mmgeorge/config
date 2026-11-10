@@ -2719,62 +2719,59 @@ fn prompt_input(input: &forge_provider_api::PromptInput) -> String {
         forge_provider_api::PromptInput::Skill { name, arguments } => {
             format!("/{name} {arguments}")
         }
-        forge_provider_api::PromptInput::QuestionReply(reply) => {
-            forge_provider_api::turn_context::question_reply(reply)
-        }
     }
 }
 
-/// Encode current and recovered typed inputs without dropping their instructions or files.
+/// Render the user's own words of one turn input, or nothing for a Harness-started turn.
+fn user_text(input: &forge_provider_api::forge::TurnInput) -> String {
+    input.user_input().map(prompt_input).unwrap_or_default()
+}
+
+/// Encode current and recovered typed inputs without dropping their elements or files.
 fn prompt_content(
     request: &PromptRequest,
     supports_images: bool,
     base_instructions: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let compact = request.recovered_inputs.is_empty()
-        && matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "/compact");
+        && matches!(
+            request.input.kind(),
+            forge_provider_api::forge::TurnKind::UserMessage {
+                input: forge_provider_api::PromptInput::Text(text)
+            } if text == "/compact"
+        );
     if compact {
         return Ok(vec![serde_json::json!({"type":"text","text":"/compact"})]);
     }
 
     let mut content = Vec::new();
-    if let Some(instructions) = base_instructions {
-        content.push(serde_json::json!({"type":"text","text":instructions}));
-    }
-    // ACP has no mid-session developer channel, so changed Harness context and this input's note
-    // travel as one `<forge>` block that the open-time instructions explain.
-    let context = request.context_block();
-    if !context.is_empty() {
-        content.push(serde_json::json!({"type":"text","text":context}));
-    }
-    for (index, recovered) in request.recovered_inputs.iter().enumerate() {
-        content.push(serde_json::json!({
-            "type":"text",
-            "text":forge_provider_api::turn_context::recovered_note(index + 1),
-        }));
-        if !recovered.instructions.is_empty() {
-            content.push(serde_json::json!({
-                "type":"text",
-                "text":forge_provider_api::turn_context::note(&recovered.instructions),
-            }));
+    let push_text = |content: &mut Vec<serde_json::Value>, text: String| {
+        if !text.is_empty() {
+            content.push(serde_json::json!({"type":"text","text":text}));
         }
+    };
+    if let Some(instructions) = base_instructions {
+        push_text(
+            &mut content,
+            forge_provider_api::forge::system_instructions_block(instructions),
+        );
+    }
+    // ACP has no mid-session developer channel, so the turn's standing sections and elements
+    // travel as one `<forge>` block that the open-time instructions explain.
+    push_text(&mut content, request.user_message_block());
+    for (index, recovered) in request.recovered_inputs.iter().enumerate() {
+        push_text(&mut content, recovered.block(index + 1));
         let mut attachments =
             super::attachments::input(String::new(), &recovered.attachments, supports_images)?;
         attachments.pop();
         content.extend(attachments);
-        content.push(serde_json::json!({"type":"text","text":prompt_input(&recovered.input)}));
-    }
-    if !request.recovered_inputs.is_empty() {
-        content.push(serde_json::json!({
-            "type":"text",
-            "text":forge_provider_api::turn_context::newest_note(),
-        }));
+        push_text(&mut content, user_text(&recovered.input));
     }
     let mut attachments =
         super::attachments::input(String::new(), &request.attachments, supports_images)?;
     attachments.pop();
     content.extend(attachments);
-    content.push(serde_json::json!({"type":"text","text":prompt_input(&request.input)}));
+    push_text(&mut content, user_text(&request.input));
     Ok(content)
 }
 

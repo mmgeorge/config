@@ -40,6 +40,8 @@ pub(crate) struct ForegroundAdmission {
     pub(crate) text: String,
     attachments: Vec<crate::attachment::InputAttachment>,
     pub(crate) purpose: crate::input::InputPurpose,
+    /// Typed Harness input of a queued Harness message; `text` is then only its label.
+    turn: Option<forge_provider_api::forge::TurnInput>,
     pub(crate) command: Option<crate::task::command::SessionCommand>,
     pub(crate) command_result: Option<Result<(Value, Vec<SessionEvent>)>>,
     pub(crate) command_response: Option<DispatchResult>,
@@ -508,6 +510,7 @@ impl HarnessBroker {
         attachments: Vec<crate::attachment::InputAttachment>,
         sink: publication::SessionUpdateSink,
     ) -> Result<TurnTransaction> {
+        let turn = message.turn().cloned();
         let previous_purpose = std::mem::replace(&mut self.input_purpose, message.purpose);
         let previous_submission = self.input_submission.take();
         let result = self.begin_foreground_dispatch(
@@ -526,6 +529,7 @@ impl HarnessBroker {
             unreachable!("queued input begins at foreground admission")
         };
         admission.input_submission = Some(submission);
+        admission.turn = turn;
         Ok(dispatch)
     }
 
@@ -583,15 +587,14 @@ impl HarnessBroker {
         let TurnTransaction::Admitting(admission) = &mut dispatch else {
             unreachable!()
         };
-        // The question's stance applies to this one forked turn, so it travels with its input
-        // rather than as a tracked context section.
+        // The question's stance applies to this one forked turn, so it is the kind's fixed
+        // instruction rather than a tracked context section; the user's question stays unwrapped.
         admission.local_interaction = Some((
             PromptMode::PlanQuestion,
             Some(ExchangeAdmission::chat(display)),
-            ProviderInput::from_text(format!(
-                "Answer the plan review question below in this forked session with a concise final response, which Harness saves on the original question. Do not edit, submit, implement, or ask follow-up questions.\n\n{}",
-                admission.text
-            )),
+            ProviderInput::kind(forge_provider_api::forge::TurnKind::PlanReviewQuestion {
+                input: forge_provider_api::PromptInput::Text(admission.text.clone()),
+            }),
         ));
         admission.phase = AdmissionPhase::Prepared;
         Ok(dispatch)
@@ -1190,6 +1193,7 @@ impl HarnessBroker {
             text,
             attachments: Vec::new(),
             purpose,
+            turn: None,
             command,
             command_result: None,
             command_response: None,
@@ -1251,23 +1255,14 @@ impl HarnessBroker {
         &mut self,
         staged: &StagedInteraction,
     ) -> Result<ForegroundProviderContext> {
-        // Harness workflow text travels in the input's note, which providers render as a
-        // `<note>` beside the user's text, so the user's words reach the model unmodified.
+        // A user message during plan review is a plan discussion; its rules are the kind's fixed
+        // instructions, so the user's words reach the model unmodified. The plan task section
+        // names the plan, so no active-plan line is needed.
         let mut input = staged.input.clone();
         if staged.mode == PromptMode::PlanDiscussion {
-            input.prepend_note(PlanPrompt::discussion());
-        }
-        if matches!(staged.mode, PromptMode::Plan | PromptMode::PlanDiscussion)
-            && !PlanPrompt::has_active_plan(&input.text())
-            && !PlanPrompt::has_active_plan(input.additional_instructions())
-        {
-            let plan_id = self
-                .current_plan_id()?
-                .context("planning turn has no active plan")?;
-            let document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan_id)?;
-            input.prepend_note(&PlanPrompt::active_plan(&document));
+            input = input.retype_user_message(|input| {
+                forge_provider_api::forge::TurnKind::PlanDiscussion { input }
+            });
         }
         let mut request = self.provider_request(input, staged.mode)?;
         if let Some(configuration) = staged.task_configuration.as_ref() {
@@ -1276,7 +1271,9 @@ impl HarnessBroker {
         request.submission = Some(staged.submission.clone());
         let owner = crate::provider::ThreadOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
-            request.input.prepend_note(&feedback);
+            request
+                .input
+                .push_notice(forge_provider_api::forge::Notice::PermissionTimeout { feedback });
         }
         let policy = request
             .control_context
@@ -1431,11 +1428,9 @@ impl HarnessBroker {
         self.store.save_exchange(&exchange)?;
         let text = admission.text.clone();
         let input = match &admission.purpose {
-            crate::input::InputPurpose::Question { reply, .. } => ProviderInput::QuestionReply {
-                reply: reply.clone(),
-                context: String::new(),
-                attachments: Vec::new(),
-            },
+            crate::input::InputPurpose::Question { reply, .. } => {
+                ProviderInput::question_reply(reply.clone())
+            }
             _ => ProviderInput::from_text(text.clone()),
         };
         self.stage_foreground_interaction(&text, mode, None, input)
@@ -1459,11 +1454,7 @@ impl HarnessBroker {
             admission.question_discussion = Some(discussion);
             let input = match &admission.purpose {
                 crate::input::InputPurpose::Question { reply, .. } => {
-                    ProviderInput::QuestionReply {
-                        reply: reply.clone(),
-                        context: String::new(),
-                        attachments: Vec::new(),
-                    }
+                    ProviderInput::question_reply(reply.clone())
                 }
                 _ => ProviderInput::from_text(text),
             };
@@ -1483,11 +1474,15 @@ impl HarnessBroker {
                 self.task_controller.current()?.is_none(),
                 "question continuation cannot replace an active task"
             );
+            let input = admission.turn.clone().map_or_else(
+                || ProviderInput::from_text(text.clone()),
+                ProviderInput::new,
+            );
             return self.stage_foreground_interaction(
                 &text,
                 PromptMode::Chat,
                 Some(&ExchangeAdmission::chat(text.clone())),
-                ProviderInput::from_text(text.clone()),
+                input,
             );
         }
         let task_input = match &admission.purpose {
@@ -1564,11 +1559,26 @@ impl HarnessBroker {
                 _ => PromptMode::GoalContinuation,
             };
             admission.planning = self.planning_context(&task, mode)?;
+            // The queued message's text is only a label; the task holds the typed input.
+            let typed = admission.turn.clone().or_else(|| match &admission.purpose {
+                crate::input::InputPurpose::TaskEntry { .. } => {
+                    task.entry.as_ref().map(|entry| entry.instruction.clone())
+                }
+                _ => task
+                    .turn
+                    .as_ref()
+                    .and_then(|turn| turn.continuation.as_ref())
+                    .and_then(|continuation| continuation.work.instruction().cloned()),
+            });
+            let input = typed.map_or_else(
+                || ProviderInput::from_text(text.clone()),
+                ProviderInput::new,
+            );
             return self.stage_foreground_interaction(
                 &text,
                 mode,
                 review.is_none().then_some(&exchange_admission),
-                ProviderInput::from_text(text.clone()),
+                input,
             );
         }
         anyhow::ensure!(
@@ -1634,10 +1644,10 @@ impl HarnessBroker {
                 admission.planning = self.planning_context(&task, PromptMode::Chat)?;
             }
             return self.stage_foreground_interaction(
-                &prompt,
+                &prompt.label(),
                 PromptMode::Chat,
                 Some(&exchange_admission),
-                ProviderInput::from_text(prompt.clone()),
+                ProviderInput::new(prompt),
             );
         }
         let mode = if self.current_task_is_plan()?
@@ -1661,17 +1671,9 @@ impl HarnessBroker {
                 .context("planning requires an active task")?;
             admission.planning = self.planning_context(&task, mode)?;
         }
-        let mut input = ProviderInput::parse(&text);
-        if let Some(plan) = active_plan
-            .as_ref()
-            .filter(|plan| !plan.working_path.is_empty())
-            && !matches!(input, ProviderInput::QuestionReply { .. })
-        {
-            let document = self
-                .plan_file
-                .read_working_document(&self.session.id, &plan.id)?;
-            input.prepend_note(&PlanPrompt::active_plan(&document));
-        }
+        // In Plan and plan-discussion modes the `<task kind="plan">` section names the plan, so
+        // the user's message is sent as typed.
+        let input = ProviderInput::parse(&text);
         self.stage_foreground_interaction(
             &text,
             mode,
@@ -2255,7 +2257,12 @@ impl HarnessBroker {
                             exchange_ordinal: exchange.ordinal,
                             turn_ordinal: exchange.turn.len(),
                         },
-                        feedback,
+                        ProviderInput::kind(
+                            forge_provider_api::forge::TurnKind::PermissionTimeout {
+                                feedback: feedback.clone(),
+                            },
+                        )
+                        .normalized(),
                         "An approval timed out".into(),
                         self.clock.now_ms(),
                     )?;
@@ -2281,7 +2288,11 @@ impl HarnessBroker {
                         &feedback,
                         PromptMode::Chat,
                         Some(&admission),
-                        ProviderInput::from_text(feedback.clone()),
+                        ProviderInput::kind(
+                            forge_provider_api::forge::TurnKind::PermissionTimeout {
+                                feedback: feedback.clone(),
+                            },
+                        ),
                     )?;
                     let TurnTransaction::Admitting(state) = &mut owned else {
                         unreachable!()

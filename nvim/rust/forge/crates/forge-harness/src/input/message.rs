@@ -28,6 +28,9 @@ pub struct InputMessage {
     pub attachments: Vec<Value>,
     pub config: Option<Value>,
     pub intent: InputIntent,
+    /// Typed Harness input for messages Harness produces, such as task entries; `text` is then
+    /// only its display label. User messages carry none. Boxed so queue events stay small.
+    turn: Option<Box<forge_provider_api::forge::TurnInput>>,
     state: DeliveryState,
 }
 
@@ -72,6 +75,8 @@ struct InputRecord {
     config: Option<Value>,
     #[serde(default)]
     intent: InputIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn: Option<Box<forge_provider_api::forge::TurnInput>>,
     #[serde(default)]
     delivery: InputDelivery,
     route: Option<InputRoute>,
@@ -116,8 +121,20 @@ impl InputMessage {
             attachments,
             config,
             intent,
+            turn: None,
             state: DeliveryState::Queued { reservation: None },
         }
+    }
+
+    /// Attach the typed Harness input that this message's text labels.
+    pub(crate) fn with_turn(mut self, turn: forge_provider_api::forge::TurnInput) -> Self {
+        self.turn = Some(Box::new(turn));
+        self
+    }
+
+    /// Get the typed Harness input, when Harness produced this message.
+    pub(crate) fn turn(&self) -> Option<&forge_provider_api::forge::TurnInput> {
+        self.turn.as_deref()
     }
 
     /// Create the first committed revision for input reserved in a workflow transaction.
@@ -137,6 +154,7 @@ impl InputMessage {
             attachments,
             config,
             intent,
+            turn: _,
             state: _,
         } = self;
         InputDraft {
@@ -278,6 +296,7 @@ impl TryFrom<InputRecord> for InputMessage {
             attachments,
             config,
             intent,
+            turn,
             delivery,
             route,
             reservation,
@@ -341,6 +360,7 @@ impl TryFrom<InputRecord> for InputMessage {
             attachments,
             config,
             intent,
+            turn,
             state,
         })
     }
@@ -361,6 +381,7 @@ impl From<InputMessage> for InputRecord {
             attachments,
             config,
             intent,
+            turn,
             state: _,
         } = message;
         Self {
@@ -371,6 +392,7 @@ impl From<InputMessage> for InputRecord {
             attachments,
             config,
             intent,
+            turn,
             delivery,
             route,
             reservation,

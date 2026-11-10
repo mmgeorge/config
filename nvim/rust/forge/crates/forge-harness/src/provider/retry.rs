@@ -600,7 +600,7 @@ mod tests {
                         log.continuation_count.fetch_add(1, Ordering::SeqCst);
                         assert_eq!(
                             request.input,
-                            forge_provider_api::PromptInput::Text(CONTINUATION_PROMPT.into())
+                            forge_provider_api::forge::TurnInput::from(CONTINUATION_PROMPT)
                         );
                     }
                     *log.selected_model.lock().unwrap() = request.configuration.model.model.clone();

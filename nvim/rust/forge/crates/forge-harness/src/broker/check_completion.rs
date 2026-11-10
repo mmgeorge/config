@@ -22,17 +22,20 @@ impl HarnessBroker {
     pub(crate) fn begin_check_repair(
         &mut self,
         request_id: u64,
-        prompt: String,
+        repair: forge_provider_api::forge::CheckRepair,
         change_owner: String,
         sink: publication::SessionUpdateSink,
     ) -> Result<TurnTransaction> {
         let scoped = sink.clone();
+        let input =
+            ProviderInput::kind(forge_provider_api::forge::TurnKind::CheckRepair { repair });
+        let label = input.text();
         self.with_publication_sink(&scoped, |broker| {
             let mut dispatch = broker.begin_foreground_dispatch(
                 Request {
                     id: request_id,
                     method: "session.prompt.submit".into(),
-                    params: json!({"text":prompt}),
+                    params: json!({"text":label}),
                 },
                 sink,
             )?;
@@ -43,10 +46,10 @@ impl HarnessBroker {
             exchange_admission.check_owner = Some(change_owner.clone());
             exchange_admission.automatic_owner = Some(change_owner.clone());
             admission.staged_interaction = Some(broker.stage_foreground_interaction(
-                &prompt,
+                &label,
                 PromptMode::Chat,
                 Some(&exchange_admission),
-                ProviderInput::from_text(prompt.clone()),
+                input,
             )?);
             admission.automatic_check_owner = Some(change_owner);
             Ok(dispatch)

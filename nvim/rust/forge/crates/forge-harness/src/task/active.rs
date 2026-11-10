@@ -165,7 +165,11 @@ impl Task {
     }
 
     /// Reserve a provider entry without exposing task internals.
-    pub(crate) fn request_entry(&mut self, instruction: String, now_ms: i64) -> Result<()> {
+    pub(crate) fn request_entry(
+        &mut self,
+        instruction: forge_provider_api::forge::TurnInput,
+        now_ms: i64,
+    ) -> Result<()> {
         self.edit(|draft| draft.request_entry(instruction, now_ms))
     }
 }
@@ -193,7 +197,7 @@ impl TryFrom<TaskSnapshot> for Task {
         );
         if let Some(entry) = &draft.entry {
             anyhow::ensure!(
-                !entry.instruction.trim().is_empty(),
+                !entry.instruction.label().trim().is_empty(),
                 "provider entry instruction is required"
             );
         }
@@ -206,7 +210,7 @@ impl TryFrom<TaskSnapshot> for Task {
                 input
                     .work
                     .instruction()
-                    .is_none_or(|instruction| !instruction.trim().is_empty()),
+                    .is_none_or(|instruction| !instruction.label().trim().is_empty()),
                 "provider continuation instruction is required"
             );
             anyhow::ensure!(
@@ -315,13 +319,15 @@ pub struct TaskContinuation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskWork {
-    Provider { instruction: String },
+    Provider {
+        instruction: forge_provider_api::forge::TurnInput,
+    },
     Checks,
 }
 
 impl TaskWork {
-    /// Get provider guidance only when this operation admits a provider turn.
-    pub fn instruction(&self) -> Option<&str> {
+    /// Get the typed provider input only when this operation admits a provider turn.
+    pub fn instruction(&self) -> Option<&forge_provider_api::forge::TurnInput> {
         match self {
             Self::Provider { instruction } => Some(instruction),
             Self::Checks => None,
@@ -337,7 +343,8 @@ impl TaskWork {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskEntry {
     pub id: TaskInputId,
-    pub instruction: String,
+    /// Typed provider input that starts or resumes the task.
+    pub instruction: forge_provider_api::forge::TurnInput,
     pub delivery: TaskInputDelivery,
     /// Keep review feedback and its revision turns in their originating exchange.
     pub review_exchange: Option<String>,
@@ -593,9 +600,13 @@ impl TaskSnapshot {
     }
 
     /// Retains entry intent until the matching provider receipt activates control admission.
-    pub(crate) fn request_entry(&mut self, instruction: String, now_ms: i64) -> Result<()> {
+    pub(crate) fn request_entry(
+        &mut self,
+        instruction: forge_provider_api::forge::TurnInput,
+        now_ms: i64,
+    ) -> Result<()> {
         anyhow::ensure!(
-            !instruction.trim().is_empty(),
+            !instruction.label().trim().is_empty(),
             "task entry instruction is required"
         );
         self.renew(now_ms);
@@ -611,7 +622,11 @@ impl TaskSnapshot {
     }
 
     /// Retain a resumption's entry intent without re-announcing the task start.
-    pub(crate) fn request_resume_entry(&mut self, instruction: String, now_ms: i64) -> Result<()> {
+    pub(crate) fn request_resume_entry(
+        &mut self,
+        instruction: forge_provider_api::forge::TurnInput,
+        now_ms: i64,
+    ) -> Result<()> {
         self.request_entry(instruction, now_ms)?;
         if let Some(entry) = self.entry.as_mut() {
             entry.resumed = true;

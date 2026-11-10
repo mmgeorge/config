@@ -269,9 +269,9 @@ fn generation_provider(
         async move {
             let mut calls = calls.lock().await;
             let opened = calls.last_mut().expect("open precedes input");
-            opened.input = match &request.input {
-                forge_provider_api::PromptInput::Text(text) => text.clone(),
-                forge_provider_api::PromptInput::Skill { .. } | forge_provider_api::PromptInput::QuestionReply(_) => panic!("utility input must preserve plain text"),
+            opened.input = match request.input.user_input() {
+                Some(forge_provider_api::PromptInput::Text(text)) => text.clone(),
+                _ => panic!("utility input must preserve plain text"),
             };
             assert!(request.tools.is_empty());
             assert!(request.attachments.is_empty());

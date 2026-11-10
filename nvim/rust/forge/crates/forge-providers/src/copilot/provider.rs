@@ -3488,17 +3488,22 @@ impl CopilotProvider {
             .await
             .map_err(|cause| cause.for_operation(ProviderOperation::TurnSteer))?;
         let input = forge_provider_api::input::MessageInput {
-            prompt: {
-                match request.input {
-                    forge_provider_api::PromptInput::Text(text) => text,
-                    forge_provider_api::PromptInput::Skill { name, arguments } => {
+            // A steered input carries its own elements, such as a question response, and no
+            // standing context; they precede the user's words.
+            prompt: [
+                forge_provider_api::forge::input_block(&request.input),
+                match request.input.user_input() {
+                    Some(forge_provider_api::PromptInput::Text(text)) => text.clone(),
+                    Some(forge_provider_api::PromptInput::Skill { name, arguments }) => {
                         format!("Use skill {name} with arguments: {arguments}")
                     }
-                    forge_provider_api::PromptInput::QuestionReply(reply) => {
-                        forge_provider_api::turn_context::question_reply(&reply)
-                    }
-                }
-            },
+                    None => String::new(),
+                },
+            ]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
             attachments: request.attachments,
         };
         callbacks.control.before_send(&request.scope).await?;
@@ -4437,11 +4442,7 @@ impl CopilotProvider {
         };
         state.callbacks.install(callbacks).await?;
         let callback_generation = state.callbacks.callbacks(&request.scope).await?.generation;
-        let repair_caution = self
-            .sessions
-            .repair(&state.owner)
-            .await
-            .map(|repair| repair.caution().to_owned());
+        let history_repaired = self.sessions.repair(&state.owner).await.is_some();
         if let Err(error) = pending.check_admission(ProviderOperation::TurnStart) {
             state.callbacks.retire_all(&state.binding.id).await?;
             return Err(error);
@@ -4457,9 +4458,16 @@ impl CopilotProvider {
             .lock()
             .await
             .insert(submission_id.clone(), (request.scope.clone(), attempt_id));
-        // Copilot has no mid-session developer channel, so changed Harness context and this
-        // input's note travel as one `<forge>` block at the start of the user message.
-        let instructions = request.context_block();
+        // A repaired history is reported as a typed notice on this input. Copilot has no
+        // mid-session developer channel, so the turn's standing sections and elements travel as
+        // one `<forge>` block at the start of the user message.
+        let mut request = request;
+        if history_repaired {
+            request
+                .input
+                .push_notice(forge_provider_api::forge::Notice::HistoryRepaired);
+        }
+        let instructions = request.user_message_block();
         let options = super::prompt::TurnOptions {
             workspace: session
                 .workspace_path()
@@ -4470,7 +4478,6 @@ impl CopilotProvider {
             input: request.input,
             recovered: request.recovered_inputs,
             instructions,
-            repair_caution,
             attachments: forge_provider_api::input::MessageInput {
                 prompt: String::new(),
                 attachments: request.attachments,
@@ -5149,11 +5156,12 @@ mod retained_recovery_tests {
             resource_lease: None,
             submission_id: receipt.id().clone(),
             attempt_id: receipt.attempt_id().unwrap(),
-            input: forge_provider_api::PromptInput::Text("never dispatch".into()),
+            input: forge_provider_api::forge::TurnInput::user(
+                forge_provider_api::PromptInput::Text("never dispatch".into()),
+            ),
             dispatch,
             recovered_inputs: Vec::new(),
             context: Default::default(),
-            instructions: String::new(),
             attachments: Vec::new(),
             receipt,
             permissions: authority.clone(),

@@ -27,9 +27,10 @@ fn member(toolset: &str, name: &str) -> bool {
     }
 }
 
-/// Render the `Toolsets` line of the permissions section for one turn.
-pub(crate) fn line(context: Option<&ControlTurnContext>) -> String {
-    let state = |enabled: bool| if enabled { "on" } else { "off" };
+/// List the toolsets for the `Toolsets` line of the permissions section for one turn.
+pub(crate) fn list(
+    context: Option<&ControlTurnContext>,
+) -> Vec<forge_provider_api::forge::Toolset> {
     let lsp = context
         .and_then(|context| context.lsp.as_ref())
         .is_some_and(|scope| scope.available());
@@ -42,13 +43,18 @@ pub(crate) fn line(context: Option<&ControlTurnContext>) -> String {
     let editing = context
         .and_then(|context| context.checks.as_ref())
         .is_some_and(|scope| scope.editing_enabled());
-    format!(
-        "Toolsets: {LSP} {}, {HARNESS_SESSION} {}, {AGENT} {}, {CHECK_DEFINITION_EDIT} {}.",
-        state(lsp),
-        state(session),
-        state(agent),
-        state(editing)
-    )
+    [
+        (LSP, lsp),
+        (HARNESS_SESSION, session),
+        (AGENT, agent),
+        (CHECK_DEFINITION_EDIT, editing),
+    ]
+    .into_iter()
+    .map(|(name, enabled)| forge_provider_api::forge::Toolset {
+        name: name.into(),
+        enabled,
+    })
+    .collect()
 }
 
 /// Describe when a tool is available, or `None` when it has no toolset or task requirement.
@@ -196,8 +202,16 @@ mod tests {
             "`question_ask` is not available in this turn."
         );
         assert_eq!(
-            line(None),
-            "Toolsets: lsp_* off, harness_session_* off, agent_* off, check_definition_edit off."
+            list(None)
+                .iter()
+                .map(|toolset| (toolset.name.as_str(), toolset.enabled))
+                .collect::<Vec<_>>(),
+            [
+                (LSP, false),
+                (HARNESS_SESSION, false),
+                (AGENT, false),
+                (CHECK_DEFINITION_EDIT, false)
+            ]
         );
     }
 }

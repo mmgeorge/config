@@ -86,7 +86,7 @@ pub(crate) enum AutomaticCheckAction {
         result: (Value, Vec<SessionEvent>),
     },
     Repair {
-        prompt: String,
+        prompt: forge_provider_api::forge::CheckRepair,
         change_owner: String,
     },
 }

@@ -377,11 +377,13 @@ async fn generate(
         resource_lease: None,
         submission_id: submission_id.clone(),
         attempt_id: attempt_id.clone(),
-        input: api::PromptInput::Text(request.input),
+        // Isolated generation is outside the `<forge>` protocol: its input is plain text.
+        input: api::forge::TurnInput::new(api::forge::TurnKind::Background {
+            input: api::PromptInput::Text(request.input),
+        }),
         dispatch,
         recovered_inputs: Vec::new(),
         context: Default::default(),
-        instructions: String::new(),
         attachments: Vec::new(),
         receipt,
         permissions: callbacks.clone(),

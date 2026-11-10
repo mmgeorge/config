@@ -69,7 +69,7 @@ struct BridgeFixtureProvider {
     compact_watermark: std::sync::atomic::AtomicU64,
     compact_started: tokio::sync::Notify,
     accept_input: std::sync::atomic::AtomicBool,
-    accepted_context: Mutex<Vec<forge_provider_api::turn_context::TurnContext>>,
+    accepted_context: Mutex<Vec<forge_provider_api::forge::TurnContext>>,
 }
 
 impl BridgeFixtureProvider {
@@ -748,7 +748,6 @@ async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() 
 /// everything again after history may have lost it.
 #[tokio::test]
 async fn accepted_turns_deliver_each_context_section_once_per_change() -> anyhow::Result<()> {
-    use forge_provider_api::turn_context::ContextSection;
     let root = tempfile::tempdir()?;
     let native = BridgeFixtureProvider::new(false);
     native.accept_input.store(true, Ordering::Release);
@@ -769,24 +768,22 @@ async fn accepted_turns_deliver_each_context_section_once_per_change() -> anyhow
         bridge.turn_start(request, scope).await?;
         Ok::<_, anyhow::Error>(())
     };
+    // Report which standing sections, permissions then task, one accepted turn delivered.
     let sections = |index: usize| {
-        native.accepted_context.lock().unwrap()[index]
-            .parts
-            .iter()
-            .map(|part| part.section)
-            .collect::<Vec<_>>()
+        let context = native.accepted_context.lock().unwrap()[index].clone();
+        (context.permissions.is_some(), context.task.is_some())
     };
     let ask = crate::session::ApprovalMode::Ask;
     let allow = crate::session::ApprovalMode::Allow;
     start("first", ask).await?;
-    assert_eq!(sections(0), ContextSection::ALL);
+    assert_eq!(sections(0), (true, true));
     let open = native.open_instructions.lock().unwrap()[0].clone();
     assert!(
         open.contains("## Forge context") && !open.contains("Tool approval:"),
         "open-time instructions explain the protocol and hold no changeable settings"
     );
     start("unchanged", ask).await?;
-    assert!(sections(1).is_empty());
+    assert_eq!(sections(1), (false, false));
     *native.input_failure.lock().unwrap() = Some(provider_failure(
         ProviderOperation::TurnStart,
         ProviderFailureKind::Rejected,
@@ -794,11 +791,11 @@ async fn accepted_turns_deliver_each_context_section_once_per_change() -> anyhow
     assert!(start("rejected", allow).await.is_err());
     native.input_failure.lock().unwrap().take();
     start("retried", allow).await?;
-    assert_eq!(sections(2), [ContextSection::Permissions]);
+    assert_eq!(sections(2), (true, false));
     // Compaction, rewind, and retraction clear the binding's record through this method.
     bridge.session(owner.clone()).await.clear_context();
     start("after-compaction", allow).await?;
-    assert_eq!(sections(3), ContextSection::ALL);
+    assert_eq!(sections(3), (true, true));
     bridge.shutdown().await?;
     Ok(())
 }

@@ -67,7 +67,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             {
                 (
                     &entry.id,
-                    entry.instruction.as_str(),
+                    &entry.instruction,
                     InputPurpose::TaskEntry {
                         revision: task.revision.clone(),
                         id: entry.id.clone(),
@@ -118,16 +118,18 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             } else {
                 return Ok(PreparedProduction::Idle);
             };
-            let changed = services.input.reconcile_task_input(InputMessage::queued(
-                crate::input::InputDraft {
+            // The typed input is what the provider receives; the text is its display label.
+            let changed = services.input.reconcile_task_input(
+                InputMessage::queued(crate::input::InputDraft {
                     id: id.as_str().into(),
-                    text: text.to_owned(),
+                    text: text.label(),
                     purpose,
                     attachments: Vec::new(),
                     config: None,
                     intent: InputIntent::Auto,
-                },
-            ))?;
+                })
+                .with_turn(text.clone()),
+            )?;
             Ok(match changed {
                 Some(update) => PreparedProduction::Updated(update),
                 None => PreparedProduction::Idle,

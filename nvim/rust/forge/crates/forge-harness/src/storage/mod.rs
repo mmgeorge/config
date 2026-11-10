@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-const SESSION_FORMAT_VERSION: u32 = 65;
+const SESSION_FORMAT_VERSION: u32 = 66;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.

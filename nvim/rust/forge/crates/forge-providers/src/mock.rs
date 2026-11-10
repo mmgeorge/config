@@ -1650,7 +1650,7 @@ impl MockProvider {
         } else {
             None
         };
-        let mut text = render_input(&request.input);
+        let mut text = render_turn(&request.input);
         if !request.attachments.is_empty() {
             let attachments = request
                 .attachments
@@ -2689,22 +2689,14 @@ async fn run_prompt_inner(
     }
     let mut prompt_parts = Vec::new();
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
-        prompt_parts.push(forge_provider_api::turn_context::recovered_note(index + 1));
-        if !recovered.instructions.is_empty() {
-            prompt_parts.push(forge_provider_api::turn_context::note(
-                &recovered.instructions,
-            ));
-        }
+        prompt_parts.push(recovered.block(index + 1));
         prompt_parts.extend(
             recovered
                 .attachments
                 .iter()
                 .map(|attachment| attachment.context.clone()),
         );
-        prompt_parts.push(render_input(&recovered.input));
-    }
-    if !request.recovered_inputs.is_empty() {
-        prompt_parts.push(forge_provider_api::turn_context::newest_note());
+        prompt_parts.extend(recovered.input.user_input().map(render_input));
     }
     // Harness workflow instructions are a provider contract, not user-visible prompt text, so
     // response holds and echoes report only what the user and task supplied.
@@ -2714,7 +2706,7 @@ async fn run_prompt_inner(
             .iter()
             .map(|attachment| attachment.context.clone()),
     );
-    prompt_parts.push(render_input(&request.input));
+    prompt_parts.push(render_turn(&request.input));
     let prompt = prompt_parts.join("\n\n");
     let hold = tokio::select! {
         result = control.arrive(&owner, request.execution, prompt.clone()) => result,
@@ -3025,7 +3017,7 @@ fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> 
     }
     // A revision keeps the original design in its instructions and renders the current design in
     // its input, so the newer version names the document the edits must revise.
-    let instructions = request.context_block();
+    let instructions = request.user_message_block();
     let Some(declaration) = [
         declaration_identity(&instructions),
         declaration_identity(prompt),
@@ -3099,21 +3091,24 @@ fn directory_planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPr
     else {
         return Vec::new();
     };
-    let instructions = request.context_block();
-    let Some(plan_id) = [prompt, instructions.as_str()]
-        .into_iter()
-        .find_map(|text| {
-            text.split_once("Active plan `")
-                .and_then(|(_, rest)| rest.split_once('`'))
-                .map(|(id, _)| id)
-                .or_else(|| {
-                    text.split_once("Plan ID: ")
-                        .map(|(_, rest)| rest.lines().next().unwrap_or_default())
-                })
-        })
-    else {
+    // The typed task names the plan when it changed this turn; otherwise the planning
+    // directory, whose last component is the plan ID, identifies it.
+    let plan_id = request
+        .context
+        .task
+        .as_ref()
+        .and_then(forge_provider_api::forge::Task::plan_id)
+        .map(str::to_owned)
+        .or_else(|| {
+            std::path::Path::new(directory)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+    let _ = prompt;
+    let Some(plan_id) = plan_id else {
         return Vec::new();
     };
+    let plan_id = plan_id.as_str();
     let overview = format!(
         "# Implement the requested change\n\n## Objective\nImplement the requested behavior.\n\n## Background\nThe mock provider prepared this design for submission {}.\n\n## Design\nApply the behavior at its owning boundary.\n\n## Manual checks\n- Confirm the requested interface behaves as designed.\n",
         request.submission_id.as_str(),
@@ -3508,9 +3503,16 @@ fn render_input(input: &PromptInput) -> String {
     match input {
         PromptInput::Text(text) => text.clone(),
         PromptInput::Skill { name, arguments } => format!("/{name} {arguments}"),
-        PromptInput::QuestionReply(reply) => {
-            forge_provider_api::turn_context::question_reply(reply)
-        }
+    }
+}
+
+/// Echo one turn input: the user's words, or the input's own block for a Harness-started turn.
+///
+/// Standing sections are a provider contract rather than prompt text, so echoes leave them out.
+fn render_turn(input: &forge_provider_api::forge::TurnInput) -> String {
+    match input.user_input() {
+        Some(user) => render_input(user),
+        None => forge_provider_api::forge::input_block(input),
     }
 }
 

@@ -18,19 +18,16 @@ pub(crate) struct PlanAuthoringScope {
 }
 
 impl PlanAuthoringScope {
-    /// Name the plan, its editable root, and its read-only authoring guide.
-    ///
-    /// The planning contract that follows in the task section holds the rules for using them.
-    pub(crate) fn prompt(&self) -> String {
-        format!(
-            "Plan ID: {}\nPlanning directory: {}\nAuthoring guide: {}",
-            self.plan_id,
-            self.directory().display(),
-            self.files
-                .plan_dir(&self.session_id, &self.plan_id)
-                .join("authoring-guide.md")
-                .display()
-        )
+    /// Get the plan this scope authorizes.
+    pub(crate) fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    /// Get the read-only authoring guide that defines the planning directory's layout.
+    pub(crate) fn authoring_guide(&self) -> PathBuf {
+        self.files
+            .plan_dir(&self.session_id, &self.plan_id)
+            .join("authoring-guide.md")
     }
 
     /// Get read-only comparison resources without granting writes to host storage.

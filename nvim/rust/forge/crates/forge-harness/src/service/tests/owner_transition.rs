@@ -34,7 +34,7 @@ async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Re
                 };
                 start.observed(1).await?;
 
-                let _ = dispatched.send(request.input.clone());
+                let _ = dispatched.send(request.input.user_input().cloned());
                 for event in crate::provider::test_support::message(
                     &address,
                     "reply",
@@ -97,7 +97,7 @@ async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Re
             params: json!({"operation_id":"new-after-early-cancel","text":"New prompt after cancellation"}),
         }, &sink).await?;
         let received = dispatches.recv().await;
-        assert!(matches!(received, Some(forge_provider_api::input::PromptInput::Text(text))
+        assert!(matches!(received, Some(Some(forge_provider_api::input::PromptInput::Text(text)))
             if text == "New prompt after cancellation"));
         Ok::<(), anyhow::Error>(())
     }.await;

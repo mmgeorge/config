@@ -1351,7 +1351,12 @@ impl HarnessBroker {
         let mut response = execution.response();
         response["result"] = json!("reviewed");
         response["plan_state"] = serde_json::to_value(plan.state)?;
-        response["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
+        response["manual_changes"] = serde_json::to_value(
+            plan.manual_changes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
         response["approval_comments"] = serde_json::to_value(&execution.approval_comments)?;
         response["document"] = serde_json::to_value(
             self.plan_file
@@ -1360,22 +1365,19 @@ impl HarnessBroker {
         Ok(response)
     }
 
+    /// Build the input that starts, continues, or resumes the active execution.
+    ///
+    /// The phase instructions and accepted design travel in the `<task>` section, and review
+    /// edits are reported only on the review decision turn, so the step names only its kind.
     pub(super) fn plan_goal_prompt(
         &self,
         _goal: &GoalRecord,
         kind: PlanExecutionPromptKind,
-    ) -> Result<Option<String>> {
-        let Some(execution) = self.current_execution()? else {
+    ) -> Result<Option<forge_provider_api::forge::TurnInput>> {
+        if self.current_execution()?.is_none() {
             return Ok(None);
-        };
-        let plan = self
-            .store
-            .load_plan(&execution.plan_id)?
-            .context("accepted plan record is missing")?;
-        Ok(Some(super::PlanPrompt::with_manual_changes(
-            super::PlanPrompt::execution(&execution, kind),
-            &plan.manual_changes,
-        )))
+        }
+        Ok(Some(super::PlanPrompt::execution(kind)))
     }
 
     /// Build the active execution's phase instructions and accepted design for the task section.
@@ -1397,13 +1399,17 @@ impl HarnessBroker {
             &plan.id,
             accepted_revision,
         )?;
-        Ok(Some(crate::provider::TaskInstructions::Execute {
-            phase: format!("{:?}", execution.phase).to_lowercase(),
-            revision: execution.revision.into(),
-            text: super::PlanPrompt::execution_task(
-                &execution,
-                &accepted.execution_json(execution.phase)?,
-            ),
-        }))
+        Ok(Some(crate::provider::TaskInstructions::Execute(
+            forge_provider_api::forge::ExecuteTask {
+                execution_id: execution.id.clone(),
+                plan_id: execution.plan_id.clone(),
+                phase: format!("{:?}", execution.phase).to_lowercase(),
+                revision: execution.revision.into(),
+                phase_instructions: execution.instructions(),
+                findings: execution.findings.clone(),
+                approval_comments: execution.approval_comments.clone(),
+                design: accepted.execution_json(execution.phase)?,
+            },
+        )))
     }
 }

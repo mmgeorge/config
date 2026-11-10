@@ -18,8 +18,8 @@ pub(crate) struct AutomaticChecks {
     pub pending: bool,
     /// Explains a repair that stopped without relevant progress.
     pub blocked: Option<String>,
-    /// Undelivered repair text retained until an exchange has admitted it.
-    pub repair_prompt: Option<String>,
+    /// Undelivered repair failures retained until an exchange has admitted them.
+    pub repair_prompt: Option<forge_provider_api::forge::CheckRepair>,
     /// Exchange proving that the saved repair request was delivered.
     pub repair_exchange: Option<String>,
 }
@@ -51,8 +51,11 @@ impl AutomaticChecks {
         Ok(())
     }
 
-    /// Returns one repair instruction, or blocks repeated unchanged failure delivery.
-    pub(crate) fn observe(&mut self, run: &CheckRun) -> Result<Option<String>> {
+    /// Returns one repair's failures, or blocks repeated unchanged failure delivery.
+    pub(crate) fn observe(
+        &mut self,
+        run: &CheckRun,
+    ) -> Result<Option<forge_provider_api::forge::CheckRepair>> {
         self.run_id = Some(run.id.clone());
         if matches!(
             run.state,
@@ -145,9 +148,19 @@ impl AutomaticChecks {
         }
         self.delivered = identities;
         self.blocked = None;
-        let prompt = format!(
-            "Automatic checks are blocking task completion. Fix the failures below and finish the repair turn, and Harness runs the checks again. You do not need to call check_run, though you may for earlier feedback. Do not run validation commands through terminal tools, and keep to the original task's scope. If the turn ends with the same failing inputs, automatic repair stops.\n\n{findings}"
-        );
+        let prompt = forge_provider_api::forge::CheckRepair::new(
+            failures
+                .iter()
+                .map(|command| forge_provider_api::forge::CheckFailure {
+                    check: command.command.clone(),
+                    state: format!("{:?}", command.state),
+                    exit_code: command.exit_code,
+                    error: command.error.clone().filter(|error| !error.is_empty()),
+                    log: command.output.display().to_string(),
+                })
+                .collect(),
+        )
+        .expect("repair has at least one failure");
         self.repair_prompt = Some(prompt.clone());
         self.repair_exchange = None;
         self.save()?;

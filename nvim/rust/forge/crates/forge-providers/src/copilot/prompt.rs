@@ -20,10 +20,10 @@ pub struct TurnOptions {
     pub workspace: String,
     pub model: Option<String>,
     pub capability: ProviderCapability,
-    pub input: PromptInput,
+    pub input: forge_provider_api::forge::TurnInput,
     pub recovered: Vec<forge_provider_api::session::RecoveredInput>,
+    /// The turn's `<forge>` block, which starts the user message.
     pub instructions: String,
-    pub repair_caution: Option<String>,
     pub attachments: MessageInput,
     pub receipt: Option<Arc<dyn InputReceipt>>,
     /// Confirm the exact journaled input transport handoff independently of acceptance.
@@ -119,30 +119,24 @@ pub async fn run(
             .publish_task_snapshot(initial_task_data, "copilot-root".into(), output, sink)
             .await?;
     }
-    let provider_text = input_text(session, &options.input).await?;
+    let provider_text = user_text(session, &options.input).await?;
     let provider_text = with_attachment_context(provider_text, &options.attachments.attachments);
     let mut recovered = Vec::new();
     let mut recovered_attachments = Vec::new();
     for input in &options.recovered {
-        let mut text = forge_provider_api::turn_context::note(&input.instructions);
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&input_text(session, &input.input).await?);
-        text = with_attachment_context(text, &input.attachments);
-        recovered.push(text);
+        let text = user_text(session, &input.input).await?;
+        recovered.push((
+            input.input.clone(),
+            with_attachment_context(text, &input.attachments),
+        ));
         recovered_attachments.extend(input.attachments.iter().cloned());
     }
     let provider_text = forge_provider_api::input::recovered_text(&provider_text, &recovered);
-    let prompt = [
-        options.instructions.as_str(),
-        options.repair_caution.as_deref().unwrap_or_default(),
-        provider_text.as_str(),
-    ]
-    .into_iter()
-    .filter(|text| !text.is_empty())
-    .collect::<Vec<_>>()
-    .join("\n\n");
+    let prompt = [options.instructions.as_str(), provider_text.as_str()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let (cursor, anchor) = owned_session.delivery_boundary().await?;
     let mut message_input = options.attachments;
     recovered_attachments.extend(message_input.attachments);
@@ -592,10 +586,18 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
                 }
             }
         }
-        PromptInput::QuestionReply(reply) => {
-            forge_provider_api::turn_context::question_reply(reply)
-        }
     })
+}
+
+/// Resolve the user's own words of one turn input, or nothing for a Harness-started turn.
+async fn user_text(
+    session: &Arc<Session>,
+    input: &forge_provider_api::forge::TurnInput,
+) -> Result<String, ProviderError> {
+    match input.user_input() {
+        Some(input) => input_text(session, input).await,
+        None => Ok(String::new()),
+    }
 }
 
 fn normalize_internal<T>(

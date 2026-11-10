@@ -43,7 +43,8 @@ impl HarnessBroker {
                     question_id: Some(question_id.as_str().into()),
                     answer: Vec::new(),
                 };
-                let encoded = serde_json::to_string_pretty(questions)?;
+                let prompt =
+                    PlanPrompt::clarification(questions, crate::provider::parse_user_input(&text));
                 self.append_plan_feedback(
                     &plan.id,
                     text.clone(),
@@ -52,13 +53,12 @@ impl HarnessBroker {
                 )?;
                 plan.updated_at_ms = self.clock.now_ms();
                 self.publish_plan(&plan)?;
-                let prompt = PlanPrompt::clarification(&plan.request, &encoded, &text);
                 admission.clarification = Some(ClarificationContext::Plan { plan_id: plan.id });
                 self.stage_foreground_interaction(
-                    &prompt,
+                    &text,
                     PromptMode::Chat,
                     None,
-                    ProviderInput::from_text(prompt.clone()),
+                    ProviderInput::new(prompt),
                 )?
             }
             InputSubmissionTarget::Interaction {
@@ -72,7 +72,10 @@ impl HarnessBroker {
                     .elicitation_mut()
                     .context("selected exchange questions are missing")?;
                 questions.begin_clarification(question_id.as_str())?;
-                let encoded = serde_json::to_string_pretty(questions)?;
+                let prompt = PlanPrompt::question_follow_up(
+                    questions,
+                    crate::provider::parse_user_input(&text),
+                );
                 let question = crate::exchange::QuestionInput {
                     set_id: questions.question_set.id.clone(),
                     question_id: Some(question_id.as_str().into()),
@@ -85,13 +88,12 @@ impl HarnessBroker {
                     self.clock.now_ms(),
                 )?;
                 self.store.save_exchange(&exchange)?;
-                let prompt = PlanPrompt::question_follow_up(&encoded, &text);
                 admission.clarification = Some(ClarificationContext::Interaction);
                 self.stage_foreground_interaction(
-                    &prompt,
+                    &text,
                     self.task_prompt_mode()?,
                     None,
-                    ProviderInput::from_text(prompt.clone()),
+                    ProviderInput::new(prompt),
                 )?
             }
             InputSubmissionTarget::PlanReview { id, .. } => {
@@ -102,14 +104,16 @@ impl HarnessBroker {
                 let questions = plan
                     .review_questions()
                     .context("selected review questions are missing")?;
-                let encoded = serde_json::to_string_pretty(questions)?;
-                let prompt = PlanPrompt::question_follow_up(&encoded, &text);
+                let prompt = PlanPrompt::question_follow_up(
+                    questions,
+                    crate::provider::parse_user_input(&text),
+                );
                 // Approval evidence remains unchanged; only a later explicit command may execute the plan.
                 self.stage_foreground_interaction(
-                    &prompt,
+                    &text,
                     PromptMode::Chat,
                     None,
-                    ProviderInput::from_text(prompt.clone()),
+                    ProviderInput::new(prompt),
                 )?
             }
             InputSubmissionTarget::Conversation | InputSubmissionTarget::Question { .. } => {

@@ -72,8 +72,8 @@ async fn slow_collection_fixture(
                 if echo_user_message {
                     let item_id = forge_provider_api::ItemId::new("echoed-user-message")
                         .expect("fixture item ID is valid");
-                    let text = match &request.input {
-                        forge_provider_api::input::PromptInput::Text(text) => text.clone(),
+                    let text = match request.input.user_input() {
+                        Some(forge_provider_api::input::PromptInput::Text(text)) => text.clone(),
                         _ => String::new(),
                     };
                     for event in [
@@ -161,7 +161,10 @@ async fn slow_collection_fixture(
                     }
                     forge_provider_api::turn::TurnOutcome::Interrupted
                 } else {
-                    let _ = dispatched.send(request.input.clone());
+                    let _ =
+                        dispatched.send(request.input.user_input().cloned().unwrap_or(
+                            forge_provider_api::input::PromptInput::Text(String::new()),
+                        ));
                     forge_provider_api::turn::TurnOutcome::Completed {
                         stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     }

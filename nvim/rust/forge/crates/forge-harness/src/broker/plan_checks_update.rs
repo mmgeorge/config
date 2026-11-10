@@ -140,17 +140,8 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.review = None;
-        plan.manual_changes.push(format!(
-            "Updated plan checks: {}",
-            changes
-                .iter()
-                .map(|(id, enabled)| format!(
-                    "{id} {}",
-                    if *enabled { "enabled" } else { "disabled" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        plan.manual_changes
+            .extend(crate::plan::check_edits(&changes));
         plan.updated_at_ms = self.clock.now_ms();
         self.publish_plan(&plan)?;
         self.save_session()?;

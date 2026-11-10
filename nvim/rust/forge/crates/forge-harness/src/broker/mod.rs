@@ -1024,7 +1024,7 @@ pub(crate) enum ForegroundJob {
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         scope: crate::provider::InvocationScope,
         task: Box<crate::agent::AgentTask>,
-        message: String,
+        message: forge_provider_api::forge::AgentResult,
     },
     AgentCancelApprovals {
         coordinator: Arc<PermissionCoordinator>,
@@ -2905,10 +2905,6 @@ impl HarnessBroker {
             checks: None,
             check_shell: self.session.shell,
             mode,
-            planning_feedback: mode == PromptMode::Plan
-                && plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.state == crate::plan::PlanState::AwaitingInput),
             plan_state: plan.as_ref().map(|plan| plan.state),
             plan_document: document,
             plan_authoring: if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
@@ -2928,13 +2924,19 @@ impl HarnessBroker {
             } else {
                 None
             },
-            // Execute and Goal turns carry their workflow material as the tracked task section.
+            // Plan, Execute, and Goal turns carry their workflow material as the `<task>` section.
             task_instructions: match mode {
+                PromptMode::Plan | PromptMode::PlanDiscussion => {
+                    plan.as_ref()
+                        .map(|plan| crate::provider::TaskInstructions::Plan {
+                            request: plan.request.clone(),
+                        })
+                }
                 PromptMode::ExecutePlan => self.execution_task_instructions().ok().flatten(),
                 PromptMode::GoalContinuation => self.current_goal().ok().flatten().map(|goal| {
-                    crate::provider::TaskInstructions::Goal {
+                    crate::provider::TaskInstructions::Goal(forge_provider_api::forge::GoalTask {
                         objective: goal.objective,
-                    }
+                    })
                 }),
                 _ => None,
             },
@@ -3027,12 +3029,15 @@ impl HarnessBroker {
         self.checkpoint = None;
         self.event_sink = Some(sink);
         self.save_session()?;
+        // Background generation is outside the `<forge>` protocol: its input is plain text.
         let result = self
             .run_interaction_input(
                 input.clone(),
                 PromptMode::Background,
                 Some(ExchangeAdmission::chat(input.clone())),
-                ProviderInput::from_text(input),
+                ProviderInput::kind(forge_provider_api::forge::TurnKind::Background {
+                    input: forge_provider_api::PromptInput::Text(input),
+                }),
             )
             .await;
         self.event_sink = None;
@@ -3842,15 +3847,18 @@ impl HarnessBroker {
                 });
             let clarification = clarification
                 .context("interrupted clarification has no recorded question input")?;
-            let follow_up = format!("{}\n\n{text}", clarification.text);
-            let elicitation_json = serde_json::to_string_pretty(elicitation)?;
-            let prompt = if let Some(plan) = &pending_plan {
-                PlanPrompt::clarification(&plan.request, &elicitation_json, &follow_up)
+            // Both are the user's words: the recorded clarification and the resumed reply.
+            let follow_up =
+                forge_provider_api::PromptInput::Text(format!("{}\n\n{text}", clarification.text));
+            let prompt = if pending_plan.is_some() {
+                PlanPrompt::clarification(elicitation, follow_up)
             } else {
-                PlanPrompt::question_follow_up(&elicitation_json, &follow_up)
+                PlanPrompt::question_follow_up(elicitation, follow_up)
             };
             let mode = self.task_prompt_mode()?;
-            let (value, event) = self.run_interaction(prompt, mode, None).await?;
+            let (value, event) = self
+                .run_interaction(ProviderInput::new(prompt), mode, None)
+                .await?;
             return if let Some(plan) = pending_plan {
                 self.finish_plan_clarification(&plan.id, value, event).await
             } else {
@@ -3863,9 +3871,11 @@ impl HarnessBroker {
         );
         let mode = self.task_prompt_mode()?;
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-            self.run_planning_interaction(text, None).await
+            self.run_planning_interaction(ProviderInput::from_text(text), None)
+                .await
         } else {
-            self.run_interaction(text, mode, None).await
+            self.run_interaction(ProviderInput::from_text(text), mode, None)
+                .await
         }
     }
 
@@ -5523,18 +5533,12 @@ impl HarnessBroker {
                         && lifecycle.kind == PlanLifecycleKind::QuestionWithdrawn
                 })
                 .context("withdrawn planning question has no lifecycle record")?;
-            let feedback = format!(
-                "Pending planning questions withdrawn: {}",
-                withdrawal
-                    .answer
-                    .as_deref()
-                    .unwrap_or("no material decision remains")
-            );
+            let reason = withdrawal
+                .answer
+                .as_deref()
+                .unwrap_or("no material decision remains");
             let continuation = self
-                .run_planning_interaction(
-                    PlanPrompt::feedback(&current_plan.request, &feedback),
-                    None,
-                )
+                .run_planning_interaction(ProviderInput::new(PlanPrompt::withdrawn(reason)), None)
                 .await;
             match continuation {
                 Ok((next_value, mut next_event)) => {
@@ -5630,8 +5634,12 @@ impl HarnessBroker {
             "plan_question_answered",
             json!({ "plan": plan, "lifecycle": lifecycle }),
         )?];
+        let prompt = match crate::plan::resolved_questions(&elicitation) {
+            Some(answers) => PlanPrompt::feedback(answers),
+            None => PlanPrompt::withdrawn("no questions were recorded"),
+        };
         let result = self
-            .run_planning_interaction(PlanPrompt::feedback(&plan.request, &answer), None)
+            .run_planning_interaction(ProviderInput::new(prompt), None)
             .await;
         match result {
             Ok((value, mut event)) => {
@@ -5695,9 +5703,12 @@ impl HarnessBroker {
             self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
-        let prompt = format!(
-            "Harness resolved the pending questions and recorded their response sources. Do not call question_answer or question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
-        );
+        let prompt = ProviderInput::new(match crate::plan::resolved_questions(&elicitation) {
+            Some(answers) => forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::WorkflowAnswers { answers },
+            ),
+            None => crate::plan::task_step(forge_provider_api::forge::TaskStep::AnswersResolved),
+        });
         let (value, mut event) = if matches!(
             self.task_prompt_mode()?,
             PromptMode::Plan | PromptMode::PlanDiscussion
@@ -5792,10 +5803,11 @@ impl HarnessBroker {
 
     async fn run_interaction(
         &mut self,
-        text: String,
+        input: ProviderInput,
         mode: PromptMode,
         admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let text = input.text();
         let setup_task = self.task_controller.current()?.filter(|task| {
             matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
                 if plan.artifact.state == PlanState::ConfiguringChecks)
@@ -5806,7 +5818,6 @@ impl HarnessBroker {
                 crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).ok()
             })
             .map(|snapshot| snapshot.digest);
-        let input = ProviderInput::from_text(text.clone());
         let result = self
             .run_interaction_input(text, mode, admission, input)
             .await?;
@@ -5844,7 +5855,7 @@ impl HarnessBroker {
 
     async fn run_planning_interaction(
         &mut self,
-        prompt: String,
+        prompt: ProviderInput,
         admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let task = self
@@ -6074,11 +6085,14 @@ impl HarnessBroker {
             let mut admission = ExchangeAdmission::chat(String::new());
             admission.check_owner = Some(change_owner.clone());
             admission.automatic_owner = Some(owner.clone());
+            let input = ProviderInput::kind(forge_provider_api::forge::TurnKind::CheckRepair {
+                repair: prompt,
+            });
             let repaired = Box::pin(self.run_interaction_input_inner(
-                prompt.clone(),
+                input.text(),
                 PromptMode::Chat,
                 Some(admission),
-                ProviderInput::from_text(prompt),
+                input,
             ))
             .await?;
             result.0 = repaired.0;
@@ -6262,16 +6276,22 @@ impl HarnessBroker {
         Ok(())
     }
 
-    fn agent_result_message(&self, task: &crate::agent::AgentTask) -> Result<String> {
+    /// Describe a settled child task as the `<agent_result>` the parent receives.
+    fn agent_result(
+        &self,
+        task: &crate::agent::AgentTask,
+    ) -> Result<forge_provider_api::forge::AgentResult> {
         let agent = self.agent_coordinator.resolve(&task.agent_id)?;
-        Ok(format!(
-            "{}\n{}",
-            crate::agent::report::CHILD_RESULT_PREAMBLE,
-            serde_json::to_string(&json!({
-                "agent":agent.task_path,"task_id":task.id,"status":task.state,
-                "response":task.final_response,"error":task.error,
-            }))?
-        ))
+        let status = serde_json::to_value(task.state)?;
+        Ok(forge_provider_api::forge::AgentResult {
+            agent: agent.task_path.to_string(),
+            task_id: task.id.to_string(),
+            status: status
+                .as_str()
+                .map_or_else(|| status.to_string(), str::to_owned),
+            response: task.final_response.clone(),
+            error: task.error.clone(),
+        })
     }
 
     fn acknowledge_agent_result(&mut self, mut task: crate::agent::AgentTask) -> Result<()> {
@@ -6945,7 +6965,7 @@ impl HarnessBroker {
                 task.session_id == self.session.id && task.completed_at_ms.is_some(),
                 "child result does not belong to this settled session"
             );
-            let message = self.agent_result_message(&task)?;
+            let message = self.agent_result(&task)?;
             return Ok(ForegroundAction::Effect(ForegroundJob::AgentResult {
                 flight: transaction.steering.pending_deliveries.retain(),
                 engine: transaction.engine.clone(),
@@ -9351,15 +9371,8 @@ impl HarnessBroker {
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.review = None;
-        let change = format!(
-            "Removed planned tests: {}",
-            selected
-                .iter()
-                .map(|test| format!("{}::{}", test.file, test.name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        plan.manual_changes.push(change);
+        plan.manual_changes
+            .extend(crate::plan::removed_test_edits(&selected));
         plan.updated_at_ms = self.clock.now_ms();
         self.publish_plan(&plan)?;
 
@@ -9460,8 +9473,11 @@ impl HarnessBroker {
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
         plan.review = None;
-        let change = format!("Renamed {previous_name} to {new_name}");
-        plan.manual_changes.push(change);
+        plan.manual_changes
+            .push(forge_provider_api::forge::PlanEdit::Rename {
+                from: previous_name.to_string(),
+                to: new_name.to_string(),
+            });
         plan.updated_at_ms = self.clock.now_ms();
         self.publish_plan(&plan)?;
 

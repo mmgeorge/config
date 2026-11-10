@@ -1322,8 +1322,16 @@ impl ClaudeProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
+        // A steered input carries its own elements, such as a question response, and no
+        // standing context.
         let content = super::conversation::input_blocks(
-            vec![prompt_input(&request.input)],
+            [
+                forge_provider_api::forge::input_block(&request.input),
+                user_text(&request.input),
+            ]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect(),
             &request.attachments,
         );
         let receipt = request.delivery.receipt().cloned();
@@ -2905,39 +2913,41 @@ fn prompt_input(input: &forge_provider_api::PromptInput) -> String {
         forge_provider_api::PromptInput::Skill { name, arguments } => {
             format!("/{name} {arguments}")
         }
-        forge_provider_api::PromptInput::QuestionReply(reply) => {
-            forge_provider_api::turn_context::question_reply(reply)
-        }
     }
+}
+
+/// Render the user's own words of one turn input, or nothing for a Harness-started turn.
+fn user_text(input: &forge_provider_api::forge::TurnInput) -> String {
+    input.user_input().map(prompt_input).unwrap_or_default()
 }
 
 /// Report whether the input is exactly the native `/compact` command.
 fn is_compact_command(request: &PromptRequest) -> bool {
     request.recovered_inputs.is_empty()
         && request.attachments.is_empty()
-        && matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "/compact")
+        && matches!(
+            request.input.kind(),
+            forge_provider_api::forge::TurnKind::UserMessage {
+                input: forge_provider_api::PromptInput::Text(text)
+            } if text == "/compact"
+        )
 }
 
-/// Order the prompt's text parts: the `<forge>` block of changed context and this input's note,
-/// recovered inputs, then the input itself.
+/// Order the prompt's text parts: the turn's `<forge>` block, each earlier input after its own
+/// marker block, then the user's own words.
 ///
 /// Claude has no mid-conversation developer channel, so the block starts the user message, as
 /// the open-time system prompt explains. Empty parts are left out.
 pub(super) fn prompt_texts(request: &PromptRequest) -> Vec<String> {
-    use forge_provider_api::turn_context::{newest_note, note, recovered_note};
-    let mut texts = vec![request.context_block()];
+    let mut texts = vec![request.user_message_block()];
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
-        texts.push(recovered_note(index + 1));
-        texts.push(note(&recovered.instructions));
+        texts.push(recovered.block(index + 1));
         for attachment in &recovered.attachments {
             texts.push(attachment.context.clone());
         }
-        texts.push(prompt_input(&recovered.input));
+        texts.push(user_text(&recovered.input));
     }
-    if !request.recovered_inputs.is_empty() {
-        texts.push(newest_note());
-    }
-    texts.push(prompt_input(&request.input));
+    texts.push(user_text(&request.input));
     texts.retain(|text| !text.is_empty());
     texts
 }

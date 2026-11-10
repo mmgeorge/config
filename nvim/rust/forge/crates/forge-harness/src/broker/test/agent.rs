@@ -623,10 +623,7 @@ impl RoutingProvider {
                     captured.lock().unwrap().push(request.clone());
                     let ordinal = turns.fetch_add(1, Ordering::AcqRel);
                     let root = request.scope.owner().is_root();
-                    let text = match &request.input {
-                        forge_provider_api::PromptInput::Text(text) => text.clone(),
-                        _ => String::new(),
-                    };
+                    let text = crate::provider::test_support::input_text(&request.input);
                     let response = if root {
                         if ordinal == 0 {
                             crate::provider::test_support::call_tool(
@@ -854,12 +851,10 @@ impl ResultReceivingProvider {
                     start.observed(0).await?;
 
                     turn.fetch_add(1, Ordering::AcqRel);
-                    let text = match &request.input {
-                        forge_provider_api::PromptInput::Text(text) => text.clone(),
-                        _ => String::new(),
-                    };
+                    let text = crate::provider::test_support::input_text(&request.input);
                     input.lock().unwrap().push(text.clone());
-                    if !text.starts_with("EXPLICIT_NEXT_TURN") {
+                    // Attached child results render before the user's words, so match anywhere.
+                    if !text.contains("EXPLICIT_NEXT_TURN") {
                         for task in ["first", "second"] {
                             crate::provider::test_support::call_tool(
                                 &request,
@@ -933,13 +928,7 @@ impl ResultReceivingProvider {
             let incoming = incoming.clone();
             let receipt = receipt.clone();
             async move {
-                let text = match request.input {
-                    forge_provider_api::PromptInput::Text(text) => text,
-                    forge_provider_api::PromptInput::Skill { name, arguments } => {
-                        format!("/{name} {arguments}")
-                    }
-                    forge_provider_api::PromptInput::QuestionReply(reply) => reply.question,
-                };
+                let text = crate::provider::test_support::input_text(&request.input);
                 let (accepted, wait) = tokio::sync::oneshot::channel();
                 receipt.lock().unwrap().push((text, accepted));
                 incoming.notify_one();
@@ -994,12 +983,16 @@ async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
                     .any(|message| message.contains(&format!("CHILD_REPORT_{result}")))
             );
         }
+        // Each report is a typed `<agent_result>` carrying only the child's identity, status, and
+        // outcome, never Harness bookkeeping such as `parent_reported`.
         for message in message.iter() {
-            let payload: Value = serde_json::from_str(message.split_once('\n').unwrap().1)?;
-            assert_eq!(payload.as_object().unwrap().len(), 5);
             assert!(
-                payload.get("instructions").is_none() && payload.get("parent_reported").is_none()
+                message.contains("<agent_result agent=\"")
+                    && message.contains(" task=\"")
+                    && message.contains(" status=\""),
+                "{message}"
             );
+            assert!(!message.contains("parent_reported"), "{message}");
         }
         let exchanges = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchanges.len(), 1);

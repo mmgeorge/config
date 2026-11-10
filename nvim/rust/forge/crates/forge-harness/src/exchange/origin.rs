@@ -43,22 +43,22 @@ impl TaskStart {
         format!("{label} started: {}", self.title)
     }
 
-    /// Render the task start into the provider input as host-prepared text.
+    /// Announce the task start as a notice on the task's first input.
     ///
-    /// Providers receive no task record; the heading precedes the task's own input so every
-    /// adapter delivers the same announcement. Structured inputs keep their native shape and
-    /// carry no heading. An untitled task adds nothing.
-    pub fn render_input(
-        start: Option<&Self>,
-        input: forge_provider_api::PromptInput,
-    ) -> forge_provider_api::PromptInput {
-        match (start, input) {
-            (Some(start), forge_provider_api::PromptInput::Text(text))
-                if !start.title.is_empty() =>
-            {
-                forge_provider_api::PromptInput::Text(format!("{}\n\n{text}", start.heading()))
-            }
-            (_, input) => input,
-        }
+    /// Providers receive no task record, so every adapter delivers the same announcement inside
+    /// the turn's `<instructions>`. An untitled task adds nothing.
+    pub fn announce(start: Option<&Self>, input: &mut forge_provider_api::forge::TurnInput) {
+        let Some(start) = start.filter(|start| !start.title.is_empty()) else {
+            return;
+        };
+        let label = match start.kind {
+            crate::task::TaskKind::Goal => "Goal",
+            crate::task::TaskKind::Plan => "Plan",
+            crate::task::TaskKind::Execute => "Execution",
+        };
+        input.push_notice(forge_provider_api::forge::Notice::TaskStarted {
+            label: label.into(),
+            title: start.title.clone(),
+        });
     }
 }

@@ -11,6 +11,23 @@ use super::{
     TurnAddress,
 };
 
+/// Render one turn input as a single-channel provider sees it: its own `<forge>` block, then the
+/// user's words. Fixtures match on this text.
+pub(crate) fn input_text(input: &forge_provider_api::forge::TurnInput) -> String {
+    let user = match input.user_input() {
+        Some(forge_provider_api::PromptInput::Text(text)) => text.clone(),
+        Some(forge_provider_api::PromptInput::Skill { name, arguments }) => {
+            format!("/{name} {arguments}")
+        }
+        None => String::new(),
+    };
+    [forge_provider_api::forge::input_block(input), user]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Use registry-advertised capabilities for normalized lifecycle fixtures.
 pub(crate) fn fixture_capability() -> super::ProviderCapability {
     let id = forge_providers::registry::nonselectable_id().expect("registry has a test provider");

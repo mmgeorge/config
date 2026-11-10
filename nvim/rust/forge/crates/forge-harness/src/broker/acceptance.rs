@@ -1,5 +1,16 @@
 use super::*;
+use crate::plan::{check_edits, removed_test_edits};
 use crate::session::SessionStore;
+use forge_provider_api::forge::PlanEdit;
+
+/// Describe review edits one per line for plan lifecycle records.
+fn edit_summary(edits: &[PlanEdit]) -> String {
+    edits
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Retain normalized execution configuration while approval decisions and owned collection settle.
 pub(crate) struct ValidatedPlanExecution {
@@ -103,7 +114,14 @@ impl BrokerObserver {
                             name,
                             Some(&trace),
                         )?;
-                    Ok((document, checksum, format!("Renamed {previous} to {name}")))
+                    Ok((
+                        document,
+                        checksum,
+                        vec![PlanEdit::Rename {
+                            from: previous.to_string(),
+                            to: name.clone(),
+                        }],
+                    ))
                 }
                 PlanEditChange::RenameEntity {
                     target: PlanEntitySelection::AddedEntity(entity),
@@ -119,7 +137,10 @@ impl BrokerObserver {
                     Ok((
                         result.document,
                         checksum,
-                        format!("Renamed {entity} to {name}"),
+                        vec![PlanEdit::Rename {
+                            from: entity.to_string(),
+                            to: name.clone(),
+                        }],
                     ))
                 }
                 PlanEditChange::DeleteTests { tests } => {
@@ -131,18 +152,7 @@ impl BrokerObserver {
                         tests,
                         None,
                     )?;
-                    Ok((
-                        document,
-                        checksum,
-                        format!(
-                            "Removed planned tests: {}",
-                            tests
-                                .iter()
-                                .map(|test| format!("{}::{}", test.file, test.name))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    ))
+                    Ok((document, checksum, removed_test_edits(tests)))
                 }
                 PlanEditChange::UpdateChecks { enabled, tests } => {
                     let (document, _, checksum) = self
@@ -159,32 +169,20 @@ impl BrokerObserver {
                             None,
                         )
                         .await?;
-                    Ok((
-                        document,
-                        checksum,
-                        format!(
-                            "Updated plan checks: {}",
-                            enabled
-                                .iter()
-                                .map(|(id, enabled)| format!(
-                                    "{id} {}",
-                                    if *enabled { "enabled" } else { "disabled" }
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    ))
+                    let mut edits = check_edits(enabled);
+                    edits.extend(removed_test_edits(tests));
+                    Ok((document, checksum, edits))
                 }
             }
         }
         .await;
-        let (document, checksum, description) =
+        let (document, checksum, edits) =
             changed.map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
         plan.document_version = document.version;
         plan.title = document.title;
         plan.review_digest = Some(checksum);
         plan.review = None;
-        plan.manual_changes.push(description);
+        plan.manual_changes.extend(edits);
         plan.updated_at_ms = now_ms;
         self.plan_file
             .seal_plan_artifacts(&plan)
@@ -398,13 +396,10 @@ impl BrokerObserver {
                     )?;
                     let feedback =
                         crate::plan::render_review_feedback(&reviewed.document, &annotation)?;
-                    let instruction = PlanPrompt::with_manual_changes(
-                        PlanPrompt::revision(
-                            &reviewed.document,
-                            &feedback,
-                            review.comment.as_deref(),
-                        ),
-                        &plan.manual_changes,
+                    let instruction = PlanPrompt::revision(
+                        feedback.clone(),
+                        review.comment.as_deref(),
+                        plan.manual_changes.clone(),
                     );
                     plan.review = None;
                     if executing {
@@ -498,7 +493,7 @@ impl BrokerObserver {
             plan,
             anchor,
             PlanLifecycleKind::RevisionCreated,
-            Some(plan.manual_changes.join("\n")),
+            Some(edit_summary(&plan.manual_changes)),
             Vec::new(),
             now_ms,
         ));
@@ -534,7 +529,7 @@ impl BrokerObserver {
     fn finish_review_execution(
         &self,
         task: &mut crate::task::TaskSnapshot,
-        plan: &PlanRecord,
+        _plan: &PlanRecord,
         anchor: Option<crate::plan::ExchangeAnchor>,
         title: &str,
         now_ms: i64,
@@ -562,10 +557,8 @@ impl BrokerObserver {
             );
         }
         if resume {
-            let instruction = PlanPrompt::with_manual_changes(
-                PlanPrompt::execution(&execution.record, PlanExecutionPromptKind::Continue),
-                &plan.manual_changes,
-            );
+            // The user's review edits were reported on the review decision itself.
+            let instruction = PlanPrompt::execution(PlanExecutionPromptKind::Continue);
             task.request_entry(instruction, now_ms)?;
             task.entry
                 .as_mut()
@@ -1008,7 +1001,7 @@ impl BrokerObserver {
                 kind: PlanLifecycleKind::RevisionCreated,
                 model_revision: plan.model_revision,
                 user_revision: plan.user_revision + 1,
-                overall_comment: Some(plan.manual_changes.join("\n")),
+                overall_comment: Some(edit_summary(&plan.manual_changes)),
                 annotation: Vec::new(),
                 question: None,
                 answer: None,
@@ -1081,10 +1074,8 @@ impl BrokerObserver {
             created_at_ms: now_ms,
             completed_at_ms: None,
         };
-        let instruction = PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(&execution, PlanExecutionPromptKind::Start),
-            &plan.manual_changes,
-        );
+        // Accepting the plan is the review decision that reports the user's edits.
+        let instruction = PlanPrompt::accepted(plan.manual_changes.clone());
         let mut task = crate::task::TaskSnapshot::execute(
             plan.title.clone(),
             execution,

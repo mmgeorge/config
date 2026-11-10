@@ -53,67 +53,50 @@ pub(crate) fn select_model_settings(
     }
 }
 
-/// Represents either ordinary user text or an explicit provider skill invocation.
+/// One logical input: its typed Harness content and the files admitted with it.
+///
+/// [`forge_provider_api::forge::TurnInput`] decides which `<forge>` elements and instructions the
+/// turn carries; the user's own words exist only in the kinds where the user typed something.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ProviderInput {
-    Text {
-        text: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        /// Files explicitly admitted with this text, never discovered from its contents.
-        attachments: Vec<crate::attachment::InputAttachment>,
-        /// Harness workflow note delivered as the `<note>` beside, not inside, the user's text.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        note: String,
-    },
-    Skill {
-        name: String,
-        arguments: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        /// Files explicitly admitted with the skill invocation.
-        attachments: Vec<crate::attachment::InputAttachment>,
-        /// Harness workflow note delivered as the `<note>` beside the skill arguments.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        note: String,
-    },
-    QuestionReply {
-        reply: forge_provider_api::QuestionReply,
-        /// Carry host workflow context separately from the structured reply.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        context: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<crate::attachment::InputAttachment>,
-    },
+pub struct ProviderInput {
+    turn: forge_provider_api::forge::TurnInput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Files explicitly admitted with this input, never discovered from its contents.
+    attachments: Vec<crate::attachment::InputAttachment>,
 }
 
 impl ProviderInput {
-    /// Return the Harness note that travels beside the user's text rather than inside it.
-    pub(crate) fn additional_instructions(&self) -> &str {
-        match self {
-            Self::Text { note, .. } | Self::Skill { note, .. } => note,
-            Self::QuestionReply { context, .. } => context,
+    /// Build input for one typed turn.
+    pub fn new(turn: forge_provider_api::forge::TurnInput) -> Self {
+        Self {
+            turn,
+            attachments: Vec::new(),
         }
     }
 
-    /// Put Harness workflow text before the input's existing note, separated by a blank line.
-    pub(crate) fn prepend_note(&mut self, text: &str) {
-        let (Self::Text { note, .. }
-        | Self::Skill { note, .. }
-        | Self::QuestionReply { context: note, .. }) = self;
-        *note = if note.is_empty() {
-            text.to_owned()
-        } else {
-            format!("{text}\n\n{note}")
-        };
+    /// Build input for one turn kind.
+    pub fn kind(kind: forge_provider_api::forge::TurnKind) -> Self {
+        Self::new(forge_provider_api::forge::TurnInput::new(kind))
     }
 
     /// Build ordinary provider input from admitted user text.
     pub fn from_text(text: impl Into<String>) -> Self {
-        Self::Text {
-            text: text.into(),
-            attachments: Vec::new(),
-            note: String::new(),
+        Self::new(forge_provider_api::forge::TurnInput::user(
+            forge_provider_api::PromptInput::Text(text.into()),
+        ))
+    }
+
+    /// Build input for one queued message: its typed Harness input, or the user's text.
+    pub(crate) fn from_message(message: &crate::input::InputMessage) -> Self {
+        match message.turn() {
+            Some(turn) => Self::new(turn.clone()),
+            None => Self::from_text(message.text.clone()),
         }
+    }
+
+    /// Build a structured response to one of the model's questions.
+    pub fn question_reply(response: forge_provider_api::QuestionReply) -> Self {
+        Self::kind(forge_provider_api::forge::TurnKind::QuestionResponse { response })
     }
 
     /// Carry files selected at user-input admission without discovering files in prompt text.
@@ -121,107 +104,105 @@ impl ProviderInput {
         mut self,
         attachments: Vec<crate::attachment::InputAttachment>,
     ) -> Self {
-        match &mut self {
-            Self::Text {
-                attachments: selected,
-                ..
-            }
-            | Self::Skill {
-                attachments: selected,
-                ..
-            }
-            | Self::QuestionReply {
-                attachments: selected,
-                ..
-            } => *selected = attachments,
-        }
+        self.attachments = attachments;
         self
     }
 
     /// Return only the files already admitted alongside this input.
     pub(crate) fn attachments(&self) -> &[crate::attachment::InputAttachment] {
-        match self {
-            Self::Text { attachments, .. }
-            | Self::Skill { attachments, .. }
-            | Self::QuestionReply { attachments, .. } => attachments,
-        }
+        &self.attachments
     }
 
     /// Parse a skill selector only when `$` starts the first non-whitespace token.
     pub fn parse(text: &str) -> Self {
-        let trimmed = text.trim_start();
-        let Some(selector) = trimmed.strip_prefix('$') else {
-            return Self::from_text(text);
+        Self::new(forge_provider_api::forge::TurnInput::user(
+            parse_user_input(text),
+        ))
+    }
+
+    /// Get the typed turn content.
+    pub fn turn(&self) -> &forge_provider_api::forge::TurnInput {
+        &self.turn
+    }
+
+    /// Re-type a user message, keeping the user's words, for example as plan discussion.
+    ///
+    /// Inputs of any other kind are returned unchanged.
+    pub(crate) fn retype_user_message(
+        self,
+        kind: impl FnOnce(forge_provider_api::PromptInput) -> forge_provider_api::forge::TurnKind,
+    ) -> Self {
+        let forge_provider_api::forge::TurnKind::UserMessage { input } = self.turn.kind() else {
+            return self;
         };
-        let name_length = selector.find(char::is_whitespace).unwrap_or(selector.len());
-        let name = &selector[..name_length];
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
-        {
-            return Self::from_text(text);
+        let mut retyped = forge_provider_api::forge::TurnInput::new(kind(input.clone()));
+        retyped.push_child_results(self.turn.child_results().iter().cloned());
+        for notice in self.turn.notices() {
+            retyped.push_notice(notice.clone());
         }
-        Self::Skill {
-            name: name.to_owned(),
-            arguments: selector[name_length..].trim_start().to_owned(),
-            attachments: Vec::new(),
-            note: String::new(),
+        Self {
+            turn: retyped,
+            attachments: self.attachments,
         }
     }
 
-    /// Return the provider-visible text corresponding to this admitted input.
+    /// Add a side condition, such as an approval timeout, to this input.
+    pub(crate) fn push_notice(&mut self, notice: forge_provider_api::forge::Notice) {
+        self.turn.push_notice(notice);
+    }
+
+    /// Report settled child results with this input.
+    pub(crate) fn push_child_results(
+        &mut self,
+        results: impl IntoIterator<Item = forge_provider_api::forge::AgentResult>,
+    ) {
+        self.turn.push_child_results(results);
+    }
+
+    /// Describe this input for transcripts: the user's text, or a short label for Harness input.
     pub fn text(&self) -> String {
-        match self {
-            Self::Text { text, .. } => text.clone(),
-            Self::Skill {
-                name, arguments, ..
-            } if arguments.is_empty() => format!("${name}"),
-            Self::Skill {
-                name, arguments, ..
-            } => format!("${name} {arguments}"),
-            Self::QuestionReply { reply, .. } => match &reply.response {
-                forge_provider_api::QuestionReplyResponse::Answer { answer, .. }
-                | forge_provider_api::QuestionReplyResponse::Correction { answer, .. } => {
-                    answer.clone()
-                }
-                forge_provider_api::QuestionReplyResponse::Clarification { text, .. } => {
-                    text.clone()
-                }
-            },
-        }
+        self.turn.label()
     }
 
-    /// Supply structured input without encoding any provider-specific envelope.
-    pub(crate) fn normalized(&self) -> forge_provider_api::PromptInput {
-        match self {
-            Self::Text { text, .. } => forge_provider_api::PromptInput::Text(text.clone()),
-            Self::Skill {
-                name, arguments, ..
-            } => forge_provider_api::PromptInput::Skill {
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-            Self::QuestionReply { reply, .. } => {
-                forge_provider_api::PromptInput::QuestionReply(reply.clone())
-            }
-        }
+    /// Supply the typed input without encoding any provider-specific envelope.
+    pub(crate) fn normalized(&self) -> forge_provider_api::forge::TurnInput {
+        self.turn.clone()
+    }
+}
+
+impl From<String> for ProviderInput {
+    /// Build ordinary user text input.
+    fn from(text: String) -> Self {
+        Self::from_text(text)
+    }
+}
+
+impl From<&str> for ProviderInput {
+    /// Build ordinary user text input.
+    fn from(text: &str) -> Self {
+        Self::from_text(text)
+    }
+}
+
+/// Parse a skill selector only when `$` starts the first non-whitespace token.
+pub(crate) fn parse_user_input(text: &str) -> forge_provider_api::PromptInput {
+    let trimmed = text.trim_start();
+    let Some(selector) = trimmed.strip_prefix('$') else {
+        return forge_provider_api::PromptInput::Text(text.to_owned());
+    };
+    let name_length = selector.find(char::is_whitespace).unwrap_or(selector.len());
+    let name = &selector[..name_length];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+    {
+        return forge_provider_api::PromptInput::Text(text.to_owned());
+    }
+    forge_provider_api::PromptInput::Skill {
+        name: name.to_owned(),
+        arguments: selector[name_length..].trim_start().to_owned(),
     }
 }
 
 pub use forge_provider_api::catalog::*;
-
-impl From<&ProviderInput> for forge_provider_api::input::PromptInput {
-    fn from(input: &ProviderInput) -> Self {
-        match input {
-            ProviderInput::Text { text, .. } => Self::Text(text.clone()),
-            ProviderInput::Skill {
-                name, arguments, ..
-            } => Self::Skill {
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-            ProviderInput::QuestionReply { reply, .. } => Self::QuestionReply(reply.clone()),
-        }
-    }
-}

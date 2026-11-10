@@ -37,13 +37,12 @@ pub struct ControlTurnContext {
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
     pub(crate) checks: Option<Arc<crate::checks::CheckToolScope>>,
     pub mode: PromptMode,
-    pub planning_feedback: bool,
     pub check_shell: crate::session::CheckShell,
     pub plan_state: Option<PlanState>,
     pub plan_document: Option<PlanDocument>,
     /// Limit filesystem authoring controls to the active planning directory.
     pub(crate) plan_authoring: Option<crate::plan::PlanAuthoringScope>,
-    /// Execute or Goal workflow material the provider prompt delivers as the task section.
+    /// Plan, Execute, or Goal workflow material the provider prompt delivers as the task section.
     pub(crate) task_instructions: Option<crate::provider::TaskInstructions>,
     pub resolved_question_digest_set: HashSet<String>,
     pub has_active_elicitation: bool,
@@ -60,7 +59,6 @@ impl std::fmt::Debug for ControlTurnContext {
         formatter
             .debug_struct("ControlTurnContext")
             .field("mode", &self.mode)
-            .field("planning_feedback", &self.planning_feedback)
             .field("plan_state", &self.plan_state)
             .field("plan_document", &self.plan_document)
             .field(
@@ -278,7 +276,6 @@ impl ControlTurnContext {
             agent: None,
             checks: None,
             mode,
-            planning_feedback: false,
             check_shell: Default::default(),
             plan_state: None,
             plan_document: None,
@@ -1379,7 +1376,6 @@ mod test {
             agent: None,
             checks: None,
             mode: PromptMode::Plan,
-            planning_feedback: false,
             check_shell: Default::default(),
             plan_state: Some(PlanState::Generating),
             plan_document: Some(crate::plan::test_fixture("plan", "Initial")),

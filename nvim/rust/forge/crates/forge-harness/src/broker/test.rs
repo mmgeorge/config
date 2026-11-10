@@ -457,10 +457,7 @@ fn delegating_root_fixture() -> Result<(
                 start.observed(0).await?;
 
                 let ordinal = turn.fetch_add(1, Ordering::AcqRel);
-                let text = match &request.input {
-                    forge_provider_api::PromptInput::Text(text) => text.clone(),
-                    _ => String::new(),
-                };
+                let text = crate::provider::test_support::input_text(&request.input);
                 if ordinal == 0 {
                     let result = crate::provider::test_support::call_tool(
                         &request,
@@ -472,8 +469,8 @@ fn delegating_root_fixture() -> Result<(
                 } else {
                     assert!(ordinal == 1, "parent continuation duplicated");
                     assert!(
-                        text.contains("CHILD_RESULT") && text.contains("\"response\""),
-                        "parent continuation omitted child result"
+                        text.contains("CHILD_RESULT") && text.contains("<agent_result "),
+                        "parent continuation omitted child result: {text}"
                     );
                 }
                 let scope = request.scope.clone();
@@ -1248,13 +1245,15 @@ enum PlanFixtureBehavior {
 /// Read the active plan's ID and version from the identity line Harness prepends to planning
 /// prompts.
 fn plan_document_in_request(request: &forge_provider_api::PromptRequest) -> Option<Value> {
-    let mut text = request.context_block();
-    if let forge_provider_api::input::PromptInput::Text(input) = &request.input {
+    let mut text = request.user_message_block();
+    if let Some(forge_provider_api::input::PromptInput::Text(input)) = request.input.user_input() {
         text.push('\n');
         text.push_str(input);
     }
     for recovered in &request.recovered_inputs {
-        if let forge_provider_api::input::PromptInput::Text(input) = &recovered.input {
+        if let Some(forge_provider_api::input::PromptInput::Text(input)) =
+            recovered.input.user_input()
+        {
             text.push('\n');
             text.push_str(input);
         }
@@ -1742,7 +1741,7 @@ async fn dispatch_pending_task_input(
             "task continuation was replaced"
         );
         (
-            continuation.work.instruction().unwrap().to_owned(),
+            continuation.work.instruction().unwrap().clone(),
             crate::input::InputPurpose::TaskContinuation {
                 revision: task.revision.clone(),
                 id: continuation.id.clone(),
@@ -1753,7 +1752,10 @@ async fn dispatch_pending_task_input(
     };
     broker.task_controller.admit(task.kind())?;
     broker.input_purpose = purpose;
-    let result = broker.submit_prompt(json!({"text": instruction})).await;
+    // The submitted text is the entry's label; dispatch reads the typed input from the task.
+    let result = broker
+        .submit_prompt(json!({"text": instruction.label()}))
+        .await;
     broker.input_purpose = crate::input::InputPurpose::User;
     result
 }

@@ -42,25 +42,13 @@ impl HarnessBroker {
         }
         let attached_results = self.agent_coordinator.unreported_result();
         if !attached_results.is_empty() {
-            let message = attached_results
+            // Child results travel as `<agent_result>` elements beside the input, never inside
+            // the user's text.
+            let results = attached_results
                 .iter()
-                .map(|task| self.agent_result_message(task))
-                .collect::<Result<Vec<_>>>()?
-                .join("\n\n");
-            match &mut request.input {
-                ProviderInput::Text { text, .. } => {
-                    text.push_str("\n\n");
-                    text.push_str(&message);
-                }
-                ProviderInput::Skill { arguments, .. } => {
-                    arguments.push_str("\n\n");
-                    arguments.push_str(&message);
-                }
-                ProviderInput::QuestionReply { context, .. } => {
-                    context.push_str("\n\n");
-                    context.push_str(&message);
-                }
-            }
+                .map(|task| self.agent_result(task))
+                .collect::<Result<Vec<_>>>()?;
+            request.input.push_child_results(results);
         }
 
         request.acknowledged_child_reports = attached_results

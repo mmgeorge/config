@@ -97,9 +97,12 @@ impl BrokerObserver {
                     crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
                     now_ms,
                 );
-                // The objective also travels as the tracked task section, which survives
-                // compaction; the entry names it once so the first turn never depends on that.
-                task.request_entry(format!("Goal: {text}\nContinue working until the goal is complete. Use goal_complete or goal_blocked to report terminal state."), now_ms)?;
+                // The objective travels in the `<task kind="goal">` section, which the delivery
+                // record re-sends after compaction, so the entry only starts the goal.
+                task.request_entry(
+                    crate::plan::task_step(forge_provider_api::forge::TaskStep::GoalStart),
+                    now_ms,
+                )?;
                 TaskChange::Install(Box::new(task))
             }
             SessionAction::NewPlan { text } => {
@@ -211,42 +214,53 @@ impl BrokerObserver {
         {
             return Ok(TaskChange::Resume);
         }
-        let mut instruction = match &task.workflow {
-            WorkflowSnapshot::Goal { goal } => format!(
-                "Resume working toward this goal: {}\nContinue until it is complete. Use goal_complete or goal_blocked to report terminal state.",
-                goal.objective
-            ),
+        use forge_provider_api::forge::TaskStep;
+        let step = match &task.workflow {
+            WorkflowSnapshot::Goal { .. } => Some(TaskStep::GoalResume),
             WorkflowSnapshot::Plan { plan }
                 if plan.artifact.state == PlanState::ConfiguringChecks =>
             {
-                PlanPrompt::checks_setup(&plan.artifact.request)
+                None
             }
-            WorkflowSnapshot::Plan { plan } => PlanPrompt::draft(&plan.artifact.request),
+            WorkflowSnapshot::Plan { .. } => Some(TaskStep::PlanResume),
             WorkflowSnapshot::Execute { execution } => {
                 let mut resumed = execution.clone();
                 crate::task::SessionTaskController::resume_execution(&mut resumed);
-                self.execution_continuation_prompt(&resumed)?
+                Some(TaskStep::ExecuteContinue)
             }
         };
-        for text in request.message.iter().chain(request.continuation.iter()) {
-            instruction.push_str("\n\n");
-            instruction.push_str(text);
-        }
+        // A user message given with the resume stays the user's own input; the resume step
+        // becomes a notice beside it.
+        let message = request
+            .message
+            .iter()
+            .chain(request.continuation.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let instruction = match (step, message.is_empty()) {
+            (None, _) => match &task.workflow {
+                WorkflowSnapshot::Plan { plan } => PlanPrompt::checks_setup(&plan.artifact.request),
+                _ => unreachable!("only check setup resumes without a step"),
+            },
+            (Some(step), true) => crate::plan::task_step(step),
+            (Some(step), false) => {
+                let mut input = forge_provider_api::forge::TurnInput::user(
+                    crate::provider::parse_user_input(&message),
+                );
+                input.push_notice(forge_provider_api::forge::Notice::TaskResumed { step });
+                input
+            }
+        };
         Ok(TaskChange::ResumeWithEntry(instruction))
     }
 
+    /// Continue the active execution at its saved phase; the `<task>` section carries its design.
     pub(super) fn execution_continuation_prompt(
         &self,
-        execution: &crate::task::ExecutionSnapshot,
-    ) -> Result<String> {
-        let store = SqliteStore::read_only(&self.data_root)?;
-        let plan = store
-            .load_plan(&execution.record.plan_id)?
-            .context("accepted plan is missing")?;
-        Ok(PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(&execution.record, PlanExecutionPromptKind::Continue),
-            &plan.manual_changes,
-        ))
+        _execution: &crate::task::ExecutionSnapshot,
+    ) -> Result<forge_provider_api::forge::TurnInput> {
+        Ok(PlanPrompt::execution(PlanExecutionPromptKind::Continue))
     }
 
     fn prepare_continuation(
@@ -282,8 +296,10 @@ impl BrokerObserver {
             WorkflowSnapshot::Execute { execution } => crate::task::TaskWork::Provider {
                 instruction: self.execution_continuation_prompt(execution)?,
             },
-            WorkflowSnapshot::Goal { goal } => crate::task::TaskWork::Provider {
-                instruction: format!("Continue working toward this goal: {}", goal.objective),
+            WorkflowSnapshot::Goal { .. } => crate::task::TaskWork::Provider {
+                instruction: crate::plan::task_step(
+                    forge_provider_api::forge::TaskStep::GoalContinue,
+                ),
             },
             WorkflowSnapshot::Plan { .. } => {
                 anyhow::bail!("planning continuation is owned by its terminal turn")

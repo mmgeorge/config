@@ -138,22 +138,27 @@ impl QuestionInputs {
                 .map_err(QuestionInputError::SourceState)?
                 .ok_or(QuestionInputError::SourceMissing)?;
             let id = format!("question-continuation:{exchange}");
+            // The original request is the user's own words; the fixed instruction says to
+            // continue it with the recorded answers.
+            let turn = forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::QuestionsResolved {
+                    original: crate::provider::parse_user_input(&original.prompt),
+                },
+            );
             let update = admit(
                 services,
                 id.clone(),
                 InputMessage::queued(crate::input::InputDraft {
                     id,
-                    text: format!(
-                        "Continue the original request using the recorded user answers. Do not repeat resolved questions.\n\nOriginal request:\n{}",
-                        original.prompt
-                    ),
+                    text: turn.label(),
                     purpose: InputPurpose::QuestionContinuation {
                         exchange_id: exchange.clone(),
                     },
                     attachments: Vec::new(),
                     config: None,
                     intent: InputIntent::Queue,
-                }),
+                })
+                .with_turn(turn),
             )?;
             let id = format!("question-continuation:{exchange}");
             publish_input(services, messages, &id, update)?;
