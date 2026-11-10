@@ -169,7 +169,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     let controller = SessionController::new(broker).await?;
     let execution_registry = controller.broker.lock().await.execution_registry();
     let engine = execution_registry.owner(owner.clone()).await?;
-    controller.trace.configure(true)?;
+    controller.trace.configure(crate::trace::LogLevel::Trace)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let delivered = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let observed = delivered.clone();

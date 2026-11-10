@@ -117,6 +117,8 @@ impl CopilotRuntime {
                 }
                 let started =
                     CopilotClient::new(Client::start(options).await.map_err(|error| {
+                        tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
+                            provider = "copilot", error = %super::super::error::Diagnostic(&error));
                         let kind = if matches!(
                             error.kind(),
                             github_copilot_sdk::ErrorKind::BinaryNotFound { .. }
@@ -301,7 +303,9 @@ pub(crate) async fn validate_version(
     );
     let status = super::operation::wait(client.call("status.get", None))
         .await?
-        .map_err(|_| {
+        .map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.version.failed",
+                provider = "copilot", error = %super::super::error::Diagnostic(&error));
             requirement.probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable)
         })?;
     Ok(requirement.validate(status.get("version").and_then(serde_json::Value::as_str))?)

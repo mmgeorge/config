@@ -945,7 +945,7 @@ T["revision_commands"] = function()
             count = #expected, truncated = false, data = vim.base64.encode(packed:sub(offset + 1, next_offset)),
           })
         elseif request.method == "host.trace.configure" then
-          emit(request.id, { enabled = false })
+          emit(request.id, { level = "none" })
         elseif request.method == "provider.registry.list" then
           emit(request.id, dofile("nvim/lua/forge/tests/support/provider_catalog.lua").registry())
         elseif request.method == "session.initialize" then

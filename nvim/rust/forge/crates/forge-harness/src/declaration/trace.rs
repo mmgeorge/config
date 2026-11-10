@@ -19,7 +19,7 @@ impl DeclarationTrace {
         session: &str,
         input: &DocumentInput,
     ) -> Option<Self> {
-        store.status().enabled.then(|| Self {
+        store.is_enabled().then(|| Self {
             store,
             session: session.into(),
             identity: json!({"document":input.document,"view":input.view,

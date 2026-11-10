@@ -78,7 +78,7 @@ function M.configure_from_forge_options(options)
       sample_rate = tonumber(options.perf_sample_rate) or M.options.diff.sample_rate,
     },
     harness = {
-      enabled = options.harness_logging == true,
+      enabled = options.log_level == "trace",
       log_path = options.harness_log_path,
       slow_threshold_ms = tonumber(options.perf_slow_threshold_ms) or M.options.harness.slow_threshold_ms,
       sample_rate = tonumber(options.perf_sample_rate) or M.options.harness.sample_rate,

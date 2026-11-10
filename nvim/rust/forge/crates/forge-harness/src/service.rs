@@ -337,7 +337,7 @@ impl HarnessService {
                 };
                 if source.document.design.is_some() {
                     let trace = registry.runtime.trace();
-                    if trace.status().enabled {
+                    if trace.is_enabled() {
                         source.trace = Some(crate::plan::review_source::ReviewTrace {
                             store: trace,
                             session_id: session_id.clone(),
@@ -2806,6 +2806,8 @@ async fn route_control_request(
 }
 
 fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
+    tracing::error!(target: "forge::ipc", event_name = "ipc.initialize.failed",
+        request_id, error = %format_args!("{error:#}"));
     error.downcast_ref::<SessionLeaseConflict>().map_or_else(
         || {
             Response::failure(

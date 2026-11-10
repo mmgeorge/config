@@ -18,7 +18,7 @@ T["settings"] = function()
   local picker = require("forge.views.picker")
   local path = temp.directory("settings-log") .. "/trace.jsonl"
   vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"operation/start","items":["a,b","c"]}}' }, path)
-  local enabled = false
+  local log_level = "info"
   local rejected_record_count = 0
   local controller = require("forge.views.harness.controller")
   local source_buffer = vim.api.nvim_get_current_buf()
@@ -100,9 +100,9 @@ T["settings"] = function()
       if params.session_tools ~= nil then state.session_tools = params.session_tools end
       return
     end
-    if method == "host.trace.configure" then enabled = params.enabled end
+    if method == "host.trace.configure" then log_level = params.level end
     if method == "session.trace.clear" then vim.fn.writefile({}, path) end
-    callback({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
+    callback({ level = log_level, path = path, rejected_record_count = rejected_record_count })
   end
   controller.configure = function(params, completed)
     client.request({ session_id = "settings-session", method = "session.configure", params = params }, function(result)
@@ -328,9 +328,22 @@ T["settings"] = function()
   assert(#timeout_row.fields == 1 and timeout_row.fields[1].value == "10m", "timeout must be one combined value")
   assert(not pcall(find, "approval_timeout:unit") and not pcall(find, "answer_timeout:unit"), "timeout retained a unit field")
   key("logging", "<CR>")
-  assert(enabled and require("forge.infra.perf").enabled("harness"))
+  assert(picker.is_open("harness-log-level"), "Logging did not open the shared level picker")
+  local logging = picker._state_for_test()
+  eq(vim.tbl_map(function(option) return option.value end, logging.spec.page_list[1].option_list),
+    { "none", "error", "warn", "info", "trace" })
+  eq(logging.spec.page_list[1].selected_index, 4)
+  require("forge.views.picker.state").move(logging.state, logging.spec, 1)
+  keymap.invoke("<CR>", { buffer = logging.buf })
+  eq(log_level, "trace")
+  assert(require("forge.infra.perf").enabled("harness"))
+  assert(picker.is_open("harness-config"), "saving the level did not restore configuration")
   key("logging", "<CR>")
-  assert(not enabled)
+  logging = picker._state_for_test()
+  require("forge.views.picker.state").move(logging.state, logging.spec, -1)
+  keymap.invoke("<CR>", { buffer = logging.buf })
+  eq(log_level, "info")
+  assert(not require("forge.infra.perf").enabled("harness"))
   local check_editing = find("check-editing")
   assert(check_editing.section == "Checks" and check_editing.label == "Allow editing")
   local access_rows = picker._state_for_test().spec.page_list[3].option_list
@@ -489,8 +502,8 @@ T["settings"] = function()
     end
     picker.close()
   end
-  settings.log("settings-session", "on")
-  assert(enabled)
+  settings.log("settings-session", "trace")
+  eq(log_level, "trace")
   local before = #vim.api.nvim_list_tabpages()
   settings.log("settings-session", "open")
   eq(#vim.api.nvim_list_tabpages(), before + 1)
@@ -508,7 +521,7 @@ T["settings"] = function()
   keymap.invoke("R")
   log_text = buffer.text(log_buffer)
   assert(log_text:find("response  #2", 1, true), log_text)
-  settings.log("settings-session")
+  settings.log("settings-session", "open")
   assert(#vim.api.nvim_list_tabpages() == before + 1, "log open duplicated the tab")
   eq(vim.api.nvim_get_current_buf(), log_buffer)
   assert(not vim.wo.winbar:find("rejected", 1, true), "zero rejections appeared as diagnostic loss")
@@ -517,7 +530,7 @@ T["settings"] = function()
   refresh.callback()
   assert(vim.wo.winbar:find("7 records rejected", 1, true), "log refresh hid host-reported saturation")
   rejected_record_count = 0
-  settings.adopt({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
+  settings.adopt({ level = log_level, path = path, rejected_record_count = rejected_record_count })
   assert(not vim.wo.winbar:find("rejected", 1, true), "adopting reset host status retained diagnostic loss")
   local logical = vim.json.encode({ timestamp_ms = 1700000000123, event = "chunked",
     payload = { text = "λ retained across rotations" } })
@@ -545,10 +558,44 @@ T["settings"] = function()
   assert(log_text:find("ordinary  #2", 1, true), "incomplete chunks hid the following ordinary event")
   vim.fn.delete(path .. ".1")
   settings.log("settings-session", "clear")
-  assert(enabled)
+  eq(log_level, "trace")
   eq(buffer.line(log_buffer, 1), "No log events yet")
-  settings.log("settings-session", "off")
-  assert(not enabled)
+  settings.log("settings-session", "none")
+  eq(log_level, "none")
+  settings.log("settings-session")
+  assert(picker.is_open("harness-log-level"), "/log did not open the level picker")
+  picker.close()
+  eq(log_level, "none")
+end
+
+T["log_level_picker_retains_failed_saves_and_ignores_stale_responses"] = function()
+  require("forge").setup({ log_level = "info", harness = { provider = "mock" } })
+  local picker = require("forge.views.picker")
+  local settings = require("forge.views.harness.settings")
+  local errors = dofile("nvim/lua/forge/tests/support/notify.lua").capture({ notifications = true })
+  local pending = {}
+  require("forge.client").request = function(request, callback)
+    if request.method == "host.trace.status" then callback({ level = "info" })
+    else
+      eq(request.method, "host.trace.configure")
+      pending[#pending + 1] = { params = request.params, callback = callback }
+    end
+  end
+  settings.log("session")
+  local current = picker._state_for_test()
+  require("forge.views.picker.state").move(current.state, current.spec, -1)
+  keymap.invoke("<CR>", { buffer = current.buf })
+  eq(pending[1].params, { level = "warn" })
+  pending[1].callback(nil, "settings write failed")
+  assert(picker.is_open("harness-log-level"), "failed save dismissed the level picker")
+  eq(errors[#errors].message, "settings write failed")
+  keymap.invoke("<CR>", { buffer = current.buf })
+  settings.log("session")
+  local replacement = picker._state_for_test()
+  pending[2].callback({ level = "warn" })
+  eq(picker._state_for_test(), replacement)
+  assert(picker.is_open("harness-log-level"), "stale save closed the replacement picker")
+  picker.close()
 end
 
 return T

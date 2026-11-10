@@ -487,6 +487,9 @@ fn decode_result(
     }
     if message.get("error").is_some() {
         let error = &message["error"];
+        tracing::error!(target: "forge::provider", event_name = "provider.rpc.failed", provider = "codex",
+            operation = ?operation, method, code = error.get("code").and_then(serde_json::Value::as_i64),
+            error = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("Native error response omitted its message"));
         if matches!(method, "thread/resume" | "thread/fork")
             && error.get("code").and_then(Value::as_i64) == Some(-32600)
             && error

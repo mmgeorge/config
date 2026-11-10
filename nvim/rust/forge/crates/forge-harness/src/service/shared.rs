@@ -346,15 +346,17 @@ async fn trace(
     let trace = registry.runtime.trace();
     match method {
         RuntimeMethod::HostTraceConfigure => {
-            let enabled = request
-                .params
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .context("trace enabled is required")?;
+            let level = serde_json::from_value(
+                request
+                    .params
+                    .get("level")
+                    .cloned()
+                    .context("logging level is required")?,
+            )?;
             if request.params.get("default_only").and_then(Value::as_bool) == Some(true) {
-                trace.configure_default(enabled)?;
+                trace.configure_default(level)?;
             } else {
-                trace.configure(enabled)?;
+                trace.configure(level)?;
             }
         }
         RuntimeMethod::SessionTraceClear => {

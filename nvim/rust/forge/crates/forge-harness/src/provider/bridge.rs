@@ -3036,6 +3036,20 @@ async fn relay_events(
                     | ProviderEvent::Thread { .. }
                     | ProviderEvent::Agent { .. } => None,
                 };
+                match &observation.event {
+                    ProviderEvent::Provider {
+                        event: forge_provider_api::ProviderConnectionEvent::Warning(warning),
+                    } => tracing::warn!(target: "forge::provider", event_name = "provider.warning",
+                        session_id = owner.session_id().as_str(), message = %warning.message),
+                    ProviderEvent::Provider {
+                        event: forge_provider_api::ProviderConnectionEvent::Unavailable(unavailable),
+                    } => {
+                        tracing::error!(target: "forge::provider", event_name = "provider.unavailable",
+                        session_id = owner.session_id().as_str(), error = %unavailable.failure,
+                        message = %unavailable.message)
+                    }
+                    _ => {}
+                }
                 let thread_owner = match &observation.event {
                     ProviderEvent::Thread { thread_id, .. } => events
                         .registrations()

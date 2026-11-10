@@ -10,6 +10,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, watch},
     task::JoinHandle,
 };
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::{
     FailureDisposition, OperationContext, OperationId, OperationInterruption, ProviderError,
@@ -247,7 +248,11 @@ where
         });
         if admitted {
             let retained = record.clone();
-            let worker = tokio::spawn(async move { supervise(retained, work, on_interrupt).await });
+            let worker = tokio::spawn(
+                async move { supervise(retained, work, on_interrupt).await }
+                    .in_current_span()
+                    .with_current_subscriber(),
+            );
             *record
                 .worker
                 .try_lock()
@@ -540,7 +545,7 @@ where
     Handler: FnOnce(OperationInterruption) -> Interruption<Cleanup> + Send + 'static,
     Cleanup: Future<Output = Result<(), ProviderError>> + Send + 'static,
 {
-    let mut worker = tokio::spawn(work);
+    let mut worker = tokio::spawn(work.in_current_span().with_current_subscriber());
     let (native, cleanup, unexpected) = tokio::select! {
         biased;
         result = &mut worker => (result, Ok(()), false),
@@ -548,7 +553,7 @@ where
             match std::panic::catch_unwind(AssertUnwindSafe(|| on_interrupt(reason))) {
                 Ok(Interruption { observation, cleanup }) => {
                     record.interrupt(observation);
-                    let cleanup = tokio::spawn(cleanup);
+                    let cleanup = tokio::spawn(cleanup.in_current_span().with_current_subscriber());
                     let (native, cleanup) = tokio::join!(&mut worker, cleanup);
                     let unexpected = cleanup.is_err();
                     let cleanup = cleanup.unwrap_or_else(|_| Err(failure(record.operation, ProviderFailureKind::Runtime, ProviderPhase::Collection, FailureDisposition::Invalidated)));

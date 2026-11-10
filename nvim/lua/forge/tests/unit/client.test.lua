@@ -156,7 +156,7 @@ T["admission_queue"] = function()
   emit({ id = writes[#writes].id, result = { initialized = true } })
   wait_until(function() return #writes == offset + 259 end, "trace configuration request was not dispatched")
   eq(writes[#writes].method, "host.trace.configure")
-  emit({ id = writes[#writes].id, result = { enabled = false } })
+  emit({ id = writes[#writes].id, result = { level = "none" } })
   wait_until(function() return #writes == offset + 260 end, "initialized waiting request was not dispatched")
   assert(writes[#writes].params.label == "startup-waiting", "initialized request never reached transport")
   respond(writes[#writes])
@@ -185,7 +185,7 @@ T["callback_isolation"] = function()
           emit({ id = request.id, result = dofile("nvim/lua/forge/tests/support/provider_catalog.lua").registry() })
         end
         if request.method == "session.initialize" then emit({ id = request.id, result = { session = { id = "fixture" } } }) end
-        if request.method == "host.trace.configure" then emit({ id = request.id, result = { enabled = false } }) end
+        if request.method == "host.trace.configure" then emit({ id = request.id, result = { level = "none" } }) end
         if request.method == "host.shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
       end,
       kill = function() end,
@@ -356,7 +356,7 @@ T["request_contract"] = function()
         elseif request.method == "session.initialize" then
           if request.params.services_only then respond(request, { initialized = true })
           else initialize_request = request end
-        elseif request.method == "host.trace.configure" then respond(request, { enabled = false })
+        elseif request.method == "host.trace.configure" then respond(request, { level = "none" })
         elseif request.method == "session.resume" then respond(request, { session = { id = request.session_id } })
         elseif request.method == "host.shutdown" then vim.schedule(function() exited({ code = 0 }) end) end
       end,
@@ -410,7 +410,7 @@ T["request_contract"] = function()
   session.register_harness("origin", origin)
   session.activate_harness(active)
   local tracing_complete = false
-  client.request({ method = "host.trace.configure", session_id = "origin", params = { enabled = true } }, function()
+  client.request({ method = "host.trace.configure", session_id = "origin", params = { level = "trace" } }, function()
     assert(session.harness == origin, "trace callback lost its explicit session context")
     session.activate_harness(origin)
     tracing_complete = true
@@ -969,7 +969,7 @@ T["receive"] = function()
         elseif request.method == "session.initialize" then
           emit({ id = request.id, result = { session = { id = "receive-test" } } })
         elseif request.method == "host.trace.configure" then
-          emit({ id = request.id, result = { enabled = request.params.enabled } })
+          emit({ id = request.id, result = { level = request.params.level } })
         elseif request.method == "session.exchange.list" then
           for sequence = 1, event_total do
             emit({ session_id = "receive-test", event = "exchange_updated", payload = { sequence = sequence } })
@@ -1027,7 +1027,7 @@ T["transport_failure"] = function()
         elseif request.method == "session.initialize" then
           emitted(nil, vim.json.encode({ id = request.id, result = { initialized = true } }) .. "\n")
         elseif request.method == "host.trace.configure" then
-          emitted(nil, vim.json.encode({ id = request.id, result = { enabled = false } }) .. "\n")
+          emitted(nil, vim.json.encode({ id = request.id, result = { level = "none" } }) .. "\n")
         elseif request.method == "session.state.get" then request_id = request.id end
       end,
       kill = function() end,
@@ -1179,7 +1179,7 @@ T["provider_registry_config_reload"] = function()
           registry_request_count = registry_request_count + 1
           result = registry_fixture.registry()
         elseif request.method == "host.trace.configure" then
-          result.enabled = false
+          result.level = "none"
         end
         options.stdout(nil, vim.json.encode({ id = request.id, result = result }) .. "\n")
       end,

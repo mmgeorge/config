@@ -1,5 +1,34 @@
 use serde_json::{Value, json};
 
+/// Keep redacted diagnostic text local while public inspection remains metadata-only.
+pub(super) fn diagnostic_payload(payload: &Value) -> Value {
+    let mut result = metadata_payload(payload);
+    if let (Some(source), Some(target)) = (payload.as_object(), result.as_object_mut()) {
+        for key in ["message", "error"] {
+            if let Some(text) = source.get(key).and_then(Value::as_str) {
+                target.insert(key.into(), Value::String(redact_text(text)));
+            }
+        }
+        if let Some(spans) = source.get("span_path").and_then(Value::as_array) {
+            target.insert(
+                "span_path".into(),
+                Value::Array(spans.iter().map(metadata_payload).collect()),
+            );
+        }
+    }
+    result
+}
+
+/// Remove credential assignments and recognizable token formats without truncating diagnostics.
+fn redact_text(text: &str) -> String {
+    static CREDENTIALS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)(?:bearer\s+[^\s"',;]+|(?:github_pat_|gh[pousr]_)[a-z0-9_]+|(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|client[_-]?secret)"?\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^\s,;]+))"#,
+        ).expect("credential redaction expression is valid")
+    });
+    CREDENTIALS.replace_all(text, "[REDACTED]").into_owned()
+}
+
 /// Bound public metadata text without splitting a UTF-8 code point.
 pub(super) fn bounded_text(text: &str) -> &str {
     let mut end = text.len().min(256);
@@ -34,10 +63,15 @@ pub(super) fn metadata_payload(payload: &Value) -> Value {
 }
 
 /// Identify generic diagnostic metadata permitted in public inspection.
-fn diagnostic_field(key: &str) -> bool {
+pub(super) fn diagnostic_field(key: &str) -> bool {
     matches!(
         key,
-        "method"
+        "level"
+            | "target"
+            | "name"
+            | "file"
+            | "line"
+            | "method"
             | "command_id"
             | "sequence"
             | "update_step"

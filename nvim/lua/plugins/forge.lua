@@ -43,7 +43,7 @@ return {
     end,
     opts = {
       diff_logging = true,
-      harness_logging = true,
+      log_level = "info",
       status_cursor_prewarm = true,
       status_cursor_prewarm_max_hunks = 2,
       walkthrough_inventory = "sem",
@@ -85,7 +85,7 @@ return {
           vim.notify("Open a Harness session first", vim.log.levels.ERROR, { title = "ForgeHarness" })
           return
         end
-        require("forge.views.harness.settings").log(active.id, command.args)
+        require("forge.views.harness.settings").log(active.id, command.args ~= "" and command.args or "open")
       end, {
         nargs = "?",
         complete = function() return { "on", "off", "open" } end,

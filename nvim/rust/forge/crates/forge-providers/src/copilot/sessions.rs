@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 /// Select a compatible binding or replace it before applying changed resources.
 #[derive(Clone, Copy, PartialEq)]
@@ -326,23 +327,34 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         }
         let worker_profile = profile.clone();
         let native_operation = super::operation::current();
-        let task = tokio::spawn(super::operation::scope(native_operation, async move {
-            let _profile = worker_profile;
-            let session = Arc::new(
-                super::session::open(&client, options, permissions, tools, trace, &correlation_id)
-                    .await?,
-            );
-            provisional
-                .lock()
-                .map_err(|_| {
-                    super::error::native_failure(
-                        forge_provider_api::ProviderOperation::TurnStart,
-                        forge_provider_api::ProviderFailureKind::Protocol,
+        let task = tokio::spawn(
+            super::operation::scope(native_operation, async move {
+                let _profile = worker_profile;
+                let session = Arc::new(
+                    super::session::open(
+                        &client,
+                        options,
+                        permissions,
+                        tools,
+                        trace,
+                        &correlation_id,
                     )
-                })?
-                .insert(startup_key, session.clone());
-            Ok(session)
-        }));
+                    .await?,
+                );
+                provisional
+                    .lock()
+                    .map_err(|_| {
+                        super::error::native_failure(
+                            forge_provider_api::ProviderOperation::TurnStart,
+                            forge_provider_api::ProviderFailureKind::Protocol,
+                        )
+                    })?
+                    .insert(startup_key, session.clone());
+                Ok(session)
+            })
+            .in_current_span()
+            .with_current_subscriber(),
+        );
         let startup = Arc::new(Mutex::new(Some(task)));
         self.startups
             .lock()

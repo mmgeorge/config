@@ -231,6 +231,8 @@ pub async fn open(
         let session = match started {
             Ok(session) => session,
             Err(error) => {
+                tracing::error!(target: "forge::provider", event_name = "provider.session.failed",
+                    provider = "copilot", error = %format_args!("{error:#}"));
                 let cause = error.downcast::<ProviderError>().unwrap_or_else(|_| {
                     generation
                         .failure()
@@ -264,6 +266,8 @@ pub async fn open(
     }
     .await;
     result.map_err(|error| {
+        tracing::error!(target: "forge::provider", event_name = "provider.session.failed",
+            provider = "copilot", error = %format_args!("{error:#}"));
         error.downcast::<ProviderError>().unwrap_or_else(|_| {
             native_failure(
                 ProviderOperation::ThreadOpen,

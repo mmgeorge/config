@@ -3,8 +3,26 @@ use crate::codex::CodexConnectionError;
 use forge_provider_api::ProviderError;
 use forge_provider_api::error::{ProviderFailureKind, ProviderOperation};
 
+/// Render a native cause chain only at the diagnostic boundary, without debug payloads.
+pub(crate) struct Diagnostic<'cause>(pub(crate) &'cause (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for Diagnostic<'_> {
+    /// Preserve each source before provider normalization discards native details.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0, formatter)?;
+        let mut cause = self.0.source();
+        while let Some(error) = cause {
+            write!(formatter, ": {error}")?;
+            cause = error.source();
+        }
+        Ok(())
+    }
+}
+
 /// Normalize a Codex transport failure at its requested operation boundary.
 pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -> ProviderError {
+    tracing::error!(target: "forge::provider", event_name = "provider.failure",
+        provider = "codex", operation = ?operation, error = %Diagnostic(&error));
     let kind = match error {
         CodexConnectionError::Overflow => {
             return ProviderError::Observation(
@@ -26,6 +44,8 @@ pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -
 
 /// Normalize an ACP transport failure without retaining native diagnostics or inventing delivery proof.
 pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> ProviderError {
+    tracing::error!(target: "forge::provider", event_name = "provider.failure",
+        provider = "antigravity", operation = ?operation, error = %Diagnostic(&error));
     let (kind, phase, disposition) = match error {
         AcpConnectionError::Protocol { .. } => (
             ProviderFailureKind::Protocol,

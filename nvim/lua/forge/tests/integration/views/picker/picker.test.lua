@@ -1098,7 +1098,7 @@ T["navigation"] = function()
     local preferences = { provider = "fixture_alpha", auto_compaction = { enabled = true, threshold_tokens = 128000 },
       models = { fixture_alpha = { model = "first", thinking = "low" } } }
     client.request = function(request, callback)
-      if request.method == "host.trace.status" then callback({ enabled = false, path = vim.fn.tempname() })
+      if request.method == "host.trace.status" then callback({ level = "none", path = vim.fn.tempname() })
       elseif request.method == "session.provider.model.list" then callback({
         { id = "first", reasoning = { "low", "high" }, default_reasoning = "low" },
         { id = "second", reasoning = { "low", "high" }, default_reasoning = "low" },

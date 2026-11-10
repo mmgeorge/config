@@ -490,6 +490,8 @@ pub(crate) fn transport_error(
     operation: ProviderOperation,
     error: TransportFailure,
 ) -> ProviderError {
+    tracing::error!(target: "forge::provider", event_name = "provider.failure",
+        provider = "claude", operation = ?operation, error = %error);
     let (kind, disposition) = match error {
         TransportFailure::Rejected { code, .. } => (
             match code.as_deref() {
@@ -513,6 +515,8 @@ pub(crate) fn transport_error(
 }
 
 fn initialization_failure(error: TransportFailure) -> ProviderError {
+    tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
+        provider = "claude", error = %error);
     let kind = match error {
         TransportFailure::Rejected { .. } => ProviderFailureKind::Initialization,
         TransportFailure::Closed | TransportFailure::Write => ProviderFailureKind::Initialization,

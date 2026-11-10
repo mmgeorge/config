@@ -84,11 +84,16 @@ impl TransportShared {
         line.push(b'\n');
         let mut writer = self.writer.lock().await;
         let writer = writer.as_mut().ok_or(TransportFailure::Closed)?;
-        writer
-            .write_all(&line)
-            .await
-            .map_err(|_| TransportFailure::Write)?;
-        writer.flush().await.map_err(|_| TransportFailure::Write)
+        writer.write_all(&line).await.map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.write.failed",
+                    provider = "claude", error = %error);
+            TransportFailure::Write
+        })?;
+        writer.flush().await.map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.flush.failed",
+                provider = "claude", error = %error);
+            TransportFailure::Write
+        })
     }
 }
 
@@ -205,7 +210,11 @@ async fn read_frames(
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => break None,
-            Err(_) => break Some(TransportFailure::Closed),
+            Err(error) => {
+                tracing::error!(target: "forge::provider", event_name = "provider.read.failed",
+                    provider = "claude", error = %error);
+                break Some(TransportFailure::Closed);
+            }
         };
         if line.trim().is_empty() {
             continue;

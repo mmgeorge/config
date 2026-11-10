@@ -16,7 +16,7 @@ pub(crate) struct PlanEditTrace {
 impl PlanEditTrace {
     /// Shares an operation identity across the UI, service, and persistence stages.
     pub(crate) fn new(store: Arc<TraceStore>, session: &str, method: &str, params: &Value) -> Self {
-        let enabled = store.status().enabled;
+        let enabled = store.is_enabled();
         Self {
             store,
             session: session.into(),

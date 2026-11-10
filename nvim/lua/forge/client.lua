@@ -754,7 +754,7 @@ local function session_send_initialize(callback, initialize_options, startup)
     if initialized_session_id then client.snapshot_by_id[initialized_session_id] = result end
     client[mode .. "_ready"] = true
     if mode == "harness" then session.harness.ready = true end
-    send_request(nil, "host.trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
+    send_request(nil, "host.trace.configure", { level = config.options.log_level, default_only = true }, function(status, failure)
       if startup then startup.mark("trace.configure.received", { error = failure }) end
       if failure then
         client[mode .. "_ready"] = false

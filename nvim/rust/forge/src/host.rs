@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
+use tracing::Instrument;
 
 use crate::router::{HostRouter, validate_initialize};
 use crate::runtime::{ForgeRuntime, SHUTDOWN_DEADLINE};
@@ -438,9 +439,32 @@ impl ConnectionHost {
             let router = Arc::clone(&self.router);
             let sink = sink.clone();
             let preparation_turn = preparation_order.reserve(&envelope)?;
+            let method_name = envelope.request.method.clone();
+            let major = !matches!(
+                method_name.as_str(),
+                "host.transport.consumed"
+                    | "host.trace.status"
+                    | "session.document"
+                    | "repository.status"
+                    | "session.snapshot"
+                    | "session.command.status.get"
+            ) && !method_name.ends_with(".get")
+                && !method_name.ends_with(".list");
+            let span = tracing::info_span!(
+                "ipc",
+                session_id = envelope.session_id.as_deref().unwrap_or("global"),
+                request_id = envelope.request.id,
+                method = method_name.as_str()
+            );
             self.requests.spawn(envelope.request.id, async move {
                 let _permit = permit;
                 let request_id = envelope.request.id;
+                let started = Instant::now();
+                if major {
+                    tracing::info!(target: "forge::ipc", event_name = "ipc.started");
+                } else {
+                    tracing::trace!(target: "forge::ipc", event_name = "ipc.started");
+                }
                 let outcome = async {
                     if let Some(turn) = &preparation_turn {
                         turn.wait().await;
@@ -463,12 +487,20 @@ impl ConnectionHost {
                 }
                 .await;
                 if let Err(error) = outcome {
+                    tracing::error!(target: "forge::ipc", event_name = "ipc.failed",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, error = %format_args!("{error:#}"));
                     sink.send(Message::Response(request_failure_response(
                         request_id, &error,
                     )))?;
+                } else if major {
+                    tracing::info!(target: "forge::ipc", event_name = "ipc.completed",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+                } else {
+                    tracing::trace!(target: "forge::ipc", event_name = "ipc.completed",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
                 }
                 Ok(())
-            })?;
+            }.instrument(span))?;
         }
     }
 

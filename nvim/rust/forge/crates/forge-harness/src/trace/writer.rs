@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::policy::{bounded_text, metadata_payload};
+use super::level::LogLevel;
+use super::policy::{bounded_text, diagnostic_payload};
 
 pub(super) const MAX_TRACE_BYTES: u64 = 100 * 1024 * 1024;
 pub(super) const MAX_PENDING_RECORDS: usize = 4096;
@@ -47,6 +48,11 @@ pub enum TraceError {
     },
     /// A retained diagnostic record could not be encoded or decoded.
     Encoding(serde_json::Error),
+    /// Persistent logging settings could not be decoded without losing the saved preference.
+    Configuration {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     /// The writer was closed before the requested control completed.
     Closed,
     /// An owned writer synchronization primitive was poisoned.
@@ -61,7 +67,9 @@ impl TraceError {
     /// Distinguish lost diagnostics from a writer that could not be collected.
     pub(super) fn is_diagnostic(&self) -> bool {
         match self {
-            Self::Io { .. } | Self::Encoding(_) | Self::State(_) => true,
+            Self::Io { .. } | Self::Encoding(_) | Self::Configuration { .. } | Self::State(_) => {
+                true
+            }
             Self::WriterFailed(source) => source.is_diagnostic(),
             Self::Closed | Self::Poisoned | Self::Panicked => false,
         }
@@ -79,6 +87,11 @@ impl std::fmt::Display for TraceError {
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
             Self::Encoding(source) => write!(formatter, "encode Harness trace: {source}"),
+            Self::Configuration { path, source } => write!(
+                formatter,
+                "read Harness logging configuration {}: {source}",
+                path.display()
+            ),
             Self::Closed => formatter.write_str("Harness trace writer is closed"),
             Self::Poisoned => {
                 formatter.write_str("Harness trace writer ownership lock is poisoned")
@@ -98,6 +111,7 @@ impl std::error::Error for TraceError {
             Self::State(source) => Some(source.as_ref()),
             Self::Io { source, .. } => Some(source),
             Self::Encoding(source) => Some(source),
+            Self::Configuration { source, .. } => Some(source),
             Self::WriterFailed(source) => Some(source.as_ref()),
             Self::Closed | Self::Poisoned | Self::Panicked => None,
         }
@@ -111,7 +125,7 @@ type Reply = mpsc::Sender<TraceResult<()>>;
 enum Command {
     Record(EncodedRecord),
     Configure {
-        enabled: bool,
+        level: LogLevel,
         default_only: bool,
         reply: Reply,
     },
@@ -151,10 +165,22 @@ impl Admission {
         Ok(())
     }
 
-    /// Commit a record without waiting for another producer or a closing lease.
-    fn enqueue(&self, sender: &mpsc::SyncSender<Command>, record: EncodedRecord) -> Commit {
-        let Ok(_commit) = self.commit.try_lock() else {
-            return Commit::Contended;
+    /// Serialize coarse diagnostics with close while verbose producers may yield under contention.
+    fn enqueue(
+        &self,
+        sender: &mpsc::SyncSender<Command>,
+        record: EncodedRecord,
+        level: tracing::Level,
+    ) -> Commit {
+        let _commit = if level <= tracing::Level::INFO {
+            self.commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            let Ok(commit) = self.commit.try_lock() else {
+                return Commit::Contended;
+            };
+            commit
         };
         if self.is_closed() {
             return Commit::Obsolete;
@@ -183,13 +209,14 @@ pub(super) struct TraceWriter {
     shared: Arc<Shared>,
     join: Mutex<Option<JoinHandle<()>>>,
     leases: AtomicUsize,
+    pub(super) admission: Admission,
 }
 
 impl TraceWriter {
     /// Create the only filesystem owner for a canonical data root.
     pub(super) fn open(root: &Path) -> TraceResult<Self> {
         let files = Files::open(root)?;
-        let shared = Arc::new(Shared::new(files.enabled, files.config_path.exists()));
+        let shared = Arc::new(Shared::new(files.level, files.config_path.exists()));
         let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_RECORDS);
         let worker_shared = shared.clone();
         let join = std::thread::Builder::new()
@@ -201,6 +228,7 @@ impl TraceWriter {
             shared,
             join: Mutex::new(Some(join)),
             leases: AtomicUsize::new(0),
+            admission: Admission::new(),
         })
     }
 
@@ -215,8 +243,8 @@ impl TraceWriter {
     }
 
     /// Get enablement without filesystem queries or writer locks.
-    pub(super) fn enabled(&self) -> bool {
-        self.shared.enabled.load(Ordering::Acquire)
+    pub(super) fn level(&self) -> LogLevel {
+        LogLevel::decode(self.shared.level.load(Ordering::Acquire))
     }
 
     /// Get whether an explicit persistent preference has been saved.
@@ -231,8 +259,9 @@ impl TraceWriter {
         session_id: &str,
         event: &str,
         payload: &Value,
+        level: tracing::Level,
     ) -> TraceAdmission {
-        let result = self.admit(admission, session_id, event, payload);
+        let result = self.admit(admission, session_id, event, payload, level);
         if matches!(
             result,
             TraceAdmission::Saturated
@@ -254,13 +283,14 @@ impl TraceWriter {
         session_id: &str,
         event: &str,
         payload: &Value,
+        level: tracing::Level,
     ) -> TraceAdmission {
         let epoch = TraceEpoch(self.shared.epoch.load(Ordering::Acquire));
         let received_at = timestamp_ms();
         if self.shared.closed.load(Ordering::Acquire) {
             return TraceAdmission::Closed;
         }
-        if !self.enabled() {
+        if self.level() == LogLevel::None {
             return TraceAdmission::Disabled;
         }
         let Some(mut buffer) = RecordBuffer::reserve(self.shared.clone()) else {
@@ -274,7 +304,7 @@ impl TraceWriter {
             timestamp_ms: received_at,
             session_id,
             event,
-            payload: &metadata_payload(payload),
+            payload: &diagnostic_payload(payload),
         };
         if serde_json::to_writer(&mut buffer, &record).is_err() {
             self.shared.losses.encoding.fetch_add(1, Ordering::Relaxed);
@@ -288,7 +318,7 @@ impl TraceWriter {
             self.shared.losses.obsolete.fetch_add(1, Ordering::Relaxed);
             return TraceAdmission::Obsolete;
         }
-        match admission.enqueue(&self.sender, EncodedRecord { epoch, buffer }) {
+        match admission.enqueue(&self.sender, EncodedRecord { epoch, buffer }, level) {
             Commit::Accepted => TraceAdmission::Queued,
             Commit::Obsolete => {
                 self.shared.losses.obsolete.fetch_add(1, Ordering::Relaxed);
@@ -317,9 +347,9 @@ impl TraceWriter {
     }
 
     /// Order a persisted enablement update after preceding accepted records.
-    pub(super) fn configure(&self, enabled: bool, default_only: bool) -> TraceResult<()> {
+    pub(super) fn configure(&self, level: LogLevel, default_only: bool) -> TraceResult<()> {
         self.control(|reply| Command::Configure {
-            enabled,
+            level,
             default_only,
             reply,
         })
@@ -349,6 +379,7 @@ impl TraceWriter {
         let Some(task) = join.take() else {
             return Ok(());
         };
+        self.admission.close()?;
         self.shared.closed.store(true, Ordering::Release);
         let result = self.control(Command::Close);
         task.join().map_err(|_| TraceError::Panicked)?;
@@ -373,7 +404,7 @@ impl Drop for TraceWriter {
 }
 
 struct Shared {
-    enabled: AtomicBool,
+    level: AtomicU8,
     configured: AtomicBool,
     closed: AtomicBool,
     record_count: AtomicUsize,
@@ -385,9 +416,9 @@ struct Shared {
 
 impl Shared {
     /// Create cached state and budgets independent of filesystem ownership.
-    fn new(enabled: bool, configured: bool) -> Self {
+    fn new(level: LogLevel, configured: bool) -> Self {
         Self {
-            enabled: AtomicBool::new(enabled),
+            level: AtomicU8::new(level.encode()),
             configured: AtomicBool::new(configured),
             closed: AtomicBool::new(false),
             record_count: AtomicUsize::new(0),
@@ -482,8 +513,14 @@ struct EncodedRecord {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TraceConfig {
-    #[serde(default)]
+    level: LogLevel,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTraceConfig {
     enabled: bool,
 }
 
@@ -492,7 +529,7 @@ struct Files {
     path: PathBuf,
     config_path: PathBuf,
     file: Option<File>,
-    enabled: bool,
+    level: LogLevel,
     _lease: crate::storage::state::StateLease,
 }
 
@@ -501,19 +538,40 @@ impl Files {
     fn open(root: &Path) -> TraceResult<Self> {
         let lease = crate::storage::state::StateLease::open(root).map_err(TraceError::State)?;
         let config_path = root.join("harness-trace-config.json");
-        let enabled = fs::read(&config_path)
-            .ok()
-            .and_then(|contents| serde_json::from_slice::<TraceConfig>(&contents).ok())
-            .is_some_and(|config| config.enabled);
+        let level = match fs::read(&config_path) {
+            Ok(contents) => match serde_json::from_slice::<TraceConfig>(&contents) {
+                Ok(config) => config.level,
+                Err(current_error) => {
+                    let legacy: LegacyTraceConfig =
+                        serde_json::from_slice(&contents).map_err(|_| {
+                            TraceError::Configuration {
+                                path: config_path.clone(),
+                                source: current_error,
+                            }
+                        })?;
+                    let level = if legacy.enabled {
+                        LogLevel::Trace
+                    } else {
+                        LogLevel::None
+                    };
+                    write_config(&config_path, level)?;
+                    level
+                }
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => LogLevel::Info,
+            Err(source) => return Err(io_error("read trace configuration", &config_path, source)),
+        };
         let path = crate::storage::state::directory(root).join("harness-trace.jsonl");
-        let file = enabled.then(|| open_global(&path)).transpose()?;
+        let file = (level != LogLevel::None)
+            .then(|| open_global(&path))
+            .transpose()?;
         Ok(Self {
             _lease: lease,
             root: root.to_owned(),
             path,
             config_path,
             file,
-            enabled,
+            level,
         })
     }
 
@@ -527,7 +585,7 @@ impl Files {
             let result = match command {
                 Command::Record(record) => {
                     if record.epoch != TraceEpoch(shared.epoch.load(Ordering::Acquire))
-                        || !self.enabled
+                        || self.level == LogLevel::None
                     {
                         shared.losses.obsolete.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -535,11 +593,11 @@ impl Files {
                     self.write_encoded(&record.buffer.bytes)
                 }
                 Command::Configure {
-                    enabled,
+                    level,
                     default_only,
                     reply,
                 } => {
-                    let result = self.configure(enabled, default_only, &shared);
+                    let result = self.configure(level, default_only, &shared);
                     let _ = reply.send(result);
                     continue;
                 }
@@ -580,28 +638,32 @@ impl Files {
     }
 
     /// Persist a preference before publishing cached enablement.
-    fn configure(&mut self, enabled: bool, default_only: bool, shared: &Shared) -> TraceResult<()> {
+    fn configure(
+        &mut self,
+        level: LogLevel,
+        default_only: bool,
+        shared: &Shared,
+    ) -> TraceResult<()> {
         if default_only && self.config_path.exists() {
             return Ok(());
         }
-        let file = enabled.then(|| open_global(&self.path)).transpose()?;
-        let contents =
-            serde_json::to_vec_pretty(&TraceConfig { enabled }).map_err(TraceError::Encoding)?;
-        fs::write(&self.config_path, contents)
-            .map_err(|source| io_error("write trace configuration", &self.config_path, source))?;
+        let file = (level != LogLevel::None)
+            .then(|| open_global(&self.path))
+            .transpose()?;
+        write_config(&self.config_path, level)?;
         self.file = file;
-        if self.enabled != enabled {
+        if self.level != level {
             shared.epoch.fetch_add(1, Ordering::AcqRel);
         }
-        self.enabled = enabled;
+        self.level = level;
         shared.configured.store(true, Ordering::Release);
-        shared.enabled.store(enabled, Ordering::Release);
-        if enabled {
+        shared.level.store(level.encode(), Ordering::Release);
+        if level == LogLevel::Trace {
             self.write_record(
                 timestamp_ms(),
                 "global",
                 "trace.configured",
-                &json!({"enabled":enabled}),
+                &json!({"level":"trace"}),
             )?;
         }
         Ok(())
@@ -617,8 +679,8 @@ impl Files {
         result
             .and(unlocked)
             .map_err(|source| io_error("clear trace", &self.path, source))?;
-        self.file = self.enabled.then_some(file);
-        if self.enabled {
+        self.file = (self.level != LogLevel::None).then_some(file);
+        if self.level == LogLevel::Trace {
             self.write_record(timestamp_ms(), "global", "trace.cleared", &Value::Null)?;
         }
         Ok(())
@@ -670,7 +732,7 @@ impl Files {
     ) -> TraceResult<()> {
         let detail_result = self.write_detail(timestamp_ms, session_id, event, payload);
         let record = json!({"timestamp_ms":timestamp_ms,"session_id":bounded_text(session_id),
-            "event":bounded_text(event),"payload":metadata_payload(payload)});
+            "event":bounded_text(event),"payload":payload});
         let line = serde_json::to_vec(&record).map_err(TraceError::Encoding)?;
         let global_result = if let Some(file) = self.file.as_mut() {
             append_global(file, &self.path, &line)
@@ -693,7 +755,7 @@ impl Files {
         let result = (|| {
             let line =
                 serde_json::to_vec(&json!({"timestamp_ms":timestamp_ms,"session_id":session_id,
-                "event":event,"payload":metadata_payload(payload)}))
+                "event":event,"payload":payload}))
                 .map_err(TraceError::Encoding)?;
             physical_records(&line, MAX_TRACE_BYTES, |part| {
                 append_detail(&path, part, MAX_TRACE_BYTES)
@@ -718,7 +780,7 @@ impl Files {
             .saturating_add(encoding_error_count)
             .saturating_add(obsolete_count)
             .saturating_add(contention_count);
-        if count == 0 {
+        if count == 0 || self.level == LogLevel::None {
             return Ok(());
         }
         // Obsolete in-flight input can finish after disable. Publish only its
@@ -745,6 +807,25 @@ impl Files {
         }
         Ok(())
     }
+}
+
+/// Publish validated settings atomically, leaving the prior preference intact on failure.
+fn write_config(path: &Path, level: LogLevel) -> TraceResult<()> {
+    let parent = path
+        .parent()
+        .expect("trace configuration has a data-root parent");
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|source| io_error("prepare trace configuration", path, source))?;
+    serde_json::to_writer_pretty(&mut temporary, &TraceConfig { level })
+        .map_err(TraceError::Encoding)?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|source| io_error("flush trace configuration", path, source))?;
+    temporary
+        .persist(path)
+        .map_err(|error| io_error("publish trace configuration", path, error.error))?;
+    Ok(())
 }
 
 /// Get the receipt time before a record enters the bounded writer queue.

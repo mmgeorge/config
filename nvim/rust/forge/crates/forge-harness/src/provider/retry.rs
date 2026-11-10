@@ -728,7 +728,7 @@ mod tests {
         let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        trace.configure(true)?;
+        trace.configure(crate::trace::LogLevel::Trace)?;
         let (native, log) = provider(6, Ending::Completed);
         let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let (sink, mut stream) = crate::provider::events::channel(scope());

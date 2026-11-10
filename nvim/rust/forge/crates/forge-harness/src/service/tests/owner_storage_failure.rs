@@ -68,7 +68,9 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
     let controller = SessionController::new(broker).await?;
-    controller.trace.configure_default(true)?;
+    controller
+        .trace
+        .configure_default(crate::trace::LogLevel::Trace)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
         while output.recv().await?.is_some() {}

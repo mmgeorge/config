@@ -239,6 +239,26 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
         let exchange = serde_json::to_value(&exchanges[0]).unwrap();
         assert_eq!(exchange["state"], "cancelled", "{exchange}");
     }
+    let path = forge_harness::storage::state::directory(data.path()).join("harness-trace.jsonl");
+    let contents = std::fs::read_to_string(path).unwrap();
+    let records = contents
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(records.iter().any(|record| record["event"] == "ipc.started"
+        && record["payload"]["method"] == "session.prompt.submit"));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "ipc.completed"
+                && record["payload"]["elapsed_ms"].is_number())
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["payload"]["level"] != "trace")
+    );
+    assert!(!contents.contains("first active turn") && !contents.contains("second active turn"));
 }
 
 #[test]

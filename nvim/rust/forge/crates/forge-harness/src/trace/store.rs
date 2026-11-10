@@ -6,16 +6,15 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::writer::{
-    Admission, TraceAdmission, TraceError, TraceResult, TraceWriter, session_path,
-};
+use super::writer::{Admission, TraceError, TraceResult, TraceWriter, session_path};
+use super::{LogLevel, subscriber::LoggingLayer};
 
 static WRITERS: OnceLock<Mutex<HashMap<PathBuf, Weak<TraceWriter>>>> = OnceLock::new();
 
 /// Describe the cached preference and the selected private trace file.
 #[derive(Clone, Debug, Serialize)]
 pub struct TraceStatus {
-    pub enabled: bool,
+    pub level: LogLevel,
     pub path: String,
     pub configured: bool,
     /// Count rejected optional diagnostics independently of execution outcomes.
@@ -26,7 +25,8 @@ pub struct TraceStatus {
 pub struct TraceStore {
     root: PathBuf,
     writer: Arc<TraceWriter>,
-    admission: Admission,
+    admission: Arc<Admission>,
+    dispatch: tracing::Dispatch,
     collection: Mutex<Option<Result<(), Arc<TraceError>>>>,
 }
 
@@ -53,10 +53,13 @@ impl TraceStore {
             }
         };
         writer.acquire();
+        let admission = Arc::new(Admission::new());
+        let dispatch = LoggingLayer::dispatch(Arc::downgrade(&writer), admission.clone());
         Ok(Self {
             root,
             writer,
-            admission: Admission::new(),
+            admission,
+            dispatch,
             collection: Mutex::new(None),
         })
     }
@@ -64,7 +67,7 @@ impl TraceStore {
     /// Get the cached trace preference without filesystem access.
     pub fn status(&self) -> TraceStatus {
         TraceStatus {
-            enabled: self.is_enabled(),
+            level: self.writer.level(),
             path: crate::storage::state::directory(&self.root)
                 .join("harness-trace.jsonl")
                 .to_string_lossy()
@@ -82,22 +85,17 @@ impl TraceStore {
     }
 
     /// Apply the editor default only before an explicit preference has been saved.
-    pub fn configure_default(&self, enabled: bool) -> TraceResult<TraceStatus> {
+    pub fn configure_default(&self, level: LogLevel) -> TraceResult<TraceStatus> {
         self.ensure_open()?;
-        self.writer.configure(enabled, true)?;
+        self.writer.configure(level, true)?;
         Ok(self.status())
     }
 
     /// Persist enablement after preceding accepted writes have completed.
-    pub fn configure(&self, enabled: bool) -> TraceResult<TraceStatus> {
+    pub fn configure(&self, level: LogLevel) -> TraceResult<TraceStatus> {
         self.ensure_open()?;
-        self.writer.configure(enabled, false)?;
+        self.writer.configure(level, false)?;
         Ok(self.status())
-    }
-
-    /// Toggle the saved tracing preference.
-    pub fn toggle(&self) -> TraceResult<TraceStatus> {
-        self.configure(!self.is_enabled())
     }
 
     /// Clear the global stream in writer order without replacing its inode.
@@ -115,17 +113,24 @@ impl TraceStore {
     }
 
     /// Enqueue bounded owned diagnostics without waiting for filesystem operations.
-    pub fn record(&self, session_id: &str, event: &str, payload: Value) -> TraceAdmission {
+    pub fn record(&self, session_id: &str, event: &str, payload: Value) {
         self.record_ref(session_id, event, &payload)
     }
 
     /// Capture bounded borrowed input and receipt time without filesystem operations.
-    pub fn record_ref(&self, session_id: &str, event: &str, payload: &Value) -> TraceAdmission {
-        if self.admission.is_closed() {
-            return TraceAdmission::Closed;
+    pub fn record_ref(&self, session_id: &str, event: &str, payload: &Value) {
+        if !self.is_enabled() {
+            return;
         }
-        self.writer
-            .record(&self.admission, session_id, event, payload)
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            tracing::trace!(target: "forge::record", session_id, event_name = event,
+                payload = %super::policy::metadata_payload(payload));
+        });
+    }
+
+    /// Get a dispatcher for scoped instrumentation without changing the process subscriber.
+    pub fn dispatch(&self) -> tracing::Dispatch {
+        self.dispatch.clone()
     }
 
     /// Finish preceding accepted writes and loss summaries before reading a snapshot.
@@ -177,7 +182,28 @@ impl TraceStore {
 
     /// Get cached enablement for inline future instrumentation.
     pub(crate) fn is_enabled(&self) -> bool {
-        !self.admission.is_closed() && self.writer.enabled()
+        !self.admission.is_closed() && self.writer.level() == LogLevel::Trace
+    }
+
+    /// Route process diagnostics only when one data root owns the host's logging destination.
+    pub(super) fn active_writer() -> Option<Arc<TraceWriter>> {
+        let registry = WRITERS.get()?;
+        let writers = match registry.lock() {
+            Ok(writers) => writers,
+            Err(_) => {
+                eprintln!("Forge logging destination registry is poisoned");
+                return None;
+            }
+        };
+        let mut active = writers.values().filter_map(Weak::upgrade);
+        let writer = active.next()?;
+        if active.next().is_some() {
+            eprintln!(
+                "Forge logging requires an explicit destination when multiple data roots are active"
+            );
+            return None;
+        }
+        Some(writer)
     }
 
     /// Resolve the private path using the same traversal protection as the writer.

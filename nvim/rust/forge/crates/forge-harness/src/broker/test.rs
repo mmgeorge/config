@@ -143,7 +143,7 @@ async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization(
         let (provider, signals) = cleanup_retry_provider(&broker, visible_output, false);
         broker.provider = provider.clone();
         broker.capability.native_turn_rollback = true;
-        broker.trace.configure(true)?;
+        broker.trace.configure(crate::trace::LogLevel::Trace)?;
         let execution_registry = broker.execution_registry();
         let repositories = Arc::clone(&broker.repositories);
         let handle = repositories

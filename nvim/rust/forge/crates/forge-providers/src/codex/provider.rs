@@ -102,7 +102,9 @@ impl CodexProvider {
             let native = super::operations::current();
             *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
                 let connect = async move {
-                    let connection = runtime.connect().await.map_err(|_| {
+                    let connection = runtime.connect().await.map_err(|error| {
+                        tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
+                            provider = "codex", error = %format_args!("{error:#}"));
                         failure(ProviderOperation::Inspect, ProviderFailureKind::Transport)
                     })?;
                     let rpc = Arc::new(NativeRpc::new(connection));

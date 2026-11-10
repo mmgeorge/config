@@ -167,7 +167,9 @@ impl HeldDispatch {
             while output.recv().await?.is_some() {}
             Ok::<(), anyhow::Error>(())
         });
-        controller.trace.configure_default(true)?;
+        controller
+            .trace
+            .configure_default(crate::trace::LogLevel::Trace)?;
         controller.start_provider(&sink).await;
         controller.attach_input(&sink).await?;
         let mut fixture = Self {

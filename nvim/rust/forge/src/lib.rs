@@ -31,6 +31,7 @@ pub enum Command {
 /// The diagnostic flag skips repository line statistics in Neovim mode.
 /// Returns service, initialization, or shutdown errors to the process entry point.
 pub fn run(command: Command, diagnostic_skip_line_stats: bool) -> Result<()> {
+    forge_harness::trace::install()?;
     shutdown::run(async {
         match command {
             Command::HistoryClear { data_root } => {

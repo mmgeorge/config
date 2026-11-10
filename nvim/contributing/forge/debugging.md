@@ -11,18 +11,21 @@ Forge records evidence ahead of time, because a failed session or a vanished edi
 
 ## Protocol trace
 
-`trace::TraceStore` owns opt-in protocol diagnostics, separately from timeline persistence. `/log on`, `/log off`, and the `/config` Logging toggle control it together with Lua performance logging. The aggregate `harness-trace.jsonl` keeps bounded metadata. Per-session `logs/<session-id>.jsonl` files keep request and response payloads with credential fields redacted, and rotate at 15 MiB with three older segments.
+Rust `tracing` supplies instrumentation; `trace::TraceStore` retains the existing shared writer, state lease, ordered shutdown, and JSONL files separately from timeline persistence. `/log` opens the level picker, also available through `/config` Logging. Levels are cumulative: None disables recording, Error records errors, Warn adds warnings, Info adds major IPC and provider lifecycle operations, and Trace adds verbose events and Lua Harness performance logging. New configurations default to Info.
 
-The detailed files can contain prompts, responses, tool arguments/results, and
-provider events. Credential redaction does not make them metadata-only. The
+Info records method, request and operation identities, outcome, and duration rather than per-frame activity. The subscriber filters events before formatting their fields; dependency Info and Debug events require Trace. Async correlation spans retain session and operation identities across provider workers. Local diagnostic records can include native error messages, cause chains, source locations, and span context. Credential patterns are redacted, and request/response bodies and unknown native fields are excluded; native messages can nevertheless contain sensitive context, so inspect logs before sharing them. Normalized provider errors still control lifecycle and retry policy independently of diagnostics.
+
+Info, Warn, and Error serialize enqueue operations through a short in-memory critical section; file I/O remains on the writer thread. Trace producers may yield under contention, and all levels remain best-effort when the existing bounded queue saturates. The log viewer exposes the rejected-record count rather than treating missing diagnostics as execution failure.
+
+The aggregate `harness-trace.jsonl` and per-session `logs/<session-id>.jsonl` files keep one logical JSON record per line, with `timestamp_ms`, `session_id`, `event`, and `payload`. Severity and diagnostic context live in the payload. Session files rotate at 100 MiB and retain ten older segments; large logical records use the existing chunk envelopes across segments. The
 `harness_session_log` tool exposes only allowlisted diagnostic metadata and reads
 up to 1,000 complete entries per page by default, newest-first, with a positive
 `limit` override. Log pages are not split by the response byte budget. Its cursor keeps
 the captured file extents and excludes later appends. Rotation renames the retained
 files so an open cursor can finish reading its original segments. The aggregate
-metadata file starts over at its 15 MiB threshold without keeping an older segment.
+file starts over at its 100 MiB threshold without keeping an older segment.
 
-`/log`, `/log open`, and `:ForgeHarnessLog` show the current session file in a read-only tab. `/log clear` empties only the current session file and its segments. Plan edits carry one `operation_id` across `harness-perf.log` and the session trace, and their timing records never contain plan text.
+`/log open` and `:ForgeHarnessLog` show the current session file in a read-only tab. `/log clear` empties only that file and its segments. `/log none|error|warn|info|trace` sets the level directly. The saved setting takes precedence over the Lua `log_level` default. Legacy `enabled: true` and `false` settings migrate to Trace and None respectively; malformed or unsupported settings fail explicitly without replacing the file. Plan edits carry one `operation_id` across `harness-perf.log` and the session trace, and their timing records never contain plan text.
 
 ## Startup log
 
@@ -37,9 +40,10 @@ Setting `vim.g.forge_skip_line_stats = true` before the host starts leaves displ
 
 ## Performance logs
 
-The repository's plugin configuration enables both `harness_logging` and
-`diff_logging`. Their Lua defaults are off, and an explicit saved Harness Logging
-preference takes precedence when the host applies its configuration. Lua writes
+The repository's plugin configuration selects `log_level = "info"` and enables
+`diff_logging`. Harness performance logging runs only at Trace; diff performance
+logging remains independent. The former `harness_logging` Lua boolean migrates to
+Trace or None when `log_level` is absent. Lua writes
 `stdpath("cache")/forge/harness-perf.log` and `diff-perf.log`; each starts over at
 15 MiB without retaining a previous segment.
 

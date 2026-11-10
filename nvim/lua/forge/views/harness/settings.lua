@@ -50,7 +50,7 @@ local configuration_field_description = {
   ["lsp-tools"] = "Allow the assistant to use language-server tools.",
   ["session-tools"] = "Allow the assistant to search and read session history.",
   ["status-thoughts"] = "Show model thoughts in the status display.",
-  ["logging"] = "Record Harness trace events for debugging.",
+  ["logging"] = "Select None, Error, Warn, Info, or Trace. Info records major operations without verbose instrumentation.",
 }
 
 --- Partition settings into category pages, keeping only compound values in one row.
@@ -269,7 +269,7 @@ local function refresh_log(path, buffer, force)
 end
 
 ---@class ForgeHarnessLogStatus
----@field enabled boolean
+---@field level "none"|"error"|"warn"|"info"|"trace"
 ---@field path? string
 ---@field rejected_record_count? integer
 
@@ -279,13 +279,13 @@ end
 local function log_title(status)
   local rejected = status.rejected_record_count or 0
   local loss = rejected > 0 and (" • %d record%s rejected"):format(rejected, rejected == 1 and "" or "s") or ""
-  return "Harness log • " .. (status.enabled and "On" or "Off") .. loss .. " • R refresh • q close"
+  return "Harness log • " .. status.level .. loss .. " • R refresh • q close"
 end
 
 ---Adopt host logging status and refresh every visible viewer of that log.
 ---@param status ForgeHarnessLogStatus
 function M.adopt(status)
-  require("forge.infra.perf").setup({ harness = { enabled = status.enabled } })
+  require("forge.infra.perf").setup({ harness = { enabled = status.level == "trace" } })
   if not status.path then return end
   log_status_by_path[status.path] = vim.deepcopy(status)
   local buffer = log_buffer_by_path[status.path]
@@ -335,21 +335,64 @@ local function open_log(status, session_id)
   refresh_log(status.path, buffer)
 end
 
+local log_level_list = {
+  { id = "none", label = "None", detail = "Do not record logs.", value = "none" },
+  { id = "error", label = "Error", detail = "Errors only.", value = "error" },
+  { id = "warn", label = "Warn", detail = "Warnings and errors.", value = "warn" },
+  { id = "info", label = "Info", detail = "Major IPC operations, warnings, and errors (default).", value = "info" },
+  { id = "trace", label = "Trace", detail = "All levels, including verbose instrumentation.", value = "trace" },
+}
+
+---@param session_id string
+---@param status ForgeHarnessLogStatus
+---@param host? table
+---@param on_close? fun()
+local function select_log_level(session_id, status, host, on_close)
+  local selected = 1
+  for index, option in ipairs(log_level_list) do
+    if option.value == status.level then selected = index break end
+  end
+  M._log_revision = (M._log_revision or 0) + 1
+  local revision, saving = M._log_revision, false
+  picker.close(false)
+  picker.open({
+    owner = "harness-log-level", host = host,
+    page_list = { { id = "logging", title = "Logging level", option_list = vim.deepcopy(log_level_list),
+      selected_index = selected, footer = "Enter select  q close" } },
+    on_close = on_close,
+    on_confirm = function(context)
+      if saving then return false end
+      saving = true
+      client.request({ session_id = session_id, method = "host.trace.configure",
+        params = { level = context.option.value } }, function(result, failure)
+        if revision ~= M._log_revision or not picker.is_open("harness-log-level") then return end
+        saving = false
+        if failure then notifications.error(failure, "Harness logging") return end
+        M.adopt(result)
+        picker.close(false)
+        if on_close then on_close() end
+      end)
+      return false
+    end,
+  })
+end
+
 ---@param session_id string
 ---@param action? string
 function M.log(session_id, action)
-  action = action or "open"
-  if action == "open" or action == "" then
+  if not action or action == "" then
+    request(session_id, "host.trace.status", {}, function(status) select_log_level(session_id, status) end)
+  elseif action == "open" then
     request(session_id, "host.trace.status", {}, function(status) open_log(status, session_id) end)
-  elseif action == "on" or action == "off" then
-    request(session_id, "host.trace.configure", { enabled = action == "on" })
+  elseif vim.tbl_contains({ "none", "error", "warn", "info", "trace" }, action) then
+    request(session_id, "host.trace.configure", { level = action })
   elseif action == "clear" then
     request(session_id, "session.trace.clear", {}, function(status)
       local buffer = log_buffer_by_path[status.path]
       if buffer and vim.api.nvim_buf_is_valid(buffer) then refresh_log(status.path, buffer, true) end
     end)
   else
-    notifications.error("Use /log [on|off|open|clear]", "Harness logging")
+    notifications.error("Use /log [none|error|warn|info|trace|open|clear]", "Harness logging")
   end
 end
 
@@ -563,15 +606,8 @@ function M.open(state, host, resume_state)
       elseif id == "automatic-checks" then
         configure({ automatic_checks = active.automatic_checks == false })
       elseif id == "logging" then
-        pending = true
-        client.request({ method = "host.trace.configure", params = { enabled = not status.enabled } }, function(result, failure)
-          pending = false
-          if not current() then return end
-          if failure then notifications.error(failure, "Harness logging") return end
-          status = result
-          M.adopt(status)
-          if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
-        end)
+        return_state = picker.capture_state()
+        select_log_level(session_id, status, host, reopen)
       end
     end
     current = function()
@@ -782,7 +818,7 @@ function M.open(state, host, resume_state)
               field("status-thoughts", "toggle", active.status_thoughts == true, "Enabled"),
             }),
             row("system", "logging", "Debug", "Logging", {
-              field("logging", "toggle", status.enabled == true, "Enabled"),
+              field("logging", "action", status.level, "Level"),
             }),
         }),
         on_field_submit = function(context, value, complete)

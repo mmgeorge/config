@@ -317,7 +317,7 @@ do
   end
   controller.submit, controller.drain = original_submit, original_drain
   mock_client.respond({
-    ["host.trace.status"] = { enabled = false },
+    ["host.trace.status"] = { level = "none" },
     ["background.settings"] = function(spec, callback) callback({ revision = 0, settings = spec.params.defaults }) end,
     ["session.provider.model.list"] = {},
   })
@@ -1576,7 +1576,7 @@ local original_configure = controller.configure
 local saved = 0
 local deferred, pending_save
 mock_client.respond({
-  ["host.trace.status"] = { enabled = false },
+  ["host.trace.status"] = { level = "none" },
   ["session.provider.model.list"] = {},
   ["background.settings"] = function(spec, callback) callback({ revision = 0, settings = spec.params.defaults }) end,
 })
@@ -1887,7 +1887,7 @@ local function mock_launcher(_, options, _)
         emit(options, { id = request.id, result = snapshot(request.params.name) })
       end
     elseif request.method == "host.trace.configure" then
-      emit(options, { id = request.id, result = { enabled = request.params.enabled } })
+      emit(options, { id = request.id, result = { level = request.params.level } })
     elseif request.method == "host.shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else

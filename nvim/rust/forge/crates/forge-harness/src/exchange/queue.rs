@@ -678,7 +678,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         super::super::core_log::persist_test_session(root.path(), "session")?;
         let trace = crate::trace::TraceStore::open(root.path())?;
-        trace.configure(false)?;
+        trace.configure(crate::trace::LogLevel::None)?;
         let mut queue = CommandQueue::open(root.path(), "session")?;
         let (active_reply, active_response) = oneshot::channel();
         let active_request = request("active");

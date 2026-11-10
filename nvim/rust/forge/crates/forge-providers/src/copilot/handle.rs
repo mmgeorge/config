@@ -90,7 +90,9 @@ impl CopilotClient {
             Ok(models)
         }
         .await;
-        result.map_err(|_| {
+        result.map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.catalog.failed",
+                provider = "copilot", operation = "model_list", error = %format_args!("{error:#}"));
             native_failure(
                 forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
@@ -145,7 +147,9 @@ impl CopilotClient {
             Ok(servers)
         }
         .await;
-        result.map_err(|_| {
+        result.map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.catalog.failed",
+                provider = "copilot", operation = "mcp_list", error = %format_args!("{error:#}"));
             native_failure(
                 forge_provider_api::error::ProviderOperation::TurnStart,
                 forge_provider_api::error::ProviderFailureKind::Transport,
@@ -175,6 +179,8 @@ impl CopilotClient {
         }
         .await;
         result.map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.fork.failed",
+                provider = "copilot", error = %format_args!("{error:#}"));
             error.downcast::<ProviderError>().unwrap_or_else(|_| {
                 native_failure(
                     forge_provider_api::ProviderOperation::ThreadFork,
@@ -1170,4 +1176,68 @@ fn native_failure(
     kind: forge_provider_api::error::ProviderFailureKind,
 ) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(operation, kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing::{
+        field::{Field, Visit},
+        instrument::WithSubscriber,
+    };
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    struct CapturedError(Arc<Mutex<Vec<String>>>);
+
+    impl Visit for CapturedError {
+        /// Capture only the emitted cause, never unrelated SDK fields.
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "error" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<SubscriberType: tracing::Subscriber> Layer<SubscriberType> for CapturedError {
+        /// Observe the real adapter's diagnostic emission before normalization.
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, SubscriberType>,
+        ) {
+            event.record(&mut CapturedError(self.0.clone()));
+        }
+    }
+
+    /// Keep native catalog causes in diagnostics without changing normalized errors or logging RPC data.
+    #[tokio::test]
+    async fn model_list_failure_logs_native_cause_before_normalization() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::Registry::default().with(CapturedError(captured.clone()));
+        let (client, peer) = super::super::test_peer::client(|request| {
+            assert_eq!(request["method"], "models.list");
+            vec![
+                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"error":{
+                    "code":-32603,"message":"native-catalog-cause","data":{"token":"private-rpc-data"}
+                }}),
+            ]
+        });
+        let client = CopilotClient::new(client);
+        let error = client
+            .models()
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("native-catalog-cause"));
+        let recorded = captured.lock().unwrap().join("\n");
+        assert!(
+            recorded.contains("list Copilot models") && recorded.contains("native-catalog-cause"),
+            "{recorded}"
+        );
+        assert!(!recorded.contains("private-rpc-data"));
+        client.stop().await.unwrap();
+        peer.collected().await;
+    }
 }

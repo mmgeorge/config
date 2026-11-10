@@ -307,7 +307,7 @@ before any tool or model output, up to five times with delays of 1, 5, 10, 30, a
 60 seconds. The status shows the retry count and a countdown, such as
 `Working · retry 2/5 · retrying in 5s`. Cancellation remains available while
 waiting. If recovery fails, Forge shows the final provider error. With tracing
-enabled, `/log` records every attempt and error. Authentication, quota, tool,
+set to Trace, Forge records every attempt and error. Authentication, quota, tool,
 unknown, and potentially partially executed failures do not trigger this retry.
 
 Failed prompt delivery preserves your input and attachments. Your next prompt
@@ -400,7 +400,7 @@ in the child. Inherited question and plan controls are inactive.
 | --- | --- | --- |
 | `:ForgeHarness` | None | Open the Harness |
 | `:ForgeHarnessNew` | None | Create a fresh Harness session |
-| `:ForgeHarnessLog` | Optional `on`, `off`, or `open` | Control or open the active session's protocol trace |
+| `:ForgeHarnessLog` | Optional logging level, `open`, or `clear` | Open the active session's log, select its recording threshold, or clear its files |
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
 `ForgeHarnessLog` requires an open Harness session. Check-worker and tool-export
@@ -638,6 +638,12 @@ inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values
 step through `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m` to `60m`.
 The endpoints do not wrap.
 **System** contains Thoughts under Display and Logging under Debug.
+Logging opens the same picker as `/log`: None, Error, Warn, Info, and Trace.
+Info is the default and records major IPC and provider lifecycle operations plus
+warnings and errors. Trace adds verbose diagnostics and Harness performance
+logging. `/log none|error|warn|info|trace` sets a level directly; `/log open` opens
+the current session's JSONL log, and `/log clear` clears it. Saved choices persist
+across restarts and override the Lua `log_level` default.
 Use `/checks edit on/off` to control check-authoring permission.
 Unsupported controls explain their restriction, and Windows sandbox options appear
 only where applicable. Forge has no sign-in flow: sign in through each provider's own

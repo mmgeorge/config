@@ -25,7 +25,7 @@ T["publication_replay"] = function()
         if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
         elseif request.method == "host.trace.configure" then
-          emit({ id = request.id, result = { enabled = false } })
+          emit({ id = request.id, result = { level = "none" } })
         elseif request.method == "host.shutdown" then
           vim.schedule(function() on_exit({ code = 0 }) end)
         end

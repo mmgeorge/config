@@ -331,7 +331,39 @@ pub(super) async fn observe_owned<T>(
         binding,
         responded: false,
     };
-    let result = work.await;
+    let dispatch = observation.trace.dispatch();
+    let owner = observation.target.owner();
+    let span = tracing::dispatcher::with_default(&dispatch, || {
+        tracing::info_span!(
+            "provider.operation", session_id = owner.session_id().as_str(),
+            operation_id = observation.id.as_str(), operation = ?operation,
+        )
+    });
+    let result = {
+        use tracing::{Instrument, instrument::WithSubscriber};
+        work.instrument(span).with_subscriber(dispatch).await
+    };
+    tracing::dispatcher::with_default(&observation.trace.dispatch(), || {
+        let owner = observation.target.owner();
+        let session_id = owner.session_id().as_str();
+        if let Err(error) = &result {
+            tracing::error!(target: "forge::provider", event_name = "provider.operation.failed",
+                session_id, operation_id = observation.id.as_str(), operation = ?operation, error = %error);
+        } else if matches!(
+            operation,
+            ProviderOperation::ThreadOpen
+                | ProviderOperation::ThreadConfigure
+                | ProviderOperation::ThreadFork
+                | ProviderOperation::ThreadCompact
+                | ProviderOperation::ThreadClose
+                | ProviderOperation::TurnStart
+                | ProviderOperation::TurnInterrupt
+                | ProviderOperation::Shutdown
+        ) {
+            tracing::info!(target: "forge::provider", event_name = "provider.operation.finished",
+                session_id, operation_id = observation.id.as_str(), operation = ?operation);
+        }
+    });
     let failure = result.as_ref().err().and_then(primary_failure);
     let outcome = match &result {
         Ok(_) => CoreOutcome::Succeeded,

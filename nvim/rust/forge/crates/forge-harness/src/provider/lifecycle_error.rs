@@ -32,6 +32,8 @@ pub(crate) fn classify(operation: ProviderOperation, error: anyhow::Error) -> Pr
         Ok(error) => return ProviderError::Delivery(error),
         Err(error) => error,
     };
+    tracing::error!(target: "forge::provider", event_name = "provider.normalization",
+        operation = ?operation, error = %format_args!("{error:#}"));
     classify_source(operation, error.as_ref())
 }
 

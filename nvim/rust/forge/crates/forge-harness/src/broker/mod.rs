@@ -10682,12 +10682,14 @@ impl HarnessBroker {
     }
 
     fn configure_trace(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let enabled = params
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .context("trace enabled is required")?;
+        let level = serde_json::from_value(
+            params
+                .get("level")
+                .cloned()
+                .context("logging level is required")?,
+        )?;
         Ok((
-            serde_json::to_value(self.trace.configure(enabled)?)?,
+            serde_json::to_value(self.trace.configure(level)?)?,
             Vec::new(),
         ))
     }

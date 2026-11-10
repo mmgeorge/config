@@ -6,7 +6,8 @@
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
 ---@field diff_logging boolean
----@field harness_logging boolean
+---@field log_level "none"|"error"|"warn"|"info"|"trace"
+---@field harness_logging? boolean Legacy configuration migrated to log_level.
 ---@field diff_log_path string?
 ---@field harness_log_path string?
 ---@field perf_slow_threshold_ms number
@@ -227,7 +228,7 @@ M.defaults = {
   -- Gate non-Harness tracing (ForgeStatus, diffs, PRs, and shared UI work).
   diff_logging = false,
   -- Gate Harness lifecycle and provider-performance tracing.
-  harness_logging = false,
+  log_level = "info",
   diff_log_path = nil,
   harness_log_path = nil,
   perf_slow_threshold_ms = 8,
@@ -389,6 +390,12 @@ M.options = vim.deepcopy(M.defaults)
 ---@param opts? ForgeConfig
 ---@return ForgeConfig
 function M.setup(opts)
+  if opts and opts.harness_logging ~= nil then
+    opts = vim.deepcopy(opts)
+    if type(opts.harness_logging) ~= "boolean" then error("harness_logging must be a boolean; use log_level instead") end
+    if opts.log_level == nil then opts.log_level = opts.harness_logging and "trace" or "none" end
+    opts.harness_logging = nil
+  end
   if opts and type(opts.harness) == "table" then
     opts = vim.deepcopy(opts)
     opts.harness.provider = opts.harness.provider or opts.harness.backend
@@ -405,6 +412,9 @@ function M.setup(opts)
     return result
   end
   local options = (opts == nil or vim.tbl_isempty(opts)) and vim.deepcopy(M.defaults) or merge(M.defaults, opts)
+  if not vim.tbl_contains({ "none", "error", "warn", "info", "trace" }, options.log_level) then
+    error("log_level must be none, error, warn, info, or trace")
+  end
   local correction = options.text_correction
   if type(options.harper)~='table' or type(options.harper.enabled)~='boolean'
     or type(options.harper.cmd)~='table' or not vim.islist(options.harper.cmd) or #options.harper.cmd==0

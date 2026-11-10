@@ -31,7 +31,9 @@ pub(super) async fn owner_transition_fixture() -> Result<OwnerTransitionFixture>
     let registry = service.registry().await?;
     let session = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session).await?;
-    controller.trace.configure_default(true)?;
+    controller
+        .trace
+        .configure_default(crate::trace::LogLevel::Trace)?;
     controller.task_controller.change(
         &mut SqliteStore::open(&controller.data_root)?,
         None,
