@@ -319,7 +319,7 @@ render_status_hint = function(state)
   end
 end
 
-function M.render()
+local function render()
   local state = harness_state()
   if state.initial_snapshot_pending then M.refresh_winbar() return end
   render_status_hint(state)
@@ -370,6 +370,18 @@ function M.render()
     opened.sync()
   end)
   M.refresh_winbar()
+end
+
+function M.render()
+  local started = perf.timing_enabled() and perf.now() or nil
+  local state = harness_state()
+  if state.transcript_buf and state.session then perf.watch_view(state.transcript_buf, state.session.id) end
+  render()
+  if started then
+    local fields = { elapsed_ms = perf.elapsed_ms(started), session_id = state.session and state.session.id }
+    if perf.enabled("harness") then perf.event("harness", "ui.render", fields)
+    else perf.diagnostic("ui.render", fields) end
+  end
 end
 
 local function schedule_render()

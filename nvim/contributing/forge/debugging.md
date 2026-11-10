@@ -41,8 +41,9 @@ Setting `vim.g.forge_skip_line_stats = true` before the host starts leaves displ
 ## Performance logs
 
 The repository's plugin configuration selects `log_level = "info"` and enables
-`diff_logging`. Harness performance logging runs only at Trace; diff performance
-logging remains independent. The former `harness_logging` Lua boolean migrates to
+`diff_logging`. Detailed Harness performance logging runs at Trace; Info retains
+sparse slow-UI and queue-edit diagnostics. Diff performance logging remains
+independent. The former `harness_logging` Lua boolean migrates to
 Trace or None when `log_level` is absent. Lua writes
 `stdpath("cache")/forge/harness-perf.log` and `diff-perf.log`; each rotates at
 100 MiB and retains ten older segments.
@@ -57,6 +58,23 @@ enabled. These are operation timings, not a CPU profile or a stack trace of a st
 The existing metadata collectors bound field counts and strings. The Lua collector
 also drops records beyond its record or pending-queue budgets. Those limits mean
 these performance logs are diagnostic samples, not a lossless execution history.
+Info records renders and buffer patches taking at least 100 ms, event-loop delay
+of at least 250 ms, and queue reservation failures, pending-removal rejections,
+and missing-entry draft recovery. These editor-local records use the same
+`harness-perf.log`, independently of host responsiveness; `/log open` continues
+to show the host log. The loop watcher runs only while a Harness transcript is
+displayed. Changing `/log` updates both detailed and sparse recording.
+
+Each of the five fixed event categories emits immediately, then at most once per
+ten seconds per editor. The next emitted record includes the suppressed count
+and maximum duration from the preceding interval; a final quiet interval has no
+forced summary. Suppressed counts can span sessions; the emitted record's IDs
+identify that individual occurrence. Metadata is allowlisted and strings are
+bounded to 256 bytes; drafts, attachments, and raw error text are excluded.
+Pending writes are bounded by 4,096 records and 1 MiB per scope, with drop counts
+available as `rejected_record_count`. Detailed Trace timing replaces the sparse
+render, patch, and lag records rather than duplicating them.
+
 Queue saturation is checked before metadata collection and JSON encoding, so
 discarded records do not pay that serialization cost. Trace still records every
 begin/end boundary and can produce substantial traffic; use Info for routine work

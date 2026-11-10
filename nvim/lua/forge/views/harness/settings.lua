@@ -285,7 +285,8 @@ end
 ---Adopt host logging status and refresh every visible viewer of that log.
 ---@param status ForgeHarnessLogStatus
 function M.adopt(status)
-  require("forge.infra.perf").setup({ harness = { enabled = status.level == "trace" } })
+  require("forge.infra.perf").setup({ harness = { enabled = status.level == "trace",
+    info = status.level == "info" or status.level == "trace" } })
   if not status.path then return end
   log_status_by_path[status.path] = vim.deepcopy(status)
   local buffer = log_buffer_by_path[status.path]
@@ -339,7 +340,7 @@ local log_level_list = {
   { id = "none", label = "None", detail = "Do not record logs.", value = "none" },
   { id = "error", label = "Error", detail = "Errors only.", value = "error" },
   { id = "warn", label = "Warn", detail = "Warnings and errors.", value = "warn" },
-  { id = "info", label = "Info", detail = "Major IPC operations, warnings, and errors (default).", value = "info" },
+  { id = "info", label = "Info", detail = "Major operations, slow UI diagnostics, warnings, and errors (default).", value = "info" },
   { id = "trace", label = "Trace", detail = "All levels, including verbose instrumentation.", value = "trace" },
 }
 

@@ -250,6 +250,11 @@ function M.perform(state, action, callback, target)
       render(state)
     end
     if failure then notifications.error(failure, "Harness message") end
+    if failure and action.kind == "reserve" then
+      require("forge.infra.perf").diagnostic("ui.queue.rejected", { reason = "reservation_failed",
+        entry_id = action.id, operation_id = id, session_id = input.session_id,
+        code = result and result.error_code or (detail and detail.code) })
+    end
     if callback then callback(failure) end
     settle_commits()
   end)

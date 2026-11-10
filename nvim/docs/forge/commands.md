@@ -645,8 +645,9 @@ The endpoints do not wrap.
 **System** contains Thoughts under Display and Logging under Debug.
 Logging opens the same picker as `/log`: None, Error, Warn, Info, and Trace.
 Info is the default and records major IPC and provider lifecycle operations plus
-warnings and errors. Trace adds verbose diagnostics and Harness performance
-logging. `/log none|error|warn|info|trace` sets a level directly; `/log open` opens
+warnings and errors. It also records rate-limited slow UI and queue-edit diagnostics
+locally in `stdpath("cache")/forge/harness-perf.log`. Trace adds verbose diagnostics
+and detailed Harness performance logging. `/log none|error|warn|info|trace` sets a level directly; `/log open` opens
 the current session's JSONL log, and `/log clear` clears it. Saved choices persist
 across restarts and override the Lua `log_level` default.
 Use `/checks edit on/off` to control check-authoring permission.

@@ -2,6 +2,7 @@
 
 ---@class ForgePerfScopeConfig
 ---@field enabled boolean
+---@field info? boolean Record sparse Harness diagnostics at Info and Trace.
 ---@field log_path string?
 ---@field slow_threshold_ms number
 ---@field sample_rate number
@@ -22,6 +23,11 @@ local M = {}
 local MAX_LOG_BYTES = 100 * 1024 * 1024
 local ROTATED_LOG_FILES = 10
 local MAX_QUEUE_RECORDS = 4096
+local MAX_QUEUE_BYTES = 1024 * 1024
+local INFO_EVENTS = { ["ui.render"] = 100, ["ui.buffer.patch"] = 100, ["ui.loop_lag"] = 250,
+  ["ui.queue.rejected"] = 0, ["ui.queue.recovered"] = 0 }
+local info_windows = {}
+local views = {}
 local METADATA_FIELD = {
   buf = true, view_kind = true, line_count = true, cursor_row = true, cursor_col = true,
   viewport_top = true, viewport_total = true, viewport_logical_total = true, viewport_render_count = true,
@@ -44,6 +50,7 @@ local METADATA_FIELD = {
   base_revision = true, received_revision = true, entry_count = true, operation_count = true,
   host_id = true, native_sequence = true, phase_ms = true, command_count = true,
   blocker_id = true, blocker_operation = true, blocker_phase = true, dropped = true,
+  entry_id = true, reservation_id = true, reason = true, suppressed = true,
 }
 local writing = { diff = false, harness = false }
 M.rejected_record_count = { diff = 0, harness = 0 }
@@ -55,15 +62,16 @@ local chunk_sequence = 0
 
 M.options = {
   diff = { enabled = false, log_path = nil, slow_threshold_ms = 8, sample_rate = 1, flush_delay_ms = 25 },
-  harness = { enabled = false, log_path = nil, slow_threshold_ms = 8, sample_rate = 1, flush_delay_ms = 25 },
+  harness = { enabled = false, info = false, log_path = nil, slow_threshold_ms = 8, sample_rate = 1, flush_delay_ms = 25 },
 }
 M.sequence = { diff = 0, harness = 0 }
 M.queue = { diff = nil, harness = nil }
 M.flush_pending = { diff = false, harness = false }
 
----@param options? {diff?: {enabled?: boolean, log_path?: string, slow_threshold_ms?: number, sample_rate?: number, flush_delay_ms?: integer}, harness?: {enabled?: boolean, log_path?: string, slow_threshold_ms?: number, sample_rate?: number, flush_delay_ms?: integer}}
+---@param options? {diff?: ForgePerfScopeConfig, harness?: ForgePerfScopeConfig}
 function M.setup(options)
   M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.options), options or {})
+  if not M.options.harness.info then info_windows = {} end
   update_loop_watch()
 end
 
@@ -79,6 +87,7 @@ function M.configure_from_forge_options(options)
     },
     harness = {
       enabled = options.log_level == "trace",
+      info = options.log_level == "info" or options.log_level == "trace",
       log_path = options.harness_log_path,
       slow_threshold_ms = tonumber(options.perf_slow_threshold_ms) or M.options.harness.slow_threshold_ms,
       sample_rate = tonumber(options.perf_sample_rate) or M.options.harness.sample_rate,
@@ -109,6 +118,48 @@ end
 ---@return boolean
 function M.enabled(scope)
   return scope_options(scope).enabled == true
+end
+
+---Cheap outer-boundary timing is enabled at Info; detailed phases remain Trace-only.
+function M.timing_enabled()
+  return M.options.harness.info or M.enabled("harness")
+end
+
+---Track only displayed Harness views; hidden views do not need a loop watcher.
+function M.watch_view(buf, session_id)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  if views[buf] then
+    if views[buf] ~= session_id then views[buf] = session_id update_loop_watch() end
+    return
+  end
+  views[buf] = session_id
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "BufWipeout" }, {
+    buffer = buf, callback = function(args)
+      if args.event == "BufWipeout" then views[buf] = nil end
+      vim.schedule(update_loop_watch)
+    end,
+  })
+  update_loop_watch()
+end
+
+---Only fixed event names can allocate aggregation state. No user text is accepted.
+function M.diagnostic(event, payload)
+  local threshold = INFO_EVENTS[event]
+  if not threshold or not M.options.harness.info then return end
+  local elapsed = payload.elapsed_ms or 0
+  if elapsed < threshold then return end
+  local now = M.now()
+  local previous = info_windows[event]
+  if previous and now - previous.at < 10e9 then
+    previous.count = previous.count + 1
+    previous.maximum = math.max(previous.maximum, elapsed)
+    return
+  end
+  local fields = M.payload(payload)
+  fields.suppressed = previous and previous.count or 0
+  fields.maximum_ms = math.max(elapsed, previous and previous.maximum or 0)
+  info_windows[event] = { at = now, count = 0, maximum = 0 }
+  M.event("harness", event, fields, true)
 end
 
 ---@param scope ForgePerfScope
@@ -263,7 +314,7 @@ function M.payload(payload)
   for key, value in pairs(payload) do
     if METADATA_FIELD[key] then
       local kind = type(value)
-      if kind == "string" then record[key] = key:match("_id$") and value or value:sub(1, 256)
+      if kind == "string" then record[key] = value:sub(1, 256)
       elseif kind == "boolean" or kind == "number" then record[key] = value end
     end
   end
@@ -273,15 +324,16 @@ end
 ---@param scope ForgePerfScope
 ---@param event string
 ---@param payload table?
+---@param info? boolean Internal sparse-diagnostic admission after filtering.
 ---@return "queued"|"saturated"|"disabled"
-function M.event(scope, event, payload)
-  if not M.enabled(scope) then return "disabled" end
+function M.event(scope, event, payload, info)
+  if not M.enabled(scope) and not (info and M.options.harness.info) then return "disabled" end
   M.sequence[scope] = M.sequence[scope] + 1
-  if #(M.queue[scope] or {}) >= MAX_QUEUE_RECORDS then
+  if #(M.queue[scope] or {}) >= MAX_QUEUE_RECORDS or queue_bytes[scope] >= MAX_QUEUE_BYTES then
     M.rejected_record_count[scope] = M.rejected_record_count[scope] + 1
     if not saturation_reported[scope] then
       saturation_reported[scope] = true
-      notify_write_error(scope, "4096-record diagnostic queue saturated; inspect rejected_record_count")
+      notify_write_error(scope, "diagnostic queue saturated; inspect rejected_record_count")
     end
     return "saturated"
   end
@@ -291,9 +343,14 @@ function M.event(scope, event, payload)
   record.event = event:sub(1, 256)
   record.time = os.date("%Y-%m-%d %H:%M:%S")
   record.kind = "forge.infra.perf"
+  if info then record.level = "info" end
   record.pid = vim.fn.getpid()
   record.monotonic_us = math.floor(M.now() / 1000)
   local encoded = vim.json.encode(record)
+  if queue_bytes[scope] + #encoded + 1 > MAX_QUEUE_BYTES then
+    M.rejected_record_count[scope] = M.rejected_record_count[scope] + 1
+    return "saturated"
+  end
   M.queue[scope] = M.queue[scope] or {}
   M.queue[scope][#M.queue[scope] + 1] = encoded
   queue_bytes[scope] = queue_bytes[scope] + #encoded + 1
@@ -307,7 +364,12 @@ end
 
 update_loop_watch = function()
   if loop_timer then loop_timer:stop() loop_timer:close() loop_timer = nil end
-  if not M.enabled("harness") then return end
+  if not M.timing_enabled() then return end
+  local visible
+  for buf, session_id in pairs(views) do
+    if vim.api.nvim_buf_is_valid(buf) and #vim.fn.win_findbuf(buf) > 0 then visible = session_id break end
+  end
+  if not visible then return end
   local timer = assert(vim.uv.new_timer())
   loop_timer = timer
   local previous = M.now()
@@ -316,7 +378,9 @@ update_loop_watch = function()
     local now = M.now()
     local delay = (now - previous) / 1e6 - 250
     previous = now
-    if delay >= 100 then M.event("harness", "ui.loop_lag", { elapsed_ms = delay }) end
+    if M.enabled("harness") then
+      if delay >= 100 then M.event("harness", "ui.loop_lag", { elapsed_ms = delay, session_id = visible }) end
+    else M.diagnostic("ui.loop_lag", { elapsed_ms = delay, session_id = visible }) end
   end))
 end
 

@@ -522,6 +522,7 @@ local function commit_patch(session, patch)
     return { kind = "Deferred", edit_sequence = session.editable.sequence }
   end
   local perf = require("forge.infra.perf")
+  local outer_started = perf.timing_enabled() and perf.now() or nil
   local descriptor = type(patch) == "table" and patch or {}
   local timing = perf.enabled("harness") and { document = session.document, revision = descriptor.next,
     rows = descriptor.next_rows, text_edits = type(descriptor.text_edit) == "table" and #descriptor.text_edit or nil,
@@ -535,6 +536,10 @@ local function commit_patch(session, patch)
     previous = now
   end
   local function finish(status)
+    if outer_started and not timing then
+      perf.diagnostic("ui.buffer.patch", { document = session.document, revision = descriptor.next,
+        elapsed_ms = perf.elapsed_ms(outer_started), status = status })
+    end
     if not timing then return end
     timing.status, timing.elapsed_ms = status, perf.elapsed_ms(started)
     perf.event("harness", "ui.buffer.patch", timing)

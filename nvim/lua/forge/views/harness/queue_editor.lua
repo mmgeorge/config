@@ -66,6 +66,8 @@ function M.move(state, draft, direction)
   -- The confirmed projection keeps the entry until removal is acknowledged.
   -- It must not become a new edit target during that interval.
   if state.input and state.input.removing[entry.id] then
+    require("forge.infra.perf").diagnostic("ui.queue.rejected", { reason = "removal_pending",
+      entry_id = entry.id, session_id = state.input.session_id })
     return nil, "This queued message is being removed. Wait for acknowledgement before editing."
   end
   -- A pending submission is already immutable and may become deliverable at any
@@ -130,6 +132,8 @@ function M.finish(state, draft)
     return nil, "The queued message being edited is no longer available"
   end
   if not position(state.queue, edit.entry) then
+    require("forge.infra.perf").diagnostic("ui.queue.recovered", { reason = "entry_missing",
+      entry_id = edit.entry.id, reservation_id = edit.reservation, session_id = state.input and state.input.session_id })
     -- Delivery can win the race with reservation. End editor ownership instead of
     -- trapping every subsequent submit behind an entry that cannot be edited.
     local attachments = attachment.capture(state.composer_buf).attachments
