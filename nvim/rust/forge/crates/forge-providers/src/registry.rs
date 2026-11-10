@@ -312,6 +312,7 @@ fn capability(id: &str) -> ProviderCapability {
                 mcp_tool_catalog: true,
                 tracked_submission: true,
                 resource_target: Some("codexcli".into()),
+                context_channel: forge_provider_api::turn_context::ContextChannel::DeveloperMessage,
                 isolation_modes: if cfg!(windows) {
                     vec![
                     forge_provider_api::model::IsolationMode { id: "elevated".into(), label: "Elevated".into(), description: "Dedicated low-privilege users and filesystem ACLs. Setup needs admin approval; sandboxed commands do not run as administrator.".into() },

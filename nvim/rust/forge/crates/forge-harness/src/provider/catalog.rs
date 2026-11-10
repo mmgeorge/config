@@ -62,6 +62,9 @@ pub enum ProviderInput {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         /// Files explicitly admitted with this text, never discovered from its contents.
         attachments: Vec<crate::attachment::InputAttachment>,
+        /// Harness workflow note delivered as the `<note>` beside, not inside, the user's text.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
     },
     Skill {
         name: String,
@@ -69,6 +72,9 @@ pub enum ProviderInput {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         /// Files explicitly admitted with the skill invocation.
         attachments: Vec<crate::attachment::InputAttachment>,
+        /// Harness workflow note delivered as the `<note>` beside the skill arguments.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
     },
     QuestionReply {
         reply: forge_provider_api::QuestionReply,
@@ -81,18 +87,32 @@ pub enum ProviderInput {
 }
 
 impl ProviderInput {
-    /// Return workflow instructions that must not be encoded inside a native question reply.
+    /// Return the Harness note that travels beside the user's text rather than inside it.
     pub(crate) fn additional_instructions(&self) -> &str {
         match self {
+            Self::Text { note, .. } | Self::Skill { note, .. } => note,
             Self::QuestionReply { context, .. } => context,
-            _ => "",
         }
     }
+
+    /// Put Harness workflow text before the input's existing note, separated by a blank line.
+    pub(crate) fn prepend_note(&mut self, text: &str) {
+        let (Self::Text { note, .. }
+        | Self::Skill { note, .. }
+        | Self::QuestionReply { context: note, .. }) = self;
+        *note = if note.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text}\n\n{note}")
+        };
+    }
+
     /// Build ordinary provider input from admitted user text.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self::Text {
             text: text.into(),
             attachments: Vec::new(),
+            note: String::new(),
         }
     }
 
@@ -146,6 +166,7 @@ impl ProviderInput {
             name: name.to_owned(),
             arguments: selector[name_length..].trim_start().to_owned(),
             attachments: Vec::new(),
+            note: String::new(),
         }
     }
 

@@ -101,7 +101,7 @@ for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
 During planning, agents select existing checks by listing their IDs, one per line,
-in the planning directory's `docs/checks.md` with ordinary file tools. A listed ID adds that check to the
+in the planning directory's `docs/checks.md` with their file-editing tool. A listed ID adds that check to the
 plan without changing repository settings or executing commands, and Harness
 adds each listed check's prerequisites itself. Automatic checks run whether or
 not they are listed. `plan_submit` reports a listed ID that names no configured

@@ -1,5 +1,8 @@
 use crate::tools::ControlToolDefinition;
 
+/// Toolset name shared by every agents tool; `toolsets` tests keep it in step.
+pub(in crate::tools) const TOOLSET: &str = "agent_*";
+
 /// List the agents tools in presentation order.
 pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
     vec![

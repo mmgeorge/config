@@ -2928,6 +2928,16 @@ impl HarnessBroker {
             } else {
                 None
             },
+            // Execute and Goal turns carry their workflow material as the tracked task section.
+            task_instructions: match mode {
+                PromptMode::ExecutePlan => self.execution_task_instructions().ok().flatten(),
+                PromptMode::GoalContinuation => self.current_goal().ok().flatten().map(|goal| {
+                    crate::provider::TaskInstructions::Goal {
+                        objective: goal.objective,
+                    }
+                }),
+                _ => None,
+            },
             resolved_question_digest_set: plan
                 .as_ref()
                 .map(|plan| {

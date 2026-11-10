@@ -97,6 +97,8 @@ impl BrokerObserver {
                     crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
                     now_ms,
                 );
+                // The objective also travels as the tracked task section, which survives
+                // compaction; the entry names it once so the first turn never depends on that.
                 task.request_entry(format!("Goal: {text}\nContinue working until the goal is complete. Use goal_complete or goal_blocked to report terminal state."), now_ms)?;
                 TaskChange::Install(Box::new(task))
             }
@@ -219,12 +221,7 @@ impl BrokerObserver {
             {
                 PlanPrompt::checks_setup(&plan.artifact.request)
             }
-            WorkflowSnapshot::Plan { plan } => {
-                let document = self
-                    .plan_file
-                    .read_working_document(&self.session_id, &plan.artifact.id)?;
-                PlanPrompt::with_active_plan(PlanPrompt::draft(&plan.artifact.request), &document)
-            }
+            WorkflowSnapshot::Plan { plan } => PlanPrompt::draft(&plan.artifact.request),
             WorkflowSnapshot::Execute { execution } => {
                 let mut resumed = execution.clone();
                 crate::task::SessionTaskController::resume_execution(&mut resumed);
@@ -246,17 +243,8 @@ impl BrokerObserver {
         let plan = store
             .load_plan(&execution.record.plan_id)?
             .context("accepted plan is missing")?;
-        let document = self.plan_file.read_submitted_document(
-            &self.session_id,
-            &plan.id,
-            execution.record.revision,
-        )?;
         Ok(PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(
-                &execution.record,
-                PlanExecutionPromptKind::Continue,
-                &document.execution_json(execution.record.phase)?,
-            ),
+            PlanPrompt::execution(&execution.record, PlanExecutionPromptKind::Continue),
             &plan.manual_changes,
         ))
     }
@@ -355,13 +343,7 @@ impl BrokerObserver {
                     let instruction = if plan.artifact.state == PlanState::ConfiguringChecks {
                         PlanPrompt::checks_setup(&plan.artifact.request)
                     } else {
-                        let document = self
-                            .plan_file
-                            .read_working_document(&self.session_id, &plan.artifact.id)?;
-                        PlanPrompt::with_active_plan(
-                            PlanPrompt::draft(&plan.artifact.request),
-                            &document,
-                        )
+                        PlanPrompt::draft(&plan.artifact.request)
                     };
                     task.request_entry(instruction, now_ms)?;
                 }

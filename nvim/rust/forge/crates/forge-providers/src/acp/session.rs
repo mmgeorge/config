@@ -52,6 +52,8 @@ pub struct AcpSessionState {
     admitted_tool: Mutex<HashMap<(String, String), AcpToolItem>>,
     started_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
+    /// Count of history changes, such as completed compactions, that may remove earlier prompts.
+    history_epoch: std::sync::atomic::AtomicU64,
     children: Mutex<super::children::AcpChildren>,
     message: Mutex<HashMap<TurnAddress, Vec<AcpMessage>>>,
     usage_owner: Mutex<HashMap<UsageReportId, TurnAddress>>,
@@ -151,6 +153,7 @@ impl AcpSessionState {
             admitted_tool: Mutex::new(HashMap::new()),
             started_tool: Mutex::new(HashSet::new()),
             compaction: Mutex::new(HashMap::new()),
+            history_epoch: std::sync::atomic::AtomicU64::new(0),
             children: Mutex::new(super::children::AcpChildren::default()),
             message: Mutex::new(HashMap::new()),
             usage_owner: Mutex::new(HashMap::new()),
@@ -548,6 +551,18 @@ impl AcpSessionState {
 
     pub async fn finish_compaction(&self) {
         *self.operation.write().await = None;
+    }
+
+    /// Get the count of history changes that may have removed earlier prompt content.
+    pub fn history_epoch(&self) -> u64 {
+        self.history_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record a history change that may have removed earlier prompt content.
+    pub fn advance_history_epoch(&self) {
+        self.history_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub async fn has_active_work(&self) -> bool {
@@ -1502,6 +1517,13 @@ impl AcpSessionState {
                     }
                     compaction_map.insert(compaction.id.clone(), compaction.clone());
                     drop(compaction_map);
+                    if matches!(
+                        compaction.state,
+                        forge_provider_api::CompactionState::Completed
+                            | forge_provider_api::CompactionState::Unconfirmed
+                    ) {
+                        self.advance_history_epoch();
+                    }
                     self.emit(AdapterActivity::Thread {
                         thread_id: self.event_scope().await?.thread_id().clone(),
                         event: ThreadEvent::CompactionUpdated(Box::new(compaction)),

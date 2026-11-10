@@ -19,7 +19,7 @@ mod transaction;
 mod work;
 
 pub(crate) use catalog::is_tool;
-pub(in crate::tools) use catalog::{definitions, execute, record};
+pub(in crate::tools) use catalog::{TOOLSET, definitions, execute, record};
 pub(crate) use changes::HostFileChange;
 pub(crate) use rename::{allowed_mode, is_mutation};
 pub(crate) use service::{LspLease, LspScope, LspService};

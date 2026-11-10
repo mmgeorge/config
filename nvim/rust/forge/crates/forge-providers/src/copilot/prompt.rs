@@ -124,9 +124,9 @@ pub async fn run(
     let mut recovered = Vec::new();
     let mut recovered_attachments = Vec::new();
     for input in &options.recovered {
-        let mut text = input.instructions.clone();
+        let mut text = forge_provider_api::turn_context::note(&input.instructions);
         if !text.is_empty() {
-            text.push_str("\n\n");
+            text.push('\n');
         }
         text.push_str(&input_text(session, &input.input).await?);
         text = with_attachment_context(text, &input.attachments);
@@ -134,13 +134,15 @@ pub async fn run(
         recovered_attachments.extend(input.attachments.iter().cloned());
     }
     let provider_text = forge_provider_api::input::recovered_text(&provider_text, &recovered);
-    let prompt = match &options.repair_caution {
-        Some(caution) => format!(
-            "{}\n\n{}\n\n{}",
-            options.instructions, caution, provider_text
-        ),
-        None => format!("{}\n\n{}", options.instructions, provider_text),
-    };
+    let prompt = [
+        options.instructions.as_str(),
+        options.repair_caution.as_deref().unwrap_or_default(),
+        provider_text.as_str(),
+    ]
+    .into_iter()
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
     let (cursor, anchor) = owned_session.delivery_boundary().await?;
     let mut message_input = options.attachments;
     recovered_attachments.extend(message_input.attachments);
@@ -591,16 +593,7 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
             }
         }
         PromptInput::QuestionReply(reply) => {
-            let answer = match &reply.response {
-                forge_provider_api::input::QuestionReplyResponse::Answer { answer, .. }
-                | forge_provider_api::input::QuestionReplyResponse::Correction { answer, .. } => {
-                    answer
-                }
-                forge_provider_api::input::QuestionReplyResponse::Clarification {
-                    text, ..
-                } => text,
-            };
-            format!("Answer to the question {:?}: {answer}", reply.question)
+            forge_provider_api::turn_context::question_reply(reply)
         }
     })
 }

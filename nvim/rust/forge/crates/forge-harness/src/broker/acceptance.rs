@@ -562,17 +562,8 @@ impl BrokerObserver {
             );
         }
         if resume {
-            let document = self.plan_file.read_submitted_document(
-                &self.session_id,
-                &plan.id,
-                execution.record.revision,
-            )?;
             let instruction = PlanPrompt::with_manual_changes(
-                PlanPrompt::execution(
-                    &execution.record,
-                    PlanExecutionPromptKind::Continue,
-                    &document.execution_json(execution.record.phase)?,
-                ),
+                PlanPrompt::execution(&execution.record, PlanExecutionPromptKind::Continue),
                 &plan.manual_changes,
             );
             task.request_entry(instruction, now_ms)?;
@@ -1091,11 +1082,7 @@ impl BrokerObserver {
             completed_at_ms: None,
         };
         let instruction = PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(
-                &execution,
-                PlanExecutionPromptKind::Start,
-                &reviewed.document.execution_json(execution.phase)?,
-            ),
+            PlanPrompt::execution(&execution, PlanExecutionPromptKind::Start),
             &plan.manual_changes,
         );
         let mut task = crate::task::TaskSnapshot::execute(

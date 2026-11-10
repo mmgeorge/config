@@ -72,6 +72,8 @@ Failure to reconcile blocks dispatch and reports the last error, keeping both th
 
 Persist the opaque correlation token before the first possible write, and acknowledge only a successful native response. Implement `Provider::input_reconcile` with read-only, fully paginated history. Return `SubmissionEvidence::Accepted` only for a positively identified input, `NotAccepted` only when positive evidence proves that exact attempt cannot later be consumed, and `Unknown` otherwise. Never turn a timeout, an empty history page, or a message substring into a rejection.
 
+Deliver `PromptRequest::context_block`, the `<forge>` block of changed context and the input's note, before the input in the same submission. Send it as one developer message when the native protocol has that channel, and declare `ContextChannel::DeveloperMessage` in the provider's `ProviderIntegration::context_channel` so the open-time instructions describe it; otherwise place it at the start of the user message. Render question replies with `turn_context::question_reply` rather than a provider-specific envelope. Return `InputAcceptance` only for a submission that carried its context, because Harness marks those sections delivered on acceptance and does not send them again ([Turn context](architecture/providers.md#turn-context)). Supply `SessionRequest::system_instructions` once, through the native system prompt or an open-time channel, and never repeat it on ordinary prompts unless the conversation may have lost it.
+
 Test the write-before-acknowledge crash, acknowledgment commit failure, expired history, cancellation, attachments, and later queued input before enabling recovery.
 
 ## Verification and diagnostics

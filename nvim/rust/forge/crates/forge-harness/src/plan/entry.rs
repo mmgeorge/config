@@ -66,23 +66,16 @@ impl PlanFileStore {
                 design.parsed = None;
             }
         }
+        // The task section names the plan and its directory, so the first planning input is the
+        // user's request alone.
         let instruction = if checks_ready {
-            PlanPrompt::with_active_plan(PlanPrompt::draft(&request), &document)
+            PlanPrompt::draft(&request)
         } else {
             PlanPrompt::checks_setup(&request)
         };
         let working_path =
             self.create_working_document(session_id, &document.plan_id, &document)?;
         self.authoring_create(session_id, &document)?;
-        let instruction = if checks_ready {
-            format!(
-                "Planning directory: {}\n\n{instruction}",
-                self.authoring_directory(session_id, &document.plan_id)
-                    .display()
-            )
-        } else {
-            instruction
-        };
         Ok(PreparedPlan {
             record: PlanRecord {
                 id: document.plan_id,

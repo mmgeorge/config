@@ -380,6 +380,7 @@ async fn generate(
         input: api::PromptInput::Text(request.input),
         dispatch,
         recovered_inputs: Vec::new(),
+        context: Default::default(),
         instructions: String::new(),
         attachments: Vec::new(),
         receipt,

@@ -11,5 +11,5 @@ mod search;
 mod status;
 mod tool;
 
-pub(in crate::tools) use catalog::{definitions, execute, is_tool, record};
+pub(in crate::tools) use catalog::{TOOLSET, definitions, execute, is_tool, record};
 pub(crate) use inspection::{HarnessInspectionScope, InspectionLease};

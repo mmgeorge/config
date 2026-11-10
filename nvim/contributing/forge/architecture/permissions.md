@@ -24,6 +24,8 @@ Each operation passes through these stages in order:
 
 Write-off denies every write, including writes to unknown paths, regardless of rules or grants. Explicit denials and protected targets always win, and providers can never write the permission document itself. Automatic decisions never persist rules.
 
+Before any of these stages, `ProviderPermissionContext` rejects a command containing a PowerShell file writer (`Set-Content`, `Add-Content`, or `Out-File`, found by `command::shell_file_writer` in any pipeline, sequence, or nested launcher) and tells the model to use its file-editing tool. A shell write reaches the approval layer only as an opaque command, so it can never be matched against write roots or path rules; a file-editing tool reports a concrete path that directory evaluation can authorize, including planning's authoring root. Saved allow rules and Allow mode do not lift this rejection.
+
 `PermissionStore` loads one validated document from `stdpath("config")/forge/permissions.json`, edited through `:ForgePermissions`, and compiles its matchers once.
 
 Built-in host tools default to Allow at the tool-approval layer. Explicit saved tool rules still apply, including Ask and Deny. Resource permissions, directory scopes, write-off, protected paths, and tool-specific admission remain independent. External provider and MCP tools continue to require approval when no saved rule matches.

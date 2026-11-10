@@ -35,17 +35,26 @@ impl PlanPrompt {
         )
     }
 
-    /// Build a decision-complete planning request for one user objective.
+    /// Get the planning workflow contract that Harness delivers as the tracked task section.
+    ///
+    /// Planning prompts refer to it instead of embedding it, so a conversation receives it once
+    /// and again only after compaction or another history change.
+    pub(crate) fn planning_contract() -> &'static str {
+        PLANNING_CONTRACT.trim_end()
+    }
+
+    /// Build the first planning turn's input for one user objective.
+    ///
+    /// The input is the user's request unchanged: the tracked `task` section names the plan and
+    /// says that each user message during the task is input to it.
     pub fn draft(request: &str) -> String {
-        format!("{PLANNING_CONTRACT}\n\nUser request:\n{request}")
+        request.to_owned()
     }
 
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers to the existing planning directory with ordinary file tools, settle remaining decisions according to the user's question preferences, then call plan_submit with the plan ID and no expected version.
-
-{PLANNING_CONTRACT}
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers to the existing planning directory with your file-editing tool, settle remaining decisions according to the user's question preferences, then call plan_submit with the plan ID and no expected version. The Harness task instructions still apply.
 
 Original request:
 {request}
@@ -75,9 +84,7 @@ Original request:
             .unwrap_or("None");
         let plan = active_plan_line(document);
         format!(
-            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment by editing the existing planning directory with ordinary file tools. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the plan ID and no expected version.
-
-{PLANNING_CONTRACT}
+            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment by editing the existing planning directory with your file-editing tool. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the plan ID and no expected version. The Harness task instructions still apply.
 
 {plan}
 
@@ -96,16 +103,23 @@ Review comments:
         format!("{}\n\n{prompt}", active_plan_line(document))
     }
 
+    /// Name the active plan in a note beside the user's text.
+    pub(crate) fn active_plan(document: &super::PlanDocument) -> String {
+        active_plan_line(document)
+    }
+
     /// Report whether a prompt already carries the active plan's identity.
     pub(crate) fn has_active_plan(prompt: &str) -> bool {
         prompt.contains(ACTIVE_PLAN_PREFIX)
     }
 
-    /// Restore execution identity and phase without replaying completed work after interruption.
+    /// Start, continue, or resume an Execute task without repeating its accepted design.
+    ///
+    /// The phase instructions and design travel as the tracked `task` section
+    /// ([`Self::execution_task`]), so this prompt names only the execution and its phase.
     pub(crate) fn execution(
         execution: &super::execution::PlanExecutionRecord,
         kind: PlanExecutionPromptKind,
-        document_json: &str,
     ) -> String {
         let continuation = match kind {
             PlanExecutionPromptKind::Start => {
@@ -119,7 +133,18 @@ Review comments:
             }
         };
         format!(
-            "{continuation}\nExecution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nReviewer approval comments (context only, not plan edits):\n{}\nAccepted semantic design:\n{}",
+            "{continuation}\nExecution ID: {}. Phase: {:?}. Accepted revision: {}. Follow the Harness task instructions; if they are missing, inspect the plan with plan_status and plan_read.",
+            execution.id, execution.phase, execution.revision,
+        )
+    }
+
+    /// Build an Execute task's phase instructions and accepted design for the `task` section.
+    pub(crate) fn execution_task(
+        execution: &super::execution::PlanExecutionRecord,
+        document_json: &str,
+    ) -> String {
+        format!(
+            "Execution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nReviewer approval comments (context only, not plan edits):\n{}\nAccepted semantic design:\n{}",
             execution.id,
             execution.plan_id,
             execution.instructions(),
@@ -130,10 +155,10 @@ Review comments:
     }
 
     /// Keep review discussion read-only until the user requests a canonical plan revision.
-    pub fn discussion(prompt: &str) -> String {
-        format!(
-            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing planning directory with ordinary file tools, then call plan_submit with its plan ID and no expected version. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
-        )
+    ///
+    /// Harness delivers it as the input's note, so the user's message follows it unchanged.
+    pub fn discussion() -> &'static str {
+        "Continue discussing the active plan in the Harness Plan task. Answer the user's message without editing or resubmitting the plan. When the user asks for changes, revise the existing planning directory with your file-editing tool, then call plan_submit with its plan ID and no expected version. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The Harness task instructions apply only when the user asks for a revision."
     }
 }
 
@@ -141,7 +166,7 @@ const ACTIVE_PLAN_PREFIX: &str = "Active plan `";
 
 fn active_plan_line(document: &super::PlanDocument) -> String {
     format!(
-        "{ACTIVE_PLAN_PREFIX}{}`. Edit the supplied planning directory with ordinary file tools; plan_status reports its location. Submit this plan ID with plan_submit without an expected version.",
+        "{ACTIVE_PLAN_PREFIX}{}`. Edit the supplied planning directory with your file-editing tool; plan_status reports its location. Submit this plan ID with plan_submit without an expected version.",
         document.plan_id
     )
 }

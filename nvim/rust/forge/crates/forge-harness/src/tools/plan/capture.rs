@@ -9,7 +9,7 @@ pub(super) const NAME: &str = "plan_capture_file";
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Capture an existing repository-relative source or configuration file into the active planning directory's files/ tree at the same relative path. Supply only the source path, never a destination. Captures save trusted original source evidence; repeating capture preserves existing proposal edits and planned deletions. Read and edit the returned absolute proposal path with ordinary file tools. New repository files can be created directly under files/ without capture. Source proposals contain declarations, not executable bodies; configuration proposals contain complete contents.",
+        description: "Capture an existing repository-relative source or configuration file into the active planning directory's files/ tree at the same relative path. Supply only the source path, never a destination. Captures save trusted original source evidence; repeating capture preserves existing proposal edits and planned deletions. Call this before proposing any change to an existing file; never hand-write its proposal. Read the returned absolute proposal path, then edit it in place with your file-editing tool rather than shell commands. New repository files can be created directly under files/ without capture. Source proposals contain declarations, not executable bodies; configuration proposals contain complete contents.",
         input_schema: strict_object_input_schema(vec![("path", string_schema())], &["path"]),
     }
 }

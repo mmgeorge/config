@@ -54,6 +54,8 @@ pub struct AcpConversation {
     initialized: Value,
     configuration: tokio::sync::Mutex<Value>,
     instructions: InstructionDelivery,
+    /// History epoch at which an accepted prompt last carried the instruction prelude.
+    prelude_epoch: std::sync::Mutex<Option<u64>>,
 }
 
 impl AcpConversation {
@@ -143,6 +145,7 @@ impl AcpConversation {
                 initialized,
                 configuration: tokio::sync::Mutex::new(configuration),
                 instructions,
+                prelude_epoch: std::sync::Mutex::new(None),
             }),
             Err(error) => {
                 // Keep a login-required rejection distinct so the user learns to sign in
@@ -200,14 +203,31 @@ impl AcpConversation {
             == Some(true)
     }
 
-    /// Get immediate prompt guidance when native delivery is unavailable or deferred on resume.
-    pub(super) fn prompt_instructions(&self) -> Option<&str> {
-        match &self.instructions {
+    /// Get the open-time instruction prelude when the conversation may not see it at `epoch`.
+    ///
+    /// Agents without native system-prompt append, and resumed agents that may keep an older
+    /// system prompt, receive the prelude in a prompt. It is sent again only after a history
+    /// change advances the session's epoch past the last accepted delivery.
+    pub(super) fn prompt_instructions(&self, epoch: u64) -> Option<&str> {
+        let text = match &self.instructions {
             InstructionDelivery::NativeAppend { resumed_prelude } => {
                 resumed_prelude.as_deref().filter(|text| !text.is_empty())
             }
-            InstructionDelivery::PromptPrelude(text) => (!text.is_empty()).then_some(text),
-        }
+            InstructionDelivery::PromptPrelude(text) => (!text.is_empty()).then_some(text.as_str()),
+        }?;
+        let delivered = *self
+            .prelude_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (delivered != Some(epoch)).then_some(text)
+    }
+
+    /// Record that an accepted prompt carried the prelude at `epoch`.
+    pub(super) fn prelude_accepted(&self, epoch: u64) {
+        *self
+            .prelude_epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch);
     }
 
     /// Reload retained history with the exact invocation-owned host MCP endpoint.

@@ -725,6 +725,11 @@ impl HostInvocation {
 
 #[async_trait]
 impl ProviderTools for HostInvocation {
+    /// Name the toolset or task that enables a tool, matching its advertised requirement.
+    fn unavailable_reason(&self, name: &str) -> String {
+        crate::tools::unavailable_tool_reason(name)
+    }
+
     /// Execute only a positively registered native child's independently forked host context.
     async fn call_observed_child(
         &self,

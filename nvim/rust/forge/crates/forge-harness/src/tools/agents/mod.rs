@@ -8,4 +8,4 @@ mod spawn;
 mod tool_output;
 
 pub(crate) use catalog::is_tool;
-pub(in crate::tools) use catalog::{definitions, execute, record};
+pub(in crate::tools) use catalog::{TOOLSET, definitions, execute, record};

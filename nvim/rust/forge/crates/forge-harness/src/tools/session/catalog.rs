@@ -1,4 +1,8 @@
 use crate::tools::ControlToolDefinition;
+
+/// Toolset name shared by every session-history tool; `toolsets` tests keep it in step.
+pub(in crate::tools) const TOOLSET: &str = "harness_session_*";
+
 pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
     vec![
         super::list::definition(),

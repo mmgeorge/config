@@ -10,6 +10,7 @@ pub use forge_provider_api::compaction;
 pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
 mod bridge;
+mod context_delivery;
 mod session_opening;
 pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt, NativeBindingStatus};
 mod completion;
@@ -28,6 +29,7 @@ pub(crate) mod mcp;
 pub mod mock_response;
 pub(crate) mod operation;
 mod prompt;
+pub(crate) use prompt::TaskInstructions;
 pub(crate) mod retry;
 pub(crate) use completion::{CompletionSlot, HostEffectBatch};
 pub(crate) mod session_execution;

@@ -2689,12 +2689,11 @@ async fn run_prompt_inner(
     }
     let mut prompt_parts = Vec::new();
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
-        prompt_parts.push(format!(
-            "Earlier user input {} was saved locally but not accepted:",
-            index + 1
-        ));
+        prompt_parts.push(forge_provider_api::turn_context::recovered_note(index + 1));
         if !recovered.instructions.is_empty() {
-            prompt_parts.push(recovered.instructions.clone());
+            prompt_parts.push(forge_provider_api::turn_context::note(
+                &recovered.instructions,
+            ));
         }
         prompt_parts.extend(
             recovered
@@ -2705,7 +2704,7 @@ async fn run_prompt_inner(
         prompt_parts.push(render_input(&recovered.input));
     }
     if !request.recovered_inputs.is_empty() {
-        prompt_parts.push("Newest user input:".into());
+        prompt_parts.push(forge_provider_api::turn_context::newest_note());
     }
     // Harness workflow instructions are a provider contract, not user-visible prompt text, so
     // response holds and echoes report only what the user and task supplied.
@@ -3026,8 +3025,9 @@ fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> 
     }
     // A revision keeps the original design in its instructions and renders the current design in
     // its input, so the newer version names the document the edits must revise.
+    let instructions = request.context_block();
     let Some(declaration) = [
-        declaration_identity(&request.instructions),
+        declaration_identity(&instructions),
         declaration_identity(prompt),
     ]
     .into_iter()
@@ -3099,12 +3099,17 @@ fn directory_planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPr
     else {
         return Vec::new();
     };
-    let Some(plan_id) = [prompt, request.instructions.as_str()]
+    let instructions = request.context_block();
+    let Some(plan_id) = [prompt, instructions.as_str()]
         .into_iter()
         .find_map(|text| {
             text.split_once("Active plan `")
                 .and_then(|(_, rest)| rest.split_once('`'))
                 .map(|(id, _)| id)
+                .or_else(|| {
+                    text.split_once("Plan ID: ")
+                        .map(|(_, rest)| rest.lines().next().unwrap_or_default())
+                })
         })
     else {
         return Vec::new();
@@ -3504,51 +3509,7 @@ fn render_input(input: &PromptInput) -> String {
         PromptInput::Text(text) => text.clone(),
         PromptInput::Skill { name, arguments } => format!("/{name} {arguments}"),
         PromptInput::QuestionReply(reply) => {
-            let response = match &reply.response {
-                QuestionReplyResponse::Answer {
-                    answer,
-                    required_questions_remain,
-                } => format!(
-                    "Answer: {answer}\nRequired questions remain: {required_questions_remain}"
-                ),
-                QuestionReplyResponse::Clarification {
-                    options,
-                    text,
-                    reply_to,
-                } => {
-                    let options = options
-                        .iter()
-                        .map(|option| {
-                            format!(
-                                "{} [{}]: {}{}",
-                                option.label,
-                                option.id,
-                                option.description,
-                                if option.recommended {
-                                    " (recommended)"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "Clarification: {text}\nOptions:\n{options}\nReply to: {}",
-                        reply_to.as_deref().unwrap_or("none")
-                    )
-                }
-                QuestionReplyResponse::Correction {
-                    answer,
-                    required_questions_remain,
-                } => format!(
-                    "Correction: {answer}\nRequired questions remain: {required_questions_remain}"
-                ),
-            };
-            format!(
-                "Question response for {} (revision {}, message {}):\n{}\n{}",
-                reply.question_id, reply.revision, reply.message_id, reply.question, response
-            )
+            forge_provider_api::turn_context::question_reply(reply)
         }
     }
 }

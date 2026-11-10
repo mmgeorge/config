@@ -5,7 +5,8 @@ use serde_json::Value;
 
 pub use forge_provider_api::control::ControlToolDefinition;
 
-/// Exclude trusted replay metadata from provider-visible schemas.
+/// Exclude trusted replay metadata from provider-visible schemas and state each tool's
+/// availability requirement.
 fn advertised_definition(mut definition: ControlToolDefinition) -> ControlToolDefinition {
     if definition.name == "plan_submit" {
         definition.input_schema["properties"]
@@ -13,7 +14,7 @@ fn advertised_definition(mut definition: ControlToolDefinition) -> ControlToolDe
             .expect("plan submit properties are an object")
             .remove("authoring_snapshot");
     }
-    definition
+    super::toolsets::with_requirement(definition)
 }
 
 /// Show plan_submit only while authoring or in Resolve, and plan_edit also in Verify, where it
@@ -176,7 +177,7 @@ impl ControlToolRegistry {
                     definition.description = "Submit the active planning directory for review. Supply plan_id without an expected version. Harness snapshots docs/ and files/, reports parsing and reference diagnostics by file and line, and preserves the editable draft on failure. Later ordinary edits require resubmission. Wait for Harness execution instructions; submission alone never authorizes implementation.";
                 }
                 if definition.name == "plan_status" && context.is_some_and(|context| context.plan_authoring.is_some()) {
-                    definition.description = "Show the active plan ID, its planning directory, proposal inventory, and whether authored files differ from the saved submission. Supply plan_id. Read and edit docs/ and files/ with ordinary file tools, not virtual plan tools.";
+                    definition.description = "Show the active plan ID, its planning directory, proposal inventory, and whether authored files differ from the saved submission. Supply plan_id. Read docs/ and files/ with your usual read tools and edit them with your file-editing tool, not virtual plan tools or shell commands.";
                 }
                 if definition.name == "agent_spawn"
                     && let Some(schema) = context
@@ -185,7 +186,7 @@ impl ControlToolRegistry {
                 {
                     definition.input_schema["properties"]["profile"] = schema;
                 }
-                definition
+                super::toolsets::with_requirement(definition)
             })
             .collect()
     }

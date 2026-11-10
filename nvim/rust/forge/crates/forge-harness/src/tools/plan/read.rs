@@ -12,7 +12,7 @@ pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
         description: "During execution, read a plan artifact or a project file's proposed semantic structure without changing \
-                the plan. During planning, read the supplied directory with ordinary file tools instead. \
+                the plan. During planning, read the supplied directory with your usual read tools instead. \
                 Supply plan_id and a path. Plan artifacts are plan:overview.md, plan:flows.md, \
                 plan:tests.md, and plan:checks.md, plus plan:findings.md, plan:evidence.md, and \
                 plan:verification.md during execution; plan:verification.md holds the Verify report and \

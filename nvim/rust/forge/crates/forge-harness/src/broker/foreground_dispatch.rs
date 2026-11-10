@@ -583,10 +583,15 @@ impl HarnessBroker {
         let TurnTransaction::Admitting(admission) = &mut dispatch else {
             unreachable!()
         };
+        // The question's stance applies to this one forked turn, so it travels with its input
+        // rather than as a tracked context section.
         admission.local_interaction = Some((
             PromptMode::PlanQuestion,
             Some(ExchangeAdmission::chat(display)),
-            ProviderInput::from_text(admission.text.clone()),
+            ProviderInput::from_text(format!(
+                "Answer the plan review question below in this forked session with a concise final response, which Harness saves on the original question. Do not edit, submit, implement, or ask follow-up questions.\n\n{}",
+                admission.text
+            )),
         ));
         admission.phase = AdmissionPhase::Prepared;
         Ok(dispatch)
@@ -1246,35 +1251,15 @@ impl HarnessBroker {
         &mut self,
         staged: &StagedInteraction,
     ) -> Result<ForegroundProviderContext> {
+        // Harness workflow text travels in the input's note, which providers render as a
+        // `<note>` beside the user's text, so the user's words reach the model unmodified.
         let mut input = staged.input.clone();
         if staged.mode == PromptMode::PlanDiscussion {
-            input = match input {
-                ProviderInput::Text { text, attachments } => {
-                    ProviderInput::from_text(PlanPrompt::discussion(&text))
-                        .with_attachments(attachments)
-                }
-                ProviderInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                } => ProviderInput::Skill {
-                    name,
-                    arguments: PlanPrompt::discussion(&arguments),
-                    attachments,
-                },
-                ProviderInput::QuestionReply {
-                    reply,
-                    context,
-                    attachments,
-                } => ProviderInput::QuestionReply {
-                    reply,
-                    context: PlanPrompt::discussion(&context),
-                    attachments,
-                },
-            };
+            input.prepend_note(PlanPrompt::discussion());
         }
         if matches!(staged.mode, PromptMode::Plan | PromptMode::PlanDiscussion)
             && !PlanPrompt::has_active_plan(&input.text())
+            && !PlanPrompt::has_active_plan(input.additional_instructions())
         {
             let plan_id = self
                 .current_plan_id()?
@@ -1282,31 +1267,7 @@ impl HarnessBroker {
             let document = self
                 .plan_file
                 .read_working_document(&self.session.id, &plan_id)?;
-            let prefix = PlanPrompt::with_active_plan(String::new(), &document);
-            input = match input {
-                ProviderInput::Text { text, attachments } => {
-                    ProviderInput::from_text(format!("{prefix}{text}"))
-                        .with_attachments(attachments)
-                }
-                ProviderInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                } => ProviderInput::Skill {
-                    name,
-                    arguments: format!("{prefix}{arguments}"),
-                    attachments,
-                },
-                ProviderInput::QuestionReply {
-                    reply,
-                    context,
-                    attachments,
-                } => ProviderInput::QuestionReply {
-                    reply,
-                    context: format!("{prefix}{context}"),
-                    attachments,
-                },
-            };
+            input.prepend_note(&PlanPrompt::active_plan(&document));
         }
         let mut request = self.provider_request(input, staged.mode)?;
         if let Some(configuration) = staged.task_configuration.as_ref() {
@@ -1315,15 +1276,7 @@ impl HarnessBroker {
         request.submission = Some(staged.submission.clone());
         let owner = crate::provider::ThreadOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
-            match &mut request.input {
-                ProviderInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
-                ProviderInput::Skill { arguments, .. } => {
-                    *arguments = format!("{feedback}\n\n{arguments}")
-                }
-                ProviderInput::QuestionReply { context, .. } => {
-                    *context = format!("{feedback}\n\n{context}")
-                }
-            }
+            request.input.prepend_note(&feedback);
         }
         let policy = request
             .control_context
@@ -1708,36 +1661,17 @@ impl HarnessBroker {
                 .context("planning requires an active task")?;
             admission.planning = self.planning_context(&task, mode)?;
         }
-        let prompt = match active_plan.as_ref() {
-            Some(plan) if !plan.working_path.is_empty() => {
-                let document = self
-                    .plan_file
-                    .read_working_document(&self.session.id, &plan.id)?;
-                PlanPrompt::with_active_plan(text.clone(), &document)
-            }
-            _ => text.clone(),
-        };
-        let input = match ProviderInput::parse(&text) {
-            ProviderInput::Skill {
-                name,
-                mut arguments,
-                attachments,
-            } => {
-                if let Some(prefix) = prompt
-                    .strip_suffix(&text)
-                    .filter(|prefix| !prefix.is_empty())
-                {
-                    arguments = format!("{prefix}{arguments}");
-                }
-                ProviderInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                }
-            }
-            ProviderInput::Text { .. } => ProviderInput::from_text(prompt),
-            input @ ProviderInput::QuestionReply { .. } => input,
-        };
+        let mut input = ProviderInput::parse(&text);
+        if let Some(plan) = active_plan
+            .as_ref()
+            .filter(|plan| !plan.working_path.is_empty())
+            && !matches!(input, ProviderInput::QuestionReply { .. })
+        {
+            let document = self
+                .plan_file
+                .read_working_document(&self.session.id, &plan.id)?;
+            input.prepend_note(&PlanPrompt::active_plan(&document));
+        }
         self.stage_foreground_interaction(
             &text,
             mode,

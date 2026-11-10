@@ -20,6 +20,8 @@ struct PermissionState {
     approval_mode: ApprovalMode,
     execution_kind: crate::provider::ApprovalExecutionKind,
     lsp_mutations: bool,
+    /// Reject every native tool, command, and file request, as Background generation requires.
+    tool_free: bool,
     event_sink: Option<HarnessEventSink>,
     inheritance: Option<crate::provider::approval::PermissionInheritance>,
 }
@@ -85,10 +87,23 @@ impl ProviderPermissionContext {
                 approval_mode: ApprovalMode::Ask,
                 execution_kind: crate::provider::ApprovalExecutionKind::Managed,
                 lsp_mutations: false,
+                tool_free: false,
                 event_sink: None,
                 inheritance: None,
             }),
         }
+    }
+
+    /// Reject every later request from this invocation, including those of its native children.
+    ///
+    /// Background generation returns text only, so no provider tool may run on its behalf,
+    /// whatever saved rules, approval mode, or access scope would otherwise allow.
+    pub(crate) fn deny_all_tools(&self) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?
+            .tool_free = true;
+        Ok(())
     }
 
     /// Bind the exact provider quarantine latch before admitting native callbacks.
@@ -235,6 +250,7 @@ impl ProviderPermissionContext {
             approval_mode,
             execution_kind: crate::provider::ApprovalExecutionKind::Managed,
             lsp_mutations: false,
+            tool_free: false,
             event_sink,
             inheritance,
         };
@@ -374,7 +390,7 @@ impl ProviderPermissionContext {
         if !self.matches_scope(scope) {
             return denied("Provider session observation was retired.", None);
         }
-        let (approval_mode, execution_kind, event_sink, _owner, task_authority) =
+        let (approval_mode, execution_kind, event_sink, _owner, task_authority, tool_free) =
             match self.state.lock() {
                 Ok(state) => (
                     state.approval_mode,
@@ -382,6 +398,7 @@ impl ProviderPermissionContext {
                     state.event_sink.clone(),
                     state.owner.clone(),
                     state.task_authority.clone(),
+                    state.tool_free,
                 ),
                 Err(_) => {
                     return denied(
@@ -391,11 +408,26 @@ impl ProviderPermissionContext {
                 }
             };
         let deny = |reason: &str| denied(reason, Some(approval_mode));
+        if tool_free {
+            return deny(
+                "Automatically rejected because Background generation has no tools. Return only the requested text from the supplied evidence.",
+            );
+        }
         if let Some(authority) = &task_authority
             && let Err(error) = authority.validate_task_for_new_request()
         {
             return deny(&format!(
                 "Task authority changed before permission approval: {error:#}"
+            ));
+        }
+        if let Some(writer) = request.target_list.iter().find_map(|target| match target {
+            crate::permissions::matcher::PermissionTarget::Command { command, shell } => {
+                crate::permissions::command::shell_file_writer(command, shell.unwrap_or_default())
+            }
+            _ => None,
+        }) {
+            return deny(&format!(
+                "Automatically rejected because `{writer}` writes files through the shell. Create and edit files with your file-editing tool, such as apply_patch, instead of shell commands."
             ));
         }
         if request.target_list.iter().any(|target| {
@@ -570,5 +602,47 @@ fn denied(reason: &str, approval_mode: Option<ApprovalMode>) -> PermissionRespon
             "Tool call rejected. The requested operation was not executed. Reason: {reason} \
          Do not retry or bypass this denial. Continue with permitted actions, or explain the blocker to the user. {guidance}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reject every Background request with the tool-free reason, regardless of Allow mode.
+    #[tokio::test]
+    async fn tool_free_context_rejects_requests_that_policy_allows() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let coordinator =
+            PermissionCoordinator::load(root.path().join("permissions.json"), root.path())?;
+        let owner = crate::provider::ThreadOwner::root("background-session");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "background-turn");
+        let request = || forge_provider_api::permissions::PermissionRequest {
+            id: "read".into(),
+            provider: forge_providers::registry::nonselectable_id().unwrap(),
+            reason: None,
+            target_list: vec![forge_provider_api::permissions::PermissionTarget::Read {
+                path: root.path().join("file.rs").to_string_lossy().into_owned(),
+            }],
+        };
+        let context = ProviderPermissionContext::new(coordinator);
+        context.configure(
+            owner,
+            ApprovalMode::Allow,
+            root.path().display().to_string(),
+            Some(crate::provider::events::channel(scope.clone()).0),
+        )?;
+        let background_denial = |response: PermissionResponse| {
+            matches!(response, PermissionResponse::Deny { reason: Some(reason) }
+                if reason.contains("Background generation has no tools"))
+        };
+        assert!(!background_denial(
+            context.authorize(&scope, request()).await
+        ));
+        context.deny_all_tools()?;
+        assert!(background_denial(
+            context.authorize(&scope, request()).await
+        ));
+        Ok(())
     }
 }

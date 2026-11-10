@@ -263,10 +263,11 @@ impl CheckToolScope {
                     .context("check_id is required")?;
                 super::response::definition(&self.runner.workspace, id)?
             }
-            "check_definition_edit" => {
+            crate::tools::CHECK_DEFINITION_EDIT => {
                 ensure!(
                     self.editing_enabled(),
-                    "Check editing is disabled. The user can enable it with /checks edit on, then request changes using the harness-checks skill."
+                    "{}",
+                    crate::tools::unavailable_tool_reason(crate::tools::CHECK_DEFINITION_EDIT)
                 );
                 ensure!(
                     self.agent.active_count() == 0,

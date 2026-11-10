@@ -513,7 +513,13 @@ pub struct PromptRequest {
     pub dispatch: crate::submission::DispatchReporter,
     /// Carry previously saved input proven not to have reached the provider.
     pub recovered_inputs: Vec<RecoveredInput>,
-    /// Carry prepared instructions.
+    /// Carry Harness context sections that changed since this conversation last received them.
+    /// Deliver them with [`Self::instructions`] as one
+    /// [`crate::turn_context::TurnContext::block`] before the input: as a developer message where
+    /// the provider declares that channel, otherwise at the start of the user message.
+    pub context: crate::turn_context::TurnContext,
+    /// Carry the Harness note that belongs to this input only, such as plan-discussion rules or a
+    /// question reply's workflow context. It is not tracked and renders as the block's `<note>`.
     pub instructions: String,
     /// Carry files admitted and resolved by the host input owner.
     pub attachments: Vec<crate::input::FileAttachment>,
@@ -560,6 +566,13 @@ impl PromptRequest {
     pub fn identity(&self) -> crate::PromptRequestIdentity {
         self.into()
     }
+
+    /// Render this turn's changed context sections and note as one `<forge>` block.
+    ///
+    /// The result is empty when the turn delivers neither.
+    pub fn context_block(&self) -> String {
+        self.context.block(&self.instructions)
+    }
 }
 
 impl PartialEq for PromptRequest {
@@ -578,6 +591,7 @@ impl PartialEq for PromptRequest {
             && self.input == other.input
             && self.dispatch == other.dispatch
             && self.recovered_inputs == other.recovered_inputs
+            && self.context == other.context
             && self.instructions == other.instructions
             && self.attachments == other.attachments
             && std::sync::Arc::ptr_eq(&self.receipt, &other.receipt)

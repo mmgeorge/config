@@ -134,6 +134,18 @@ struct HostSession {
         HashMap<forge_provider_api::InvocationId, Arc<super::host_invocation::HostInvocation>>,
     >,
     request: Mutex<Option<ProviderRequest>>,
+    /// Context sections this binding's native conversation already sees.
+    context_delivery: std::sync::Mutex<super::context_delivery::ContextDelivery>,
+}
+
+impl HostSession {
+    /// Forget delivered context after a history change that may have removed it.
+    fn clear_context(&self) {
+        self.context_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 struct BoundSession {
@@ -520,7 +532,10 @@ impl ProviderBridge {
                     approval_mode: request.approval_mode,
                     provider_session_id: request.provider_session_id.clone(),
                 };
+                // Background generation is tool-free, so it selects no skills or MCP servers; an
+                // empty selection excludes inherited resources rather than restoring defaults.
                 let resources = match descriptor.capability.integration.resource_target.as_deref() {
+                    Some(_) if request.mode == super::PromptMode::Background => Default::default(),
                     Some(target) => crate::settings::SessionResources::load(
                         &self.root,
                         &catalog,
@@ -538,20 +553,11 @@ impl ProviderBridge {
                 };
                 let tools = crate::tools::ControlToolRegistry
                     .registration_definitions(&owner, request.mode);
-                // Adapters such as Codex retain open-time instructions for every later turn,
-                // while each turn supplies its own mode contract. Open an interactive root with
-                // the conversation-wide Chat baseline so a first `/plan` or goal turn does not
-                // impose its task contract on later chat turns.
+                // Adapters retain open-time instructions for every later turn, so they hold only
+                // static text. Each turn's purpose, task contract, and settings travel as tracked
+                // context sections that the binding's delivery record sends once per change.
                 let system_instructions =
-                    if owner.is_root() && request.mode != super::PromptMode::Background {
-                        super::ProviderRequest {
-                            mode: super::PromptMode::Chat,
-                            ..request.clone()
-                        }
-                        .system_message()
-                    } else {
-                        request.system_message()
-                    };
+                    request.open_instructions(descriptor.capability.integration.context_channel);
                 let opening_request = SessionRequest {
                     thread_id: (owner.clone()).thread_id(),
                     mode: if request.mode == super::PromptMode::Background {
@@ -771,6 +777,7 @@ impl ProviderBridge {
             flight: _flight,
         } = prepared.admit(submission)?;
         let expected = request.submission_id.clone();
+        let delivered_context = request.context.clone();
         drop(_preparation);
         drop(_admission);
         let native_scope = request.scope.clone();
@@ -809,6 +816,11 @@ impl ProviderBridge {
         if accepted.submission_id != expected {
             return self.invalid_acceptance(&binding).await;
         }
+        // Only an accepted submission proves the conversation received its context sections.
+        host.context_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit(&delivered_context);
         Ok(())
     }
 
@@ -838,12 +850,8 @@ impl ProviderBridge {
             .map_err(super::submission::journal_failure)?;
         let prepared_attachments =
             prepare_attachments(request.input.attachments().to_vec()).await?;
-        let input = request.input.normalized();
-        let instructions = format!(
-            "{}\n{}",
-            request.system_message(),
-            request.input.additional_instructions()
-        );
+        let input = neutralized_input(request.input.normalized());
+        let instructions = request.input_instructions();
         let included_inputs = submission.included_inputs()?;
         if included_inputs.len() != request.recovered_input.len() {
             return Err(ProviderError::Observation(
@@ -854,7 +862,7 @@ impl ProviderBridge {
         for (recovered, covered_input) in request.recovered_input.iter().zip(included_inputs) {
             recovered_inputs.push(forge_provider_api::RecoveredInput {
                 covered_input,
-                input: recovered.normalized(),
+                input: neutralized_input(recovered.normalized()),
                 attachments: prepare_attachments(recovered.attachments().to_vec()).await?,
                 instructions: recovered.additional_instructions().to_owned(),
             });
@@ -943,6 +951,11 @@ impl ProviderBridge {
         }
         let tools = crate::tools::ControlToolRegistry
             .definition_list_for_context(Some(&context), scope.owner().is_root());
+        let turn_context = host
+            .context_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending(request.context_sections());
         let permissions = Arc::new(
             crate::permissions::provider::ProviderPermissionContext::new(self.permissions.clone()),
         );
@@ -964,6 +977,12 @@ impl ProviderBridge {
                     ProviderFailureKind::Rejected,
                 ))
             })?;
+        // Background generation returns text only, so every native tool request is rejected.
+        if request.mode == super::PromptMode::Background {
+            permissions.deny_all_tools().map_err(|_| {
+                failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
+            })?;
+        }
         let authority = Arc::new(ObservedPermissionAuthority::new(
             binding.id.clone(),
             scope.clone(),
@@ -1059,6 +1078,7 @@ impl ProviderBridge {
                 dispatch,
                 input: crate::exchange::TaskStart::render_input(context.task_start.as_ref(), input),
                 recovered_inputs,
+                context: turn_context,
                 instructions,
                 attachments: prepared_attachments,
                 receipt: native_receipt,
@@ -1768,6 +1788,8 @@ impl ProviderBridge {
                 ProviderFailureKind::SessionMissing,
             )
         })?;
+        // Retracting a turn can also remove the context delivered with it.
+        host.clear_context();
         super::operation::observe(
             self.trace.clone(),
             &self.core_events,
@@ -1804,6 +1826,8 @@ impl ProviderBridge {
             .map_err(|_| rejected())?;
         let owner = request.owner().map_err(|_| rejected())?;
         let binding = self.binding_under_admission(&request).await?;
+        // A rewind, even an uncertain one, may remove context delivered after its boundary.
+        self.session(owner.clone()).await.clear_context();
         let control = OperationControl::fresh(ProviderOperation::ThreadRewind)?;
         let context = control.context();
         super::operation::observe(
@@ -1858,6 +1882,8 @@ impl ProviderBridge {
                                     ProviderFailureKind::SessionMissing,
                                 )
                             })?;
+                    // Compaction summarizes delivered context, so the next turn sends it again.
+                    host.clear_context();
                     Ok(history_operation::CompactionTarget::new(
                         host, owner, binding.id,
                     ))
@@ -2789,7 +2815,11 @@ impl ProviderBridge {
                 approval: request.source.approval_mode,
                 resources,
             },
-            system_instructions: request.source.system_message(),
+            // The forked target opens with its own binding and delivery record, which delivers
+            // every context section again on its first turn.
+            system_instructions: request
+                .source
+                .open_instructions(descriptor.capability.integration.context_channel),
         };
         let checkpoint = request
             .checkpoint_id
@@ -2845,6 +2875,9 @@ impl ProviderBridge {
                     receiver: Mutex::new(Some(HostEventStream { receiver })),
                     invocations: Mutex::new(HashMap::new()),
                     request: Mutex::new(None),
+                    context_delivery: std::sync::Mutex::new(
+                        super::context_delivery::ContextDelivery::new(),
+                    ),
                     observation: Default::default(),
                     changed: Default::default(),
                     observers: Default::default(),
@@ -2902,6 +2935,24 @@ fn binding_metadata(event: &ProviderEvent, owner: &ThreadOwner) -> Option<Bindin
         ProviderEvent::Turn { .. } | ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => {
             None
         }
+    }
+}
+
+/// Disarm `<forge>` markers in input text before it reaches a provider.
+///
+/// The open-time instructions tell the model that every `<forge>` block in a user message comes
+/// from Harness, so input text must not be able to open or close one. Question replies are
+/// neutralized where they are rendered.
+fn neutralized_input(input: forge_provider_api::PromptInput) -> forge_provider_api::PromptInput {
+    use forge_provider_api::PromptInput;
+    use forge_provider_api::turn_context::neutralize;
+    match input {
+        PromptInput::Text(text) => PromptInput::Text(neutralize(&text).into_owned()),
+        PromptInput::Skill { name, arguments } => PromptInput::Skill {
+            name,
+            arguments: neutralize(&arguments).into_owned(),
+        },
+        reply @ PromptInput::QuestionReply(_) => reply,
     }
 }
 
@@ -3037,6 +3088,19 @@ async fn relay_events(
                     | ProviderEvent::Agent { .. } => None,
                 };
                 match &observation.event {
+                    // Completed or unconfirmed compaction may have summarized away earlier context.
+                    ProviderEvent::Thread {
+                        thread_id,
+                        event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+                    } if thread_id == &owner.thread_id()
+                        && matches!(
+                            compaction.state,
+                            forge_provider_api::CompactionState::Completed
+                                | forge_provider_api::CompactionState::Unconfirmed
+                        ) =>
+                    {
+                        host.clear_context();
+                    }
                     ProviderEvent::Provider {
                         event: forge_provider_api::ProviderConnectionEvent::Warning(warning),
                     } => tracing::warn!(target: "forge::provider", event_name = "provider.warning",

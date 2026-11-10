@@ -222,9 +222,7 @@ impl ControlSession {
             .as_ref()
             .filter(|active| active.tools.contains(name))
             .cloned()
-            .ok_or_else(|| {
-                ToolError::MissingState("Tool is unavailable in the active invocation".into())
-            })?;
+            .ok_or_else(|| ToolError::MissingState(crate::tools::unavailable_tool_reason(name)))?;
         state.pending_calls = state.pending_calls.checked_add(1).ok_or_else(|| {
             ToolError::MissingState("Tool is unavailable in the active invocation".into())
         })?;

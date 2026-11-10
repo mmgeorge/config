@@ -18,10 +18,13 @@ pub(crate) struct PlanAuthoringScope {
 }
 
 impl PlanAuthoringScope {
-    /// Describe only the editable root and the specific read-only authoring guide.
+    /// Name the plan, its editable root, and its read-only authoring guide.
+    ///
+    /// The planning contract that follows in the task section holds the rules for using them.
     pub(crate) fn prompt(&self) -> String {
         format!(
-            "Planning directory: {}\nRead the authoring guide: {}\nEdit only docs/ and files/ inside the planning directory using ordinary file tools. Capture existing repository files with plan_capture_file; submit with plan_submit using the plan ID, without an expected version.",
+            "Plan ID: {}\nPlanning directory: {}\nAuthoring guide: {}",
+            self.plan_id,
             self.directory().display(),
             self.files
                 .plan_dir(&self.session_id, &self.plan_id)

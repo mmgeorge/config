@@ -507,6 +507,7 @@ impl CodexProvider {
             closing: AtomicBool::new(false),
             provider_closed: self.closed.clone(),
             isolated,
+            background: request.mode == forge_provider_api::session::SessionMode::Background,
             isolation_auth,
             configuration: Mutex::new(request.configuration.clone()),
             capabilities,
@@ -622,14 +623,12 @@ impl CodexProvider {
             .recovered_inputs
             .iter()
             .map(|recovered| {
-                let text = input_text(&recovered.input);
-                if recovered.instructions.is_empty() {
-                    text
-                } else if text.is_empty() {
-                    recovered.instructions.clone()
-                } else {
-                    format!("{text}\n\n{}", recovered.instructions)
-                }
+                let note = forge_provider_api::turn_context::note(&recovered.instructions);
+                [note, input_text(&recovered.input)]
+                    .into_iter()
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             })
             .collect::<Vec<_>>();
         if !recovered_text.is_empty() {
@@ -676,28 +675,20 @@ impl CodexProvider {
         let effort =
             apply_model_selection(&rpc, &mut params, &model, ProviderOperation::TurnStart).await?;
         drop(rpc);
-        let enabled_tools = request
-            .tools
-            .iter()
-            .map(|tool| tool.name)
+        // Changed Harness context sections and this input's note become one `<forge>` developer
+        // message. Harness tracks which sections the conversation already accepted.
+        let developer = Some(request.context_block())
+            .filter(|block| !block.is_empty())
+            .into_iter()
             .collect::<Vec<_>>();
-        let instructions = if enabled_tools.is_empty() {
-            request.instructions.clone()
-        } else {
-            format!(
-                "{}\n\nFor this invocation, the available host tools are: {}.",
-                request.instructions,
-                enabled_tools.join(", ")
-            )
-        };
-        // Codex prefers its catalog's mode text over these per-turn instructions, so the same
-        // context is also appended to model-visible history before the turn starts.
+        // Codex prefers its catalog's mode text over per-turn mode instructions, so this slot
+        // carries only the static open-time text and per-turn context travels as history items.
         params["collaborationMode"] = json!({
             "mode":"default",
             "settings":{
                 "model":params["model"].clone(),
                 "reasoning_effort":effort.clone(),
-                "developer_instructions":instructions.clone()
+                "developer_instructions":session.system_instructions.clone()
             }
         });
         security.apply_turn(&mut params, &session.workspace);
@@ -705,19 +696,18 @@ impl CodexProvider {
         if session.isolated {
             params["approvalPolicy"] = json!("never");
             params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
+        } else if session.background {
+            // Harness rejects every Background approval request; the read-only sandbox without
+            // network keeps commands Codex runs unprompted from changing anything.
+            params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
         }
         let thread_id = session.history_id();
-        let compaction_count = session
-            .normalization
-            .lock()
-            .await
-            .compaction_count(thread_id.as_str());
         let rpc = session.rpc.lock().await;
-        session
+        let injected = session
             .turn_context
             .lock()
             .await
-            .deliver(&rpc, &thread_id, &instructions, compaction_count, || {
+            .deliver(&rpc, &thread_id, &developer, || {
                 // An injection persists native history, so the thread can no longer be
                 // replaced as unused even if the turn never starts.
                 session
@@ -728,6 +718,12 @@ impl CodexProvider {
             })
             .await?;
         drop(rpc);
+        if !injected {
+            // Without developer injection, the same block starts the user input instead.
+            if let Some(input) = params["input"].as_array_mut() {
+                input.insert(0, json!({"type":"text","text":developer.concat()}));
+            }
+        }
         let native_confirmation = session
             .native_confirmation
             .lock()
@@ -1424,8 +1420,8 @@ impl CodexProvider {
         };
         drop(rollback);
         session.rollback.lock().await.take();
-        // The revert may also remove context injected before the retracted turn.
-        session.turn_context.lock().await.invalidate();
+        // Harness clears its delivery record on retraction, so the next turn re-sends any
+        // context the revert removed.
         if !session.closing.load(Ordering::Acquire) && !session.invalidated.load(Ordering::Acquire)
         {
             session.fenced.store(false, Ordering::Release);
@@ -3820,6 +3816,8 @@ struct CodexBinding {
     closing: AtomicBool,
     provider_closed: Arc<AtomicBool>,
     isolated: bool,
+    /// Retained Background generation, which must run no native tool that changes anything.
+    background: bool,
     isolation_auth: Option<Arc<super::isolation::IsolationAuth>>,
     configuration: Mutex<forge_provider_api::SessionConfiguration>,
     capabilities: forge_provider_api::capability::CapabilityManifest,
@@ -5778,8 +5776,10 @@ async fn handle_native_request(
             })?;
             let name = call.name.as_str();
             if !request.tools.iter().any(|tool| tool.name == name) {
+                // Codex registers its catalog once per thread, so the model can see tools this
+                // invocation rejects; the host explains which toolset or task enables them.
                 super::decode::dynamic_tool_response(
-                    "The requested tool is not enabled for this invocation.".into(),
+                    request.provider_tools.unavailable_reason(name),
                     false,
                 )
             } else {
@@ -5909,7 +5909,9 @@ fn input_text(input: &PromptInput) -> String {
         PromptInput::Skill { name, arguments } => {
             format!("Use skill {name} with arguments: {arguments}")
         }
-        PromptInput::QuestionReply(reply) => super::question::render(reply),
+        PromptInput::QuestionReply(reply) => {
+            forge_provider_api::turn_context::question_reply(reply)
+        }
     }
 }
 
@@ -6390,6 +6392,7 @@ mod continuation_tests {
             closing: AtomicBool::new(false),
             provider_closed: provider.closed.clone(),
             isolated: false,
+            background: false,
             isolation_auth: None,
             configuration: Mutex::new(forge_provider_api::SessionConfiguration {
                 model: ModelSelection::default(),
@@ -7120,6 +7123,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
                 .expect("fixture identity is valid"),
             input: PromptInput::Text("original request".into()),
             recovered_inputs: Vec::new(),
+            context: Default::default(),
             instructions: "instructions".into(),
             attachments: Vec::new(),
             receipt: Arc::new(FixtureReceipt(

@@ -1372,6 +1372,23 @@ impl HarnessBroker {
             .store
             .load_plan(&execution.plan_id)?
             .context("accepted plan record is missing")?;
+        Ok(Some(super::PlanPrompt::with_manual_changes(
+            super::PlanPrompt::execution(&execution, kind),
+            &plan.manual_changes,
+        )))
+    }
+
+    /// Build the active execution's phase instructions and accepted design for the task section.
+    pub(super) fn execution_task_instructions(
+        &self,
+    ) -> Result<Option<crate::provider::TaskInstructions>> {
+        let Some(execution) = self.current_execution()? else {
+            return Ok(None);
+        };
+        let plan = self
+            .store
+            .load_plan(&execution.plan_id)?
+            .context("accepted plan record is missing")?;
         let accepted_revision = plan
             .accepted_revision
             .context("accepted plan revision is missing")?;
@@ -1380,13 +1397,13 @@ impl HarnessBroker {
             &plan.id,
             accepted_revision,
         )?;
-        Ok(Some(super::PlanPrompt::with_manual_changes(
-            super::PlanPrompt::execution(
+        Ok(Some(crate::provider::TaskInstructions::Execute {
+            phase: format!("{:?}", execution.phase).to_lowercase(),
+            revision: execution.revision.into(),
+            text: super::PlanPrompt::execution_task(
                 &execution,
-                kind,
                 &accepted.execution_json(execution.phase)?,
             ),
-            &plan.manual_changes,
-        )))
+        }))
     }
 }

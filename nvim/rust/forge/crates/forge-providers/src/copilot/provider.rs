@@ -3495,21 +3495,7 @@ impl CopilotProvider {
                         format!("Use skill {name} with arguments: {arguments}")
                     }
                     forge_provider_api::PromptInput::QuestionReply(reply) => {
-                        let answer = match reply.response {
-                            forge_provider_api::input::QuestionReplyResponse::Answer {
-                                answer,
-                                ..
-                            }
-                            | forge_provider_api::input::QuestionReplyResponse::Correction {
-                                answer,
-                                ..
-                            } => answer,
-                            forge_provider_api::input::QuestionReplyResponse::Clarification {
-                                text,
-                                ..
-                            } => text,
-                        };
-                        format!("Answer to the question {:?}: {answer}", reply.question)
+                        forge_provider_api::turn_context::question_reply(&reply)
                     }
                 }
             },
@@ -4471,6 +4457,9 @@ impl CopilotProvider {
             .lock()
             .await
             .insert(submission_id.clone(), (request.scope.clone(), attempt_id));
+        // Copilot has no mid-session developer channel, so changed Harness context and this
+        // input's note travel as one `<forge>` block at the start of the user message.
+        let instructions = request.context_block();
         let options = super::prompt::TurnOptions {
             workspace: session
                 .workspace_path()
@@ -4480,7 +4469,7 @@ impl CopilotProvider {
             capability: self.descriptor().capability,
             input: request.input,
             recovered: request.recovered_inputs,
-            instructions: request.instructions,
+            instructions,
             repair_caution,
             attachments: forge_provider_api::input::MessageInput {
                 prompt: String::new(),
@@ -5163,6 +5152,7 @@ mod retained_recovery_tests {
             input: forge_provider_api::PromptInput::Text("never dispatch".into()),
             dispatch,
             recovered_inputs: Vec::new(),
+            context: Default::default(),
             instructions: String::new(),
             attachments: Vec::new(),
             receipt,

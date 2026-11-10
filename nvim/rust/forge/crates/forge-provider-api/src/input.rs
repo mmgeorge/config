@@ -61,21 +61,19 @@ pub enum QuestionReplyResponse {
 }
 
 /// Render admitted but definitely undelivered input ahead of the newest instruction.
+///
+/// Each input follows a Harness note that labels it, so the labels stay distinguishable from the
+/// user's text.
 pub fn recovered_text(current: &str, previous: &[String]) -> String {
+    use crate::turn_context::{newest_note, recovered_note};
     if previous.is_empty() {
         return current.to_owned();
     }
-    let mut text = String::from(
-        "Earlier user input was saved locally but never accepted by the provider. Treat it as context for the newest instruction, which may amend or cancel it.\n",
-    );
+    let mut text = String::new();
     for (index, input) in previous.iter().enumerate() {
-        text.push_str(&format!(
-            "\nEarlier undelivered input {}:\n{}\n",
-            index + 1,
-            input
-        ));
+        text.push_str(&format!("{}\n{input}\n\n", recovered_note(index + 1)));
     }
-    text.push_str(&format!("\nNewest user input:\n{current}"));
+    text.push_str(&format!("{}\n{current}", newest_note()));
     text
 }
 

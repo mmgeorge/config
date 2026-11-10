@@ -43,6 +43,8 @@ pub struct ControlTurnContext {
     pub plan_document: Option<PlanDocument>,
     /// Limit filesystem authoring controls to the active planning directory.
     pub(crate) plan_authoring: Option<crate::plan::PlanAuthoringScope>,
+    /// Execute or Goal workflow material the provider prompt delivers as the task section.
+    pub(crate) task_instructions: Option<crate::provider::TaskInstructions>,
     pub resolved_question_digest_set: HashSet<String>,
     pub has_active_elicitation: bool,
     pub has_active_execution: bool,
@@ -281,6 +283,7 @@ impl ControlTurnContext {
             plan_state: None,
             plan_document: None,
             plan_authoring: None,
+            task_instructions: None,
             resolved_question_digest_set: HashSet::new(),
             has_active_elicitation: false,
             has_active_execution: false,
@@ -329,7 +332,8 @@ impl ControlToolRuntime {
         if self.context.plan_authoring.is_some() {
             crate::tools::error::ensure!(
                 !matches!(invocation.name.as_str(), "plan_read" | "plan_edit"),
-                "planning uses ordinary file tools in its planning directory; capture existing files with plan_capture_file"
+                "{}",
+                super::unavailable_tool_reason(&invocation.name)
             );
         }
         if self.context.observed_file_changes.is_some()
@@ -399,7 +403,8 @@ impl ControlToolRuntime {
         if self.context.plan_authoring.is_some() {
             crate::tools::error::ensure!(
                 !matches!(invocation.name.as_str(), "plan_read" | "plan_edit"),
-                "planning uses ordinary file tools, not virtual plan reads or patches"
+                "{}",
+                super::unavailable_tool_reason(&invocation.name)
             );
         }
         self.ensure_submission_active()?;
@@ -676,9 +681,13 @@ mod test {
             .invoke(invocation(serde_json::json!({"path":"source.rs"})))
             .await?;
         assert!(
-            result
-                .message
-                .contains(&directory.join("files/source.rs").display().to_string())
+            result.message.contains(
+                &directory
+                    .join("files")
+                    .join("source.rs")
+                    .display()
+                    .to_string()
+            )
         );
         assert!(
             std::fs::read_to_string(directory.join("files/source.rs"))?
@@ -1375,6 +1384,7 @@ mod test {
             plan_state: Some(PlanState::Generating),
             plan_document: Some(crate::plan::test_fixture("plan", "Initial")),
             plan_authoring: None,
+            task_instructions: None,
             resolved_question_digest_set: HashSet::new(),
             has_active_elicitation: false,
             has_active_execution: false,

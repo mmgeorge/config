@@ -1352,6 +1352,8 @@ impl AcpProvider {
         session
             .state
             .ensure_admission(ProviderOperation::InputRetract)?;
+        // The retracted prompt may have carried the instruction prelude.
+        session.state.advance_history_epoch();
         if session.has_active_prompt() {
             return Err(failure(
                 ProviderOperation::InputRetract,
@@ -2296,7 +2298,10 @@ async fn run_prompt(
             .await
             .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
         let current_model = session.native_model.lock().await.clone();
-        let prompt = match prompt_content(&request, session.conversation.supports_images(), session.conversation.prompt_instructions()) {
+        let history_epoch = session.state.history_epoch();
+        let prelude = session.conversation.prompt_instructions(history_epoch);
+        let carries_prelude = prelude.is_some();
+        let prompt = match prompt_content(&request, session.conversation.supports_images(), prelude) {
             Ok(prompt) => prompt,
             Err(error) => return Err(reject_before_dispatch(&request.receipt, error).await),
         };
@@ -2364,6 +2369,9 @@ async fn run_prompt(
                 return Err(with_cleanup(error, cleanup));
             }
         };
+        if carries_prelude {
+            session.conversation.prelude_accepted(history_epoch);
+        }
         let native_end = session.conversation.prompt_end(&forge_provider_api::CoveredInput::new(
             request.submission_id.clone(), request.attempt_id.clone()))
             .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
@@ -2712,55 +2720,7 @@ fn prompt_input(input: &forge_provider_api::PromptInput) -> String {
             format!("/{name} {arguments}")
         }
         forge_provider_api::PromptInput::QuestionReply(reply) => {
-            let response = match &reply.response {
-                forge_provider_api::QuestionReplyResponse::Answer {
-                    answer,
-                    required_questions_remain,
-                } => {
-                    format!(
-                        "Answer: {answer}\nRequired questions remain: {required_questions_remain}"
-                    )
-                }
-                forge_provider_api::QuestionReplyResponse::Clarification {
-                    options,
-                    text,
-                    reply_to,
-                } => {
-                    let options = options
-                        .iter()
-                        .map(|option| {
-                            format!(
-                                "{} [{}]: {}{}",
-                                option.label,
-                                option.id,
-                                option.description,
-                                if option.recommended {
-                                    " (recommended)"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "Clarification: {text}\nOptions:\n{options}\nReply to: {}",
-                        reply_to.as_deref().unwrap_or("none")
-                    )
-                }
-                forge_provider_api::QuestionReplyResponse::Correction {
-                    answer,
-                    required_questions_remain,
-                } => {
-                    format!(
-                        "Correction: {answer}\nRequired questions remain: {required_questions_remain}"
-                    )
-                }
-            };
-            format!(
-                "Question response for {} (revision {}, message {}):\n{}\n{}",
-                reply.question_id, reply.revision, reply.message_id, reply.question, response
-            )
+            forge_provider_api::turn_context::question_reply(reply)
         }
     }
 }
@@ -2781,13 +2741,22 @@ fn prompt_content(
     if let Some(instructions) = base_instructions {
         content.push(serde_json::json!({"type":"text","text":instructions}));
     }
+    // ACP has no mid-session developer channel, so changed Harness context and this input's note
+    // travel as one `<forge>` block that the open-time instructions explain.
+    let context = request.context_block();
+    if !context.is_empty() {
+        content.push(serde_json::json!({"type":"text","text":context}));
+    }
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
         content.push(serde_json::json!({
             "type":"text",
-            "text":format!("Earlier user input {} was saved locally but not accepted:", index + 1),
+            "text":forge_provider_api::turn_context::recovered_note(index + 1),
         }));
         if !recovered.instructions.is_empty() {
-            content.push(serde_json::json!({"type":"text","text":recovered.instructions}));
+            content.push(serde_json::json!({
+                "type":"text",
+                "text":forge_provider_api::turn_context::note(&recovered.instructions),
+            }));
         }
         let mut attachments =
             super::attachments::input(String::new(), &recovered.attachments, supports_images)?;
@@ -2796,10 +2765,10 @@ fn prompt_content(
         content.push(serde_json::json!({"type":"text","text":prompt_input(&recovered.input)}));
     }
     if !request.recovered_inputs.is_empty() {
-        content.push(serde_json::json!({"type":"text","text":"Newest user input:"}));
-    }
-    if !request.instructions.is_empty() {
-        content.push(serde_json::json!({"type":"text","text":request.instructions}));
+        content.push(serde_json::json!({
+            "type":"text",
+            "text":forge_provider_api::turn_context::newest_note(),
+        }));
     }
     let mut attachments =
         super::attachments::input(String::new(), &request.attachments, supports_images)?;

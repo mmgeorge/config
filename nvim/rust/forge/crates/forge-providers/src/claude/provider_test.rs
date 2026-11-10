@@ -218,6 +218,7 @@ fn prompt_request(
         attempt_id: receipt.attempt_id().unwrap(),
         input: forge_provider_api::input::PromptInput::Text("hello".into()),
         recovered_inputs: Vec::new(),
+        context: Default::default(),
         instructions: "fixture instructions".into(),
         attachments: Vec::new(),
         receipt,
@@ -226,6 +227,39 @@ fn prompt_request(
         turn_control: Arc::new(OpenTurnControl),
         host_effects: Arc::new(SettledHostEffects),
     }
+}
+
+/// Start the user message with one `<forge>` block holding changed context and the input's note.
+#[test]
+fn prompt_texts_place_the_forge_block_before_the_input() {
+    use forge_provider_api::turn_context::{ContextPart, ContextSection, TurnContext};
+    let binding = forge_provider_api::BindingId::new("context-binding").unwrap();
+    let mut request = prompt_request(
+        &binding,
+        "context-turn",
+        receipt("context-submission"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    request.instructions.clear();
+    assert_eq!(
+        super::provider::prompt_texts(&request),
+        ["hello"],
+        "an unchanged context without a note adds no text"
+    );
+    request.instructions = "fixture note".into();
+    request.context = TurnContext {
+        record: "k3f9".into(),
+        parts: vec![
+            ContextPart::new(ContextSection::Task, "Plan task.").with_attribute("kind", "plan"),
+        ],
+    };
+    assert_eq!(
+        super::provider::prompt_texts(&request),
+        [
+            "<forge>\n<note>\nfixture note\n</note>\n<task kind=\"plan\">\nPlan task.\n</task>\n</forge>",
+            "hello"
+        ]
+    );
 }
 
 fn steering_request(

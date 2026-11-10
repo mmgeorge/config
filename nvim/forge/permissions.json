@@ -75,6 +75,7 @@
       "Select-Object *": "allow",
       "Select-String": "allow",
       "Select-String *": "allow",
+      "Set-Content *": "deny",
       "Sort-Object": "allow",
       "Sort-Object *": "allow",
       "Split-Path": "allow",

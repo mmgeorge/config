@@ -98,6 +98,12 @@ pub trait ProviderTools: Send + Sync {
         )
         .into())
     }
+
+    /// Explain to the model why a tool registered for the conversation is unavailable in this
+    /// invocation. Adapters with a fixed tool catalog return it when the model calls such a tool.
+    fn unavailable_reason(&self, name: &str) -> String {
+        format!("`{name}` is not available in this turn.")
+    }
 }
 
 #[cfg(test)]

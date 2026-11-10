@@ -20,6 +20,11 @@ mod plan;
 mod questions;
 pub mod repository;
 pub(crate) mod session;
+mod toolsets;
+
+pub(crate) use toolsets::{
+    CHECK_DEFINITION_EDIT, line as toolset_line, unavailable_reason as unavailable_tool_reason,
+};
 
 pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority, TaskAuthorityProgress};
 pub use error::{ToolError, ToolResult};

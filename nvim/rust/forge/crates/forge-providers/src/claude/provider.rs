@@ -2906,51 +2906,7 @@ fn prompt_input(input: &forge_provider_api::PromptInput) -> String {
             format!("/{name} {arguments}")
         }
         forge_provider_api::PromptInput::QuestionReply(reply) => {
-            let response = match &reply.response {
-                forge_provider_api::QuestionReplyResponse::Answer {
-                    answer,
-                    required_questions_remain,
-                } => format!(
-                    "Answer: {answer}\nRequired questions remain: {required_questions_remain}"
-                ),
-                forge_provider_api::QuestionReplyResponse::Clarification {
-                    options,
-                    text,
-                    reply_to,
-                } => {
-                    let options = options
-                        .iter()
-                        .map(|option| {
-                            format!(
-                                "{} [{}]: {}{}",
-                                option.label,
-                                option.id,
-                                option.description,
-                                if option.recommended {
-                                    " (recommended)"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "Clarification: {text}\nOptions:\n{options}\nReply to: {}",
-                        reply_to.as_deref().unwrap_or("none")
-                    )
-                }
-                forge_provider_api::QuestionReplyResponse::Correction {
-                    answer,
-                    required_questions_remain,
-                } => format!(
-                    "Correction: {answer}\nRequired questions remain: {required_questions_remain}"
-                ),
-            };
-            format!(
-                "Question response for {} (revision {}, message {}):\n{}\n{}",
-                reply.question_id, reply.revision, reply.message_id, reply.question, response
-            )
+            forge_provider_api::turn_context::question_reply(reply)
         }
     }
 }
@@ -2962,25 +2918,27 @@ fn is_compact_command(request: &PromptRequest) -> bool {
         && matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "/compact")
 }
 
-/// Order the prompt's text parts: recovered inputs, task instructions, then the input itself.
-fn prompt_texts(request: &PromptRequest) -> Vec<String> {
-    let mut texts = Vec::new();
+/// Order the prompt's text parts: the `<forge>` block of changed context and this input's note,
+/// recovered inputs, then the input itself.
+///
+/// Claude has no mid-conversation developer channel, so the block starts the user message, as
+/// the open-time system prompt explains. Empty parts are left out.
+pub(super) fn prompt_texts(request: &PromptRequest) -> Vec<String> {
+    use forge_provider_api::turn_context::{newest_note, note, recovered_note};
+    let mut texts = vec![request.context_block()];
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
-        texts.push(format!(
-            "Earlier user input {} was saved locally but not accepted:",
-            index + 1
-        ));
-        texts.push(recovered.instructions.clone());
+        texts.push(recovered_note(index + 1));
+        texts.push(note(&recovered.instructions));
         for attachment in &recovered.attachments {
             texts.push(attachment.context.clone());
         }
         texts.push(prompt_input(&recovered.input));
     }
     if !request.recovered_inputs.is_empty() {
-        texts.push("Newest user input:".into());
+        texts.push(newest_note());
     }
-    texts.push(request.instructions.clone());
     texts.push(prompt_input(&request.input));
+    texts.retain(|text| !text.is_empty());
     texts
 }
 

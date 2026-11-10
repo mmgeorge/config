@@ -1,4 +1,8 @@
 use crate::tools::ControlToolDefinition;
+
+/// Toolset name shared by every source-navigation tool; `toolsets` tests keep it in step.
+pub(in crate::tools) const TOOLSET: &str = "lsp_*";
+
 /// List source-navigation tools.
 pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
     let mut tools = vec![

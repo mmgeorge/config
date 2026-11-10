@@ -1248,8 +1248,7 @@ enum PlanFixtureBehavior {
 /// Read the active plan's ID and version from the identity line Harness prepends to planning
 /// prompts.
 fn plan_document_in_request(request: &forge_provider_api::PromptRequest) -> Option<Value> {
-    let mut text = String::new();
-    text.push_str(&request.instructions);
+    let mut text = request.context_block();
     if let forge_provider_api::input::PromptInput::Text(input) = &request.input {
         text.push('\n');
         text.push_str(input);

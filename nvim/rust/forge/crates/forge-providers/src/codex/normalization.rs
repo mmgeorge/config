@@ -96,9 +96,6 @@ pub struct CodexNormalization {
     agents: HashMap<String, forge_provider_api::AgentId>,
     pending_agents: HashMap<(TurnId, String), forge_provider_api::AgentId>,
     delegations: HashMap<String, AgentDelegation>,
-    /// Native thread → compaction notifications observed on it. Compaction rebuilds model-visible
-    /// history, so context the adapter appended earlier may no longer reach the model.
-    compaction_counts: HashMap<String, u64>,
     pub replay_sensitive: bool,
 }
 
@@ -157,14 +154,6 @@ impl NativeItem {
 }
 
 impl CodexNormalization {
-    /// Get the number of compaction notifications observed on one native thread.
-    pub(super) fn compaction_count(&self, native_thread: &str) -> u64 {
-        self.compaction_counts
-            .get(native_thread)
-            .copied()
-            .unwrap_or_default()
-    }
-
     /// Bind the next admitted operation without reassigning retained native objects.
     pub fn bind(&mut self, scope: Option<impl Into<EventScope>>) {
         self.scope = scope.map(Into::into);
@@ -653,11 +642,10 @@ impl CodexNormalization {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if matches!(method, "item/started" | "item/completed") && item_type == "contextCompaction" {
-            let (native_id, thread) = native_thread
+            let thread = native_thread
                 .as_ref()
-                .and_then(|native_id| self.threads.get_key_value(native_id))
+                .and_then(|native_id| self.threads.get(native_id))
                 .ok_or_else(protocol_error)?;
-            *self.compaction_counts.entry(native_id.clone()).or_default() += 1;
             events.push(AdapterActivity::Thread {
                 thread_id: thread.clone(),
                 event: ThreadEvent::CompactionUpdated(Box::new(Compaction {
