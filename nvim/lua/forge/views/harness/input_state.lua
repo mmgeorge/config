@@ -13,6 +13,7 @@ local command = require("forge.command")
 ---@field entry_by_id table<string, table> Stable display objects for queue editing.
 ---@field retraction table<string, fun(): boolean>
 ---@field committing table<string, integer> In-flight edit commits per message id.
+---@field removing table<string, integer> In-flight edit commits that remove a message.
 ---@field commit_waiters table<string, fun()[]> Reservations waiting for a message's commit result.
 ---@field refreshing? boolean
 ---@field required_revision? integer
@@ -139,7 +140,7 @@ function M.attach(state, changed)
     session_id = state.session.id, runtime_epoch = state.runtime_epoch,
     host_generation = client.host_get_generation(), revision = 0, control_revision = 0,
     confirmed = {}, drafts = {}, entry_by_id = {}, retraction = {}, suspended = false, changed = changed,
-    committing = {}, commit_waiters = {},
+    committing = {}, removing = {}, commit_waiters = {},
   }
   M.refresh(state)
 end
@@ -199,9 +200,14 @@ function M.perform(state, action, callback, target)
   end
   local completed = false
   local committing = {}
+  local removing = {}
   for _, edit in ipairs(action.kind == "commit" and action.edits or {}) do
     committing[#committing + 1] = edit.id
     input.committing[edit.id] = (input.committing[edit.id] or 0) + 1
+    if edit.text == "" and not edit.config then
+      removing[#removing + 1] = edit.id
+      input.removing[edit.id] = (input.removing[edit.id] or 0) + 1
+    end
   end
   client.request({ session_id = input.session_id, method = "session.input.apply", params = {
     id = id, action = vim.deepcopy(action), control_revision = input.control_revision,
@@ -213,6 +219,10 @@ function M.perform(state, action, callback, target)
     -- Release commit ownership only after the result updated the displayed revision, so waiters
     -- observe the revision the host published.
     local function settle_commits()
+      for _, edit_id in ipairs(removing) do
+        local remaining = input.removing[edit_id] - 1
+        input.removing[edit_id] = remaining > 0 and remaining or nil
+      end
       for _, edit_id in ipairs(committing) do
         local remaining = input.committing[edit_id] - 1
         input.committing[edit_id] = remaining > 0 and remaining or nil

@@ -710,6 +710,69 @@ T["queued_model"] = function()
   eq(#warnings, 1)
 end
 
+T["input_render_burst"] = function()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  local receive, renders = nil, 0
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  controller.render = function() renders = renders + 1 end
+  controller.attach_transcript = function() end
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  state.session = { id = "render-burst", provider = "mock" }
+  state.composer_buf, state.transcript_buf = buffer.scratch(), buffer.scratch()
+  controller.attach()
+  requests[1].callback({ revision = 0, messages = {}, suspended = false })
+  for revision = 1, 100 do
+    receive("input_changed", { revision = revision, upsert = {
+      { id = "queued", text = tostring(revision), revision = revision, delivery = "queued" },
+    }, removed = {} }, state.session.id)
+  end
+  -- Queue correctness cannot wait for the scheduled presentation work.
+  eq(state.queue[1].text, "100")
+  eq(renders, 0)
+  wait_until(function() return renders > 0 end, "input burst was never rendered")
+  eq(renders, 1)
+end
+
+T["unavailable_queue_edit_submit"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  local warnings = {}
+  controller.refresh_winbar = function() end
+  require("forge.views.harness.prompt_history").record = function() end
+  require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+  state.session = { id = "missing-edit", provider = "mock" }
+  state.composer_buf = buffer.scratch()
+  state.presentation = {
+    follow_tail = function() end,
+    capture_prompt = function()
+      return { buffer = state.composer_buf, document = "composer", is_current = function() return true end }
+    end,
+  }
+  state.queue = {}
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 1, messages = {
+    { id = "queued", revision = 1, text = "original", delivery = "queued", attachments = {} },
+  }, suspended = false })
+  controller.edit_queued(-1)
+  input.receive(state, { revision = 2, removed = { "queued" }, upsert = {} })
+  buffer.set(state.composer_buf, "new prompt")
+  controller.submit()
+  eq(state.queue_edit, nil)
+  eq(buffer.text(state.composer_buf), "new prompt")
+  eq(#warnings, 1)
+  eq(requests[#requests].spec.params.action.kind, "release")
+  controller.submit()
+  eq(requests[#requests].spec.params.action.kind, "submit")
+  eq(requests[#requests].spec.params.action.message.text, "new prompt")
+  eq(buffer.text(state.composer_buf), "")
+end
+
 T["session_name"] = function()
   local client = require("forge.client")
   local controller = require("forge.views.harness.controller")

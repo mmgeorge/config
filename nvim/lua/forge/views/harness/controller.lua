@@ -374,10 +374,8 @@ end
 
 local function schedule_render()
   local state = harness_state()
-  if not vim.in_fast_event() then
-    M.render()
-    return
-  end
+  -- Transport events normally arrive on the main loop already. Coalesce their
+  -- presentation work too, so a burst does not render between every queue delta.
   if state.render_pending then return end
   state.render_pending = true
   vim.schedule(function()
@@ -1451,16 +1449,19 @@ local function finish_queue_edit(state, text, unqueue)
     end
   end
   local selected_attachments = edit.attachments[edit.entry]
-  local original, failure, attachments = queue_editor.finish(state, unqueue and "" or text)
+  local original, failure, attachments, recovered = queue_editor.finish(state, unqueue and "" or text)
   if failure then notifications.warn(failure, "ForgeHarness") return end
   if unqueue then original, attachments = text, selected_attachments
-  elseif text ~= "" then prompt_history.record(text) end
+  elseif text ~= "" and not recovered then prompt_history.record(text) end
   set_composer_text(state.composer_buf, original, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     layout.resize_composer(state.composer_buf, state.composer_win)
     if unqueue then vim.api.nvim_set_current_win(state.composer_win) end
   end
   M.refresh_winbar()
+  if recovered then
+    notifications.warn("The queued message is no longer available. Your text is now a normal draft; submit again to send it.", "ForgeHarness")
+  end
   if state.presentation then state.presentation.follow_tail() end
 end
 
@@ -1859,7 +1860,7 @@ function M.edit_queued(direction)
   local state = harness_state()
   if not attachments_ready(state.composer_buf) then return end
   local draft = composer_text(state.composer_buf)
-  local text, failure, attachments = queue_editor.move(state, draft, direction)
+  local text, failure, attachments, recovered = queue_editor.move(state, draft, direction)
   if failure then notifications.warn(failure, "ForgeHarness") return end
   if not text then return end
   vim.cmd.stopinsert()
@@ -1869,6 +1870,9 @@ function M.edit_queued(direction)
     vim.api.nvim_set_current_win(state.composer_win)
   end
   M.refresh_winbar()
+  if recovered then
+    notifications.warn("The queued message is no longer available. Your text is now a normal draft; submit again to send it.", "ForgeHarness")
+  end
   if state.presentation then state.presentation.follow_tail() end
 end
 
@@ -2363,7 +2367,7 @@ function M.attach()
   input_state.attach(state, function()
     local active = session.harness
     session.activate_harness(state)
-    M.render()
+    schedule_render()
     if active ~= state then session.activate_harness(active) end
   end)
   local composer_buffer = state.composer_buf

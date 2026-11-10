@@ -541,6 +541,11 @@ While editing, `Ctrl-Q` instead removes the selected message from the queue and 
 its edited text and attachments in the normal prompt. It does not submit automatically,
 so you can steer that text into the active response or submit it later. The upper bar
 shows the configured unqueue and queue-navigation shortcuts during editing.
+Messages still being submitted cannot be edited until the host acknowledges them.
+The same applies while a previous edit is removing the message from the queue.
+If delivery wins the race with an edit reservation, submitting or navigating the
+unavailable edit exits editing and keeps nonempty text as a normal draft. Submit
+again to send that draft; recovery never sends it automatically.
 
 Paste an absolute file path into the Harness composer to attach the file. Terminal
 drag-and-drop works when the terminal pastes the dropped paths. Quoted paths,

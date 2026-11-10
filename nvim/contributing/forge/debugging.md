@@ -44,8 +44,8 @@ The repository's plugin configuration selects `log_level = "info"` and enables
 `diff_logging`. Harness performance logging runs only at Trace; diff performance
 logging remains independent. The former `harness_logging` Lua boolean migrates to
 Trace or None when `log_level` is absent. Lua writes
-`stdpath("cache")/forge/harness-perf.log` and `diff-perf.log`; each starts over at
-15 MiB without retaining a previous segment.
+`stdpath("cache")/forge/harness-perf.log` and `diff-perf.log`; each rotates at
+100 MiB and retains ten older segments.
 
 These streams include render and patch timings, request/queue metadata, and
 event-loop delay observations. Trace spans record begin/end boundaries; timed
@@ -57,6 +57,44 @@ enabled. These are operation timings, not a CPU profile or a stack trace of a st
 The existing metadata collectors bound field counts and strings. The Lua collector
 also drops records beyond its record or pending-queue budgets. Those limits mean
 these performance logs are diagnostic samples, not a lossless execution history.
+Queue saturation is checked before metadata collection and JSON encoding, so
+discarded records do not pay that serialization cost. Trace still records every
+begin/end boundary and can produce substantial traffic; use Info for routine work
+and enable Trace for a bounded reproduction. Timing records identify the slow
+boundary but do not identify native buffer callbacks, CPU stacks, or lock owners.
+
+## Queue-edit investigation, 2026-11-10
+
+The retained foreground session `8dcba1ee-f6df-49cd-b6e4-48990555e14b`
+in state version 17 records a successful removal at input revision 481, followed
+by a reservation for the same removed entry at revision 482 (`input_missing`).
+The editor allowed reopening the entry while its removal was in flight; the
+deferred reservation then ran after deletion. The queue editor now blocks that
+reopening and converts a missing edit target to a normal draft, preserving text
+and attachments and requiring a separate submit to send it.
+
+The removal RPC took 5.64 seconds and the stale reservation took 10.60 seconds.
+For the reservation, 7.53 seconds elapsed before owner intake, 2.21 seconds before
+command execution, and 0.86 seconds during execution. Publication continued in
+the interval. These timings establish latency, but do not identify a SQLite lock
+owner or prove database contention.
+
+Editor performance logging was already enabled. It recorded buffer patches of
+1.53, 1.80, and 2.37 seconds, almost entirely inside the native buffer API, with
+zero editable-callback time for those patches. Markdown parse time in the
+surrounding 50-second window totaled approximately 75 ms. A later read-only
+inspection found 1,001 undo entries in the transcript buffer; this is a lead,
+not evidence that undo caused the earlier stalls. Native stack profiling remains
+necessary to attribute that time. The available Samply installation could not
+record because Windows Performance Toolkit/xperf was unavailable.
+
+The `exchange_profile` example accepts a read-only database path and exchange ID,
+then measures serialization, fresh temporary-store writes, and timeline updates
+without resuming the session. Replaying the retained 5,196,912-byte exchange in
+the dev profile measured saves at 271–278 ms before the question-merge fast path
+and 141–146 ms afterward. This microbenchmark isolates repeated whole-record JSON
+work; it is not an end-to-end latency guarantee. Stored answers and withdrawals
+still use the merge path and have regression coverage.
 
 ## Session log
 

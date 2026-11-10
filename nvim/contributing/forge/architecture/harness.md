@@ -134,6 +134,16 @@ for queue display and editing. Rust applies the configuration only when that ent
 is eligible for delivery and consumes an empty prompt without starting a turn.
 Ctrl-S settings-only model commands use the immediate configuration coordinator.
 
+Lua refuses edits of pending submissions: their immutable command is already in
+flight, but their local display entry cannot yet acquire a host reservation. Once
+acknowledged, edits follow the host reservation path. A commit that removes an entry blocks reopening that
+entry until its result settles, even while the confirmed queue still displays it.
+The block clears on success or failure. Delivery can still win before
+a reservation is granted. Submitting or navigating an edit whose target has left
+the queue releases editor ownership and preserves nonempty composer text as a
+normal draft without resending it. Transport events update queue state immediately;
+their presentation work is coalesced into one scheduled render per event-loop burst.
+
 The queue commits accepted state and idempotency receipts to its SQLite journal before acknowledging a mutation. Recovery releases abandoned edit reservations and restores retained input suspended. It reconciles linked submission evidence: accepted input leaves the queue, uncertain sends stay blocked, and proven unsent work requires explicit resumption or retry. An empty recovered queue preserves readiness instead of creating a pause. Lua reserves a queued message for editing at the revision its last committed edit published: a reservation requested while that commit awaits its host result waits for the result, because the displayed revision is stale until then and the host rejects it as `RevisionChanged`.
 
 Provider acceptance and queue acknowledgement are separate facts. `SubmissionStore` persists a `Prepared → Sending → Accepted` journal, and restart recovery never treats `Sending` as permission to replay. A turn that ends before dispatch keeps the message for the next eligible interaction. A failed message stays visible and blocks later follow-ups until the user retries or removes it. `SessionAdmission` keeps a compact task, operation, question, and exchange projection in memory, republished after every committed mutation, so submission never reopens SQLite.

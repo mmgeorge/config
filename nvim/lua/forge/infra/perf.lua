@@ -277,6 +277,14 @@ end
 function M.event(scope, event, payload)
   if not M.enabled(scope) then return "disabled" end
   M.sequence[scope] = M.sequence[scope] + 1
+  if #(M.queue[scope] or {}) >= MAX_QUEUE_RECORDS then
+    M.rejected_record_count[scope] = M.rejected_record_count[scope] + 1
+    if not saturation_reported[scope] then
+      saturation_reported[scope] = true
+      notify_write_error(scope, "4096-record diagnostic queue saturated; inspect rejected_record_count")
+    end
+    return "saturated"
+  end
   local record = M.payload(payload or {})
   record.seq = M.sequence[scope]
   record.scope = scope
@@ -286,14 +294,6 @@ function M.event(scope, event, payload)
   record.pid = vim.fn.getpid()
   record.monotonic_us = math.floor(M.now() / 1000)
   local encoded = vim.json.encode(record)
-  if #(M.queue[scope] or {}) >= MAX_QUEUE_RECORDS then
-    M.rejected_record_count[scope] = M.rejected_record_count[scope] + 1
-    if not saturation_reported[scope] then
-      saturation_reported[scope] = true
-      notify_write_error(scope, "4096-record diagnostic queue saturated; inspect rejected_record_count")
-    end
-    return "saturated"
-  end
   M.queue[scope] = M.queue[scope] or {}
   M.queue[scope][#M.queue[scope] + 1] = encoded
   queue_bytes[scope] = queue_bytes[scope] + #encoded + 1

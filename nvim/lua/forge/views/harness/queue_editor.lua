@@ -43,6 +43,7 @@ end
 ---@return string? text
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
+---@return boolean? recovered
 function M.move(state, draft, direction)
   local edit = state.queue_edit
   if not edit and state.failed_queue_edit then
@@ -57,11 +58,21 @@ function M.move(state, draft, direction)
   ---@type integer?
   local index = #state.queue + 1
   if edit then index = position(state.queue, edit.entry) end
-  if not index then return nil, "The queued message being edited is no longer available" end
+  if not index then return M.finish(state, draft) end
   index = index + direction
   if index < 1 then return nil, edit and "Already editing the first queued prompt" or "No queued prompt to edit" end
   if index > #state.queue then return nil, "Already editing the last queued prompt" end
   local entry = state.queue[index]
+  -- The confirmed projection keeps the entry until removal is acknowledged.
+  -- It must not become a new edit target during that interval.
+  if state.input and state.input.removing[entry.id] then
+    return nil, "This queued message is being removed. Wait for acknowledgement before editing."
+  end
+  -- A pending submission is already immutable and may become deliverable at any
+  -- moment. Editing it as a local draft would bypass the host reservation entirely.
+  if entry.local_only and entry.draft_state == "pending" then
+    return nil, "This message is still being submitted. Wait for acknowledgement before editing."
+  end
   if entry.delivery == "delivering" or entry.delivery == "unknown" then
     return nil, "Delivery has started. The original message cannot be edited."
   end
@@ -112,15 +123,19 @@ end
 ---@return string? original_draft
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
+---@return boolean? recovered Whether an unavailable edit became an ordinary draft.
 function M.finish(state, draft)
   local edit = state.queue_edit
   if not edit then
     return nil, "The queued message being edited is no longer available"
   end
   if not position(state.queue, edit.entry) then
-    if draft ~= "" then return nil, "This message was delivered. Unqueue to keep the edited draft separately." end
+    -- Delivery can win the race with reservation. End editor ownership instead of
+    -- trapping every subsequent submit behind an entry that cannot be edited.
+    local attachments = attachment.capture(state.composer_buf).attachments
     state.queue_edit = nil
     input_state.perform(state, { kind = "release", reservation = edit.reservation })
+    if draft ~= "" then return draft, nil, attachments, true end
     return edit.original_draft, nil, edit.original_attachments
   end
   if edit.failure and draft ~= "" then return nil, edit.failure .. ". Unqueue to retain this draft separately." end

@@ -13,6 +13,23 @@ pub(super) fn preserve_answers(
     id: &str,
     encoded: String,
 ) -> Result<String> {
+    // Most streaming writes have no question state to merge. Inspect only the
+    // stored question fields before allocating two complete exchange JSON trees.
+    // Keep the existing merge path whenever answers or withdrawals may exist.
+    if table == "exchange_record" {
+        let needs_merge: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE id=?1 AND (
+                json_type(payload,'$.elicitation')='object'
+                OR json_type(payload,'$.review.elicitation')='object'
+                OR EXISTS(SELECT 1 FROM json_each(payload,'$.node_list')
+                    WHERE json_extract(value,'$.kind')='question_withdrawn')))",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !needs_merge {
+            return Ok(encoded);
+        }
+    }
     let mut incoming: Value = serde_json::from_str(&encoded)?;
     let stored: Option<String> = transaction
         .query_row(
@@ -458,6 +475,39 @@ impl SqliteStore {
 mod tests {
     use super::*;
     use crate::session::SessionStore;
+
+    #[test]
+    fn streaming_save_skips_unneeded_merge_but_preserves_withdrawals() -> Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        connection
+            .execute_batch("CREATE TABLE exchange_record(id TEXT PRIMARY KEY,payload TEXT);")?;
+        let transaction = connection.transaction()?;
+        let incoming = r#"{ "node_list":[], "elicitation":null }"#.to_owned();
+        assert_eq!(
+            preserve_answers(&transaction, "exchange_record", "id", incoming.clone())?,
+            incoming
+        );
+        transaction.execute(
+            "INSERT INTO exchange_record VALUES('id',?1)",
+            [r#"{"node_list":[{"kind":"text","text":"question_withdrawn"}]}"#],
+        )?;
+        assert_eq!(
+            preserve_answers(&transaction, "exchange_record", "id", incoming.clone())?,
+            incoming
+        );
+        transaction.execute("UPDATE exchange_record SET payload=?1",
+            [r#"{"node_list":[{"id":"withdrawal","kind":"question_withdrawn","question":{"id":"set"}}]}"#])?;
+        let restored: Value = serde_json::from_str(&preserve_answers(
+            &transaction,
+            "exchange_record",
+            "id",
+            r#"{"node_list":[],"elicitation":{"question_set":{"id":"set"}}}"#.into(),
+        )?)?;
+        assert!(restored["elicitation"].is_null());
+        assert_eq!(restored["awaiting_input"], false);
+        assert_eq!(restored["node_list"][0]["id"], "withdrawal");
+        Ok(())
+    }
 
     #[test]
     fn answer_receipt_is_atomic_and_preserves_newer_answers() -> Result<()> {

@@ -74,12 +74,13 @@ if vim.g.forge_attachments_grid then
     attachment.restore(state.composer_buf, captured.attachments)
     controller.queue_submit()
     assert(#state.queue == 1 and state.queue[1].text == image_prompt and #state.queue[1].attachments == 1, "queued prompt lost the attachment")
+    wait_until(function() return state.queue[1] and not state.queue[1].local_only end,
+      "queued attachment was not acknowledged", wait_options)
     buffer.set(state.composer_buf, { "Unsent draft" })
     controller.edit_queued(-1)
     vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "Edited: " })
     controller.submit()
-    assert(state.queue[1].text == "Edited: " .. image_prompt and #state.queue[1].attachments == 1
-      and buffer.text(state.composer_buf) == "Unsent draft", "queue edit lost its attachment or original draft")
+    assert(buffer.text(state.composer_buf) == "Unsent draft", "queue edit lost its original draft")
     -- Editor drafts await host acknowledgement in `input.drafts`; the committed edit replaces the
     -- confirmed host message that carries the attachment.
     wait_until(function()
